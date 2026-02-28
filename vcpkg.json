@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "yuzu",
+  "version": "0.1.0",
+  "description": "Multi-platform agent and server framework",
+  "homepage": "https://github.com/Tr3kkR/Yuzu",
+  "license": "Apache-2.0",
+  "dependencies": [
+    {
+      "name": "grpc",
+      "features": ["codegen"]
+    },
+    "protobuf",
+    {
+      "name": "abseil",
+      "version>=": "20240116"
+    },
+    "spdlog",
+    "nlohmann-json",
+    "cli11",
+    {
+      "name": "openssl",
+      "platform": "!windows"
+    },
+    {
+      "name": "schannel",
+      "platform": "windows"
+    },
+    {
+      "name": "catch2",
+      "platform": "!(arm & !x64)"
+    }
+  ],
+  "builtin-baseline": "a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6",
+  "overrides": []
+}

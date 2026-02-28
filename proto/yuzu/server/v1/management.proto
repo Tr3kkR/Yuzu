@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package yuzu.server.v1;
+
+import "yuzu/common/v1/common.proto";
+import "yuzu/agent/v1/agent.proto";
+
+option cc_enable_arenas = true;
+
+// ManagementService is the API consumed by operators / dashboards / CLI tools.
+// It is distinct from AgentService (which faces agents) so auth policies differ.
+service ManagementService {
+  // ListAgents returns all currently connected agents.
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+
+  // GetAgent returns details about a single agent by ID.
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+
+  // SendCommand dispatches a command to one or more agents.
+  rpc SendCommand(SendCommandRequest) returns (stream SendCommandResponse);
+
+  // WatchEvents opens a server-push stream of agent lifecycle events.
+  rpc WatchEvents(WatchEventsRequest) returns (stream AgentEvent);
+
+  // QueryInventory retrieves stored inventory for an agent.
+  rpc QueryInventory(QueryInventoryRequest) returns (QueryInventoryResponse);
+}
+
+// ── Agent listing ─────────────────────────────────────────────────────────────
+
+message ListAgentsRequest {
+  string filter = 1;  // Simple filter expression (future: OData / CEL)
+  int32  limit  = 2;
+  string cursor = 3;  // Pagination cursor
+}
+
+message AgentSummary {
+  string agent_id  = 1;
+  string hostname  = 2;
+  yuzu.common.v1.Platform platform = 3;
+  string agent_version = 4;
+  bool   online    = 5;
+  yuzu.common.v1.Timestamp last_seen = 6;
+}
+
+message ListAgentsResponse {
+  repeated AgentSummary agents = 1;
+  string next_cursor = 2;
+}
+
+message GetAgentRequest  { string agent_id = 1; }
+message GetAgentResponse {
+  AgentSummary summary = 1;
+  repeated yuzu.common.v1.PluginInfo plugins = 2;
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────────
+
+message SendCommandRequest {
+  repeated string agent_ids = 1;  // Empty = broadcast to all online agents
+  yuzu.agent.v1.CommandRequest command = 2;
+  int32 timeout_seconds = 3;
+}
+
+message SendCommandResponse {
+  string agent_id = 1;
+  yuzu.agent.v1.CommandResponse response = 2;
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+message WatchEventsRequest {
+  repeated string agent_ids = 1;  // Empty = all agents
+}
+
+message AgentEvent {
+  string agent_id = 1;
+  yuzu.common.v1.Timestamp occurred_at = 2;
+
+  oneof event {
+    AgentConnected    connected    = 3;
+    AgentDisconnected disconnected = 4;
+    AgentPluginLoaded plugin_loaded = 5;
+  }
+}
+
+message AgentConnected    { string session_id = 1; }
+message AgentDisconnected { string reason = 1; }
+message AgentPluginLoaded { yuzu.common.v1.PluginInfo plugin = 1; }
+
+// ── Inventory ─────────────────────────────────────────────────────────────────
+
+message QueryInventoryRequest {
+  string agent_id = 1;
+  string plugin   = 2;  // Which plugin's data to retrieve; empty = all
+}
+
+message QueryInventoryResponse {
+  string agent_id = 1;
+  map<string, bytes> plugin_data = 2;
+  yuzu.common.v1.Timestamp collected_at = 3;
+}

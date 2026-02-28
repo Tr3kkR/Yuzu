@@ -1,0 +1,54 @@
+# Build directories
+build/
+build-*/
+out/
+.cache/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+CMakeUserPresets.json
+
+# Meson
+.mesonpy/
+meson-info/
+meson-logs/
+meson-private/
+compile_commands.json
+
+# vcpkg
+vcpkg_installed/
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.a
+*.lib
+*.pdb
+
+# Generated protobuf sources
+*.pb.h
+*.pb.cc
+*.grpc.pb.h
+*.grpc.pb.cc
+
+# IDE / Editor
+.vscode/
+.idea/
+*.user
+*.suo
+.vs/
+.clangd/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

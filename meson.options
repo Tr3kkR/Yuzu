@@ -1,0 +1,7 @@
+option('build_agent',    type: 'boolean', value: true,  description: 'Build the agent daemon')
+option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
+option('build_examples', type: 'boolean', value: true,  description: 'Build example plugins')
+option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
+option('enable_lto',     type: 'boolean', value: false, description: 'Enable link-time optimisation')
+option('enable_asan',    type: 'boolean', value: false, description: 'Enable AddressSanitizer')
+option('enable_tsan',    type: 'boolean', value: false, description: 'Enable ThreadSanitizer')

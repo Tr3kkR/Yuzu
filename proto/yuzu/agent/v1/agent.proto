@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package yuzu.agent.v1;
+
+import "yuzu/common/v1/common.proto";
+
+option cc_enable_arenas = true;
+
+// AgentService is the primary service implemented by the server.
+// Agents connect to it and maintain a long-lived session.
+service AgentService {
+  // Register is the first call an agent makes. Returns a session token.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Heartbeat keeps the session alive and receives pending commands.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // ExecuteCommand dispatches a command to a plugin on this agent.
+  // Results stream back as they are produced.
+  rpc ExecuteCommand(CommandRequest) returns (stream CommandResponse);
+
+  // Subscribe opens a bidirectional command channel (alternative to polling).
+  // The server pushes CommandRequests; the agent streams CommandResponses.
+  rpc Subscribe(stream CommandResponse) returns (stream CommandRequest);
+
+  // ReportInventory pushes full inventory data to the server.
+  rpc ReportInventory(InventoryReport) returns (InventoryAck);
+}
+
+// ── Registration ─────────────────────────────────────────────────────────────
+
+message AgentInfo {
+  string agent_id  = 1;  // Stable UUID for this endpoint
+  string hostname  = 2;
+  yuzu.common.v1.Platform platform = 3;
+  string agent_version = 4;
+  repeated yuzu.common.v1.PluginInfo plugins = 5;
+}
+
+message RegisterRequest {
+  AgentInfo info = 1;
+}
+
+message RegisterResponse {
+  string session_id    = 1;
+  bool   accepted      = 2;
+  string reject_reason = 3;  // Populated if accepted == false
+  // Server may send initial commands immediately after registration
+  repeated CommandRequest pending_commands = 4;
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp sent_at = 2;
+  // Lightweight status fields; full inventory uses ReportInventory
+  map<string, string> status_tags = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  yuzu.common.v1.Timestamp server_time = 2;
+  repeated CommandRequest pending_commands = 3;
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+message CommandRequest {
+  string command_id = 1;  // Unique per invocation
+  string plugin     = 2;  // Target plugin name (e.g. "inventory", "patch")
+  string action     = 3;  // Action within the plugin
+  map<string, string> parameters = 4;
+  yuzu.common.v1.Timestamp expires_at = 5;  // Agent should discard after this
+}
+
+message CommandResponse {
+  string command_id = 1;
+
+  enum Status {
+    RUNNING  = 0;
+    SUCCESS  = 1;
+    FAILURE  = 2;
+    TIMEOUT  = 3;
+    REJECTED = 4;
+  }
+  Status status = 2;
+
+  string output    = 3;  // Streamed stdout / structured output
+  int32  exit_code = 4;
+
+  yuzu.common.v1.ErrorDetail error  = 5;
+  yuzu.common.v1.Timestamp   sent_at = 6;
+}
+
+// ── Inventory ─────────────────────────────────────────────────────────────────
+
+message InventoryReport {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp collected_at = 2;
+
+  // Key-value blobs per plugin; plugins define their own schemas.
+  map<string, bytes> plugin_data = 3;
+}
+
+message InventoryAck {
+  bool received = 1;
+}

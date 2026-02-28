@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package yuzu.common.v1;
+
+option cc_enable_arenas = true;
+
+// Platform identifies the operating system and architecture of an endpoint.
+message Platform {
+  string os      = 1;  // "windows", "linux", "darwin"
+  string arch    = 2;  // "x86_64", "aarch64", "armv7"
+  string version = 3;  // OS version string
+}
+
+// PluginInfo describes a loaded plugin on an agent.
+message PluginInfo {
+  string name        = 1;
+  string version     = 2;
+  string description = 3;
+  repeated string capabilities = 4;
+}
+
+// ErrorDetail carries structured error information.
+message ErrorDetail {
+  string code    = 1;
+  string message = 2;
+  map<string, string> metadata = 3;
+}
+
+// Timestamp wraps unix epoch millis for consistency.
+message Timestamp {
+  int64 millis_epoch = 1;
+}
