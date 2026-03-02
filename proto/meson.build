@@ -1,51 +1,49 @@
+grpc_dep = dependency('grpc')
+protobuf_dep = dependency('protobuf')
+
 protoc = find_program('protoc', required: true)
 grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)
 
-proto_src_dir = meson.current_source_dir()
-proto_out_dir = meson.current_build_dir() / 'generated'
-fs = import('fs')
+proto_root = meson.current_source_dir()
 
-proto_files = files(
-  'yuzu/common/v1/common.proto',
-  'yuzu/agent/v1/agent.proto',
-  'yuzu/server/v1/management.proto',
+gen = custom_target(
+    'all_proto_gen',
+    input: [
+        proto_root / 'yuzu/common/v1/common.proto',
+        proto_root / 'yuzu/agent/v1/agent.proto',
+        proto_root / 'yuzu/server/v1/management.proto',
+    ],
+    output: [
+        'common.pb.cc', 'common.pb.h', 'common.grpc.pb.cc', 'common.grpc.pb.h',
+        'agent.pb.cc',  'agent.pb.h',  'agent.grpc.pb.cc',  'agent.grpc.pb.h',
+        'management.pb.cc', 'management.pb.h', 'management.grpc.pb.cc', 'management.grpc.pb.h',
+    ],
+    command: [
+        find_program('python3', 'python'),
+        files('gen_proto.py'),
+        '@OUTDIR@',
+        protoc.full_path(),
+        grpc_cpp_plugin.full_path(),
+        proto_root,
+        proto_root / 'yuzu/common/v1/common.proto',
+        proto_root / 'yuzu/agent/v1/agent.proto',
+        proto_root / 'yuzu/server/v1/management.proto',
+    ],
 )
 
-gen_srcs = []
-gen_hdrs = []
-
-foreach pf : proto_files
-  pf_str = pf.full_path()
-  name   = fs.stem(pf_str)
-
-  gen = custom_target(
-    name + '_proto',
-    input:   pf,
-    output:  [name + '.pb.cc', name + '.pb.h', name + '.grpc.pb.cc', name + '.grpc.pb.h'],
-    command: [
-      protoc,
-      '--cpp_out=' + proto_out_dir,
-      '--grpc_out=' + proto_out_dir,
-      '--plugin=protoc-gen-grpc=' + grpc_cpp_plugin.full_path(),
-      '-I', proto_src_dir,
-      '@INPUT@',
-    ],
-    build_by_default: true,
-  )
-
-  gen_srcs += [gen[0], gen[2]]
-  gen_hdrs += [gen[1], gen[3]]
-endforeach
+gen_srcs = [gen[0], gen[2], gen[4], gen[6], gen[8], gen[10]]
+gen_hdrs = [gen[1], gen[3], gen[5], gen[7], gen[9], gen[11]]
 
 yuzu_proto_lib = static_library(
-  'yuzu_proto',
-  gen_srcs,
-  include_directories: include_directories(proto_out_dir),
-  dependencies: [grpc_dep, protobuf_dep],
+    'yuzu_proto',
+    gen_srcs,
+    include_directories: include_directories('.'),
+    dependencies: [grpc_dep, protobuf_dep],
 )
 
 yuzu_proto_dep = declare_dependency(
-  link_with: yuzu_proto_lib,
-  include_directories: include_directories(proto_out_dir),
-  dependencies: [grpc_dep, protobuf_dep],
+    link_with: yuzu_proto_lib,
+    sources: gen_hdrs,
+    include_directories: include_directories('.'),
+    dependencies: [grpc_dep, protobuf_dep],
 )

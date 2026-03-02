@@ -5,7 +5,7 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++23',
+    'cpp_std=c++latest',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -25,8 +25,8 @@ build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
-grpc_dep        = dependency('grpc++',        required: true)
-protobuf_dep    = dependency('protobuf',      required: true)
+grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], required: true)
+protobuf_dep = dependency('Protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: true)
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
