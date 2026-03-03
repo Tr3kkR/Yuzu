@@ -13,7 +13,7 @@
     "protobuf",
     {
       "name": "abseil",
-      "version>=": "20240116"
+      "version>=": "20240116.1"
     },
     "spdlog",
     "nlohmann-json",
@@ -31,6 +31,5 @@
       "platform": "!(arm & !x64)"
     }
   ],
-  "builtin-baseline": "c1f21baeaf7127c13ee141fe1bdaa49eed371c0c",
   "overrides": []
 }
