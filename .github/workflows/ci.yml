@@ -48,7 +48,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6'
+          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
       - name: Set compiler env
         run: |
@@ -100,7 +100,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6'
+          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
       - name: Configure (CMake)
         shell: pwsh
@@ -145,7 +145,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6'
+          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
       - name: Configure (CMake)
         run: |
@@ -186,7 +186,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ runner.temp }}/vcpkg'
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6'
+          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
       - name: Configure (CMake — cross)
         run: |
