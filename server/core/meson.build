@@ -13,6 +13,7 @@ yuzu_server_core_dep = declare_dependency(
 executable(
   'yuzu-server',
   files('src/main.cpp'),
-  dependencies: [yuzu_server_core_dep, cli11_dep],
+  dependencies: [yuzu_server_core_dep, yuzu_sdk_dep, cli11_dep],
+  link_args: ['/FORCE:MULTIPLE'],
   install: true,
 )

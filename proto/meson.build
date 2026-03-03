@@ -1,5 +1,5 @@
-grpc_dep = dependency('grpc')
-protobuf_dep = dependency('protobuf')
+grpc_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'])
+protobuf_dep = dependency('Protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'])
 
 protoc = find_program('protoc', required: true)
 grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)

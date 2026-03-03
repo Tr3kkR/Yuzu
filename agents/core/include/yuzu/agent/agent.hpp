@@ -29,7 +29,7 @@ struct Config {
  *   auto agent = yuzu::agent::Agent::create(config);
  *   agent->run();  // blocks until shutdown is requested
  */
-class Agent {
+class YUZU_EXPORT Agent {
 public:
     virtual ~Agent() = default;
 

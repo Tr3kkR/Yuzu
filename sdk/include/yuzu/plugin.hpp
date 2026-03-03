@@ -189,7 +189,7 @@ public:
         .execute     = _yuzu_execute_,                                         \
     };                                                                         \
                                                                                \
-    extern "C" YUZU_EXPORT                                                     \
+    extern "C" YUZU_PLUGIN_API                                                 \
     const YuzuPluginDescriptor* yuzu_plugin_descriptor(void) {                 \
         return &_yuzu_descriptor_;                                             \
     }

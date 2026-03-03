@@ -107,10 +107,22 @@ typedef struct {
  */
 typedef const YuzuPluginDescriptor* (*yuzu_plugin_descriptor_fn)(void);
 
+/* For agent core functions (import when used by plugins/agent) */
 #ifdef _WIN32
-#  define YUZU_EXPORT __declspec(dllexport)
+#  ifdef YUZU_AGENT_CORE_BUILDING
+#    define YUZU_EXPORT __declspec(dllexport)
+#  else
+#    define YUZU_EXPORT __declspec(dllimport)
+#  endif
 #else
 #  define YUZU_EXPORT __attribute__((visibility("default")))
+#endif
+
+/* For plugin exports (always export from plugin DLLs) */
+#ifdef _WIN32
+#  define YUZU_PLUGIN_API __declspec(dllexport)
+#else
+#  define YUZU_PLUGIN_API __attribute__((visibility("default")))
 #endif
 
 /* ── Context helpers (implemented by the agent host) ─────────────────────────── */

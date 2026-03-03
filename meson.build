@@ -27,6 +27,7 @@ build_tests    = get_option('build_tests')
 # ── Dependencies ──────────────────────────────────────────────────────────────
 grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], required: true)
 protobuf_dep = dependency('Protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: true)
+add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)

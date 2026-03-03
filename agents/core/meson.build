@@ -1,4 +1,4 @@
-yuzu_agent_core_lib = static_library(
+yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
   files('src/agent.cpp', 'src/plugin_loader.cpp'),
   include_directories: [
@@ -6,6 +6,8 @@ yuzu_agent_core_lib = static_library(
     include_directories('../../sdk/include'),
   ],
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, grpcpp_dep, spdlog_dep],
+  cpp_args: ['-DYUZU_AGENT_CORE_BUILDING'],
+  install: true,
 )
 
 yuzu_agent_core_dep = declare_dependency(

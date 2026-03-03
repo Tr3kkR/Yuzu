@@ -34,7 +34,7 @@ struct CommandContextImpl {
 
 extern "C" {
 
-void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text) {
+YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text) {
     if (!ctx || !text) return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
     if (impl->output_accumulator) {
@@ -43,18 +43,18 @@ void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text) {
     }
 }
 
-void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
+YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
     (void)ctx;
     spdlog::debug("Plugin progress: {}%", percent);
 }
 
-const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
+YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
     (void)ctx; (void)key;
     // TODO: look up in agent config map
     return nullptr;
 }
 
-const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
+YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
     (void)ctx; (void)key;
     // TODO: look up in secret store
     return nullptr;
