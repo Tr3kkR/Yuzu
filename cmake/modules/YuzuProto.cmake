@@ -19,13 +19,16 @@ function(yuzu_proto_library)
   set(GENERATED_HDRS "")
 
   foreach(PROTO_FILE IN LISTS ARG_PROTOS)
-    get_filename_component(PROTO_NAME_WE "${PROTO_FILE}" NAME_WE)
-    get_filename_component(PROTO_DIR    "${PROTO_FILE}" DIRECTORY)
+    # Compute the path relative to the proto import root so the declared
+    # OUTPUT paths mirror where protoc actually writes the files, e.g.
+    #   proto/yuzu/agent/v1/agent.proto  →  yuzu/agent/v1/agent
+    file(RELATIVE_PATH PROTO_REL "${CMAKE_SOURCE_DIR}/proto" "${PROTO_FILE}")
+    string(REGEX REPLACE "\\.proto$" "" PROTO_REL_WE "${PROTO_REL}")
 
-    set(PB_H     "${PROTO_OUT}/${PROTO_NAME_WE}.pb.h")
-    set(PB_CC    "${PROTO_OUT}/${PROTO_NAME_WE}.pb.cc")
-    set(GRPC_H   "${PROTO_OUT}/${PROTO_NAME_WE}.grpc.pb.h")
-    set(GRPC_CC  "${PROTO_OUT}/${PROTO_NAME_WE}.grpc.pb.cc")
+    set(PB_H     "${PROTO_OUT}/${PROTO_REL_WE}.pb.h")
+    set(PB_CC    "${PROTO_OUT}/${PROTO_REL_WE}.pb.cc")
+    set(GRPC_H   "${PROTO_OUT}/${PROTO_REL_WE}.grpc.pb.h")
+    set(GRPC_CC  "${PROTO_OUT}/${PROTO_REL_WE}.grpc.pb.cc")
 
     add_custom_command(
       OUTPUT  "${PB_H}" "${PB_CC}" "${GRPC_H}" "${GRPC_CC}"
