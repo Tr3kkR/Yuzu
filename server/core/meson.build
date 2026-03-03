@@ -8,12 +8,12 @@ yuzu_server_core_lib = static_library(
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
+  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, grpc_dep, spdlog_dep],
 )
 
 executable(
   'yuzu-server',
   files('src/main.cpp'),
-  dependencies: [yuzu_server_core_dep, yuzu_sdk_dep, cli11_dep],
-  link_args: ['/FORCE:MULTIPLE'],
+  dependencies: [yuzu_server_core_dep, cli11_dep],
   install: true,
 )
