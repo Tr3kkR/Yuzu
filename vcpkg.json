@@ -23,10 +23,6 @@
       "platform": "!windows"
     },
     {
-      "name": "schannel",
-      "platform": "windows"
-    },
-    {
       "name": "catch2",
       "platform": "!(arm & !x64)"
     },
