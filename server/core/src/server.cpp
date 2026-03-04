@@ -42,7 +42,6 @@ namespace {
 }
 
 // -- SSE Event Bus ------------------------------------------------------------
-// A simple broadcast mechanism: chargen output -> all connected SSE clients.
 
 class EventBus {
 public:
@@ -73,7 +72,7 @@ private:
     std::unordered_map<std::size_t, Listener> listeners_;
 };
 
-// -- Chargen state (shared between gRPC agent handler and web UI) -------------
+// -- Chargen state ------------------------------------------------------------
 
 struct ChargenState {
     std::mutex                      mu;
@@ -83,7 +82,7 @@ struct ChargenState {
     EventBus                        event_bus;
 };
 
-// -- SSE sink state (per-connection, shared with content provider) -------------
+// -- SSE sink state (per-connection) ------------------------------------------
 
 struct SseSinkState {
     std::mutex              mu;
@@ -109,7 +108,6 @@ bool sse_content_provider(
         return false;
     }
 
-    // Drain all queued lines
     while (!state->queue.empty()) {
         auto& line = state->queue.front();
         std::string evt = "event: chargen\ndata: " + line + "\n\n";
@@ -119,7 +117,6 @@ bool sse_content_provider(
         state->queue.pop_front();
     }
 
-    // Timeout with no data -- send a keepalive comment
     const char* keepalive = ": keepalive\n\n";
     sink.write(keepalive, std::strlen(keepalive));
     return true;
@@ -139,20 +136,10 @@ void sse_resource_release(
 
 // -- AgentServiceImpl ---------------------------------------------------------
 
-class AgentServiceImpl /* : public yuzu::agent::v1::AgentService::Service */ {
+class AgentServiceImpl {
 public:
     explicit AgentServiceImpl(std::shared_ptr<ChargenState> cs)
         : chargen_state_(std::move(cs)) {}
-
-    // Placeholder for the real gRPC service implementation.
-    // When protobuf codegen is wired up, this class would inherit from
-    // yuzu::agent::v1::AgentService::Service and implement the RPCs.
-    //
-    // The ExecuteCommand flow:
-    //   1. Server sends CommandRequest (plugin="chargen", action="chargen_start")
-    //   2. Agent runs the chargen plugin, which loops sending write_output()
-    //   3. Each write_output() becomes a CommandResponse streamed back here
-    //   4. We log each line and push it to the SSE event bus
 
     void on_chargen_output(const std::string& agent_id, const std::string& line) {
         auto& s = *chargen_state_;
@@ -168,14 +155,24 @@ private:
 
 // -- ManagementServiceImpl ----------------------------------------------------
 
-class ManagementServiceImpl /* : public yuzu::server::v1::ManagementService::Service */ {
+class ManagementServiceImpl {
 public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
 
+// -- File-reading helper ------------------------------------------------------
+
+std::string read_file_contents(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    return std::string(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+}
+
 }  // anonymous namespace
 
 // -- ServerImpl ---------------------------------------------------------------
+// All methods defined inline to avoid MSVC C4596 with out-of-line definitions.
 
 class ServerImpl final : public Server {
 public:
@@ -183,22 +180,231 @@ public:
         : cfg_(std::move(cfg)),
           chargen_state_(std::make_shared<ChargenState>())
     {
-        setup_chargen_logger();
+        // Setup chargen file logger
+        auto log_path = chargen_log_path();
+        auto parent = log_path.parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                spdlog::warn("Could not create log directory {}: {}",
+                    parent.string(), ec.message());
+            }
+        }
+        try {
+            chargen_state_->file_logger = spdlog::basic_logger_mt(
+                "chargen_file", log_path.string());
+            chargen_state_->file_logger->set_pattern(
+                "[%Y-%m-%d %H:%M:%S.%e] [chargen] %v");
+            chargen_state_->file_logger->flush_on(spdlog::level::info);
+            spdlog::info("Chargen log file: {}", log_path.string());
+        } catch (const spdlog::spdlog_ex& ex) {
+            spdlog::error("Failed to create chargen file logger: {}", ex.what());
+        }
     }
 
-    void run() override;
-    void stop() noexcept override;
+    void run() override {
+        grpc::EnableDefaultHealthCheckService(true);
+
+        auto agent_creds = grpc::InsecureServerCredentials();
+        if (cfg_.tls_enabled) {
+            auto tls = build_tls_credentials();
+            if (tls) {
+                agent_creds = std::move(tls);
+            } else {
+                spdlog::warn("TLS enabled but cert/key not provided -- falling back to insecure");
+            }
+        }
+
+        grpc::ServerBuilder agent_builder;
+        agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
+
+        grpc::ServerBuilder mgmt_builder;
+        mgmt_builder.AddListeningPort(
+            cfg_.management_address,
+            grpc::InsecureServerCredentials()
+        );
+
+        agent_server_ = agent_builder.BuildAndStart();
+        mgmt_server_  = mgmt_builder.BuildAndStart();
+
+        spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
+            cfg_.listen_address, cfg_.management_address);
+
+        start_web_server();
+        agent_server_->Wait();
+    }
+
+    void stop() noexcept override {
+        spdlog::info("Shutting down server...");
+
+        stop_chargen();
+
+        if (web_server_) {
+            web_server_->stop();
+        }
+        if (web_thread_.joinable()) {
+            web_thread_.join();
+        }
+
+        if (agent_server_) agent_server_->Shutdown();
+        if (mgmt_server_)  mgmt_server_->Shutdown();
+    }
 
 private:
-    [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
-    build_server_credentials() const;
+    // -- TLS ------------------------------------------------------------------
 
-    void setup_chargen_logger();
-    void start_web_server();
-    void setup_sse_endpoint();
-    void setup_api_endpoints();
-    void start_chargen();
-    void stop_chargen();
+    [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
+    build_tls_credentials() const {
+        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+            return nullptr;
+        }
+
+        auto cert = read_file_contents(cfg_.tls_server_cert);
+        auto key  = read_file_contents(cfg_.tls_server_key);
+        if (cert.empty() || key.empty()) {
+            spdlog::error("Failed to read TLS cert or key files");
+            return nullptr;
+        }
+
+        grpc::SslServerCredentialsOptions ssl_opts;
+        ssl_opts.pem_key_cert_pairs.push_back({std::move(key), std::move(cert)});
+
+        if (!cfg_.tls_ca_cert.empty()) {
+            auto ca = read_file_contents(cfg_.tls_ca_cert);
+            if (!ca.empty()) {
+                ssl_opts.pem_root_certs = std::move(ca);
+                ssl_opts.client_certificate_request =
+                    GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+            }
+        }
+
+        return grpc::SslServerCredentials(ssl_opts);
+    }
+
+    // -- Web server -----------------------------------------------------------
+
+    void start_web_server() {
+        web_server_ = std::make_unique<httplib::Server>();
+
+        web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(kChargenIndexHtml, "text/html; charset=utf-8");
+        });
+
+        auto* cs = chargen_state_.get();
+
+        // SSE endpoint
+        web_server_->Get("/events", [cs](const httplib::Request&, httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+
+            auto sink_state = std::make_shared<SseSinkState>();
+            sink_state->sub_id = cs->event_bus.subscribe(
+                [sink_state](const std::string& line) {
+                    {
+                        std::lock_guard lk(sink_state->mu);
+                        sink_state->queue.push_back(line);
+                    }
+                    sink_state->cv.notify_one();
+                });
+
+            EventBus* bus = &cs->event_bus;
+            res.set_content_provider(
+                "text/event-stream",
+                [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
+                    return sse_content_provider(sink_state, offset, sink);
+                },
+                [sink_state, bus](bool success) {
+                    sse_resource_release(sink_state, *bus, success);
+                }
+            );
+        });
+
+        // API endpoints
+        web_server_->Post("/api/chargen/start",
+            [this](const httplib::Request&, httplib::Response& res) {
+                start_chargen();
+                res.set_content("{\"status\":\"started\"}", "application/json");
+            });
+
+        web_server_->Post("/api/chargen/stop",
+            [this](const httplib::Request&, httplib::Response& res) {
+                stop_chargen();
+                res.set_content("{\"status\":\"stopped\"}", "application/json");
+            });
+
+        web_server_->Get("/api/chargen/status",
+            [this](const httplib::Request&, httplib::Response& res) {
+                std::lock_guard lock(chargen_state_->mu);
+                std::string status = chargen_state_->running ? "running" : "stopped";
+                res.set_content("{\"status\":\"" + status + "\"}", "application/json");
+            });
+
+        web_thread_ = std::thread([this] {
+            spdlog::info("Web UI available at http://{}:{}/",
+                cfg_.web_address, cfg_.web_port);
+            web_server_->listen(cfg_.web_address, cfg_.web_port);
+        });
+    }
+
+    // -- Chargen --------------------------------------------------------------
+
+    void start_chargen() {
+        std::lock_guard lock(chargen_state_->mu);
+        if (chargen_state_->running) {
+            spdlog::info("Chargen already running");
+            return;
+        }
+        chargen_state_->running = true;
+        spdlog::info("Chargen started");
+
+        chargen_thread_ = std::thread([this] {
+            constexpr int kFirstChar  = 32;
+            constexpr int kLastChar   = 126;
+            constexpr int kCharRange  = kLastChar - kFirstChar + 1;
+            constexpr int kLineLength = 72;
+
+            int offset = 0;
+
+            while (true) {
+                {
+                    std::lock_guard lk(chargen_state_->mu);
+                    if (!chargen_state_->running) break;
+                }
+
+                std::string line;
+                line.reserve(kLineLength);
+                for (int i = 0; i < kLineLength; ++i) {
+                    line.push_back(
+                        static_cast<char>(kFirstChar + ((offset + i) % kCharRange)));
+                }
+                offset = (offset + 1) % kCharRange;
+
+                if (chargen_state_->file_logger) {
+                    chargen_state_->file_logger->info("{}", line);
+                }
+
+                chargen_state_->event_bus.publish(line);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            spdlog::info("Chargen thread exited");
+        });
+    }
+
+    void stop_chargen() {
+        {
+            std::lock_guard lock(chargen_state_->mu);
+            if (!chargen_state_->running) return;
+            chargen_state_->running = false;
+        }
+        if (chargen_thread_.joinable()) {
+            chargen_thread_.join();
+        }
+        spdlog::info("Chargen stopped");
+    }
+
+    // -- Data members ---------------------------------------------------------
 
     Config                            cfg_;
     std::shared_ptr<ChargenState>     chargen_state_;
@@ -210,251 +416,6 @@ private:
     std::thread                       web_thread_;
     std::thread                       chargen_thread_;
 };
-
-// -- ServerImpl method definitions --------------------------------------------
-
-void ServerImpl::run() {
-    grpc::EnableDefaultHealthCheckService(true);
-
-    auto agent_creds = grpc::InsecureServerCredentials();
-    if (cfg_.tls_enabled) {
-        auto tls = build_server_credentials();
-        if (tls) {
-            agent_creds = std::move(tls);
-        } else {
-            spdlog::warn("TLS enabled but cert/key not provided -- falling back to insecure");
-        }
-    }
-
-    grpc::ServerBuilder agent_builder;
-    agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
-    // agent_builder.RegisterService(&agent_service_);
-
-    grpc::ServerBuilder mgmt_builder;
-    mgmt_builder.AddListeningPort(
-        cfg_.management_address,
-        grpc::InsecureServerCredentials()
-    );
-    // mgmt_builder.RegisterService(&mgmt_service_);
-
-    agent_server_ = agent_builder.BuildAndStart();
-    mgmt_server_  = mgmt_builder.BuildAndStart();
-
-    spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
-        cfg_.listen_address, cfg_.management_address);
-
-    start_web_server();
-    agent_server_->Wait();
-}
-
-void ServerImpl::stop() noexcept {
-    spdlog::info("Shutting down server...");
-
-    stop_chargen();
-
-    if (web_server_) {
-        web_server_->stop();
-    }
-    if (web_thread_.joinable()) {
-        web_thread_.join();
-    }
-
-    if (agent_server_) agent_server_->Shutdown();
-    if (mgmt_server_)  mgmt_server_->Shutdown();
-}
-
-std::shared_ptr<grpc::ServerCredentials>
-ServerImpl::build_server_credentials() const {
-    if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
-        return nullptr;
-    }
-
-    auto read_file = [](const std::filesystem::path& p) -> std::string {
-        std::ifstream f(p, std::ios::binary);
-        if (!f) return {};
-        return {std::istreambuf_iterator<char>(f),
-                std::istreambuf_iterator<char>()};
-    };
-
-    auto cert = read_file(cfg_.tls_server_cert);
-    auto key  = read_file(cfg_.tls_server_key);
-    if (cert.empty() || key.empty()) {
-        spdlog::error("Failed to read TLS cert or key files");
-        return nullptr;
-    }
-
-    grpc::SslServerCredentialsOptions ssl_opts;
-    ssl_opts.pem_key_cert_pairs.push_back({std::move(key), std::move(cert)});
-
-    if (!cfg_.tls_ca_cert.empty()) {
-        auto ca = read_file(cfg_.tls_ca_cert);
-        if (!ca.empty()) {
-            ssl_opts.pem_root_certs = std::move(ca);
-            ssl_opts.client_certificate_request =
-                GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-        }
-    }
-
-    return grpc::SslServerCredentials(ssl_opts);
-}
-
-void ServerImpl::setup_chargen_logger() {
-    auto log_path = chargen_log_path();
-    auto parent = log_path.parent_path();
-    if (!parent.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            spdlog::warn("Could not create log directory {}: {}",
-                parent.string(), ec.message());
-        }
-    }
-    try {
-        chargen_state_->file_logger = spdlog::basic_logger_mt(
-            "chargen_file", log_path.string());
-        chargen_state_->file_logger->set_pattern(
-            "[%Y-%m-%d %H:%M:%S.%e] [chargen] %v");
-        chargen_state_->file_logger->flush_on(spdlog::level::info);
-        spdlog::info("Chargen log file: {}", log_path.string());
-    } catch (const spdlog::spdlog_ex& ex) {
-        spdlog::error("Failed to create chargen file logger: {}", ex.what());
-    }
-}
-
-void ServerImpl::start_web_server() {
-    web_server_ = std::make_unique<httplib::Server>();
-
-    // Serve the HTMX page
-    web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
-        res.set_content(kChargenIndexHtml, "text/html; charset=utf-8");
-    });
-
-    setup_sse_endpoint();
-    setup_api_endpoints();
-
-    web_thread_ = std::thread([this] {
-        spdlog::info("Web UI available at http://{}:{}/",
-            cfg_.web_address, cfg_.web_port);
-        web_server_->listen(cfg_.web_address, cfg_.web_port);
-    });
-}
-
-void ServerImpl::setup_sse_endpoint() {
-    auto* cs = chargen_state_.get();
-
-    web_server_->Get("/events", [cs](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Cache-Control", "no-cache");
-        res.set_header("X-Accel-Buffering", "no");
-
-        auto sink_state = std::make_shared<SseSinkState>();
-
-        sink_state->sub_id = cs->event_bus.subscribe(
-            [sink_state](const std::string& line) {
-                {
-                    std::lock_guard lk(sink_state->mu);
-                    sink_state->queue.push_back(line);
-                }
-                sink_state->cv.notify_one();
-            });
-
-        EventBus* bus = &cs->event_bus;
-
-        res.set_content_provider(
-            "text/event-stream",
-            [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                return sse_content_provider(sink_state, offset, sink);
-            },
-            [sink_state, bus](bool success) {
-                sse_resource_release(sink_state, *bus, success);
-            }
-        );
-    });
-}
-
-void ServerImpl::setup_api_endpoints() {
-    web_server_->Post("/api/chargen/start",
-        [this](const httplib::Request&, httplib::Response& res) {
-            start_chargen();
-            res.set_content("{\"status\":\"started\"}", "application/json");
-        });
-
-    web_server_->Post("/api/chargen/stop",
-        [this](const httplib::Request&, httplib::Response& res) {
-            stop_chargen();
-            res.set_content("{\"status\":\"stopped\"}", "application/json");
-        });
-
-    web_server_->Get("/api/chargen/status",
-        [this](const httplib::Request&, httplib::Response& res) {
-            std::lock_guard lock(chargen_state_->mu);
-            std::string status = chargen_state_->running ? "running" : "stopped";
-            res.set_content("{\"status\":\"" + status + "\"}", "application/json");
-        });
-}
-
-// -- Local chargen simulation -------------------------------------------------
-// In a full implementation, this would dispatch a CommandRequest to a connected
-// agent via the ExecuteCommand gRPC stream.  For now, we run the RFC 864
-// generator directly on the server to demonstrate the full pipeline.
-
-void ServerImpl::start_chargen() {
-    std::lock_guard lock(chargen_state_->mu);
-    if (chargen_state_->running) {
-        spdlog::info("Chargen already running");
-        return;
-    }
-    chargen_state_->running = true;
-    spdlog::info("Chargen started");
-
-    chargen_thread_ = std::thread([this] {
-        constexpr int kFirstChar  = 32;
-        constexpr int kLastChar   = 126;
-        constexpr int kCharRange  = kLastChar - kFirstChar + 1;
-        constexpr int kLineLength = 72;
-
-        int offset = 0;
-
-        while (true) {
-            {
-                std::lock_guard lk(chargen_state_->mu);
-                if (!chargen_state_->running) break;
-            }
-
-            // Generate one RFC 864 line
-            std::string line;
-            line.reserve(kLineLength);
-            for (int i = 0; i < kLineLength; ++i) {
-                line.push_back(
-                    static_cast<char>(kFirstChar + ((offset + i) % kCharRange)));
-            }
-            offset = (offset + 1) % kCharRange;
-
-            // Log to file
-            if (chargen_state_->file_logger) {
-                chargen_state_->file_logger->info("{}", line);
-            }
-
-            // Broadcast to SSE clients
-            chargen_state_->event_bus.publish(line);
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        spdlog::info("Chargen thread exited");
-    });
-}
-
-void ServerImpl::stop_chargen() {
-    {
-        std::lock_guard lock(chargen_state_->mu);
-        if (!chargen_state_->running) return;
-        chargen_state_->running = false;
-    }
-    if (chargen_thread_.joinable()) {
-        chargen_thread_.join();
-    }
-    spdlog::info("Chargen stopped");
-}
 
 // -- Factory ------------------------------------------------------------------
 
