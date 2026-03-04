@@ -22,6 +22,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Defined in chargen_ui.cpp (separate TU to isolate MSVC raw-string issues).
+extern const char* const kChargenIndexHtml;
+
 namespace yuzu::server {
 
 namespace {
@@ -117,11 +120,6 @@ public:
 };
 
 }  // anonymous namespace
-
-// Extern HTML declaration — definition lives in chargen_ui.cpp (separate TU
-// to work around MSVC raw-string brace-matching bug).
-#include "chargen_ui.hpp"
-using detail::kIndexHtml;
 
 // ── ServerImpl ───────────────────────────────────────────────────────────────
 
@@ -251,7 +249,7 @@ private:
 
         // Serve the HTMX page
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kIndexHtml, "text/html; charset=utf-8");
+            res.set_content(kChargenIndexHtml, "text/html; charset=utf-8");
         });
 
         // SSE endpoint — clients connect here for live chargen output

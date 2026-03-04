@@ -1,11 +1,8 @@
-// Chargen web UI HTML — compiled in its own translation unit to work around
-// an MSVC bug where long raw string literals containing braces confuse the
-// preprocessor's brace-matching in surrounding code.
-
-namespace yuzu::server::detail {
+// Chargen web UI HTML — compiled in its own translation unit to isolate
+// the long raw string literal from MSVC's brace-matching in server.cpp.
 
 // NOLINTBEGIN(cert-err58-cpp)
-const char* const kIndexHtml = R"HTM(<!DOCTYPE html>
+const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -167,5 +164,3 @@ const char* const kIndexHtml = R"HTM(<!DOCTYPE html>
 </html>
 )HTM";
 // NOLINTEND(cert-err58-cpp)
-
-}  // namespace yuzu::server::detail
