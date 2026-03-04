@@ -285,8 +285,11 @@ constexpr const char* kIndexHtml = R"html(<!DOCTYPE html>
 
 class ServerImpl final : public Server {
 public:
-    explicit ServerImpl(Config cfg) : cfg_{std::move(cfg)} {
-        chargen_state_ = std::make_shared<ChargenState>();
+    explicit ServerImpl(Config cfg)
+    : cfg_{std::move(cfg)},
+      chargen_state_{std::make_shared<ChargenState>()},
+      agent_service_{chargen_state_}   // now safe — chargen_state_ already init'd
+    {
         setup_chargen_logger();
     }
 
