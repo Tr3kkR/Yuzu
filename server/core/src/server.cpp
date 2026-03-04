@@ -173,6 +173,8 @@ public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
 
+}  // anonymous namespace
+
 // -- ServerImpl ---------------------------------------------------------------
 
 class ServerImpl final : public Server {
@@ -453,8 +455,6 @@ void ServerImpl::stop_chargen() {
     }
     spdlog::info("Chargen stopped");
 }
-
-}  // anonymous namespace
 
 // -- Factory ------------------------------------------------------------------
 
