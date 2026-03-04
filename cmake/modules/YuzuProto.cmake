@@ -12,6 +12,7 @@ function(yuzu_proto_library)
   find_program(PROTOC_EXE       protoc        REQUIRED)
   find_program(GRPC_CPP_PLUGIN  grpc_cpp_plugin REQUIRED)
 
+  set(PROTO_IMPORT_DIR "${CMAKE_SOURCE_DIR}/proto")
   set(PROTO_OUT "${CMAKE_BINARY_DIR}/generated/proto")
   file(MAKE_DIRECTORY "${PROTO_OUT}")
 
@@ -19,13 +20,19 @@ function(yuzu_proto_library)
   set(GENERATED_HDRS "")
 
   foreach(PROTO_FILE IN LISTS ARG_PROTOS)
-    get_filename_component(PROTO_NAME_WE "${PROTO_FILE}" NAME_WE)
-    get_filename_component(PROTO_DIR    "${PROTO_FILE}" DIRECTORY)
+    # Compute the path relative to the import dir so output structure matches.
+    # e.g. proto/yuzu/agent/v1/agent.proto → yuzu/agent/v1/agent
+    file(RELATIVE_PATH PROTO_REL "${PROTO_IMPORT_DIR}" "${PROTO_FILE}")
+    get_filename_component(PROTO_REL_DIR "${PROTO_REL}" DIRECTORY)
+    get_filename_component(PROTO_NAME_WE "${PROTO_REL}" NAME_WE)
 
-    set(PB_H     "${PROTO_OUT}/${PROTO_NAME_WE}.pb.h")
-    set(PB_CC    "${PROTO_OUT}/${PROTO_NAME_WE}.pb.cc")
-    set(GRPC_H   "${PROTO_OUT}/${PROTO_NAME_WE}.grpc.pb.h")
-    set(GRPC_CC  "${PROTO_OUT}/${PROTO_NAME_WE}.grpc.pb.cc")
+    set(OUT_DIR "${PROTO_OUT}/${PROTO_REL_DIR}")
+    file(MAKE_DIRECTORY "${OUT_DIR}")
+
+    set(PB_H     "${OUT_DIR}/${PROTO_NAME_WE}.pb.h")
+    set(PB_CC    "${OUT_DIR}/${PROTO_NAME_WE}.pb.cc")
+    set(GRPC_H   "${OUT_DIR}/${PROTO_NAME_WE}.grpc.pb.h")
+    set(GRPC_CC  "${OUT_DIR}/${PROTO_NAME_WE}.grpc.pb.cc")
 
     add_custom_command(
       OUTPUT  "${PB_H}" "${PB_CC}" "${GRPC_H}" "${GRPC_CC}"
@@ -33,7 +40,7 @@ function(yuzu_proto_library)
         --cpp_out="${PROTO_OUT}"
         --grpc_out="${PROTO_OUT}"
         --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN}"
-        -I "${CMAKE_SOURCE_DIR}/proto"
+        -I "${PROTO_IMPORT_DIR}"
         "${PROTO_FILE}"
       DEPENDS "${PROTO_FILE}"
       COMMENT "Generating protobuf/gRPC for ${PROTO_FILE}"
