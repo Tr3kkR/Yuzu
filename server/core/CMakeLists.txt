@@ -13,6 +13,7 @@ target_link_libraries(yuzu_server_core
     yuzu_proto
     gRPC::grpc++
     spdlog::spdlog
+    httplib::httplib
 )
 
 yuzu_set_compiler_flags(yuzu_server_core)

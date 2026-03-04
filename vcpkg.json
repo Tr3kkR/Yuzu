@@ -29,7 +29,8 @@
     {
       "name": "catch2",
       "platform": "!(arm & !x64)"
-    }
+    },
+    "cpp-httplib"
   ],
   "overrides": []
 }

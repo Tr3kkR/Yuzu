@@ -10,6 +10,8 @@ namespace yuzu::server {
 struct Config {
     std::string           listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string           management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
+    std::string           web_address{"0.0.0.0"};              // HTMX web UI bind address
+    int                   web_port{8080};                       // HTMX web UI port
 
     bool                  tls_enabled{true};
     std::filesystem::path tls_server_cert;   // PEM server certificate

@@ -31,6 +31,7 @@ add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
+httplib_dep     = dependency('cpp-httplib',   required: true)
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
 subdir('proto')
@@ -43,6 +44,7 @@ if build_agent
   subdir('agents/core')
   if build_examples
     subdir('agents/plugins/example')
+    subdir('agents/plugins/chargen')
   endif
 endif
 
