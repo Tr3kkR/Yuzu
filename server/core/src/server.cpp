@@ -27,7 +27,7 @@ extern const char* const kChargenIndexHtml;
 
 namespace yuzu::server {
 
-namespace {
+namespace detail {
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -173,7 +173,7 @@ public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
 
-}  // anonymous namespace
+}  // namespace detail
 
 // -- ServerImpl ---------------------------------------------------------------
 
@@ -300,7 +300,7 @@ ServerImpl::build_server_credentials() const {
 }
 
 void ServerImpl::setup_chargen_logger() {
-    auto log_path = chargen_log_path();
+    auto log_path = detail::chargen_log_path();
     auto parent = log_path.parent_path();
     if (!parent.empty()) {
         std::error_code ec;
@@ -347,7 +347,7 @@ void ServerImpl::setup_sse_endpoint() {
         res.set_header("Cache-Control", "no-cache");
         res.set_header("X-Accel-Buffering", "no");
 
-        auto sink_state = std::make_shared<SseSinkState>();
+        auto sink_state = std::make_shared<detail::SseSinkState>();
 
         sink_state->sub_id = cs->event_bus.subscribe(
             [sink_state](const std::string& line) {
@@ -358,15 +358,15 @@ void ServerImpl::setup_sse_endpoint() {
                 sink_state->cv.notify_one();
             });
 
-        EventBus* bus = &cs->event_bus;
+        detail::EventBus* bus = &cs->event_bus;
 
         res.set_content_provider(
             "text/event-stream",
             [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                return sse_content_provider(sink_state, offset, sink);
+                return detail::sse_content_provider(sink_state, offset, sink);
             },
             [sink_state, bus](bool success) {
-                sse_resource_release(sink_state, *bus, success);
+                detail::sse_resource_release(sink_state, *bus, success);
             }
         );
     });
