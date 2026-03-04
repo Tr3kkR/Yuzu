@@ -46,6 +46,7 @@ find_package(absl        CONFIG REQUIRED)
 find_package(spdlog      CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CLI11       CONFIG REQUIRED)
+find_package(httplib     CONFIG REQUIRED)
 
 # ── Protobuf / gRPC code generation ──────────────────────────────────────────
 add_subdirectory(proto)
@@ -60,6 +61,7 @@ if(YUZU_BUILD_AGENT)
   add_subdirectory(agents/core)
   if(YUZU_BUILD_EXAMPLES)
     add_subdirectory(agents/plugins/example)
+    add_subdirectory(agents/plugins/chargen)
   endif()
 endif()
 
