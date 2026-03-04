@@ -27,6 +27,10 @@ int main(int argc, char* argv[]) {
        ->default_val("0.0.0.0:50051");
     app.add_option("--management", cfg.management_address, "Management gRPC address (host:port)")
        ->default_val("0.0.0.0:50052");
+    app.add_option("--web-address", cfg.web_address,      "Web UI bind address")
+       ->default_val("0.0.0.0");
+    app.add_option("--web-port",    cfg.web_port,          "Web UI port")
+       ->default_val(8080);
     app.add_flag  ("--no-tls",    "Disable TLS (insecure, for development only)")
        ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--cert",       cfg.tls_server_cert,    "PEM server certificate");

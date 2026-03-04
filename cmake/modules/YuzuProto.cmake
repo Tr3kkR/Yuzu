@@ -12,6 +12,7 @@ function(yuzu_proto_library)
   find_program(PROTOC_EXE       protoc        REQUIRED)
   find_program(GRPC_CPP_PLUGIN  grpc_cpp_plugin REQUIRED)
 
+  set(PROTO_IMPORT_DIR "${CMAKE_SOURCE_DIR}/proto")
   set(PROTO_OUT "${CMAKE_BINARY_DIR}/generated/proto")
   file(MAKE_DIRECTORY "${PROTO_OUT}")
 
@@ -36,7 +37,7 @@ function(yuzu_proto_library)
         --cpp_out="${PROTO_OUT}"
         --grpc_out="${PROTO_OUT}"
         --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN}"
-        -I "${CMAKE_SOURCE_DIR}/proto"
+        -I "${PROTO_IMPORT_DIR}"
         "${PROTO_FILE}"
       DEPENDS "${PROTO_FILE}"
       COMMENT "Generating protobuf/gRPC for ${PROTO_FILE}"
