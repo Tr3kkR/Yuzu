@@ -181,7 +181,7 @@ class ServerImpl final : public Server {
 public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
-          chargen_state_(std::make_shared<detail::ChargenState>()),
+          chargen_state_(std::make_shared<ChargenState>()),
           agent_service_(chargen_state_)
     {
         setup_chargen_logger();
@@ -202,9 +202,9 @@ private:
     void stop_chargen();
 
     Config                            cfg_;
-    std::shared_ptr<detail::ChargenState> chargen_state_;
-    detail::AgentServiceImpl             agent_service_;
-    detail::ManagementServiceImpl        mgmt_service_;
+    std::shared_ptr<ChargenState> chargen_state_;
+    AgentServiceImpl             agent_service_;
+    ManagementServiceImpl        mgmt_service_;
     std::unique_ptr<grpc::Server>     agent_server_;
     std::unique_ptr<grpc::Server>     mgmt_server_;
     std::unique_ptr<httplib::Server>  web_server_;
