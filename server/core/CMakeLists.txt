@@ -2,6 +2,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/modules/CompilerFlags.cmake)
 
 add_library(yuzu_server_core STATIC
   src/server.cpp
+  src/chargen_ui.cpp
 )
 add_library(yuzu::server_core ALIAS yuzu_server_core)
 

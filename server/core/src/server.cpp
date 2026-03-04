@@ -116,12 +116,12 @@ public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
 
-// Embedded HTML for the chargen web UI — kept in a separate header to work
-// around an MSVC preprocessing bug with long raw string literals.
+}  // anonymous namespace
+
+// Extern HTML declaration — definition lives in chargen_ui.cpp (separate TU
+// to work around MSVC raw-string brace-matching bug).
 #include "chargen_ui.hpp"
 using detail::kIndexHtml;
-
-}  // anonymous namespace
 
 // ── ServerImpl ───────────────────────────────────────────────────────────────
 
