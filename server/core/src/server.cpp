@@ -181,7 +181,8 @@ class ServerImpl final : public Server {
 public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
-          chargen_state_(std::make_shared<detail::ChargenState>())
+          chargen_state_(std::make_shared<detail::ChargenState>()),
+          agent_service_(chargen_state_)
     {
     explicit ServerImpl(Config cfg)
     : cfg_{std::move(cfg)},
@@ -207,7 +208,7 @@ private:
 
     Config                            cfg_;
     std::shared_ptr<detail::ChargenState> chargen_state_;
-    detail::AgentServiceImpl             agent_service_{chargen_state_};
+    detail::AgentServiceImpl             agent_service_;
     detail::ManagementServiceImpl        mgmt_service_;
     std::unique_ptr<grpc::Server>     agent_server_;
     std::unique_ptr<grpc::Server>     mgmt_server_;
