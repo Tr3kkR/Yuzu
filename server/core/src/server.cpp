@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -285,21 +286,28 @@ constexpr const char* kIndexHtml = R"html(<!DOCTYPE html>
 
 class ServerImpl final : public Server {
 public:
-    explicit ServerImpl(Config cfg) : cfg_{std::move(cfg)} {
-        chargen_state_ = std::make_shared<ChargenState>();
+    explicit ServerImpl(Config cfg)
+        : cfg_{std::move(cfg)},
+          chargen_state_{std::make_shared<ChargenState>()}
+    {
         setup_chargen_logger();
     }
 
     void run() override {
         grpc::EnableDefaultHealthCheckService(true);
 
+        auto agent_creds = grpc::InsecureServerCredentials();
+        if (cfg_.tls_enabled) {
+            auto tls = build_server_credentials();
+            if (tls) {
+                agent_creds = std::move(tls);
+            } else {
+                spdlog::warn("TLS enabled but cert/key not provided — falling back to insecure");
+            }
+        }
+
         grpc::ServerBuilder agent_builder;
-        agent_builder.AddListeningPort(
-            cfg_.listen_address,
-            cfg_.tls_enabled
-                ? build_server_credentials()
-                : grpc::InsecureServerCredentials()
-        );
+        agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
         // agent_builder.RegisterService(&agent_service_);
 
         grpc::ServerBuilder mgmt_builder;
@@ -341,7 +349,36 @@ public:
 
 private:
     [[nodiscard]] std::shared_ptr<grpc::ServerCredentials> build_server_credentials() const {
+        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+            return nullptr;
+        }
+
+        auto read_file = [](const std::filesystem::path& p) -> std::string {
+            std::ifstream f(p, std::ios::binary);
+            if (!f) return {};
+            return {std::istreambuf_iterator<char>(f),
+                    std::istreambuf_iterator<char>()};
+        };
+
+        auto cert = read_file(cfg_.tls_server_cert);
+        auto key  = read_file(cfg_.tls_server_key);
+        if (cert.empty() || key.empty()) {
+            spdlog::error("Failed to read TLS cert or key files");
+            return nullptr;
+        }
+
         grpc::SslServerCredentialsOptions ssl_opts;
+        ssl_opts.pem_key_cert_pairs.push_back({std::move(key), std::move(cert)});
+
+        if (!cfg_.tls_ca_cert.empty()) {
+            auto ca = read_file(cfg_.tls_ca_cert);
+            if (!ca.empty()) {
+                ssl_opts.pem_root_certs = std::move(ca);
+                ssl_opts.client_certificate_request =
+                    GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+            }
+        }
+
         return grpc::SslServerCredentials(ssl_opts);
     }
 

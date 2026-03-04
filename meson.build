@@ -31,7 +31,7 @@ add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
-httplib_dep     = dependency('cpp-httplib',   required: true)
+httplib_dep     = dependency('httplib', method: 'cmake', modules: ['httplib::httplib'], required: true)
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
 subdir('proto')
