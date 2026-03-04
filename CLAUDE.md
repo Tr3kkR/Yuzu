@@ -1,479 +1,99 @@
-# CLAUDE.md — Yuzu Codebase Guide
+# Yuzu — Claude Code Guide
 
-This file provides context for AI assistants (Claude Code and similar tools) working on the Yuzu codebase.
+Multi-platform agent and server framework for real-time endpoint management. C++23, gRPC/Protobuf, vcpkg, CMake 3.28+.
 
----
+## Build
 
-## Project Overview
+### Prerequisites
+- CMake 3.28+, Ninja
+- C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
+- vcpkg (set `VCPKG_ROOT` or pass `CMAKE_TOOLCHAIN_FILE` manually)
 
-**Yuzu** is a multi-platform agent–server framework written in **C++23**. It enables real-time endpoint management via gRPC bidirectional streaming, with a language-agnostic plugin architecture built on a stable C ABI.
-
-- **Language:** C++23 (`std::expected`, ranges, structured bindings)
-- **Transport:** gRPC + Protocol Buffers with TLS built-in
-- **Platforms:** Windows (x64), Linux (x64/ARM64), macOS (ARM64)
-- **Version:** 0.1.0 — Initial Scaffold
-- **License:** Apache 2.0
-
----
-
-## Repository Layout
-
-```
-Yuzu/
-├── agents/
-│   ├── core/                       # Agent daemon (yuzu-agent binary)
-│   │   ├── include/yuzu/agent/
-│   │   │   ├── agent.hpp           # Agent class + Config
-│   │   │   └── plugin_loader.hpp
-│   │   ├── src/
-│   │   │   ├── agent.cpp
-│   │   │   ├── plugin_loader.cpp
-│   │   │   └── main.cpp            # CLI entry point (CLI11)
-│   │   ├── CMakeLists.txt
-│   │   └── meson.build
-│   └── plugins/
-│       └── example/                # Reference plugin implementation
-│           ├── src/example_plugin.cpp
-│           ├── CMakeLists.txt
-│           └── meson.build
-├── cmake/
-│   ├── modules/
-│   │   ├── CompilerFlags.cmake     # yuzu_set_compiler_flags() helper
-│   │   └── YuzuProto.cmake         # yuzu_proto_library() helper
-│   └── toolchains/
-│       └── aarch64-linux-gnu.cmake # ARM64 cross-compile toolchain
-├── proto/
-│   └── yuzu/
-│       ├── agent/v1/agent.proto    # AgentService (Register, Heartbeat, ExecuteCommand…)
-│       ├── common/v1/common.proto  # Shared types (Platform, PluginInfo, ErrorDetail…)
-│       └── server/v1/management.proto  # ManagementService (ListAgents, SendCommand…)
-│   ├── CMakeLists.txt
-│   └── meson.build
-├── sdk/
-│   └── include/yuzu/
-│       ├── plugin.h                # C ABI — stable binary interface for plugins
-│       ├── plugin.hpp              # C++ CRTP wrapper (yuzu::Plugin, yuzu::Result<T>)
-│       └── version.hpp             # Version constants (kVersionMajor, kVersionString…)
-│   ├── CMakeLists.txt
-│   └── meson.build
-├── server/
-│   ├── core/                       # Server daemon (yuzu-server binary)
-│   │   ├── include/yuzu/server/
-│   │   ├── src/
-│   │   │   ├── server.cpp
-│   │   │   └── main.cpp
-│   │   ├── CMakeLists.txt
-│   │   └── meson.build
-│   └── gateway/                    # gRPC gateway (placeholder, TBD)
-│       ├── CMakeLists.txt
-│       └── meson.build             # placeholder only
-├── tests/
-│   └── unit/
-│       └── test_plugin_loader.cpp  # Catch2 unit tests
-│   ├── CMakeLists.txt
-│   └── meson.build
-├── CMakeLists.txt                  # Primary build system (root)
-├── CMakePresets.json               # Preset configs for all platforms (version 6)
-├── meson.build                     # Root Meson build (alternative to CMake)
-├── meson.options                   # Meson option definitions
-├── vcpkg.json                      # Dependency manifest (pinned baseline)
-├── vcpkg-configuration.json
-├── .github/workflows/ci.yml        # GitHub Actions CI (4 platforms × 2 build types)
-└── README.md
-```
-
----
-
-## Build System
-
-The project supports both **CMake** (primary) and **Meson** (alternative). CMake uses **vcpkg** in manifest mode; Meson resolves dependencies via `pkg-config` / system packages.
-
-### Requirements
-
-| Tool | Minimum Version |
-|------|----------------|
-| CMake | 3.28 |
-| Meson | 1.3 |
-| Ninja | any recent |
-| GCC | 13+ |
-| Clang | 17+ |
-| MSVC | 19.38+ (VS 2022) |
-| vcpkg | any (baseline pinned) |
-
-### CMake — Recommended
-
+### Configure and build (CMake presets — preferred)
 ```bash
-# Configure with a preset (Ninja generator, vcpkg auto-wired)
-cmake --preset linux-debug          # Debug, x64-linux
-cmake --preset linux-release        # Release, x64-linux, LTO ON
-cmake --preset windows-debug        # MSVC, x64-windows, MultiThreadedDebugDLL
-cmake --preset windows-release      # MSVC, x64-windows, MultiThreadedDLL, LTO ON
-cmake --preset macos-debug          # Apple Clang, arm64-osx
-cmake --preset macos-release        # arm64-osx, LTO ON
-cmake --preset arm64-linux-debug    # Cross-compile aarch64-linux-gnu
-cmake --preset arm64-linux-release  # arm64-linux, LTO ON
+cmake --preset linux-debug          # configure
+cmake --build --preset linux-debug  # build
+ctest --preset linux-debug          # test
+```
 
-# Build
-cmake --build --preset linux-debug
+Available presets: `linux-debug`, `linux-release`, `windows-debug`, `windows-release`, `macos-debug`, `macos-release`, `arm64-linux-debug`, `arm64-linux-release`.
 
-# Manual configure (vcpkg path must be set)
-cmake -B build \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
+### Manual configure (no VCPKG_ROOT)
+```bash
+cmake -B build -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake \
   -DVCPKG_TARGET_TRIPLET=x64-linux \
+  -DCMAKE_BUILD_TYPE=Debug \
   -DYUZU_BUILD_TESTS=ON
-
 cmake --build build --parallel $(nproc)
 ```
 
-#### CMake Build Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `YUZU_BUILD_AGENT` | ON | Build yuzu-agent daemon |
-| `YUZU_BUILD_SERVER` | ON | Build yuzu-server daemon |
-| `YUZU_BUILD_SDK` | ON | Build and install the public SDK |
-| `YUZU_BUILD_TESTS` | OFF | Enable Catch2 unit tests |
-| `YUZU_BUILD_EXAMPLES` | ON | Build example plugins (only when `YUZU_BUILD_AGENT=ON`) |
-| `YUZU_ENABLE_LTO` | OFF | Link-time optimization (auto-ON in all release presets) |
+### Build options
+| Option | Default | Notes |
+|---|---|---|
+| `YUZU_BUILD_AGENT` | ON | Agent daemon |
+| `YUZU_BUILD_SERVER` | ON | Server daemon |
+| `YUZU_BUILD_SDK` | ON | SDK headers + static helper lib |
+| `YUZU_BUILD_TESTS` | OFF | Catch2 test suite |
+| `YUZU_BUILD_EXAMPLES` | ON | Example plugin |
+| `YUZU_ENABLE_LTO` | OFF | Link-time optimisation (ON in Release presets) |
 | `YUZU_ENABLE_ASAN` | OFF | AddressSanitizer + UBSan |
 | `YUZU_ENABLE_TSAN` | OFF | ThreadSanitizer |
 
-#### CMake Compiler Flags (`cmake/modules/CompilerFlags.cmake`)
-
-Applied per-target via `yuzu_set_compiler_flags(<target>)`. **Always call this on new targets.**
-
-| Compiler | Flags |
-|----------|-------|
-| MSVC | `/W4 /WX- /permissive- /Zc:__cplusplus /utf-8 /wd4100 /wd4251` |
-| GCC / Clang | `-Wall -Wextra -Wpedantic -Wno-unused-parameter -fvisibility=hidden` |
-| Clang only | `-Wno-gnu-zero-variadic-macro-arguments` |
-
-Sanitizer flags are appended when `YUZU_ENABLE_ASAN` or `YUZU_ENABLE_TSAN` are ON (GCC/Clang only). LTO is enabled via `INTERPROCEDURAL_OPTIMIZATION`.
-
-#### Proto Code Generation (`cmake/modules/YuzuProto.cmake`)
-
-```cmake
-yuzu_proto_library(
-  NAME   yuzu_proto
-  PROTOS ${PROTO_FILES}   # globbed via GLOB_RECURSE from proto/**/*.proto
-)
-```
-
-- Finds `protoc` and `grpc_cpp_plugin` programs.
-- Generates `*.pb.{h,cc}` and `*.grpc.pb.{h,cc}` into `${CMAKE_BINARY_DIR}/generated/proto/`.
-- Produces a static library `yuzu_proto` that other targets link against.
-- New `.proto` files placed under `proto/yuzu/` are picked up automatically by `GLOB_RECURSE` — no manual registration needed in CMake.
-- Include generated headers as `#include "<stem>.pb.h"` (the generated dir is on the include path).
-
-### Meson — Alternative
-
+## Test
 ```bash
-meson setup builddir -Dbuildtype=debug
-meson compile -C builddir
-
-# With options
-meson setup builddir \
-  -Dbuildtype=release \
-  -Dbuild_tests=true \
-  -Denable_lto=true
-
-meson test -C builddir
-```
-
-#### Meson Options (`meson.options`)
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `build_agent` | `true` | Build the agent daemon |
-| `build_server` | `true` | Build the server daemon |
-| `build_examples` | `true` | Build example plugins |
-| `build_tests` | `false` | Build unit and integration tests |
-| `enable_lto` | `false` | Link-time optimisation |
-| `enable_asan` | `false` | AddressSanitizer |
-| `enable_tsan` | `false` | ThreadSanitizer |
-
-> **Note:** Meson has no `build_sdk` option — the SDK is always included as a header-only `declare_dependency()` in `sdk/meson.build`.
-
-#### Meson Project Defaults
-
-From `meson.build` `default_options`:
-
-```
-cpp_std=c++23, warning_level=3, werror=false,
-default_library=shared, b_pie=true
-```
-
-Shared libraries are the Meson default (unlike CMake which uses static for internal libs). PIE is enabled globally.
-
-#### Meson Dependency Names
-
-| `dependency()` name | Package |
-|---------------------|---------|
-| `grpc++` | gRPC C++ |
-| `protobuf` | Protocol Buffers |
-| `spdlog` | spdlog |
-| `nlohmann_json` | nlohmann-json |
-| `CLI11` | CLI11 |
-| `catch2-with-main` | Catch2 (tests only, in `tests/meson.build`) |
-
-#### Meson Proto Codegen (`proto/meson.build`)
-
-```meson
-proto_out_dir = meson.current_build_dir() / 'generated'
-
-custom_target(name + '_proto',
-  output: [name + '.pb.cc', name + '.pb.h',
-           name + '.grpc.pb.cc', name + '.grpc.pb.h'],
-  command: [protoc, '--cpp_out=' + proto_out_dir,
-            '--grpc_out=' + proto_out_dir,
-            '--plugin=protoc-gen-grpc=' + ..., '-I', proto_src_dir, '@INPUT@'],
-)
-```
-
-Outputs go to `<builddir>/proto/generated/`. The `yuzu_proto` static library wraps all generated sources and is exposed via `yuzu_proto_dep`. To add a new `.proto` file under Meson, add it to the `proto_files` list in `proto/meson.build`.
-
-#### Meson Target Summary
-
-| `meson.build` | Target | Type | Notes |
-|---------------|--------|------|-------|
-| `agents/core` | `yuzu_agent_core` | `static_library` | |
-| `agents/core` | `yuzu-agent` | `executable` | `install: true` |
-| `agents/plugins/example` | `example` | `shared_library` | `name_prefix: ''` → `example.so`/`.dll` |
-| `proto` | `yuzu_proto` | `static_library` | wraps generated sources |
-| `sdk` | *(header-only)* | `declare_dependency` | no compiled library |
-| `server/core` | `yuzu_server_core` | `static_library` | |
-| `server/core` | `yuzu-server` | `executable` | `install: true` |
-| `tests` | `yuzu_tests` | `executable` | registered via `test('unit tests', ...)` |
-
-Plugin install path (Meson): `get_option('libdir') / 'yuzu' / 'plugins'`
-(e.g., `/usr/lib/yuzu/plugins/example.so`)
-
-### Build Outputs
-
-| Artifact | CMake location | Meson location |
-|----------|---------------|----------------|
-| Binaries | `${build}/bin/` | `<builddir>/` |
-| Libraries | `${build}/lib/` | `<builddir>/` |
-| Generated protos | `${build}/generated/proto/` | `<builddir>/proto/generated/` |
-
-> **Generated files are in `.gitignore`** — `*.pb.h`, `*.pb.cc`, `*.grpc.pb.*` are never committed.
-
----
-
-## Running Tests
-
-```bash
-# CMake
-cmake -B build -DYUZU_BUILD_TESTS=ON ...
-cmake --build build
 ctest --test-dir build --output-on-failure -j $(nproc)
+```
+Tests require `-DYUZU_BUILD_TESTS=ON`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
 
-# Via preset (uses testPresets in CMakePresets.json)
-ctest --preset linux-debug
-
-# Meson
-meson setup builddir -Dbuild_tests=true
-meson test -C builddir
+## Project layout
+```
+agents/core/              Agent daemon (gRPC client, plugin loader)
+agents/plugins/example/   Reference plugin implementation
+server/core/              Server daemon (session management)
+server/gateway/           gRPC gateway / TLS termination (TBD)
+sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
+proto/                    Protobuf definitions (source of truth for wire protocol)
+  yuzu/agent/v1/          AgentService: Register, Heartbeat, ExecuteCommand
+  yuzu/common/v1/         Shared types: Platform, Timestamp, ErrorDetail
+  yuzu/server/v1/         Management API
+cmake/modules/
+  YuzuProto.cmake         yuzu_proto_library() — runs protoc + grpc_cpp_plugin
+  CompilerFlags.cmake     Warning flags, sanitizers, LTO helper
+cmake/toolchains/         aarch64-linux-gnu and armv7-linux-gnueabihf cross-compile files
+tests/unit/               Catch2 unit tests
 ```
 
-- Tests live in `tests/unit/test_plugin_loader.cpp` and use **Catch2 3.x**.
-- **CMake:** links `Catch2::Catch2WithMain`; tests discovered with `catch_discover_tests(yuzu_tests)`.
-- **Meson:** `dependency('catch2-with-main')` in `tests/meson.build`; registered with `test('unit tests', test_exe)`.
-- Both link against `yuzu_agent_core` and the SDK.
+## Protobuf / gRPC code generation
+`YuzuProto.cmake` provides `yuzu_proto_library(NAME <target> PROTOS <files>)`. It:
+1. Invokes `protoc` with `-I ${CMAKE_SOURCE_DIR}/proto`, preserving the package subdirectory in the output path (e.g. `yuzu/agent/v1/agent.pb.cc` under `build/generated/proto/`).
+2. Builds a static library linking `gRPC::grpc++` and `protobuf::libprotobuf`.
+3. Exposes `build/generated/proto/` as a PUBLIC include directory.
 
----
+**Important**: The `OUTPUT` paths in `add_custom_command` must mirror where protoc actually writes files (relative to the import root, not just the bare filename). This was a past bug — don't revert to `NAME_WE`.
 
-## Dependencies
+## vcpkg
+- Manifest: `vcpkg.json`. Pinned baseline: `c1f21baeaf7127c13ee141fe1bdaa49eed371c0c` (matches `vcpkgGitCommitId` in CI).
+- `builtin-baseline` is required because of the `version>=` constraint on abseil. Without it vcpkg resolves against HEAD.
+- OpenSSL is skipped on Windows (`"platform": "!windows"`) — gRPC uses the native Windows crypto stack.
+- `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
+- `schannel` is NOT a vcpkg port — don't add it. It's a Windows system library.
 
-Managed via `vcpkg.json` (manifest mode, baseline `a42af01b72c28a8e1d7b48107b3c26c8ac3aa0b6`).
+## CI matrix (`.github/workflows/ci.yml`)
+| Job | Runner | Compiler | Triplet |
+|---|---|---|---|
+| linux | ubuntu-24.04 | GCC 13, Clang 17 | x64-linux |
+| windows | windows-2022 | MSVC (VS 17 2022) | x64-windows |
+| macos | macos-14 (Apple Silicon) | Apple Clang | arm64-osx |
+| arm64-cross | ubuntu-24.04 | aarch64-linux-gnu gcc | arm64-linux |
 
-| Package | Platform | Purpose |
-|---------|----------|---------|
-| `grpc` + `codegen` feature | all | RPC framework + protoc plugin |
-| `protobuf` | all | Message serialization |
-| `abseil` ≥ 20240116 | all | Foundation lib (required by gRPC) |
-| `spdlog` | all | Structured logging |
-| `nlohmann-json` | all | JSON config parsing |
-| `cli11` | all | CLI argument parsing |
-| `openssl` | `!windows` | TLS / cryptography |
-| `schannel` | `windows` | Windows native TLS |
-| `catch2` | `!(arm & !x64)` | Unit testing (excluded on pure ARM) |
+vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
 
----
-
-## Code Conventions
-
-### Naming
-
-| Entity | Convention | Example |
-|--------|-----------|---------|
-| Namespaces | `snake_case` | `yuzu::agent`, `yuzu::server` |
-| Classes / Structs | `PascalCase` | `AgentImpl`, `PluginHandle`, `Config` |
-| Functions / Methods | `snake_case` | `create()`, `scan()`, `write_output()` |
-| Constants | `kCamelCase` | `kVersionString`, `kVersionMajor` |
-| Macros | `SCREAMING_SNAKE_CASE` | `YUZU_PLUGIN_EXPORT`, `YUZU_BUILD_AGENT` |
-| Private members | trailing `_` | `cfg_`, `descriptor_`, `handle_` |
-
-### C++ Style
-
-- **Standard:** C++23; use `std::expected`, ranges, structured bindings, `std::make_unique`.
-- **Error handling:** Prefer `std::expected<T, E>` (via `yuzu::Result<T>`) over exceptions.
-- **Attributes:** `[[nodiscard]]` on all query methods; `noexcept` on leaf functions.
-- **Ownership:** `std::unique_ptr`; no raw owning pointers.
-- **Const-correctness:** Strictly observed throughout.
-- **PIMPL:** Public headers expose an interface + `create()` factory; implementation lives in `*Impl` classes in `.cpp` files.
-- **Visibility:** `-fvisibility=hidden` (GCC/Clang); explicitly mark exported symbols.
-- **No broad imports:** Never `using namespace std;` or similar in headers.
-
-### Design Patterns
-
-- **Factory:** `Agent::create(cfg)`, `Server::create(cfg)`, `PluginHandle::load(path)`
-- **CRTP base:** `yuzu::Plugin<Derived>` for compile-time polymorphism in the C++ SDK wrapper
-- **RAII:** `PluginHandle` manages `dlopen`/`dlclose` lifecycle
-- **Stable C ABI:** All plugin entry points in `sdk/include/yuzu/plugin.h` — never reorder or remove fields in `YuzuPluginDescriptor`; only append
-
-### Logging
-
-Uses **spdlog**. Levels: `trace`, `debug`, `info`, `warn`, `error`.
-
-```
-[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v
-```
-
-### Proto / gRPC Conventions
-
-- All `.proto` files live under `proto/yuzu/<service>/v1/`.
-- Package names follow the directory: `yuzu.agent.v1`, `yuzu.common.v1`, `yuzu.server.v1`.
-- **Do not commit generated files.** They are in `.gitignore`.
-- **CMake:** `GLOB_RECURSE` auto-discovers new files in `proto/` — no manual registration needed.
-- **Meson:** Add new `.proto` files to the `proto_files` list in `proto/meson.build`.
-- Generated headers are included as `#include "<stem>.pb.h"` (no subdirectory prefix).
-
-### Plugin Development
-
-Plugins implement the C ABI in `sdk/include/yuzu/plugin.h`. Use the C++ CRTP wrapper:
-
-```cpp
-#include <yuzu/plugin.hpp>
-
-class MyPlugin : public yuzu::Plugin<MyPlugin> {
-public:
-    static constexpr auto name    = "my_plugin";
-    static constexpr auto version = "1.0.0";
-
-    yuzu::Result<void> execute(std::string_view action,
-                               const yuzu::Params& params,
-                               yuzu::CommandContext& ctx) {
-        if (action == "ping") {
-            ctx.write_output("pong");
-            return {};
-        }
-        return std::unexpected(yuzu::PluginError::UnknownAction);
-    }
-};
-
-YUZU_PLUGIN_EXPORT(MyPlugin)   // generates C export trampolines
-```
-
-Plugins are built as **shared libraries** with no `lib` prefix (Meson: `name_prefix: ''`). They are installed to `<libdir>/yuzu/plugins/`. See `agents/plugins/example/` for the full reference implementation.
-
----
-
-## Architecture Summary
-
-```
-┌──────────────────────────────────┐
-│         Yuzu Server              │
-│  ┌─────────┐  ┌──────────────┐  │
-│  │ Gateway │  │  AgentMgr    │  │
-│  │ (TBD)   │  │  (sessions)  │  │
-│  └─────────┘  └──────────────┘  │
-│        ↕ ManagementService       │
-└──────────────────────────────────┘
-         ↕ AgentService (gRPC TLS)
-┌──────────────────────────────────┐
-│         Yuzu Agent               │
-│  ┌────────────┐  ┌────────────┐  │
-│  │ PluginHost │  │ Plugin A   │  │
-│  │  (loader)  │  │ Plugin B   │  │
-│  └────────────┘  └────────────┘  │
-└──────────────────────────────────┘
-```
-
-- **AgentService** (`proto/yuzu/agent/v1/`) — bidirectional streaming: Register, Heartbeat, ExecuteCommand, Subscribe, ReportInventory
-- **ManagementService** (`proto/yuzu/server/v1/`) — operator API: ListAgents, GetAgent, SendCommand, WatchEvents, QueryInventory
-
----
-
-## CI/CD
-
-GitHub Actions (`.github/workflows/ci.yml`) triggers on:
-- Push to `main`, `feature/**`, `fix/**`
-- Pull requests targeting `main`
-
-Concurrency: cancels in-progress runs for the same workflow + ref.
-
-| Job | Runner | Compiler | Triplet | Tests run |
-|-----|--------|----------|---------|-----------|
-| `linux` | ubuntu-24.04 | GCC 13 or Clang 17 | x64-linux | yes |
-| `windows` | windows-2022 | MSVC (VS 17 2022) | x64-windows | yes |
-| `macos` | macos-14 | Apple Clang | arm64-osx | yes |
-| `arm64-cross` | ubuntu-24.04 | aarch64-linux-gnu | arm64-linux | **no** (build only) |
-
-All jobs:
-- Use `lukka/run-vcpkg@v11` with the pinned baseline commit
-- Enable vcpkg binary caching (`VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"`)
-- Build Debug and Release (`fail-fast: false`)
-- Run `YUZU_BUILD_TESTS=ON` (except ARM64 cross-compile)
-- Windows uses `"Visual Studio 17 2022" -A x64` generator (not Ninja)
-
----
-
-## Common Tasks
-
-### Add a new source file to the agent
-
-1. Place the file in `agents/core/src/` (or `include/yuzu/agent/` for headers).
-2. **CMake:** Add to `target_sources(yuzu_agent_core ...)` in `agents/core/CMakeLists.txt`. Call `yuzu_set_compiler_flags(yuzu_agent_core)` if not already present.
-3. **Meson:** Add to the `files(...)` list in `agents/core/meson.build`.
-
-### Add a new proto message or service
-
-1. Create/edit the `.proto` file under `proto/yuzu/<service>/v1/`.
-2. **CMake:** `GLOB_RECURSE` picks it up automatically — no change needed.
-3. **Meson:** Add the path to the `proto_files` list in `proto/meson.build`.
-4. Include generated headers as `#include "<stem>.pb.h"`.
-
-### Add a new test
-
-1. Add a `TEST_CASE` block in `tests/unit/` (new or existing `.cpp` file).
-2. If creating a new `.cpp` file:
-   - **CMake:** Add to `target_sources(yuzu_tests ...)` in `tests/CMakeLists.txt`.
-   - **Meson:** Add to `files(...)` in `tests/meson.build`.
-3. Run: `ctest --test-dir build -R <test_name> --output-on-failure`
-
-### Add a new plugin
-
-1. Create `agents/plugins/<name>/src/<name>_plugin.cpp` implementing `yuzu::Plugin<Derived>`.
-2. **CMake:** Create `agents/plugins/<name>/CMakeLists.txt` (model on `example`); add `add_subdirectory` under the `YUZU_BUILD_EXAMPLES` guard in root `CMakeLists.txt`.
-3. **Meson:** Create `agents/plugins/<name>/meson.build` (model on `agents/plugins/example/meson.build`); add `subdir(...)` under `build_examples` guard in root `meson.build`.
-
-### Add a new vcpkg dependency
-
-1. Add the package to `"dependencies"` in `vcpkg.json`.
-2. Re-run `cmake` to trigger vcpkg install.
-3. Add `find_package(...)` and `target_link_libraries(...)` in the relevant `CMakeLists.txt`.
-4. Add the `dependency(...)` call in the relevant `meson.build`.
-
----
-
-## What to Avoid
-
-- **Do not commit generated protobuf files.** They are regenerated at build time and listed in `.gitignore`.
-- **Do not break the C ABI.** `YuzuPluginDescriptor` and `YuzuCommandContext` in `sdk/include/yuzu/plugin.h` must remain binary-stable. Only append new fields — never reorder or remove existing ones.
-- **Do not throw exceptions across plugin boundaries.** Plugins are shared libraries; use `yuzu::Result<T>` / `std::expected` for all error propagation.
-- **Do not use raw owning pointers.** Use `std::unique_ptr` or `std::shared_ptr`.
-- **Do not use `using namespace std;`** or other broad namespace imports in headers.
-- **Do not skip `yuzu_set_compiler_flags()`** on new CMake targets — this applies `-fvisibility=hidden`, sanitizers, and LTO consistently.
+## Coding conventions
+- **C++ standard**: C++23 throughout. Use `std::expected<T, E>` for errors, `std::span`, `std::string_view`, `std::format`.
+- **Namespaces**: `yuzu::`, `yuzu::agent::`, `yuzu::server::`.
+- **Naming**: PascalCase classes, snake_case variables/functions, `k`-prefix constants, trailing `_` for private members.
+- **Headers**: `#pragma once` only. Include order: STL → third-party → project.
+- **Plugin ABI**: C API in `sdk/include/yuzu/plugin.h` must stay stable. C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary.
+- **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
+- **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
