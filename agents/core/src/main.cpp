@@ -1,3 +1,15 @@
+#ifdef _WIN32
+#  include <windows.h>
+#  include <cstdio>
+// Runs before ANY C++ static initializers — prints to stderr via Win32 API.
+#  pragma section(".CRT$XCA", read)
+static void __cdecl diag_before_static_init() {
+    const char msg[] = "[DIAG] CRT static-init starting (before C++ globals)\n";
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof(msg) - 1, nullptr, nullptr);
+}
+__declspec(allocate(".CRT$XCA")) static void (__cdecl *p_diag_init)() = diag_before_static_init;
+#endif
+
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/version.hpp>
 
@@ -19,6 +31,7 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char* argv[]) {
+    fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
     app.set_version_flag("--version", std::string{yuzu::kVersionString});
 
