@@ -177,12 +177,12 @@ public:
                                                                                \
     static const YuzuPluginDescriptor _yuzu_descriptor_{                       \
         .abi_version = YUZU_PLUGIN_ABI_VERSION,                                \
-        .name        = []() { return std::string{                              \
-                           _yuzu_plugin_instance_.name()}.c_str(); }(),        \
-        .version     = []() { return std::string{                              \
-                           _yuzu_plugin_instance_.version()}.c_str(); }(),     \
-        .description = []() { return std::string{                              \
-                           _yuzu_plugin_instance_.description()}.c_str(); }(), \
+        .name        = []() { static const std::string s{                      \
+                           _yuzu_plugin_instance_.name()}; return s.c_str(); }(),   \
+        .version     = []() { static const std::string s{                      \
+                           _yuzu_plugin_instance_.version()}; return s.c_str(); }(),\
+        .description = []() { static const std::string s{                      \
+                           _yuzu_plugin_instance_.description()}; return s.c_str(); }(), \
         .actions     = _yuzu_plugin_instance_.actions(),                       \
         .init        = _yuzu_init_,                                            \
         .shutdown    = _yuzu_shutdown_,                                        \
