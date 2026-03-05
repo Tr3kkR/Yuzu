@@ -1,11 +1,11 @@
 #ifdef _WIN32
 #  include <io.h>
-#  pragma section(".CRT$XCA", read)
+#  pragma section(".CRT$XCB", read)
 static void __cdecl diag_dll_static_init() {
     const char msg[] = "[DIAG] DLL static-init starting (before proto registration)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCA")) static void (__cdecl *p_dll_diag)() = diag_dll_static_init;
+__declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
