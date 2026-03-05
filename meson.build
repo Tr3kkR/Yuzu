@@ -17,6 +17,9 @@ project(
 cxx = meson.get_compiler('cpp')
 host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
+if host_machine.system() == 'windows'
+  add_project_arguments('/wd4251','/wd4127','/wd4275', language: 'cpp')
+endif
 
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')

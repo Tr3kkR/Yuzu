@@ -9,11 +9,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <fstream>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,19 +49,19 @@ public:
     using Listener = std::function<void(const std::string&)>;
 
     std::size_t subscribe(Listener fn) {
-        std::lock_guard lock(mu_);
+        std::lock_guard<std::mutex> lock(mu_);
         auto id = next_id_++;
         listeners_[id] = std::move(fn);
         return id;
     }
 
     void unsubscribe(std::size_t id) {
-        std::lock_guard lock(mu_);
+        std::lock_guard<std::mutex> lock(mu_);
         listeners_.erase(id);
     }
 
     void publish(const std::string& data) {
-        std::lock_guard lock(mu_);
+        std::lock_guard<std::mutex> lock(mu_);
         for (auto& [id, fn] : listeners_) {
             fn(data);
         }
@@ -100,7 +100,7 @@ bool sse_content_provider(
     size_t /*offset*/,
     httplib::DataSink& sink)
 {
-    std::unique_lock lk(state->mu);
+    std::unique_lock<std::mutex> lk(state->mu);
     state->cv.wait_for(lk, std::chrono::seconds(15), [&state] {
         return !state->queue.empty() || state->closed.load();
     });
@@ -182,20 +182,19 @@ std::string read_file_contents(const std::filesystem::path& p) {
                        std::istreambuf_iterator<char>());
 }
 
-}  // anonymous namespace
+}  // namespace detail
 
 // -- ServerImpl ---------------------------------------------------------------
-// All methods defined inline to avoid MSVC C4596 with out-of-line definitions.
 
 class ServerImpl final : public Server {
 public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
-          chargen_state_(std::make_shared<ChargenState>()),
+          chargen_state_(std::make_shared<detail::ChargenState>()),
           agent_service_(chargen_state_)
     {
         // Setup chargen file logger
-        auto log_path = chargen_log_path();
+        auto log_path = detail::chargen_log_path();
         auto parent = log_path.parent_path();
         if (!parent.empty()) {
             std::error_code ec;
@@ -217,23 +216,43 @@ public:
         }
     }
 
-    void run() override {
+   void run() override {
+        spdlog::info("run(): entering");
         grpc::EnableDefaultHealthCheckService(true);
+        spdlog::info("run(): health check enabled");
 
         auto agent_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
-            auto tls = build_tls_credentials();
-            if (tls) {
+            if (auto tls = build_tls_credentials()) {
                 agent_creds = std::move(tls);
             } else {
                 spdlog::warn("TLS enabled but cert/key not provided -- falling back to insecure");
             }
         }
+        spdlog::info("run(): credentials ready");
 
         grpc::ServerBuilder agent_builder;
         agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
+        spdlog::info("run(): agent port added");
 
         grpc::ServerBuilder mgmt_builder;
+        mgmt_builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
+        spdlog::info("run(): management port added");
+
+        agent_server_ = agent_builder.BuildAndStart();
+        spdlog::info("run(): agent server built: {}", agent_server_ ? "OK" : "FAILED");
+
+        try {
+            agent_server_ = agent_builder.BuildAndStart();
+            spdlog::info("run(): agent server built: {}", agent_server_ ? "OK" : "FAILED");
+        } catch (const std::exception& ex) {
+            spdlog::error("run(): agent server threw: {}", ex.what());
+            return;
+        } catch (...) {
+            spdlog::error("run(): agent server threw unknown exception");
+            return;
+        }
+
         mgmt_builder.AddListeningPort(
             cfg_.management_address,
             grpc::InsecureServerCredentials()
@@ -241,6 +260,12 @@ public:
 
         agent_server_ = agent_builder.BuildAndStart();
         mgmt_server_  = mgmt_builder.BuildAndStart();
+
+        if (!agent_server_ || !mgmt_server_) {
+            spdlog::error("Failed to start gRPC server(s) -- check that ports {} and {} are available",
+                cfg_.listen_address, cfg_.management_address);
+            return;
+        }
 
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
             cfg_.listen_address, cfg_.management_address);
@@ -274,18 +299,21 @@ private:
             return nullptr;
         }
 
-        auto cert = read_file_contents(cfg_.tls_server_cert);
-        auto key  = read_file_contents(cfg_.tls_server_key);
+        auto cert = detail::read_file_contents(cfg_.tls_server_cert);
+        auto key  = detail::read_file_contents(cfg_.tls_server_key);
         if (cert.empty() || key.empty()) {
             spdlog::error("Failed to read TLS cert or key files");
             return nullptr;
         }
 
         grpc::SslServerCredentialsOptions ssl_opts;
-        ssl_opts.pem_key_cert_pairs.push_back({std::move(key), std::move(cert)});
+        grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
+        pair.private_key = std::move(key);
+        pair.cert_chain  = std::move(cert);
+        ssl_opts.pem_key_cert_pairs.push_back(std::move(pair));
 
         if (!cfg_.tls_ca_cert.empty()) {
-            auto ca = read_file_contents(cfg_.tls_ca_cert);
+            auto ca = detail::read_file_contents(cfg_.tls_ca_cert);
             if (!ca.empty()) {
                 ssl_opts.pem_root_certs = std::move(ca);
                 ssl_opts.client_certificate_request =
@@ -312,24 +340,24 @@ private:
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
 
-            auto sink_state = std::make_shared<SseSinkState>();
+            auto sink_state = std::make_shared<detail::SseSinkState>();
             sink_state->sub_id = cs->event_bus.subscribe(
                 [sink_state](const std::string& line) {
                     {
-                        std::lock_guard lk(sink_state->mu);
+                        std::lock_guard<std::mutex> lk(sink_state->mu);
                         sink_state->queue.push_back(line);
                     }
                     sink_state->cv.notify_one();
                 });
 
-            EventBus* bus = &cs->event_bus;
+            detail::EventBus* bus = &cs->event_bus;
             res.set_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                    return sse_content_provider(sink_state, offset, sink);
+                    return detail::sse_content_provider(sink_state, offset, sink);
                 },
                 [sink_state, bus](bool success) {
-                    sse_resource_release(sink_state, *bus, success);
+                    detail::sse_resource_release(sink_state, *bus, success);
                 }
             );
         });
@@ -349,7 +377,7 @@ private:
 
         web_server_->Get("/api/chargen/status",
             [this](const httplib::Request&, httplib::Response& res) {
-                std::lock_guard lock(chargen_state_->mu);
+                std::lock_guard<std::mutex> lock(chargen_state_->mu);
                 std::string status = chargen_state_->running ? "running" : "stopped";
                 res.set_content("{\"status\":\"" + status + "\"}", "application/json");
             });
@@ -364,7 +392,7 @@ private:
     // -- Chargen --------------------------------------------------------------
 
     void start_chargen() {
-        std::lock_guard lock(chargen_state_->mu);
+        std::lock_guard<std::mutex> lock(chargen_state_->mu);
         if (chargen_state_->running) {
             spdlog::info("Chargen already running");
             return;
@@ -373,19 +401,19 @@ private:
         spdlog::info("Chargen started");
 
         chargen_thread_ = std::thread([this] {
-            constexpr int kFirstChar  = 32;
-            constexpr int kLastChar   = 126;
-            constexpr int kCharRange  = kLastChar - kFirstChar + 1;
-            constexpr int kLineLength = 72;
+            constexpr int kFirstChar = 32;
+            constexpr int kLastChar  = 126;
+            constexpr int kCharRange = kLastChar - kFirstChar + 1;
 
             int offset = 0;
 
             while (true) {
                 {
-                    std::lock_guard lk(chargen_state_->mu);
+                    std::lock_guard<std::mutex> lk(chargen_state_->mu);
                     if (!chargen_state_->running) break;
                 }
 
+                constexpr int kLineLength = 72;
                 std::string line;
                 line.reserve(kLineLength);
                 for (int i = 0; i < kLineLength; ++i) {
@@ -408,7 +436,7 @@ private:
 
     void stop_chargen() {
         {
-            std::lock_guard lock(chargen_state_->mu);
+            std::lock_guard<std::mutex> lock(chargen_state_->mu);
             if (!chargen_state_->running) return;
             chargen_state_->running = false;
         }
@@ -420,15 +448,15 @@ private:
 
     // -- Data members ---------------------------------------------------------
 
-    Config                            cfg_;
-    std::shared_ptr<ChargenState>     chargen_state_;
-    AgentServiceImpl                  agent_service_{chargen_state_};
-    ManagementServiceImpl             mgmt_service_;
-    std::unique_ptr<grpc::Server>     agent_server_;
-    std::unique_ptr<grpc::Server>     mgmt_server_;
-    std::unique_ptr<httplib::Server>  web_server_;
-    std::thread                       web_thread_;
-    std::thread                       chargen_thread_;
+    Config                                     cfg_;
+    std::shared_ptr<detail::ChargenState>      chargen_state_;
+    detail::AgentServiceImpl                   agent_service_;
+    detail::ManagementServiceImpl              mgmt_service_;
+    std::unique_ptr<grpc::Server>              agent_server_;
+    std::unique_ptr<grpc::Server>              mgmt_server_;
+    std::unique_ptr<httplib::Server>           web_server_;
+    std::thread                                web_thread_;
+    std::thread                                chargen_thread_;
 };
 
 // -- Factory ------------------------------------------------------------------

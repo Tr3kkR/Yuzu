@@ -2,7 +2,7 @@
 // the long raw string literal from MSVC's brace-matching in server.cpp.
 
 // NOLINTBEGIN(cert-err58-cpp)
-const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
+extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
