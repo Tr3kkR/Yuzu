@@ -12,7 +12,6 @@ target_link_libraries(yuzu_server_core
   PUBLIC
     yuzu::sdk
     yuzu_proto
-    gRPC::grpc++
     spdlog::spdlog
     httplib::httplib
 )

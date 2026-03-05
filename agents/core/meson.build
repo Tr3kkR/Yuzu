@@ -5,7 +5,7 @@ yuzu_agent_core_lib = shared_library(
     include_directories('include'),
     include_directories('../../sdk/include'),
   ],
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, grpcpp_dep, spdlog_dep],
+  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep],
   cpp_args: ['-DYUZU_AGENT_CORE_BUILDING'],
   install: true,
 )
@@ -25,6 +25,6 @@ executable(
     include_directories('include'),
     include_directories('../../sdk/include'),
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_proto_dep, grpcpp_dep, spdlog_dep, cli11_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_proto_dep, spdlog_dep, cli11_dep],
   install: true,
 )

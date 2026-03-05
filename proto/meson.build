@@ -1,6 +1,3 @@
-grpc_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'])
-protobuf_dep = dependency('Protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'])
-
 protoc = find_program('protoc', required: true)
 grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)
 
@@ -39,12 +36,12 @@ yuzu_proto_lib = static_library(
     gen_srcs,
     cpp_args: ['/wd4100','/wd4267','/wd4244','/wd4458','/wd4018','/wd4996'],
     include_directories: include_directories('.'),
-    dependencies: [grpc_dep, protobuf_dep],
+    dependencies: [grpcpp_dep],
 )
 
 yuzu_proto_dep = declare_dependency(
     link_with: yuzu_proto_lib,
     sources: gen_hdrs,
     include_directories: include_directories('.'),
-    dependencies: [grpc_dep, protobuf_dep],
+    dependencies: [grpcpp_dep],
 )

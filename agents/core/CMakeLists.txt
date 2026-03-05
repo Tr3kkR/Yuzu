@@ -16,7 +16,6 @@ target_link_libraries(yuzu_agent_core
   PUBLIC
     yuzu::sdk
     yuzu_proto
-    gRPC::grpc++
     spdlog::spdlog
 )
 
