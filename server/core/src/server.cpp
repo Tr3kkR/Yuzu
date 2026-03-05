@@ -206,6 +206,29 @@ public:
                     resp.command_id(),
                     static_cast<int>(resp.status()),
                     resp.exit_code());
+
+                // If a chargen command was rejected or failed, reset UI state
+                if (resp.command_id().starts_with("chargen") &&
+                    (resp.status() == pb::CommandResponse::REJECTED ||
+                     resp.status() == pb::CommandResponse::FAILURE)) {
+                    std::lock_guard lock(chargen_state_->mu);
+                    if (chargen_state_->running) {
+                        chargen_state_->running = false;
+                        chargen_state_->event_bus.publish("status", "stopped");
+                        chargen_state_->event_bus.publish("chargen",
+                            "error: agent rejected command \xe2\x80\x94 " + resp.output());
+                    }
+                }
+
+                // chargen_stop completed successfully — confirm state reset
+                if (resp.command_id().starts_with("chargen-stop") &&
+                    resp.status() == pb::CommandResponse::SUCCESS) {
+                    std::lock_guard lock(chargen_state_->mu);
+                    if (chargen_state_->running) {
+                        chargen_state_->running = false;
+                        chargen_state_->event_bus.publish("status", "stopped");
+                    }
+                }
             }
         }
 
