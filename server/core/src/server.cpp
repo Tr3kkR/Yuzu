@@ -139,7 +139,7 @@ void sse_resource_release(
 
 // -- AgentServiceImpl ---------------------------------------------------------
 
-class AgentServiceImpl /* : public yuzu::agent::v1::AgentService::Service */ {
+class AgentServiceImpl : public grpc::Service {
 public:
     explicit AgentServiceImpl(std::shared_ptr<ChargenState> cs)
         : chargen_state_(std::move(cs)) {}
@@ -168,7 +168,7 @@ private:
 
 // -- ManagementServiceImpl ----------------------------------------------------
 
-class ManagementServiceImpl /* : public yuzu::server::v1::ManagementService::Service */ {
+class ManagementServiceImpl : public grpc::Service {
 public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
@@ -232,6 +232,8 @@ public:
         grpc::ServerBuilder builder;
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
+        builder.RegisterService(&agent_service_);
+        builder.RegisterService(&mgmt_service_);
 
         agent_server_ = builder.BuildAndStart();
 
