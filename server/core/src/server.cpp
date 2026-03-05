@@ -2,6 +2,9 @@
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+
+#include "agent.grpc.pb.h"
+#include "management.grpc.pb.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -139,7 +142,7 @@ void sse_resource_release(
 
 // -- AgentServiceImpl ---------------------------------------------------------
 
-class AgentServiceImpl : public grpc::Service {
+class AgentServiceImpl : public yuzu::agent::v1::AgentService::Service {
 public:
     explicit AgentServiceImpl(std::shared_ptr<ChargenState> cs)
         : chargen_state_(std::move(cs)) {}
@@ -168,7 +171,7 @@ private:
 
 // -- ManagementServiceImpl ----------------------------------------------------
 
-class ManagementServiceImpl : public grpc::Service {
+class ManagementServiceImpl : public yuzu::server::v1::ManagementService::Service {
 public:
     // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
 };
