@@ -27,7 +27,7 @@ extern const char* const kChargenIndexHtml;
 
 namespace yuzu::server {
 
-namespace {
+namespace detail {
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -178,7 +178,8 @@ class ServerImpl final : public Server {
 public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
-          chargen_state_(std::make_shared<ChargenState>())
+          chargen_state_(std::make_shared<ChargenState>()),
+          agent_service_(chargen_state_)
     {
         // Setup chargen file logger
         auto log_path = chargen_log_path();

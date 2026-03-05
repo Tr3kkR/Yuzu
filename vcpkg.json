@@ -5,6 +5,7 @@
   "description": "Multi-platform agent and server framework",
   "homepage": "https://github.com/Tr3kkR/Yuzu",
   "license": "Apache-2.0",
+  "builtin-baseline": "c1f21baeaf7127c13ee141fe1bdaa49eed371c0c",
   "dependencies": [
     {
       "name": "grpc",
@@ -24,9 +25,8 @@
     },
     {
       "name": "catch2",
-      "platform": "!(arm & !x64)"
-    },
-    "cpp-httplib"
+      "platform": "x64 | arm64"
+    }
   ],
   "overrides": []
 }
