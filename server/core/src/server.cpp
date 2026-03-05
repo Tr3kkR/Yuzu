@@ -28,6 +28,9 @@
 // Defined in chargen_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kChargenIndexHtml;
 
+// Defined in procfetch_ui.cpp.
+extern const char* const kProcfetchIndexHtml;
+
 namespace yuzu::server {
 
 namespace detail {
@@ -96,6 +99,13 @@ struct ChargenState {
     EventBus                        event_bus;
 };
 
+// -- Procfetch state (shared between gRPC agent handler and web UI) -----------
+
+struct ProcfetchState {
+    std::mutex mu;
+    bool       fetching = false;
+};
+
 // -- SSE sink state (per-connection, shared with content provider) -------------
 
 struct SseSinkState {
@@ -154,8 +164,9 @@ void sse_resource_release(
 
 class AgentServiceImpl : public pb::AgentService::Service {
 public:
-    explicit AgentServiceImpl(std::shared_ptr<ChargenState> cs)
-        : chargen_state_(std::move(cs)) {}
+    AgentServiceImpl(std::shared_ptr<ChargenState> cs,
+                     std::shared_ptr<ProcfetchState> ps)
+        : chargen_state_(std::move(cs)), procfetch_state_(std::move(ps)) {}
 
     grpc::Status Register(
         grpc::ServerContext* /*context*/,
@@ -199,14 +210,34 @@ public:
         // Read loop — process responses from the agent
         pb::CommandResponse resp;
         while (stream->Read(&resp)) {
+            bool is_procfetch = resp.command_id().starts_with("procfetch");
+
             if (resp.status() == pb::CommandResponse::RUNNING) {
-                on_chargen_output(resp.output());
+                if (is_procfetch) {
+                    chargen_state_->event_bus.publish("procfetch", resp.output());
+                } else {
+                    on_chargen_output(resp.output());
+                }
             } else {
                 spdlog::info("Command {} completed: status={}, exit_code={}",
                     resp.command_id(),
                     static_cast<int>(resp.status()),
                     resp.exit_code());
 
+                // -- procfetch completion -----------------------------------------
+                if (is_procfetch) {
+                    if (resp.status() == pb::CommandResponse::SUCCESS) {
+                        std::lock_guard lock(procfetch_state_->mu);
+                        procfetch_state_->fetching = false;
+                        chargen_state_->event_bus.publish("procfetch-status", "done");
+                    } else {
+                        std::lock_guard lock(procfetch_state_->mu);
+                        procfetch_state_->fetching = false;
+                        chargen_state_->event_bus.publish("procfetch-status", "error");
+                    }
+                }
+
+                // -- chargen completion ------------------------------------------
                 // If a chargen command was rejected or failed, reset UI state
                 if (resp.command_id().starts_with("chargen") &&
                     (resp.status() == pb::CommandResponse::REJECTED ||
@@ -244,6 +275,13 @@ public:
                 chargen_state_->event_bus.publish("status", "stopped");
             }
         }
+        {
+            std::lock_guard lock(procfetch_state_->mu);
+            if (procfetch_state_->fetching) {
+                procfetch_state_->fetching = false;
+                chargen_state_->event_bus.publish("procfetch-status", "error");
+            }
+        }
         spdlog::info("Agent subscribe stream closed");
 
         return grpc::Status::OK;
@@ -270,7 +308,8 @@ private:
         s.event_bus.publish("chargen", line);
     }
 
-    std::shared_ptr<ChargenState> chargen_state_;
+    std::shared_ptr<ChargenState>  chargen_state_;
+    std::shared_ptr<ProcfetchState> procfetch_state_;
     mutable std::mutex agent_mu_;
     std::string agent_id_;
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* agent_stream_ = nullptr;
@@ -301,7 +340,8 @@ public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
           chargen_state_(std::make_shared<detail::ChargenState>()),
-          agent_service_(chargen_state_)
+          procfetch_state_(std::make_shared<detail::ProcfetchState>()),
+          agent_service_(chargen_state_, procfetch_state_)
     {
         // Setup chargen file logger
         auto log_path = detail::chargen_log_path();
@@ -522,6 +562,63 @@ private:
                     "application/json");
             });
 
+        // -- Process Fetch routes -------------------------------------------------
+
+        web_server_->Get("/procfetch", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(kProcfetchIndexHtml, "text/html; charset=utf-8");
+        });
+
+        web_server_->Post("/api/procfetch/fetch",
+            [this](const httplib::Request&, httplib::Response& res) {
+                {
+                    std::lock_guard<std::mutex> lock(procfetch_state_->mu);
+                    if (procfetch_state_->fetching) {
+                        res.set_content("{\"status\":\"already_fetching\"}",
+                            "application/json");
+                        return;
+                    }
+                }
+
+                if (!agent_service_.has_agent()) {
+                    res.status = 503;
+                    res.set_content("{\"error\":\"no agent connected\"}",
+                        "application/json");
+                    return;
+                }
+
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id("procfetch-" + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count()));
+                cmd.set_plugin("procfetch");
+                cmd.set_action("procfetch_fetch");
+
+                if (!agent_service_.send_command(cmd)) {
+                    res.status = 503;
+                    res.set_content("{\"error\":\"failed to send command to agent\"}",
+                        "application/json");
+                    return;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(procfetch_state_->mu);
+                    procfetch_state_->fetching = true;
+                }
+                chargen_state_->event_bus.publish("procfetch-status", "fetching");
+                spdlog::info("Procfetch fetch command sent to agent");
+                res.set_content("{\"status\":\"fetching\"}", "application/json");
+            });
+
+        web_server_->Get("/api/procfetch/status",
+            [this](const httplib::Request&, httplib::Response& res) {
+                std::lock_guard<std::mutex> lock(procfetch_state_->mu);
+                std::string status = procfetch_state_->fetching ? "fetching" : "idle";
+                bool agent_connected = agent_service_.has_agent();
+                res.set_content(
+                    "{\"status\":\"" + status + "\","
+                    "\"agent_connected\":" + (agent_connected ? "true" : "false") + "}",
+                    "application/json");
+            });
+
         web_thread_ = std::thread([this] {
             spdlog::info("Web UI available at http://{}:{}/",
                 cfg_.web_address, cfg_.web_port);
@@ -533,6 +630,7 @@ private:
 
     Config                                     cfg_;
     std::shared_ptr<detail::ChargenState>      chargen_state_;
+    std::shared_ptr<detail::ProcfetchState>    procfetch_state_;
     detail::AgentServiceImpl                   agent_service_;
     detail::ManagementServiceImpl              mgmt_service_;
     std::unique_ptr<grpc::Server>              agent_server_;

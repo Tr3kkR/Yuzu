@@ -48,6 +48,7 @@ if build_agent
   if build_examples
     subdir('agents/plugins/example')
     subdir('agents/plugins/chargen')
+    subdir('agents/plugins/procfetch')
   endif
 endif
 

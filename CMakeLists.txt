@@ -62,6 +62,7 @@ if(YUZU_BUILD_AGENT)
   if(YUZU_BUILD_EXAMPLES)
     add_subdirectory(agents/plugins/example)
     add_subdirectory(agents/plugins/chargen)
+    add_subdirectory(agents/plugins/procfetch)
   endif()
 endif()
 

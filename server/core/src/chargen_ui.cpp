@@ -88,8 +88,9 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
 
   <div id="terminal"></div>
 
-  <footer>
-    Yuzu Server &mdash; RFC 864 Character Generator &mdash; Output streamed from agent
+  <footer style="display:flex;justify-content:space-between;">
+    <span>Yuzu Server &mdash; RFC 864 Character Generator &mdash; Output streamed from agent</span>
+    <a href="/procfetch" style="color:#58a6ff;text-decoration:none;">Process Fetch</a>
   </footer>
 
   <script>
