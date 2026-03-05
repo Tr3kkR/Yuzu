@@ -71,5 +71,5 @@ function(yuzu_proto_library)
 
   add_library(${ARG_NAME} STATIC ${GENERATED_SRCS} ${GENERATED_HDRS})
   target_include_directories(${ARG_NAME} PUBLIC "${PROTO_OUT}")
-  target_link_libraries(${ARG_NAME} PUBLIC gRPC::grpc++)
+  target_link_libraries(${ARG_NAME} PUBLIC gRPC::grpc++ protobuf::libprotobuf)
 endfunction()
