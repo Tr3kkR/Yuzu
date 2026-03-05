@@ -89,7 +89,7 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
   <div id="terminal"></div>
 
   <footer>
-    Yuzu Server &mdash; RFC 864 Character Generator &mdash; Output logged to server
+    Yuzu Server &mdash; RFC 864 Character Generator &mdash; Output streamed from agent
   </footer>
 
   <script>
