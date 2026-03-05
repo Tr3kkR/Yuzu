@@ -216,10 +216,9 @@ public:
         }
     }
 
-   void run() override {
+    void run() override {
         spdlog::info("run(): entering");
         grpc::EnableDefaultHealthCheckService(true);
-        spdlog::info("run(): health check enabled");
 
         auto agent_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
@@ -229,34 +228,12 @@ public:
                 spdlog::warn("TLS enabled but cert/key not provided -- falling back to insecure");
             }
         }
-        spdlog::info("run(): credentials ready");
 
         grpc::ServerBuilder agent_builder;
         agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
-        spdlog::info("run(): agent port added");
 
         grpc::ServerBuilder mgmt_builder;
         mgmt_builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
-        spdlog::info("run(): management port added");
-
-        agent_server_ = agent_builder.BuildAndStart();
-        spdlog::info("run(): agent server built: {}", agent_server_ ? "OK" : "FAILED");
-
-        try {
-            agent_server_ = agent_builder.BuildAndStart();
-            spdlog::info("run(): agent server built: {}", agent_server_ ? "OK" : "FAILED");
-        } catch (const std::exception& ex) {
-            spdlog::error("run(): agent server threw: {}", ex.what());
-            return;
-        } catch (...) {
-            spdlog::error("run(): agent server threw unknown exception");
-            return;
-        }
-
-        mgmt_builder.AddListeningPort(
-            cfg_.management_address,
-            grpc::InsecureServerCredentials()
-        );
 
         agent_server_ = agent_builder.BuildAndStart();
         mgmt_server_  = mgmt_builder.BuildAndStart();
