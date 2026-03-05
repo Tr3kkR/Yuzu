@@ -19,6 +19,7 @@ target_link_libraries(yuzu_agent_core
     spdlog::spdlog
 )
 
+target_compile_definitions(yuzu_agent_core PRIVATE YUZU_AGENT_CORE_BUILDING)
 yuzu_set_compiler_flags(yuzu_agent_core)
 
 # ── Agent executable ──────────────────────────────────────────────────────────
