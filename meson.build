@@ -5,7 +5,7 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++23',
+    'cpp_std=c++latest',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
