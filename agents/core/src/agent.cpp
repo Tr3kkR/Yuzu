@@ -1,19 +1,9 @@
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  define NOMINMAX
-#  include <windows.h>
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        const char msg[] = "[DIAG] DllMain(DLL_PROCESS_ATTACH) — yuzu_agent_core.dll loaded\n";
-        WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof(msg) - 1, nullptr, nullptr);
-    }
-    return TRUE;
-}
-// Early static-init diagnostic inside the DLL (runs after DllMain, before other C++ globals)
+#  include <io.h>
 #  pragma section(".CRT$XCA", read)
 static void __cdecl diag_dll_static_init() {
     const char msg[] = "[DIAG] DLL static-init starting (before proto registration)\n";
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof(msg) - 1, nullptr, nullptr);
+    _write(2, msg, sizeof(msg) - 1);
 }
 __declspec(allocate(".CRT$XCA")) static void (__cdecl *p_dll_diag)() = diag_dll_static_init;
 #endif

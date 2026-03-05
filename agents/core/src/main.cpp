@@ -1,13 +1,10 @@
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  define NOMINMAX
-#  include <windows.h>
+#  include <io.h>
 #  include <cstdio>
-// Runs before ANY C++ static initializers — prints to stderr via Win32 API.
 #  pragma section(".CRT$XCA", read)
 static void __cdecl diag_before_static_init() {
-    const char msg[] = "[DIAG] CRT static-init starting (before C++ globals)\n";
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof(msg) - 1, nullptr, nullptr);
+    const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
+    _write(2, msg, sizeof(msg) - 1);
 }
 __declspec(allocate(".CRT$XCA")) static void (__cdecl *p_diag_init)() = diag_before_static_init;
 #endif
