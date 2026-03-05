@@ -25,6 +25,6 @@ executable(
     include_directories('include'),
     include_directories('../../sdk/include'),
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_proto_dep, spdlog_dep, cli11_dep],
+  dependencies: [yuzu_agent_core_dep, spdlog_dep, cli11_dep],
   install: true,
 )

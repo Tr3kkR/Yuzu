@@ -1,3 +1,14 @@
+#ifdef _WIN32
+#  include <io.h>
+#  include <cstdio>
+#  pragma section(".CRT$XCB", read)
+static void __cdecl diag_before_static_init() {
+    const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
+    _write(2, msg, sizeof(msg) - 1);
+}
+__declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_before_static_init;
+#endif
+
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/version.hpp>
 
@@ -19,6 +30,7 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char* argv[]) {
+    fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
     app.set_version_flag("--version", std::string{yuzu::kVersionString});
 
