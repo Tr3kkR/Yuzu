@@ -229,17 +229,14 @@ public:
             }
         }
 
-        grpc::ServerBuilder agent_builder;
-        agent_builder.AddListeningPort(cfg_.listen_address, agent_creds);
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort(cfg_.listen_address, agent_creds);
+        builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
 
-        grpc::ServerBuilder mgmt_builder;
-        mgmt_builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
+        agent_server_ = builder.BuildAndStart();
 
-        agent_server_ = agent_builder.BuildAndStart();
-        mgmt_server_  = mgmt_builder.BuildAndStart();
-
-        if (!agent_server_ || !mgmt_server_) {
-            spdlog::error("Failed to start gRPC server(s) -- check that ports {} and {} are available",
+        if (!agent_server_) {
+            spdlog::error("Failed to start gRPC server -- check that ports {} and {} are available",
                 cfg_.listen_address, cfg_.management_address);
             return;
         }
