@@ -9,7 +9,9 @@
  * Output is pipe-delimited, one process per line via write_output():
  *   pid|name|path|sha1_hex
  *
- * On non-Linux platforms the plugin returns an error string.
+ * Platform support:
+ *   Linux  — /proc filesystem, OpenSSL EVP for SHA-1
+ *   Windows — CreateToolhelp32Snapshot, BCrypt for SHA-1
  */
 
 #include <yuzu/plugin.hpp>
@@ -24,10 +26,45 @@
 
 #ifdef __linux__
 #include <openssl/evp.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#include <bcrypt.h>
+#include <charconv>
 #endif
 
 namespace {
 
+// -- Shared helpers -----------------------------------------------------------
+
+struct ProcessInfo {
+    int pid;
+    std::string name;
+    std::string exe_path;
+    std::string sha1;
+};
+
+// Escape pipe characters in strings so they don't break the delimiter.
+std::string escape_pipes(std::string_view sv) {
+    std::string out;
+    out.reserve(sv.size());
+    for (char c : sv) {
+        if (c == '|') {
+            out += "\\|";
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// -- Linux implementation -----------------------------------------------------
 #ifdef __linux__
 
 std::string read_first_line(const std::filesystem::path& path) {
@@ -83,27 +120,6 @@ std::string sha1_of_file(const std::filesystem::path& path) {
     return hex;
 }
 
-// Escape pipe characters in strings so they don't break the delimiter.
-std::string escape_pipes(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size());
-    for (char c : sv) {
-        if (c == '|') {
-            out += "\\|";
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
-
-struct ProcessInfo {
-    int pid;
-    std::string name;
-    std::string exe_path;
-    std::string sha1;
-};
-
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> result;
 
@@ -136,7 +152,108 @@ std::vector<ProcessInfo> enumerate_processes() {
     return result;
 }
 
-#endif  // __linux__
+// -- Windows implementation ---------------------------------------------------
+#elif defined(_WIN32)
+
+std::string wide_to_utf8(const wchar_t* ws) {
+    if (!ws || !*ws) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string s(static_cast<size_t>(len - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), len, nullptr, nullptr);
+    return s;
+}
+
+std::string get_process_image_path(DWORD pid) {
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return {};
+
+    wchar_t path_buf[MAX_PATH];
+    DWORD path_len = MAX_PATH;
+    BOOL ok = QueryFullProcessImageNameW(proc, 0, path_buf, &path_len);
+    CloseHandle(proc);
+
+    if (!ok) return {};
+    return wide_to_utf8(path_buf);
+}
+
+std::string sha1_of_file(const std::string& path) {
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM,
+                                                  nullptr, 0);
+    if (status != 0) {
+        CloseHandle(file);
+        return {};
+    }
+
+    BCRYPT_HASH_HANDLE hash_handle = nullptr;
+    status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
+    if (status != 0) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        CloseHandle(file);
+        return {};
+    }
+
+    char buf[8192];
+    DWORD bytes_read = 0;
+    while (ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
+        status = BCryptHashData(hash_handle, reinterpret_cast<PUCHAR>(buf),
+                                bytes_read, 0);
+        if (status != 0) break;
+    }
+    CloseHandle(file);
+
+    unsigned char hash[20];  // SHA-1 is 20 bytes
+    status = BCryptFinishHash(hash_handle, hash, sizeof(hash), 0);
+    BCryptDestroyHash(hash_handle);
+    BCryptCloseAlgorithmProvider(alg, 0);
+
+    if (status != 0) return {};
+
+    std::string hex;
+    hex.reserve(40);
+    for (int i = 0; i < 20; ++i) {
+        hex += std::format("{:02x}", hash[i]);
+    }
+    return hex;
+}
+
+std::vector<ProcessInfo> enumerate_processes() {
+    std::vector<ProcessInfo> result;
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return result;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (!Process32FirstW(snap, &pe)) {
+        CloseHandle(snap);
+        return result;
+    }
+
+    do {
+        ProcessInfo info;
+        info.pid = static_cast<int>(pe.th32ProcessID);
+        info.name = wide_to_utf8(pe.szExeFile);
+        if (info.name.empty()) continue;
+
+        info.exe_path = get_process_image_path(pe.th32ProcessID);
+        if (!info.exe_path.empty()) {
+            info.sha1 = sha1_of_file(info.exe_path);
+        }
+        result.push_back(std::move(info));
+    } while (Process32NextW(snap, &pe));
+
+    CloseHandle(snap);
+    return result;
+}
+
+#endif  // platform
 
 }  // namespace
 
@@ -168,7 +285,7 @@ public:
 
 private:
     int do_fetch(yuzu::CommandContext& ctx) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
         auto procs = enumerate_processes();
         for (const auto& p : procs) {
             ctx.write_output(std::format("{}|{}|{}|{}",

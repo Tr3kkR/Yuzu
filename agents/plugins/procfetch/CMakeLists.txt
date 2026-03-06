@@ -7,7 +7,9 @@ add_library(yuzu::plugin_procfetch ALIAS plugin_procfetch)
 
 target_link_libraries(plugin_procfetch PRIVATE yuzu::sdk)
 
-if(NOT WIN32)
+if(WIN32)
+  target_link_libraries(plugin_procfetch PRIVATE bcrypt)
+else()
   find_package(OpenSSL REQUIRED)
   target_link_libraries(plugin_procfetch PRIVATE OpenSSL::Crypto)
 endif()
