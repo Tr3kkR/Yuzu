@@ -113,8 +113,8 @@ public:
 
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
         grpc::ChannelArguments ch_args;
-        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
-        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 

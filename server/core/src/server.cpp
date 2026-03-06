@@ -433,10 +433,11 @@ public:
         }
 
         grpc::ServerBuilder builder;
-        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
-        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
         builder.RegisterService(&agent_service_);
