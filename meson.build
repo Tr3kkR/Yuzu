@@ -50,6 +50,7 @@ if build_agent
     subdir('agents/plugins/example')
     subdir('agents/plugins/chargen')
     subdir('agents/plugins/procfetch')
+    subdir('agents/plugins/netstat')
   endif
 endif
 
