@@ -42,9 +42,9 @@ int main(int argc, char* argv[]) {
        ->default_val("localhost:50051");
     app.add_option("--agent-id", cfg.agent_id,        "Stable agent UUID (auto-generated if empty)");
     app.add_option("--data-dir", cfg.data_dir,        "Directory for persistent agent state")
-       ->default_val(yuzu::agent::default_data_dir());
+       ->default_val(yuzu::agent::default_data_dir().string());
     app.add_option("--plugin-dir", cfg.plugin_dir,    "Directory containing plugin shared libraries")
-       ->default_val(std::filesystem::current_path() / "plugins");
+       ->default_val((std::filesystem::current_path() / "plugins").string());
     app.add_option("--heartbeat", cfg.heartbeat_interval,
                    "Heartbeat interval in seconds")->default_val(30);
     app.add_flag  ("--no-tls",   "Disable TLS (insecure, for development only)")
