@@ -65,7 +65,7 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     resp.set_output(text);
 
     std::lock_guard lock(*impl->write_mu);
-    impl->stream->Write(resp);
+    impl->stream->Write(resp, grpc::WriteOptions());
 }
 
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
@@ -111,12 +111,19 @@ public:
 
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
-        // 2. Connect to server
-        auto channel = grpc::CreateChannel(
+        // 2. Connect to server (tuned for low-latency bidirectional streaming)
+        grpc::ChannelArguments ch_args;
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+
+        auto channel = grpc::CreateCustomChannel(
             cfg_.server_address,
             cfg_.tls_enabled
                 ? grpc::SslCredentials({})
-                : grpc::InsecureChannelCredentials()
+                : grpc::InsecureChannelCredentials(),
+            ch_args
         );
 
         auto stub = pb::AgentService::NewStub(channel);
@@ -189,7 +196,7 @@ public:
                     resp.set_status(pb::CommandResponse::REJECTED);
                     resp.set_output("plugin not found: " + cmd.plugin());
                     std::lock_guard lock(stream_write_mu_);
-                    stream->Write(resp);
+                    stream->Write(resp, grpc::WriteOptions());
                     continue;
                 }
 
@@ -237,7 +244,7 @@ public:
                         timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(timing_resp);
+                        raw_stream->Write(timing_resp, grpc::WriteOptions());
                     }
 
                     // Send final status
@@ -254,7 +261,7 @@ public:
                         final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(final_resp);
+                        raw_stream->Write(final_resp, grpc::WriteOptions());
                     }
 
                     spdlog::info("Command {} finished (rc={}, exec={}ms)",

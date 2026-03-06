@@ -339,7 +339,7 @@ public:
         }
         std::lock_guard lock(agent_mu_);
         if (!agent_stream_) return false;
-        return agent_stream_->Write(cmd);
+        return agent_stream_->Write(cmd, grpc::WriteOptions());
     }
 
     bool has_agent() const {
@@ -433,6 +433,10 @@ public:
         }
 
         grpc::ServerBuilder builder;
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 10000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
         builder.RegisterService(&agent_service_);
