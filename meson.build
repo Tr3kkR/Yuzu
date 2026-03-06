@@ -35,7 +35,7 @@ spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
 httplib_dep     = dependency('httplib',   required: true)
-sqlite3_dep     = dependency('unofficial-sqlite3', method: 'cmake', modules: ['unofficial::sqlite3::sqlite3'], required: true)
+sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'], required: true)
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
 subdir('proto')
