@@ -23,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Defined in chargen_ui.cpp (separate TU to isolate MSVC raw-string issues).
@@ -213,6 +214,34 @@ public:
             bool is_procfetch = resp.command_id().starts_with("procfetch");
 
             if (resp.status() == pb::CommandResponse::RUNNING) {
+                // -- Intercept __timing__ metadata lines from agent ------
+                if (resp.output().starts_with("__timing__|")) {
+                    // Parse "exec_ms=1234" from output
+                    auto payload = resp.output().substr(11);
+                    chargen_state_->event_bus.publish("timing",
+                        resp.command_id() + "|" + payload + "|agent_total");
+                    spdlog::info("Timing [{}]: {}", resp.command_id(), payload);
+                    continue;
+                }
+
+                // -- Track first response for server-side latency --------
+                {
+                    std::lock_guard lock(cmd_times_mu_);
+                    if (cmd_first_seen_.find(resp.command_id()) == cmd_first_seen_.end()) {
+                        cmd_first_seen_.insert(resp.command_id());
+                        auto it = cmd_send_times_.find(resp.command_id());
+                        if (it != cmd_send_times_.end()) {
+                            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - it->second).count();
+                            chargen_state_->event_bus.publish("timing",
+                                resp.command_id() + "|first_data_ms="
+                                + std::to_string(elapsed) + "|first_data");
+                            spdlog::info("Timing [{}]: first_data_ms={}",
+                                resp.command_id(), elapsed);
+                        }
+                    }
+                }
+
                 if (is_procfetch) {
                     chargen_state_->event_bus.publish("procfetch", resp.output());
                 } else {
@@ -260,6 +289,21 @@ public:
                         chargen_state_->event_bus.publish("status", "stopped");
                     }
                 }
+
+                // -- Publish total round-trip and clean up timing maps ----
+                {
+                    std::lock_guard lock(cmd_times_mu_);
+                    auto it = cmd_send_times_.find(resp.command_id());
+                    if (it != cmd_send_times_.end()) {
+                        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - it->second).count();
+                        chargen_state_->event_bus.publish("timing",
+                            resp.command_id() + "|total_ms="
+                            + std::to_string(total_ms) + "|complete");
+                        cmd_send_times_.erase(it);
+                    }
+                    cmd_first_seen_.erase(resp.command_id());
+                }
             }
         }
 
@@ -289,6 +333,10 @@ public:
 
     // Send a command to the connected agent. Returns false if no agent.
     bool send_command(const pb::CommandRequest& cmd) {
+        {
+            std::lock_guard lock(cmd_times_mu_);
+            cmd_send_times_[cmd.command_id()] = std::chrono::steady_clock::now();
+        }
         std::lock_guard lock(agent_mu_);
         if (!agent_stream_) return false;
         return agent_stream_->Write(cmd);
@@ -313,6 +361,11 @@ private:
     mutable std::mutex agent_mu_;
     std::string agent_id_;
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* agent_stream_ = nullptr;
+
+    // -- Command timing instrumentation ---
+    std::mutex cmd_times_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
+    std::unordered_set<std::string> cmd_first_seen_;
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------

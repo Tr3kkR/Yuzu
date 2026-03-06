@@ -45,6 +45,8 @@ struct CommandContextImpl {
     SubscribeStream* stream;
     std::mutex*      write_mu;   // protects concurrent stream->Write()
     std::string      command_id;
+    std::chrono::steady_clock::time_point start_time;
+    std::atomic<bool> first_output_sent{false};
 };
 
 }  // anonymous namespace
@@ -200,6 +202,7 @@ public:
                         .stream     = raw_stream,
                         .write_mu   = &stream_write_mu_,
                         .command_id = cmd.command_id(),
+                        .start_time = std::chrono::steady_clock::now(),
                     };
                     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
 
@@ -222,19 +225,40 @@ public:
                         params.size()
                     );
 
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        end_time - ctx_impl.start_time).count();
+
+                    // Send timing metadata before the final status
+                    {
+                        pb::CommandResponse timing_resp;
+                        timing_resp.set_command_id(cmd.command_id());
+                        timing_resp.set_status(pb::CommandResponse::RUNNING);
+                        timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
+
+                        std::lock_guard lock(stream_write_mu_);
+                        raw_stream->Write(timing_resp);
+                    }
+
                     // Send final status
-                    pb::CommandResponse final_resp;
-                    final_resp.set_command_id(cmd.command_id());
-                    final_resp.set_status(rc == 0
-                        ? pb::CommandResponse::SUCCESS
-                        : pb::CommandResponse::FAILURE);
-                    final_resp.set_exit_code(rc);
+                    {
+                        pb::CommandResponse final_resp;
+                        final_resp.set_command_id(cmd.command_id());
+                        final_resp.set_status(rc == 0
+                            ? pb::CommandResponse::SUCCESS
+                            : pb::CommandResponse::FAILURE);
+                        final_resp.set_exit_code(rc);
 
-                    std::lock_guard lock(stream_write_mu_);
-                    raw_stream->Write(final_resp);
+                        auto now_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
-                    spdlog::info("Command {} finished (rc={})",
-                        cmd.command_id(), rc);
+                        std::lock_guard lock(stream_write_mu_);
+                        raw_stream->Write(final_resp);
+                    }
+
+                    spdlog::info("Command {} finished (rc={}, exec={}ms)",
+                        cmd.command_id(), rc, exec_ms);
                 });
 
                 {

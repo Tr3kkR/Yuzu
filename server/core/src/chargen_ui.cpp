@@ -128,6 +128,9 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
     <div class="stats">
       <span>Lines: <strong id="line-count">0</strong></span>
       <span>Bytes: <strong id="byte-count">0</strong></span>
+      <span>Network: <strong id="cg-network-time">&mdash;</strong></span>
+      <span>Agent: <strong id="cg-agent-time">&mdash;</strong></span>
+      <span>Total: <strong id="cg-total-time">&mdash;</strong></span>
     </div>
   </div>
 
@@ -149,6 +152,9 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
     </button>
     <div class="stats">
       <span>Processes: <strong id="proc-count">0</strong></span>
+      <span>Network: <strong id="pf-network-time">&mdash;</strong></span>
+      <span>Agent: <strong id="pf-agent-time">&mdash;</strong></span>
+      <span>Total: <strong id="pf-total-time">&mdash;</strong></span>
     </div>
   </div>
 
@@ -200,6 +206,9 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
       lines = 0; bytes = 0;
       lineCount.textContent = '0';
       byteCount.textContent = '0';
+      document.getElementById('cg-network-time').innerHTML = '&mdash;';
+      document.getElementById('cg-agent-time').innerHTML = '&mdash;';
+      document.getElementById('cg-total-time').innerHTML = '&mdash;';
     }
 
     /* -- Process Fetch state ------------------------------------------ */
@@ -227,6 +236,9 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
       procTotal = 0;
       procCount.textContent = '0';
       setPfBadge('idle');
+      document.getElementById('pf-network-time').innerHTML = '&mdash;';
+      document.getElementById('pf-agent-time').innerHTML = '&mdash;';
+      document.getElementById('pf-total-time').innerHTML = '&mdash;';
     }
 
     function escapeHtml(s) {
@@ -290,6 +302,34 @@ extern const char* const kChargenIndexHtml = R"HTM(<!DOCTYPE html>
 
       evtSource.addEventListener('procfetch-status', function(e) {
         setPfBadge(e.data);
+      });
+
+      evtSource.addEventListener('timing', function(e) {
+        // data format: command_id|key=value|type
+        var parts = e.data.split('|');
+        if (parts.length < 3) return;
+        var cmdId = parts[0];
+        var kv    = parts[1];  // e.g. "first_data_ms=45" or "exec_ms=1234"
+        var type  = parts[2];  // "first_data", "agent_total", "complete"
+
+        // Extract the numeric value from "key=value"
+        var eqIdx = kv.indexOf('=');
+        var ms = eqIdx >= 0 ? kv.substring(eqIdx + 1) : kv;
+
+        // Determine which section this belongs to
+        var isChargen = cmdId.indexOf('chargen') === 0;
+        var isProcfetch = cmdId.indexOf('procfetch') === 0;
+
+        if (type === 'first_data') {
+          if (isChargen)   document.getElementById('cg-network-time').textContent = ms + ' ms';
+          if (isProcfetch) document.getElementById('pf-network-time').textContent = ms + ' ms';
+        } else if (type === 'agent_total') {
+          if (isChargen)   document.getElementById('cg-agent-time').textContent = ms + ' ms';
+          if (isProcfetch) document.getElementById('pf-agent-time').textContent = ms + ' ms';
+        } else if (type === 'complete') {
+          if (isChargen)   document.getElementById('cg-total-time').textContent = ms + ' ms';
+          if (isProcfetch) document.getElementById('pf-total-time').textContent = ms + ' ms';
+        }
       });
 
       evtSource.onerror = function() {
