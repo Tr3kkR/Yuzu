@@ -5,6 +5,8 @@
 #include <string>
 #include <string_view>
 
+#include <yuzu/plugin.h>  // for YUZU_EXPORT
+
 namespace yuzu::agent {
 
 struct IdentityError {
@@ -13,12 +15,12 @@ struct IdentityError {
 
 /// Resolves the agent ID: returns cli_override if non-empty, otherwise
 /// loads from (or generates into) the SQLite database at db_path.
-[[nodiscard]] auto resolve_agent_id(
+[[nodiscard]] YUZU_EXPORT auto resolve_agent_id(
     std::string_view cli_override,
     const std::filesystem::path& db_path
 ) -> std::expected<std::string, IdentityError>;
 
 /// Returns the platform-appropriate default data directory for Yuzu.
-[[nodiscard]] auto default_data_dir() -> std::filesystem::path;
+[[nodiscard]] YUZU_EXPORT auto default_data_dir() -> std::filesystem::path;
 
 }  // namespace yuzu::agent
