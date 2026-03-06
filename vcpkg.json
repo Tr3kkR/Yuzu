@@ -19,6 +19,7 @@
     "spdlog",
     "nlohmann-json",
     "cli11",
+    "sqlite3",
     {
       "name": "openssl",
       "platform": "!windows"

@@ -10,6 +10,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/identity_store.hpp>
 #include <yuzu/version.hpp>
 
 #include <CLI/CLI.hpp>
@@ -40,6 +41,8 @@ int main(int argc, char* argv[]) {
     app.add_option("--server",   cfg.server_address,  "Server address (host:port)")
        ->default_val("localhost:50051");
     app.add_option("--agent-id", cfg.agent_id,        "Stable agent UUID (auto-generated if empty)");
+    app.add_option("--data-dir", cfg.data_dir,        "Directory for persistent agent state")
+       ->default_val(yuzu::agent::default_data_dir());
     app.add_option("--plugin-dir", cfg.plugin_dir,    "Directory containing plugin shared libraries")
        ->default_val(std::filesystem::current_path() / "plugins");
     app.add_option("--heartbeat", cfg.heartbeat_interval,
@@ -57,6 +60,16 @@ int main(int argc, char* argv[]) {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
     spdlog::info("Yuzu Agent v{}", yuzu::kVersionString);
+
+    // Resolve persistent agent ID
+    auto id_result = yuzu::agent::resolve_agent_id(
+        cfg.agent_id, cfg.data_dir / "agent.db");
+    if (!id_result) {
+        spdlog::error("Failed to resolve agent ID: {}", id_result.error().message);
+        return EXIT_FAILURE;
+    }
+    cfg.agent_id = std::move(*id_result);
+    spdlog::info("Agent ID: {}", cfg.agent_id);
 
     // Signal handling
     std::signal(SIGINT,  on_signal);

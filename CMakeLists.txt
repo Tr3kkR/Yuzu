@@ -47,6 +47,7 @@ find_package(spdlog      CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CLI11       CONFIG REQUIRED)
 find_package(httplib     CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 # ── Protobuf / gRPC code generation ──────────────────────────────────────────
 add_subdirectory(proto)
