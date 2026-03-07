@@ -20,6 +20,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <string>
 
@@ -33,7 +34,7 @@ static void on_signal(int sig) {
 int main(int argc, char* argv[]) {
     fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
-    app.set_version_flag("--version", std::string{yuzu::kVersionString});
+    app.set_version_flag("--version", std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
 
     yuzu::agent::Config cfg;
     std::string log_level = "info";
@@ -59,7 +60,7 @@ int main(int argc, char* argv[]) {
     spdlog::set_level(spdlog::level::from_str(log_level));
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
-    spdlog::info("Yuzu Agent v{}", yuzu::kVersionString);
+    spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
     // Resolve persistent agent ID
     auto id_result = yuzu::agent::resolve_agent_id(

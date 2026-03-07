@@ -4,6 +4,7 @@ add_library(yuzu::sdk ALIAS yuzu_sdk)
 
 target_include_directories(yuzu_sdk
   INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/generated/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
