@@ -26,10 +26,11 @@
 #include <unordered_set>
 #include <vector>
 
-// Defined in chargen_ui.cpp (separate TU to isolate MSVC raw-string issues).
-extern const char* const kChargenIndexHtml;
+// Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
+extern const char* const kDashboardIndexHtml;
 
-// Defined in procfetch_ui.cpp.
+// Legacy UIs kept for backward compatibility (redirect to /).
+extern const char* const kChargenIndexHtml;
 extern const char* const kProcfetchIndexHtml;
 
 namespace yuzu::server {
@@ -40,7 +41,7 @@ namespace pb = ::yuzu::agent::v1;
 
 // -- Platform-specific log path -----------------------------------------------
 
-[[nodiscard]] std::filesystem::path chargen_log_path() {
+[[nodiscard]] std::filesystem::path server_log_path() {
 #ifdef _WIN32
     return R"(C:\ProgramData\Yuzu\logs\agent.log)";
 #elif defined(__APPLE__)
@@ -53,12 +54,11 @@ namespace pb = ::yuzu::agent::v1;
 // -- SSE Event ----------------------------------------------------------------
 
 struct SseEvent {
-    std::string event_type;  // e.g. "chargen", "status"
+    std::string event_type;
     std::string data;
 };
 
 // -- SSE Event Bus ------------------------------------------------------------
-// Broadcast mechanism: chargen output / status events -> all connected SSE clients.
 
 class EventBus {
 public:
@@ -90,21 +90,165 @@ private:
     std::unordered_map<std::size_t, Listener> listeners_;
 };
 
-// -- Chargen state (shared between gRPC agent handler and web UI) -------------
+// -- Agent session (one per connected agent) ----------------------------------
 
-struct ChargenState {
-    std::mutex                      mu;
-    bool                            running = false;
-    std::string                     target_agent_id;
-    std::shared_ptr<spdlog::logger> file_logger;
-    EventBus                        event_bus;
+struct AgentSession {
+    std::string agent_id;
+    std::string hostname;
+    std::string os;
+    std::string arch;
+    std::string agent_version;
+    std::vector<std::string> plugin_names;
+
+    // Stream pointer — valid only while Subscribe() RPC is active.
+    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
+    std::mutex stream_mu;
 };
 
-// -- Procfetch state (shared between gRPC agent handler and web UI) -----------
+// -- Agent registry -----------------------------------------------------------
 
-struct ProcfetchState {
-    std::mutex mu;
-    bool       fetching = false;
+class AgentRegistry {
+public:
+    explicit AgentRegistry(EventBus& bus) : bus_(bus) {}
+
+    void register_agent(const pb::AgentInfo& info) {
+        auto session = std::make_shared<AgentSession>();
+        session->agent_id      = info.agent_id();
+        session->hostname      = info.hostname();
+        session->os            = info.platform().os();
+        session->arch          = info.platform().arch();
+        session->agent_version = info.agent_version();
+        for (const auto& p : info.plugins()) {
+            session->plugin_names.push_back(p.name());
+        }
+
+        {
+            std::lock_guard lock(mu_);
+            agents_[info.agent_id()] = session;
+        }
+        bus_.publish("agent-online", info.agent_id());
+        spdlog::info("Agent registered: id={}, hostname={}, plugins={}",
+            info.agent_id(), info.hostname(), info.plugins_size());
+    }
+
+    void set_stream(const std::string& agent_id,
+                    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it != agents_.end()) {
+            std::lock_guard slock(it->second->stream_mu);
+            it->second->stream = stream;
+        }
+    }
+
+    void clear_stream(const std::string& agent_id) {
+        std::shared_ptr<AgentSession> session;
+        {
+            std::lock_guard lock(mu_);
+            auto it = agents_.find(agent_id);
+            if (it == agents_.end()) return;
+            session = it->second;
+        }
+        {
+            std::lock_guard slock(session->stream_mu);
+            session->stream = nullptr;
+        }
+    }
+
+    void remove_agent(const std::string& agent_id) {
+        {
+            std::lock_guard lock(mu_);
+            agents_.erase(agent_id);
+        }
+        bus_.publish("agent-offline", agent_id);
+        spdlog::info("Agent removed: id={}", agent_id);
+    }
+
+    // Send a command to a specific agent. Returns false if agent not found or write failed.
+    bool send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {
+        std::shared_ptr<AgentSession> session;
+        {
+            std::lock_guard lock(mu_);
+            auto it = agents_.find(agent_id);
+            if (it == agents_.end()) return false;
+            session = it->second;
+        }
+        std::lock_guard slock(session->stream_mu);
+        if (!session->stream) return false;
+        return session->stream->Write(cmd, grpc::WriteOptions());
+    }
+
+    // Send command to all connected agents. Returns count of agents sent to.
+    int send_to_all(const pb::CommandRequest& cmd) {
+        std::vector<std::shared_ptr<AgentSession>> snapshot;
+        {
+            std::lock_guard lock(mu_);
+            snapshot.reserve(agents_.size());
+            for (auto& [id, s] : agents_) {
+                snapshot.push_back(s);
+            }
+        }
+        int count = 0;
+        for (auto& s : snapshot) {
+            std::lock_guard slock(s->stream_mu);
+            if (s->stream && s->stream->Write(cmd, grpc::WriteOptions())) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    bool has_any() const {
+        std::lock_guard lock(mu_);
+        return !agents_.empty();
+    }
+
+    // Build JSON array of all agents for the web UI.
+    std::string to_json() const {
+        std::lock_guard lock(mu_);
+        std::string json = "[";
+        bool first = true;
+        for (const auto& [id, s] : agents_) {
+            if (!first) json += ",";
+            first = false;
+            // Simple JSON escaping (agent metadata shouldn't contain quotes normally)
+            json += "{\"agent_id\":\"" + s->agent_id +
+                    "\",\"hostname\":\"" + s->hostname +
+                    "\",\"os\":\"" + s->os +
+                    "\",\"arch\":\"" + s->arch +
+                    "\",\"agent_version\":\"" + s->agent_version + "\"}";
+        }
+        json += "]";
+        return json;
+    }
+
+    // Get list of all agent IDs.
+    std::vector<std::string> all_ids() const {
+        std::lock_guard lock(mu_);
+        std::vector<std::string> ids;
+        ids.reserve(agents_.size());
+        for (const auto& [id, s] : agents_) {
+            ids.push_back(id);
+        }
+        return ids;
+    }
+
+    // Look up the agent_id that was registered for a given Subscribe call.
+    // The Subscribe RPC needs to know which agent_id it's serving.
+    std::string find_agent_by_stream(
+        grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const {
+        std::lock_guard lock(mu_);
+        for (const auto& [id, s] : agents_) {
+            std::lock_guard slock(s->stream_mu);
+            if (s->stream == stream) return id;
+        }
+        return {};
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
+    EventBus& bus_;
 };
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
@@ -133,7 +277,6 @@ bool sse_content_provider(
         return false;
     }
 
-    // Drain all queued events
     while (!state->queue.empty()) {
         auto& ev = state->queue.front();
         std::string sse = "event: " + ev.event_type + "\ndata: " + ev.data + "\n\n";
@@ -143,13 +286,10 @@ bool sse_content_provider(
         state->queue.pop_front();
     }
 
-    // Timeout with no data -- send a keepalive comment
     const char* keepalive = ": keepalive\n\n";
     sink.write(keepalive, std::strlen(keepalive));
     return true;
 }
-
-// -- SSE resource-release callback --------------------------------------------
 
 void sse_resource_release(
     const std::shared_ptr<SseSinkState>& state,
@@ -165,9 +305,8 @@ void sse_resource_release(
 
 class AgentServiceImpl : public pb::AgentService::Service {
 public:
-    AgentServiceImpl(std::shared_ptr<ChargenState> cs,
-                     std::shared_ptr<ProcfetchState> ps)
-        : chargen_state_(std::move(cs)), procfetch_state_(std::move(ps)) {}
+    AgentServiceImpl(AgentRegistry& registry, EventBus& bus)
+        : registry_(registry), bus_(bus) {}
 
     grpc::Status Register(
         grpc::ServerContext* /*context*/,
@@ -175,22 +314,18 @@ public:
         pb::RegisterResponse* response) override
     {
         const auto& info = request->info();
-        spdlog::info("Agent registered: id={}, version={}, plugins={}",
-            info.agent_id(), info.agent_version(), info.plugins_size());
-
-        for (const auto& p : info.plugins()) {
-            spdlog::info("  plugin: {} v{} — {}",
-                p.name(), p.version(), p.description());
-        }
+        registry_.register_agent(info);
 
         auto session_id = "session-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
         response->set_session_id(session_id);
         response->set_accepted(true);
 
+        // Store agent_id in thread-local for the Subscribe call that follows.
         {
-            std::lock_guard lock(agent_mu_);
-            agent_id_ = info.agent_id();
+            std::lock_guard lock(pending_mu_);
+            // Key by agent_id so Subscribe can look it up.
+            pending_agent_ids_.insert(info.agent_id());
         }
 
         return grpc::Status::OK;
@@ -200,31 +335,40 @@ public:
         grpc::ServerContext* /*context*/,
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) override
     {
-        spdlog::info("Agent subscribe stream opened");
-
-        // Register this stream so web API can push commands
+        // Determine which agent this stream belongs to.
+        // The agent writes its first response which contains the command_id we can correlate,
+        // but we also know it just called Register. We set the stream for all pending agents.
+        std::string agent_id;
         {
-            std::lock_guard lock(agent_mu_);
-            agent_stream_ = stream;
+            std::lock_guard lock(pending_mu_);
+            if (!pending_agent_ids_.empty()) {
+                agent_id = *pending_agent_ids_.begin();
+                pending_agent_ids_.erase(pending_agent_ids_.begin());
+            }
         }
+
+        if (agent_id.empty()) {
+            spdlog::warn("Subscribe called but no pending agent registration");
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "Register must be called before Subscribe");
+        }
+
+        spdlog::info("Agent subscribe stream opened for {}", agent_id);
+        registry_.set_stream(agent_id, stream);
 
         // Read loop — process responses from the agent
         pb::CommandResponse resp;
         while (stream->Read(&resp)) {
-            bool is_procfetch = resp.command_id().starts_with("procfetch");
-
             if (resp.status() == pb::CommandResponse::RUNNING) {
-                // -- Intercept __timing__ metadata lines from agent ------
+                // Intercept __timing__ metadata
                 if (resp.output().starts_with("__timing__|")) {
-                    // Parse "exec_ms=1234" from output
                     auto payload = resp.output().substr(11);
-                    chargen_state_->event_bus.publish("timing",
+                    bus_.publish("timing",
                         resp.command_id() + "|" + payload + "|agent_total");
-                    spdlog::info("Timing [{}]: {}", resp.command_id(), payload);
                     continue;
                 }
 
-                // -- Track first response for server-side latency --------
+                // Track first response for server-side latency
                 {
                     std::lock_guard lock(cmd_times_mu_);
                     if (cmd_first_seen_.find(resp.command_id()) == cmd_first_seen_.end()) {
@@ -233,71 +377,39 @@ public:
                         if (it != cmd_send_times_.end()) {
                             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - it->second).count();
-                            chargen_state_->event_bus.publish("timing",
+                            bus_.publish("timing",
                                 resp.command_id() + "|first_data_ms="
                                 + std::to_string(elapsed) + "|first_data");
-                            spdlog::info("Timing [{}]: first_data_ms={}",
-                                resp.command_id(), elapsed);
                         }
                     }
                 }
 
-                if (is_procfetch) {
-                    chargen_state_->event_bus.publish("procfetch", resp.output());
-                } else {
-                    on_chargen_output(resp.output());
-                }
+                // Determine the plugin from command_id prefix (format: plugin-timestamp)
+                std::string plugin = extract_plugin(resp.command_id());
+
+                // Publish as generic output event: agent_id|plugin|data
+                bus_.publish("output",
+                    agent_id + "|" + plugin + "|" + resp.output());
+
             } else {
                 spdlog::info("Command {} completed: status={}, exit_code={}",
                     resp.command_id(),
                     static_cast<int>(resp.status()),
                     resp.exit_code());
 
-                // -- procfetch completion -----------------------------------------
-                if (is_procfetch) {
-                    if (resp.status() == pb::CommandResponse::SUCCESS) {
-                        std::lock_guard lock(procfetch_state_->mu);
-                        procfetch_state_->fetching = false;
-                        chargen_state_->event_bus.publish("procfetch-status", "done");
-                    } else {
-                        std::lock_guard lock(procfetch_state_->mu);
-                        procfetch_state_->fetching = false;
-                        chargen_state_->event_bus.publish("procfetch-status", "error");
-                    }
-                }
+                std::string status_str =
+                    (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+                bus_.publish("command-status",
+                    resp.command_id() + "|" + status_str);
 
-                // -- chargen completion ------------------------------------------
-                // If a chargen command was rejected or failed, reset UI state
-                if (resp.command_id().starts_with("chargen") &&
-                    (resp.status() == pb::CommandResponse::REJECTED ||
-                     resp.status() == pb::CommandResponse::FAILURE)) {
-                    std::lock_guard lock(chargen_state_->mu);
-                    if (chargen_state_->running) {
-                        chargen_state_->running = false;
-                        chargen_state_->event_bus.publish("status", "stopped");
-                        chargen_state_->event_bus.publish("chargen",
-                            "error: agent rejected command \xe2\x80\x94 " + resp.output());
-                    }
-                }
-
-                // chargen_stop completed successfully — confirm state reset
-                if (resp.command_id().starts_with("chargen-stop") &&
-                    resp.status() == pb::CommandResponse::SUCCESS) {
-                    std::lock_guard lock(chargen_state_->mu);
-                    if (chargen_state_->running) {
-                        chargen_state_->running = false;
-                        chargen_state_->event_bus.publish("status", "stopped");
-                    }
-                }
-
-                // -- Publish total round-trip and clean up timing maps ----
+                // Publish total round-trip and clean up timing maps
                 {
                     std::lock_guard lock(cmd_times_mu_);
                     auto it = cmd_send_times_.find(resp.command_id());
                     if (it != cmd_send_times_.end()) {
                         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - it->second).count();
-                        chargen_state_->event_bus.publish("timing",
+                        bus_.publish("timing",
                             resp.command_id() + "|total_ms="
                             + std::to_string(total_ms) + "|complete");
                         cmd_send_times_.erase(it);
@@ -308,61 +420,37 @@ public:
         }
 
         // Agent disconnected
-        {
-            std::lock_guard lock(agent_mu_);
-            agent_stream_ = nullptr;
-        }
-        {
-            std::lock_guard lock(chargen_state_->mu);
-            if (chargen_state_->running) {
-                chargen_state_->running = false;
-                chargen_state_->event_bus.publish("status", "stopped");
-            }
-        }
-        {
-            std::lock_guard lock(procfetch_state_->mu);
-            if (procfetch_state_->fetching) {
-                procfetch_state_->fetching = false;
-                chargen_state_->event_bus.publish("procfetch-status", "error");
-            }
-        }
-        spdlog::info("Agent subscribe stream closed");
+        registry_.clear_stream(agent_id);
+        registry_.remove_agent(agent_id);
+        spdlog::info("Agent subscribe stream closed for {}", agent_id);
 
         return grpc::Status::OK;
     }
 
-    // Send a command to the connected agent. Returns false if no agent.
-    bool send_command(const pb::CommandRequest& cmd) {
-        {
-            std::lock_guard lock(cmd_times_mu_);
-            cmd_send_times_[cmd.command_id()] = std::chrono::steady_clock::now();
-        }
-        std::lock_guard lock(agent_mu_);
-        if (!agent_stream_) return false;
-        return agent_stream_->Write(cmd, grpc::WriteOptions());
-    }
-
-    bool has_agent() const {
-        std::lock_guard lock(agent_mu_);
-        return agent_stream_ != nullptr;
+    // Record send time for latency measurement.
+    void record_send_time(const std::string& command_id) {
+        std::lock_guard lock(cmd_times_mu_);
+        cmd_send_times_[command_id] = std::chrono::steady_clock::now();
     }
 
 private:
-    void on_chargen_output(const std::string& line) {
-        auto& s = *chargen_state_;
-        if (s.file_logger) {
-            s.file_logger->info("{}", line);
+    static std::string extract_plugin(const std::string& command_id) {
+        // command_id format: "plugin-timestamp" e.g. "chargen-12345" or "netstat-12345"
+        auto dash = command_id.find('-');
+        if (dash != std::string::npos) {
+            return command_id.substr(0, dash);
         }
-        s.event_bus.publish("chargen", line);
+        return command_id;
     }
 
-    std::shared_ptr<ChargenState>  chargen_state_;
-    std::shared_ptr<ProcfetchState> procfetch_state_;
-    mutable std::mutex agent_mu_;
-    std::string agent_id_;
-    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* agent_stream_ = nullptr;
+    AgentRegistry& registry_;
+    EventBus& bus_;
 
-    // -- Command timing instrumentation ---
+    // Pending agent IDs from Register that haven't been paired with Subscribe yet.
+    std::mutex pending_mu_;
+    std::unordered_set<std::string> pending_agent_ids_;
+
+    // Command timing instrumentation
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
@@ -372,7 +460,7 @@ private:
 
 class ManagementServiceImpl : public ::yuzu::server::v1::ManagementService::Service {
 public:
-    // Placeholder. SendCommand RPC would forward to the agent's ExecuteCommand stream.
+    // Placeholder.
 };
 
 // -- File-reading helper ------------------------------------------------------
@@ -392,12 +480,11 @@ class ServerImpl final : public Server {
 public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
-          chargen_state_(std::make_shared<detail::ChargenState>()),
-          procfetch_state_(std::make_shared<detail::ProcfetchState>()),
-          agent_service_(chargen_state_, procfetch_state_)
+          registry_(event_bus_),
+          agent_service_(registry_, event_bus_)
     {
-        // Setup chargen file logger
-        auto log_path = detail::chargen_log_path();
+        // Setup file logger
+        auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
         if (!parent.empty()) {
             std::error_code ec;
@@ -408,14 +495,14 @@ public:
             }
         }
         try {
-            chargen_state_->file_logger = spdlog::basic_logger_mt(
-                "chargen_file", log_path.string());
-            chargen_state_->file_logger->set_pattern(
-                "[%Y-%m-%d %H:%M:%S.%e] [chargen] %v");
-            chargen_state_->file_logger->flush_on(spdlog::level::info);
-            spdlog::info("Chargen log file: {}", log_path.string());
+            file_logger_ = spdlog::basic_logger_mt(
+                "server_file", log_path.string());
+            file_logger_->set_pattern(
+                "[%Y-%m-%d %H:%M:%S.%e] [server] %v");
+            file_logger_->flush_on(spdlog::level::info);
+            spdlog::info("Log file: {}", log_path.string());
         } catch (const spdlog::spdlog_ex& ex) {
-            spdlog::error("Failed to create chargen file logger: {}", ex.what());
+            spdlog::error("Failed to create file logger: {}", ex.what());
         }
     }
 
@@ -511,19 +598,27 @@ private:
     void start_web_server() {
         web_server_ = std::make_unique<httplib::Server>();
 
+        // Dashboard (unified UI)
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kChargenIndexHtml, "text/html; charset=utf-8");
+            res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
 
-        auto* cs = chargen_state_.get();
+        // Legacy routes — redirect to dashboard
+        web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
+            res.set_redirect("/");
+        });
+        web_server_->Get("/procfetch", [](const httplib::Request&, httplib::Response& res) {
+            res.set_redirect("/");
+        });
 
         // SSE endpoint
-        web_server_->Get("/events", [cs](const httplib::Request&, httplib::Response& res) {
+        web_server_->Get("/events",
+            [this](const httplib::Request&, httplib::Response& res) {
             res.set_header("Cache-Control", "no-cache");
             res.set_header("X-Accel-Buffering", "no");
 
             auto sink_state = std::make_shared<detail::SseSinkState>();
-            sink_state->sub_id = cs->event_bus.subscribe(
+            sink_state->sub_id = event_bus_.subscribe(
                 [sink_state](const detail::SseEvent& ev) {
                     {
                         std::lock_guard<std::mutex> lk(sink_state->mu);
@@ -532,7 +627,7 @@ private:
                     sink_state->cv.notify_one();
                 });
 
-            detail::EventBus* bus = &cs->event_bus;
+            detail::EventBus* bus = &event_bus_;
             res.set_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
@@ -544,136 +639,102 @@ private:
             );
         });
 
-        // API endpoints — commands are forwarded to the agent via Subscribe stream
-        web_server_->Post("/api/chargen/start",
+        // -- Agent listing API ------------------------------------------------
+
+        web_server_->Get("/api/agents",
             [this](const httplib::Request&, httplib::Response& res) {
-                {
-                    std::lock_guard<std::mutex> lock(chargen_state_->mu);
-                    if (chargen_state_->running) {
-                        res.set_content("{\"status\":\"already_running\"}",
-                            "application/json");
-                        return;
-                    }
+                res.set_content(registry_.to_json(), "application/json");
+            });
+
+        // -- Generic command dispatch API -------------------------------------
+
+        web_server_->Post("/api/command",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
+                auto plugin = extract_json_string(req.body, "plugin");
+                auto action = extract_json_string(req.body, "action");
+                auto agent_ids = extract_json_string_array(req.body, "agent_ids");
+
+                if (plugin.empty() || action.empty()) {
+                    res.status = 400;
+                    res.set_content("{\"error\":\"plugin and action are required\"}",
+                        "application/json");
+                    return;
                 }
 
-                if (!agent_service_.has_agent()) {
+                if (!registry_.has_any()) {
                     res.status = 503;
                     res.set_content("{\"error\":\"no agent connected\"}",
                         "application/json");
                     return;
                 }
 
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id("chargen-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count()));
-                cmd.set_plugin("chargen");
-                cmd.set_action("chargen_start");
+                auto command_id = plugin + "-" + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count());
 
-                if (!agent_service_.send_command(cmd)) {
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin(plugin);
+                cmd.set_action(action);
+
+                agent_service_.record_send_time(command_id);
+
+                int sent = 0;
+                if (agent_ids.empty()) {
+                    // Broadcast to all agents
+                    sent = registry_.send_to_all(cmd);
+                } else {
+                    for (const auto& aid : agent_ids) {
+                        if (registry_.send_to(aid, cmd)) {
+                            ++sent;
+                        }
+                    }
+                }
+
+                if (sent == 0) {
                     res.status = 503;
-                    res.set_content("{\"error\":\"failed to send command to agent\"}",
+                    res.set_content("{\"error\":\"failed to send command to any agent\"}",
                         "application/json");
                     return;
                 }
 
-                {
-                    std::lock_guard<std::mutex> lock(chargen_state_->mu);
-                    chargen_state_->running = true;
-                }
-                chargen_state_->event_bus.publish("status", "running");
-                spdlog::info("Chargen started (command sent to agent)");
-                res.set_content("{\"status\":\"started\"}", "application/json");
+                spdlog::info("Command dispatched: {}:{} → {} agent(s)",
+                    plugin, action, sent);
+                res.set_content("{\"status\":\"sent\",\"command_id\":\"" + command_id +
+                    "\",\"agents_reached\":" + std::to_string(sent) + "}",
+                    "application/json");
+            });
+
+        // -- Legacy API endpoints (still functional, delegate to generic path) --
+
+        web_server_->Post("/api/chargen/start",
+            [this](const httplib::Request&, httplib::Response& res) {
+                forward_legacy_command("chargen", "chargen_start", res);
             });
 
         web_server_->Post("/api/chargen/stop",
             [this](const httplib::Request&, httplib::Response& res) {
-                {
-                    std::lock_guard<std::mutex> lock(chargen_state_->mu);
-                    if (!chargen_state_->running) {
-                        res.set_content("{\"status\":\"already_stopped\"}",
-                            "application/json");
-                        return;
-                    }
-                    chargen_state_->running = false;
-                }
+                forward_legacy_command("chargen", "chargen_stop", res);
+            });
 
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id("chargen-stop-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count()));
-                cmd.set_plugin("chargen");
-                cmd.set_action("chargen_stop");
-                agent_service_.send_command(cmd);
-
-                chargen_state_->event_bus.publish("status", "stopped");
-                spdlog::info("Chargen stop command sent to agent");
-                res.set_content("{\"status\":\"stopped\"}", "application/json");
+        web_server_->Post("/api/procfetch/fetch",
+            [this](const httplib::Request&, httplib::Response& res) {
+                forward_legacy_command("procfetch", "procfetch_fetch", res);
             });
 
         web_server_->Get("/api/chargen/status",
             [this](const httplib::Request&, httplib::Response& res) {
-                std::lock_guard<std::mutex> lock(chargen_state_->mu);
-                std::string status = chargen_state_->running ? "running" : "stopped";
-                bool agent_connected = agent_service_.has_agent();
                 res.set_content(
-                    "{\"status\":\"" + status + "\","
-                    "\"agent_connected\":" + (agent_connected ? "true" : "false") + "}",
+                    "{\"agent_connected\":" +
+                    std::string(registry_.has_any() ? "true" : "false") + "}",
                     "application/json");
-            });
-
-        // -- Process Fetch routes -------------------------------------------------
-
-        web_server_->Get("/procfetch", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kProcfetchIndexHtml, "text/html; charset=utf-8");
-        });
-
-        web_server_->Post("/api/procfetch/fetch",
-            [this](const httplib::Request&, httplib::Response& res) {
-                {
-                    std::lock_guard<std::mutex> lock(procfetch_state_->mu);
-                    if (procfetch_state_->fetching) {
-                        res.set_content("{\"status\":\"already_fetching\"}",
-                            "application/json");
-                        return;
-                    }
-                }
-
-                if (!agent_service_.has_agent()) {
-                    res.status = 503;
-                    res.set_content("{\"error\":\"no agent connected\"}",
-                        "application/json");
-                    return;
-                }
-
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id("procfetch-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count()));
-                cmd.set_plugin("procfetch");
-                cmd.set_action("procfetch_fetch");
-
-                if (!agent_service_.send_command(cmd)) {
-                    res.status = 503;
-                    res.set_content("{\"error\":\"failed to send command to agent\"}",
-                        "application/json");
-                    return;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock(procfetch_state_->mu);
-                    procfetch_state_->fetching = true;
-                }
-                chargen_state_->event_bus.publish("procfetch-status", "fetching");
-                spdlog::info("Procfetch fetch command sent to agent");
-                res.set_content("{\"status\":\"fetching\"}", "application/json");
             });
 
         web_server_->Get("/api/procfetch/status",
             [this](const httplib::Request&, httplib::Response& res) {
-                std::lock_guard<std::mutex> lock(procfetch_state_->mu);
-                std::string status = procfetch_state_->fetching ? "fetching" : "idle";
-                bool agent_connected = agent_service_.has_agent();
                 res.set_content(
-                    "{\"status\":\"" + status + "\","
-                    "\"agent_connected\":" + (agent_connected ? "true" : "false") + "}",
+                    "{\"agent_connected\":" +
+                    std::string(registry_.has_any() ? "true" : "false") + "}",
                     "application/json");
             });
 
@@ -684,13 +745,80 @@ private:
         });
     }
 
+    void forward_legacy_command(const std::string& plugin, const std::string& action,
+                                httplib::Response& res) {
+        if (!registry_.has_any()) {
+            res.status = 503;
+            res.set_content("{\"error\":\"no agent connected\"}", "application/json");
+            return;
+        }
+
+        auto command_id = plugin + "-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+
+        detail::pb::CommandRequest cmd;
+        cmd.set_command_id(command_id);
+        cmd.set_plugin(plugin);
+        cmd.set_action(action);
+
+        agent_service_.record_send_time(command_id);
+        int sent = registry_.send_to_all(cmd);
+
+        if (sent == 0) {
+            res.status = 503;
+            res.set_content("{\"error\":\"failed to send command\"}", "application/json");
+            return;
+        }
+        res.set_content("{\"status\":\"sent\"}", "application/json");
+    }
+
+    // -- Minimal JSON parsing (no external dependency) ------------------------
+
+    static std::string extract_json_string(const std::string& json, const std::string& key) {
+        auto needle = "\"" + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return {};
+        pos = json.find(':', pos + needle.size());
+        if (pos == std::string::npos) return {};
+        pos = json.find('"', pos + 1);
+        if (pos == std::string::npos) return {};
+        auto end = json.find('"', pos + 1);
+        if (end == std::string::npos) return {};
+        return json.substr(pos + 1, end - pos - 1);
+    }
+
+    static std::vector<std::string> extract_json_string_array(
+            const std::string& json, const std::string& key) {
+        std::vector<std::string> result;
+        auto needle = "\"" + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return result;
+        pos = json.find('[', pos);
+        if (pos == std::string::npos) return result;
+        auto end = json.find(']', pos);
+        if (end == std::string::npos) return result;
+        auto arr = json.substr(pos + 1, end - pos - 1);
+        // Extract all quoted strings from the array
+        std::size_t i = 0;
+        while (i < arr.size()) {
+            auto q1 = arr.find('"', i);
+            if (q1 == std::string::npos) break;
+            auto q2 = arr.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            result.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
+            i = q2 + 1;
+        }
+        return result;
+    }
+
     // -- Data members ---------------------------------------------------------
 
     Config                                     cfg_;
-    std::shared_ptr<detail::ChargenState>      chargen_state_;
-    std::shared_ptr<detail::ProcfetchState>    procfetch_state_;
+    detail::EventBus                           event_bus_;
+    detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;
     detail::ManagementServiceImpl              mgmt_service_;
+    std::shared_ptr<spdlog::logger>            file_logger_;
     std::unique_ptr<grpc::Server>              agent_server_;
     std::unique_ptr<grpc::Server>              mgmt_server_;
     std::unique_ptr<httplib::Server>           web_server_;
