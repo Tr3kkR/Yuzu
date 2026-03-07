@@ -2,7 +2,9 @@
 // the long raw string literal from MSVC's brace-matching in server.cpp.
 
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kDashboardIndexHtml = R"HTM(<!DOCTYPE html>
+extern const char* const kDashboardIndexHtml =
+// Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
+R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -230,7 +232,9 @@ extern const char* const kDashboardIndexHtml = R"HTM(<!DOCTYPE html>
   </div>
 
   <footer>Yuzu Server &mdash; Dashboard</footer>
-
+)HTM"
+// Part 2: JavaScript
+R"HTM(
   <script>
     /* ── State ─────────────────────────────────────────────── */
     var selectedScope = '__all__';
