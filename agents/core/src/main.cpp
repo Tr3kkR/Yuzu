@@ -51,10 +51,20 @@ int main(int argc, char* argv[]) {
     app.add_flag  ("--no-tls",   "Disable TLS (insecure, for development only)")
        ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
     app.add_option("--ca-cert",  cfg.tls_ca_cert,     "PEM CA certificate for server verification");
+    app.add_flag  ("--debug",    "Enable debug mode (diagnostic features)")
+       ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
+    app.add_flag  ("--verbose",  "Enable verbose logging")
+       ->each([&cfg](const std::string&) { cfg.verbose_logging = true; });
     app.add_option("--log-level", log_level,           "Log level: trace|debug|info|warn|error")
        ->default_val("info");
 
     CLI11_PARSE(app, argc, argv);
+
+    cfg.log_level = log_level;
+    if (cfg.verbose_logging) {
+        log_level = "trace";
+        cfg.log_level = "trace";
+    }
 
     // Configure logging
     spdlog::set_level(spdlog::level::from_str(log_level));

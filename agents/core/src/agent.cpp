@@ -10,6 +10,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/version.hpp>
 
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
@@ -19,9 +20,11 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 
 #include <atomic>
 #include <chrono>
+#include <format>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::agent {
@@ -38,7 +41,7 @@ using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::Comman
 // These are passed to plugins; they bridge the C ABI callbacks to gRPC streams.
 
 struct PluginContextImpl {
-    // TODO: hold reference to config map / secret store
+    std::unordered_map<std::string, std::string> config;
 };
 
 struct CommandContextImpl {
@@ -74,8 +77,11 @@ YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) 
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
-    (void)ctx; (void)key;
-    return nullptr;
+    if (!ctx || !key) return nullptr;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    auto it = impl->config.find(key);
+    if (it == impl->config.end()) return nullptr;
+    return it->second.c_str();
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
@@ -96,9 +102,32 @@ public:
 
         // 1. Load plugins
         auto scan = PluginLoader::scan(cfg_.plugin_dir);
+
+        // Collect successfully loaded handles first (before init)
+        std::vector<PluginHandle> candidates;
         for (auto& handle : scan.loaded) {
+            candidates.push_back(std::move(handle));
+        }
+
+        // Build the plugin context config map with agent state
+        plugin_ctx_.config["agent.id"]                 = cfg_.agent_id;
+        plugin_ctx_.config["agent.version"]            = std::string{yuzu::kFullVersionString};
+        plugin_ctx_.config["agent.build_number"]       = std::to_string(yuzu::kBuildNumber);
+        plugin_ctx_.config["agent.git_commit"]         = std::string{yuzu::kGitCommitHash};
+        plugin_ctx_.config["agent.server_address"]     = cfg_.server_address;
+        plugin_ctx_.config["agent.tls_enabled"]        = cfg_.tls_enabled ? "true" : "false";
+        plugin_ctx_.config["agent.heartbeat_interval"] = std::to_string(cfg_.heartbeat_interval.count());
+        plugin_ctx_.config["agent.plugin_dir"]         = cfg_.plugin_dir.string();
+        plugin_ctx_.config["agent.data_dir"]           = cfg_.data_dir.string();
+        plugin_ctx_.config["agent.log_level"]          = cfg_.log_level;
+        plugin_ctx_.config["agent.debug_mode"]         = cfg_.debug_mode ? "true" : "false";
+        plugin_ctx_.config["agent.verbose_logging"]    = cfg_.verbose_logging ? "true" : "false";
+
+        auto* raw_plugin_ctx = reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+
+        for (auto& handle : candidates) {
             if (handle.descriptor()->init) {
-                int rc = handle.descriptor()->init(nullptr);
+                int rc = handle.descriptor()->init(raw_plugin_ctx);
                 if (rc != 0) {
                     spdlog::warn("Plugin {} init returned {}, skipping",
                         handle.descriptor()->name, rc);
@@ -107,6 +136,15 @@ public:
             }
             plugin_names_.emplace_back(handle.descriptor()->name);
             plugins_.push_back(std::move(handle));
+        }
+
+        // Populate plugin list in config (available to all plugins via get_config)
+        plugin_ctx_.config["agent.plugins.count"] = std::to_string(plugins_.size());
+        for (size_t i = 0; i < plugins_.size(); ++i) {
+            auto prefix = std::format("agent.plugins.{}", i);
+            plugin_ctx_.config[prefix + ".name"]        = plugins_[i].descriptor()->name;
+            plugin_ctx_.config[prefix + ".version"]     = plugins_[i].descriptor()->version;
+            plugin_ctx_.config[prefix + ".description"] = plugins_[i].descriptor()->description;
         }
 
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
@@ -134,7 +172,7 @@ public:
             pb::RegisterRequest req;
             auto* info = req.mutable_info();
             info->set_agent_id(cfg_.agent_id);
-            info->set_agent_version("0.1.0");
+            info->set_agent_version(std::string{yuzu::kFullVersionString});
 
             for (const auto& handle : plugins_) {
                 auto* pi = info->add_plugins();
@@ -282,7 +320,8 @@ public:
         // 6. Shutdown plugins (signals running commands like chargen to stop)
         for (auto& handle : plugins_) {
             if (handle.descriptor()->shutdown) {
-                handle.descriptor()->shutdown(nullptr);
+                handle.descriptor()->shutdown(
+                    reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
             }
         }
 
@@ -314,6 +353,7 @@ public:
 
 private:
     Config                              cfg_;
+    PluginContextImpl                   plugin_ctx_;
     std::string                         session_id_;
     std::atomic<bool>                   stop_requested_{false};
     std::atomic<grpc::ClientContext*>   subscribe_ctx_{nullptr};
