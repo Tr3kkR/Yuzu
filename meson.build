@@ -51,6 +51,7 @@ if build_agent
     subdir('agents/plugins/chargen')
     subdir('agents/plugins/procfetch')
     subdir('agents/plugins/netstat')
+    subdir('agents/plugins/sockwho')
   endif
 endif
 

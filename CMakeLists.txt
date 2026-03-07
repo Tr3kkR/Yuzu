@@ -65,6 +65,7 @@ if(YUZU_BUILD_AGENT)
     add_subdirectory(agents/plugins/chargen)
     add_subdirectory(agents/plugins/procfetch)
     add_subdirectory(agents/plugins/netstat)
+    add_subdirectory(agents/plugins/sockwho)
   endif()
 endif()
 

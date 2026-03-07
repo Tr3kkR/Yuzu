@@ -187,7 +187,7 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, chargen stop"
+    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, chargen stop"
            autocomplete="off" spellcheck="false">
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
@@ -248,14 +248,16 @@ R"HTM(
       'chargen':       { plugin: 'chargen',   action: 'chargen_start' },
       'chargen stop':  { plugin: 'chargen',   action: 'chargen_stop' },
       'procfetch':     { plugin: 'procfetch', action: 'procfetch_fetch' },
-      'netstat':       { plugin: 'netstat',   action: 'netstat_list' }
+      'netstat':       { plugin: 'netstat',   action: 'netstat_list' },
+      'sockwho':       { plugin: 'sockwho',  action: 'sockwho_list' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
     var columnSchemas = {
       'chargen':   ['Agent', 'Output'],
       'procfetch': ['Agent', 'PID', 'Name', 'Path', 'SHA-1'],
-      'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID']
+      'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
+      'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State']
     };
 
     /* ── Helpers ──────────────────────────────────────────── */
@@ -392,7 +394,7 @@ R"HTM(
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, chargen stop';
+          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, chargen stop';
         return;
       }
 
@@ -473,6 +475,17 @@ R"HTM(
           var parts = payload.split('|');
           if (parts.length >= 7) {
             addRow([agentName, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]]);
+          } else {
+            addRow([agentName, payload]);
+          }
+        } else if (plugin === 'sockwho') {
+          /* pid|name|path|proto|local_addr|local_port|remote_addr|remote_port|state */
+          var parts = payload.split('|');
+          if (parts.length >= 9) {
+            addRow([agentName, parts[0],
+                    parts[1].replace(/\\\|/g,'|'),
+                    parts[2].replace(/\\\|/g,'|'),
+                    parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
           } else {
             addRow([agentName, payload]);
           }
