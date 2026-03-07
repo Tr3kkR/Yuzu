@@ -82,6 +82,17 @@ The `run()` method uses `goto shutdown_plugins` for error handling. While functi
 
 ### Issues
 
+#### HIGH: Predictable session IDs (`server.cpp:330-331`)
+
+```cpp
+auto session_id = "session-" + std::to_string(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+```
+
+Session tokens are derived from a monotonic clock timestamp — they are sequential and predictable. An attacker who can observe one session ID can predict future ones. Combined with the unauthenticated HTTP API, this could allow session hijacking.
+
+**Fix:** Use a cryptographically secure random generator (e.g., `RAND_bytes()` from OpenSSL, which is already a transitive dependency via gRPC).
+
 #### HIGH: No enrollment token / pre-authentication (`agent.proto:40-42`)
 
 Any entity that possesses a valid client certificate signed by the CA can register as an agent with an arbitrary `agent_id`. The `RegisterRequest` has no `enrollment_token` field. In an enterprise environment, this means:
@@ -151,6 +162,17 @@ Agent metadata (agent_id, hostname, OS, arch) is concatenated directly into JSON
 - Whitespace variations
 
 A crafted request body could bypass validation or extract incorrect values.
+
+#### MEDIUM: Missing compiler hardening flags (`CompilerFlags.cmake`)
+
+The build does not enable:
+- `-D_FORTIFY_SOURCE=2` — compile-time/runtime buffer overflow detection
+- `-fstack-protector-strong` — stack canary protection
+- `-Wl,-z,relro,-z,now` (full RELRO) — GOT hardening against overwrite attacks
+- PIE enforcement for position-independent executables
+- MSVC `/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT` — ASLR + DEP on Windows
+
+These are standard enterprise hardening flags and should be enabled for release builds.
 
 #### MEDIUM: Web server binds to `0.0.0.0` by default
 
@@ -234,6 +256,7 @@ To deploy this in an enterprise today, an operator would need to:
 1. **Add authentication to HTTP endpoints** — Bearer token at minimum, OIDC/SSO for enterprise
 2. **Fix use-after-free risk in agent command dispatch** — Join threads before stream destruction
 3. **Fix JSON injection in `to_json()`** — Escape agent metadata properly
+4. **Use cryptographically secure session IDs** — Replace timestamp-based generation with `RAND_bytes()`
 
 ### P1 — Should fix for any serious deployment
 4. **Remove spdlog calls from signal handlers** — Undefined behavior
@@ -242,11 +265,12 @@ To deploy this in an enterprise today, an operator would need to:
 7. **Add config file support** — Stop passing secrets via CLI args
 
 ### P2 — Enterprise hardening
-8. Add Docker/K8s deployment manifests
-9. Add Prometheus metrics endpoint
-10. Implement certificate hot-reload
-11. Add agent reconnection with exponential backoff
-12. Implement the ManagementService gRPC API
-13. Add RBAC for web API and management API
-14. Implement session timeout enforcement
-15. Add structured JSON logging option
+8. Enable compiler hardening flags (`_FORTIFY_SOURCE`, stack protector, RELRO, PIE)
+9. Add Docker/K8s deployment manifests
+10. Add Prometheus metrics endpoint
+11. Implement certificate hot-reload
+12. Add agent reconnection with exponential backoff
+13. Implement the ManagementService gRPC API
+14. Add RBAC for web API and management API
+15. Implement session timeout enforcement
+16. Add structured JSON logging option
