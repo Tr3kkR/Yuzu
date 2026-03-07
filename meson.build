@@ -73,6 +73,7 @@ if build_agent
     subdir('agents/plugins/netstat')
     subdir('agents/plugins/sockwho')
     subdir('agents/plugins/status')
+    subdir('agents/plugins/device_identity')
   endif
 endif
 
