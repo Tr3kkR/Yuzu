@@ -113,6 +113,15 @@ Private keys are read into `std::string` objects and passed to gRPC. These strin
 
 **Recommendation:** Use `OPENSSL_cleanse()` or a secure allocator for key material. At minimum, zero the strings after passing them to gRPC.
 
+#### MEDIUM: Agent UUID generation uses non-cryptographic PRNG (`identity_store.cpp:14-39`)
+
+```cpp
+std::random_device rd;
+std::mt19937_64 gen(rd());
+```
+
+`std::mt19937_64` is a Mersenne Twister — deterministic and recoverable from observed output. If an attacker observes an agent's UUID (e.g., via the unauthenticated `/api/agents` endpoint), they could theoretically recover the PRNG state and predict UUIDs generated on the same machine. Use `RAND_bytes()` from OpenSSL (already a transitive dependency) instead.
+
 #### MEDIUM: No certificate rotation / hot-reload
 
 Certificates are loaded once at startup. Rotating certificates requires a full process restart. For enterprise deployments with short-lived certificates (e.g., Vault PKI, SPIFFE), this is a significant operational burden.
@@ -151,9 +160,11 @@ json += "{\"agent_id\":\"" + s->agent_id + "\",\"hostname\":\"" + s->hostname + 
 
 Agent metadata (agent_id, hostname, OS, arch) is concatenated directly into JSON without escaping. If an agent registers with a hostname containing `"`, `\`, or control characters, this produces malformed or injectable JSON. While the agent itself controls this data (and mTLS limits who can register), a compromised agent could inject arbitrary JSON that the dashboard JavaScript would parse.
 
-**Fix:** Use proper JSON escaping, or adopt a lightweight JSON library (nlohmann/json is already common in vcpkg).
+**Fix:** Use proper JSON escaping, or adopt nlohmann/json which is **already a declared dependency** in `vcpkg.json`.
 
 #### HIGH: Hand-rolled JSON parser is fragile (`server.cpp:931-966`)
+
+Note: `nlohmann-json` is already listed in `vcpkg.json` as a dependency, making the hand-rolled parser entirely unnecessary.
 
 `extract_json_string()` and `extract_json_string_array()` use simple string searching. They don't handle:
 - Escaped quotes in values (`\"`)
