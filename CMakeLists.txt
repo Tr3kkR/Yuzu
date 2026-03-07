@@ -47,6 +47,7 @@ find_package(spdlog      CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(CLI11       CONFIG REQUIRED)
 find_package(httplib     CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 # ── Protobuf / gRPC code generation ──────────────────────────────────────────
 add_subdirectory(proto)
@@ -62,6 +63,9 @@ if(YUZU_BUILD_AGENT)
   if(YUZU_BUILD_EXAMPLES)
     add_subdirectory(agents/plugins/example)
     add_subdirectory(agents/plugins/chargen)
+    add_subdirectory(agents/plugins/procfetch)
+    add_subdirectory(agents/plugins/netstat)
+    add_subdirectory(agents/plugins/sockwho)
   endif()
 endif()
 

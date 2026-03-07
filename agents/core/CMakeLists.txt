@@ -3,6 +3,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/modules/CompilerFlags.cmake)
 # ── Agent static library (re-used by tests) ───────────────────────────────────
 add_library(yuzu_agent_core STATIC
   src/agent.cpp
+  src/identity_store.cpp
   src/plugin_loader.cpp
 )
 add_library(yuzu::agent_core ALIAS yuzu_agent_core)
@@ -17,6 +18,7 @@ target_link_libraries(yuzu_agent_core
     yuzu::sdk
     yuzu_proto
     spdlog::spdlog
+    unofficial::sqlite3::sqlite3
 )
 
 target_compile_definitions(yuzu_agent_core PRIVATE YUZU_AGENT_CORE_BUILDING)

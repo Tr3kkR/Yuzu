@@ -14,6 +14,7 @@ struct Config {
     std::string              server_address;     // e.g. "server.example.com:50051"
     std::string              agent_id;           // Stable UUID; generated on first run if empty
     std::filesystem::path    plugin_dir;         // Directory to scan for plugin .so/.dll
+    std::filesystem::path    data_dir;           // Directory for persistent state (agent.db)
     std::chrono::seconds     heartbeat_interval{30};
     bool                     tls_enabled{true};
     std::filesystem::path    tls_ca_cert;        // PEM CA certificate for server verification
