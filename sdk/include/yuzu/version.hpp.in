@@ -1,0 +1,23 @@
+/**
+ * yuzu/version.hpp.in — CMake configure_file template
+ *
+ * This file is processed by CMake to produce version.hpp with build-time
+ * values substituted. Do NOT edit the generated version.hpp directly.
+ */
+
+#pragma once
+
+#include <string_view>
+
+namespace yuzu {
+
+inline constexpr int kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr int kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr int kVersionPatch = @PROJECT_VERSION_PATCH@;
+inline constexpr int kBuildNumber  = @YUZU_BUILD_NUMBER@;
+
+inline constexpr std::string_view kVersionString     = "@PROJECT_VERSION@";
+inline constexpr std::string_view kFullVersionString  = "@PROJECT_VERSION@+@YUZU_BUILD_NUMBER@";
+inline constexpr std::string_view kGitCommitHash      = "@YUZU_GIT_COMMIT_HASH@";
+
+}  // namespace yuzu

@@ -13,6 +13,43 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# ── Build number from git ────────────────────────────────────────────────────
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-list --count HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE YUZU_BUILD_NUMBER
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _git_count_rc
+  )
+  if(NOT _git_count_rc EQUAL 0)
+    set(YUZU_BUILD_NUMBER "0")
+  endif()
+
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE YUZU_GIT_COMMIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE _git_hash_rc
+  )
+  if(NOT _git_hash_rc EQUAL 0)
+    set(YUZU_GIT_COMMIT_HASH "unknown")
+  endif()
+else()
+  set(YUZU_BUILD_NUMBER "0")
+  set(YUZU_GIT_COMMIT_HASH "unknown")
+endif()
+
+configure_file(
+  "${CMAKE_SOURCE_DIR}/sdk/include/yuzu/version.hpp.in"
+  "${CMAKE_BINARY_DIR}/generated/include/yuzu/version.hpp"
+  @ONLY
+)
+
 # ── Policies ──────────────────────────────────────────────────────────────────
 cmake_policy(SET CMP0091 NEW)  # MSVC runtime library via CMAKE_MSVC_RUNTIME_LIBRARY
 cmake_policy(SET CMP0135 NEW)  # FetchContent timestamp
@@ -66,6 +103,7 @@ if(YUZU_BUILD_AGENT)
     add_subdirectory(agents/plugins/procfetch)
     add_subdirectory(agents/plugins/netstat)
     add_subdirectory(agents/plugins/sockwho)
+    add_subdirectory(agents/plugins/status)
   endif()
 endif()
 
@@ -86,4 +124,8 @@ include(GNUInstallDirs)
 install(
   DIRECTORY sdk/include/
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+)
+install(
+  FILES "${CMAKE_BINARY_DIR}/generated/include/yuzu/version.hpp"
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/yuzu"
 )

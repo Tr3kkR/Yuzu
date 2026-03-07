@@ -187,7 +187,7 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, chargen stop"
+    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, status, chargen stop"
            autocomplete="off" spellcheck="false">
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
@@ -245,11 +245,18 @@ R"HTM(
 
     /* ── Instruction mapping ──────────────────────────────── */
     var instructionMap = {
-      'chargen':       { plugin: 'chargen',   action: 'chargen_start' },
-      'chargen stop':  { plugin: 'chargen',   action: 'chargen_stop' },
-      'procfetch':     { plugin: 'procfetch', action: 'procfetch_fetch' },
-      'netstat':       { plugin: 'netstat',   action: 'netstat_list' },
-      'sockwho':       { plugin: 'sockwho',  action: 'sockwho_list' }
+      'chargen':          { plugin: 'chargen',   action: 'chargen_start' },
+      'chargen stop':     { plugin: 'chargen',   action: 'chargen_stop' },
+      'procfetch':        { plugin: 'procfetch', action: 'procfetch_fetch' },
+      'netstat':          { plugin: 'netstat',   action: 'netstat_list' },
+      'sockwho':          { plugin: 'sockwho',   action: 'sockwho_list' },
+      'status':           { plugin: 'status',    action: 'info' },
+      'status version':   { plugin: 'status',    action: 'version' },
+      'status info':      { plugin: 'status',    action: 'info' },
+      'status health':    { plugin: 'status',    action: 'health' },
+      'status plugins':   { plugin: 'status',    action: 'plugins' },
+      'status connection': { plugin: 'status',   action: 'connection' },
+      'status config':    { plugin: 'status',    action: 'config' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
@@ -257,7 +264,8 @@ R"HTM(
       'chargen':   ['Agent', 'Output'],
       'procfetch': ['Agent', 'PID', 'Name', 'Path', 'SHA-1'],
       'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
-      'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State']
+      'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
+      'status':    ['Agent', 'Key', 'Value']
     };
 
     /* ── Helpers ──────────────────────────────────────────── */
@@ -394,7 +402,7 @@ R"HTM(
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, chargen stop';
+          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, status, chargen stop';
         return;
       }
 
@@ -488,6 +496,14 @@ R"HTM(
                     parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
           } else {
             addRow([agentName, payload]);
+          }
+        } else if (plugin === 'status') {
+          /* key|value */
+          var parts = payload.split('|');
+          if (parts.length >= 2) {
+            addRow([agentName, parts[0], parts.slice(1).join('|')]);
+          } else {
+            addRow([agentName, payload, '']);
           }
         } else {
           addRow([agentName, payload]);

@@ -6,6 +6,7 @@
 
 #include <csignal>
 #include <cstdlib>
+#include <format>
 #include <memory>
 #include <string>
 
@@ -18,7 +19,7 @@ static void on_signal(int sig) {
 
 int main(int argc, char* argv[]) {
     CLI::App app{"Yuzu Server", "yuzu-server"};
-    app.set_version_flag("--version", std::string{yuzu::kVersionString});
+    app.set_version_flag("--version", std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
 
     yuzu::server::Config cfg;
     std::string log_level = "info";
@@ -46,7 +47,7 @@ int main(int argc, char* argv[]) {
     spdlog::set_level(spdlog::level::from_str(log_level));
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
 
-    spdlog::info("Yuzu Server v{}", yuzu::kVersionString);
+    spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);

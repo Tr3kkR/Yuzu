@@ -82,6 +82,9 @@ class PluginContext {
 public:
     explicit PluginContext(YuzuPluginContext* raw) noexcept : raw_{raw} {}
 
+    /** Returns the underlying C context pointer (for caching across calls). */
+    [[nodiscard]] YuzuPluginContext* raw() const noexcept { return raw_; }
+
     [[nodiscard]] std::string_view get_config(std::string_view key) const noexcept {
         const char* v = yuzu_ctx_get_config(raw_, std::string{key}.c_str());
         return v ? v : std::string_view{};

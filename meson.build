@@ -21,6 +21,26 @@ if host_machine.system() == 'windows'
   add_project_arguments('/wd4251','/wd4127','/wd4275', language: 'cpp')
 endif
 
+# ── Build number from git ────────────────────────────────────────────────────
+git = find_program('git', required: false)
+if git.found()
+  git_count = run_command(git, 'rev-list', '--count', 'HEAD', check: false)
+  yuzu_build_number = git_count.returncode() == 0 ? git_count.stdout().strip() : '0'
+  git_hash = run_command(git, 'rev-parse', '--short', 'HEAD', check: false)
+  yuzu_git_commit_hash = git_hash.returncode() == 0 ? git_hash.stdout().strip() : 'unknown'
+else
+  yuzu_build_number = '0'
+  yuzu_git_commit_hash = 'unknown'
+endif
+
+version_conf = configuration_data()
+version_conf.set('PROJECT_VERSION_MAJOR', meson.project_version().split('.')[0])
+version_conf.set('PROJECT_VERSION_MINOR', meson.project_version().split('.')[1])
+version_conf.set('PROJECT_VERSION_PATCH', meson.project_version().split('.')[2])
+version_conf.set('YUZU_BUILD_NUMBER', yuzu_build_number)
+version_conf.set('YUZU_GIT_COMMIT_HASH', yuzu_git_commit_hash)
+version_conf.set('PROJECT_VERSION', meson.project_version())
+
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')
 build_server   = get_option('build_server')
@@ -52,6 +72,7 @@ if build_agent
     subdir('agents/plugins/procfetch')
     subdir('agents/plugins/netstat')
     subdir('agents/plugins/sockwho')
+    subdir('agents/plugins/status')
   endif
 endif
 
