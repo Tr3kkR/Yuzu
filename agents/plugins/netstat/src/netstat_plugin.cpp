@@ -366,9 +366,9 @@ std::string format_addr4(DWORD addr) {
     return buf;
 }
 
-std::string format_addr6(const IN6_ADDR& addr) {
+std::string format_addr6(const void* addr) {
     char buf[INET6_ADDRSTRLEN]{};
-    inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
+    inet_ntop(AF_INET6, addr, buf, sizeof(buf));
     return buf;
 }
 
