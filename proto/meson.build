@@ -1,5 +1,22 @@
-protoc = find_program('protoc', required: true)
-grpc_cpp_plugin = find_program('grpc_cpp_plugin', required: true)
+# Locate protoc and grpc_cpp_plugin.  When PATH doesn't include the vcpkg
+# tools directories (e.g. CLion builds), fall back to the vcpkg install tree
+# using cmake_prefix_path (set automatically by vcpkg toolchain integration).
+_protoc_extra_dirs = []
+_grpc_extra_dirs   = []
+_cmake_prefixes = get_option('cmake_prefix_path')
+foreach _prefix : _cmake_prefixes
+  _protoc_extra_dirs += _prefix / 'tools' / 'protobuf'
+  _grpc_extra_dirs   += _prefix / 'tools' / 'grpc'
+endforeach
+
+protoc = find_program('protoc',
+  dirs: _protoc_extra_dirs,
+  required: true,
+)
+grpc_cpp_plugin = find_program('grpc_cpp_plugin',
+  dirs: _grpc_extra_dirs,
+  required: true,
+)
 
 proto_root = meson.current_source_dir()
 

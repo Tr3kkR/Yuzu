@@ -37,6 +37,11 @@ int main(int argc, char* argv[]) {
     app.add_option("--cert",       cfg.tls_server_cert,    "PEM server certificate");
     app.add_option("--key",        cfg.tls_server_key,     "PEM server private key");
     app.add_option("--ca-cert",    cfg.tls_ca_cert,        "PEM CA cert (for mTLS agent verification)");
+    app.add_flag  ("--allow-one-way-tls", "Allow TLS without --ca-cert (disables mTLS)")
+       ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+    app.add_option("--management-cert",    cfg.mgmt_tls_server_cert, "PEM management server certificate override");
+    app.add_option("--management-key",     cfg.mgmt_tls_server_key,  "PEM management server private key override");
+    app.add_option("--management-ca-cert", cfg.mgmt_tls_ca_cert,     "PEM CA cert for management client cert verification");
     app.add_option("--max-agents", cfg.max_agents,         "Maximum concurrent agent connections")
        ->default_val(10000);
     app.add_option("--log-level",  log_level,              "Log level: trace|debug|info|warn|error")

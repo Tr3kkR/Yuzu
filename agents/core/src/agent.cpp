@@ -20,6 +20,8 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <mutex>
 #include <string>
@@ -32,6 +34,14 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
+
+std::string read_file_contents(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    return std::string(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+}
 
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
 // (Subscribe RPC: stream CommandResponse → stream CommandRequest)
@@ -156,15 +166,45 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
-        auto channel = grpc::CreateCustomChannel(
-            cfg_.server_address,
-            cfg_.tls_enabled
-                ? grpc::SslCredentials({})
-                : grpc::InsecureChannelCredentials(),
-            ch_args
-        );
+        std::shared_ptr<grpc::ChannelCredentials> creds;
+        std::shared_ptr<grpc::Channel> channel;
+        std::unique_ptr<pb::AgentService::Stub> stub;
+        if (cfg_.tls_enabled) {
+            grpc::SslCredentialsOptions ssl_opts;
+            if (!cfg_.tls_ca_cert.empty()) {
+                ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
+                if (ssl_opts.pem_root_certs.empty()) {
+                    spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
+                    goto shutdown_plugins;
+                }
+            }
 
-        auto stub = pb::AgentService::NewStub(channel);
+            const bool has_client_cert = !cfg_.tls_client_cert.empty();
+            const bool has_client_key = !cfg_.tls_client_key.empty();
+            if (has_client_cert != has_client_key) {
+                spdlog::error("mTLS requires both --client-cert and --client-key");
+                goto shutdown_plugins;
+            }
+
+            if (has_client_cert && has_client_key) {
+                ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
+                ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
+                if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                    spdlog::error("Failed to read client cert/key for mTLS");
+                    goto shutdown_plugins;
+                } else {
+                    spdlog::info("mTLS enabled: using client certificate");
+                }
+            }
+            creds = grpc::SslCredentials(ssl_opts);
+        } else {
+            creds = grpc::InsecureChannelCredentials();
+        }
+
+        channel = grpc::CreateCustomChannel(
+            cfg_.server_address, creds, ch_args);
+
+        stub = pb::AgentService::NewStub(channel);
 
         // 3. Register with server
         {
@@ -200,6 +240,9 @@ public:
         // 4. Open Subscribe bidi stream
         {
             grpc::ClientContext sub_ctx;
+            if (!session_id_.empty()) {
+                sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
+            }
             subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
 
             auto stream = stub->Subscribe(&sub_ctx);

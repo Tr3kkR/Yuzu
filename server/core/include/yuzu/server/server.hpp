@@ -17,6 +17,13 @@ struct Config {
     std::filesystem::path tls_server_cert;   // PEM server certificate
     std::filesystem::path tls_server_key;    // PEM server private key
     std::filesystem::path tls_ca_cert;       // For mTLS agent verification
+    bool                  allow_one_way_tls{false}; // Permit TLS without client cert verification
+
+    // Optional management listener TLS override.
+    // If left empty, management reuses the agent listener credentials.
+    std::filesystem::path mgmt_tls_server_cert;
+    std::filesystem::path mgmt_tls_server_key;
+    std::filesystem::path mgmt_tls_ca_cert;
 
     // Session management
     std::chrono::seconds  session_timeout{90};  // Agents disconnected after this many seconds without heartbeat

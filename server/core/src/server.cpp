@@ -2,6 +2,7 @@
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
+#include <grpc/grpc_security_constants.h>
 
 #include "agent.grpc.pb.h"
 #include "management.grpc.pb.h"
@@ -25,6 +26,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <string_view>
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -305,15 +307,24 @@ void sse_resource_release(
 
 class AgentServiceImpl : public pb::AgentService::Service {
 public:
-    AgentServiceImpl(AgentRegistry& registry, EventBus& bus)
-        : registry_(registry), bus_(bus) {}
+    AgentServiceImpl(AgentRegistry& registry, EventBus& bus, bool require_client_identity)
+        : registry_(registry), bus_(bus), require_client_identity_(require_client_identity) {}
 
     grpc::Status Register(
-        grpc::ServerContext* /*context*/,
+        grpc::ServerContext* context,
         const pb::RegisterRequest* request,
         pb::RegisterResponse* response) override
     {
         const auto& info = request->info();
+
+        if (require_client_identity_) {
+            if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
+                spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
+                return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                    "agent_id must match client certificate identity (CN/SAN)");
+            }
+        }
+
         registry_.register_agent(info);
 
         auto session_id = "session-" + std::to_string(
@@ -321,36 +332,61 @@ public:
         response->set_session_id(session_id);
         response->set_accepted(true);
 
-        // Store agent_id in thread-local for the Subscribe call that follows.
+        PendingRegistration pending;
+        pending.agent_id = info.agent_id();
+        pending.register_peer = context ? context->peer() : std::string{};
+        pending.peer_identities = context ? extract_peer_identities(*context) : std::vector<std::string>{};
+        pending.created_at = std::chrono::steady_clock::now();
         {
             std::lock_guard lock(pending_mu_);
-            // Key by agent_id so Subscribe can look it up.
-            pending_agent_ids_.insert(info.agent_id());
+            prune_expired_pending_locked();
+            pending_by_session_id_[session_id] = std::move(pending);
         }
 
         return grpc::Status::OK;
     }
 
     grpc::Status Subscribe(
-        grpc::ServerContext* /*context*/,
+        grpc::ServerContext* context,
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) override
     {
-        // Determine which agent this stream belongs to.
-        // The agent writes its first response which contains the command_id we can correlate,
-        // but we also know it just called Register. We set the stream for all pending agents.
+        if (!context) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, "missing server context");
+        }
+
+        const auto session_id = client_metadata_value(*context, kSessionMetadataKey);
+        if (session_id.empty()) {
+            spdlog::warn("Subscribe rejected: missing {} metadata", kSessionMetadataKey);
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "missing session metadata");
+        }
+
         std::string agent_id;
         {
             std::lock_guard lock(pending_mu_);
-            if (!pending_agent_ids_.empty()) {
-                agent_id = *pending_agent_ids_.begin();
-                pending_agent_ids_.erase(pending_agent_ids_.begin());
+            prune_expired_pending_locked();
+            auto it = pending_by_session_id_.find(session_id);
+            if (it == pending_by_session_id_.end()) {
+                spdlog::warn("Subscribe rejected: unknown or expired session id");
+                return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                    "invalid or expired session");
             }
-        }
 
-        if (agent_id.empty()) {
-            spdlog::warn("Subscribe called but no pending agent registration");
-            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
-                                "Register must be called before Subscribe");
+            if (it->second.register_peer != context->peer()) {
+                spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
+                return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
+            }
+
+            if (require_client_identity_) {
+                const auto subscribe_ids = extract_peer_identities(*context);
+                if (!has_identity_overlap(it->second.peer_identities, subscribe_ids)) {
+                    spdlog::warn("Subscribe rejected: mTLS identity mismatch for session {}", session_id);
+                    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer identity mismatch");
+                }
+            }
+
+            agent_id = it->second.agent_id;
+            pending_by_session_id_.erase(it);
         }
 
         spdlog::info("Agent subscribe stream opened for {}", agent_id);
@@ -434,6 +470,80 @@ public:
     }
 
 private:
+    struct PendingRegistration {
+        std::string agent_id;
+        std::string register_peer;
+        std::vector<std::string> peer_identities;
+        std::chrono::steady_clock::time_point created_at;
+    };
+
+    static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context) {
+        std::vector<std::string> out;
+        auto auth_ctx = context.auth_context();
+        if (!auth_ctx || !auth_ctx->IsPeerAuthenticated()) {
+            return out;
+        }
+
+        auto append_unique = [&out](std::string_view s) {
+            if (s.empty()) return;
+            for (const auto& existing : out) {
+                if (existing == s) return;
+            }
+            out.emplace_back(s);
+        };
+
+        for (const auto& id : auth_ctx->GetPeerIdentity()) {
+            append_unique(std::string_view{id.data(), id.size()});
+        }
+        for (const auto& cn : auth_ctx->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME)) {
+            append_unique(std::string_view{cn.data(), cn.size()});
+        }
+        for (const auto& san : auth_ctx->FindPropertyValues(GRPC_X509_SAN_PROPERTY_NAME)) {
+            append_unique(std::string_view{san.data(), san.size()});
+        }
+
+        return out;
+    }
+
+    static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
+                                               const std::string& agent_id) {
+        if (agent_id.empty()) return false;
+        const auto identities = extract_peer_identities(context);
+        for (const auto& id : identities) {
+            if (id == agent_id) return true;
+        }
+        return false;
+    }
+
+    static std::string client_metadata_value(const grpc::ServerContext& context,
+                                             std::string_view key) {
+        const auto& md = context.client_metadata();
+        auto it = md.find(std::string(key));
+        if (it == md.end()) return {};
+        return std::string(it->second.data(), it->second.length());
+    }
+
+    static bool has_identity_overlap(const std::vector<std::string>& lhs,
+                                     const std::vector<std::string>& rhs) {
+        for (const auto& left : lhs) {
+            for (const auto& right : rhs) {
+                if (left == right) return true;
+            }
+        }
+        return false;
+    }
+
+    void prune_expired_pending_locked() {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = pending_by_session_id_.begin(); it != pending_by_session_id_.end();) {
+            if (now - it->second.created_at > kPendingRegistrationTtl) {
+                it = pending_by_session_id_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     static std::string extract_plugin(const std::string& command_id) {
         // command_id format: "plugin-timestamp" e.g. "chargen-12345" or "netstat-12345"
         auto dash = command_id.find('-');
@@ -446,14 +556,18 @@ private:
     AgentRegistry& registry_;
     EventBus& bus_;
 
-    // Pending agent IDs from Register that haven't been paired with Subscribe yet.
+    static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
+    static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
+
+    // Pending Register calls waiting for the corresponding Subscribe.
     std::mutex pending_mu_;
-    std::unordered_set<std::string> pending_agent_ids_;
+    std::unordered_map<std::string, PendingRegistration> pending_by_session_id_;
 
     // Command timing instrumentation
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
+    bool require_client_identity_{false};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -481,7 +595,8 @@ public:
     explicit ServerImpl(Config cfg)
         : cfg_(std::move(cfg)),
           registry_(event_bus_),
-          agent_service_(registry_, event_bus_)
+          agent_service_(registry_, event_bus_,
+              cfg_.tls_enabled && !cfg_.tls_ca_cert.empty())
     {
         // Setup file logger
         auto log_path = detail::server_log_path();
@@ -510,12 +625,37 @@ public:
         spdlog::info("run(): entering");
         grpc::EnableDefaultHealthCheckService(true);
 
-        auto agent_creds = grpc::InsecureServerCredentials();
+        std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
+        std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
-            if (auto tls = build_tls_credentials()) {
+            auto tls = build_tls_credentials(
+                cfg_.tls_server_cert,
+                cfg_.tls_server_key,
+                cfg_.tls_ca_cert,
+                cfg_.allow_one_way_tls,
+                "agent listener");
+            if (tls) {
                 agent_creds = std::move(tls);
             } else {
-                spdlog::warn("TLS enabled but cert/key not provided -- falling back to insecure");
+                spdlog::error("TLS is enabled but credentials are invalid; refusing to start");
+                return;
+            }
+
+            if (!cfg_.mgmt_tls_server_cert.empty() || !cfg_.mgmt_tls_server_key.empty() ||
+                !cfg_.mgmt_tls_ca_cert.empty()) {
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.mgmt_tls_server_cert,
+                    cfg_.mgmt_tls_server_key,
+                    cfg_.mgmt_tls_ca_cert,
+                    true,
+                    "management listener");
+                if (!mgmt_tls) {
+                    spdlog::error("Management TLS credentials are invalid; refusing to start");
+                    return;
+                }
+                mgmt_creds = std::move(mgmt_tls);
+            } else {
+                mgmt_creds = agent_creds;
             }
         }
 
@@ -526,7 +666,7 @@ public:
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
-        builder.AddListeningPort(cfg_.management_address, grpc::InsecureServerCredentials());
+        builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
         builder.RegisterService(&mgmt_service_);
 
@@ -563,15 +703,20 @@ private:
     // -- TLS ------------------------------------------------------------------
 
     [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
-    build_tls_credentials() const {
-        if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+    build_tls_credentials(const std::filesystem::path& cert_path,
+                          const std::filesystem::path& key_path,
+                          const std::filesystem::path& ca_path,
+                          bool allow_one_way_tls,
+                          std::string_view listener_name) const {
+        if (cert_path.empty() || key_path.empty()) {
+            spdlog::error("{} TLS requires certificate and key", listener_name);
             return nullptr;
         }
 
-        auto cert = detail::read_file_contents(cfg_.tls_server_cert);
-        auto key  = detail::read_file_contents(cfg_.tls_server_key);
+        auto cert = detail::read_file_contents(cert_path);
+        auto key  = detail::read_file_contents(key_path);
         if (cert.empty() || key.empty()) {
-            spdlog::error("Failed to read TLS cert or key files");
+            spdlog::error("Failed to read {} TLS cert/key files", listener_name);
             return nullptr;
         }
 
@@ -581,13 +726,22 @@ private:
         pair.cert_chain  = std::move(cert);
         ssl_opts.pem_key_cert_pairs.push_back(std::move(pair));
 
-        if (!cfg_.tls_ca_cert.empty()) {
-            auto ca = detail::read_file_contents(cfg_.tls_ca_cert);
-            if (!ca.empty()) {
-                ssl_opts.pem_root_certs = std::move(ca);
-                ssl_opts.client_certificate_request =
-                    GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+        if (!ca_path.empty()) {
+            auto ca = detail::read_file_contents(ca_path);
+            if (ca.empty()) {
+                spdlog::error("Failed to read {} CA cert from {}", listener_name, ca_path.string());
+                return nullptr;
             }
+
+            ssl_opts.pem_root_certs = std::move(ca);
+            ssl_opts.client_certificate_request =
+                GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+        } else {
+            if (!allow_one_way_tls) {
+                spdlog::error("{} TLS requires --ca-cert (or enable --allow-one-way-tls)", listener_name);
+                return nullptr;
+            }
+            spdlog::warn("{} TLS running without client certificate verification", listener_name);
         }
 
         return grpc::SslServerCredentials(ssl_opts);

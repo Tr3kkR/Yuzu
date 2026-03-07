@@ -187,7 +187,7 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop"
+    <input type="text" id="instr-input" placeholder="status, os_info, hardware, users, installed_apps, msi_packages, network_config, netstat, sockwho, procfetch"
            autocomplete="off" spellcheck="false">
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
@@ -259,7 +259,36 @@ R"HTM(
       'status config':    { plugin: 'status',    action: 'config' },
       'device_identity':          { plugin: 'device_identity', action: 'device_name' },
       'device_identity domain':   { plugin: 'device_identity', action: 'domain' },
-      'device_identity ou':       { plugin: 'device_identity', action: 'ou' }
+      'device_identity ou':       { plugin: 'device_identity', action: 'ou' },
+      'os_info':                  { plugin: 'os_info', action: 'os_name' },
+      'os_info os_name':          { plugin: 'os_info', action: 'os_name' },
+      'os_info os_version':       { plugin: 'os_info', action: 'os_version' },
+      'os_info os_build':         { plugin: 'os_info', action: 'os_build' },
+      'os_info os_arch':          { plugin: 'os_info', action: 'os_arch' },
+      'os_info uptime':           { plugin: 'os_info', action: 'uptime' },
+      'hardware':                 { plugin: 'hardware', action: 'manufacturer' },
+      'hardware manufacturer':    { plugin: 'hardware', action: 'manufacturer' },
+      'hardware model':           { plugin: 'hardware', action: 'model' },
+      'hardware bios':            { plugin: 'hardware', action: 'bios' },
+      'hardware processors':     { plugin: 'hardware', action: 'processors' },
+      'hardware memory':          { plugin: 'hardware', action: 'memory' },
+      'hardware disks':           { plugin: 'hardware', action: 'disks' },
+      'users':                    { plugin: 'users', action: 'logged_on' },
+      'users logged_on':          { plugin: 'users', action: 'logged_on' },
+      'users sessions':           { plugin: 'users', action: 'sessions' },
+      'users local_users':        { plugin: 'users', action: 'local_users' },
+      'users local_admins':       { plugin: 'users', action: 'local_admins' },
+      'installed_apps':            { plugin: 'installed_apps', action: 'list' },
+      'installed_apps list':       { plugin: 'installed_apps', action: 'list' },
+      'installed_apps query':      { plugin: 'installed_apps', action: 'query' },
+      'msi_packages':              { plugin: 'msi_packages', action: 'list' },
+      'msi_packages list':         { plugin: 'msi_packages', action: 'list' },
+      'msi_packages product_codes': { plugin: 'msi_packages', action: 'product_codes' },
+      'network_config':              { plugin: 'network_config', action: 'adapters' },
+      'network_config adapters':     { plugin: 'network_config', action: 'adapters' },
+      'network_config ip_addresses': { plugin: 'network_config', action: 'ip_addresses' },
+      'network_config dns_servers':  { plugin: 'network_config', action: 'dns_servers' },
+      'network_config proxy':        { plugin: 'network_config', action: 'proxy' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
@@ -269,7 +298,13 @@ R"HTM(
       'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
       'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
       'status':            ['Agent', 'Key', 'Value'],
-      'device_identity':   ['Agent', 'Key', 'Value']
+      'device_identity':   ['Agent', 'Key', 'Value'],
+      'os_info':           ['Agent', 'Key', 'Value'],
+      'hardware':          ['Agent', 'Key', 'Value'],
+      'users':             ['Agent', 'Key', 'Value'],
+      'installed_apps':    ['Agent', 'Key', 'Value'],
+      'msi_packages':     ['Agent', 'Key', 'Value'],
+      'network_config':   ['Agent', 'Key', 'Value']
     };
 
     /* ── Helpers ──────────────────────────────────────────── */
@@ -406,7 +441,7 @@ R"HTM(
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop';
+          'Unknown instruction: "' + raw + '". Try: status, os_info, hardware, users, installed_apps, msi_packages, network_config, netstat, sockwho, procfetch, chargen';
         return;
       }
 
@@ -501,7 +536,7 @@ R"HTM(
           } else {
             addRow([agentName, payload]);
           }
-        } else if (plugin === 'status' || plugin === 'device_identity') {
+        } else if (plugin === 'status' || plugin === 'device_identity' || plugin === 'os_info' || plugin === 'hardware' || plugin === 'users' || plugin === 'installed_apps' || plugin === 'msi_packages' || plugin === 'network_config') {
           /* key|value */
           var parts = payload.split('|');
           if (parts.length >= 2) {

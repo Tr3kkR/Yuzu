@@ -97,3 +97,13 @@ vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
 - **Plugin ABI**: C API in `sdk/include/yuzu/plugin.h` must stay stable. C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary.
 - **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
 - **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
+
+## Authentication & Authorization (in progress)
+
+mTLS for agent ↔ server is implemented. Remaining work:
+
+1. **Enrollment token** — Add `enrollment_token` field to `RegisterRequest` in `agent.proto`. Server validates against a configured secret and rejects agents with invalid/missing tokens. Agent reads token from config/CLI.
+2. **API key guard on HTTP endpoints** — Protect `/api/*` and `/events` with a static API key (`Authorization: Bearer <key>` header). Config/env-driven. Dashboard should prompt or embed the key.
+3. **Admin / read-only roles** — Two-role model tied to API keys. Read-only: view dashboard, list agents, query inventory. Admin: send commands. `management.proto` already notes auth policies differ between agent-facing and operator-facing services.
+
+Certificate setup instructions: `scripts/Certificate Instructions.txt`.
