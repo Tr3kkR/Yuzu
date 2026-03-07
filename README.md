@@ -1,6 +1,6 @@
 # Yuzu
 
-A multi-platform agent and server framework for real-time endpoint management. Yuzu is the successor to 1e Tachyon, built from the ground up in C++23 with a focus on extensibility, performance, and cross-platform portability.
+A multi-platform agent and server framework for real-time endpoint management. Yuzu is the successor to a popular automation and orchestration suite, built from the ground up in C++23 with a focus on extensibility, performance, and cross-platform portability.
 
 ## Architecture
 
