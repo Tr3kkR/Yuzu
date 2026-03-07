@@ -187,7 +187,7 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, status, chargen stop"
+    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop"
            autocomplete="off" spellcheck="false">
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
@@ -256,7 +256,10 @@ R"HTM(
       'status health':    { plugin: 'status',    action: 'health' },
       'status plugins':   { plugin: 'status',    action: 'plugins' },
       'status connection': { plugin: 'status',   action: 'connection' },
-      'status config':    { plugin: 'status',    action: 'config' }
+      'status config':    { plugin: 'status',    action: 'config' },
+      'device_identity':          { plugin: 'device_identity', action: 'device_name' },
+      'device_identity domain':   { plugin: 'device_identity', action: 'domain' },
+      'device_identity ou':       { plugin: 'device_identity', action: 'ou' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
@@ -265,7 +268,8 @@ R"HTM(
       'procfetch': ['Agent', 'PID', 'Name', 'Path', 'SHA-1'],
       'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
       'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
-      'status':    ['Agent', 'Key', 'Value']
+      'status':            ['Agent', 'Key', 'Value'],
+      'device_identity':   ['Agent', 'Key', 'Value']
     };
 
     /* ── Helpers ──────────────────────────────────────────── */
@@ -402,7 +406,7 @@ R"HTM(
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, status, chargen stop';
+          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop';
         return;
       }
 
@@ -497,7 +501,7 @@ R"HTM(
           } else {
             addRow([agentName, payload]);
           }
-        } else if (plugin === 'status') {
+        } else if (plugin === 'status' || plugin === 'device_identity') {
           /* key|value */
           var parts = payload.split('|');
           if (parts.length >= 2) {

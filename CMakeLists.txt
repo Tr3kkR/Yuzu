@@ -104,6 +104,7 @@ if(YUZU_BUILD_AGENT)
     add_subdirectory(agents/plugins/netstat)
     add_subdirectory(agents/plugins/sockwho)
     add_subdirectory(agents/plugins/status)
+    add_subdirectory(agents/plugins/device_identity)
   endif()
 endif()
 
