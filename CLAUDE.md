@@ -98,12 +98,54 @@ vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
 - **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
 - **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
 
-## Authentication & Authorization (in progress)
+## Dual build systems — CMake + Meson
 
-mTLS for agent ↔ server is implemented. Remaining work:
+Both CMake and Meson build files must be kept in sync. **Every time you add, remove, or rename a source file, update both `CMakeLists.txt` and `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
 
-1. **Enrollment token** — Add `enrollment_token` field to `RegisterRequest` in `agent.proto`. Server validates against a configured secret and rejects agents with invalid/missing tokens. Agent reads token from config/CLI.
-2. **API key guard on HTTP endpoints** — Protect `/api/*` and `/events` with a static API key (`Authorization: Bearer <key>` header). Config/env-driven. Dashboard should prompt or embed the key.
-3. **Admin / read-only roles** — Two-role model tied to API keys. Read-only: view dashboard, list agents, query inventory. Admin: send commands. `management.proto` already notes auth policies differ between agent-facing and operator-facing services.
+### Meson build (Windows, from MSYS2 bash)
+```bash
+cat > /c/Users/natha/Yuzu/_build_tmp.bat << 'EOF'
+@echo off
+set PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set PATH=C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf;C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc;%PATH%
+cd /d C:\Users\natha\Yuzu
+meson compile -C builddir
+EOF
+powershell.exe -NoProfile -Command "& {cmd /c 'C:\Users\natha\Yuzu\_build_tmp.bat'}" 2>&1 | tail -60
+```
+
+### Windows toolchain requirements
+All of these must be reachable. vcvars64.bat sets most SDK/include/lib paths, but the others need manual PATH entries:
+| Tool | Path |
+|---|---|
+| vcvars64.bat | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat` |
+| vswhere.exe | `C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe` (needed by vcvars64) |
+| cl.exe | Set by vcvars64 — do **not** use Clang (`C:\Program Files\LLVM\bin`) |
+| cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` |
+| ninja.exe | Installed with CMake or VS BuildTools |
+| meson | `pip install meson` (Python) |
+| vcpkg | `C:\Users\natha\vcpkg` (`VCPKG_ROOT`) |
+| protoc | `C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
+| grpc_cpp_plugin | `C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
+
+**Friction note**: vcvars64.bat environment does not propagate through MSYS2 bash. Use the PowerShell + .bat wrapper pattern shown above.
+
+## Authentication & Authorization
+
+### Implemented
+- **mTLS** for agent ↔ server gRPC connections.
+- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Two roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
+- **Login page** — dark-themed, with greyed-out OIDC SSO stub ("Coming soon").
+- **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, greyed-out AD/Entra section.
+- **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
+- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
+
+### Remaining work
+1. **Enrollment token** — Add `enrollment_token` field to `RegisterRequest` in `agent.proto`. Server validates against a configured secret.
+2. **HTTPS for web dashboard** — currently HTTP only; add TLS termination.
+3. **OIDC SSO** — replace the stub login button with real OIDC flow.
+4. **AD/Entra directory integration** — inherit roles from domain groups.
+5. **Windows certificate store** — move cert storage from `/etc/yuzu/certs` to Windows crypto store on Windows hosts.
 
 Certificate setup instructions: `scripts/Certificate Instructions.txt`.

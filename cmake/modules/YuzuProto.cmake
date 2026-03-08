@@ -46,9 +46,9 @@ function(yuzu_proto_library)
       OUTPUT  "${PB_H}" "${PB_CC}" "${GRPC_H}" "${GRPC_CC}"
       # 1) Run protoc — outputs land in the subdirectory tree.
       COMMAND "${PROTOC_EXE}"
-        --cpp_out="${PROTO_OUT}"
-        --grpc_out="${PROTO_OUT}"
-        --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN}"
+        --cpp_out  "${PROTO_OUT}"
+        --grpc_out "${PROTO_OUT}"
+        "--plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}"
         -I "${PROTO_IMPORT_DIR}"
         "${PROTO_FILE}"
       # 2) Copy the generated files flat into PROTO_OUT.

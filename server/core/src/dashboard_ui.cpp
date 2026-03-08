@@ -180,6 +180,62 @@ R"HTM(<!DOCTYPE html>
       padding: 0.4rem 1rem; border-top: 1px solid var(--border);
       font-size: 0.7rem; color: #484f58;
     }
+
+    /* ── Hamburger Menu ──────────────────────────────────────── */
+    .hamburger-wrap {
+      position: relative; margin-left: auto;
+    }
+    .hamburger-btn {
+      background: none; border: 1px solid var(--border); border-radius: 0.375rem;
+      color: var(--fg); font-size: 1.2rem; padding: 0.2rem 0.55rem;
+      cursor: pointer; line-height: 1; transition: background 0.15s;
+    }
+    .hamburger-btn:hover { background: rgba(88,166,255,0.1); }
+    .hamburger-menu {
+      display: none; position: absolute; right: 0; top: 110%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.5rem; min-width: 160px; z-index: 1000;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      overflow: hidden;
+    }
+    .hamburger-menu.open { display: block; }
+    .hamburger-menu a, .hamburger-menu button {
+      display: block; width: 100%; padding: 0.55rem 1rem;
+      font-size: 0.8rem; color: var(--fg); text-align: left;
+      text-decoration: none; background: none; border: none;
+      cursor: pointer; transition: background 0.1s;
+    }
+    .hamburger-menu a:hover, .hamburger-menu button:hover {
+      background: rgba(88,166,255,0.1);
+    }
+    .hamburger-menu .divider {
+      height: 1px; background: var(--border); margin: 0.25rem 0;
+    }
+    .hamburger-user {
+      padding: 0.55rem 1rem; font-size: 0.7rem; color: #8b949e;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── About Modal ─────────────────────────────────────────── */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 2000;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.75rem; padding: 2rem; width: 380px;
+      text-align: center;
+    }
+    .modal h2 { font-size: 1.3rem; margin-bottom: 0.5rem; }
+    .modal .version { font-size: 0.8rem; color: #8b949e; margin-bottom: 1rem; }
+    .modal p { font-size: 0.8rem; color: #8b949e; line-height: 1.5; margin-bottom: 1rem; }
+    .modal .btn-close {
+      padding: 0.4rem 1.5rem; font-size: 0.8rem; font-weight: 500;
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 0.375rem; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -198,8 +254,33 @@ R"HTM(<!DOCTYPE html>
       <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
       <span>Total: <strong id="stat-total">&mdash;</strong></span>
     </div>
+    <div class="hamburger-wrap">
+      <button class="hamburger-btn" onclick="toggleMenu()" title="Menu">&#9776;</button>
+      <div class="hamburger-menu" id="hamburger-menu">
+        <div class="hamburger-user" id="menu-user">Signed in</div>
+        <a href="/settings">Settings</a>
+        <button onclick="showAbout()">About</button>
+        <div class="divider"></div>
+        <button onclick="doLogout()">Logout</button>
+      </div>
+    </div>
   </div>
 
+  <!-- ── About Modal ──────────────────────────────────────── -->
+  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
+    <div class="modal">
+      <h2>Yuzu</h2>
+      <div class="version">Agent &amp; Server Management Platform</div>
+      <p>Real-time endpoint management with gRPC/Protobuf transport,
+         plugin architecture, and multi-platform support.</p>
+      <p style="font-size:0.7rem">Built with C++23, gRPC, httplib, spdlog.</p>
+      <button class="btn-close" onclick="closeAbout()">Close</button>
+    </div>
+  </div>
+
+)HTM"
+// Part 2: HTML body continued
+R"HTM(
   <!-- ── Results ────────────────────────────────────────────── -->
   <div class="results">
     <div class="results-header">
@@ -488,7 +569,9 @@ R"HTM(
     document.getElementById('instr-input').addEventListener('keydown', function(e) {
       if (e.key === 'Enter') { e.preventDefault(); sendInstruction(); }
     });
-
+)HTM"
+// Part 4: SSE + menu JavaScript
+R"HTM(
     /* ── SSE ──────────────────────────────────────────────── */
     function connectSSE() {
       if (evtSource) evtSource.close();
@@ -582,10 +665,63 @@ R"HTM(
       evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
     }
 
+    /* ── Hamburger menu ───────────────────────────────────── */
+    function toggleMenu() {
+      document.getElementById('hamburger-menu').classList.toggle('open');
+    }
+    document.addEventListener('click', function(e) {
+      var wrap = document.querySelector('.hamburger-wrap');
+      if (wrap && !wrap.contains(e.target)) {
+        document.getElementById('hamburger-menu').classList.remove('open');
+      }
+    });
+
+    /* ── About modal ─────────────────────────────────────── */
+    function showAbout() {
+      document.getElementById('hamburger-menu').classList.remove('open');
+      document.getElementById('about-modal').classList.add('open');
+    }
+    function closeAbout(e) {
+      if (!e || e.target === document.getElementById('about-modal')) {
+        document.getElementById('about-modal').classList.remove('open');
+      }
+    }
+
+    /* ── Logout ──────────────────────────────────────────── */
+    function doLogout() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/logout');
+      xhr.onload = function() { window.location.href = '/login'; };
+      xhr.onerror = function() { window.location.href = '/login'; };
+      xhr.send();
+    }
+
+    /* ── Load current user info ──────────────────────────── */
+    function loadUserInfo() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/me');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          var data = JSON.parse(xhr.responseText);
+          document.getElementById('menu-user').textContent =
+            'Signed in as ' + data.username + ' (' + data.role + ')';
+          /* Hide settings link for non-admin */
+          if (data.role !== 'admin') {
+            var links = document.querySelectorAll('.hamburger-menu a[href="/settings"]');
+            for (var i = 0; i < links.length; i++) {
+              links[i].style.display = 'none';
+            }
+          }
+        }
+      };
+      xhr.send();
+    }
+
     /* ── Init ─────────────────────────────────────────────── */
     connectSSE();
     refreshAgentList();
     setInterval(refreshAgentList, 5000);
+    loadUserInfo();
   </script>
 </body>
 </html>

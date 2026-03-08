@@ -1,4 +1,5 @@
 #include <yuzu/server/server.hpp>
+#include <yuzu/server/auth.hpp>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -34,6 +35,10 @@ extern const char* const kDashboardIndexHtml;
 // Legacy UIs kept for backward compatibility (redirect to /).
 extern const char* const kChargenIndexHtml;
 extern const char* const kProcfetchIndexHtml;
+
+// Login and Settings pages (separate TUs).
+extern const char* const kLoginHtml;
+extern const char* const kSettingsHtml;
 
 namespace yuzu::server {
 
@@ -592,8 +597,9 @@ std::string read_file_contents(const std::filesystem::path& p) {
 
 class ServerImpl final : public Server {
 public:
-    explicit ServerImpl(Config cfg)
+    explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
+          auth_mgr_(auth_mgr),
           registry_(event_bus_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty())
@@ -749,13 +755,345 @@ private:
 
     // -- Web server -----------------------------------------------------------
 
+    // -- Base64 decode --------------------------------------------------------
+
+    static std::string base64_decode(const std::string& in) {
+        static constexpr unsigned char kTable[256] = {
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,62,64,64,64,63,
+            52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+            64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+            15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+            64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+            41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+            64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64
+        };
+        std::string out;
+        out.reserve(in.size() * 3 / 4);
+        unsigned int val = 0;
+        int bits = -8;
+        for (unsigned char c : in) {
+            if (kTable[c] == 64) continue;
+            val = (val << 6) | kTable[c];
+            bits += 6;
+            if (bits >= 0) {
+                out += static_cast<char>((val >> bits) & 0xFF);
+                bits -= 8;
+            }
+        }
+        return out;
+    }
+
+    // -- Auth helpers for HTTP ------------------------------------------------
+
+    static std::string extract_session_cookie(const httplib::Request& req) {
+        auto cookie = req.get_header_value("Cookie");
+        // Find yuzu_session=<token>
+        const std::string prefix = "yuzu_session=";
+        auto pos = cookie.find(prefix);
+        if (pos == std::string::npos) return {};
+        pos += prefix.size();
+        auto end = cookie.find(';', pos);
+        return cookie.substr(pos, end == std::string::npos ? end : end - pos);
+    }
+
+    static std::string url_decode(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (std::size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                auto hex = s.substr(i + 1, 2);
+                out += static_cast<char>(std::stoul(hex, nullptr, 16));
+                i += 2;
+            } else if (s[i] == '+') {
+                out += ' ';
+            } else {
+                out += s[i];
+            }
+        }
+        return out;
+    }
+
+    static std::string extract_form_value(const std::string& body, const std::string& key) {
+        auto needle = key + "=";
+        auto pos = body.find(needle);
+        if (pos == std::string::npos) return {};
+        pos += needle.size();
+        auto end = body.find('&', pos);
+        auto raw = body.substr(pos, end == std::string::npos ? end : end - pos);
+        return url_decode(raw);
+    }
+
+    std::optional<auth::Session> require_auth(const httplib::Request& req,
+                                              httplib::Response& res) {
+        auto token = extract_session_cookie(req);
+        auto session = auth_mgr_.validate_session(token);
+        if (!session) {
+            res.status = 401;
+            res.set_content(R"({"error":"unauthorized"})", "application/json");
+        }
+        return session;
+    }
+
+    bool require_admin(const httplib::Request& req, httplib::Response& res) {
+        auto session = require_auth(req, res);
+        if (!session) return false;
+        if (session->role != auth::Role::admin) {
+            res.status = 403;
+            res.set_content(R"({"error":"admin role required"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    // -- Web server -----------------------------------------------------------
+
     void start_web_server() {
         web_server_ = std::make_unique<httplib::Server>();
 
-        // Dashboard (unified UI)
+        // -- Auth middleware (pre-routing) -----------------------------------
+        web_server_->set_pre_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
+                // Allow unauthenticated access to login page
+                if (req.path == "/login") {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                // Check session cookie
+                auto token = extract_session_cookie(req);
+                auto session = auth_mgr_.validate_session(token);
+                if (!session) {
+                    // API calls get 401, pages get redirect
+                    if (req.path.starts_with("/api/") || req.path == "/events") {
+                        res.status = 401;
+                        res.set_content(R"({"error":"unauthorized"})",
+                                        "application/json");
+                    } else {
+                        res.set_redirect("/login");
+                    }
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+
+        // -- Login page -------------------------------------------------------
+        web_server_->Get("/login", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(kLoginHtml, "text/html; charset=utf-8");
+        });
+
+        web_server_->Post("/login",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto username = extract_form_value(req.body, "username");
+                auto password = extract_form_value(req.body, "password");
+
+                auto token = auth_mgr_.authenticate(username, password);
+                if (!token) {
+                    res.status = 401;
+                    res.set_content(R"({"error":"Invalid username or password"})",
+                                    "application/json");
+                    return;
+                }
+
+                res.set_header("Set-Cookie",
+                    "yuzu_session=" + *token +
+                    "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800");
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // -- Logout -----------------------------------------------------------
+        web_server_->Post("/logout",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto token = extract_session_cookie(req);
+                if (!token.empty()) {
+                    auth_mgr_.invalidate_session(token);
+                }
+                res.set_header("Set-Cookie",
+                    "yuzu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // -- Current user info (/api/me) --------------------------------------
+        web_server_->Get("/api/me",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                res.set_content(
+                    "{\"username\":\"" + session->username +
+                    "\",\"role\":\"" + auth::role_to_string(session->role) + "\"}",
+                    "application/json");
+            });
+
+        // -- Dashboard (unified UI) -------------------------------------------
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
+
+        // -- Settings page (admin only) ---------------------------------------
+        web_server_->Get("/settings",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) {
+                    res.set_redirect("/");
+                    return;
+                }
+                res.set_content(kSettingsHtml, "text/html; charset=utf-8");
+            });
+
+        // -- Settings API: TLS state ------------------------------------------
+        web_server_->Get("/api/settings/tls",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(
+                    "{\"tls_enabled\":" + std::string(cfg_.tls_enabled ? "true" : "false") +
+                    ",\"cert_path\":\"" + cfg_.tls_server_cert.string() +
+                    "\",\"key_path\":\"" + cfg_.tls_server_key.string() +
+                    "\",\"ca_path\":\"" + cfg_.tls_ca_cert.string() + "\"}",
+                    "application/json");
+            });
+
+        web_server_->Post("/api/settings/tls",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto val = extract_json_string(req.body, "tls_enabled");
+                cfg_.tls_enabled = (val == "true");
+                spdlog::info("TLS setting changed to {} (restart required)",
+                             cfg_.tls_enabled ? "enabled" : "disabled");
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // -- Settings API: Certificate upload (admin only) --------------------
+        web_server_->Post("/api/settings/cert-upload",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+
+                auto type     = extract_json_string(req.body, "type");
+                auto filename = extract_json_string(req.body, "filename");
+                auto b64      = extract_json_string(req.body, "content");
+
+                if (type.empty() || b64.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"type and content required"})",
+                                    "application/json");
+                    return;
+                }
+
+                // Decode base64 content
+                auto content = base64_decode(b64);
+                if (content.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid base64 content"})",
+                                    "application/json");
+                    return;
+                }
+
+                // Ensure cert dir exists
+                auto cert_dir = auth::default_cert_dir();
+                std::error_code ec;
+                std::filesystem::create_directories(cert_dir, ec);
+                if (ec) {
+                    res.status = 500;
+                    res.set_content(R"({"error":"cannot create cert directory"})",
+                                    "application/json");
+                    return;
+                }
+
+                // Determine filename and config field
+                std::string out_name;
+                if (type == "cert")     out_name = "server.pem";
+                else if (type == "key") out_name = "server-key.pem";
+                else if (type == "ca")  out_name = "ca.pem";
+                else {
+                    res.status = 400;
+                    res.set_content(R"({"error":"type must be cert, key, or ca"})",
+                                    "application/json");
+                    return;
+                }
+
+                auto out_path = cert_dir / out_name;
+                {
+                    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                    if (!f.is_open()) {
+                        res.status = 500;
+                        res.set_content(R"({"error":"cannot write cert file"})",
+                                        "application/json");
+                        return;
+                    }
+                    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+                }
+
+                // Update config
+                if (type == "cert")     cfg_.tls_server_cert = out_path;
+                else if (type == "key") cfg_.tls_server_key  = out_path;
+                else if (type == "ca")  cfg_.tls_ca_cert     = out_path;
+
+                spdlog::info("Certificate uploaded: {} → {}", type, out_path.string());
+                res.set_content(
+                    "{\"status\":\"ok\",\"path\":\"" + out_path.string() + "\"}",
+                    "application/json");
+            });
+
+        // -- Settings API: User management (admin only) -----------------------
+        web_server_->Get("/api/settings/users",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto users = auth_mgr_.list_users();
+                std::string json = "[";
+                bool first = true;
+                for (const auto& u : users) {
+                    if (!first) json += ",";
+                    first = false;
+                    json += "{\"username\":\"" + u.username +
+                            "\",\"role\":\"" + auth::role_to_string(u.role) + "\"}";
+                }
+                json += "]";
+                res.set_content(json, "application/json");
+            });
+
+        web_server_->Post("/api/settings/users",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto username = extract_json_string(req.body, "username");
+                auto password = extract_json_string(req.body, "password");
+                auto role_str = extract_json_string(req.body, "role");
+
+                if (username.empty() || password.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"username and password required"})",
+                                    "application/json");
+                    return;
+                }
+
+                auto role = auth::string_to_role(role_str);
+                auth_mgr_.upsert_user(username, password, role);
+                auth_mgr_.save_config();
+                spdlog::info("User '{}' added/updated (role={})", username, role_str);
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // DELETE /api/settings/users/:username
+        web_server_->Delete(R"(/api/settings/users/(.+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto username = req.matches[1].str();
+                if (auth_mgr_.remove_user(username)) {
+                    auth_mgr_.save_config();
+                    spdlog::info("User '{}' removed", username);
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"user not found"})",
+                                    "application/json");
+                }
+            });
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -968,6 +1306,7 @@ private:
     // -- Data members ---------------------------------------------------------
 
     Config                                     cfg_;
+    auth::AuthManager&                         auth_mgr_;
     detail::EventBus                           event_bus_;
     detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;
@@ -981,8 +1320,8 @@ private:
 
 // -- Factory ------------------------------------------------------------------
 
-std::unique_ptr<Server> Server::create(Config config) {
-    return std::make_unique<ServerImpl>(std::move(config));
+std::unique_ptr<Server> Server::create(Config config, auth::AuthManager& auth_mgr) {
+    return std::make_unique<ServerImpl>(std::move(config), auth_mgr);
 }
 
 }  // namespace yuzu::server

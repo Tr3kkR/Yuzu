@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 
+namespace yuzu::server::auth { class AuthManager; }
+
 namespace yuzu::server {
 
 struct Config {
@@ -28,6 +30,9 @@ struct Config {
     // Session management
     std::chrono::seconds  session_timeout{90};  // Agents disconnected after this many seconds without heartbeat
     std::size_t           max_agents{10'000};
+
+    // Authentication
+    std::filesystem::path auth_config_path;     // yuzu-server.cfg path
 };
 
 /**
@@ -37,7 +42,8 @@ class Server {
 public:
     virtual ~Server() = default;
 
-    [[nodiscard]] static std::unique_ptr<Server> create(Config config);
+    [[nodiscard]] static std::unique_ptr<Server> create(Config config,
+                                                        auth::AuthManager& auth_mgr);
 
     /** Block and serve until stop() is called. */
     virtual void run() = 0;

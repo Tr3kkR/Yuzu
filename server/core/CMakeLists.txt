@@ -2,9 +2,12 @@ include(${CMAKE_SOURCE_DIR}/cmake/modules/CompilerFlags.cmake)
 
 add_library(yuzu_server_core STATIC
   src/server.cpp
+  src/auth.cpp
   src/dashboard_ui.cpp
   src/chargen_ui.cpp
   src/procfetch_ui.cpp
+  src/login_ui.cpp
+  src/settings_ui.cpp
 )
 add_library(yuzu::server_core ALIAS yuzu_server_core)
 
@@ -17,6 +20,14 @@ target_link_libraries(yuzu_server_core
     spdlog::spdlog
     httplib::httplib
 )
+
+# Platform-specific crypto for auth module
+if(WIN32)
+  target_link_libraries(yuzu_server_core PUBLIC bcrypt)
+else()
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(yuzu_server_core PUBLIC OpenSSL::Crypto)
+endif()
 
 yuzu_set_compiler_flags(yuzu_server_core)
 
