@@ -369,7 +369,54 @@ R"HTM(
       'network_config adapters':     { plugin: 'network_config', action: 'adapters' },
       'network_config ip_addresses': { plugin: 'network_config', action: 'ip_addresses' },
       'network_config dns_servers':  { plugin: 'network_config', action: 'dns_servers' },
-      'network_config proxy':        { plugin: 'network_config', action: 'proxy' }
+      'network_config proxy':        { plugin: 'network_config', action: 'proxy' },
+      'diagnostics':                   { plugin: 'diagnostics', action: 'log_level' },
+      'diagnostics log_level':         { plugin: 'diagnostics', action: 'log_level' },
+      'diagnostics certificates':      { plugin: 'diagnostics', action: 'certificates' },
+      'diagnostics connection_info':   { plugin: 'diagnostics', action: 'connection_info' },
+      'agent_actions':                 { plugin: 'agent_actions', action: 'info' },
+      'agent_actions info':            { plugin: 'agent_actions', action: 'info' },
+      'agent_actions set_log_level':   { plugin: 'agent_actions', action: 'set_log_level' },
+      'processes':                     { plugin: 'processes', action: 'list' },
+      'processes list':                { plugin: 'processes', action: 'list' },
+      'processes query':               { plugin: 'processes', action: 'query' },
+      'services':                      { plugin: 'services', action: 'list' },
+      'services list':                 { plugin: 'services', action: 'list' },
+      'services running':              { plugin: 'services', action: 'running' },
+      'filesystem':                    { plugin: 'filesystem', action: 'exists' },
+      'filesystem exists':             { plugin: 'filesystem', action: 'exists' },
+      'filesystem list_dir':           { plugin: 'filesystem', action: 'list_dir' },
+      'filesystem file_hash':          { plugin: 'filesystem', action: 'file_hash' },
+      'network_diag':                  { plugin: 'network_diag', action: 'listening' },
+      'network_diag listening':        { plugin: 'network_diag', action: 'listening' },
+      'network_diag connections':      { plugin: 'network_diag', action: 'connections' },
+      'network_actions':               { plugin: 'network_actions', action: 'flush_dns' },
+      'network_actions flush_dns':     { plugin: 'network_actions', action: 'flush_dns' },
+      'network_actions ping':          { plugin: 'network_actions', action: 'ping' },
+      'firewall':                      { plugin: 'firewall', action: 'state' },
+      'firewall state':                { plugin: 'firewall', action: 'state' },
+      'firewall rules':                { plugin: 'firewall', action: 'rules' },
+      'antivirus':                     { plugin: 'antivirus', action: 'products' },
+      'antivirus products':            { plugin: 'antivirus', action: 'products' },
+      'antivirus status':              { plugin: 'antivirus', action: 'status' },
+      'bitlocker':                     { plugin: 'bitlocker', action: 'state' },
+      'bitlocker state':               { plugin: 'bitlocker', action: 'state' },
+      'windows_updates':               { plugin: 'windows_updates', action: 'installed' },
+      'windows_updates installed':     { plugin: 'windows_updates', action: 'installed' },
+      'windows_updates missing':       { plugin: 'windows_updates', action: 'missing' },
+      'event_logs':                    { plugin: 'event_logs', action: 'errors' },
+      'event_logs errors':             { plugin: 'event_logs', action: 'errors' },
+      'event_logs query':              { plugin: 'event_logs', action: 'query' },
+      'sccm':                          { plugin: 'sccm', action: 'client_version' },
+      'sccm client_version':           { plugin: 'sccm', action: 'client_version' },
+      'sccm site':                     { plugin: 'sccm', action: 'site' },
+      'script_exec':                   { plugin: 'script_exec', action: 'exec' },
+      'script_exec exec':              { plugin: 'script_exec', action: 'exec' },
+      'script_exec powershell':        { plugin: 'script_exec', action: 'powershell' },
+      'script_exec bash':              { plugin: 'script_exec', action: 'bash' },
+      'software_actions':              { plugin: 'software_actions', action: 'list_upgradable' },
+      'software_actions list_upgradable': { plugin: 'software_actions', action: 'list_upgradable' },
+      'software_actions installed_count': { plugin: 'software_actions', action: 'installed_count' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
@@ -385,9 +432,26 @@ R"HTM(
       'users':             ['Agent', 'Key', 'Value'],
       'installed_apps':    ['Agent', 'Key', 'Value'],
       'msi_packages':     ['Agent', 'Key', 'Value'],
-      'network_config':   ['Agent', 'Key', 'Value']
+      'network_config':   ['Agent', 'Key', 'Value'],
+      'diagnostics':      ['Agent', 'Key', 'Value'],
+      'agent_actions':    ['Agent', 'Key', 'Value'],
+      'processes':        ['Agent', 'Key', 'Value'],
+      'services':         ['Agent', 'Key', 'Value'],
+      'filesystem':       ['Agent', 'Key', 'Value'],
+      'network_diag':     ['Agent', 'Key', 'Value'],
+      'network_actions':  ['Agent', 'Key', 'Value'],
+      'firewall':         ['Agent', 'Key', 'Value'],
+      'antivirus':        ['Agent', 'Key', 'Value'],
+      'bitlocker':        ['Agent', 'Key', 'Value'],
+      'windows_updates':  ['Agent', 'Key', 'Value'],
+      'event_logs':       ['Agent', 'Key', 'Value'],
+      'sccm':             ['Agent', 'Key', 'Value'],
+      'script_exec':      ['Agent', 'Key', 'Value'],
+      'software_actions': ['Agent', 'Key', 'Value']
     };
-
+)HTM"
+// Part 3: Helpers and table management
+R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -619,7 +683,7 @@ R"HTM(
           } else {
             addRow([agentName, payload]);
           }
-        } else if (plugin === 'status' || plugin === 'device_identity' || plugin === 'os_info' || plugin === 'hardware' || plugin === 'users' || plugin === 'installed_apps' || plugin === 'msi_packages' || plugin === 'network_config') {
+        } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
           /* key|value */
           var parts = payload.split('|');
           if (parts.length >= 2) {

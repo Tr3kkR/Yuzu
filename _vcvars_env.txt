@@ -1,0 +1,13 @@
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.27
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[ERROR:VsDevCmd.bat] *** VsDevCmd.bat encountered errors. Environment may be incomplete and/or incorrect. ***
+[ERROR:VsDevCmd.bat] In an uninitialized command prompt, please 'set VSCMD_DEBUG=[value]' and then re-run
+[ERROR:VsDevCmd.bat] vsdevcmd.bat [args] for additional details.
+[ERROR:VsDevCmd.bat] Where [value] is:
+[ERROR:VsDevCmd.bat]    1 : basic debug logging
+[ERROR:VsDevCmd.bat]    2 : detailed debug logging
+[ERROR:VsDevCmd.bat]    3 : trace level logging. Redirection of output to a file when using this level is recommended.
+[ERROR:VsDevCmd.bat] Example: set VSCMD_DEBUG=3
+[ERROR:VsDevCmd.bat]          vsdevcmd.bat > vsdevcmd.trace.txt 2>&1

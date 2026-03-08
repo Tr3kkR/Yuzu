@@ -1,0 +1,30 @@
+Traceback (most recent call last):
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\mesonmain.py", line 193, in run
+    return options.run_func(options)
+           ~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\msetup.py", line 395, in run
+    app.generate()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\msetup.py", line 194, in generate
+    return self._generate(env, capture, vslite_ctx)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\msetup.py", line 282, in _generate
+    captured_compile_args = intr.backend.generate(capture, vslite_ctx)
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\backend\ninjabackend.py", line 647, in generate
+    self.generate_target(t)
+    ~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\backend\ninjabackend.py", line 1004, in generate_target
+    o, s = self.generate_single_compile(target, src, True, order_deps=header_deps)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\backend\ninjabackend.py", line 3273, in generate_single_compile
+    self.add_dependency_scanner_entries_to_element(target, compiler, element, src)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\backend\ninjabackend.py", line 3280, in add_dependency_scanner_entries_to_element
+    if not self.should_use_dyndeps_for_target(target):
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\backend\ninjabackend.py", line 1130, in should_use_dyndeps_for_target
+    if not mesonlib.current_vs_supports_modules():
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\natha\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\site-packages\mesonbuild\utils\universal.py", line 829, in current_vs_supports_modules
+    major = int(nums[0])
+ValueError: invalid literal for int() with base 10: ''

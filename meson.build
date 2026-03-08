@@ -80,6 +80,21 @@ if build_agent
     subdir('agents/plugins/installed_apps')
     subdir('agents/plugins/msi_packages')
     subdir('agents/plugins/network_config')
+    subdir('agents/plugins/diagnostics')
+    subdir('agents/plugins/agent_actions')
+    subdir('agents/plugins/processes')
+    subdir('agents/plugins/services')
+    subdir('agents/plugins/filesystem')
+    subdir('agents/plugins/windows_updates')
+    subdir('agents/plugins/event_logs')
+    subdir('agents/plugins/sccm')
+    subdir('agents/plugins/script_exec')
+    subdir('agents/plugins/software_actions')
+    subdir('agents/plugins/network_diag')
+    subdir('agents/plugins/network_actions')
+    subdir('agents/plugins/firewall')
+    subdir('agents/plugins/antivirus')
+    subdir('agents/plugins/bitlocker')
   endif
 endif
 
