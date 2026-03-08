@@ -5,9 +5,11 @@
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -50,6 +52,17 @@ int main(int argc, char* argv[]) {
     app.add_option("--log-level",  log_level,                "Log level: trace|debug|info|warn|error")
        ->default_val("info");
 
+    // Batch token generation mode (runs and exits, no server startup)
+    int generate_tokens = 0;
+    std::string gen_label;
+    int gen_max_uses = 1;
+    int gen_ttl_hours = 0;
+    app.add_option("--generate-tokens", generate_tokens,
+                   "Generate N enrollment tokens and print to stdout (JSON), then exit");
+    app.add_option("--token-label",     gen_label,     "Label prefix for generated tokens");
+    app.add_option("--token-max-uses",  gen_max_uses,  "Max uses per token (default: 1)");
+    app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+
     CLI11_PARSE(app, argc, argv);
 
     spdlog::set_level(spdlog::level::from_str(log_level));
@@ -84,6 +97,28 @@ int main(int argc, char* argv[]) {
     }
 
     cfg.auth_config_path = cfg_path;
+
+    // -- Batch token generation mode (exits without starting server) ----------
+
+    if (generate_tokens > 0) {
+        auto ttl = gen_ttl_hours > 0
+            ? std::chrono::seconds(gen_ttl_hours * 3600)
+            : std::chrono::seconds(0);
+
+        auto tokens = auth_mgr.create_enrollment_tokens_batch(
+            gen_label, generate_tokens, gen_max_uses, ttl);
+
+        // Output JSON to stdout for scripting (Ansible, etc.)
+        std::cout << "{\"count\":" << tokens.size() << ",\"tokens\":[\n";
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (i > 0) std::cout << ",\n";
+            std::cout << "  \"" << tokens[i] << "\"";
+        }
+        std::cout << "\n]}\n";
+
+        spdlog::info("Generated {} enrollment tokens", tokens.size());
+        return EXIT_SUCCESS;
+    }
 
     // -------------------------------------------------------------------------
 

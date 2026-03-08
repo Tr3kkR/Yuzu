@@ -257,6 +257,23 @@ R"HTM(<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- ── Auto-Approve Policies ─────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Auto-Approve Policies</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Define rules to automatically approve agents on registration.
+          Matching agents skip the pending queue entirely.
+        </p>
+        <div id="auto-approve-section"
+             hx-get="/fragments/settings/auto-approve"
+             hx-trigger="load, refreshAutoApprove from:body"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Pending Agents ─────────────────────────────────── -->
     <div class="section"
          hx-ext="sse"

@@ -23,6 +23,7 @@ struct Config {
     std::string              cert_store;         // Windows cert store name (e.g. "MY")
     std::string              cert_subject;       // Subject CN match for cert store lookup
     std::string              cert_thumbprint;    // SHA-1 thumbprint for cert store lookup
+    bool                     cert_auto_discovery{true}; // Auto-discover certs from well-known paths
     std::string              enrollment_token;   // Pre-shared enrollment token (Tier 2)
     std::string              log_level{"info"};  // Current log level
     bool                     debug_mode{false};  // Debug mode flag (diagnostic features)

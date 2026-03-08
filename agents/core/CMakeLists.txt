@@ -3,7 +3,9 @@ include(${CMAKE_SOURCE_DIR}/cmake/modules/CompilerFlags.cmake)
 # ── Agent static library (re-used by tests) ───────────────────────────────────
 add_library(yuzu_agent_core STATIC
   src/agent.cpp
+  src/cert_discovery.cpp
   src/cert_store.cpp
+  src/cloud_identity.cpp
   src/identity_store.cpp
   src/plugin_loader.cpp
 )

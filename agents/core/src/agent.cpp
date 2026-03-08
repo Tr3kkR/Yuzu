@@ -9,7 +9,9 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
+#include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/version.hpp>
 
@@ -18,6 +20,12 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
+
+#ifdef _WIN32
+#  include <winsock2.h>   // gethostname
+#else
+#  include <unistd.h>     // gethostname
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -167,6 +175,20 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
+        // Auto-discover client certificate if none explicitly configured
+        if (cfg_.cert_auto_discovery
+            && cfg_.tls_client_cert.empty()
+            && cfg_.cert_store.empty()) {
+            auto discovered = discover_client_cert();
+            if (discovered) {
+                cfg_.tls_client_cert = discovered->cert_path;
+                cfg_.tls_client_key  = discovered->key_path;
+                spdlog::info("Using auto-discovered cert from {} (source: {})",
+                             discovered->cert_path.string(), discovered->source);
+            }
+        }
+
+        CloudIdentity cloud_id;  // Populated before registration (step 2b)
         std::shared_ptr<grpc::ChannelCredentials> creds;
         std::shared_ptr<grpc::Channel> channel;
         std::unique_ptr<pb::AgentService::Stub> stub;
@@ -224,6 +246,15 @@ public:
 
         stub = pb::AgentService::NewStub(channel);
 
+        // 2b. Detect cloud instance identity (for auto-approve)
+        {
+            cloud_id = detect_cloud_identity();
+            if (cloud_id.valid()) {
+                spdlog::info("Cloud identity detected: provider={}, instance={}, region={}",
+                             cloud_id.provider, cloud_id.instance_id, cloud_id.region);
+            }
+        }
+
         // 3. Register with server
         {
             grpc::ClientContext ctx;
@@ -231,6 +262,14 @@ public:
             auto* info = req.mutable_info();
             info->set_agent_id(cfg_.agent_id);
             info->set_agent_version(std::string{yuzu::kFullVersionString});
+
+            // Set hostname for auto-approve hostname_glob matching
+            {
+                char host_buf[256] = {};
+                if (gethostname(host_buf, sizeof(host_buf) - 1) == 0) {
+                    info->set_hostname(host_buf);
+                }
+            }
 
             for (const auto& handle : plugins_) {
                 auto* pi = info->add_plugins();
@@ -243,6 +282,16 @@ public:
             if (!cfg_.enrollment_token.empty()) {
                 req.set_enrollment_token(cfg_.enrollment_token);
                 spdlog::info("Including enrollment token in registration");
+            }
+
+            // Tier 3: Include cloud identity attestation if available
+            if (cloud_id.valid()) {
+                req.set_attestation_provider(cloud_id.provider);
+                req.set_machine_certificate(
+                    cloud_id.identity_document.data(),
+                    cloud_id.identity_document.size());
+                spdlog::info("Including {} cloud attestation in registration",
+                             cloud_id.provider);
             }
 
             pb::RegisterResponse resp;

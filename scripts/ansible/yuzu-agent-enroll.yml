@@ -1,0 +1,172 @@
+---
+# yuzu-agent-enroll.yml — Ansible playbook for mass Yuzu agent enrollment
+#
+# Enrolls RHEL/CentOS/Fedora/Debian/Ubuntu hosts as Yuzu agents.
+# Supports three enrollment paths:
+#   1. FreeIPA (certmonger) — for IPA-enrolled hosts
+#   2. Enrollment token — pre-generated tokens from yuzu-server
+#   3. Auto-approve — server-side policy matches (hostname/subnet/CA)
+#
+# Usage:
+#   # Generate tokens on the server first:
+#   yuzu-server --generate-tokens 1000 --token-label "batch-2026-03" > tokens.json
+#
+#   # Then run the playbook:
+#   ansible-playbook -i inventory yuzu-agent-enroll.yml \
+#     -e yuzu_server=server.example.com:50051 \
+#     -e token_file=tokens.json
+#
+# Variables:
+#   yuzu_server        - Server address (required)
+#   enrollment_method  - "freeipa", "token", or "auto" (default: auto-detect)
+#   token_file         - Path to tokens.json (required for token method)
+#   yuzu_version       - Package version to install (default: latest)
+#   yuzu_ca_cert       - Path to CA cert to distribute (optional)
+
+- name: Enroll Yuzu agents
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    yuzu_server: ""
+    enrollment_method: "auto"
+    token_file: ""
+    yuzu_version: "latest"
+    yuzu_ca_cert: ""
+    yuzu_cert_dir: "/etc/yuzu"
+    yuzu_config_file: "/etc/yuzu/yuzu-agent.cfg"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - yuzu_server | length > 0
+        fail_msg: "yuzu_server must be set (e.g. -e yuzu_server=server.example.com:50051)"
+
+    - name: Load enrollment tokens
+      when: token_file | length > 0
+      block:
+        - name: Read token file
+          ansible.builtin.slurp:
+            src: "{{ token_file }}"
+          delegate_to: localhost
+          become: false
+          register: token_data
+
+        - name: Parse tokens
+          ansible.builtin.set_fact:
+            tokens: "{{ (token_data.content | b64decode | from_json).tokens }}"
+
+    - name: Auto-detect enrollment method
+      when: enrollment_method == "auto"
+      block:
+        - name: Check if host is IPA-enrolled
+          ansible.builtin.stat:
+            path: /etc/ipa/default.conf
+          register: ipa_conf
+
+        - name: Set enrollment method
+          ansible.builtin.set_fact:
+            enrollment_method: "{{ 'freeipa' if ipa_conf.stat.exists else ('token' if (tokens is defined) else 'auto-approve') }}"
+
+  tasks:
+    # ── Install yuzu-agent ───────────────────────────────────────────────────
+
+    - name: Create yuzu config directory
+      ansible.builtin.file:
+        path: "{{ yuzu_cert_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Distribute CA certificate
+      when: yuzu_ca_cert | length > 0
+      ansible.builtin.copy:
+        src: "{{ yuzu_ca_cert }}"
+        dest: "{{ yuzu_cert_dir }}/ca.pem"
+        mode: "0644"
+
+    # ── FreeIPA enrollment ───────────────────────────────────────────────────
+
+    - name: FreeIPA certificate enrollment
+      when: enrollment_method == "freeipa"
+      block:
+        - name: Copy FreeIPA enrollment script
+          ansible.builtin.copy:
+            src: yuzu-agent-freeipa-enroll.sh
+            dest: /tmp/yuzu-agent-freeipa-enroll.sh
+            mode: "0755"
+
+        - name: Run FreeIPA enrollment
+          ansible.builtin.command:
+            cmd: >-
+              /tmp/yuzu-agent-freeipa-enroll.sh
+              --server {{ yuzu_server }}
+              --enable-service
+              {% if tokens is defined and (ansible_play_hosts.index(inventory_hostname) < (tokens | length)) %}
+              --token {{ tokens[ansible_play_hosts.index(inventory_hostname)].token }}
+              {% endif %}
+          register: freeipa_result
+          changed_when: "'Enrollment complete' in freeipa_result.stdout"
+
+        - name: Clean up enrollment script
+          ansible.builtin.file:
+            path: /tmp/yuzu-agent-freeipa-enroll.sh
+            state: absent
+
+    # ── Token enrollment ─────────────────────────────────────────────────────
+
+    - name: Token-based enrollment
+      when: enrollment_method == "token"
+      block:
+        - name: Assign token to this host
+          ansible.builtin.set_fact:
+            my_token: "{{ tokens[ansible_play_hosts.index(inventory_hostname)].token }}"
+          when: ansible_play_hosts.index(inventory_hostname) < (tokens | length)
+
+        - name: Fail if no token available
+          ansible.builtin.fail:
+            msg: "Not enough tokens for all hosts. Generated {{ tokens | length }}, need {{ ansible_play_hosts | length }}"
+          when: my_token is not defined
+
+        - name: Write agent configuration
+          ansible.builtin.template:
+            src: yuzu-agent.cfg.j2
+            dest: "{{ yuzu_config_file }}"
+            mode: "0640"
+
+    # ── Auto-approve enrollment ──────────────────────────────────────────────
+
+    - name: Auto-approve enrollment (no token needed)
+      when: enrollment_method == "auto-approve"
+      block:
+        - name: Write agent configuration (no token)
+          ansible.builtin.copy:
+            dest: "{{ yuzu_config_file }}"
+            mode: "0640"
+            content: |
+              # Yuzu Agent Configuration (auto-approve enrollment)
+              server_address={{ yuzu_server }}
+              tls_enabled=true
+
+    # ── Start service ────────────────────────────────────────────────────────
+
+    - name: Enable and start yuzu-agent
+      ansible.builtin.systemd:
+        name: yuzu-agent
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Verify agent is running
+      ansible.builtin.command:
+        cmd: systemctl is-active yuzu-agent
+      register: service_status
+      changed_when: false
+      failed_when: service_status.rc != 0
+
+  handlers:
+    - name: Restart yuzu-agent
+      ansible.builtin.systemd:
+        name: yuzu-agent
+        state: restarted

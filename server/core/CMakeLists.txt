@@ -3,6 +3,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/modules/CompilerFlags.cmake)
 add_library(yuzu_server_core STATIC
   src/server.cpp
   src/auth.cpp
+  src/auto_approve.cpp
   src/dashboard_ui.cpp
   src/chargen_ui.cpp
   src/procfetch_ui.cpp

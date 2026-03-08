@@ -56,6 +56,8 @@ int main(int argc, char* argv[]) {
     app.add_option("--cert-store",      cfg.cert_store,      "Windows certificate store name (e.g. MY) for mTLS");
     app.add_option("--cert-subject",    cfg.cert_subject,    "Subject CN match for cert store lookup");
     app.add_option("--cert-thumbprint", cfg.cert_thumbprint, "SHA-1 thumbprint for cert store lookup (hex)");
+    app.add_flag  ("--no-cert-discovery", "Disable auto-discovery of certs from well-known paths")
+       ->each([&cfg](const std::string&) { cfg.cert_auto_discovery = false; });
     app.add_option("--enrollment-token", cfg.enrollment_token, "Pre-shared enrollment token for server registration");
     app.add_flag  ("--debug",    "Enable debug mode (diagnostic features)")
        ->each([&cfg](const std::string&) { cfg.debug_mode = true; });

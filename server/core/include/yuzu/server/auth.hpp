@@ -99,6 +99,14 @@ public:
                                         int max_uses,
                                         std::chrono::seconds ttl);
 
+    /// Create multiple enrollment tokens at once for batch deployment.
+    /// Returns a vector of raw token strings (each shown once).
+    std::vector<std::string> create_enrollment_tokens_batch(
+        const std::string& label_prefix,
+        int count,
+        int max_uses_each,
+        std::chrono::seconds ttl);
+
     /// Validate a raw enrollment token. Returns true and increments use_count
     /// if valid. Returns false if expired, revoked, or exhausted.
     bool validate_enrollment_token(const std::string& raw_token);

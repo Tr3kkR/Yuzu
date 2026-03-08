@@ -12,6 +12,7 @@ yuzu_server_core_lib = static_library(
   files(
     'src/server.cpp',
     'src/auth.cpp',
+    'src/auto_approve.cpp',
     'src/dashboard_ui.cpp',
     'src/chargen_ui.cpp',
     'src/procfetch_ui.cpp',

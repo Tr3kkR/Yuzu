@@ -1,5 +1,6 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auto_approve.hpp>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -314,10 +315,12 @@ class AgentServiceImpl : public pb::AgentService::Service {
 public:
     AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
                      bool require_client_identity,
-                     auth::AuthManager& auth_mgr)
+                     auth::AuthManager& auth_mgr,
+                     auth::AutoApproveEngine& auto_approve)
         : registry_(registry), bus_(bus),
           require_client_identity_(require_client_identity),
-          auth_mgr_(auth_mgr) {}
+          auth_mgr_(auth_mgr),
+          auto_approve_(auto_approve) {}
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -355,7 +358,38 @@ public:
             // Remove from pending queue if it was there
             auth_mgr_.remove_pending_agent(info.agent_id());
         } else {
-            // Tier 1: No token — check the pending queue
+            // Tier 1.5: Auto-approve policies — check before pending queue
+            auth::ApprovalContext approval_ctx;
+            approval_ctx.hostname = info.hostname();
+            approval_ctx.attestation_provider = request->attestation_provider();
+
+            // Extract peer IP from gRPC context (format: "ipv4:1.2.3.4:port")
+            if (context) {
+                auto peer = context->peer();
+                // Strip scheme prefix and port
+                auto colon1 = peer.find(':');
+                if (colon1 != std::string::npos) {
+                    auto ip_start = colon1 + 1;
+                    auto colon2 = peer.rfind(':');
+                    if (colon2 > ip_start) {
+                        approval_ctx.peer_ip = peer.substr(ip_start, colon2 - ip_start);
+                    } else {
+                        approval_ctx.peer_ip = peer.substr(ip_start);
+                    }
+                }
+            }
+
+            // TODO: Extract CA fingerprint from peer TLS cert chain
+            // approval_ctx.ca_fingerprint_sha256 = ...
+
+            auto matched_rule = auto_approve_.evaluate(approval_ctx);
+            if (!matched_rule.empty()) {
+                spdlog::info("Agent {} auto-approved by policy: {}",
+                             info.agent_id(), matched_rule);
+                auth_mgr_.remove_pending_agent(info.agent_id());
+                // Fall through to normal registration
+            } else {
+            // Tier 1: No token, no policy match — check the pending queue
             auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
 
             if (!pending_status) {
@@ -393,6 +427,7 @@ public:
                     // Fall through to normal registration
                     break;
             }
+            }  // auto-approve else
         }
 
         // ── Agent is enrolled — proceed with registration ────────────────
@@ -629,6 +664,7 @@ private:
     AgentRegistry& registry_;
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
+    auth::AutoApproveEngine& auto_approve_;
 
     static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
@@ -672,8 +708,11 @@ public:
           registry_(event_bus_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
-              auth_mgr)
+              auth_mgr, auto_approve_)
     {
+        // Load auto-approve policies
+        auto approve_path = cfg_.auth_config_path.parent_path() / "auto-approve.cfg";
+        auto_approve_.load(approve_path);
         // Setup file logger
         auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
@@ -1225,6 +1264,92 @@ private:
         return html;
     }
 
+    std::string render_auto_approve_fragment() {
+        auto rules = auto_approve_.list_rules();
+        std::string html;
+
+        // Mode selector
+        html += "<div class=\"form-row\" style=\"margin-bottom:1rem\">"
+                "<label>Match mode</label>"
+                "<select name=\"mode\" "
+                "hx-post=\"/api/settings/auto-approve/mode\" "
+                "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
+                "style=\"flex:0 0 auto;width:180px\">"
+                "<option value=\"any\"" + std::string(auto_approve_.require_all() ? "" : " selected") + ">Any rule (first match)</option>"
+                "<option value=\"all\"" + std::string(auto_approve_.require_all() ? " selected" : "") + ">All rules must match</option>"
+                "</select>"
+                "</div>";
+
+        // Rules table
+        html += "<table class=\"user-table\">"
+                "<thead><tr><th>Type</th><th>Value</th><th>Label</th>"
+                "<th>Enabled</th><th></th></tr></thead><tbody>";
+
+        if (rules.empty()) {
+            html += "<tr><td colspan=\"5\" style=\"color:#484f58\">No auto-approve rules configured</td></tr>";
+        } else {
+            auto type_str = [](auth::AutoApproveRuleType t) -> std::string {
+                switch (t) {
+                    case auth::AutoApproveRuleType::trusted_ca:     return "Trusted CA";
+                    case auth::AutoApproveRuleType::hostname_glob:  return "Hostname Glob";
+                    case auth::AutoApproveRuleType::ip_subnet:      return "IP Subnet";
+                    case auth::AutoApproveRuleType::cloud_provider: return "Cloud Provider";
+                }
+                return "Unknown";
+            };
+
+            for (size_t i = 0; i < rules.size(); ++i) {
+                const auto& r = rules[i];
+                auto idx = std::to_string(i);
+                html += "<tr>"
+                        "<td>" + html_escape(type_str(r.type)) + "</td>"
+                        "<td><code style=\"font-size:0.75rem\">" + html_escape(r.value) + "</code></td>"
+                        "<td>" + html_escape(r.label) + "</td>"
+                        "<td>"
+                        "<label class=\"toggle\">"
+                        "<input type=\"checkbox\"" + std::string(r.enabled ? " checked" : "") +
+                        " hx-post=\"/api/settings/auto-approve/" + idx + "/toggle\" "
+                        "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\">"
+                        "<span class=\"slider\"></span></label></td>"
+                        "<td><button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/auto-approve/" + idx + "\" "
+                        "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Remove this auto-approve rule?\" "
+                        ">Remove</button></td></tr>";
+            }
+        }
+
+        html += "</tbody></table>";
+
+        // Add rule form
+        html += "<div class=\"add-user-form\">"
+                "<form hx-post=\"/api/settings/auto-approve\" "
+                "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
+                "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
+                "<div class=\"mini-field\">"
+                "<label>Type</label>"
+                "<select name=\"type\" style=\"width:140px\">"
+                "<option value=\"hostname_glob\">Hostname Glob</option>"
+                "<option value=\"ip_subnet\">IP Subnet</option>"
+                "<option value=\"trusted_ca\">Trusted CA</option>"
+                "<option value=\"cloud_provider\">Cloud Provider</option>"
+                "</select></div>"
+                "<div class=\"mini-field\" style=\"flex:1\">"
+                "<label>Value</label>"
+                "<input type=\"text\" name=\"value\" placeholder=\"*.prod.example.com\" required>"
+                "</div>"
+                "<div class=\"mini-field\" style=\"flex:1\">"
+                "<label>Label</label>"
+                "<input type=\"text\" name=\"label\" placeholder=\"Production servers\">"
+                "</div>"
+                "<button class=\"btn btn-primary\" type=\"submit\">Add Rule</button>"
+                "</form></div>"
+                "<div class=\"feedback\" id=\"auto-approve-feedback\"></div>";
+
+        return html;
+    }
+
     // -- Web server -----------------------------------------------------------
 
     void start_web_server() {
@@ -1343,6 +1468,12 @@ private:
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
                 res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/settings/auto-approve",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
             });
 
         // -- Settings API: TLS toggle (HTMX POST) ----------------------------
@@ -1501,6 +1632,42 @@ private:
                 res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             });
 
+        // -- Batch enrollment token generation (JSON API for scripting) ---------
+        web_server_->Post("/api/settings/enrollment-tokens/batch",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto label = extract_json_string(req.body, "label");
+                auto count_s = extract_json_string(req.body, "count");
+                auto max_uses_s = extract_json_string(req.body, "max_uses");
+                auto ttl_s = extract_json_string(req.body, "ttl_hours");
+
+                int count = count_s.empty() ? 10 : std::stoi(count_s);
+                int max_uses = max_uses_s.empty() ? 1 : std::stoi(max_uses_s);
+                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+
+                if (count < 1 || count > 10000) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"count must be 1-10000"})", "application/json");
+                    return;
+                }
+
+                auto ttl = ttl_hours > 0
+                    ? std::chrono::seconds(ttl_hours * 3600)
+                    : std::chrono::seconds(0);
+
+                auto tokens = auth_mgr_.create_enrollment_tokens_batch(
+                    label, count, max_uses, ttl);
+
+                // Return JSON array for scripting/Ansible consumption
+                std::string json = "{\"count\":" + std::to_string(tokens.size()) + ",\"tokens\":[";
+                for (size_t i = 0; i < tokens.size(); ++i) {
+                    if (i > 0) json += ",";
+                    json += "\"" + tokens[i] + "\"";
+                }
+                json += "]}";
+                res.set_content(json, "application/json");
+            });
+
         // -- Settings API: Pending agents (admin only, HTMX) --------------------
 
         web_server_->Post(R"(/api/settings/pending-agents/(.+)/approve)",
@@ -1525,6 +1692,60 @@ private:
                 auto agent_id = req.matches[1].str();
                 auth_mgr_.remove_pending_agent(agent_id);
                 res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            });
+
+        // -- Settings API: Auto-approve rules (HTMX) -------------------------
+
+        // Add a new rule
+        web_server_->Post("/api/settings/auto-approve",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto type_s = extract_form_value(req.body, "type");
+                auto value = extract_form_value(req.body, "value");
+                auto label = extract_form_value(req.body, "label");
+
+                auth::AutoApproveRuleType type;
+                if (type_s == "trusted_ca")          type = auth::AutoApproveRuleType::trusted_ca;
+                else if (type_s == "ip_subnet")      type = auth::AutoApproveRuleType::ip_subnet;
+                else if (type_s == "cloud_provider")  type = auth::AutoApproveRuleType::cloud_provider;
+                else                                  type = auth::AutoApproveRuleType::hostname_glob;
+
+                auto_approve_.add_rule({type, value, label, true});
+                spdlog::info("Auto-approve rule added: {}:{} ({})", type_s, value, label);
+                res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Change mode (any/all)
+        web_server_->Post("/api/settings/auto-approve/mode",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto mode = extract_form_value(req.body, "mode");
+                auto_approve_.set_require_all(mode == "all");
+                auto_approve_.save();
+                spdlog::info("Auto-approve mode changed to {}", mode);
+                res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Toggle rule enabled/disabled
+        web_server_->Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                auto rules = auto_approve_.list_rules();
+                if (idx < rules.size()) {
+                    auto_approve_.set_enabled(idx, !rules[idx].enabled);
+                }
+                res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Remove a rule
+        web_server_->Delete(R"(/api/settings/auto-approve/(\d+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto idx = static_cast<size_t>(std::stoul(req.matches[1].str()));
+                auto_approve_.remove_rule(idx);
+                spdlog::info("Auto-approve rule {} removed", idx);
+                res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
             });
 
         // Legacy routes — redirect to dashboard
@@ -1739,6 +1960,7 @@ private:
 
     Config                                     cfg_;
     auth::AuthManager&                         auth_mgr_;
+    auth::AutoApproveEngine                    auto_approve_;
     detail::EventBus                           event_bus_;
     detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;

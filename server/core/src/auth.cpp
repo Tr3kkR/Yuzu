@@ -516,6 +516,24 @@ std::string AuthManager::create_enrollment_token(const std::string& label,
     return raw_token;
 }
 
+std::vector<std::string> AuthManager::create_enrollment_tokens_batch(
+    const std::string& label_prefix,
+    int count,
+    int max_uses_each,
+    std::chrono::seconds ttl)
+{
+    std::vector<std::string> tokens;
+    tokens.reserve(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        auto label = label_prefix.empty()
+            ? std::format("batch-{}", i + 1)
+            : std::format("{}-{}", label_prefix, i + 1);
+        tokens.push_back(create_enrollment_token(label, max_uses_each, ttl));
+    }
+    spdlog::info("Batch created {} enrollment tokens (prefix='{}')", count, label_prefix);
+    return tokens;
+}
+
 bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
     auto hash = sha256_hex(raw_token);
     auto now = std::chrono::system_clock::now();
