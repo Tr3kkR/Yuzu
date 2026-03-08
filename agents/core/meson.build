@@ -1,6 +1,6 @@
 yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
-  files('src/agent.cpp', 'src/identity_store.cpp', 'src/plugin_loader.cpp'),
+  files('src/agent.cpp', 'src/cert_store.cpp', 'src/identity_store.cpp', 'src/plugin_loader.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),

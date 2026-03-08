@@ -18,8 +18,11 @@ struct Config {
     std::chrono::seconds     heartbeat_interval{30};
     bool                     tls_enabled{true};
     std::filesystem::path    tls_ca_cert;        // PEM CA certificate for server verification
-    std::filesystem::path    tls_client_cert;    // Optional mTLS client cert
-    std::filesystem::path    tls_client_key;     // Optional mTLS client key
+    std::filesystem::path    tls_client_cert;    // Optional mTLS client cert (PEM file)
+    std::filesystem::path    tls_client_key;     // Optional mTLS client key (PEM file)
+    std::string              cert_store;         // Windows cert store name (e.g. "MY")
+    std::string              cert_subject;       // Subject CN match for cert store lookup
+    std::string              cert_thumbprint;    // SHA-1 thumbprint for cert store lookup
     std::string              enrollment_token;   // Pre-shared enrollment token (Tier 2)
     std::string              log_level{"info"};  // Current log level
     bool                     debug_mode{false};  // Debug mode flag (diagnostic features)

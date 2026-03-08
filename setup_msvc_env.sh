@@ -22,6 +22,11 @@ _MESON_DIR="/c/Users/natha/AppData/Local/Packages/PythonSoftwareFoundation.Pytho
 export CC="cl.exe"
 export CXX="cl.exe"
 
+# ── VSCMD_VER — Meson checks this to decide C++20 modules support ────────────
+# Without vcvars64.bat this is unset, causing Meson to crash parsing an empty
+# string as a version number. Set it manually from the VS BuildTools version.
+export VSCMD_VER="17.14.27"
+
 # ── CMake / build config ─────────────────────────────────────────────────────
 export CMAKE_GENERATOR="Ninja"
 export CMAKE_BUILD_TYPE="Debug"

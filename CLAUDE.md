@@ -137,12 +137,14 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
   - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
 - **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+- **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
+- **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
 
 ### Remaining work
-1. **Tier 3 platform trust** — implement Windows cert store (`CertOpenSystemStore`), macOS Keychain, and cloud attestation (AWS/Azure/GCP) enrollment paths.
+1. **Tier 3 platform trust server-side** — server validates machine certificates against enterprise CA for auto-enrollment (agent-side cert store reading is done; server-side validation is not).
 2. **HTTPS for web dashboard** — currently HTTP only; add TLS termination.
 3. **OIDC SSO** — replace the stub login button with real OIDC flow.
 4. **AD/Entra directory integration** — inherit roles from domain groups.
-5. **Windows certificate store** — move cert storage from `/etc/yuzu/certs` to Windows crypto store on Windows hosts.
+5. **macOS Keychain / Linux PKCS#11** — cert store integration for non-Windows platforms.
 
 Certificate setup instructions: `scripts/Certificate Instructions.txt`.

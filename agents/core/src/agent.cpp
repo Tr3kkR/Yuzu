@@ -9,6 +9,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/version.hpp>
 
@@ -179,21 +180,38 @@ public:
                 }
             }
 
-            const bool has_client_cert = !cfg_.tls_client_cert.empty();
-            const bool has_client_key = !cfg_.tls_client_key.empty();
-            if (has_client_cert != has_client_key) {
-                spdlog::error("mTLS requires both --client-cert and --client-key");
-                goto shutdown_plugins;
-            }
+            // Client certificate: prefer cert store, fall back to PEM files
+            if (!cfg_.cert_store.empty()) {
+                // Read client cert + key from OS certificate store
+                spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
+                auto store_result = read_cert_from_store(
+                    cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
 
-            if (has_client_cert && has_client_key) {
-                ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
-                ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
-                if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
-                    spdlog::error("Failed to read client cert/key for mTLS");
+                if (!store_result.ok()) {
+                    spdlog::error("Certificate store error: {}", store_result.error);
                     goto shutdown_plugins;
-                } else {
-                    spdlog::info("mTLS enabled: using client certificate");
+                }
+
+                ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
+                ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
+                spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
+            } else {
+                const bool has_client_cert = !cfg_.tls_client_cert.empty();
+                const bool has_client_key = !cfg_.tls_client_key.empty();
+                if (has_client_cert != has_client_key) {
+                    spdlog::error("mTLS requires both --client-cert and --client-key");
+                    goto shutdown_plugins;
+                }
+
+                if (has_client_cert && has_client_key) {
+                    ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
+                    ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
+                    if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                        spdlog::error("Failed to read client cert/key for mTLS");
+                        goto shutdown_plugins;
+                    } else {
+                        spdlog::info("mTLS enabled: using client certificate files");
+                    }
                 }
             }
             creds = grpc::SslCredentials(ssl_opts);
