@@ -862,6 +862,24 @@ private:
         return out;
     }
 
+    // -- HTML helpers ---------------------------------------------------------
+
+    static std::string html_escape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            switch (c) {
+                case '&':  out += "&amp;"; break;
+                case '<':  out += "&lt;"; break;
+                case '>':  out += "&gt;"; break;
+                case '"':  out += "&quot;"; break;
+                case '\'': out += "&#39;"; break;
+                default:   out += c;
+            }
+        }
+        return out;
+    }
+
     // -- Auth helpers for HTTP ------------------------------------------------
 
     static std::string extract_session_cookie(const httplib::Request& req) {
@@ -922,6 +940,289 @@ private:
             return false;
         }
         return true;
+    }
+
+    // -- HTML fragment renderers for HTMX Settings page -------------------------
+
+    std::string render_tls_fragment() {
+        std::string checked = cfg_.tls_enabled ? " checked" : "";
+        std::string status_color = cfg_.tls_enabled ? "#3fb950" : "#f85149";
+        std::string status_text = cfg_.tls_enabled ? "Enabled" : "Disabled";
+        std::string fields_opacity = cfg_.tls_enabled ? "1" : "0.4";
+
+        std::string cert_name = cfg_.tls_server_cert.empty() ? "No file" : html_escape(cfg_.tls_server_cert.string());
+        std::string key_name = cfg_.tls_server_key.empty() ? "No file" : html_escape(cfg_.tls_server_key.string());
+        std::string ca_name = cfg_.tls_ca_cert.empty() ? "No file" : html_escape(cfg_.tls_ca_cert.string());
+
+        return
+            "<form id=\"tls-form\">"
+            "<div class=\"form-row\">"
+            "  <label>gRPC mTLS</label>"
+            "  <label class=\"toggle\">"
+            "    <input type=\"checkbox\" name=\"tls_enabled\" value=\"true\"" + checked +
+            "           hx-post=\"/api/settings/tls\" hx-target=\"#tls-feedback\""
+            "           hx-swap=\"innerHTML\">"
+            "    <span class=\"slider\"></span>"
+            "  </label>"
+            "  <span style=\"font-size:0.75rem;color:" + status_color + ";margin-left:0.5rem\">"
+            + status_text + "</span>"
+            "</div>"
+            "<div style=\"margin-top:1rem;opacity:" + fields_opacity + "\">"
+            "  <div class=\"form-row\">"
+            "    <label>Server Certificate</label>"
+            "    <div class=\"file-upload\">"
+            "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" hx-swap=\"innerHTML\""
+            "            hx-encoding=\"multipart/form-data\" style=\"display:flex;align-items:center;gap:0.75rem\">"
+            "        <input type=\"hidden\" name=\"type\" value=\"cert\">"
+            "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
+            "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" id=\"cert-file\">"
+            "        <button type=\"button\" class=\"btn btn-secondary\""
+            "                onclick=\"document.getElementById('cert-file').click()\">Upload PEM</button>"
+            "        <span class=\"file-name\">" + cert_name + "</span>"
+            "      </form>"
+            "    </div>"
+            "  </div>"
+            "  <div class=\"form-row\">"
+            "    <label>Server Private Key</label>"
+            "    <div class=\"file-upload\">"
+            "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" hx-swap=\"innerHTML\""
+            "            hx-encoding=\"multipart/form-data\" style=\"display:flex;align-items:center;gap:0.75rem\">"
+            "        <input type=\"hidden\" name=\"type\" value=\"key\">"
+            "        <input type=\"file\" name=\"file\" accept=\".pem,.key\""
+            "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" id=\"key-file\">"
+            "        <button type=\"button\" class=\"btn btn-secondary\""
+            "                onclick=\"document.getElementById('key-file').click()\">Upload PEM</button>"
+            "        <span class=\"file-name\">" + key_name + "</span>"
+            "      </form>"
+            "    </div>"
+            "  </div>"
+            "  <div class=\"form-row\">"
+            "    <label>CA Certificate</label>"
+            "    <div class=\"file-upload\">"
+            "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" hx-swap=\"innerHTML\""
+            "            hx-encoding=\"multipart/form-data\" style=\"display:flex;align-items:center;gap:0.75rem\">"
+            "        <input type=\"hidden\" name=\"type\" value=\"ca\">"
+            "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
+            "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" id=\"ca-file\">"
+            "        <button type=\"button\" class=\"btn btn-secondary\""
+            "                onclick=\"document.getElementById('ca-file').click()\">Upload PEM</button>"
+            "        <span class=\"file-name\">" + ca_name + "</span>"
+            "      </form>"
+            "    </div>"
+            "  </div>"
+            "</div>"
+            "</form>"
+            "<div class=\"feedback\" id=\"tls-feedback\"></div>";
+    }
+
+    std::string render_users_fragment() {
+        auto users = auth_mgr_.list_users();
+        std::string html =
+            "<table class=\"user-table\">"
+            "  <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>"
+            "  <tbody>";
+
+        if (users.empty()) {
+            html += "<tr><td colspan=\"3\" style=\"color:#484f58\">No users</td></tr>";
+        } else {
+            for (const auto& u : users) {
+                auto role_str = auth::role_to_string(u.role);
+                auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
+                html += "<tr><td>" + html_escape(u.username) + "</td>"
+                        "<td><span class=\"role-badge " + std::string(cls) + "\">" +
+                        html_escape(role_str) + "</span></td>"
+                        "<td><button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/users/" + html_escape(u.username) + "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Remove user &quot;" + html_escape(u.username) + "&quot;?\""
+                        ">Remove</button></td></tr>";
+            }
+        }
+
+        html +=
+            "  </tbody>"
+            "</table>"
+            "<form class=\"add-user-form\" hx-post=\"/api/settings/users\" "
+            "      hx-target=\"#user-section\" hx-swap=\"innerHTML\">"
+            "  <div class=\"mini-field\">"
+            "    <label>Username</label>"
+            "    <input type=\"text\" name=\"username\" placeholder=\"username\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Password</label>"
+            "    <input type=\"password\" name=\"password\" placeholder=\"password\" required>"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Role</label>"
+            "    <select name=\"role\">"
+            "      <option value=\"user\">User</option>"
+            "      <option value=\"admin\">Admin</option>"
+            "    </select>"
+            "  </div>"
+            "  <button class=\"btn btn-primary\" type=\"submit\">Add User</button>"
+            "</form>"
+            "<div class=\"feedback\" id=\"user-feedback\"></div>";
+
+        return html;
+    }
+
+    std::string render_tokens_fragment(const std::string& new_raw_token = {}) {
+        auto tokens = auth_mgr_.list_enrollment_tokens();
+        std::string html =
+            "<table class=\"user-table\">"
+            "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
+            "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
+            "  <tbody>";
+
+        if (tokens.empty()) {
+            html += "<tr><td colspan=\"6\" style=\"color:#484f58\">No tokens created</td></tr>";
+        } else {
+            for (const auto& t : tokens) {
+                auto uses = t.max_uses == 0
+                    ? std::to_string(t.use_count) + " / \xe2\x88\x9e"
+                    : std::to_string(t.use_count) + " / " + std::to_string(t.max_uses);
+
+                std::string exp;
+                if (t.expires_at == (std::chrono::system_clock::time_point::max)()) {
+                    exp = "Never";
+                } else {
+                    auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                        t.expires_at.time_since_epoch()).count();
+                    exp = std::to_string(epoch);  // epoch seconds, formatted client-side
+                }
+
+                std::string status_cls, status_txt;
+                if (t.revoked) {
+                    status_cls = "role-user"; status_txt = "Revoked";
+                } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
+                    status_cls = "role-user"; status_txt = "Exhausted";
+                } else {
+                    status_cls = "role-admin"; status_txt = "Active";
+                }
+
+                html += "<tr><td><code>" + html_escape(t.token_id) + "</code></td>"
+                        "<td>" + html_escape(t.label) + "</td>"
+                        "<td>" + uses + "</td>"
+                        "<td style=\"font-size:0.75rem\">" + exp + "</td>"
+                        "<td><span class=\"role-badge " + status_cls + "\">" + status_txt + "</span></td>"
+                        "<td>";
+                if (!t.revoked) {
+                    html += "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-delete=\"/api/settings/enrollment-tokens/" + html_escape(t.token_id) + "\" "
+                            "hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
+                            "hx-confirm=\"Revoke token &quot;" + html_escape(t.token_id) +
+                            "&quot;? Agents using this token will no longer be able to enroll.\""
+                            ">Revoke</button>";
+                }
+                html += "</td></tr>";
+            }
+        }
+
+        html +=
+            "  </tbody>"
+            "</table>"
+            "<form class=\"add-user-form\" hx-post=\"/api/settings/enrollment-tokens\" "
+            "      hx-target=\"#token-section\" hx-swap=\"innerHTML\">"
+            "  <div class=\"mini-field\">"
+            "    <label>Label</label>"
+            "    <input type=\"text\" name=\"label\" placeholder=\"e.g. NYC rollout\" style=\"width:160px\">"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>Max Uses</label>"
+            "    <input type=\"text\" name=\"max_uses\" placeholder=\"0 = unlimited\" style=\"width:80px\">"
+            "  </div>"
+            "  <div class=\"mini-field\">"
+            "    <label>TTL (hours)</label>"
+            "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" style=\"width:80px\">"
+            "  </div>"
+            "  <button class=\"btn btn-primary\" type=\"submit\">Generate Token</button>"
+            "</form>"
+            "<div class=\"feedback\" id=\"token-feedback\"></div>";
+
+        // Show the one-time token reveal if a new token was just created
+        if (!new_raw_token.empty()) {
+            html +=
+                "<div class=\"token-reveal\">"
+                "  <div class=\"token-reveal-header\">"
+                "    COPY THIS TOKEN NOW — it will not be shown again"
+                "  </div>"
+                "  <code>" + html_escape(new_raw_token) + "</code><br>"
+                "  <button class=\"btn btn-secondary\" style=\"margin-top:0.5rem;font-size:0.7rem\" "
+                "          data-copy-token>Copy to Clipboard</button>"
+                "</div>";
+        }
+
+        return html;
+    }
+
+    std::string render_pending_fragment() {
+        auto agents = auth_mgr_.list_pending_agents();
+        std::string html =
+            "<table class=\"user-table\">"
+            "  <thead><tr><th>Agent ID</th><th>Hostname</th><th>OS</th>"
+            "  <th>Version</th><th>Status</th><th></th></tr></thead>"
+            "  <tbody>";
+
+        if (agents.empty()) {
+            html += "<tr><td colspan=\"6\" style=\"color:#484f58\">No pending agents</td></tr>";
+        } else {
+            for (const auto& a : agents) {
+                auto status_str = auth::pending_status_to_string(a.status);
+                std::string status_cls, status_style;
+                if (a.status == auth::PendingStatus::approved) {
+                    status_cls = "role-admin";
+                } else if (a.status == auth::PendingStatus::denied) {
+                    status_cls = "role-user";
+                } else {
+                    status_style = "background:var(--yellow);color:#000";
+                }
+
+                // Truncate agent ID for display
+                auto short_id = a.agent_id.size() > 12
+                    ? a.agent_id.substr(0, 12) + "..."
+                    : a.agent_id;
+
+                html += "<tr>"
+                        "<td><code style=\"font-size:0.7rem\">" + html_escape(short_id) + "</code></td>"
+                        "<td>" + html_escape(a.hostname) + "</td>"
+                        "<td>" + html_escape(a.os) + " " + html_escape(a.arch) + "</td>"
+                        "<td>" + html_escape(a.agent_version) + "</td>"
+                        "<td><span class=\"role-badge " + status_cls + "\" style=\"" + status_style + "\">" +
+                        html_escape(status_str) + "</span></td>"
+                        "<td>";
+
+                if (a.status == auth::PendingStatus::pending) {
+                    html += "<button class=\"btn btn-primary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;margin-right:0.3rem\" "
+                            "hx-post=\"/api/settings/pending-agents/" + html_escape(a.agent_id) + "/approve\" "
+                            "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
+                            ">Approve</button>"
+                            "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-post=\"/api/settings/pending-agents/" + html_escape(a.agent_id) + "/deny\" "
+                            "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
+                            "hx-confirm=\"Deny agent enrollment?\""
+                            ">Deny</button>";
+                } else {
+                    html += "<button class=\"btn btn-secondary\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-delete=\"/api/settings/pending-agents/" + html_escape(a.agent_id) + "\" "
+                            "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
+                            ">Remove</button>";
+                }
+
+                html += "</td></tr>";
+            }
+        }
+
+        html +=
+            "  </tbody>"
+            "</table>"
+            "<div class=\"feedback\" id=\"pending-feedback\"></div>";
+
+        return html;
     }
 
     // -- Web server -----------------------------------------------------------
@@ -1018,50 +1319,70 @@ private:
                 res.set_content(kSettingsHtml, "text/html; charset=utf-8");
             });
 
-        // -- Settings API: TLS state ------------------------------------------
-        web_server_->Get("/api/settings/tls",
+        // -- Settings HTMX fragment endpoints -----------------------------------
+
+        web_server_->Get("/fragments/settings/tls",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
-                res.set_content(
-                    "{\"tls_enabled\":" + std::string(cfg_.tls_enabled ? "true" : "false") +
-                    ",\"cert_path\":\"" + cfg_.tls_server_cert.string() +
-                    "\",\"key_path\":\"" + cfg_.tls_server_key.string() +
-                    "\",\"ca_path\":\"" + cfg_.tls_ca_cert.string() + "\"}",
-                    "application/json");
+                res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
             });
 
+        web_server_->Get("/fragments/settings/users",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/settings/tokens",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/settings/pending",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            });
+
+        // -- Settings API: TLS toggle (HTMX POST) ----------------------------
         web_server_->Post("/api/settings/tls",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
-                auto val = extract_json_string(req.body, "tls_enabled");
+                // HTMX sends form-encoded: tls_enabled=true (or absent if unchecked)
+                auto val = extract_form_value(req.body, "tls_enabled");
                 cfg_.tls_enabled = (val == "true");
                 spdlog::info("TLS setting changed to {} (restart required)",
                              cfg_.tls_enabled ? "enabled" : "disabled");
-                res.set_content(R"({"status":"ok"})", "application/json");
+                // Return updated TLS fragment
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
             });
 
-        // -- Settings API: Certificate upload (admin only) --------------------
+        // -- Settings API: Certificate upload (admin only, multipart) ----------
         web_server_->Post("/api/settings/cert-upload",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
 
-                auto type     = extract_json_string(req.body, "type");
-                auto filename = extract_json_string(req.body, "filename");
-                auto b64      = extract_json_string(req.body, "content");
+                // HTMX sends multipart/form-data with "type" hidden field and "file" file input
+                std::string type;
+                std::string content;
 
-                if (type.empty() || b64.empty()) {
-                    res.status = 400;
-                    res.set_content(R"({"error":"type and content required"})",
-                                    "application/json");
-                    return;
+                if (req.form.has_field("type")) {
+                    type = req.form.get_field("type");
+                } else if (req.has_param("type")) {
+                    type = req.get_param_value("type");
                 }
 
-                // Decode base64 content
-                auto content = base64_decode(b64);
-                if (content.empty()) {
+                if (req.form.has_file("file")) {
+                    content = req.form.get_file("file").content;
+                }
+
+                if (type.empty() || content.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid base64 content"})",
-                                    "application/json");
+                    res.set_content(
+                        "<span class=\"feedback-error\">Type and file are required.</span>",
+                        "text/html; charset=utf-8");
                     return;
                 }
 
@@ -1071,20 +1392,22 @@ private:
                 std::filesystem::create_directories(cert_dir, ec);
                 if (ec) {
                     res.status = 500;
-                    res.set_content(R"({"error":"cannot create cert directory"})",
-                                    "application/json");
+                    res.set_content(
+                        "<span class=\"feedback-error\">Cannot create cert directory.</span>",
+                        "text/html; charset=utf-8");
                     return;
                 }
 
-                // Determine filename and config field
+                // Determine output filename
                 std::string out_name;
                 if (type == "cert")     out_name = "server.pem";
                 else if (type == "key") out_name = "server-key.pem";
                 else if (type == "ca")  out_name = "ca.pem";
                 else {
                     res.status = 400;
-                    res.set_content(R"({"error":"type must be cert, key, or ca"})",
-                                    "application/json");
+                    res.set_content(
+                        "<span class=\"feedback-error\">Type must be cert, key, or ca.</span>",
+                        "text/html; charset=utf-8");
                     return;
                 }
 
@@ -1093,8 +1416,9 @@ private:
                     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
                     if (!f.is_open()) {
                         res.status = 500;
-                        res.set_content(R"({"error":"cannot write cert file"})",
-                                        "application/json");
+                        res.set_content(
+                            "<span class=\"feedback-error\">Cannot write cert file.</span>",
+                            "text/html; charset=utf-8");
                         return;
                     }
                     f.write(content.data(), static_cast<std::streamsize>(content.size()));
@@ -1106,39 +1430,25 @@ private:
                 else if (type == "ca")  cfg_.tls_ca_cert     = out_path;
 
                 spdlog::info("Certificate uploaded: {} → {}", type, out_path.string());
-                res.set_content(
-                    "{\"status\":\"ok\",\"path\":\"" + out_path.string() + "\"}",
-                    "application/json");
+                // Re-render TLS section to show new file paths
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
             });
 
-        // -- Settings API: User management (admin only) -----------------------
-        web_server_->Get("/api/settings/users",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res)) return;
-                auto users = auth_mgr_.list_users();
-                std::string json = "[";
-                bool first = true;
-                for (const auto& u : users) {
-                    if (!first) json += ",";
-                    first = false;
-                    json += "{\"username\":\"" + u.username +
-                            "\",\"role\":\"" + auth::role_to_string(u.role) + "\"}";
-                }
-                json += "]";
-                res.set_content(json, "application/json");
-            });
-
+        // -- Settings API: User management (admin only, HTMX) ------------------
         web_server_->Post("/api/settings/users",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
-                auto username = extract_json_string(req.body, "username");
-                auto password = extract_json_string(req.body, "password");
-                auto role_str = extract_json_string(req.body, "role");
+                auto username = extract_form_value(req.body, "username");
+                auto password = extract_form_value(req.body, "password");
+                auto role_str = extract_form_value(req.body, "role");
 
                 if (username.empty() || password.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"username and password required"})",
-                                    "application/json");
+                    res.set_content(render_users_fragment() +
+                        "<script>document.getElementById('user-feedback').className='feedback feedback-error';"
+                        "document.getElementById('user-feedback').textContent='Username and password required.';</script>",
+                        "text/html; charset=utf-8");
                     return;
                 }
 
@@ -1146,7 +1456,7 @@ private:
                 auth_mgr_.upsert_user(username, password, role);
                 auth_mgr_.save_config();
                 spdlog::info("User '{}' added/updated (role={})", username, role_str);
-                res.set_content(R"({"status":"ok"})", "application/json");
+                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
 
         // DELETE /api/settings/users/:username
@@ -1157,51 +1467,18 @@ private:
                 if (auth_mgr_.remove_user(username)) {
                     auth_mgr_.save_config();
                     spdlog::info("User '{}' removed", username);
-                    res.set_content(R"({"status":"ok"})", "application/json");
-                } else {
-                    res.status = 404;
-                    res.set_content(R"({"error":"user not found"})",
-                                    "application/json");
                 }
+                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
 
-        // -- Settings API: Enrollment tokens (admin only) --------------------
-
-        web_server_->Get("/api/settings/enrollment-tokens",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res)) return;
-                auto tokens = auth_mgr_.list_enrollment_tokens();
-                std::string json = "[";
-                bool first = true;
-                for (const auto& t : tokens) {
-                    if (!first) json += ",";
-                    first = false;
-
-                    auto created_epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                        t.created_at.time_since_epoch()).count();
-                    auto expires_epoch = (t.expires_at == std::chrono::system_clock::time_point::max())
-                        ? int64_t{0}
-                        : std::chrono::duration_cast<std::chrono::seconds>(
-                            t.expires_at.time_since_epoch()).count();
-
-                    json += "{\"token_id\":\"" + t.token_id +
-                            "\",\"label\":\"" + t.label +
-                            "\",\"max_uses\":" + std::to_string(t.max_uses) +
-                            ",\"use_count\":" + std::to_string(t.use_count) +
-                            ",\"created_at\":" + std::to_string(created_epoch) +
-                            ",\"expires_at\":" + std::to_string(expires_epoch) +
-                            ",\"revoked\":" + (t.revoked ? "true" : "false") + "}";
-                }
-                json += "]";
-                res.set_content(json, "application/json");
-            });
+        // -- Settings API: Enrollment tokens (admin only, HTMX) ----------------
 
         web_server_->Post("/api/settings/enrollment-tokens",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
-                auto label = extract_json_string(req.body, "label");
-                auto max_uses_s = extract_json_string(req.body, "max_uses");
-                auto ttl_s = extract_json_string(req.body, "ttl_hours");
+                auto label = extract_form_value(req.body, "label");
+                auto max_uses_s = extract_form_value(req.body, "max_uses");
+                auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
                 int max_uses = max_uses_s.empty() ? 0 : std::stoi(max_uses_s);
                 int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
@@ -1212,83 +1489,42 @@ private:
 
                 auto raw_token = auth_mgr_.create_enrollment_token(label, max_uses, ttl);
 
-                // Return the raw token — this is the only time it's visible
-                res.set_content(
-                    "{\"status\":\"ok\",\"token\":\"" + raw_token + "\"}",
-                    "application/json");
+                // Return token list fragment with the one-time token reveal
+                res.set_content(render_tokens_fragment(raw_token), "text/html; charset=utf-8");
             });
 
         web_server_->Delete(R"(/api/settings/enrollment-tokens/(.+))",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
                 auto token_id = req.matches[1].str();
-                if (auth_mgr_.revoke_enrollment_token(token_id)) {
-                    res.set_content(R"({"status":"ok"})", "application/json");
-                } else {
-                    res.status = 404;
-                    res.set_content(R"({"error":"token not found"})", "application/json");
-                }
+                auth_mgr_.revoke_enrollment_token(token_id);
+                res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             });
 
-        // -- Settings API: Pending agents (admin only) ------------------------
-
-        web_server_->Get("/api/settings/pending-agents",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res)) return;
-                auto agents = auth_mgr_.list_pending_agents();
-                std::string json = "[";
-                bool first = true;
-                for (const auto& a : agents) {
-                    if (!first) json += ",";
-                    first = false;
-                    auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                        a.requested_at.time_since_epoch()).count();
-                    json += "{\"agent_id\":\"" + a.agent_id +
-                            "\",\"hostname\":\"" + a.hostname +
-                            "\",\"os\":\"" + a.os +
-                            "\",\"arch\":\"" + a.arch +
-                            "\",\"agent_version\":\"" + a.agent_version +
-                            "\",\"requested_at\":" + std::to_string(epoch) +
-                            ",\"status\":\"" + auth::pending_status_to_string(a.status) + "\"}";
-                }
-                json += "]";
-                res.set_content(json, "application/json");
-            });
+        // -- Settings API: Pending agents (admin only, HTMX) --------------------
 
         web_server_->Post(R"(/api/settings/pending-agents/(.+)/approve)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
                 auto agent_id = req.matches[1].str();
-                if (auth_mgr_.approve_pending_agent(agent_id)) {
-                    res.set_content(R"({"status":"ok"})", "application/json");
-                } else {
-                    res.status = 404;
-                    res.set_content(R"({"error":"agent not found"})", "application/json");
-                }
+                auth_mgr_.approve_pending_agent(agent_id);
+                res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             });
 
         web_server_->Post(R"(/api/settings/pending-agents/(.+)/deny)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
                 auto agent_id = req.matches[1].str();
-                if (auth_mgr_.deny_pending_agent(agent_id)) {
-                    res.set_content(R"({"status":"ok"})", "application/json");
-                } else {
-                    res.status = 404;
-                    res.set_content(R"({"error":"agent not found"})", "application/json");
-                }
+                auth_mgr_.deny_pending_agent(agent_id);
+                res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             });
 
         web_server_->Delete(R"(/api/settings/pending-agents/(.+))",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!require_admin(req, res)) return;
                 auto agent_id = req.matches[1].str();
-                if (auth_mgr_.remove_pending_agent(agent_id)) {
-                    res.set_content(R"({"status":"ok"})", "application/json");
-                } else {
-                    res.status = 404;
-                    res.set_content(R"({"error":"agent not found"})", "application/json");
-                }
+                auth_mgr_.remove_pending_agent(agent_id);
+                res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             });
 
         // Legacy routes — redirect to dashboard
