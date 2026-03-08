@@ -104,24 +104,17 @@ Both CMake and Meson build files must be kept in sync. **Every time you add, rem
 
 ### Meson build (Windows, from MSYS2 bash)
 ```bash
-cat > /c/Users/natha/Yuzu/_build_tmp.bat << 'EOF'
-@echo off
-set PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-set PATH=C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf;C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc;%PATH%
-cd /d C:\Users\natha\Yuzu
+source ./setup_msvc_env.sh
 meson compile -C builddir
-EOF
-powershell.exe -NoProfile -Command "& {cmd /c 'C:\Users\natha\Yuzu\_build_tmp.bat'}" 2>&1 | tail -60
 ```
 
+**IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
+
 ### Windows toolchain requirements
-All of these must be reachable. vcvars64.bat sets most SDK/include/lib paths, but the others need manual PATH entries:
+All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe/MSVC.
 | Tool | Path |
 |---|---|
-| vcvars64.bat | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat` |
-| vswhere.exe | `C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe` (needed by vcvars64) |
-| cl.exe | Set by vcvars64 — do **not** use Clang (`C:\Program Files\LLVM\bin`) |
+| cl.exe | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe` |
 | cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` |
 | ninja.exe | Installed with CMake or VS BuildTools |
 | meson | `pip install meson` (Python) |
@@ -129,20 +122,24 @@ All of these must be reachable. vcvars64.bat sets most SDK/include/lib paths, bu
 | protoc | `C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
 | grpc_cpp_plugin | `C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
 
-**Friction note**: vcvars64.bat environment does not propagate through MSYS2 bash. Use the PowerShell + .bat wrapper pattern shown above.
-
 ## Authentication & Authorization
 
 ### Implemented
 - **mTLS** for agent ↔ server gRPC connections.
 - **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Two roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
 - **Login page** — dark-themed, with greyed-out OIDC SSO stub ("Coming soon").
-- **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, greyed-out AD/Entra section.
+- **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, greyed-out AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
+- **Tiered agent enrollment**:
+  - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
+  - **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
+  - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
+- **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
+- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
 
 ### Remaining work
-1. **Enrollment token** — Add `enrollment_token` field to `RegisterRequest` in `agent.proto`. Server validates against a configured secret.
+1. **Tier 3 platform trust** — implement Windows cert store (`CertOpenSystemStore`), macOS Keychain, and cloud attestation (AWS/Azure/GCP) enrollment paths.
 2. **HTTPS for web dashboard** — currently HTTP only; add TLS termination.
 3. **OIDC SSO** — replace the stub login button with real OIDC flow.
 4. **AD/Entra directory integration** — inherit roles from domain groups.

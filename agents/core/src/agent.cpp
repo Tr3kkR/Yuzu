@@ -221,6 +221,12 @@ public:
                 pi->set_description(handle.descriptor()->description);
             }
 
+            // Tier 2: Include enrollment token if provided
+            if (!cfg_.enrollment_token.empty()) {
+                req.set_enrollment_token(cfg_.enrollment_token);
+                spdlog::info("Including enrollment token in registration");
+            }
+
             pb::RegisterResponse resp;
             auto status = stub->Register(&ctx, req, &resp);
             if (!status.ok()) {
@@ -233,8 +239,17 @@ public:
                     resp.reject_reason());
                 goto shutdown_plugins;
             }
+
+            auto enrollment_status = resp.enrollment_status();
+            if (enrollment_status == "pending") {
+                spdlog::warn("Registration pending admin approval — agent will not receive commands until approved");
+                spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard", cfg_.agent_id);
+                goto shutdown_plugins;
+            }
+
             session_id_ = resp.session_id();
-            spdlog::info("Registered with server (session={})", session_id_);
+            spdlog::info("Registered with server (session={}, enrollment={})",
+                session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
         }
 
         // 4. Open Subscribe bidi stream

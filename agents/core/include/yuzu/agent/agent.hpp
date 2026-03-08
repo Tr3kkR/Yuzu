@@ -20,6 +20,7 @@ struct Config {
     std::filesystem::path    tls_ca_cert;        // PEM CA certificate for server verification
     std::filesystem::path    tls_client_cert;    // Optional mTLS client cert
     std::filesystem::path    tls_client_key;     // Optional mTLS client key
+    std::string              enrollment_token;   // Pre-shared enrollment token (Tier 2)
     std::string              log_level{"info"};  // Current log level
     bool                     debug_mode{false};  // Debug mode flag (diagnostic features)
     bool                     verbose_logging{false}; // Verbose logging flag

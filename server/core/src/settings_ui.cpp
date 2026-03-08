@@ -274,6 +274,75 @@ R"HTM(<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- ── Enrollment Tokens ────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Enrollment Tokens</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Generate pre-shared tokens to auto-enroll agents.
+          The raw token is shown <strong>once</strong> — copy it before closing.
+        </p>
+
+        <table class="user-table">
+          <thead>
+            <tr><th>ID</th><th>Label</th><th>Uses</th><th>Expires</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="token-tbody">
+            <tr><td colspan="6" style="color:#484f58">Loading...</td></tr>
+          </tbody>
+        </table>
+
+        <div class="add-user-form">
+          <div class="mini-field">
+            <label>Label</label>
+            <input type="text" id="token-label" placeholder="e.g. NYC rollout" style="width:160px">
+          </div>
+          <div class="mini-field">
+            <label>Max Uses</label>
+            <input type="text" id="token-max-uses" placeholder="0 = unlimited" style="width:80px">
+          </div>
+          <div class="mini-field">
+            <label>TTL (hours)</label>
+            <input type="text" id="token-ttl" placeholder="0 = never" style="width:80px">
+          </div>
+          <button class="btn btn-primary" onclick="createToken()">Generate Token</button>
+        </div>
+        <div class="feedback" id="token-feedback"></div>
+
+        <!-- One-time token display -->
+        <div id="token-reveal" style="display:none;margin-top:1rem;padding:0.75rem;background:#0d1117;border:1px solid var(--green);border-radius:0.3rem">
+          <div style="font-size:0.7rem;color:var(--green);margin-bottom:0.3rem;font-weight:600">
+            COPY THIS TOKEN NOW — it will not be shown again
+          </div>
+          <code id="token-raw" style="font-size:0.85rem;word-break:break-all;color:var(--fg);user-select:all"></code>
+          <button class="btn btn-secondary" style="margin-top:0.5rem;font-size:0.7rem"
+                  onclick="navigator.clipboard.writeText(document.getElementById('token-raw').textContent);this.textContent='Copied!'">
+            Copy to Clipboard
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Pending Agents ─────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Pending Agent Approvals</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Agents that registered without an enrollment token are shown here.
+          Approve or deny them to control fleet membership.
+        </p>
+        <table class="user-table">
+          <thead>
+            <tr><th>Agent ID</th><th>Hostname</th><th>OS</th><th>Version</th><th>Status</th><th></th></tr>
+          </thead>
+          <tbody id="pending-tbody">
+            <tr><td colspan="6" style="color:#484f58">Loading...</td></tr>
+          </tbody>
+        </table>
+        <div class="feedback" id="pending-feedback"></div>
+      </div>
+    </div>
+
     <!-- ── Directory Integration (coming soon) ───────────── -->
     <div class="section coming-soon">
       <span class="coming-soon-badge">COMING SOON</span>
@@ -469,9 +538,181 @@ R"HTM(
       return d.innerHTML;
     }
 
+    /* ── Enrollment tokens ────────────────────────────────── */
+    function loadTokens() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/settings/enrollment-tokens');
+      xhr.onload = function() {
+        if (xhr.status !== 200) return;
+        var tokens = JSON.parse(xhr.responseText);
+        var tbody = document.getElementById('token-tbody');
+        if (tokens.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:#484f58">No tokens created</td></tr>';
+          return;
+        }
+        var html = '';
+        for (var i = 0; i < tokens.length; i++) {
+          var t = tokens[i];
+          var uses = t.max_uses === 0 ? t.use_count + ' / \u221e' : t.use_count + ' / ' + t.max_uses;
+          var exp = t.expires_at === 0 ? 'Never' : new Date(t.expires_at * 1000).toLocaleString();
+          var statusCls = t.revoked ? 'role-user' : 'role-admin';
+          var statusTxt = t.revoked ? 'Revoked' : 'Active';
+          if (!t.revoked && t.max_uses > 0 && t.use_count >= t.max_uses) {
+            statusCls = 'role-user'; statusTxt = 'Exhausted';
+          }
+          html += '<tr><td><code>' + escapeHtml(t.token_id) + '</code></td>' +
+                  '<td>' + escapeHtml(t.label) + '</td>' +
+                  '<td>' + uses + '</td>' +
+                  '<td style="font-size:0.75rem">' + exp + '</td>' +
+                  '<td><span class="role-badge ' + statusCls + '">' + statusTxt + '</span></td>' +
+                  '<td>' + (t.revoked ? '' :
+                  '<button class="btn btn-danger" style="padding:0.2rem 0.6rem;font-size:0.7rem" ' +
+                  'onclick="revokeToken(\'' + escapeHtml(t.token_id) + '\')">Revoke</button>') + '</td></tr>';
+        }
+        tbody.innerHTML = html;
+      };
+      xhr.send();
+    }
+
+    function createToken() {
+      var label = document.getElementById('token-label').value.trim();
+      var maxUses = document.getElementById('token-max-uses').value.trim() || '0';
+      var ttl = document.getElementById('token-ttl').value.trim() || '0';
+      var fb = document.getElementById('token-feedback');
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/settings/enrollment-tokens');
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          var resp = JSON.parse(xhr.responseText);
+          document.getElementById('token-raw').textContent = resp.token;
+          document.getElementById('token-reveal').style.display = 'block';
+          fb.className = 'feedback feedback-ok';
+          fb.textContent = 'Token created. Copy it now!';
+          document.getElementById('token-label').value = '';
+          document.getElementById('token-max-uses').value = '';
+          document.getElementById('token-ttl').value = '';
+          loadTokens();
+        } else {
+          fb.className = 'feedback feedback-error';
+          fb.textContent = 'Failed to create token.';
+        }
+      };
+      xhr.send(JSON.stringify({ label: label, max_uses: maxUses, ttl_hours: ttl }));
+    }
+
+    function revokeToken(tokenId) {
+      if (!confirm('Revoke token "' + tokenId + '"? Agents using this token will no longer be able to enroll.')) return;
+      var xhr = new XMLHttpRequest();
+      xhr.open('DELETE', '/api/settings/enrollment-tokens/' + encodeURIComponent(tokenId));
+      xhr.onload = function() {
+        var fb = document.getElementById('token-feedback');
+        if (xhr.status === 200) {
+          fb.className = 'feedback feedback-ok';
+          fb.textContent = 'Token revoked.';
+          loadTokens();
+        } else {
+          fb.className = 'feedback feedback-error';
+          fb.textContent = 'Failed to revoke token.';
+        }
+      };
+      xhr.send();
+    }
+
+    /* ── Pending agents ───────────────────────────────────── */
+    function loadPendingAgents() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/settings/pending-agents');
+      xhr.onload = function() {
+        if (xhr.status !== 200) return;
+        var agents = JSON.parse(xhr.responseText);
+        var tbody = document.getElementById('pending-tbody');
+        if (agents.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:#484f58">No pending agents</td></tr>';
+          return;
+        }
+        var html = '';
+        for (var i = 0; i < agents.length; i++) {
+          var a = agents[i];
+          var statusCls = a.status === 'approved' ? 'role-admin' :
+                          a.status === 'denied'   ? 'role-user'  : '';
+          var statusStyle = a.status === 'pending'
+            ? 'background:var(--yellow);color:#000' : '';
+          var actions = '';
+          if (a.status === 'pending') {
+            actions = '<button class="btn btn-primary" style="padding:0.2rem 0.6rem;font-size:0.7rem;margin-right:0.3rem" ' +
+                      'onclick="approvePending(\'' + escapeHtml(a.agent_id) + '\')">Approve</button>' +
+                      '<button class="btn btn-danger" style="padding:0.2rem 0.6rem;font-size:0.7rem" ' +
+                      'onclick="denyPending(\'' + escapeHtml(a.agent_id) + '\')">Deny</button>';
+          } else {
+            actions = '<button class="btn btn-secondary" style="padding:0.2rem 0.6rem;font-size:0.7rem" ' +
+                      'onclick="removePending(\'' + escapeHtml(a.agent_id) + '\')">Remove</button>';
+          }
+          html += '<tr><td><code style="font-size:0.7rem">' + escapeHtml(a.agent_id).substring(0, 12) + '...</code></td>' +
+                  '<td>' + escapeHtml(a.hostname) + '</td>' +
+                  '<td>' + escapeHtml(a.os) + ' ' + escapeHtml(a.arch) + '</td>' +
+                  '<td>' + escapeHtml(a.agent_version) + '</td>' +
+                  '<td><span class="role-badge ' + statusCls + '" style="' + statusStyle + '">' +
+                  escapeHtml(a.status) + '</span></td>' +
+                  '<td>' + actions + '</td></tr>';
+        }
+        tbody.innerHTML = html;
+      };
+      xhr.send();
+    }
+
+    function approvePending(agentId) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/settings/pending-agents/' + encodeURIComponent(agentId) + '/approve');
+      xhr.onload = function() {
+        var fb = document.getElementById('pending-feedback');
+        if (xhr.status === 200) {
+          fb.className = 'feedback feedback-ok';
+          fb.textContent = 'Agent approved. It will connect on next retry.';
+          loadPendingAgents();
+        } else {
+          fb.className = 'feedback feedback-error';
+          fb.textContent = 'Failed to approve agent.';
+        }
+      };
+      xhr.send();
+    }
+
+    function denyPending(agentId) {
+      if (!confirm('Deny agent enrollment?')) return;
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/settings/pending-agents/' + encodeURIComponent(agentId) + '/deny');
+      xhr.onload = function() {
+        var fb = document.getElementById('pending-feedback');
+        if (xhr.status === 200) {
+          fb.className = 'feedback feedback-ok';
+          fb.textContent = 'Agent denied.';
+          loadPendingAgents();
+        } else {
+          fb.className = 'feedback feedback-error';
+          fb.textContent = 'Failed to deny agent.';
+        }
+      };
+      xhr.send();
+    }
+
+    function removePending(agentId) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('DELETE', '/api/settings/pending-agents/' + encodeURIComponent(agentId));
+      xhr.onload = function() { loadPendingAgents(); };
+      xhr.send();
+    }
+
     /* ── Init ──────────────────────────────────────────────── */
     loadTlsState();
     loadUsers();
+    loadTokens();
+    loadPendingAgents();
+
+    /* Refresh pending agents when SSE notifies us */
+    var evtSrc = new EventSource('/events');
+    evtSrc.addEventListener('pending-agent', function() { loadPendingAgents(); });
   </script>
 </body>
 </html>

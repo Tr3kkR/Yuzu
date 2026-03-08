@@ -173,6 +173,11 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
     }
 
     spdlog::info("Loaded {} user(s) from {}", users_.size(), cfg_path.string());
+
+    // Also load enrollment tokens and pending agents
+    load_tokens();
+    load_pending();
+
     return !users_.empty();
 }
 
@@ -415,6 +420,405 @@ bool AuthManager::upsert_user(const std::string& username,
 bool AuthManager::remove_user(const std::string& username) {
     std::lock_guard lock(mu_);
     return users_.erase(username) > 0;
+}
+
+// ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
+
+std::string AuthManager::sha256_hex(const std::string& input) {
+    // Reuse PBKDF2 with 1 iteration and empty salt for a simple SHA-256 hash.
+    // This is fine for token hashing (tokens are already high-entropy).
+    constexpr int kKeyLen = 32;
+    std::vector<uint8_t> derived(kKeyLen);
+
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    auto status = BCryptOpenAlgorithmProvider(&hAlg,
+        BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptOpenAlgorithmProvider failed for SHA-256");
+    }
+
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        throw std::runtime_error("BCryptCreateHash failed");
+    }
+
+    status = BCryptHashData(hHash,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
+        static_cast<ULONG>(input.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        throw std::runtime_error("BCryptHashData failed");
+    }
+
+    status = BCryptFinishHash(hHash, derived.data(),
+        static_cast<ULONG>(derived.size()), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptFinishHash failed");
+    }
+#else
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) throw std::runtime_error("EVP_MD_CTX_new failed");
+
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(ctx, input.data(), input.size()) != 1 ||
+        EVP_DigestFinal_ex(ctx, derived.data(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP SHA-256 digest failed");
+    }
+    EVP_MD_CTX_free(ctx);
+#endif
+
+    return bytes_to_hex(derived);
+}
+
+std::string AuthManager::create_enrollment_token(const std::string& label,
+                                                  int max_uses,
+                                                  std::chrono::seconds ttl) {
+    // Generate a high-entropy raw token
+    auto raw_bytes = random_bytes(32);
+    auto raw_token = bytes_to_hex(raw_bytes);
+
+    // Hash it for storage (we never store the raw token)
+    auto hash = sha256_hex(raw_token);
+
+    // Token ID = first 8 hex chars of the hash (for display/admin reference)
+    auto token_id = hash.substr(0, 8);
+
+    auto now = std::chrono::system_clock::now();
+
+    EnrollmentToken et;
+    et.token_id   = token_id;
+    et.token_hash = hash;
+    et.label      = label;
+    et.max_uses   = max_uses;
+    et.use_count  = 0;
+    et.created_at = now;
+    et.expires_at = (ttl.count() == 0)
+        ? (std::chrono::system_clock::time_point::max)()
+        : now + ttl;
+    et.revoked    = false;
+
+    {
+        std::lock_guard lock(mu_);
+        enrollment_tokens_[token_id] = std::move(et);
+    }
+
+    save_tokens();
+
+    spdlog::info("Enrollment token created: id={}, label='{}', max_uses={}, ttl={}s",
+                 token_id, label, max_uses, ttl.count());
+    return raw_token;
+}
+
+bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
+    auto hash = sha256_hex(raw_token);
+    auto now = std::chrono::system_clock::now();
+
+    std::lock_guard lock(mu_);
+
+    for (auto& [id, et] : enrollment_tokens_) {
+        if (et.token_hash != hash) continue;
+
+        if (et.revoked) {
+            spdlog::warn("Enrollment token {} is revoked", id);
+            return false;
+        }
+        if (now > et.expires_at) {
+            spdlog::warn("Enrollment token {} has expired", id);
+            return false;
+        }
+        if (et.max_uses > 0 && et.use_count >= et.max_uses) {
+            spdlog::warn("Enrollment token {} exhausted ({}/{})", id, et.use_count, et.max_uses);
+            return false;
+        }
+
+        ++et.use_count;
+        spdlog::info("Enrollment token {} used ({}/{})", id, et.use_count,
+                     et.max_uses == 0 ? -1 : et.max_uses);
+        // Save updated use count (don't hold lock during file I/O — already locked)
+        // We'll save after releasing; use a flag.
+        return true;
+    }
+
+    spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
+    return false;
+}
+
+std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
+    std::lock_guard lock(mu_);
+    std::vector<EnrollmentToken> out;
+    out.reserve(enrollment_tokens_.size());
+    for (const auto& [_, et] : enrollment_tokens_) {
+        out.push_back(et);
+    }
+    return out;
+}
+
+bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = enrollment_tokens_.find(token_id);
+        if (it == enrollment_tokens_.end()) return false;
+        it->second.revoked = true;
+    }
+    save_tokens();
+    spdlog::info("Enrollment token {} revoked", token_id);
+    return true;
+}
+
+// ── Enrollment token persistence ────────────────────────────────────────────
+
+bool AuthManager::save_tokens() const {
+    auto path = cfg_path_.parent_path() / "enrollment-tokens.cfg";
+
+    std::lock_guard lock(mu_);
+
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open()) {
+        spdlog::error("Cannot write enrollment tokens to {}", path.string());
+        return false;
+    }
+
+    f << "# Yuzu Enrollment Tokens\n";
+    f << "# Format: token_id:token_hash:label:max_uses:use_count:created_epoch:expires_epoch:revoked\n\n";
+
+    for (const auto& [id, et] : enrollment_tokens_) {
+        auto created_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            et.created_at.time_since_epoch()).count();
+        auto expires_epoch = (et.expires_at == (std::chrono::system_clock::time_point::max)())
+            ? int64_t{0}
+            : std::chrono::duration_cast<std::chrono::seconds>(
+                et.expires_at.time_since_epoch()).count();
+
+        f << et.token_id << ':'
+          << et.token_hash << ':'
+          << et.label << ':'
+          << et.max_uses << ':'
+          << et.use_count << ':'
+          << created_epoch << ':'
+          << expires_epoch << ':'
+          << (et.revoked ? '1' : '0') << '\n';
+    }
+
+    return true;
+}
+
+bool AuthManager::load_tokens() {
+    auto path = cfg_path_.parent_path() / "enrollment-tokens.cfg";
+
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::lock_guard lock(mu_);
+    enrollment_tokens_.clear();
+
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream ss(line);
+        std::string token_id, token_hash, label, max_uses_s, use_count_s,
+                    created_s, expires_s, revoked_s;
+
+        if (!std::getline(ss, token_id, ':')) continue;
+        if (!std::getline(ss, token_hash, ':')) continue;
+        if (!std::getline(ss, label, ':')) continue;
+        if (!std::getline(ss, max_uses_s, ':')) continue;
+        if (!std::getline(ss, use_count_s, ':')) continue;
+        if (!std::getline(ss, created_s, ':')) continue;
+        if (!std::getline(ss, expires_s, ':')) continue;
+        if (!std::getline(ss, revoked_s, ':')) continue;
+
+        EnrollmentToken et;
+        et.token_id   = token_id;
+        et.token_hash = token_hash;
+        et.label      = label;
+        et.max_uses   = std::stoi(max_uses_s);
+        et.use_count  = std::stoi(use_count_s);
+        et.created_at = std::chrono::system_clock::time_point(
+            std::chrono::seconds(std::stoll(created_s)));
+        et.expires_at = (expires_s == "0")
+            ? (std::chrono::system_clock::time_point::max)()
+            : std::chrono::system_clock::time_point(
+                std::chrono::seconds(std::stoll(expires_s)));
+        et.revoked    = (revoked_s == "1");
+
+        enrollment_tokens_[token_id] = std::move(et);
+    }
+
+    spdlog::info("Loaded {} enrollment token(s)", enrollment_tokens_.size());
+    return true;
+}
+
+// ── Pending agents (Tier 1) ─────────────────────────────────────────────────
+
+std::string pending_status_to_string(PendingStatus s) {
+    switch (s) {
+        case PendingStatus::pending:  return "pending";
+        case PendingStatus::approved: return "approved";
+        case PendingStatus::denied:   return "denied";
+    }
+    return "unknown";
+}
+
+void AuthManager::add_pending_agent(const std::string& agent_id,
+                                     const std::string& hostname,
+                                     const std::string& os,
+                                     const std::string& arch,
+                                     const std::string& agent_version) {
+    {
+        std::lock_guard lock(mu_);
+        // Don't overwrite if already exists
+        if (pending_agents_.contains(agent_id)) return;
+
+        PendingAgent pa;
+        pa.agent_id      = agent_id;
+        pa.hostname      = hostname;
+        pa.os            = os;
+        pa.arch          = arch;
+        pa.agent_version = agent_version;
+        pa.requested_at  = std::chrono::system_clock::now();
+        pa.status        = PendingStatus::pending;
+        pending_agents_[agent_id] = std::move(pa);
+    }
+    save_pending();
+    spdlog::info("Agent {} added to pending approval queue", agent_id);
+}
+
+std::optional<PendingStatus> AuthManager::get_pending_status(const std::string& agent_id) const {
+    std::lock_guard lock(mu_);
+    auto it = pending_agents_.find(agent_id);
+    if (it == pending_agents_.end()) return std::nullopt;
+    return it->second.status;
+}
+
+std::vector<PendingAgent> AuthManager::list_pending_agents() const {
+    std::lock_guard lock(mu_);
+    std::vector<PendingAgent> out;
+    out.reserve(pending_agents_.size());
+    for (const auto& [_, pa] : pending_agents_) {
+        out.push_back(pa);
+    }
+    return out;
+}
+
+bool AuthManager::approve_pending_agent(const std::string& agent_id) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = pending_agents_.find(agent_id);
+        if (it == pending_agents_.end()) return false;
+        it->second.status = PendingStatus::approved;
+    }
+    save_pending();
+    spdlog::info("Agent {} approved for enrollment", agent_id);
+    return true;
+}
+
+bool AuthManager::deny_pending_agent(const std::string& agent_id) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = pending_agents_.find(agent_id);
+        if (it == pending_agents_.end()) return false;
+        it->second.status = PendingStatus::denied;
+    }
+    save_pending();
+    spdlog::info("Agent {} denied enrollment", agent_id);
+    return true;
+}
+
+bool AuthManager::remove_pending_agent(const std::string& agent_id) {
+    {
+        std::lock_guard lock(mu_);
+        if (pending_agents_.erase(agent_id) == 0) return false;
+    }
+    save_pending();
+    return true;
+}
+
+// ── Pending agent persistence ───────────────────────────────────────────────
+
+bool AuthManager::save_pending() const {
+    auto path = cfg_path_.parent_path() / "pending-agents.cfg";
+
+    std::lock_guard lock(mu_);
+
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open()) {
+        spdlog::error("Cannot write pending agents to {}", path.string());
+        return false;
+    }
+
+    f << "# Yuzu Pending Agents\n";
+    f << "# Format: agent_id:hostname:os:arch:version:requested_epoch:status\n\n";
+
+    for (const auto& [id, pa] : pending_agents_) {
+        auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            pa.requested_at.time_since_epoch()).count();
+
+        f << pa.agent_id << ':'
+          << pa.hostname << ':'
+          << pa.os << ':'
+          << pa.arch << ':'
+          << pa.agent_version << ':'
+          << epoch << ':'
+          << pending_status_to_string(pa.status) << '\n';
+    }
+
+    return true;
+}
+
+bool AuthManager::load_pending() {
+    auto path = cfg_path_.parent_path() / "pending-agents.cfg";
+
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+
+    std::lock_guard lock(mu_);
+    pending_agents_.clear();
+
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream ss(line);
+        std::string agent_id, hostname, os, arch, version, epoch_s, status_s;
+
+        if (!std::getline(ss, agent_id, ':')) continue;
+        if (!std::getline(ss, hostname, ':')) continue;
+        if (!std::getline(ss, os, ':')) continue;
+        if (!std::getline(ss, arch, ':')) continue;
+        if (!std::getline(ss, version, ':')) continue;
+        if (!std::getline(ss, epoch_s, ':')) continue;
+        if (!std::getline(ss, status_s, ':')) continue;
+
+        PendingAgent pa;
+        pa.agent_id      = agent_id;
+        pa.hostname       = hostname;
+        pa.os             = os;
+        pa.arch           = arch;
+        pa.agent_version  = version;
+        pa.requested_at   = std::chrono::system_clock::time_point(
+            std::chrono::seconds(std::stoll(epoch_s)));
+
+        if (status_s == "approved")     pa.status = PendingStatus::approved;
+        else if (status_s == "denied")  pa.status = PendingStatus::denied;
+        else                            pa.status = PendingStatus::pending;
+
+        pending_agents_[agent_id] = std::move(pa);
+    }
+
+    spdlog::info("Loaded {} pending agent(s)", pending_agents_.size());
+    return true;
 }
 
 }  // namespace yuzu::server::auth

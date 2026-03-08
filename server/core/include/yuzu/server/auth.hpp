@@ -26,6 +26,33 @@ struct Session {
     std::chrono::steady_clock::time_point expires_at;
 };
 
+// ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
+
+struct EnrollmentToken {
+    std::string token_id;      // Short display ID (first 8 hex chars)
+    std::string token_hash;    // SHA-256 hash of the actual token (stored, never raw)
+    std::string label;         // Admin-assigned label (e.g. "NYC office rollout")
+    int         max_uses;      // 0 = unlimited
+    int         use_count;     // How many times this token has been used
+    std::chrono::system_clock::time_point created_at;
+    std::chrono::system_clock::time_point expires_at;  // time_point::max() = never
+    bool        revoked;
+};
+
+// ── Pending agents (Tier 1) ─────────────────────────────────────────────────
+
+enum class PendingStatus { pending, approved, denied };
+
+struct PendingAgent {
+    std::string agent_id;
+    std::string hostname;
+    std::string os;
+    std::string arch;
+    std::string agent_version;
+    std::chrono::system_clock::time_point requested_at;
+    PendingStatus status;
+};
+
 class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
@@ -65,6 +92,47 @@ public:
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
+    // -- Enrollment tokens (Tier 2) ---------------------------------------
+
+    /// Create a new enrollment token. Returns the raw token string (show once).
+    std::string create_enrollment_token(const std::string& label,
+                                        int max_uses,
+                                        std::chrono::seconds ttl);
+
+    /// Validate a raw enrollment token. Returns true and increments use_count
+    /// if valid. Returns false if expired, revoked, or exhausted.
+    bool validate_enrollment_token(const std::string& raw_token);
+
+    /// List all enrollment tokens (for admin UI).
+    std::vector<EnrollmentToken> list_enrollment_tokens() const;
+
+    /// Revoke a token by its token_id.
+    bool revoke_enrollment_token(const std::string& token_id);
+
+    // -- Pending agents (Tier 1) ------------------------------------------
+
+    /// Add an agent to the pending approval queue.
+    void add_pending_agent(const std::string& agent_id,
+                           const std::string& hostname,
+                           const std::string& os,
+                           const std::string& arch,
+                           const std::string& agent_version);
+
+    /// Check if an agent_id is pending, approved, or denied.
+    std::optional<PendingStatus> get_pending_status(const std::string& agent_id) const;
+
+    /// List all pending agents (for admin UI).
+    std::vector<PendingAgent> list_pending_agents() const;
+
+    /// Approve a pending agent.
+    bool approve_pending_agent(const std::string& agent_id);
+
+    /// Deny a pending agent.
+    bool deny_pending_agent(const std::string& agent_id);
+
+    /// Remove a pending agent entry (cleanup after enrollment or denial).
+    bool remove_pending_agent(const std::string& agent_id);
+
     // -- Crypto primitives (platform-abstracted) --------------------------
 
     static std::vector<uint8_t> random_bytes(std::size_t n);
@@ -73,14 +141,31 @@ public:
     static std::string          pbkdf2_sha256(const std::string& password,
                                               const std::vector<uint8_t>& salt,
                                               int iterations);
+    static std::string          sha256_hex(const std::string& input);
 
 private:
     static std::string generate_session_token();
+
+    /// Persist enrollment tokens to disk.
+    bool save_tokens() const;
+    /// Load enrollment tokens from disk.
+    bool load_tokens();
+
+    /// Persist pending agents to disk.
+    bool save_pending() const;
+    /// Load pending agents from disk.
+    bool load_pending();
 
     mutable std::mutex mu_;
     std::filesystem::path cfg_path_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;
+
+    // Enrollment tokens keyed by token_id
+    std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;
+
+    // Pending agents keyed by agent_id
+    std::unordered_map<std::string, PendingAgent> pending_agents_;
 };
 
 // OS-appropriate default paths.
@@ -89,5 +174,7 @@ std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
 Role        string_to_role(const std::string& s);
+
+std::string pending_status_to_string(PendingStatus s);
 
 }  // namespace yuzu::server::auth

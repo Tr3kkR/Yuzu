@@ -39,6 +39,14 @@ message AgentInfo {
 
 message RegisterRequest {
   AgentInfo info = 1;
+
+  // Tier 2: Pre-shared enrollment token (admin-generated).
+  string enrollment_token = 2;
+
+  // Tier 3 (future): Platform trust — machine certificate / attestation.
+  bytes  machine_certificate    = 3;   // DER-encoded X.509
+  bytes  attestation_signature  = 4;   // Signed challenge
+  string attestation_provider   = 5;   // "ad-cs", "aws", "azure", etc.
 }
 
 message RegisterResponse {
@@ -47,6 +55,11 @@ message RegisterResponse {
   string reject_reason = 3;  // Populated if accepted == false
   // Server may send initial commands immediately after registration
   repeated CommandRequest pending_commands = 4;
+
+  // Enrollment status: "enrolled", "pending", "denied"
+  string enrollment_status = 5;
+  // Persistent agent credential for reconnection (future use)
+  string agent_credential = 6;
 }
 
 // ── Heartbeat ─────────────────────────────────────────────────────────────────

@@ -53,6 +53,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--ca-cert",      cfg.tls_ca_cert,     "PEM CA certificate for server verification");
     app.add_option("--client-cert",  cfg.tls_client_cert, "PEM client certificate for mTLS");
     app.add_option("--client-key",   cfg.tls_client_key,  "PEM client private key for mTLS");
+    app.add_option("--enrollment-token", cfg.enrollment_token, "Pre-shared enrollment token for server registration");
     app.add_flag  ("--debug",    "Enable debug mode (diagnostic features)")
        ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
     app.add_flag  ("--verbose",  "Enable verbose logging")

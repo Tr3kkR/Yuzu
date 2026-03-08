@@ -312,8 +312,12 @@ void sse_resource_release(
 
 class AgentServiceImpl : public pb::AgentService::Service {
 public:
-    AgentServiceImpl(AgentRegistry& registry, EventBus& bus, bool require_client_identity)
-        : registry_(registry), bus_(bus), require_client_identity_(require_client_identity) {}
+    AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
+                     bool require_client_identity,
+                     auth::AuthManager& auth_mgr)
+        : registry_(registry), bus_(bus),
+          require_client_identity_(require_client_identity),
+          auth_mgr_(auth_mgr) {}
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -330,12 +334,76 @@ public:
             }
         }
 
+        // ── Tiered enrollment ────────────────────────────────────────────
+        //
+        //  Tier 2: Pre-shared enrollment token → auto-enroll
+        //  Tier 1: No token → check pending queue → pending/approved/denied
+        //
+
+        const auto& enrollment_token = request->enrollment_token();
+
+        if (!enrollment_token.empty()) {
+            // Tier 2: Validate the pre-shared token
+            if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
+                spdlog::warn("Agent {} presented invalid enrollment token", info.agent_id());
+                response->set_accepted(false);
+                response->set_reject_reason("invalid, expired, or exhausted enrollment token");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
+            // Remove from pending queue if it was there
+            auth_mgr_.remove_pending_agent(info.agent_id());
+        } else {
+            // Tier 1: No token — check the pending queue
+            auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+
+            if (!pending_status) {
+                // First time seeing this agent — add to pending queue
+                auth_mgr_.add_pending_agent(
+                    info.agent_id(),
+                    info.hostname(),
+                    info.platform().os(),
+                    info.platform().arch(),
+                    info.agent_version());
+
+                response->set_accepted(false);
+                response->set_reject_reason("awaiting admin approval");
+                response->set_enrollment_status("pending");
+                bus_.publish("pending-agent", info.agent_id());
+                spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
+                return grpc::Status::OK;
+            }
+
+            switch (*pending_status) {
+                case auth::PendingStatus::pending:
+                    response->set_accepted(false);
+                    response->set_reject_reason("still awaiting admin approval");
+                    response->set_enrollment_status("pending");
+                    return grpc::Status::OK;
+
+                case auth::PendingStatus::denied:
+                    response->set_accepted(false);
+                    response->set_reject_reason("enrollment denied by administrator");
+                    response->set_enrollment_status("denied");
+                    return grpc::Status::OK;
+
+                case auth::PendingStatus::approved:
+                    spdlog::info("Agent {} enrolled (admin-approved)", info.agent_id());
+                    // Fall through to normal registration
+                    break;
+            }
+        }
+
+        // ── Agent is enrolled — proceed with registration ────────────────
+
         registry_.register_agent(info);
 
         auto session_id = "session-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
         response->set_session_id(session_id);
         response->set_accepted(true);
+        response->set_enrollment_status("enrolled");
 
         PendingRegistration pending;
         pending.agent_id = info.agent_id();
@@ -560,6 +628,7 @@ private:
 
     AgentRegistry& registry_;
     EventBus& bus_;
+    auth::AuthManager& auth_mgr_;
 
     static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
@@ -602,7 +671,8 @@ public:
           auth_mgr_(auth_mgr),
           registry_(event_bus_),
           agent_service_(registry_, event_bus_,
-              cfg_.tls_enabled && !cfg_.tls_ca_cert.empty())
+              cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
+              auth_mgr)
     {
         // Setup file logger
         auto log_path = detail::server_log_path();
@@ -1092,6 +1162,132 @@ private:
                     res.status = 404;
                     res.set_content(R"({"error":"user not found"})",
                                     "application/json");
+                }
+            });
+
+        // -- Settings API: Enrollment tokens (admin only) --------------------
+
+        web_server_->Get("/api/settings/enrollment-tokens",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto tokens = auth_mgr_.list_enrollment_tokens();
+                std::string json = "[";
+                bool first = true;
+                for (const auto& t : tokens) {
+                    if (!first) json += ",";
+                    first = false;
+
+                    auto created_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                        t.created_at.time_since_epoch()).count();
+                    auto expires_epoch = (t.expires_at == std::chrono::system_clock::time_point::max())
+                        ? int64_t{0}
+                        : std::chrono::duration_cast<std::chrono::seconds>(
+                            t.expires_at.time_since_epoch()).count();
+
+                    json += "{\"token_id\":\"" + t.token_id +
+                            "\",\"label\":\"" + t.label +
+                            "\",\"max_uses\":" + std::to_string(t.max_uses) +
+                            ",\"use_count\":" + std::to_string(t.use_count) +
+                            ",\"created_at\":" + std::to_string(created_epoch) +
+                            ",\"expires_at\":" + std::to_string(expires_epoch) +
+                            ",\"revoked\":" + (t.revoked ? "true" : "false") + "}";
+                }
+                json += "]";
+                res.set_content(json, "application/json");
+            });
+
+        web_server_->Post("/api/settings/enrollment-tokens",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto label = extract_json_string(req.body, "label");
+                auto max_uses_s = extract_json_string(req.body, "max_uses");
+                auto ttl_s = extract_json_string(req.body, "ttl_hours");
+
+                int max_uses = max_uses_s.empty() ? 0 : std::stoi(max_uses_s);
+                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+
+                auto ttl = ttl_hours > 0
+                    ? std::chrono::seconds(ttl_hours * 3600)
+                    : std::chrono::seconds(0);
+
+                auto raw_token = auth_mgr_.create_enrollment_token(label, max_uses, ttl);
+
+                // Return the raw token — this is the only time it's visible
+                res.set_content(
+                    "{\"status\":\"ok\",\"token\":\"" + raw_token + "\"}",
+                    "application/json");
+            });
+
+        web_server_->Delete(R"(/api/settings/enrollment-tokens/(.+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto token_id = req.matches[1].str();
+                if (auth_mgr_.revoke_enrollment_token(token_id)) {
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"token not found"})", "application/json");
+                }
+            });
+
+        // -- Settings API: Pending agents (admin only) ------------------------
+
+        web_server_->Get("/api/settings/pending-agents",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto agents = auth_mgr_.list_pending_agents();
+                std::string json = "[";
+                bool first = true;
+                for (const auto& a : agents) {
+                    if (!first) json += ",";
+                    first = false;
+                    auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                        a.requested_at.time_since_epoch()).count();
+                    json += "{\"agent_id\":\"" + a.agent_id +
+                            "\",\"hostname\":\"" + a.hostname +
+                            "\",\"os\":\"" + a.os +
+                            "\",\"arch\":\"" + a.arch +
+                            "\",\"agent_version\":\"" + a.agent_version +
+                            "\",\"requested_at\":" + std::to_string(epoch) +
+                            ",\"status\":\"" + auth::pending_status_to_string(a.status) + "\"}";
+                }
+                json += "]";
+                res.set_content(json, "application/json");
+            });
+
+        web_server_->Post(R"(/api/settings/pending-agents/(.+)/approve)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto agent_id = req.matches[1].str();
+                if (auth_mgr_.approve_pending_agent(agent_id)) {
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"agent not found"})", "application/json");
+                }
+            });
+
+        web_server_->Post(R"(/api/settings/pending-agents/(.+)/deny)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto agent_id = req.matches[1].str();
+                if (auth_mgr_.deny_pending_agent(agent_id)) {
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"agent not found"})", "application/json");
+                }
+            });
+
+        web_server_->Delete(R"(/api/settings/pending-agents/(.+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                auto agent_id = req.matches[1].str();
+                if (auth_mgr_.remove_pending_agent(agent_id)) {
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(R"({"error":"agent not found"})", "application/json");
                 }
             });
 
