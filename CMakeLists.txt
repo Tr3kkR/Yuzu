@@ -126,6 +126,7 @@ if(YUZU_BUILD_AGENT)
     add_subdirectory(agents/plugins/firewall)
     add_subdirectory(agents/plugins/antivirus)
     add_subdirectory(agents/plugins/bitlocker)
+    add_subdirectory(agents/plugins/vuln_scan)
   endif()
 endif()
 
