@@ -19,6 +19,7 @@
     "spdlog",
     "nlohmann-json",
     "cli11",
+    "cpp-httplib",
     "sqlite3",
     {
       "name": "openssl",
