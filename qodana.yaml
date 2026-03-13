@@ -8,6 +8,12 @@ profile:
   name: qodana.recommended
 include:
   - name: CheckDependencyLicenses
+exclude:
+  - name: All
+    paths:
+      - build
+      - vcpkg
+      - proto
 bootstrap: |
   # Install system dependencies needed by vcpkg ports
   sudo apt-get update && sudo apt-get install -y --no-install-recommends \
@@ -27,5 +33,7 @@ bootstrap: |
     -DCMAKE_BUILD_TYPE=Debug \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DYUZU_BUILD_TESTS=OFF
+  # Build so generated protobuf headers exist for clang-tidy resolution
+  cmake --build build --parallel $(nproc)
   # Symlink compile_commands.json to project root for Qodana auto-detection
   ln -sf build/compile_commands.json compile_commands.json
