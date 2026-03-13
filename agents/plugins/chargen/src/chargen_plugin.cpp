@@ -94,7 +94,7 @@ private:
         auto rate_str = params.get("rate_ms", "100");
         int rate_ms = 100;
         try { rate_ms = std::stoi(std::string{rate_str}); }
-        catch (...) { /* keep default */ }
+        catch (const std::exception&) { /* invalid rate_ms param; keep default */ }
         if (rate_ms < 1) rate_ms = 1;
 
         auto session = std::make_shared<Session>();

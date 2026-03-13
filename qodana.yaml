@@ -3,7 +3,7 @@
 ####################################################################################################################
 
 version: "1.0"
-linter: jetbrains/qodana-clang:2025.2
+linter: jetbrains/qodana-clang:2025.3-eap-clang17
 profile:
   name: qodana.recommended
 include:
