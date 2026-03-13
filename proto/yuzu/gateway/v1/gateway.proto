@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package yuzu.gateway.v1;
+
+import "yuzu/agent/v1/agent.proto";
+import "yuzu/common/v1/common.proto";
+
+option cc_enable_arenas = true;
+
+// GatewayUpstream is an internal-only service exposed by the C++ yuzu-server.
+// The Erlang gateway calls it to proxy control-plane operations while owning
+// the command fanout plane (Subscribe bidi streams) locally.
+service GatewayUpstream {
+  // ProxyRegister forwards agent registration to the control plane.
+  rpc ProxyRegister(yuzu.agent.v1.RegisterRequest)
+      returns (yuzu.agent.v1.RegisterResponse);
+
+  // BatchHeartbeat sends aggregated heartbeats from all agents on one gateway
+  // node, reducing per-agent RPC overhead from O(agents/interval) to
+  // O(nodes/interval).
+  rpc BatchHeartbeat(BatchHeartbeatRequest)
+      returns (BatchHeartbeatResponse);
+
+  // ProxyInventory forwards full inventory reports to the control plane's
+  // storage layer.
+  rpc ProxyInventory(yuzu.agent.v1.InventoryReport)
+      returns (yuzu.agent.v1.InventoryAck);
+
+  // NotifyStreamStatus informs the C++ server when an agent's Subscribe
+  // stream connects or disconnects at the gateway.
+  rpc NotifyStreamStatus(StreamStatusNotification)
+      returns (StreamStatusAck);
+}
+
+message BatchHeartbeatRequest {
+  // All heartbeats from agents connected to this gateway node.
+  repeated yuzu.agent.v1.HeartbeatRequest heartbeats = 1;
+  // Gateway node identifier for diagnostics.
+  string gateway_node = 2;
+}
+
+message BatchHeartbeatResponse {
+  int32 acknowledged_count = 1;
+}
+
+message StreamStatusNotification {
+  string agent_id   = 1;
+  string session_id = 2;
+
+  enum Event {
+    CONNECTED    = 0;
+    DISCONNECTED = 1;
+  }
+  Event event = 3;
+
+  // Peer address of the agent (for audit trail).
+  string peer_addr = 4;
+  // Gateway node handling this agent.
+  string gateway_node = 5;
+}
+
+message StreamStatusAck {
+  bool acknowledged = 1;
+}
