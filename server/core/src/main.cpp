@@ -47,6 +47,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--management-cert",    cfg.mgmt_tls_server_cert, "PEM management server certificate override");
     app.add_option("--management-key",     cfg.mgmt_tls_server_key,  "PEM management server private key override");
     app.add_option("--management-ca-cert", cfg.mgmt_tls_ca_cert,     "PEM CA cert for management client cert verification");
+    app.add_option("--gateway-upstream", cfg.gateway_upstream_address,
+                   "Gateway upstream gRPC address (host:port); empty = disabled");
+    app.add_flag  ("--gateway-mode", "Enable gateway mode (relax peer-mismatch in Subscribe)")
+       ->each([&cfg](const std::string&) { cfg.gateway_mode = true; });
     app.add_option("--max-agents", cfg.max_agents,           "Maximum concurrent agent connections")
        ->default_val(10000);
     app.add_option("--log-level",  log_level,                "Log level: trace|debug|info|warn|error")

@@ -26,11 +26,13 @@ gen = custom_target(
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
         proto_root / 'yuzu/server/v1/management.proto',
+        proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],
     output: [
         'common.pb.cc', 'common.pb.h', 'common.grpc.pb.cc', 'common.grpc.pb.h',
         'agent.pb.cc',  'agent.pb.h',  'agent.grpc.pb.cc',  'agent.grpc.pb.h',
         'management.pb.cc', 'management.pb.h', 'management.grpc.pb.cc', 'management.grpc.pb.h',
+        'gateway.pb.cc', 'gateway.pb.h', 'gateway.grpc.pb.cc', 'gateway.grpc.pb.h',
     ],
     command: [
         find_program('python3', 'python'),
@@ -42,11 +44,12 @@ gen = custom_target(
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
         proto_root / 'yuzu/server/v1/management.proto',
+        proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],
 )
 
-gen_srcs = [gen[0], gen[2], gen[4], gen[6], gen[8], gen[10]]
-gen_hdrs = [gen[1], gen[3], gen[5], gen[7], gen[9], gen[11]]
+gen_srcs = [gen[0], gen[2], gen[4], gen[6], gen[8], gen[10], gen[12], gen[14]]
+gen_hdrs = [gen[1], gen[3], gen[5], gen[7], gen[9], gen[11], gen[13], gen[15]]
 
 yuzu_proto_lib = static_library(
     'yuzu_proto',
