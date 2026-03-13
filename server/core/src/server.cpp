@@ -9,6 +9,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -206,20 +207,17 @@ public:
     // Build JSON array of all agents for the web UI.
     std::string to_json() const {
         std::lock_guard lock(mu_);
-        std::string json = "[";
-        bool first = true;
+        auto arr = nlohmann::json::array();
         for (const auto& [id, s] : agents_) {
-            if (!first) json += ",";
-            first = false;
-            // Simple JSON escaping (agent metadata shouldn't contain quotes normally)
-            json += "{\"agent_id\":\"" + s->agent_id +
-                    "\",\"hostname\":\"" + s->hostname +
-                    "\",\"os\":\"" + s->os +
-                    "\",\"arch\":\"" + s->arch +
-                    "\",\"agent_version\":\"" + s->agent_version + "\"}";
+            arr.push_back({
+                {"agent_id",      s->agent_id},
+                {"hostname",      s->hostname},
+                {"os",            s->os},
+                {"arch",          s->arch},
+                {"agent_version", s->agent_version}
+            });
         }
-        json += "]";
-        return json;
+        return arr.dump();
     }
 
     // Get list of all agent IDs.

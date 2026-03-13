@@ -45,6 +45,7 @@ vcpkg_installed/
 *.suo
 .vs/
 .clangd/
+CLion.ini
 
 # OS
 .DS_Store
