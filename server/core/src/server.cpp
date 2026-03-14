@@ -13,6 +13,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -216,20 +217,17 @@ public:
     // Build JSON array of all agents for the web UI.
     std::string to_json() const {
         std::lock_guard lock(mu_);
-        std::string json = "[";
-        bool first = true;
+        nlohmann::json arr = nlohmann::json::array();
         for (const auto& [id, s] : agents_) {
-            if (!first) json += ",";
-            first = false;
-            // Simple JSON escaping (agent metadata shouldn't contain quotes normally)
-            json += "{\"agent_id\":\"" + s->agent_id +
-                    "\",\"hostname\":\"" + s->hostname +
-                    "\",\"os\":\"" + s->os +
-                    "\",\"arch\":\"" + s->arch +
-                    "\",\"agent_version\":\"" + s->agent_version + "\"}";
+            arr.push_back({
+                {"agent_id",      s->agent_id},
+                {"hostname",      s->hostname},
+                {"os",            s->os},
+                {"arch",          s->arch},
+                {"agent_version", s->agent_version}
+            });
         }
-        json += "]";
-        return json;
+        return arr.dump();
     }
 
     // Get list of all agent IDs.
@@ -1681,8 +1679,8 @@ private:
                 auto session = require_auth(req, res);
                 if (!session) return;
                 res.set_content(
-                    "{\"username\":\"" + session->username +
-                    "\",\"role\":\"" + auth::role_to_string(session->role) + "\"}",
+                    nlohmann::json({{"username", session->username},
+                                    {"role", auth::role_to_string(session->role)}}).dump(),
                     "application/json");
             });
 
@@ -1933,13 +1931,10 @@ private:
                     label, count, max_uses, ttl);
 
                 // Return JSON array for scripting/Ansible consumption
-                std::string json = "{\"count\":" + std::to_string(tokens.size()) + ",\"tokens\":[";
-                for (size_t i = 0; i < tokens.size(); ++i) {
-                    if (i > 0) json += ",";
-                    json += "\"" + tokens[i] + "\"";
-                }
-                json += "]}";
-                res.set_content(json, "application/json");
+                res.set_content(
+                    nlohmann::json({{"count", tokens.size()},
+                                    {"tokens", tokens}}).dump(),
+                    "application/json");
             });
 
         // -- Settings API: Pending agents (admin only, HTMX) --------------------
@@ -2095,7 +2090,8 @@ private:
                 if (kAdminOnlyPlugins.contains(plugin) &&
                     session->role != auth::Role::admin) {
                     res.status = 403;
-                    res.set_content("{\"error\":\"admin role required for plugin '" + plugin + "'\"}",
+                    res.set_content(
+                        nlohmann::json({{"error", "admin role required for plugin '" + plugin + "'"}}).dump(),
                         "application/json");
                     return;
                 }
@@ -2138,8 +2134,10 @@ private:
 
                 spdlog::info("Command dispatched: {}:{} → {} agent(s)",
                     plugin, action, sent);
-                res.set_content("{\"status\":\"sent\",\"command_id\":\"" + command_id +
-                    "\",\"agents_reached\":" + std::to_string(sent) + "}",
+                res.set_content(
+                    nlohmann::json({{"status", "sent"},
+                                    {"command_id", command_id},
+                                    {"agents_reached", sent}}).dump(),
                     "application/json");
             });
 
@@ -2163,16 +2161,14 @@ private:
         web_server_->Get("/api/chargen/status",
             [this](const httplib::Request&, httplib::Response& res) {
                 res.set_content(
-                    "{\"agent_connected\":" +
-                    std::string(registry_.has_any() ? "true" : "false") + "}",
+                    nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
                     "application/json");
             });
 
         web_server_->Get("/api/procfetch/status",
             [this](const httplib::Request&, httplib::Response& res) {
                 res.set_content(
-                    "{\"agent_connected\":" +
-                    std::string(registry_.has_any() ? "true" : "false") + "}",
+                    nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
                     "application/json");
             });
 
@@ -2210,43 +2206,33 @@ private:
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
 
-    // -- Minimal JSON parsing (no external dependency) ------------------------
+    // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
-    static std::string extract_json_string(const std::string& json, const std::string& key) {
-        auto needle = "\"" + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return {};
-        pos = json.find(':', pos + needle.size());
-        if (pos == std::string::npos) return {};
-        pos = json.find('"', pos + 1);
-        if (pos == std::string::npos) return {};
-        auto end = json.find('"', pos + 1);
-        if (end == std::string::npos) return {};
-        return json.substr(pos + 1, end - pos - 1);
+    static std::string extract_json_string(const std::string& body, const std::string& key) {
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.contains(key) && j[key].is_string()) {
+                return j[key].get<std::string>();
+            }
+        } catch (...) {}
+        return {};
     }
 
     static std::vector<std::string> extract_json_string_array(
-            const std::string& json, const std::string& key) {
-        std::vector<std::string> result;
-        auto needle = "\"" + key + "\"";
-        auto pos = json.find(needle);
-        if (pos == std::string::npos) return result;
-        pos = json.find('[', pos);
-        if (pos == std::string::npos) return result;
-        auto end = json.find(']', pos);
-        if (end == std::string::npos) return result;
-        auto arr = json.substr(pos + 1, end - pos - 1);
-        // Extract all quoted strings from the array
-        std::size_t i = 0;
-        while (i < arr.size()) {
-            auto q1 = arr.find('"', i);
-            if (q1 == std::string::npos) break;
-            auto q2 = arr.find('"', q1 + 1);
-            if (q2 == std::string::npos) break;
-            result.push_back(arr.substr(q1 + 1, q2 - q1 - 1));
-            i = q2 + 1;
-        }
-        return result;
+            const std::string& body, const std::string& key) {
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.contains(key) && j[key].is_array()) {
+                std::vector<std::string> result;
+                for (const auto& elem : j[key]) {
+                    if (elem.is_string()) {
+                        result.push_back(elem.get<std::string>());
+                    }
+                }
+                return result;
+            }
+        } catch (...) {}
+        return {};
     }
 
     // -- Data members ---------------------------------------------------------

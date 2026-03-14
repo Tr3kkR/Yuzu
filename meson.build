@@ -110,6 +110,34 @@ if build_tests
   subdir('tests')
 endif
 
+# ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
+_rebar3 = find_program('rebar3', required: false)
+if _rebar3.found()
+  _gw_src = meson.project_source_root() / 'gateway'
+  # rebar3 must run from inside the gateway/ directory.
+  # Meson custom_target has no workdir param, so we use 'cmd /c cd ... &&'
+  # on Windows or 'sh -c cd ... &&' on POSIX.
+  if host_machine.system() == 'windows'
+    custom_target('gateway',
+      command: ['cmd', '/c', 'cd /d ' + _gw_src + ' && rebar3 compile'],
+      output: '.gateway_built',
+      build_always_stale: true,
+      build_by_default: true,
+    )
+  else
+    _sh = find_program('sh')
+    custom_target('gateway',
+      command: [_sh, '-c', 'cd ' + _gw_src + ' && rebar3 compile'],
+      output: '.gateway_built',
+      build_always_stale: true,
+      build_by_default: true,
+    )
+  endif
+  message('Erlang gateway: enabled (rebar3 found)')
+else
+  message('Erlang gateway: skipped (rebar3 not found)')
+endif
+
 # ── Deploy DLLs (Windows) ────────────────────────────────────────────────
 # Copies vcpkg dependency DLLs alongside executables and gathers plugin
 # DLLs into builddir/plugins/ so the agent can find them at runtime.

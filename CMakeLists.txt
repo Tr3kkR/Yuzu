@@ -142,6 +142,19 @@ if(YUZU_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
+# ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────────
+find_program(REBAR3 rebar3)
+if(REBAR3)
+  message(STATUS "Erlang gateway: enabled (rebar3 found at ${REBAR3})")
+  add_custom_target(gateway ALL
+    COMMAND "${REBAR3}" compile
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/gateway"
+    COMMENT "Compiling Erlang gateway (rebar3)"
+  )
+else()
+  message(STATUS "Erlang gateway: skipped (rebar3 not found)")
+endif()
+
 # ── Install rules ─────────────────────────────────────────────────────────────
 include(GNUInstallDirs)
 install(

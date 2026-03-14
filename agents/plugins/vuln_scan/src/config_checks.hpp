@@ -9,6 +9,8 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -341,18 +343,22 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
     }
 
     // World-writable directories in PATH
+    // Uses stat() directly instead of shell commands to avoid injection.
     {
-        auto path_env = detail::run_cmd("echo $PATH");
-        std::istringstream ss(path_env);
-        std::string dir;
+        const char* path_env = std::getenv("PATH");
         std::vector<std::string> writable;
-        while (std::getline(ss, dir, ':')) {
-            if (dir.empty()) continue;
-            auto check = "test -d '" + dir + "' && test -w '" + dir +
-                         "' && stat -c '%a' '" + dir + "' 2>/dev/null";
-            auto perms = detail::run_cmd(check.c_str());
-            if (!perms.empty() && perms.size() >= 3 && perms.back() >= '2') {
-                writable.push_back(dir);
+        if (path_env) {
+            std::istringstream ss(path_env);
+            std::string dir;
+            while (std::getline(ss, dir, ':')) {
+                if (dir.empty()) continue;
+                struct stat st{};
+                if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                    // Check if world-writable (other-write bit)
+                    if (st.st_mode & S_IWOTH) {
+                        writable.push_back(dir);
+                    }
+                }
             }
         }
         if (!writable.empty()) {
