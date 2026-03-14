@@ -10,8 +10,9 @@
 #include <cstdlib>
 
 #ifdef _WIN32
-#include <crtdbg.h>
+#include <winsock2.h>
 #include <windows.h>
+#include <crtdbg.h>
 #endif
 #include <format>
 #include <iostream>
@@ -26,6 +27,25 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // Suppress all CRT/abort pop-up dialogs — route to stderr instead.
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+
+    // Winsock must be initialised before any socket work (httplib, gRPC).
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        std::cerr << "WSAStartup failed\n";
+        return EXIT_FAILURE;
+    }
+#endif
+
     CLI::App app{"Yuzu Server", "yuzu-server"};
     app.set_version_flag("--version", std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
 
@@ -140,11 +160,20 @@ int main(int argc, char* argv[]) {
         server->run();
     } catch (const std::exception& ex) {
         spdlog::error("Fatal exception: {}", ex.what());
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return EXIT_FAILURE;
     } catch (...) {
         spdlog::error("Fatal unknown exception");
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return EXIT_FAILURE;
     }
 
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return EXIT_SUCCESS;
 }

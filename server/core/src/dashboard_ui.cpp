@@ -55,6 +55,24 @@ R"HTM(<!DOCTYPE html>
       box-shadow: 0 0 0 2px rgba(88,166,255,0.2);
     }
     .instr-bar input[type="text"]::placeholder { color: #484f58; }
+    .instr-wrap { position: relative; flex: 1; display: flex; }
+    .instr-wrap input[type="text"] { width: 100%; }
+    .ac-list {
+      display: none; position: absolute; top: 100%; left: 0; right: 0;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0 0 0.375rem 0.375rem; max-height: 280px;
+      overflow-y: auto; z-index: 200; margin-top: 2px;
+      font-family: var(--mono); font-size: 0.825rem;
+    }
+    .ac-list.open { display: block; }
+    .ac-item {
+      padding: 0.35rem 0.75rem; cursor: pointer; color: var(--fg);
+      border-bottom: 1px solid var(--border); display: flex;
+      justify-content: space-between; align-items: center;
+    }
+    .ac-item:last-child { border-bottom: none; }
+    .ac-item:hover, .ac-item.sel { background: rgba(88,166,255,0.12); }
+    .ac-item .ac-desc { color: #8b949e; font-size: 0.75rem; margin-left: 1rem; text-align: right; }
     .instr-bar button {
       padding: 0.45rem 1.2rem; font-size: 0.875rem; font-weight: 500;
       background: var(--accent); color: #fff; border: none;
@@ -243,8 +261,11 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="status, os_info, hardware, users, installed_apps, msi_packages, network_config, netstat, sockwho, procfetch"
-           autocomplete="off" spellcheck="false">
+    <div class="instr-wrap">
+      <input type="text" id="instr-input" placeholder="Type a command or 'help'..."
+             autocomplete="off" spellcheck="false">
+      <div class="ac-list" id="ac-list"></div>
+    </div>
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
     <button class="btn-clear" onclick="clearResults()">Clear</button>
@@ -324,105 +345,34 @@ R"HTM(
     var agents = {};   // agent_id -> { hostname, os, arch }
     var evtSource = null;
 
-    /* ── Instruction mapping ──────────────────────────────── */
-    var instructionMap = {
-      'chargen':          { plugin: 'chargen',   action: 'chargen_start' },
-      'chargen stop':     { plugin: 'chargen',   action: 'chargen_stop' },
-      'procfetch':        { plugin: 'procfetch', action: 'procfetch_fetch' },
-      'netstat':          { plugin: 'netstat',   action: 'netstat_list' },
-      'sockwho':          { plugin: 'sockwho',   action: 'sockwho_list' },
-      'status':           { plugin: 'status',    action: 'info' },
-      'status version':   { plugin: 'status',    action: 'version' },
-      'status info':      { plugin: 'status',    action: 'info' },
-      'status health':    { plugin: 'status',    action: 'health' },
-      'status plugins':   { plugin: 'status',    action: 'plugins' },
-      'status connection': { plugin: 'status',   action: 'connection' },
-      'status config':    { plugin: 'status',    action: 'config' },
-      'device_identity':          { plugin: 'device_identity', action: 'device_name' },
-      'device_identity domain':   { plugin: 'device_identity', action: 'domain' },
-      'device_identity ou':       { plugin: 'device_identity', action: 'ou' },
-      'os_info':                  { plugin: 'os_info', action: 'os_name' },
-      'os_info os_name':          { plugin: 'os_info', action: 'os_name' },
-      'os_info os_version':       { plugin: 'os_info', action: 'os_version' },
-      'os_info os_build':         { plugin: 'os_info', action: 'os_build' },
-      'os_info os_arch':          { plugin: 'os_info', action: 'os_arch' },
-      'os_info uptime':           { plugin: 'os_info', action: 'uptime' },
-      'hardware':                 { plugin: 'hardware', action: 'manufacturer' },
-      'hardware manufacturer':    { plugin: 'hardware', action: 'manufacturer' },
-      'hardware model':           { plugin: 'hardware', action: 'model' },
-      'hardware bios':            { plugin: 'hardware', action: 'bios' },
-      'hardware processors':     { plugin: 'hardware', action: 'processors' },
-      'hardware memory':          { plugin: 'hardware', action: 'memory' },
-      'hardware disks':           { plugin: 'hardware', action: 'disks' },
-      'users':                    { plugin: 'users', action: 'logged_on' },
-      'users logged_on':          { plugin: 'users', action: 'logged_on' },
-      'users sessions':           { plugin: 'users', action: 'sessions' },
-      'users local_users':        { plugin: 'users', action: 'local_users' },
-      'users local_admins':       { plugin: 'users', action: 'local_admins' },
-      'installed_apps':            { plugin: 'installed_apps', action: 'list' },
-      'installed_apps list':       { plugin: 'installed_apps', action: 'list' },
-      'installed_apps query':      { plugin: 'installed_apps', action: 'query' },
-      'msi_packages':              { plugin: 'msi_packages', action: 'list' },
-      'msi_packages list':         { plugin: 'msi_packages', action: 'list' },
-      'msi_packages product_codes': { plugin: 'msi_packages', action: 'product_codes' },
-      'network_config':              { plugin: 'network_config', action: 'adapters' },
-      'network_config adapters':     { plugin: 'network_config', action: 'adapters' },
-      'network_config ip_addresses': { plugin: 'network_config', action: 'ip_addresses' },
-      'network_config dns_servers':  { plugin: 'network_config', action: 'dns_servers' },
-      'network_config proxy':        { plugin: 'network_config', action: 'proxy' },
-      'diagnostics':                   { plugin: 'diagnostics', action: 'log_level' },
-      'diagnostics log_level':         { plugin: 'diagnostics', action: 'log_level' },
-      'diagnostics certificates':      { plugin: 'diagnostics', action: 'certificates' },
-      'diagnostics connection_info':   { plugin: 'diagnostics', action: 'connection_info' },
-      'agent_actions':                 { plugin: 'agent_actions', action: 'info' },
-      'agent_actions info':            { plugin: 'agent_actions', action: 'info' },
-      'agent_actions set_log_level':   { plugin: 'agent_actions', action: 'set_log_level' },
-      'processes':                     { plugin: 'processes', action: 'list' },
-      'processes list':                { plugin: 'processes', action: 'list' },
-      'processes query':               { plugin: 'processes', action: 'query' },
-      'services':                      { plugin: 'services', action: 'list' },
-      'services list':                 { plugin: 'services', action: 'list' },
-      'services running':              { plugin: 'services', action: 'running' },
-      'filesystem':                    { plugin: 'filesystem', action: 'exists' },
-      'filesystem exists':             { plugin: 'filesystem', action: 'exists' },
-      'filesystem list_dir':           { plugin: 'filesystem', action: 'list_dir' },
-      'filesystem file_hash':          { plugin: 'filesystem', action: 'file_hash' },
-      'network_diag':                  { plugin: 'network_diag', action: 'listening' },
-      'network_diag listening':        { plugin: 'network_diag', action: 'listening' },
-      'network_diag connections':      { plugin: 'network_diag', action: 'connections' },
-      'network_actions':               { plugin: 'network_actions', action: 'flush_dns' },
-      'network_actions flush_dns':     { plugin: 'network_actions', action: 'flush_dns' },
-      'network_actions ping':          { plugin: 'network_actions', action: 'ping' },
-      'firewall':                      { plugin: 'firewall', action: 'state' },
-      'firewall state':                { plugin: 'firewall', action: 'state' },
-      'firewall rules':                { plugin: 'firewall', action: 'rules' },
-      'antivirus':                     { plugin: 'antivirus', action: 'products' },
-      'antivirus products':            { plugin: 'antivirus', action: 'products' },
-      'antivirus status':              { plugin: 'antivirus', action: 'status' },
-      'bitlocker':                     { plugin: 'bitlocker', action: 'state' },
-      'bitlocker state':               { plugin: 'bitlocker', action: 'state' },
-      'windows_updates':               { plugin: 'windows_updates', action: 'installed' },
-      'windows_updates installed':     { plugin: 'windows_updates', action: 'installed' },
-      'windows_updates missing':       { plugin: 'windows_updates', action: 'missing' },
-      'event_logs':                    { plugin: 'event_logs', action: 'errors' },
-      'event_logs errors':             { plugin: 'event_logs', action: 'errors' },
-      'event_logs query':              { plugin: 'event_logs', action: 'query' },
-      'sccm':                          { plugin: 'sccm', action: 'client_version' },
-      'sccm client_version':           { plugin: 'sccm', action: 'client_version' },
-      'sccm site':                     { plugin: 'sccm', action: 'site' },
-      'script_exec':                   { plugin: 'script_exec', action: 'exec' },
-      'script_exec exec':              { plugin: 'script_exec', action: 'exec' },
-      'script_exec powershell':        { plugin: 'script_exec', action: 'powershell' },
-      'script_exec bash':              { plugin: 'script_exec', action: 'bash' },
-      'software_actions':              { plugin: 'software_actions', action: 'list_upgradable' },
-      'software_actions list_upgradable': { plugin: 'software_actions', action: 'list_upgradable' },
-      'software_actions installed_count': { plugin: 'software_actions', action: 'installed_count' },
-      'vuln_scan':              { plugin: 'vuln_scan', action: 'scan' },
-      'vuln_scan scan':         { plugin: 'vuln_scan', action: 'scan' },
-      'vuln_scan cve_scan':     { plugin: 'vuln_scan', action: 'cve_scan' },
-      'vuln_scan config_scan':  { plugin: 'vuln_scan', action: 'config_scan' },
-      'vuln_scan summary':      { plugin: 'vuln_scan', action: 'summary' }
-    };
+    /* ── Instruction mapping (built dynamically from /api/help) ── */
+    var instructionMap = {};
+    var helpData = { plugins: [], commands: [] };
+
+    function buildInstructionMap(data) {
+      helpData = data;
+      instructionMap = {};
+      for (var i = 0; i < data.plugins.length; i++) {
+        var p = data.plugins[i];
+        if (p.actions.length > 0) {
+          instructionMap[p.name] = { plugin: p.name, action: p.actions[0] };
+        }
+        for (var j = 0; j < p.actions.length; j++) {
+          instructionMap[p.name + ' ' + p.actions[j]] = { plugin: p.name, action: p.actions[j] };
+        }
+      }
+    }
+
+    function loadHelp() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/help');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          buildInstructionMap(JSON.parse(xhr.responseText));
+        }
+      };
+      xhr.send();
+    }
 
     /* ── Column schemas per plugin ────────────────────────── */
     var columnSchemas = {
@@ -583,16 +533,65 @@ R"HTM(
     }
 
     /* ── Send instruction ─────────────────────────────────── */
+    function showHelp(query) {
+      var plugins = helpData.plugins;
+      if (!plugins || plugins.length === 0) {
+        document.getElementById('result-context').textContent = 'No agents connected — help unavailable.';
+        setBadge('error');
+        return;
+      }
+      /* Filter to a specific plugin if requested */
+      var filter = query.replace(/^help\s*/i, '').trim().toLowerCase();
+      if (filter) {
+        plugins = plugins.filter(function(p) { return p.name === filter; });
+        if (plugins.length === 0) {
+          document.getElementById('result-context').textContent = 'Unknown plugin: "' + filter + '"';
+          setBadge('error');
+          return;
+        }
+      }
+      setColumns(['Plugin', 'Action', 'Description']);
+      clearResults();
+      document.getElementById('result-context').textContent = filter ? 'help ' + filter : 'help — all plugins';
+      setBadge('idle');
+      var tbody = document.getElementById('results-tbody');
+      for (var i = 0; i < plugins.length; i++) {
+        var p = plugins[i];
+        if (p.actions.length === 0) {
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>&mdash;</td><td>' + escapeHtml(p.description) + '</td>';
+          tbody.appendChild(tr);
+          rowCount++;
+        } else {
+          for (var j = 0; j < p.actions.length; j++) {
+            var tr = document.createElement('tr');
+            tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.actions[j]) +
+              '</td><td>' + (j === 0 ? escapeHtml(p.description) : '') + '</td>';
+            tbody.appendChild(tr);
+            rowCount++;
+          }
+        }
+      }
+      document.getElementById('row-count').textContent = rowCount;
+    }
+
     function sendInstruction() {
       var input = document.getElementById('instr-input');
       var raw = input.value.trim().toLowerCase();
       if (!raw) return;
+      closeAC();
+
+      /* Built-in help command */
+      if (raw === 'help' || raw.startsWith('help ')) {
+        showHelp(raw);
+        return;
+      }
 
       var mapped = instructionMap[raw];
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: status, os_info, hardware, users, installed_apps, msi_packages, network_config, netstat, sockwho, procfetch, chargen';
+          'Unknown command: "' + raw + '". Type "help" to list all commands.';
         return;
       }
 
@@ -635,9 +634,93 @@ R"HTM(
       xhr.send(payload);
     }
 
-    /* Enter key in input sends instruction */
-    document.getElementById('instr-input').addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') { e.preventDefault(); sendInstruction(); }
+    /* ── Autocomplete ────────────────────────────────────── */
+    var acSel = -1;
+
+    function closeAC() {
+      document.getElementById('ac-list').classList.remove('open');
+      acSel = -1;
+    }
+
+    function acSelect(cmd) {
+      document.getElementById('instr-input').value = cmd;
+      closeAC();
+      document.getElementById('instr-input').focus();
+    }
+
+    function updateAC() {
+      var input = document.getElementById('instr-input');
+      var q = input.value.trim().toLowerCase();
+      var list = document.getElementById('ac-list');
+      list.innerHTML = '';
+      acSel = -1;
+      if (!q) { closeAC(); return; }
+
+      /* Build description lookup */
+      var descMap = {};
+      for (var i = 0; i < helpData.plugins.length; i++) {
+        descMap[helpData.plugins[i].name] = helpData.plugins[i].description;
+      }
+
+      /* Filter commands — prefix match */
+      var cmds = helpData.commands || Object.keys(instructionMap);
+      var matches = [];
+      for (var i = 0; i < cmds.length; i++) {
+        if (cmds[i].indexOf(q) === 0 && cmds[i] !== q) matches.push(cmds[i]);
+      }
+      /* Also add 'help' if it matches */
+      if ('help'.indexOf(q) === 0 && q !== 'help') matches.unshift('help');
+
+      if (matches.length === 0) { closeAC(); return; }
+      if (matches.length > 15) matches.length = 15;
+
+      for (var i = 0; i < matches.length; i++) {
+        var div = document.createElement('div');
+        div.className = 'ac-item';
+        var plugin = matches[i].split(' ')[0];
+        var desc = descMap[plugin] || '';
+        div.innerHTML = '<span>' + escapeHtml(matches[i]) + '</span>' +
+          (desc ? '<span class="ac-desc">' + escapeHtml(desc) + '</span>' : '');
+        div.setAttribute('data-cmd', matches[i]);
+        div.addEventListener('mousedown', function(ev) {
+          ev.preventDefault();
+          acSelect(this.getAttribute('data-cmd'));
+        });
+        list.appendChild(div);
+      }
+      list.classList.add('open');
+    }
+
+    var instrInput = document.getElementById('instr-input');
+    instrInput.addEventListener('input', updateAC);
+    instrInput.addEventListener('blur', function() { setTimeout(closeAC, 150); });
+    instrInput.addEventListener('keydown', function(e) {
+      var list = document.getElementById('ac-list');
+      var items = list.querySelectorAll('.ac-item');
+      if (e.key === 'ArrowDown' && items.length > 0) {
+        e.preventDefault();
+        acSel = Math.min(acSel + 1, items.length - 1);
+        for (var i = 0; i < items.length; i++) items[i].classList.toggle('sel', i === acSel);
+        items[acSel].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp' && items.length > 0) {
+        e.preventDefault();
+        acSel = Math.max(acSel - 1, 0);
+        for (var i = 0; i < items.length; i++) items[i].classList.toggle('sel', i === acSel);
+        items[acSel].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Tab' && acSel >= 0 && items.length > 0) {
+        e.preventDefault();
+        acSelect(items[acSel].getAttribute('data-cmd'));
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (acSel >= 0 && items.length > 0) {
+          acSelect(items[acSel].getAttribute('data-cmd'));
+        } else {
+          closeAC();
+          sendInstruction();
+        }
+      } else if (e.key === 'Escape') {
+        closeAC();
+      }
     });
 )HTM"
 // Part 4: SSE + menu JavaScript
@@ -723,10 +806,12 @@ R"HTM(
 
       evtSource.addEventListener('agent-online', function(e) {
         refreshAgentList();
+        loadHelp();
       });
 
       evtSource.addEventListener('agent-offline', function(e) {
         refreshAgentList();
+        loadHelp();
       });
 
       evtSource.addEventListener('timing', function(e) {
@@ -802,6 +887,7 @@ R"HTM(
     refreshAgentList();
     setInterval(refreshAgentList, 5000);
     loadUserInfo();
+    loadHelp();
   </script>
 </body>
 </html>

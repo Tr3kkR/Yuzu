@@ -44,8 +44,11 @@ int main(int argc, char* argv[]) {
     app.add_option("--agent-id", cfg.agent_id,        "Stable agent UUID (auto-generated if empty)");
     app.add_option("--data-dir", cfg.data_dir,        "Directory for persistent agent state")
        ->default_val(yuzu::agent::default_data_dir().string());
+    // Default plugin dir: <exe_dir>/../plugins (matches meson build layout)
+    auto exe_dir = std::filesystem::path(argv[0]).parent_path();
+    if (exe_dir.empty()) exe_dir = std::filesystem::current_path();
     app.add_option("--plugin-dir", cfg.plugin_dir,    "Directory containing plugin shared libraries")
-       ->default_val((std::filesystem::current_path() / "plugins").string());
+       ->default_val((exe_dir / ".." / "plugins").string());
     app.add_option("--heartbeat", cfg.heartbeat_interval,
                    "Heartbeat interval in seconds")->default_val(30);
     app.add_flag  ("--no-tls",   "Disable TLS (insecure, for development only)")

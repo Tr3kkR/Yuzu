@@ -103,6 +103,13 @@ private:
 
 // -- Agent session (one per connected agent) ----------------------------------
 
+struct PluginMeta {
+    std::string name;
+    std::string version;
+    std::string description;
+    std::vector<std::string> actions;
+};
+
 struct AgentSession {
     std::string agent_id;
     std::string hostname;
@@ -110,6 +117,7 @@ struct AgentSession {
     std::string arch;
     std::string agent_version;
     std::vector<std::string> plugin_names;
+    std::vector<PluginMeta> plugin_meta;
 
     // Stream pointer — valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -131,6 +139,14 @@ public:
         session->agent_version = info.agent_version();
         for (const auto& p : info.plugins()) {
             session->plugin_names.push_back(p.name());
+            PluginMeta pm;
+            pm.name        = p.name();
+            pm.version     = p.version();
+            pm.description = p.description();
+            for (const auto& cap : p.capabilities()) {
+                pm.actions.push_back(cap);
+            }
+            session->plugin_meta.push_back(std::move(pm));
         }
 
         {
@@ -228,6 +244,51 @@ public:
             });
         }
         return arr.dump();
+    }
+
+    // Build help catalog: deduplicated plugin metadata across all agents.
+    std::string help_json() const {
+        std::lock_guard lock(mu_);
+
+        // Deduplicate plugins by name (take the richest action list)
+        std::unordered_map<std::string, const PluginMeta*> best;
+        for (const auto& [id, s] : agents_) {
+            for (const auto& pm : s->plugin_meta) {
+                auto it = best.find(pm.name);
+                if (it == best.end() || pm.actions.size() > it->second->actions.size()) {
+                    best[pm.name] = &pm;
+                }
+            }
+        }
+
+        // Sort by plugin name
+        std::vector<const PluginMeta*> sorted;
+        sorted.reserve(best.size());
+        for (const auto& [name, pm] : best) sorted.push_back(pm);
+        std::sort(sorted.begin(), sorted.end(),
+            [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
+
+        nlohmann::json plugins_arr = nlohmann::json::array();
+        nlohmann::json commands_arr = nlohmann::json::array();
+
+        for (const auto* pm : sorted) {
+            nlohmann::json pj;
+            pj["name"]        = pm->name;
+            pj["version"]     = pm->version;
+            pj["description"] = pm->description;
+            pj["actions"]     = pm->actions;
+
+            plugins_arr.push_back(std::move(pj));
+
+            // Build command strings: bare plugin name + plugin action
+            commands_arr.push_back(pm->name);
+            for (const auto& act : pm->actions) {
+                commands_arr.push_back(pm->name + " " + act);
+            }
+        }
+
+        return nlohmann::json({{"plugins", plugins_arr},
+                                {"commands", commands_arr}}).dump();
     }
 
     // Get list of all agent IDs.
@@ -2058,6 +2119,11 @@ private:
         web_server_->Get("/api/agents",
             [this](const httplib::Request&, httplib::Response& res) {
                 res.set_content(registry_.to_json(), "application/json");
+            });
+
+        web_server_->Get("/api/help",
+            [this](const httplib::Request&, httplib::Response& res) {
+                res.set_content(registry_.help_json(), "application/json");
             });
 
         // -- Generic command dispatch API -------------------------------------

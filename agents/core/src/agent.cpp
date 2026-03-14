@@ -276,6 +276,11 @@ public:
                 pi->set_name(handle.descriptor()->name);
                 pi->set_version(handle.descriptor()->version);
                 pi->set_description(handle.descriptor()->description);
+                if (handle.descriptor()->actions) {
+                    for (const char* const* a = handle.descriptor()->actions; *a; ++a) {
+                        pi->add_capabilities(*a);
+                    }
+                }
             }
 
             // Tier 2: Include enrollment token if provided

@@ -156,39 +156,43 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
     std::ifstream f(cfg_path);
     if (!f.is_open()) return false;
 
-    std::lock_guard lock(mu_);
-    users_.clear();
+    bool has_users = false;
+    {
+        std::lock_guard lock(mu_);
+        users_.clear();
 
-    std::string line;
-    while (std::getline(f, line)) {
-        // Trim
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty() || line[0] == '#') continue;
+        std::string line;
+        while (std::getline(f, line)) {
+            // Trim
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+                line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
 
-        // Format: username:role:salt_hex:hash_hex
-        std::istringstream ss(line);
-        std::string username, role_str, salt_hex, hash_hex;
-        if (!std::getline(ss, username, ':')) continue;
-        if (!std::getline(ss, role_str, ':')) continue;
-        if (!std::getline(ss, salt_hex, ':')) continue;
-        if (!std::getline(ss, hash_hex, ':')) continue;
+            // Format: username:role:salt_hex:hash_hex
+            std::istringstream ss(line);
+            std::string username, role_str, salt_hex, hash_hex;
+            if (!std::getline(ss, username, ':')) continue;
+            if (!std::getline(ss, role_str, ':')) continue;
+            if (!std::getline(ss, salt_hex, ':')) continue;
+            if (!std::getline(ss, hash_hex, ':')) continue;
 
-        UserEntry entry;
-        entry.username = username;
-        entry.role     = string_to_role(role_str);
-        entry.salt_hex = salt_hex;
-        entry.hash_hex = hash_hex;
-        users_[username] = std::move(entry);
+            UserEntry entry;
+            entry.username = username;
+            entry.role     = string_to_role(role_str);
+            entry.salt_hex = salt_hex;
+            entry.hash_hex = hash_hex;
+            users_[username] = std::move(entry);
+        }
+
+        has_users = !users_.empty();
+        spdlog::info("Loaded {} user(s) from {}", users_.size(), cfg_path.string());
     }
 
-    spdlog::info("Loaded {} user(s) from {}", users_.size(), cfg_path.string());
-
-    // Also load enrollment tokens and pending agents
+    // Load enrollment tokens and pending agents (each acquires mu_ internally)
     load_tokens();
     load_pending();
 
-    return !users_.empty();
+    return has_users;
 }
 
 bool AuthManager::save_config() const {

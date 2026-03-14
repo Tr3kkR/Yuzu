@@ -104,7 +104,7 @@ PluginLoader::ScanResult PluginLoader::scan(const std::filesystem::path& plugin_
         return result;
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(plugin_dir)) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(plugin_dir)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != YUZU_SO_EXT) continue;
 
