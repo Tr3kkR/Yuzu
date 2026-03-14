@@ -233,6 +233,7 @@ public:
     // Build JSON array of all agents for the web UI.
     std::string to_json() const {
         std::lock_guard lock(mu_);
+
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& [id, s] : agents_) {
             arr.push_back({

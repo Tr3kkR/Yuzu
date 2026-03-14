@@ -3,8 +3,37 @@
 ####################################################################################################################
 
 version: "1.0"
-linter: jetbrains/qodana-clang:2025.2
+linter: jetbrains/qodana-clang:2025.3-eap-clang17
 profile:
   name: qodana.recommended
 include:
   - name: CheckDependencyLicenses
+exclude:
+  - name: All
+    paths:
+      - build
+      - vcpkg
+      - proto
+bootstrap: |
+  # Install system dependencies needed by vcpkg ports
+  sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+    build-essential pkg-config autoconf autoconf-archive libtool \
+    cmake ninja-build curl zip unzip tar git \
+    linux-libc-dev
+  # Bootstrap vcpkg
+  if [ -z "$VCPKG_ROOT" ]; then
+    export VCPKG_ROOT="$HOME/vcpkg"
+    git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+    "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+  fi
+  # Configure with compile_commands.json
+  cmake -B build -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
+    -DVCPKG_TARGET_TRIPLET=x64-linux \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DYUZU_BUILD_TESTS=OFF
+  # Build so generated protobuf headers exist for clang-tidy resolution
+  cmake --build build --parallel $(nproc)
+  # Symlink compile_commands.json to project root for Qodana auto-detection
+  ln -sf build/compile_commands.json compile_commands.json

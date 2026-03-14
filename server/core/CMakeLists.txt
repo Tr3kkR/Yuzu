@@ -14,12 +14,15 @@ add_library(yuzu::server_core ALIAS yuzu_server_core)
 
 target_include_directories(yuzu_server_core PUBLIC include)
 
+find_package(nlohmann_json CONFIG REQUIRED)
+
 target_link_libraries(yuzu_server_core
   PUBLIC
     yuzu::sdk
     yuzu_proto
     spdlog::spdlog
     httplib::httplib
+    nlohmann_json::nlohmann_json
 )
 
 # Platform-specific crypto for auth module

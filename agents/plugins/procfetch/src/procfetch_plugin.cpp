@@ -77,7 +77,7 @@ std::string read_first_line(const std::filesystem::path& path) {
 std::string resolve_exe(const std::filesystem::path& link) {
     try {
         return std::filesystem::read_symlink(link).string();
-    } catch (...) {
+    } catch (const std::filesystem::filesystem_error&) {
         return {};
     }
 }
