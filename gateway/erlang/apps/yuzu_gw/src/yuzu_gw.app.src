@@ -1,0 +1,24 @@
+{application, yuzu_gw, [
+    {description, "Yuzu Gateway — Erlang command fanout plane for million-agent management"},
+    {vsn, "0.1.0"},
+    {registered, [
+        yuzu_gw_sup,
+        yuzu_gw_registry,
+        yuzu_gw_router,
+        yuzu_gw_upstream,
+        yuzu_gw_agent_sup
+    ]},
+    {mod, {yuzu_gw_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        sasl,
+        grpcbox,
+        telemetry,
+        prometheus
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Proprietary"]},
+    {links, []}
+]}.

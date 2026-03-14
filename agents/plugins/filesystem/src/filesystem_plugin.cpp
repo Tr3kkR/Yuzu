@@ -6,6 +6,12 @@
  *   "list_dir"  — List directory contents (max 1000 entries).
  *   "file_hash" — Compute SHA-256 (or SHA-1) hash of a file.
  *
+ * Security:
+ *   - All paths are canonicalized via std::filesystem::canonical() to
+ *     resolve symlinks and prevent traversal attacks.
+ *   - An optional base_dir parameter restricts access to a subtree.
+ *   - This plugin requires admin role on the server side.
+ *
  * Output is pipe-delimited via write_output():
  *   exists|true/false, type|file/directory/other, size|N
  *   entry|name|type|size
@@ -37,6 +43,92 @@
 namespace {
 
 namespace fs = std::filesystem;
+
+// Maximum file size for hashing (10 GB)
+constexpr std::uintmax_t kMaxHashFileSize = 10ULL * 1024 * 1024 * 1024;
+
+// ── Path validation ─────────────────────────────────────────────────────
+
+// Canonicalize a path and optionally enforce a base directory restriction.
+// Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
+std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
+    if (raw_path.empty()) return {};
+
+    std::error_code ec;
+    std::string path_str{raw_path};
+
+    // First check the path exists (canonical requires it to exist)
+    if (!fs::exists(path_str, ec)) return {};
+
+    // Resolve all symlinks and normalize the path
+    auto canonical = fs::canonical(path_str, ec);
+    if (ec) return {};
+
+    // If a base_dir is configured, ensure the canonical path is within it
+    if (!base_dir.empty()) {
+        auto canonical_base = fs::canonical(std::string{base_dir}, ec);
+        if (ec) return {};
+
+        auto canon_str = canonical.string();
+        auto base_str = canonical_base.string();
+
+        // Ensure the canonical path starts with the base directory
+        if (canon_str.size() < base_str.size() ||
+            canon_str.compare(0, base_str.size(), base_str) != 0) {
+            return {};
+        }
+        // Ensure it's not just a prefix match on a directory name
+        // e.g., /var/log vs /var/logbackup
+        if (canon_str.size() > base_str.size() &&
+            canon_str[base_str.size()] != '/' &&
+            canon_str[base_str.size()] != '\\') {
+            return {};
+        }
+    }
+
+    return canonical.string();
+}
+
+// For paths that might not exist yet (exists check), validate the parent
+std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
+    if (raw_path.empty()) return {};
+
+    std::error_code ec;
+    std::string path_str{raw_path};
+
+    // If it exists, do full validation
+    if (fs::exists(path_str, ec)) {
+        return validate_path(raw_path, base_dir);
+    }
+
+    // For non-existent paths, validate the parent directory
+    auto parent = fs::path(path_str).parent_path();
+    if (parent.empty() || !fs::exists(parent, ec)) return {};
+
+    auto canonical_parent = fs::canonical(parent, ec);
+    if (ec) return {};
+
+    if (!base_dir.empty()) {
+        auto canonical_base = fs::canonical(std::string{base_dir}, ec);
+        if (ec) return {};
+
+        auto parent_str = canonical_parent.string();
+        auto base_str = canonical_base.string();
+
+        if (parent_str.size() < base_str.size() ||
+            parent_str.compare(0, base_str.size(), base_str) != 0) {
+            return {};
+        }
+        if (parent_str.size() > base_str.size() &&
+            parent_str[base_str.size()] != '/' &&
+            parent_str[base_str.size()] != '\\') {
+            return {};
+        }
+    }
+
+    // Return the original path (parent is validated, file just doesn't exist)
+    return path_str;
+}
 
 #ifdef _WIN32
 
@@ -101,45 +193,62 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 
 #else
 
-std::string run_command(const char* cmd) {
+std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
+    // Use execvp-based approach to avoid shell injection via path
+    int pipe_fd[2];
+    if (pipe(pipe_fd) != 0) return {};
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return {};
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]);
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        close(pipe_fd[1]);
+
+#ifdef __APPLE__
+        if (algorithm == "sha1") {
+            execlp("shasum", "shasum", "-a", "1", path.c_str(), nullptr);
+        } else {
+            execlp("shasum", "shasum", "-a", "256", path.c_str(), nullptr);
+        }
+#else
+        if (algorithm == "sha1") {
+            execlp("sha1sum", "sha1sum", path.c_str(), nullptr);
+        } else {
+            execlp("sha256sum", "sha256sum", path.c_str(), nullptr);
+        }
+#endif
+        _exit(127);
+    }
+
+    close(pipe_fd[1]);
+
     std::string result;
     std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+    ssize_t n;
+    while ((n = read(pipe_fd[0], buf.data(), buf.size())) > 0) {
+        result.append(buf.data(), static_cast<size_t>(n));
     }
-    pclose(pipe);
+    close(pipe_fd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
-    return result;
-}
 
-std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
-    std::string cmd;
-
-#ifdef __APPLE__
-    if (algorithm == "sha1") {
-        cmd = std::format("shasum -a 1 '{}'", path);
-    } else {
-        cmd = std::format("shasum -a 256 '{}'", path);
-    }
-#else
-    if (algorithm == "sha1") {
-        cmd = std::format("sha1sum '{}'", path);
-    } else {
-        cmd = std::format("sha256sum '{}'", path);
-    }
-#endif
-
-    auto output = run_command(cmd.c_str());
     // Output format: "HASH  filename" or "HASH filename"
-    auto space = output.find(' ');
+    auto space = result.find(' ');
     if (space != std::string::npos) {
-        return output.substr(0, space);
+        return result.substr(0, space);
     }
-    return output;
+    return result;
 }
 
 #endif
@@ -149,9 +258,9 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 class FilesystemPlugin final : public yuzu::Plugin {
 public:
     std::string_view name()        const noexcept override { return "filesystem"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view version()     const noexcept override { return "0.2.0"; }
     std::string_view description() const noexcept override {
-        return "Filesystem queries — exists, list_dir, file_hash";
+        return "Filesystem queries — exists, list_dir, file_hash (admin-only)";
     }
 
     const char* const* actions() const noexcept override {
@@ -190,17 +299,34 @@ private:
             return 1;
         }
 
+        auto base_dir = params.get("base_dir");
+
+        // For exists check, use validate_path_or_parent (path may not exist)
+        auto validated = validate_path_or_parent(path, base_dir);
+        if (validated.empty() && !base_dir.empty()) {
+            ctx.write_output("error|path is outside allowed base directory");
+            return 1;
+        }
+
         std::error_code ec;
-        std::string path_str{path};
+        std::string path_str = validated.empty() ? std::string{path} : validated;
         bool exists = fs::exists(path_str, ec);
         ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
 
         if (exists) {
-            if (fs::is_regular_file(path_str, ec)) {
+            // Re-validate with canonical now that we know it exists
+            auto canon = validate_path(path, base_dir);
+            if (canon.empty() && !base_dir.empty()) {
+                ctx.write_output("error|path resolves outside allowed base directory");
+                return 1;
+            }
+            auto& check_path = canon.empty() ? path_str : canon;
+
+            if (fs::is_regular_file(check_path, ec)) {
                 ctx.write_output("type|file");
-                auto sz = fs::file_size(path_str, ec);
+                auto sz = fs::file_size(check_path, ec);
                 ctx.write_output(std::format("size|{}", ec ? 0 : sz));
-            } else if (fs::is_directory(path_str, ec)) {
+            } else if (fs::is_directory(check_path, ec)) {
                 ctx.write_output("type|directory");
                 ctx.write_output("size|0");
             } else {
@@ -218,10 +344,15 @@ private:
             return 1;
         }
 
-        std::error_code ec;
-        std::string path_str{path};
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
 
-        if (!fs::is_directory(path_str, ec)) {
+        std::error_code ec;
+        if (!fs::is_directory(validated, ec)) {
             ctx.write_output("error|path is not a directory or does not exist");
             return 1;
         }
@@ -229,7 +360,7 @@ private:
         int count = 0;
         constexpr int max_entries = 1000;
 
-        for (auto it = fs::directory_iterator(path_str, ec);
+        for (auto it = fs::directory_iterator(validated, ec);
              it != fs::directory_iterator() && count < max_entries;
              it.increment(ec)) {
             if (ec) continue;
@@ -267,6 +398,13 @@ private:
             return 1;
         }
 
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
         auto algorithm = params.get("algorithm", "sha256");
         std::string algo_str{algorithm};
 
@@ -276,20 +414,25 @@ private:
             return 1;
         }
 
-        std::string path_str{path};
         std::error_code ec;
-        if (!fs::is_regular_file(path_str, ec)) {
+        if (!fs::is_regular_file(validated, ec)) {
             ctx.write_output("error|path is not a regular file or does not exist");
             return 1;
         }
 
-        auto file_size = fs::file_size(path_str, ec);
+        auto file_size = fs::file_size(validated, ec);
         if (ec) file_size = 0;
 
+        if (file_size > kMaxHashFileSize) {
+            ctx.write_output(std::format("error|file too large for hashing ({} bytes, max {})",
+                                         file_size, kMaxHashFileSize));
+            return 1;
+        }
+
 #ifdef _WIN32
-        auto hash = compute_hash_win(path_str, algo_str);
+        auto hash = compute_hash_win(validated, algo_str);
 #else
-        auto hash = compute_hash_unix(path_str, algo_str);
+        auto hash = compute_hash_unix(validated, algo_str);
 #endif
 
         if (hash.empty()) {

@@ -8,6 +8,7 @@
 
 #include "agent.grpc.pb.h"
 #include "management.grpc.pb.h"
+#include "gateway.grpc.pb.h"
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -46,6 +47,7 @@ namespace yuzu::server {
 namespace detail {
 
 namespace pb = ::yuzu::agent::v1;
+namespace gw = ::yuzu::gateway::v1;
 
 // -- Platform-specific log path -----------------------------------------------
 
@@ -316,11 +318,13 @@ public:
     AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
                      bool require_client_identity,
                      auth::AuthManager& auth_mgr,
-                     auth::AutoApproveEngine& auto_approve)
+                     auth::AutoApproveEngine& auto_approve,
+                     bool gateway_mode = false)
         : registry_(registry), bus_(bus),
           require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
-          auto_approve_(auto_approve) {}
+          auto_approve_(auto_approve),
+          gateway_mode_(gateway_mode) {}
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -434,8 +438,8 @@ public:
 
         registry_.register_agent(info);
 
-        auto session_id = "session-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+        auto session_id = "session-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(16));
         response->set_session_id(session_id);
         response->set_accepted(true);
         response->set_enrollment_status("enrolled");
@@ -480,7 +484,7 @@ public:
                                     "invalid or expired session");
             }
 
-            if (it->second.register_peer != context->peer()) {
+            if (!gateway_mode_ && it->second.register_peer != context->peer()) {
                 spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
                 return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
             }
@@ -678,6 +682,7 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
     bool require_client_identity_{false};
+    bool gateway_mode_{false};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -685,6 +690,240 @@ private:
 class ManagementServiceImpl : public ::yuzu::server::v1::ManagementService::Service {
 public:
     // Placeholder.
+};
+
+// -- GatewayUpstreamServiceImpl -----------------------------------------------
+
+class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
+public:
+    GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus,
+                               auth::AuthManager& auth_mgr,
+                               auth::AutoApproveEngine& auto_approve)
+        : registry_(registry), bus_(bus),
+          auth_mgr_(auth_mgr), auto_approve_(auto_approve) {}
+
+    // -- ProxyRegister --------------------------------------------------------
+    // Gateway forwards an agent's RegisterRequest.  We run the same enrollment
+    // logic as AgentServiceImpl::Register but skip peer-identity checks (the
+    // gateway is a trusted internal service).
+
+    grpc::Status ProxyRegister(
+        grpc::ServerContext* /*context*/,
+        const pb::RegisterRequest* request,
+        pb::RegisterResponse* response) override
+    {
+        const auto& info = request->info();
+
+        // ── Tiered enrollment (same logic as AgentServiceImpl::Register) ─────
+        const auto& enrollment_token = request->enrollment_token();
+
+        if (!enrollment_token.empty()) {
+            if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
+                spdlog::warn("[gateway] Agent {} presented invalid enrollment token",
+                             info.agent_id());
+                response->set_accepted(false);
+                response->set_reject_reason("invalid, expired, or exhausted enrollment token");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token",
+                         info.agent_id());
+            auth_mgr_.remove_pending_agent(info.agent_id());
+        } else {
+            // Auto-approve policies (no peer IP available from gateway yet)
+            auth::ApprovalContext approval_ctx;
+            approval_ctx.hostname = info.hostname();
+            approval_ctx.attestation_provider = request->attestation_provider();
+
+            auto matched_rule = auto_approve_.evaluate(approval_ctx);
+            if (!matched_rule.empty()) {
+                spdlog::info("[gateway] Agent {} auto-approved by policy: {}",
+                             info.agent_id(), matched_rule);
+                auth_mgr_.remove_pending_agent(info.agent_id());
+            } else {
+                // Tier 1: pending queue
+                auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+
+                if (!pending_status) {
+                    auth_mgr_.add_pending_agent(
+                        info.agent_id(),
+                        info.hostname(),
+                        info.platform().os(),
+                        info.platform().arch(),
+                        info.agent_version());
+
+                    response->set_accepted(false);
+                    response->set_reject_reason("awaiting admin approval");
+                    response->set_enrollment_status("pending");
+                    bus_.publish("pending-agent", info.agent_id());
+                    spdlog::info("[gateway] Agent {} placed in pending queue",
+                                 info.agent_id());
+                    return grpc::Status::OK;
+                }
+
+                switch (*pending_status) {
+                    case auth::PendingStatus::pending:
+                        response->set_accepted(false);
+                        response->set_reject_reason("still awaiting admin approval");
+                        response->set_enrollment_status("pending");
+                        return grpc::Status::OK;
+                    case auth::PendingStatus::denied:
+                        response->set_accepted(false);
+                        response->set_reject_reason("enrollment denied by administrator");
+                        response->set_enrollment_status("denied");
+                        return grpc::Status::OK;
+                    case auth::PendingStatus::approved:
+                        spdlog::info("[gateway] Agent {} enrolled (admin-approved)",
+                                     info.agent_id());
+                        break;
+                }
+            }
+        }
+
+        // ── Enrolled — register the agent ────────────────────────────────────
+        registry_.register_agent(info);
+
+        auto session_id = "gw-session-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(16));
+        response->set_session_id(session_id);
+        response->set_accepted(true);
+        response->set_enrollment_status("enrolled");
+
+        {
+            std::lock_guard lock(sessions_mu_);
+            gateway_sessions_[session_id] = info.agent_id();
+        }
+
+        spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}",
+                     info.agent_id(), session_id);
+        return grpc::Status::OK;
+    }
+
+    // -- BatchHeartbeat -------------------------------------------------------
+
+    grpc::Status BatchHeartbeat(
+        grpc::ServerContext* /*context*/,
+        const gw::BatchHeartbeatRequest* request,
+        gw::BatchHeartbeatResponse* response) override
+    {
+        int acked = 0;
+        for (const auto& hb : request->heartbeats()) {
+            // Validate that the session is known
+            std::string agent_id;
+            {
+                std::lock_guard lock(sessions_mu_);
+                auto it = gateway_sessions_.find(hb.session_id());
+                if (it != gateway_sessions_.end()) {
+                    agent_id = it->second;
+                }
+            }
+            if (agent_id.empty()) {
+                spdlog::debug("[gateway] BatchHeartbeat: unknown session {}",
+                              hb.session_id());
+                continue;
+            }
+            // TODO: Update last-heartbeat timestamp in registry when session
+            //       timeout tracking is implemented.
+            ++acked;
+        }
+
+        response->set_acknowledged_count(acked);
+        spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked",
+                      request->gateway_node(), acked, request->heartbeats_size());
+        return grpc::Status::OK;
+    }
+
+    // -- ProxyInventory -------------------------------------------------------
+
+    grpc::Status ProxyInventory(
+        grpc::ServerContext* /*context*/,
+        const pb::InventoryReport* request,
+        pb::InventoryAck* response) override
+    {
+        std::string agent_id;
+        {
+            std::lock_guard lock(sessions_mu_);
+            auto it = gateway_sessions_.find(request->session_id());
+            if (it != gateway_sessions_.end()) {
+                agent_id = it->second;
+            }
+        }
+        if (agent_id.empty()) {
+            spdlog::warn("[gateway] ProxyInventory: unknown session {}",
+                         request->session_id());
+            response->set_received(false);
+            return grpc::Status::OK;
+        }
+
+        // TODO: Persist inventory data once storage layer is implemented.
+        spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={}",
+                     agent_id, request->plugin_data_size());
+        response->set_received(true);
+        return grpc::Status::OK;
+    }
+
+    // -- NotifyStreamStatus ---------------------------------------------------
+
+    grpc::Status NotifyStreamStatus(
+        grpc::ServerContext* /*context*/,
+        const gw::StreamStatusNotification* request,
+        gw::StreamStatusAck* response) override
+    {
+        const auto& agent_id  = request->agent_id();
+        const auto& session_id = request->session_id();
+
+        // Verify session
+        {
+            std::lock_guard lock(sessions_mu_);
+            auto it = gateway_sessions_.find(session_id);
+            if (it == gateway_sessions_.end() || it->second != agent_id) {
+                spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
+                             session_id, agent_id);
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
+            }
+        }
+
+        switch (request->event()) {
+            case gw::StreamStatusNotification::CONNECTED:
+                // The gateway now owns the Subscribe stream for this agent.
+                // We don't have a local stream pointer, so we mark stream as null
+                // but keep the agent registered (it was registered in ProxyRegister).
+                spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}'",
+                             agent_id, request->gateway_node());
+                break;
+
+            case gw::StreamStatusNotification::DISCONNECTED:
+                registry_.clear_stream(agent_id);
+                registry_.remove_agent(agent_id);
+                {
+                    std::lock_guard lock(sessions_mu_);
+                    gateway_sessions_.erase(session_id);
+                }
+                spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'",
+                             agent_id, request->gateway_node());
+                break;
+
+            default:
+                spdlog::warn("[gateway] NotifyStreamStatus: unknown event {} for agent {}",
+                             static_cast<int>(request->event()), agent_id);
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
+        }
+
+        response->set_acknowledged(true);
+        return grpc::Status::OK;
+    }
+
+private:
+    AgentRegistry& registry_;
+    EventBus& bus_;
+    auth::AuthManager& auth_mgr_;
+    auth::AutoApproveEngine& auto_approve_;
+
+    // Map of gateway session_id → agent_id for validation.
+    std::mutex sessions_mu_;
+    std::unordered_map<std::string, std::string> gateway_sessions_;
 };
 
 // -- File-reading helper ------------------------------------------------------
@@ -708,8 +947,14 @@ public:
           registry_(event_bus_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
-              auth_mgr, auto_approve_)
+              auth_mgr, auto_approve_, cfg_.gateway_mode)
     {
+        // Create gateway upstream service if configured
+        if (!cfg_.gateway_upstream_address.empty()) {
+            gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
+                registry_, event_bus_, auth_mgr, auto_approve_);
+        }
+
         // Load auto-approve policies
         auto approve_path = cfg_.auth_config_path.parent_path() / "auto-approve.cfg";
         auto_approve_.load(approve_path);
@@ -785,6 +1030,15 @@ public:
         builder.RegisterService(&agent_service_);
         builder.RegisterService(&mgmt_service_);
 
+        if (gateway_service_) {
+            // Gateway upstream uses the same credentials as the management listener
+            // (internal traffic, typically mTLS between gateway and server).
+            builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
+            builder.RegisterService(gateway_service_.get());
+            spdlog::info("Gateway upstream service enabled on {}",
+                         cfg_.gateway_upstream_address);
+        }
+
         agent_server_ = builder.BuildAndStart();
 
         if (!agent_server_) {
@@ -795,6 +1049,9 @@ public:
 
         spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
             cfg_.listen_address, cfg_.management_address);
+        if (gateway_service_) {
+            spdlog::info("Gateway upstream listening on {}", cfg_.gateway_upstream_address);
+        }
 
         start_web_server();
         agent_server_->Wait();
@@ -1611,8 +1868,16 @@ private:
                 auto max_uses_s = extract_form_value(req.body, "max_uses");
                 auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-                int max_uses = max_uses_s.empty() ? 0 : std::stoi(max_uses_s);
-                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+                int max_uses = 0;
+                int ttl_hours = 0;
+                try {
+                    if (!max_uses_s.empty()) max_uses = std::stoi(max_uses_s);
+                    if (!ttl_s.empty()) ttl_hours = std::stoi(ttl_s);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                    return;
+                }
 
                 auto ttl = ttl_hours > 0
                     ? std::chrono::seconds(ttl_hours * 3600)
@@ -1641,9 +1906,18 @@ private:
                 auto max_uses_s = extract_json_string(req.body, "max_uses");
                 auto ttl_s = extract_json_string(req.body, "ttl_hours");
 
-                int count = count_s.empty() ? 10 : std::stoi(count_s);
-                int max_uses = max_uses_s.empty() ? 1 : std::stoi(max_uses_s);
-                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+                int count = 10;
+                int max_uses = 1;
+                int ttl_hours = 0;
+                try {
+                    if (!count_s.empty()) count = std::stoi(count_s);
+                    if (!max_uses_s.empty()) max_uses = std::stoi(max_uses_s);
+                    if (!ttl_s.empty()) ttl_hours = std::stoi(ttl_s);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                    return;
+                }
 
                 if (count < 1 || count > 10000) {
                     res.status = 400;
@@ -1793,6 +2067,12 @@ private:
 
         // -- Generic command dispatch API -------------------------------------
 
+        // Plugins that require admin role to invoke
+        static const std::unordered_set<std::string> kAdminOnlyPlugins = {
+            "script_exec", "software_actions", "services", "processes",
+            "filesystem", "agent_actions", "network_actions"
+        };
+
         web_server_->Post("/api/command",
             [this](const httplib::Request& req, httplib::Response& res) {
                 // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
@@ -1807,6 +2087,19 @@ private:
                     return;
                 }
 
+                // All commands require authentication
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                // Restricted plugins require admin role
+                if (kAdminOnlyPlugins.contains(plugin) &&
+                    session->role != auth::Role::admin) {
+                    res.status = 403;
+                    res.set_content("{\"error\":\"admin role required for plugin '" + plugin + "'\"}",
+                        "application/json");
+                    return;
+                }
+
                 if (!registry_.has_any()) {
                     res.status = 503;
                     res.set_content("{\"error\":\"no agent connected\"}",
@@ -1814,8 +2107,8 @@ private:
                     return;
                 }
 
-                auto command_id = plugin + "-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count());
+                auto command_id = plugin + "-" + auth::AuthManager::bytes_to_hex(
+                    auth::AuthManager::random_bytes(8));
 
                 detail::pb::CommandRequest cmd;
                 cmd.set_command_id(command_id);
@@ -1898,8 +2191,8 @@ private:
             return;
         }
 
-        auto command_id = plugin + "-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+        auto command_id = plugin + "-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(8));
 
         detail::pb::CommandRequest cmd;
         cmd.set_command_id(command_id);
@@ -1965,6 +2258,7 @@ private:
     detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;
     detail::ManagementServiceImpl              mgmt_service_;
+    std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
     std::shared_ptr<spdlog::logger>            file_logger_;
     std::unique_ptr<grpc::Server>              agent_server_;
     std::unique_ptr<grpc::Server>              mgmt_server_;

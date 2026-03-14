@@ -138,6 +138,16 @@ std::string AuthManager::generate_session_token() {
     return bytes_to_hex(random_bytes(32));
 }
 
+bool AuthManager::constant_time_compare(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    volatile unsigned char result = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        result |= static_cast<unsigned char>(a[i]) ^
+                  static_cast<unsigned char>(b[i]);
+    }
+    return result == 0;
+}
+
 // ── Config I/O ──────────────────────────────────────────────────────────────
 
 bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
@@ -348,7 +358,7 @@ std::optional<std::string> AuthManager::authenticate(
     auto salt = hex_to_bytes(it->second.salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
-    if (hash != it->second.hash_hex) {
+    if (!constant_time_compare(hash, it->second.hash_hex)) {
         spdlog::warn("Auth failed: bad password for '{}'", username);
         return std::nullopt;
     }
@@ -541,7 +551,7 @@ bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
     std::lock_guard lock(mu_);
 
     for (auto& [id, et] : enrollment_tokens_) {
-        if (et.token_hash != hash) continue;
+        if (!constant_time_compare(et.token_hash, hash)) continue;
 
         if (et.revoked) {
             spdlog::warn("Enrollment token {} is revoked", id);
