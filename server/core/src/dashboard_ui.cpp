@@ -416,7 +416,12 @@ R"HTM(
       'script_exec bash':              { plugin: 'script_exec', action: 'bash' },
       'software_actions':              { plugin: 'software_actions', action: 'list_upgradable' },
       'software_actions list_upgradable': { plugin: 'software_actions', action: 'list_upgradable' },
-      'software_actions installed_count': { plugin: 'software_actions', action: 'installed_count' }
+      'software_actions installed_count': { plugin: 'software_actions', action: 'installed_count' },
+      'vuln_scan':              { plugin: 'vuln_scan', action: 'scan' },
+      'vuln_scan scan':         { plugin: 'vuln_scan', action: 'scan' },
+      'vuln_scan cve_scan':     { plugin: 'vuln_scan', action: 'cve_scan' },
+      'vuln_scan config_scan':  { plugin: 'vuln_scan', action: 'config_scan' },
+      'vuln_scan summary':      { plugin: 'vuln_scan', action: 'summary' }
     };
 
     /* ── Column schemas per plugin ────────────────────────── */
@@ -447,7 +452,8 @@ R"HTM(
       'event_logs':       ['Agent', 'Key', 'Value'],
       'sccm':             ['Agent', 'Key', 'Value'],
       'script_exec':      ['Agent', 'Key', 'Value'],
-      'software_actions': ['Agent', 'Key', 'Value']
+      'software_actions': ['Agent', 'Key', 'Value'],
+      'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
     };
 )HTM"
 // Part 3: Helpers and table management
@@ -682,6 +688,16 @@ R"HTM(
                     parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
           } else {
             addRow([agentName, payload]);
+          }
+        } else if (plugin === 'vuln_scan') {
+          /* severity|category|title|detail */
+          var parts = payload.split('|');
+          if (parts.length >= 4) {
+            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
+          } else if (parts.length >= 2) {
+            addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
+          } else {
+            addRow([agentName, payload, '', '', '']);
           }
         } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
           /* key|value */

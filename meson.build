@@ -95,6 +95,7 @@ if build_agent
     subdir('agents/plugins/firewall')
     subdir('agents/plugins/antivirus')
     subdir('agents/plugins/bitlocker')
+    subdir('agents/plugins/vuln_scan')
   endif
 endif
 
