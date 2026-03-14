@@ -151,6 +151,9 @@ public:
                                               int iterations);
     static std::string          sha256_hex(const std::string& input);
 
+    /// Constant-time comparison of two hex strings (timing-attack safe).
+    static bool constant_time_compare(const std::string& a, const std::string& b);
+
 private:
     static std::string generate_session_token();
 

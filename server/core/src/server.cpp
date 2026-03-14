@@ -438,8 +438,8 @@ public:
 
         registry_.register_agent(info);
 
-        auto session_id = "session-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+        auto session_id = "session-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(16));
         response->set_session_id(session_id);
         response->set_accepted(true);
         response->set_enrollment_status("enrolled");
@@ -783,8 +783,8 @@ public:
         // ── Enrolled — register the agent ────────────────────────────────────
         registry_.register_agent(info);
 
-        auto session_id = "gw-session-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+        auto session_id = "gw-session-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(16));
         response->set_session_id(session_id);
         response->set_accepted(true);
         response->set_enrollment_status("enrolled");
@@ -1868,8 +1868,16 @@ private:
                 auto max_uses_s = extract_form_value(req.body, "max_uses");
                 auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-                int max_uses = max_uses_s.empty() ? 0 : std::stoi(max_uses_s);
-                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+                int max_uses = 0;
+                int ttl_hours = 0;
+                try {
+                    if (!max_uses_s.empty()) max_uses = std::stoi(max_uses_s);
+                    if (!ttl_s.empty()) ttl_hours = std::stoi(ttl_s);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                    return;
+                }
 
                 auto ttl = ttl_hours > 0
                     ? std::chrono::seconds(ttl_hours * 3600)
@@ -1898,9 +1906,18 @@ private:
                 auto max_uses_s = extract_json_string(req.body, "max_uses");
                 auto ttl_s = extract_json_string(req.body, "ttl_hours");
 
-                int count = count_s.empty() ? 10 : std::stoi(count_s);
-                int max_uses = max_uses_s.empty() ? 1 : std::stoi(max_uses_s);
-                int ttl_hours = ttl_s.empty() ? 0 : std::stoi(ttl_s);
+                int count = 10;
+                int max_uses = 1;
+                int ttl_hours = 0;
+                try {
+                    if (!count_s.empty()) count = std::stoi(count_s);
+                    if (!max_uses_s.empty()) max_uses = std::stoi(max_uses_s);
+                    if (!ttl_s.empty()) ttl_hours = std::stoi(ttl_s);
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                    return;
+                }
 
                 if (count < 1 || count > 10000) {
                     res.status = 400;
@@ -2050,6 +2067,12 @@ private:
 
         // -- Generic command dispatch API -------------------------------------
 
+        // Plugins that require admin role to invoke
+        static const std::unordered_set<std::string> kAdminOnlyPlugins = {
+            "script_exec", "software_actions", "services", "processes",
+            "filesystem", "agent_actions", "network_actions"
+        };
+
         web_server_->Post("/api/command",
             [this](const httplib::Request& req, httplib::Response& res) {
                 // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
@@ -2064,6 +2087,19 @@ private:
                     return;
                 }
 
+                // All commands require authentication
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                // Restricted plugins require admin role
+                if (kAdminOnlyPlugins.contains(plugin) &&
+                    session->role != auth::Role::admin) {
+                    res.status = 403;
+                    res.set_content("{\"error\":\"admin role required for plugin '" + plugin + "'\"}",
+                        "application/json");
+                    return;
+                }
+
                 if (!registry_.has_any()) {
                     res.status = 503;
                     res.set_content("{\"error\":\"no agent connected\"}",
@@ -2071,8 +2107,8 @@ private:
                     return;
                 }
 
-                auto command_id = plugin + "-" + std::to_string(
-                    std::chrono::steady_clock::now().time_since_epoch().count());
+                auto command_id = plugin + "-" + auth::AuthManager::bytes_to_hex(
+                    auth::AuthManager::random_bytes(8));
 
                 detail::pb::CommandRequest cmd;
                 cmd.set_command_id(command_id);
@@ -2155,8 +2191,8 @@ private:
             return;
         }
 
-        auto command_id = plugin + "-" + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count());
+        auto command_id = plugin + "-" + auth::AuthManager::bytes_to_hex(
+            auth::AuthManager::random_bytes(8));
 
         detail::pb::CommandRequest cmd;
         cmd.set_command_id(command_id);

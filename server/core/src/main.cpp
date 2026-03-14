@@ -8,6 +8,11 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+
+#ifdef _WIN32
+#include <crtdbg.h>
+#include <windows.h>
+#endif
 #include <format>
 #include <iostream>
 #include <memory>
@@ -129,9 +134,17 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);
 
-    auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
-    g_server = server.get();
-    server->run();
+    try {
+        auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
+        g_server = server.get();
+        server->run();
+    } catch (const std::exception& ex) {
+        spdlog::error("Fatal exception: {}", ex.what());
+        return EXIT_FAILURE;
+    } catch (...) {
+        spdlog::error("Fatal unknown exception");
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }
