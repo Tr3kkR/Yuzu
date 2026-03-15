@@ -92,6 +92,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
 
@@ -114,26 +117,18 @@ jobs:
             --x-manifest-root="${{ github.workspace }}"
 
       - name: Configure (Meson)
-        shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson setup builddir ^
-            --buildtype=${{ matrix.build_type }} ^
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-windows ^
-            -Dbuild_tests=true ^
+          meson setup builddir `
+            --buildtype=${{ matrix.build_type }} `
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-windows `
+            -Dbuild_tests=true `
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson compile -C builddir
+        run: meson compile -C builddir
 
       - name: Test
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson test -C builddir --print-errorlogs
+        run: meson test -C builddir --print-errorlogs
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────────
   macos:
