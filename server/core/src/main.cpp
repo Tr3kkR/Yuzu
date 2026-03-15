@@ -12,9 +12,12 @@
 #include <cstdlib>
 
 #ifdef _WIN32
+#include <io.h>
 #include <winsock2.h>
 #include <windows.h>
 #include <crtdbg.h>
+#else
+#include <unistd.h>
 #endif
 #include <format>
 #include <iostream>
@@ -24,7 +27,15 @@
 static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
 static void on_signal(int sig) {
-    spdlog::warn("Received signal {}, shutting down...", sig);
+    // Only async-signal-safe calls allowed here.
+    // write() to stderr instead of spdlog (which allocates and locks).
+    const char msg[] = "Received signal, shutting down...\n";
+#ifdef _WIN32
+    _write(2, msg, sizeof(msg) - 1);
+#else
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+    (void)sig;
     if (auto* s = g_server.load(std::memory_order_acquire)) s->stop();
 }
 

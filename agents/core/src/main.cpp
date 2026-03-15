@@ -29,7 +29,15 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 static std::atomic<yuzu::agent::Agent*> g_agent{nullptr};
 
 static void on_signal(int sig) {
-    spdlog::warn("Received signal {}, shutting down...", sig);
+    // Only async-signal-safe calls allowed here.
+    // write() to stderr instead of spdlog (which allocates and locks).
+    const char msg[] = "Received signal, shutting down...\n";
+#ifdef _WIN32
+    _write(2, msg, sizeof(msg) - 1);
+#else
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+    (void)sig;
     if (auto* a = g_agent.load(std::memory_order_acquire)) a->stop();
 }
 
