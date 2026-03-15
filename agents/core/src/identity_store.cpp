@@ -5,11 +5,21 @@
 #include <array>
 #include <cstdlib>
 #include <format>
+#include <memory>
 #include <random>
 
 namespace yuzu::agent {
 
 namespace {
+
+struct SqliteDbDeleter {
+    void operator()(sqlite3* db) const { sqlite3_close(db); }
+};
+struct SqliteStmtDeleter {
+    void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
+};
+using SqliteDb   = std::unique_ptr<sqlite3, SqliteDbDeleter>;
+using SqliteStmt = std::unique_ptr<sqlite3_stmt, SqliteStmtDeleter>;
 
 std::string generate_uuid_v4() {
     std::random_device rd;
@@ -80,81 +90,69 @@ auto resolve_agent_id(
                         db_path.parent_path().string(), ec.message())});
     }
 
-    sqlite3* db = nullptr;
-    int rc = sqlite3_open(db_path.string().c_str(), &db);
+    sqlite3* raw_db = nullptr;
+    int rc = sqlite3_open(db_path.string().c_str(), &raw_db);
+    SqliteDb db(raw_db);
     if (rc != SQLITE_OK) {
-        std::string err = sqlite3_errmsg(db);
-        sqlite3_close(db);
         return std::unexpected(IdentityError{
-            std::format("failed to open database {}: {}", db_path.string(), err)});
+            std::format("failed to open database {}: {}", db_path.string(),
+                        sqlite3_errmsg(db.get()))});
     }
 
     // Create table if needed
     const char* create_sql =
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
     char* err_msg = nullptr;
-    rc = sqlite3_exec(db, create_sql, nullptr, nullptr, &err_msg);
+    rc = sqlite3_exec(db.get(), create_sql, nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
-        sqlite3_close(db);
         return std::unexpected(IdentityError{
             std::format("failed to create kv table: {}", err)});
     }
 
     // Try to read existing agent_id
     const char* select_sql = "SELECT value FROM kv WHERE key = 'agent_id'";
-    sqlite3_stmt* stmt = nullptr;
-    rc = sqlite3_prepare_v2(db, select_sql, -1, &stmt, nullptr);
+    sqlite3_stmt* raw_stmt = nullptr;
+    rc = sqlite3_prepare_v2(db.get(), select_sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        std::string err = sqlite3_errmsg(db);
-        sqlite3_close(db);
         return std::unexpected(IdentityError{
-            std::format("failed to prepare SELECT: {}", err)});
+            std::format("failed to prepare SELECT: {}", sqlite3_errmsg(db.get()))});
     }
 
-    rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-        // Found existing ID
-        auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        std::string existing_id = text ? text : "";
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
-        return existing_id;
-    }
-    sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) {
-        std::string err = sqlite3_errmsg(db);
-        sqlite3_close(db);
-        return std::unexpected(IdentityError{
-            std::format("failed to query agent_id: {}", err)});
+    {
+        SqliteStmt stmt(raw_stmt);
+        rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_ROW) {
+            auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+            return std::string(text ? text : "");
+        }
+        if (rc != SQLITE_DONE) {
+            return std::unexpected(IdentityError{
+                std::format("failed to query agent_id: {}", sqlite3_errmsg(db.get()))});
+        }
     }
 
     // Generate new UUID and insert
     std::string new_id = generate_uuid_v4();
 
     const char* insert_sql = "INSERT INTO kv (key, value) VALUES ('agent_id', ?)";
-    rc = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, nullptr);
+    raw_stmt = nullptr;
+    rc = sqlite3_prepare_v2(db.get(), insert_sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        std::string err = sqlite3_errmsg(db);
-        sqlite3_close(db);
         return std::unexpected(IdentityError{
-            std::format("failed to prepare INSERT: {}", err)});
+            std::format("failed to prepare INSERT: {}", sqlite3_errmsg(db.get()))});
     }
 
-    sqlite3_bind_text(stmt, 1, new_id.c_str(), -1, SQLITE_STATIC);
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    SqliteStmt insert_stmt(raw_stmt);
+    sqlite3_bind_text(insert_stmt.get(), 1, new_id.c_str(), -1, SQLITE_STATIC);
+    rc = sqlite3_step(insert_stmt.get());
 
     if (rc != SQLITE_DONE) {
-        std::string err = sqlite3_errmsg(db);
-        sqlite3_close(db);
         return std::unexpected(IdentityError{
-            std::format("failed to insert agent_id: {}", err)});
+            std::format("failed to insert agent_id: {}", sqlite3_errmsg(db.get()))});
     }
 
-    sqlite3_close(db);
     return new_id;
 }
 
