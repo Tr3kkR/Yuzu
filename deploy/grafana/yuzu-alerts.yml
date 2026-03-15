@@ -1,0 +1,60 @@
+# Yuzu Prometheus Alert Rules
+# Import into Prometheus or Grafana alerting.
+
+groups:
+  - name: yuzu.rules
+    rules:
+      # Alert when no agents are connected for more than 5 minutes.
+      - alert: YuzuNoAgentsConnected
+        expr: yuzu_agents_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No Yuzu agents connected"
+          description: "The Yuzu server has had zero connected agents for more than 5 minutes."
+
+      # Alert when an agent disconnects (connected count drops).
+      - alert: YuzuAgentDisconnected
+        expr: delta(yuzu_agents_connected[5m]) < -1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu agent disconnection detected"
+          description: "The connected agent count dropped by {{ $value }} in the last 5 minutes."
+
+      # Alert when command failure rate exceeds 10% over 5 minutes.
+      - alert: YuzuHighCommandFailureRate
+        expr: >
+          rate(yuzu_commands_completed_total{status="error"}[5m])
+          / (rate(yuzu_commands_completed_total[5m]) > 0) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High command failure rate"
+          description: "More than 10% of commands are failing (current rate: {{ $value | humanizePercentage }})."
+
+      # Alert when command latency p95 exceeds 10 seconds.
+      - alert: YuzuHighCommandLatency
+        expr: histogram_quantile(0.95, rate(yuzu_command_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High command execution latency"
+          description: "p95 command latency is {{ $value }}s (threshold: 10s)."
+
+      # Alert when no commands are being processed (possible stall).
+      - alert: YuzuCommandProcessingStalled
+        expr: >
+          yuzu_agents_connected > 0
+          and rate(yuzu_commands_dispatched_total[15m]) == 0
+          and rate(yuzu_commands_completed_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "No commands processed"
+          description: "Agents are connected but no commands have been dispatched or completed in 15 minutes."

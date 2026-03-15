@@ -1,6 +1,7 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/version.hpp>
+#include <yuzu/json_log_formatter.hpp>
 
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
@@ -51,6 +52,7 @@ int main(int argc, char* argv[]) {
 
     yuzu::server::Config cfg;
     std::string log_level = "info";
+    std::string log_format = "text";
     std::string config_file;
 
     app.add_option("--config",     config_file,              "Path to yuzu-server.cfg");
@@ -80,6 +82,8 @@ int main(int argc, char* argv[]) {
        ->default_val(10000);
     app.add_option("--log-level",  log_level,                "Log level: trace|debug|info|warn|error")
        ->default_val("info");
+    app.add_option("--log-format", log_format,              "Log format: text|json")
+       ->default_val("text");
 
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
@@ -95,7 +99,12 @@ int main(int argc, char* argv[]) {
     CLI11_PARSE(app, argc, argv);
 
     spdlog::set_level(spdlog::level::from_str(log_level));
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
+    if (log_format == "json") {
+        spdlog::set_formatter(
+            std::make_unique<yuzu::JsonLogFormatter>("server"));
+    } else {
+        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
+    }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 

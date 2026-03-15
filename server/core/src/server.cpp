@@ -1,6 +1,7 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -128,7 +129,8 @@ struct AgentSession {
 
 class AgentRegistry {
 public:
-    explicit AgentRegistry(EventBus& bus) : bus_(bus) {}
+    explicit AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics)
+        : bus_(bus), metrics_(metrics) {}
 
     void register_agent(const pb::AgentInfo& info) {
         auto session = std::make_shared<AgentSession>();
@@ -153,6 +155,9 @@ public:
             std::lock_guard lock(mu_);
             agents_[info.agent_id()] = session;
         }
+        metrics_.counter("yuzu_agents_registered_total").increment();
+        metrics_.gauge("yuzu_agents_connected").set(
+            static_cast<double>(agent_count()));
         bus_.publish("agent-online", info.agent_id());
         spdlog::info("Agent registered: id={}, hostname={}, plugins={}",
             info.agent_id(), info.hostname(), info.plugins_size());
@@ -187,6 +192,8 @@ public:
             std::lock_guard lock(mu_);
             agents_.erase(agent_id);
         }
+        metrics_.gauge("yuzu_agents_connected").set(
+            static_cast<double>(agent_count()));
         bus_.publish("agent-offline", agent_id);
         spdlog::info("Agent removed: id={}", agent_id);
     }
@@ -315,10 +322,16 @@ public:
         return {};
     }
 
+    std::size_t agent_count() const {
+        std::lock_guard lock(mu_);
+        return agents_.size();
+    }
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
     EventBus& bus_;
+    yuzu::MetricsRegistry& metrics_;
 };
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
@@ -379,11 +392,13 @@ public:
                      bool require_client_identity,
                      auth::AuthManager& auth_mgr,
                      auth::AutoApproveEngine& auto_approve,
+                     yuzu::MetricsRegistry& metrics,
                      bool gateway_mode = false)
         : registry_(registry), bus_(bus),
           require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
+          metrics_(metrics),
           gateway_mode_(gateway_mode) {}
 
     grpc::Status Register(
@@ -391,6 +406,8 @@ public:
         const pb::RegisterRequest* request,
         pb::RegisterResponse* response) override
     {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "Register"}, {"status", "received"}}).increment();
         const auto& info = request->info();
 
         if (require_client_identity_) {
@@ -607,6 +624,8 @@ public:
 
                 std::string status_str =
                     (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+                metrics_.counter("yuzu_commands_completed_total",
+                    {{"status", status_str}}).increment();
                 bus_.publish("command-status",
                     resp.command_id() + "|" + status_str);
 
@@ -617,6 +636,8 @@ public:
                     if (it != cmd_send_times_.end()) {
                         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - it->second).count();
+                        metrics_.histogram("yuzu_command_duration_seconds")
+                            .observe(static_cast<double>(total_ms) / 1000.0);
                         bus_.publish("timing",
                             resp.command_id() + "|total_ms="
                             + std::to_string(total_ms) + "|complete");
@@ -729,6 +750,7 @@ private:
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine& auto_approve_;
+    yuzu::MetricsRegistry& metrics_;
 
     static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
@@ -1004,11 +1026,26 @@ public:
     explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
           auth_mgr_(auth_mgr),
-          registry_(event_bus_),
+          registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
-              auth_mgr, auto_approve_, cfg_.gateway_mode)
+              auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode)
     {
+        // Register metric descriptions
+        metrics_.describe("yuzu_agents_connected",
+            "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_agents_registered_total",
+            "Total number of agent registrations", "counter");
+        metrics_.describe("yuzu_commands_dispatched_total",
+            "Total number of commands dispatched to agents", "counter");
+        metrics_.describe("yuzu_commands_completed_total",
+            "Total number of completed commands by status", "counter");
+        metrics_.describe("yuzu_command_duration_seconds",
+            "Command execution latency in seconds", "histogram");
+        metrics_.describe("yuzu_grpc_requests_total",
+            "Total gRPC requests by method and status", "counter");
+        metrics_.describe("yuzu_http_requests_total",
+            "Total HTTP requests by path and status", "counter");
         // Create gateway upstream service if configured
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
@@ -1676,8 +1713,8 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page
-                if (req.path == "/login") {
+                // Allow unauthenticated access to login page and metrics
+                if (req.path == "/login" || req.path == "/metrics") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -1733,6 +1770,21 @@ private:
                 res.set_header("Set-Cookie",
                     "yuzu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
                 res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // -- HTTP metrics (post-routing handler) --------------------------------
+        web_server_->set_post_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                metrics_.counter("yuzu_http_requests_total",
+                    {{"method", req.method},
+                     {"status", std::to_string(res.status)}}).increment();
+            });
+
+        // -- Prometheus metrics endpoint ----------------------------------------
+        web_server_->Get("/metrics",
+            [this](const httplib::Request&, httplib::Response& res) {
+                res.set_content(metrics_.serialize(),
+                    "text/plain; version=0.0.4; charset=utf-8");
             });
 
         // -- Current user info (/api/me) --------------------------------------
@@ -2199,6 +2251,7 @@ private:
                     return;
                 }
 
+                metrics_.counter("yuzu_commands_dispatched_total").increment();
                 spdlog::info("Command dispatched: {}:{} → {} agent(s)",
                     plugin, action, sent);
                 res.set_content(
@@ -2307,6 +2360,7 @@ private:
     Config                                     cfg_;
     auth::AuthManager&                         auth_mgr_;
     auth::AutoApproveEngine                    auto_approve_;
+    yuzu::MetricsRegistry                      metrics_;
     detail::EventBus                           event_bus_;
     detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;
