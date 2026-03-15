@@ -18,6 +18,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
@@ -25,11 +26,19 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 #include <memory>
 #include <string>
 
-static yuzu::agent::Agent* g_agent = nullptr;
+static std::atomic<yuzu::agent::Agent*> g_agent{nullptr};
 
 static void on_signal(int sig) {
-    spdlog::warn("Received signal {}, shutting down...", sig);
-    if (g_agent) g_agent->stop();
+    // Only async-signal-safe calls allowed here.
+    // write() to stderr instead of spdlog (which allocates and locks).
+    const char msg[] = "Received signal, shutting down...\n";
+#ifdef _WIN32
+    _write(2, msg, sizeof(msg) - 1);
+#else
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+    (void)sig;
+    if (auto* a = g_agent.load(std::memory_order_acquire)) a->stop();
 }
 
 int main(int argc, char* argv[]) {
@@ -107,7 +116,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, on_signal);
 
     auto agent = yuzu::agent::Agent::create(std::move(cfg));
-    g_agent = agent.get();
+    g_agent.store(agent.get(), std::memory_order_release);
     agent->run();
 
     return EXIT_SUCCESS;

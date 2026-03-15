@@ -2,6 +2,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/metrics.hpp>
+#include <yuzu/secure_zero.hpp>
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
 
@@ -1228,7 +1229,11 @@ private:
             spdlog::warn("{} TLS running without client certificate verification", listener_name);
         }
 
-        return grpc::SslServerCredentials(ssl_opts);
+        auto creds = grpc::SslServerCredentials(ssl_opts);
+        for (auto& pair : ssl_opts.pem_key_cert_pairs) {
+            yuzu::secure_zero(pair.private_key);
+        }
+        return creds;
     }
 
     // -- Web server -----------------------------------------------------------
