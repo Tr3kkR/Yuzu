@@ -81,7 +81,7 @@ tests/unit/               Catch2 unit tests
 The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 
 ## vcpkg
-- Manifest: `vcpkg.json`. Pinned baseline: `c1f21baeaf7127c13ee141fe1bdaa49eed371c0c` (matches `vcpkgGitCommitId` in CI).
+- Manifest: `vcpkg.json`. Pinned baseline: `4b77da7fed37817f124936239197833469f1b9a8` (matches `vcpkgGitCommitId` in CI).
 - `builtin-baseline` is required because of the `version>=` constraint on abseil. Without it vcpkg resolves against HEAD.
 - OpenSSL is skipped on Windows (`"platform": "!windows"`) — gRPC uses the native Windows crypto stack.
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
@@ -95,7 +95,7 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 | macos | macos-14 (Apple Silicon) | Apple Clang | arm64-osx |
 | arm64-cross | ubuntu-24.04 | aarch64-linux-gnu gcc | arm64-linux |
 
-vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
+vcpkg binary cache: `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash.
 
 ## Coding conventions
 - **C++ standard**: C++23 throughout. Use `std::expected<T, E>` for errors, `std::span`, `std::string_view`, `std::format`.
