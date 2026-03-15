@@ -9,12 +9,16 @@ add_library(yuzu_server_core STATIC
   src/procfetch_ui.cpp
   src/login_ui.cpp
   src/settings_ui.cpp
+  src/nvd_db.cpp
+  src/nvd_client.cpp
+  src/nvd_sync.cpp
 )
 add_library(yuzu::server_core ALIAS yuzu_server_core)
 
 target_include_directories(yuzu_server_core PUBLIC include)
 
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 
 target_link_libraries(yuzu_server_core
   PUBLIC
@@ -23,6 +27,7 @@ target_link_libraries(yuzu_server_core
     spdlog::spdlog
     httplib::httplib
     nlohmann_json::nlohmann_json
+    unofficial::sqlite3::sqlite3
 )
 
 # Platform-specific crypto for auth module

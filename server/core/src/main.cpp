@@ -96,7 +96,18 @@ int main(int argc, char* argv[]) {
     app.add_option("--token-max-uses",  gen_max_uses,  "Max uses per token (default: 1)");
     app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
 
+    // NVD CVE feed options
+    int nvd_sync_hours = 4;
+    app.add_option("--nvd-api-key",       cfg.nvd_api_key,   "NVD API key (for higher rate limits)");
+    app.add_option("--nvd-proxy",         cfg.nvd_proxy,     "HTTP proxy for NVD API (e.g. http://proxy:8080)");
+    app.add_option("--nvd-sync-interval", nvd_sync_hours,    "NVD sync interval in hours (default: 4)")
+       ->default_val(4);
+    app.add_flag  ("--no-nvd-sync", "Disable NVD CVE feed sync")
+       ->each([&cfg](const std::string&) { cfg.nvd_sync_enabled = false; });
+
     CLI11_PARSE(app, argc, argv);
+
+    cfg.nvd_sync_interval = std::chrono::seconds(nvd_sync_hours * 3600);
 
     spdlog::set_level(spdlog::level::from_str(log_level));
     if (log_format == "json") {

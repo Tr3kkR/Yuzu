@@ -2,6 +2,8 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/metrics.hpp>
+#include "nvd_db.hpp"
+#include "nvd_sync.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -1076,6 +1078,16 @@ public:
         } catch (const spdlog::spdlog_ex& ex) {
             spdlog::error("Failed to create file logger: {}", ex.what());
         }
+
+        // Initialize NVD CVE database
+        auto nvd_path = cfg_.auth_config_path.parent_path() / "nvd_cves.db";
+        nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
+
+        if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval);
+            nvd_sync_->start();
+        }
     }
 
     void run() override {
@@ -1157,6 +1169,9 @@ public:
     void stop() noexcept override {
         spdlog::info("Shutting down server...");
 
+        if (nvd_sync_) {
+            nvd_sync_->stop();
+        }
         if (web_server_) {
             web_server_->stop();
         }
@@ -2179,6 +2194,84 @@ private:
                 res.set_content(registry_.help_json(), "application/json");
             });
 
+        // -- NVD CVE feed endpoints -------------------------------------------
+
+        web_server_->Get("/api/nvd/status",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_auth(req, res)) return;
+                if (!nvd_db_ || !nvd_db_->is_open()) {
+                    res.set_content(R"({"enabled":false})", "application/json");
+                    return;
+                }
+                nlohmann::json j;
+                j["enabled"] = true;
+                j["total_cves"] = nvd_db_->total_cve_count();
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    j["syncing"] = st.syncing;
+                    j["last_sync_time"] = st.last_sync_time;
+                    j["last_error"] = st.last_error;
+                }
+                res.set_content(j.dump(), "application/json");
+            });
+
+        web_server_->Post("/api/nvd/sync",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!nvd_sync_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"NVD sync not enabled"})", "application/json");
+                    return;
+                }
+                // Run sync in a detached thread so we don't block the HTTP response
+                std::thread([this] { nvd_sync_->sync_now(); }).detach();
+                res.set_content(R"({"status":"sync_started"})", "application/json");
+            });
+
+        web_server_->Post("/api/nvd/match",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_auth(req, res)) return;
+                if (!nvd_db_ || !nvd_db_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"NVD database not available"})", "application/json");
+                    return;
+                }
+                // Parse inventory: array of {name, version} or pipe-delimited lines
+                std::vector<SoftwareItem> inventory;
+                try {
+                    auto body = nlohmann::json::parse(req.body);
+                    if (body.contains("inventory") && body["inventory"].is_array()) {
+                        for (const auto& item : body["inventory"]) {
+                            SoftwareItem si;
+                            si.name = item.value("name", "");
+                            si.version = item.value("version", "");
+                            if (!si.name.empty()) inventory.push_back(std::move(si));
+                        }
+                    }
+                } catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+                    return;
+                }
+
+                auto matches = nvd_db_->match_inventory(inventory);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& m : matches) {
+                    arr.push_back({
+                        {"cve_id", m.cve_id},
+                        {"severity", m.severity},
+                        {"description", m.description},
+                        {"product", m.product},
+                        {"installed_version", m.installed_version},
+                        {"fixed_in", m.fixed_in},
+                        {"source", m.source}
+                    });
+                }
+                res.set_content(nlohmann::json({{"findings", arr},
+                                                 {"count", arr.size()}}).dump(),
+                                "application/json");
+            });
+
         // -- Generic command dispatch API -------------------------------------
 
         // Plugins that require admin role to invoke
@@ -2371,6 +2464,10 @@ private:
     std::unique_ptr<grpc::Server>              mgmt_server_;
     std::unique_ptr<httplib::Server>           web_server_;
     std::thread                                web_thread_;
+
+    // NVD CVE feed
+    std::shared_ptr<NvdDatabase>               nvd_db_;
+    std::unique_ptr<NvdSyncManager>            nvd_sync_;
 };
 
 // -- Factory ------------------------------------------------------------------
