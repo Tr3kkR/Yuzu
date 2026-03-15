@@ -29,12 +29,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <string_view>
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -221,7 +222,7 @@ public:
         {
             std::lock_guard lock(mu_);
             snapshot.reserve(agents_.size());
-            for (auto& [id, s] : agents_) {
+            for (auto& s : agents_ | std::views::values) {
                 snapshot.push_back(s);
             }
         }
@@ -245,7 +246,7 @@ public:
         std::lock_guard lock(mu_);
 
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             arr.push_back({
                 {"agent_id",      s->agent_id},
                 {"hostname",      s->hostname},
@@ -263,7 +264,7 @@ public:
 
         // Deduplicate plugins by name (take the richest action list)
         std::unordered_map<std::string, const PluginMeta*> best;
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             for (const auto& pm : s->plugin_meta) {
                 auto it = best.find(pm.name);
                 if (it == best.end() || pm.actions.size() > it->second->actions.size()) {
@@ -275,8 +276,8 @@ public:
         // Sort by plugin name
         std::vector<const PluginMeta*> sorted;
         sorted.reserve(best.size());
-        for (const auto& [name, pm] : best) sorted.push_back(pm);
-        std::sort(sorted.begin(), sorted.end(),
+        for (const auto* pm : best | std::views::values) sorted.push_back(pm);
+        std::ranges::sort(sorted,
             [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
         nlohmann::json plugins_arr = nlohmann::json::array();
@@ -307,7 +308,7 @@ public:
         std::lock_guard lock(mu_);
         std::vector<std::string> ids;
         ids.reserve(agents_.size());
-        for (const auto& [id, s] : agents_) {
+        for (const auto& id : agents_ | std::views::keys) {
             ids.push_back(id);
         }
         return ids;
@@ -599,7 +600,7 @@ public:
                 // Track first response for server-side latency
                 {
                     std::lock_guard lock(cmd_times_mu_);
-                    if (cmd_first_seen_.find(resp.command_id()) == cmd_first_seen_.end()) {
+                    if (!cmd_first_seen_.contains(resp.command_id())) {
                         cmd_first_seen_.insert(resp.command_id());
                         auto it = cmd_send_times_.find(resp.command_id());
                         if (it != cmd_send_times_.end()) {
