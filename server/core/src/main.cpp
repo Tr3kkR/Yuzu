@@ -6,6 +6,7 @@
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -20,11 +21,11 @@
 #include <memory>
 #include <string>
 
-static yuzu::server::Server* g_server = nullptr;
+static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
 static void on_signal(int sig) {
     spdlog::warn("Received signal {}, shutting down...", sig);
-    if (g_server) g_server->stop();
+    if (auto* s = g_server.load(std::memory_order_acquire)) s->stop();
 }
 
 int main(int argc, char* argv[]) {
@@ -176,7 +177,7 @@ int main(int argc, char* argv[]) {
 
     try {
         auto server = yuzu::server::Server::create(std::move(cfg), auth_mgr);
-        g_server = server.get();
+        g_server.store(server.get(), std::memory_order_release);
         server->run();
     } catch (const std::exception& ex) {
         spdlog::error("Fatal exception: {}", ex.what());
