@@ -14,6 +14,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/metrics.hpp>
+#include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -272,6 +273,7 @@ public:
                 }
             }
             creds = grpc::SslCredentials(ssl_opts);
+            yuzu::secure_zero(ssl_opts.pem_private_key);
         } else {
             creds = grpc::InsecureChannelCredentials();
         }
