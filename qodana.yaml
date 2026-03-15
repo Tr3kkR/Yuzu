@@ -21,20 +21,20 @@ bootstrap: |
     cmake ninja-build curl zip unzip tar git \
     linux-libc-dev python3-pip python3-venv
   # Install meson in a venv (avoids PEP 668 and PATH issues)
-  python3 -m venv /opt/meson-venv
-  /opt/meson-venv/bin/pip install meson==1.9.2
-  export PATH="/opt/meson-venv/bin:/usr/local/bin:/usr/bin:/bin"
+  python3 -m venv /tmp/meson-venv
+  /tmp/meson-venv/bin/pip install meson==1.9.2
+  export PATH="/tmp/meson-venv/bin:/usr/local/bin:/usr/bin:/bin"
   # Bootstrap vcpkg at a fixed path (avoid shell variables — Qodana expands $ before bash)
-  git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg
-  git -C /opt/vcpkg fetch --depth 1 origin 4b77da7fed37817f124936239197833469f1b9a8
-  git -C /opt/vcpkg checkout FETCH_HEAD
-  bash /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+  git clone --depth 1 https://github.com/microsoft/vcpkg.git /tmp/vcpkg
+  git -C /tmp/vcpkg fetch --depth 1 origin 4b77da7fed37817f124936239197833469f1b9a8
+  git -C /tmp/vcpkg checkout FETCH_HEAD
+  bash /tmp/vcpkg/bootstrap-vcpkg.sh -disableMetrics
   # Install vcpkg packages
-  /opt/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
+  /tmp/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
   # Configure with Meson (generates compile_commands.json in build/)
   meson setup build \
     --buildtype=debug \
-    -Dcmake_prefix_path=/opt/vcpkg/installed/x64-linux \
+    -Dcmake_prefix_path=/tmp/vcpkg/installed/x64-linux \
     -Dbuild_tests=false
   # Build so generated protobuf headers exist for clang-tidy resolution
   meson compile -C build
