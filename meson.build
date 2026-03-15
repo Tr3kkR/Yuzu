@@ -74,6 +74,28 @@ if build_agent
     subdir('agents/plugins/sockwho')
     subdir('agents/plugins/status')
     subdir('agents/plugins/device_identity')
+    subdir('agents/plugins/os_info')
+    subdir('agents/plugins/hardware')
+    subdir('agents/plugins/users')
+    subdir('agents/plugins/installed_apps')
+    subdir('agents/plugins/msi_packages')
+    subdir('agents/plugins/network_config')
+    subdir('agents/plugins/diagnostics')
+    subdir('agents/plugins/agent_actions')
+    subdir('agents/plugins/processes')
+    subdir('agents/plugins/services')
+    subdir('agents/plugins/filesystem')
+    subdir('agents/plugins/windows_updates')
+    subdir('agents/plugins/event_logs')
+    subdir('agents/plugins/sccm')
+    subdir('agents/plugins/script_exec')
+    subdir('agents/plugins/software_actions')
+    subdir('agents/plugins/network_diag')
+    subdir('agents/plugins/network_actions')
+    subdir('agents/plugins/firewall')
+    subdir('agents/plugins/antivirus')
+    subdir('agents/plugins/bitlocker')
+    subdir('agents/plugins/vuln_scan')
   endif
 endif
 
@@ -86,6 +108,76 @@ endif
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if build_tests
   subdir('tests')
+endif
+
+# ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
+_rebar3 = find_program('rebar3', required: false)
+if _rebar3.found()
+  _gw_src = meson.project_source_root() / 'gateway'
+  # rebar3 must run from inside the gateway/ directory.
+  # Meson custom_target has no workdir param, so we use 'cmd /c cd ... &&'
+  # on Windows or 'sh -c cd ... &&' on POSIX.
+  if host_machine.system() == 'windows'
+    custom_target('gateway',
+      command: ['cmd', '/c', 'cd /d ' + _gw_src + ' && rebar3 compile'],
+      output: '.gateway_built',
+      build_always_stale: true,
+      build_by_default: true,
+    )
+  else
+    _sh = find_program('sh')
+    custom_target('gateway',
+      command: [_sh, '-c', 'cd ' + _gw_src + ' && rebar3 compile'],
+      output: '.gateway_built',
+      build_always_stale: true,
+      build_by_default: true,
+    )
+  endif
+  message('Erlang gateway: enabled (rebar3 found)')
+else
+  message('Erlang gateway: skipped (rebar3 not found)')
+endif
+
+# ── Deploy DLLs (Windows) ────────────────────────────────────────────────
+# Copies vcpkg dependency DLLs alongside executables and gathers plugin
+# DLLs into builddir/plugins/ so the agent can find them at runtime.
+if host_machine.system() == 'windows'
+  _python3 = find_program('python3')
+  _deploy_script = meson.project_source_root() / 'scripts' / 'deploy_build_dlls.py'
+  _build_root = meson.project_build_root()
+
+  # Derive the vcpkg DLL directory from cmake_prefix_path so we don't
+  # depend on VCPKG_ROOT being set in every environment (e.g. CLion).
+  _vcpkg_bin = ''
+  _cmake_prefixes = get_option('cmake_prefix_path')
+  foreach _prefix : _cmake_prefixes
+    if _vcpkg_bin == ''
+      if get_option('buildtype') == 'debug' or get_option('buildtype') == 'debugoptimized'
+        _vcpkg_bin = _prefix / 'debug' / 'bin'
+      else
+        _vcpkg_bin = _prefix / 'bin'
+      endif
+    endif
+  endforeach
+
+  _deploy_args = ['--build-root', _build_root, '--triplet', 'x64-windows']
+  if _vcpkg_bin != ''
+    _deploy_args += ['--vcpkg-bin', _vcpkg_bin]
+  endif
+  if get_option('buildtype') == 'debug' or get_option('buildtype') == 'debugoptimized'
+    _deploy_args += ['--debug']
+  endif
+
+  # Run at configure time so a fresh setup has all DLLs immediately
+  run_command(_python3, _deploy_script, _deploy_args, check: false)
+
+  # Run at build time so rebuilt plugins are always copied to plugins/
+  custom_target('deploy_dlls',
+    command: [_python3, _deploy_script] + _deploy_args,
+    output: '.dlls_deployed',
+    build_always_stale: true,
+    build_by_default: true,
+  )
 endif
 
 # ── Summary ───────────────────────────────────────────────────────────────────

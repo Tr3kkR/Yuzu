@@ -105,6 +105,28 @@ if(YUZU_BUILD_AGENT)
     add_subdirectory(agents/plugins/sockwho)
     add_subdirectory(agents/plugins/status)
     add_subdirectory(agents/plugins/device_identity)
+    add_subdirectory(agents/plugins/os_info)
+    add_subdirectory(agents/plugins/hardware)
+    add_subdirectory(agents/plugins/users)
+    add_subdirectory(agents/plugins/installed_apps)
+    add_subdirectory(agents/plugins/msi_packages)
+    add_subdirectory(agents/plugins/network_config)
+    add_subdirectory(agents/plugins/diagnostics)
+    add_subdirectory(agents/plugins/agent_actions)
+    add_subdirectory(agents/plugins/processes)
+    add_subdirectory(agents/plugins/services)
+    add_subdirectory(agents/plugins/filesystem)
+    add_subdirectory(agents/plugins/windows_updates)
+    add_subdirectory(agents/plugins/event_logs)
+    add_subdirectory(agents/plugins/sccm)
+    add_subdirectory(agents/plugins/script_exec)
+    add_subdirectory(agents/plugins/software_actions)
+    add_subdirectory(agents/plugins/network_diag)
+    add_subdirectory(agents/plugins/network_actions)
+    add_subdirectory(agents/plugins/firewall)
+    add_subdirectory(agents/plugins/antivirus)
+    add_subdirectory(agents/plugins/bitlocker)
+    add_subdirectory(agents/plugins/vuln_scan)
   endif()
 endif()
 
@@ -118,6 +140,19 @@ endif()
 if(YUZU_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────────
+find_program(REBAR3 rebar3)
+if(REBAR3)
+  message(STATUS "Erlang gateway: enabled (rebar3 found at ${REBAR3})")
+  add_custom_target(gateway ALL
+    COMMAND "${REBAR3}" compile
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/gateway"
+    COMMENT "Compiling Erlang gateway (rebar3)"
+  )
+else()
+  message(STATUS "Erlang gateway: skipped (rebar3 not found)")
 endif()
 
 # ── Install rules ─────────────────────────────────────────────────────────────

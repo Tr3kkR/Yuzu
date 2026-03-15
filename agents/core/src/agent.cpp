@@ -9,6 +9,9 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #endif
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/cert_discovery.hpp>
+#include <yuzu/agent/cert_store.hpp>
+#include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/version.hpp>
 
@@ -18,8 +21,16 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 
+#ifdef _WIN32
+#  include <winsock2.h>   // gethostname
+#else
+#  include <unistd.h>     // gethostname
+#endif
+
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <mutex>
 #include <string>
@@ -32,6 +43,14 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
+
+std::string read_file_contents(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    return std::string(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+}
 
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
 // (Subscribe RPC: stream CommandResponse → stream CommandRequest)
@@ -156,15 +175,85 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
-        auto channel = grpc::CreateCustomChannel(
-            cfg_.server_address,
-            cfg_.tls_enabled
-                ? grpc::SslCredentials({})
-                : grpc::InsecureChannelCredentials(),
-            ch_args
-        );
+        // Auto-discover client certificate if none explicitly configured
+        if (cfg_.cert_auto_discovery
+            && cfg_.tls_client_cert.empty()
+            && cfg_.cert_store.empty()) {
+            auto discovered = discover_client_cert();
+            if (discovered) {
+                cfg_.tls_client_cert = discovered->cert_path;
+                cfg_.tls_client_key  = discovered->key_path;
+                spdlog::info("Using auto-discovered cert from {} (source: {})",
+                             discovered->cert_path.string(), discovered->source);
+            }
+        }
 
-        auto stub = pb::AgentService::NewStub(channel);
+        CloudIdentity cloud_id;  // Populated before registration (step 2b)
+        std::shared_ptr<grpc::ChannelCredentials> creds;
+        std::shared_ptr<grpc::Channel> channel;
+        std::unique_ptr<pb::AgentService::Stub> stub;
+        if (cfg_.tls_enabled) {
+            grpc::SslCredentialsOptions ssl_opts;
+            if (!cfg_.tls_ca_cert.empty()) {
+                ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
+                if (ssl_opts.pem_root_certs.empty()) {
+                    spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
+                    goto shutdown_plugins;
+                }
+            }
+
+            // Client certificate: prefer cert store, fall back to PEM files
+            if (!cfg_.cert_store.empty()) {
+                // Read client cert + key from OS certificate store
+                spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
+                auto store_result = read_cert_from_store(
+                    cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
+
+                if (!store_result.ok()) {
+                    spdlog::error("Certificate store error: {}", store_result.error);
+                    goto shutdown_plugins;
+                }
+
+                ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
+                ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
+                spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
+            } else {
+                const bool has_client_cert = !cfg_.tls_client_cert.empty();
+                const bool has_client_key = !cfg_.tls_client_key.empty();
+                if (has_client_cert != has_client_key) {
+                    spdlog::error("mTLS requires both --client-cert and --client-key");
+                    goto shutdown_plugins;
+                }
+
+                if (has_client_cert && has_client_key) {
+                    ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
+                    ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
+                    if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                        spdlog::error("Failed to read client cert/key for mTLS");
+                        goto shutdown_plugins;
+                    } else {
+                        spdlog::info("mTLS enabled: using client certificate files");
+                    }
+                }
+            }
+            creds = grpc::SslCredentials(ssl_opts);
+        } else {
+            creds = grpc::InsecureChannelCredentials();
+        }
+
+        channel = grpc::CreateCustomChannel(
+            cfg_.server_address, creds, ch_args);
+
+        stub = pb::AgentService::NewStub(channel);
+
+        // 2b. Detect cloud instance identity (for auto-approve)
+        {
+            cloud_id = detect_cloud_identity();
+            if (cloud_id.valid()) {
+                spdlog::info("Cloud identity detected: provider={}, instance={}, region={}",
+                             cloud_id.provider, cloud_id.instance_id, cloud_id.region);
+            }
+        }
 
         // 3. Register with server
         {
@@ -174,11 +263,40 @@ public:
             info->set_agent_id(cfg_.agent_id);
             info->set_agent_version(std::string{yuzu::kFullVersionString});
 
+            // Set hostname for auto-approve hostname_glob matching
+            {
+                char host_buf[256] = {};
+                if (gethostname(host_buf, sizeof(host_buf) - 1) == 0) {
+                    info->set_hostname(host_buf);
+                }
+            }
+
             for (const auto& handle : plugins_) {
                 auto* pi = info->add_plugins();
                 pi->set_name(handle.descriptor()->name);
                 pi->set_version(handle.descriptor()->version);
                 pi->set_description(handle.descriptor()->description);
+                if (handle.descriptor()->actions) {
+                    for (const char* const* a = handle.descriptor()->actions; *a; ++a) {
+                        pi->add_capabilities(*a);
+                    }
+                }
+            }
+
+            // Tier 2: Include enrollment token if provided
+            if (!cfg_.enrollment_token.empty()) {
+                req.set_enrollment_token(cfg_.enrollment_token);
+                spdlog::info("Including enrollment token in registration");
+            }
+
+            // Tier 3: Include cloud identity attestation if available
+            if (cloud_id.valid()) {
+                req.set_attestation_provider(cloud_id.provider);
+                req.set_machine_certificate(
+                    cloud_id.identity_document.data(),
+                    cloud_id.identity_document.size());
+                spdlog::info("Including {} cloud attestation in registration",
+                             cloud_id.provider);
             }
 
             pb::RegisterResponse resp;
@@ -193,13 +311,25 @@ public:
                     resp.reject_reason());
                 goto shutdown_plugins;
             }
+
+            auto enrollment_status = resp.enrollment_status();
+            if (enrollment_status == "pending") {
+                spdlog::warn("Registration pending admin approval — agent will not receive commands until approved");
+                spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard", cfg_.agent_id);
+                goto shutdown_plugins;
+            }
+
             session_id_ = resp.session_id();
-            spdlog::info("Registered with server (session={})", session_id_);
+            spdlog::info("Registered with server (session={}, enrollment={})",
+                session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
         }
 
         // 4. Open Subscribe bidi stream
         {
             grpc::ClientContext sub_ctx;
+            if (!session_id_.empty()) {
+                sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
+            }
             subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
 
             auto stream = stub->Subscribe(&sub_ctx);

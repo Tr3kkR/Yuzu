@@ -97,3 +97,54 @@ vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
 - **Plugin ABI**: C API in `sdk/include/yuzu/plugin.h` must stay stable. C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary.
 - **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
 - **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
+
+## Dual build systems — CMake + Meson
+
+Both CMake and Meson build files must be kept in sync. **Every time you add, remove, or rename a source file, update both `CMakeLists.txt` and `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
+
+### Meson build (Windows, from MSYS2 bash)
+```bash
+source ./setup_msvc_env.sh
+meson compile -C builddir
+```
+
+**IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
+
+### Windows toolchain requirements
+All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe/MSVC.
+| Tool | Path |
+|---|---|
+| cl.exe | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe` |
+| cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` |
+| ninja.exe | Installed with CMake or VS BuildTools |
+| meson | `pip install meson` (Python) |
+| vcpkg | `C:\Users\natha\vcpkg` (`VCPKG_ROOT`) |
+| protoc | `C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
+| grpc_cpp_plugin | `C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
+
+## Authentication & Authorization
+
+### Implemented
+- **mTLS** for agent ↔ server gRPC connections.
+- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Two roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
+- **Login page** — dark-themed, with greyed-out OIDC SSO stub ("Coming soon").
+- **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, greyed-out AD/Entra section.
+- **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
+- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
+- **Tiered agent enrollment**:
+  - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
+  - **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
+  - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
+- **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
+- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+- **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
+- **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+
+### Remaining work
+1. **Tier 3 platform trust server-side** — server validates machine certificates against enterprise CA for auto-enrollment (agent-side cert store reading is done; server-side validation is not).
+2. **HTTPS for web dashboard** — currently HTTP only; add TLS termination.
+3. **OIDC SSO** — replace the stub login button with real OIDC flow.
+4. **AD/Entra directory integration** — inherit roles from domain groups.
+5. **macOS Keychain / Linux PKCS#11** — cert store integration for non-Windows platforms.
+
+Certificate setup instructions: `scripts/Certificate Instructions.txt`.

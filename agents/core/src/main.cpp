@@ -44,13 +44,24 @@ int main(int argc, char* argv[]) {
     app.add_option("--agent-id", cfg.agent_id,        "Stable agent UUID (auto-generated if empty)");
     app.add_option("--data-dir", cfg.data_dir,        "Directory for persistent agent state")
        ->default_val(yuzu::agent::default_data_dir().string());
+    // Default plugin dir: <exe_dir>/../plugins (matches meson build layout)
+    auto exe_dir = std::filesystem::path(argv[0]).parent_path();
+    if (exe_dir.empty()) exe_dir = std::filesystem::current_path();
     app.add_option("--plugin-dir", cfg.plugin_dir,    "Directory containing plugin shared libraries")
-       ->default_val((std::filesystem::current_path() / "plugins").string());
+       ->default_val((exe_dir / ".." / "plugins").string());
     app.add_option("--heartbeat", cfg.heartbeat_interval,
                    "Heartbeat interval in seconds")->default_val(30);
     app.add_flag  ("--no-tls",   "Disable TLS (insecure, for development only)")
        ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
-    app.add_option("--ca-cert",  cfg.tls_ca_cert,     "PEM CA certificate for server verification");
+    app.add_option("--ca-cert",      cfg.tls_ca_cert,     "PEM CA certificate for server verification");
+    app.add_option("--client-cert",  cfg.tls_client_cert, "PEM client certificate for mTLS");
+    app.add_option("--client-key",   cfg.tls_client_key,  "PEM client private key for mTLS");
+    app.add_option("--cert-store",      cfg.cert_store,      "Windows certificate store name (e.g. MY) for mTLS");
+    app.add_option("--cert-subject",    cfg.cert_subject,    "Subject CN match for cert store lookup");
+    app.add_option("--cert-thumbprint", cfg.cert_thumbprint, "SHA-1 thumbprint for cert store lookup (hex)");
+    app.add_flag  ("--no-cert-discovery", "Disable auto-discovery of certs from well-known paths")
+       ->each([&cfg](const std::string&) { cfg.cert_auto_discovery = false; });
+    app.add_option("--enrollment-token", cfg.enrollment_token, "Pre-shared enrollment token for server registration");
     app.add_flag  ("--debug",    "Enable debug mode (diagnostic features)")
        ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
     app.add_flag  ("--verbose",  "Enable verbose logging")

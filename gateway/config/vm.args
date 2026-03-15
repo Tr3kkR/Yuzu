@@ -1,0 +1,33 @@
+## Node name (change for each node in the cluster)
+-name yuzu_gw1@127.0.0.1
+
+## Cookie for Erlang distribution (must match across cluster)
+-setcookie yuzu_gw_secret_change_me
+
+## Scheduler configuration
++K true
++A 128
++SDio 128
+
+## Process limit — 4M processes to support 1M+ agents with overhead
++P 4194304
+
+## Port (file descriptor) limit
++Q 2097152
+
+## Async thread pool for dirty schedulers
++SDcpu 0:0
+
+## Memory allocator tuning for many small processes
++MBas aobf
++MBlmbcs 512
++MEas aobf
+
+## Kernel poll (epoll on Linux)
++K true
+
+## GC: fullsweep after 20 collections (default 65535 is too lazy for short-lived data)
+-env ERL_FULLSWEEP_AFTER 20
+
+## Distribution buffer size (bytes) — larger for cluster fanout
++zdbbl 32768

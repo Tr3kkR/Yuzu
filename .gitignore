@@ -53,3 +53,16 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Dev artifacts
+_build_tmp.bat
+_debug_vcvars.bat
+_vcvars_env.txt
+build_now.bat
+build_now.ps1
+meson_stderr.txt
+meson_stdout.txt
+_build_err.txt
+_build_out.txt
+build_log.txt
+.claude/settings.local.json

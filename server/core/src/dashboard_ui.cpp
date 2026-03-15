@@ -55,6 +55,24 @@ R"HTM(<!DOCTYPE html>
       box-shadow: 0 0 0 2px rgba(88,166,255,0.2);
     }
     .instr-bar input[type="text"]::placeholder { color: #484f58; }
+    .instr-wrap { position: relative; flex: 1; display: flex; }
+    .instr-wrap input[type="text"] { width: 100%; }
+    .ac-list {
+      display: none; position: absolute; top: 100%; left: 0; right: 0;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0 0 0.375rem 0.375rem; max-height: 280px;
+      overflow-y: auto; z-index: 200; margin-top: 2px;
+      font-family: var(--mono); font-size: 0.825rem;
+    }
+    .ac-list.open { display: block; }
+    .ac-item {
+      padding: 0.35rem 0.75rem; cursor: pointer; color: var(--fg);
+      border-bottom: 1px solid var(--border); display: flex;
+      justify-content: space-between; align-items: center;
+    }
+    .ac-item:last-child { border-bottom: none; }
+    .ac-item:hover, .ac-item.sel { background: rgba(88,166,255,0.12); }
+    .ac-item .ac-desc { color: #8b949e; font-size: 0.75rem; margin-left: 1rem; text-align: right; }
     .instr-bar button {
       padding: 0.45rem 1.2rem; font-size: 0.875rem; font-weight: 500;
       background: var(--accent); color: #fff; border: none;
@@ -180,6 +198,62 @@ R"HTM(<!DOCTYPE html>
       padding: 0.4rem 1rem; border-top: 1px solid var(--border);
       font-size: 0.7rem; color: #484f58;
     }
+
+    /* ── Hamburger Menu ──────────────────────────────────────── */
+    .hamburger-wrap {
+      position: relative; margin-left: auto;
+    }
+    .hamburger-btn {
+      background: none; border: 1px solid var(--border); border-radius: 0.375rem;
+      color: var(--fg); font-size: 1.2rem; padding: 0.2rem 0.55rem;
+      cursor: pointer; line-height: 1; transition: background 0.15s;
+    }
+    .hamburger-btn:hover { background: rgba(88,166,255,0.1); }
+    .hamburger-menu {
+      display: none; position: absolute; right: 0; top: 110%;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.5rem; min-width: 160px; z-index: 1000;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      overflow: hidden;
+    }
+    .hamburger-menu.open { display: block; }
+    .hamburger-menu a, .hamburger-menu button {
+      display: block; width: 100%; padding: 0.55rem 1rem;
+      font-size: 0.8rem; color: var(--fg); text-align: left;
+      text-decoration: none; background: none; border: none;
+      cursor: pointer; transition: background 0.1s;
+    }
+    .hamburger-menu a:hover, .hamburger-menu button:hover {
+      background: rgba(88,166,255,0.1);
+    }
+    .hamburger-menu .divider {
+      height: 1px; background: var(--border); margin: 0.25rem 0;
+    }
+    .hamburger-user {
+      padding: 0.55rem 1rem; font-size: 0.7rem; color: #8b949e;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* ── About Modal ─────────────────────────────────────────── */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 2000;
+      align-items: center; justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.75rem; padding: 2rem; width: 380px;
+      text-align: center;
+    }
+    .modal h2 { font-size: 1.3rem; margin-bottom: 0.5rem; }
+    .modal .version { font-size: 0.8rem; color: #8b949e; margin-bottom: 1rem; }
+    .modal p { font-size: 0.8rem; color: #8b949e; line-height: 1.5; margin-bottom: 1rem; }
+    .modal .btn-close {
+      padding: 0.4rem 1.5rem; font-size: 0.8rem; font-weight: 500;
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 0.375rem; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -187,8 +261,11 @@ R"HTM(<!DOCTYPE html>
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
-    <input type="text" id="instr-input" placeholder="chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop"
-           autocomplete="off" spellcheck="false">
+    <div class="instr-wrap">
+      <input type="text" id="instr-input" placeholder="Type a command or 'help'..."
+             autocomplete="off" spellcheck="false">
+      <div class="ac-list" id="ac-list"></div>
+    </div>
     <button id="btn-send" onclick="sendInstruction()">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
     <button class="btn-clear" onclick="clearResults()">Clear</button>
@@ -198,8 +275,33 @@ R"HTM(<!DOCTYPE html>
       <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
       <span>Total: <strong id="stat-total">&mdash;</strong></span>
     </div>
+    <div class="hamburger-wrap">
+      <button class="hamburger-btn" onclick="toggleMenu()" title="Menu">&#9776;</button>
+      <div class="hamburger-menu" id="hamburger-menu">
+        <div class="hamburger-user" id="menu-user">Signed in</div>
+        <a href="/settings">Settings</a>
+        <button onclick="showAbout()">About</button>
+        <div class="divider"></div>
+        <button onclick="doLogout()">Logout</button>
+      </div>
+    </div>
   </div>
 
+  <!-- ── About Modal ──────────────────────────────────────── -->
+  <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
+    <div class="modal">
+      <h2>Yuzu</h2>
+      <div class="version">Agent &amp; Server Management Platform</div>
+      <p>Real-time endpoint management with gRPC/Protobuf transport,
+         plugin architecture, and multi-platform support.</p>
+      <p style="font-size:0.7rem">Built with C++23, gRPC, httplib, spdlog.</p>
+      <button class="btn-close" onclick="closeAbout()">Close</button>
+    </div>
+  </div>
+
+)HTM"
+// Part 2: HTML body continued
+R"HTM(
   <!-- ── Results ────────────────────────────────────────────── -->
   <div class="results">
     <div class="results-header">
@@ -243,24 +345,34 @@ R"HTM(
     var agents = {};   // agent_id -> { hostname, os, arch }
     var evtSource = null;
 
-    /* ── Instruction mapping ──────────────────────────────── */
-    var instructionMap = {
-      'chargen':          { plugin: 'chargen',   action: 'chargen_start' },
-      'chargen stop':     { plugin: 'chargen',   action: 'chargen_stop' },
-      'procfetch':        { plugin: 'procfetch', action: 'procfetch_fetch' },
-      'netstat':          { plugin: 'netstat',   action: 'netstat_list' },
-      'sockwho':          { plugin: 'sockwho',   action: 'sockwho_list' },
-      'status':           { plugin: 'status',    action: 'info' },
-      'status version':   { plugin: 'status',    action: 'version' },
-      'status info':      { plugin: 'status',    action: 'info' },
-      'status health':    { plugin: 'status',    action: 'health' },
-      'status plugins':   { plugin: 'status',    action: 'plugins' },
-      'status connection': { plugin: 'status',   action: 'connection' },
-      'status config':    { plugin: 'status',    action: 'config' },
-      'device_identity':          { plugin: 'device_identity', action: 'device_name' },
-      'device_identity domain':   { plugin: 'device_identity', action: 'domain' },
-      'device_identity ou':       { plugin: 'device_identity', action: 'ou' }
-    };
+    /* ── Instruction mapping (built dynamically from /api/help) ── */
+    var instructionMap = {};
+    var helpData = { plugins: [], commands: [] };
+
+    function buildInstructionMap(data) {
+      helpData = data;
+      instructionMap = {};
+      for (var i = 0; i < data.plugins.length; i++) {
+        var p = data.plugins[i];
+        if (p.actions.length > 0) {
+          instructionMap[p.name] = { plugin: p.name, action: p.actions[0] };
+        }
+        for (var j = 0; j < p.actions.length; j++) {
+          instructionMap[p.name + ' ' + p.actions[j]] = { plugin: p.name, action: p.actions[j] };
+        }
+      }
+    }
+
+    function loadHelp() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/help');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          buildInstructionMap(JSON.parse(xhr.responseText));
+        }
+      };
+      xhr.send();
+    }
 
     /* ── Column schemas per plugin ────────────────────────── */
     var columnSchemas = {
@@ -269,9 +381,33 @@ R"HTM(
       'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
       'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
       'status':            ['Agent', 'Key', 'Value'],
-      'device_identity':   ['Agent', 'Key', 'Value']
+      'device_identity':   ['Agent', 'Key', 'Value'],
+      'os_info':           ['Agent', 'Key', 'Value'],
+      'hardware':          ['Agent', 'Key', 'Value'],
+      'users':             ['Agent', 'Key', 'Value'],
+      'installed_apps':    ['Agent', 'Key', 'Value'],
+      'msi_packages':     ['Agent', 'Key', 'Value'],
+      'network_config':   ['Agent', 'Key', 'Value'],
+      'diagnostics':      ['Agent', 'Key', 'Value'],
+      'agent_actions':    ['Agent', 'Key', 'Value'],
+      'processes':        ['Agent', 'Key', 'Value'],
+      'services':         ['Agent', 'Key', 'Value'],
+      'filesystem':       ['Agent', 'Key', 'Value'],
+      'network_diag':     ['Agent', 'Key', 'Value'],
+      'network_actions':  ['Agent', 'Key', 'Value'],
+      'firewall':         ['Agent', 'Key', 'Value'],
+      'antivirus':        ['Agent', 'Key', 'Value'],
+      'bitlocker':        ['Agent', 'Key', 'Value'],
+      'windows_updates':  ['Agent', 'Key', 'Value'],
+      'event_logs':       ['Agent', 'Key', 'Value'],
+      'sccm':             ['Agent', 'Key', 'Value'],
+      'script_exec':      ['Agent', 'Key', 'Value'],
+      'software_actions': ['Agent', 'Key', 'Value'],
+      'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
     };
-
+)HTM"
+// Part 3: Helpers and table management
+R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -397,16 +533,65 @@ R"HTM(
     }
 
     /* ── Send instruction ─────────────────────────────────── */
+    function showHelp(query) {
+      var plugins = helpData.plugins;
+      if (!plugins || plugins.length === 0) {
+        document.getElementById('result-context').textContent = 'No agents connected — help unavailable.';
+        setBadge('error');
+        return;
+      }
+      /* Filter to a specific plugin if requested */
+      var filter = query.replace(/^help\s*/i, '').trim().toLowerCase();
+      if (filter) {
+        plugins = plugins.filter(function(p) { return p.name === filter; });
+        if (plugins.length === 0) {
+          document.getElementById('result-context').textContent = 'Unknown plugin: "' + filter + '"';
+          setBadge('error');
+          return;
+        }
+      }
+      setColumns(['Plugin', 'Action', 'Description']);
+      clearResults();
+      document.getElementById('result-context').textContent = filter ? 'help ' + filter : 'help — all plugins';
+      setBadge('idle');
+      var tbody = document.getElementById('results-tbody');
+      for (var i = 0; i < plugins.length; i++) {
+        var p = plugins[i];
+        if (p.actions.length === 0) {
+          var tr = document.createElement('tr');
+          tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>&mdash;</td><td>' + escapeHtml(p.description) + '</td>';
+          tbody.appendChild(tr);
+          rowCount++;
+        } else {
+          for (var j = 0; j < p.actions.length; j++) {
+            var tr = document.createElement('tr');
+            tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.actions[j]) +
+              '</td><td>' + (j === 0 ? escapeHtml(p.description) : '') + '</td>';
+            tbody.appendChild(tr);
+            rowCount++;
+          }
+        }
+      }
+      document.getElementById('row-count').textContent = rowCount;
+    }
+
     function sendInstruction() {
       var input = document.getElementById('instr-input');
       var raw = input.value.trim().toLowerCase();
       if (!raw) return;
+      closeAC();
+
+      /* Built-in help command */
+      if (raw === 'help' || raw.startsWith('help ')) {
+        showHelp(raw);
+        return;
+      }
 
       var mapped = instructionMap[raw];
       if (!mapped) {
         setBadge('error');
         document.getElementById('result-context').textContent =
-          'Unknown instruction: "' + raw + '". Try: chargen, procfetch, netstat, sockwho, status, device_identity, chargen stop';
+          'Unknown command: "' + raw + '". Type "help" to list all commands.';
         return;
       }
 
@@ -449,11 +634,97 @@ R"HTM(
       xhr.send(payload);
     }
 
-    /* Enter key in input sends instruction */
-    document.getElementById('instr-input').addEventListener('keydown', function(e) {
-      if (e.key === 'Enter') { e.preventDefault(); sendInstruction(); }
-    });
+    /* ── Autocomplete ────────────────────────────────────── */
+    var acSel = -1;
 
+    function closeAC() {
+      document.getElementById('ac-list').classList.remove('open');
+      acSel = -1;
+    }
+
+    function acSelect(cmd) {
+      document.getElementById('instr-input').value = cmd;
+      closeAC();
+      document.getElementById('instr-input').focus();
+    }
+
+    function updateAC() {
+      var input = document.getElementById('instr-input');
+      var q = input.value.trim().toLowerCase();
+      var list = document.getElementById('ac-list');
+      list.innerHTML = '';
+      acSel = -1;
+      if (!q) { closeAC(); return; }
+
+      /* Build description lookup */
+      var descMap = {};
+      for (var i = 0; i < helpData.plugins.length; i++) {
+        descMap[helpData.plugins[i].name] = helpData.plugins[i].description;
+      }
+
+      /* Filter commands — prefix match */
+      var cmds = helpData.commands || Object.keys(instructionMap);
+      var matches = [];
+      for (var i = 0; i < cmds.length; i++) {
+        if (cmds[i].indexOf(q) === 0 && cmds[i] !== q) matches.push(cmds[i]);
+      }
+      /* Also add 'help' if it matches */
+      if ('help'.indexOf(q) === 0 && q !== 'help') matches.unshift('help');
+
+      if (matches.length === 0) { closeAC(); return; }
+      if (matches.length > 15) matches.length = 15;
+
+      for (var i = 0; i < matches.length; i++) {
+        var div = document.createElement('div');
+        div.className = 'ac-item';
+        var plugin = matches[i].split(' ')[0];
+        var desc = descMap[plugin] || '';
+        div.innerHTML = '<span>' + escapeHtml(matches[i]) + '</span>' +
+          (desc ? '<span class="ac-desc">' + escapeHtml(desc) + '</span>' : '');
+        div.setAttribute('data-cmd', matches[i]);
+        div.addEventListener('mousedown', function(ev) {
+          ev.preventDefault();
+          acSelect(this.getAttribute('data-cmd'));
+        });
+        list.appendChild(div);
+      }
+      list.classList.add('open');
+    }
+
+    var instrInput = document.getElementById('instr-input');
+    instrInput.addEventListener('input', updateAC);
+    instrInput.addEventListener('blur', function() { setTimeout(closeAC, 150); });
+    instrInput.addEventListener('keydown', function(e) {
+      var list = document.getElementById('ac-list');
+      var items = list.querySelectorAll('.ac-item');
+      if (e.key === 'ArrowDown' && items.length > 0) {
+        e.preventDefault();
+        acSel = Math.min(acSel + 1, items.length - 1);
+        for (var i = 0; i < items.length; i++) items[i].classList.toggle('sel', i === acSel);
+        items[acSel].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp' && items.length > 0) {
+        e.preventDefault();
+        acSel = Math.max(acSel - 1, 0);
+        for (var i = 0; i < items.length; i++) items[i].classList.toggle('sel', i === acSel);
+        items[acSel].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Tab' && acSel >= 0 && items.length > 0) {
+        e.preventDefault();
+        acSelect(items[acSel].getAttribute('data-cmd'));
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (acSel >= 0 && items.length > 0) {
+          acSelect(items[acSel].getAttribute('data-cmd'));
+        } else {
+          closeAC();
+          sendInstruction();
+        }
+      } else if (e.key === 'Escape') {
+        closeAC();
+      }
+    });
+)HTM"
+// Part 4: SSE + menu JavaScript
+R"HTM(
     /* ── SSE ──────────────────────────────────────────────── */
     function connectSSE() {
       if (evtSource) evtSource.close();
@@ -501,7 +772,17 @@ R"HTM(
           } else {
             addRow([agentName, payload]);
           }
-        } else if (plugin === 'status' || plugin === 'device_identity') {
+        } else if (plugin === 'vuln_scan') {
+          /* severity|category|title|detail */
+          var parts = payload.split('|');
+          if (parts.length >= 4) {
+            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
+          } else if (parts.length >= 2) {
+            addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
+          } else {
+            addRow([agentName, payload, '', '', '']);
+          }
+        } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
           /* key|value */
           var parts = payload.split('|');
           if (parts.length >= 2) {
@@ -525,10 +806,12 @@ R"HTM(
 
       evtSource.addEventListener('agent-online', function(e) {
         refreshAgentList();
+        loadHelp();
       });
 
       evtSource.addEventListener('agent-offline', function(e) {
         refreshAgentList();
+        loadHelp();
       });
 
       evtSource.addEventListener('timing', function(e) {
@@ -547,10 +830,64 @@ R"HTM(
       evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
     }
 
+    /* ── Hamburger menu ───────────────────────────────────── */
+    function toggleMenu() {
+      document.getElementById('hamburger-menu').classList.toggle('open');
+    }
+    document.addEventListener('click', function(e) {
+      var wrap = document.querySelector('.hamburger-wrap');
+      if (wrap && !wrap.contains(e.target)) {
+        document.getElementById('hamburger-menu').classList.remove('open');
+      }
+    });
+
+    /* ── About modal ─────────────────────────────────────── */
+    function showAbout() {
+      document.getElementById('hamburger-menu').classList.remove('open');
+      document.getElementById('about-modal').classList.add('open');
+    }
+    function closeAbout(e) {
+      if (!e || e.target === document.getElementById('about-modal')) {
+        document.getElementById('about-modal').classList.remove('open');
+      }
+    }
+
+    /* ── Logout ──────────────────────────────────────────── */
+    function doLogout() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/logout');
+      xhr.onload = function() { window.location.href = '/login'; };
+      xhr.onerror = function() { window.location.href = '/login'; };
+      xhr.send();
+    }
+
+    /* ── Load current user info ──────────────────────────── */
+    function loadUserInfo() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/me');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          var data = JSON.parse(xhr.responseText);
+          document.getElementById('menu-user').textContent =
+            'Signed in as ' + data.username + ' (' + data.role + ')';
+          /* Hide settings link for non-admin */
+          if (data.role !== 'admin') {
+            var links = document.querySelectorAll('.hamburger-menu a[href="/settings"]');
+            for (var i = 0; i < links.length; i++) {
+              links[i].style.display = 'none';
+            }
+          }
+        }
+      };
+      xhr.send();
+    }
+
     /* ── Init ─────────────────────────────────────────────── */
     connectSSE();
     refreshAgentList();
     setInterval(refreshAgentList, 5000);
+    loadUserInfo();
+    loadHelp();
   </script>
 </body>
 </html>

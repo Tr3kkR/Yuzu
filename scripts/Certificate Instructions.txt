@@ -1,0 +1,115 @@
+Yuzu mTLS Certificate Setup
+============================
+
+This guide explains how to generate and configure TLS certificates for
+mutual TLS (mTLS) between the Yuzu server and agents using OpenSSL.
+
+
+1. Create a CA (Certificate Authority)
+---------------------------------------
+
+This is the root of trust. Both server and agent trust certs signed by this CA.
+
+    openssl genrsa -out ca-key.pem 4096
+
+    openssl req -new -x509 -key ca-key.pem -sha256 -days 3650 \
+      -out ca.pem -subj "/CN=Yuzu CA"
+
+You now have:
+  - ca-key.pem   -- keep this secret, used only to sign certs
+  - ca.pem       -- distribute to both server and agents
+
+
+2. Create the Server Certificate
+---------------------------------
+
+    openssl genrsa -out server-key.pem 2048
+
+    openssl req -new -key server-key.pem \
+      -out server.csr -subj "/CN=yuzu-server"
+
+gRPC requires a Subject Alternative Name (SAN). Create a config file:
+
+    # server-ext.cnf
+    subjectAltName = DNS:localhost, IP:127.0.0.1
+
+For production, replace with your actual hostname/IP:
+
+    subjectAltName = DNS:server.example.com, IP:10.0.0.5
+
+Sign with the CA:
+
+    openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem \
+      -CAcreateserial -out server.pem -days 365 -sha256 \
+      -extfile server-ext.cnf
+
+
+3. Create an Agent Certificate
+-------------------------------
+
+    openssl genrsa -out agent-key.pem 2048
+
+    openssl req -new -key agent-key.pem \
+      -out agent.csr -subj "/CN=agent-01"
+
+    openssl x509 -req -in agent.csr -CA ca.pem -CAkey ca-key.pem \
+      -CAcreateserial -out agent.pem -days 365 -sha256
+
+Repeat for each agent, using a unique CN (or the agent's UUID).
+Important: the agent certificate identity (CN or SAN entry) must match
+the runtime agent ID used by yuzu-agent (--agent-id or persisted ID),
+because the server enforces certificate-to-agent_id binding in mTLS mode.
+
+
+4. Start the Server and Agent
+------------------------------
+
+Server (present its cert, require agent certs signed by our CA):
+
+    yuzu-server --cert server.pem --key server-key.pem --ca-cert ca.pem
+
+Agent (verify server cert, present its own client cert):
+
+    yuzu-agent --server localhost:50051 \
+      --ca-cert ca.pem \
+      --client-cert agent.pem \
+      --client-key agent-key.pem
+
+
+5. Flag Reference
+------------------
+
+  Server flags:
+    --cert       Server's PEM certificate (presented to agents)
+    --key        Server's private key
+    --ca-cert    CA cert to verify agent client certs (enables mTLS)
+    --allow-one-way-tls  Explicitly allow TLS without --ca-cert
+    --management-cert/--management-key/--management-ca-cert
+                 Optional management-listener TLS override
+
+  Agent flags:
+    --ca-cert      CA cert to verify server identity
+    --client-cert  Agent's PEM certificate (presented to server)
+    --client-key   Agent's private key
+
+By default, server startup now requires --ca-cert when TLS is enabled.
+If you intentionally want one-way TLS, pass --allow-one-way-tls.
+
+When TLS is enabled:
+  - Server startup fails if --cert/--key are missing or unreadable.
+  - Server startup fails if --ca-cert is provided but unreadable.
+  - Server startup fails if --ca-cert is missing (unless --allow-one-way-tls is set).
+  - Agent startup fails if only one of --client-cert/--client-key is set.
+  - Agent startup fails if provided cert files are unreadable.
+
+
+6. Suggested File Layout
+-------------------------
+
+    certs/
+      ca.pem              Shared -- goes on server + all agents
+      ca-key.pem          Keep offline / secured
+      server.pem          Server only
+      server-key.pem      Server only
+      agent-01.pem        Deploy with that agent
+      agent-01-key.pem    Deploy with that agent
