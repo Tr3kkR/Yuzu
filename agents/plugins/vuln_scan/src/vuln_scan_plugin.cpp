@@ -398,7 +398,7 @@ public:
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {
-            "scan", "cve_scan", "config_scan", "summary", nullptr
+            "scan", "cve_scan", "config_scan", "summary", "inventory", nullptr
         };
         return acts;
     }
@@ -443,6 +443,18 @@ public:
             auto findings = do_config_scan_impl();
             output_findings(ctx, findings);
             ctx.report_progress(100);
+            return 0;
+        }
+
+        if (action == "inventory") {
+            // Return raw software inventory for server-side NVD matching.
+            // Format: name|version (one per line, pipe-delimited)
+            auto apps = get_installed_apps();
+            for (const auto& app : apps) {
+                ctx.write_output(std::format("{}|{}",
+                    escape_pipes(sanitize_utf8(app.name)),
+                    escape_pipes(sanitize_utf8(app.version))));
+            }
             return 0;
         }
 

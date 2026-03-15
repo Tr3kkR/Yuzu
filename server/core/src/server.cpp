@@ -1,6 +1,9 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
+#include <yuzu/metrics.hpp>
+#include "nvd_db.hpp"
+#include "nvd_sync.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -128,7 +131,8 @@ struct AgentSession {
 
 class AgentRegistry {
 public:
-    explicit AgentRegistry(EventBus& bus) : bus_(bus) {}
+    explicit AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics)
+        : bus_(bus), metrics_(metrics) {}
 
     void register_agent(const pb::AgentInfo& info) {
         auto session = std::make_shared<AgentSession>();
@@ -153,6 +157,9 @@ public:
             std::lock_guard lock(mu_);
             agents_[info.agent_id()] = session;
         }
+        metrics_.counter("yuzu_agents_registered_total").increment();
+        metrics_.gauge("yuzu_agents_connected").set(
+            static_cast<double>(agent_count()));
         bus_.publish("agent-online", info.agent_id());
         spdlog::info("Agent registered: id={}, hostname={}, plugins={}",
             info.agent_id(), info.hostname(), info.plugins_size());
@@ -187,6 +194,8 @@ public:
             std::lock_guard lock(mu_);
             agents_.erase(agent_id);
         }
+        metrics_.gauge("yuzu_agents_connected").set(
+            static_cast<double>(agent_count()));
         bus_.publish("agent-offline", agent_id);
         spdlog::info("Agent removed: id={}", agent_id);
     }
@@ -315,10 +324,16 @@ public:
         return {};
     }
 
+    std::size_t agent_count() const {
+        std::lock_guard lock(mu_);
+        return agents_.size();
+    }
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
     EventBus& bus_;
+    yuzu::MetricsRegistry& metrics_;
 };
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
@@ -379,11 +394,13 @@ public:
                      bool require_client_identity,
                      auth::AuthManager& auth_mgr,
                      auth::AutoApproveEngine& auto_approve,
+                     yuzu::MetricsRegistry& metrics,
                      bool gateway_mode = false)
         : registry_(registry), bus_(bus),
           require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
+          metrics_(metrics),
           gateway_mode_(gateway_mode) {}
 
     grpc::Status Register(
@@ -391,6 +408,8 @@ public:
         const pb::RegisterRequest* request,
         pb::RegisterResponse* response) override
     {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "Register"}, {"status", "received"}}).increment();
         const auto& info = request->info();
 
         if (require_client_identity_) {
@@ -607,6 +626,8 @@ public:
 
                 std::string status_str =
                     (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+                metrics_.counter("yuzu_commands_completed_total",
+                    {{"status", status_str}}).increment();
                 bus_.publish("command-status",
                     resp.command_id() + "|" + status_str);
 
@@ -617,6 +638,8 @@ public:
                     if (it != cmd_send_times_.end()) {
                         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - it->second).count();
+                        metrics_.histogram("yuzu_command_duration_seconds")
+                            .observe(static_cast<double>(total_ms) / 1000.0);
                         bus_.publish("timing",
                             resp.command_id() + "|total_ms="
                             + std::to_string(total_ms) + "|complete");
@@ -729,6 +752,7 @@ private:
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine& auto_approve_;
+    yuzu::MetricsRegistry& metrics_;
 
     static constexpr std::string_view kSessionMetadataKey = "x-yuzu-session-id";
     static constexpr auto kPendingRegistrationTtl = std::chrono::seconds(60);
@@ -1004,11 +1028,26 @@ public:
     explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
           auth_mgr_(auth_mgr),
-          registry_(event_bus_),
+          registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
-              auth_mgr, auto_approve_, cfg_.gateway_mode)
+              auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode)
     {
+        // Register metric descriptions
+        metrics_.describe("yuzu_agents_connected",
+            "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_agents_registered_total",
+            "Total number of agent registrations", "counter");
+        metrics_.describe("yuzu_commands_dispatched_total",
+            "Total number of commands dispatched to agents", "counter");
+        metrics_.describe("yuzu_commands_completed_total",
+            "Total number of completed commands by status", "counter");
+        metrics_.describe("yuzu_command_duration_seconds",
+            "Command execution latency in seconds", "histogram");
+        metrics_.describe("yuzu_grpc_requests_total",
+            "Total gRPC requests by method and status", "counter");
+        metrics_.describe("yuzu_http_requests_total",
+            "Total HTTP requests by path and status", "counter");
         // Create gateway upstream service if configured
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
@@ -1038,6 +1077,16 @@ public:
             spdlog::info("Log file: {}", log_path.string());
         } catch (const spdlog::spdlog_ex& ex) {
             spdlog::error("Failed to create file logger: {}", ex.what());
+        }
+
+        // Initialize NVD CVE database
+        auto nvd_path = cfg_.auth_config_path.parent_path() / "nvd_cves.db";
+        nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
+
+        if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
+            nvd_sync_ = std::make_unique<NvdSyncManager>(
+                nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval);
+            nvd_sync_->start();
         }
     }
 
@@ -1120,6 +1169,9 @@ public:
     void stop() noexcept override {
         spdlog::info("Shutting down server...");
 
+        if (nvd_sync_) {
+            nvd_sync_->stop();
+        }
         if (web_server_) {
             web_server_->stop();
         }
@@ -1676,8 +1728,8 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page
-                if (req.path == "/login") {
+                // Allow unauthenticated access to login page and metrics
+                if (req.path == "/login" || req.path == "/metrics") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -1733,6 +1785,21 @@ private:
                 res.set_header("Set-Cookie",
                     "yuzu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
                 res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // -- HTTP metrics (post-routing handler) --------------------------------
+        web_server_->set_post_routing_handler(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                metrics_.counter("yuzu_http_requests_total",
+                    {{"method", req.method},
+                     {"status", std::to_string(res.status)}}).increment();
+            });
+
+        // -- Prometheus metrics endpoint ----------------------------------------
+        web_server_->Get("/metrics",
+            [this](const httplib::Request&, httplib::Response& res) {
+                res.set_content(metrics_.serialize(),
+                    "text/plain; version=0.0.4; charset=utf-8");
             });
 
         // -- Current user info (/api/me) --------------------------------------
@@ -2127,6 +2194,84 @@ private:
                 res.set_content(registry_.help_json(), "application/json");
             });
 
+        // -- NVD CVE feed endpoints -------------------------------------------
+
+        web_server_->Get("/api/nvd/status",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_auth(req, res)) return;
+                if (!nvd_db_ || !nvd_db_->is_open()) {
+                    res.set_content(R"({"enabled":false})", "application/json");
+                    return;
+                }
+                nlohmann::json j;
+                j["enabled"] = true;
+                j["total_cves"] = nvd_db_->total_cve_count();
+                if (nvd_sync_) {
+                    auto st = nvd_sync_->status();
+                    j["syncing"] = st.syncing;
+                    j["last_sync_time"] = st.last_sync_time;
+                    j["last_error"] = st.last_error;
+                }
+                res.set_content(j.dump(), "application/json");
+            });
+
+        web_server_->Post("/api/nvd/sync",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!nvd_sync_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"NVD sync not enabled"})", "application/json");
+                    return;
+                }
+                // Run sync in a detached thread so we don't block the HTTP response
+                std::thread([this] { nvd_sync_->sync_now(); }).detach();
+                res.set_content(R"({"status":"sync_started"})", "application/json");
+            });
+
+        web_server_->Post("/api/nvd/match",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_auth(req, res)) return;
+                if (!nvd_db_ || !nvd_db_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"NVD database not available"})", "application/json");
+                    return;
+                }
+                // Parse inventory: array of {name, version} or pipe-delimited lines
+                std::vector<SoftwareItem> inventory;
+                try {
+                    auto body = nlohmann::json::parse(req.body);
+                    if (body.contains("inventory") && body["inventory"].is_array()) {
+                        for (const auto& item : body["inventory"]) {
+                            SoftwareItem si;
+                            si.name = item.value("name", "");
+                            si.version = item.value("version", "");
+                            if (!si.name.empty()) inventory.push_back(std::move(si));
+                        }
+                    }
+                } catch (...) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+                    return;
+                }
+
+                auto matches = nvd_db_->match_inventory(inventory);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& m : matches) {
+                    arr.push_back({
+                        {"cve_id", m.cve_id},
+                        {"severity", m.severity},
+                        {"description", m.description},
+                        {"product", m.product},
+                        {"installed_version", m.installed_version},
+                        {"fixed_in", m.fixed_in},
+                        {"source", m.source}
+                    });
+                }
+                res.set_content(nlohmann::json({{"findings", arr},
+                                                 {"count", arr.size()}}).dump(),
+                                "application/json");
+            });
+
         // -- Generic command dispatch API -------------------------------------
 
         // Plugins that require admin role to invoke
@@ -2199,6 +2344,7 @@ private:
                     return;
                 }
 
+                metrics_.counter("yuzu_commands_dispatched_total").increment();
                 spdlog::info("Command dispatched: {}:{} → {} agent(s)",
                     plugin, action, sent);
                 res.set_content(
@@ -2307,6 +2453,7 @@ private:
     Config                                     cfg_;
     auth::AuthManager&                         auth_mgr_;
     auth::AutoApproveEngine                    auto_approve_;
+    yuzu::MetricsRegistry                      metrics_;
     detail::EventBus                           event_bus_;
     detail::AgentRegistry                      registry_;
     detail::AgentServiceImpl                   agent_service_;
@@ -2317,6 +2464,10 @@ private:
     std::unique_ptr<grpc::Server>              mgmt_server_;
     std::unique_ptr<httplib::Server>           web_server_;
     std::thread                                web_thread_;
+
+    // NVD CVE feed
+    std::shared_ptr<NvdDatabase>               nvd_db_;
+    std::unique_ptr<NvdSyncManager>            nvd_sync_;
 };
 
 // -- Factory ------------------------------------------------------------------

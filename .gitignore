@@ -4,14 +4,6 @@ build-*/
 out/
 .cache/
 
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-CTestTestfile.cmake
-_deps/
-CMakeUserPresets.json
-
 # Meson
 .mesonpy/
 meson-info/

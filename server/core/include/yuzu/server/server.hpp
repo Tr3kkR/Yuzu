@@ -37,6 +37,12 @@ struct Config {
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string           gateway_upstream_address;   // Empty = disabled; e.g. "0.0.0.0:50053"
     bool                  gateway_mode{false};         // When true, relax peer-mismatch in Subscribe
+
+    // NVD CVE feed
+    std::string           nvd_api_key;                            // Optional NVD API key for higher rate limits
+    std::string           nvd_proxy;                              // HTTP proxy for NVD API (e.g. "http://proxy:8080")
+    std::chrono::seconds  nvd_sync_interval{4 * 3600};            // Default: 4 hours
+    bool                  nvd_sync_enabled{true};
 };
 
 /**
