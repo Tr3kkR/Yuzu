@@ -1974,7 +1974,9 @@ private:
 
                 auto role = auth::string_to_role(role_str);
                 auth_mgr_.upsert_user(username, password, role);
-                auth_mgr_.save_config();
+                if (!auth_mgr_.save_config()) {
+                    spdlog::error("Failed to save config after user upsert");
+                }
                 spdlog::info("User '{}' added/updated (role={})", username, role_str);
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
@@ -1985,7 +1987,9 @@ private:
                 if (!require_admin(req, res)) return;
                 auto username = req.matches[1].str();
                 if (auth_mgr_.remove_user(username)) {
-                    auth_mgr_.save_config();
+                    if (!auth_mgr_.save_config()) {
+                        spdlog::error("Failed to save config after user removal");
+                    }
                     spdlog::info("User '{}' removed", username);
                 }
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
