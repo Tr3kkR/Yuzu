@@ -13,6 +13,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/metrics.hpp>
 #include <yuzu/version.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -114,7 +115,14 @@ YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* 
 
 class AgentImpl final : public Agent {
 public:
-    explicit AgentImpl(Config cfg) : cfg_{std::move(cfg)} {}
+    explicit AgentImpl(Config cfg) : cfg_{std::move(cfg)} {
+        metrics_.describe("yuzu_agent_uptime_seconds",
+            "Agent uptime in seconds", "gauge");
+        metrics_.describe("yuzu_agent_commands_executed_total",
+            "Total commands executed by plugin", "counter");
+        metrics_.describe("yuzu_agent_plugins_loaded",
+            "Number of loaded plugins", "gauge");
+    }
 
     void run() override {
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
@@ -166,6 +174,9 @@ public:
             plugin_ctx_.config[prefix + ".description"] = plugins_[i].descriptor()->description;
         }
 
+        metrics_.gauge("yuzu_agent_plugins_loaded").set(
+            static_cast<double>(plugins_.size()));
+        start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
@@ -373,6 +384,8 @@ public:
                 // so concurrent dispatch is required.
                 auto* raw_stream = stream.get();
                 std::thread exec_thread([this, target, cmd, raw_stream]() {
+                    metrics_.counter("yuzu_agent_commands_executed_total",
+                        {{"plugin", cmd.plugin()}}).increment();
                     CommandContextImpl ctx_impl{
                         .stream     = raw_stream,
                         .write_mu   = &stream_write_mu_,
@@ -484,6 +497,8 @@ public:
 private:
     Config                              cfg_;
     PluginContextImpl                   plugin_ctx_;
+    yuzu::MetricsRegistry               metrics_;
+    std::chrono::steady_clock::time_point start_time_;
     std::string                         session_id_;
     std::atomic<bool>                   stop_requested_{false};
     std::atomic<grpc::ClientContext*>   subscribe_ctx_{nullptr};

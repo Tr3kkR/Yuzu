@@ -12,6 +12,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/identity_store.hpp>
 #include <yuzu/version.hpp>
+#include <yuzu/json_log_formatter.hpp>
 
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
@@ -66,8 +67,11 @@ int main(int argc, char* argv[]) {
        ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
     app.add_flag  ("--verbose",  "Enable verbose logging")
        ->each([&cfg](const std::string&) { cfg.verbose_logging = true; });
+    std::string log_format = "text";
     app.add_option("--log-level", log_level,           "Log level: trace|debug|info|warn|error")
        ->default_val("info");
+    app.add_option("--log-format", log_format,         "Log format: text|json")
+       ->default_val("text");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -79,7 +83,12 @@ int main(int argc, char* argv[]) {
 
     // Configure logging
     spdlog::set_level(spdlog::level::from_str(log_level));
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
+    if (log_format == "json") {
+        spdlog::set_formatter(
+            std::make_unique<yuzu::JsonLogFormatter>("agent"));
+    } else {
+        spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
+    }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
