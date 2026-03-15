@@ -398,10 +398,10 @@ public:
                      yuzu::MetricsRegistry& metrics,
                      bool gateway_mode = false)
         : registry_(registry), bus_(bus),
-          require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
           metrics_(metrics),
+          require_client_identity_(require_client_identity),
           gateway_mode_(gateway_mode) {}
 
     grpc::Status Register(
@@ -1029,6 +1029,9 @@ public:
     explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
           auth_mgr_(auth_mgr),
+          auto_approve_(),
+          metrics_(),
+          event_bus_(),
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
