@@ -2,11 +2,19 @@
 
 #include <sqlite3.h>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  include <bcrypt.h>
+#  pragma comment(lib, "bcrypt.lib")
+#else
+#  include <openssl/rand.h>
+#endif
+
 #include <array>
 #include <cstdlib>
 #include <format>
 #include <memory>
-#include <random>
+#include <stdexcept>
 
 namespace yuzu::agent {
 
@@ -21,13 +29,30 @@ struct SqliteStmtDeleter {
 using SqliteDb   = std::unique_ptr<sqlite3, SqliteDbDeleter>;
 using SqliteStmt = std::unique_ptr<sqlite3_stmt, SqliteStmtDeleter>;
 
-std::string generate_uuid_v4() {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist;
+void crypto_random_bytes(uint8_t* buf, size_t n) {
+#ifdef _WIN32
+    auto status = BCryptGenRandom(nullptr, buf,
+                                  static_cast<ULONG>(n),
+                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(status)) {
+        throw std::runtime_error("BCryptGenRandom failed");
+    }
+#else
+    if (RAND_bytes(buf, static_cast<int>(n)) != 1) {
+        throw std::runtime_error("RAND_bytes failed");
+    }
+#endif
+}
 
-    uint64_t hi = dist(gen);
-    uint64_t lo = dist(gen);
+std::string generate_uuid_v4() {
+    uint8_t bytes[16];
+    crypto_random_bytes(bytes, sizeof(bytes));
+
+    uint64_t hi = 0, lo = 0;
+    for (int i = 0; i < 8; ++i) {
+        hi = (hi << 8) | bytes[i];
+        lo = (lo << 8) | bytes[i + 8];
+    }
 
     // Set version 4 (bits 48-51 of hi)
     hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
