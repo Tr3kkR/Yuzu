@@ -34,7 +34,9 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             gcc-13 g++-13 \
-            pkg-config curl zip unzip tar
+            pkg-config curl zip unzip tar \
+            python3-pip
+          pip3 install meson==1.9.2
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v8
@@ -51,26 +53,28 @@ jobs:
         env:
           VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: c-cpp
           queries: +security-extended
 
-      - name: Configure (CMake)
-        env:
-          CC: gcc-13
-          CXX: g++-13
+      - name: Configure (Meson)
         run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DYUZU_BUILD_TESTS=OFF
+          meson setup builddir \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dbuild_tests=false
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: meson compile -C builddir
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
