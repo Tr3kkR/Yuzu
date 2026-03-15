@@ -54,7 +54,9 @@ gen_hdrs = [gen[1], gen[3], gen[5], gen[7], gen[9], gen[11], gen[13], gen[15]]
 yuzu_proto_lib = static_library(
     'yuzu_proto',
     gen_srcs,
-    cpp_args: ['/wd4100','/wd4267','/wd4244','/wd4458','/wd4018','/wd4996'],
+    cpp_args: cxx.get_id() == 'msvc'
+      ? ['/wd4100','/wd4267','/wd4244','/wd4458','/wd4018','/wd4996']
+      : ['-Wno-unused-parameter', '-Wno-array-bounds'],
     include_directories: include_directories('.'),
     dependencies: [grpcpp_dep, protobuf_dep],
 )

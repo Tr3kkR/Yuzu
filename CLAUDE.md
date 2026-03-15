@@ -1,50 +1,58 @@
 # Yuzu — Claude Code Guide
 
-Multi-platform agent and server framework for real-time endpoint management. C++23, gRPC/Protobuf, vcpkg, CMake 3.28+.
+Multi-platform agent and server framework for real-time endpoint management. C++23, gRPC/Protobuf, vcpkg, Meson.
 
 ## Build
 
 ### Prerequisites
-- CMake 3.28+, Ninja
+- Meson 1.9.2, Ninja
+- CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
-- vcpkg (set `VCPKG_ROOT` or pass `CMAKE_TOOLCHAIN_FILE` manually)
+- vcpkg (set `VCPKG_ROOT`)
 
-### Configure and build (CMake presets — preferred)
+### Quick start (setup script)
 ```bash
-cmake --preset linux-debug          # configure
-cmake --build --preset linux-debug  # build
-ctest --preset linux-debug          # test
+./scripts/setup.sh                              # debug build, default compiler
+./scripts/setup.sh --buildtype release --lto    # release + LTO
+./scripts/setup.sh --tests                      # enable tests
+./scripts/setup.sh --native-file meson/native/linux-gcc13.ini
+./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini
 ```
+The script runs `vcpkg install` then `meson setup` automatically.
 
-Available presets: `linux-debug`, `linux-release`, `windows-debug`, `windows-release`, `macos-debug`, `macos-release`, `arm64-linux-debug`, `arm64-linux-release`.
-
-### Manual configure (no VCPKG_ROOT)
+### Manual configure
 ```bash
-cmake -B build -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake \
-  -DVCPKG_TARGET_TRIPLET=x64-linux \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DYUZU_BUILD_TESTS=ON
-cmake --build build --parallel $(nproc)
+# 1. Install vcpkg packages
+vcpkg install --triplet x64-linux --x-manifest-root=.
+
+# 2. Configure
+meson setup builddir \
+  --buildtype=debug \
+  -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux \
+  -Dbuild_tests=true
+
+# 3. Build
+meson compile -C builddir
 ```
 
 ### Build options
 | Option | Default | Notes |
 |---|---|---|
-| `YUZU_BUILD_AGENT` | ON | Agent daemon |
-| `YUZU_BUILD_SERVER` | ON | Server daemon |
-| `YUZU_BUILD_SDK` | ON | SDK headers + static helper lib |
-| `YUZU_BUILD_TESTS` | OFF | Catch2 test suite |
-| `YUZU_BUILD_EXAMPLES` | ON | Example plugin |
-| `YUZU_ENABLE_LTO` | OFF | Link-time optimisation (ON in Release presets) |
-| `YUZU_ENABLE_ASAN` | OFF | AddressSanitizer + UBSan |
-| `YUZU_ENABLE_TSAN` | OFF | ThreadSanitizer |
+| `-Dbuild_agent` | true | Agent daemon |
+| `-Dbuild_server` | true | Server daemon |
+| `-Dbuild_tests` | false | Catch2 test suite |
+| `-Dbuild_examples` | true | Example plugins |
+| `-Db_lto` | false | Link-time optimisation |
+| `-Db_sanitize=address,undefined` | none | AddressSanitizer + UBSan |
+| `-Db_sanitize=thread` | none | ThreadSanitizer |
+
+Sanitizers and LTO use Meson built-in options (`b_lto`, `b_sanitize`).
 
 ## Test
 ```bash
-ctest --test-dir build --output-on-failure -j $(nproc)
+meson test -C builddir --print-errorlogs
 ```
-Tests require `-DYUZU_BUILD_TESTS=ON`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
+Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
 
 ## Project layout
 ```
@@ -57,20 +65,20 @@ proto/                    Protobuf definitions (source of truth for wire protoco
   yuzu/agent/v1/          AgentService: Register, Heartbeat, ExecuteCommand
   yuzu/common/v1/         Shared types: Platform, Timestamp, ErrorDetail
   yuzu/server/v1/         Management API
-cmake/modules/
-  YuzuProto.cmake         yuzu_proto_library() — runs protoc + grpc_cpp_plugin
-  CompilerFlags.cmake     Warning flags, sanitizers, LTO helper
-cmake/toolchains/         aarch64-linux-gnu and armv7-linux-gnueabihf cross-compile files
+  gen_proto.py            Codegen script (invoked by meson.build)
+meson/cross/              Cross-compilation files (aarch64, armv7)
+meson/native/             Native files for CI compilers (gcc-13, clang-17, etc.)
+scripts/setup.sh          vcpkg install + meson setup convenience wrapper
 tests/unit/               Catch2 unit tests
 ```
 
 ## Protobuf / gRPC code generation
-`YuzuProto.cmake` provides `yuzu_proto_library(NAME <target> PROTOS <files>)`. It:
-1. Invokes `protoc` with `-I ${CMAKE_SOURCE_DIR}/proto`, preserving the package subdirectory in the output path (e.g. `yuzu/agent/v1/agent.pb.cc` under `build/generated/proto/`).
-2. Builds a static library linking `gRPC::grpc++` and `protobuf::libprotobuf`.
-3. Exposes `build/generated/proto/` as a PUBLIC include directory.
+`proto/meson.build` uses a `custom_target` that invokes `proto/gen_proto.py`. The script:
+1. Runs `protoc` with `--cpp_out` and `--grpc_out` for each `.proto` file.
+2. Rewrites `#include` paths to flatten subdirectory prefixes (so generated headers can be included as `"common.pb.h"` rather than `"yuzu/common/v1/common.pb.h"`).
+3. Moves all generated files to a flat output directory.
 
-**Important**: The `OUTPUT` paths in `add_custom_command` must mirror where protoc actually writes files (relative to the import root, not just the bare filename). This was a past bug — don't revert to `NAME_WE`.
+The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 
 ## vcpkg
 - Manifest: `vcpkg.json`. Pinned baseline: `c1f21baeaf7127c13ee141fe1bdaa49eed371c0c` (matches `vcpkgGitCommitId` in CI).
@@ -98,11 +106,11 @@ vcpkg binary cache: `VCPKG_BINARY_SOURCES=clear;x-gha,readwrite`.
 - **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
 - **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
 
-## Dual build systems — CMake + Meson
+## Build system — Meson only
 
-Both CMake and Meson build files must be kept in sync. **Every time you add, remove, or rename a source file, update both `CMakeLists.txt` and `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
+Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
 
-### Meson build (Windows, from MSYS2 bash)
+### Windows build (from MSYS2 bash)
 ```bash
 source ./setup_msvc_env.sh
 meson compile -C builddir
@@ -110,14 +118,20 @@ meson compile -C builddir
 
 **IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
 
+### Cross-compilation
+```bash
+./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini
+```
+Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
+
 ### Windows toolchain requirements
 All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe/MSVC.
 | Tool | Path |
 |---|---|
 | cl.exe | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe` |
-| cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` |
+| cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` (needed by Meson's cmake dep method) |
 | ninja.exe | Installed with CMake or VS BuildTools |
-| meson | `pip install meson` (Python) |
+| meson | `pip install meson==1.9.2` (Python) |
 | vcpkg | `C:\Users\natha\vcpkg` (`VCPKG_ROOT`) |
 | protoc | `C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
 | grpc_cpp_plugin | `C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |

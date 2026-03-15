@@ -12,6 +12,7 @@ concurrency:
 
 env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  MESON_VERSION: "1.9.2"
 
 jobs:
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
@@ -22,10 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         compiler: [gcc-13, clang-17]
-        build_type: [Debug, Release]
+        build_type: [debug, release]
         exclude:
-          # PRs only run Debug to halve feedback time; push to main runs all.
-          - build_type: ${{ github.event_name == 'pull_request' && 'Release' || 'NONE' }}
+          # PRs only run debug to halve feedback time; push to main runs all.
+          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -45,7 +46,9 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             gcc-13 g++-13 clang-17 \
-            pkg-config curl zip unzip tar
+            pkg-config curl zip unzip tar \
+            python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -53,30 +56,26 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
-      - name: Set compiler env
+      - name: Install vcpkg packages
         run: |
-          if [[ "${{ matrix.compiler }}" == "gcc-13" ]]; then
-            echo "CC=gcc-13"  >> $GITHUB_ENV
-            echo "CXX=g++-13" >> $GITHUB_ENV
-          else
-            echo "CC=clang-17"   >> $GITHUB_ENV
-            echo "CXX=clang++-17" >> $GITHUB_ENV
-          fi
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
 
-      - name: Configure (CMake)
+      - name: Configure (Meson)
         run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DYUZU_BUILD_TESTS=ON
+          meson setup builddir \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang17.ini' }} \
+            --buildtype=${{ matrix.build_type }} \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dbuild_tests=true \
+            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: meson compile -C builddir
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j $(nproc)
+        run: meson test -C builddir --print-errorlogs
 
   # ── Windows (MSVC) ─────────────────────────────────────────────────────────
   windows:
@@ -85,9 +84,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, Release]
+        build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'Release' || 'NONE' }}
+          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -101,26 +100,42 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Install Meson
+        run: pip install meson==${{ env.MESON_VERSION }}
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
-      - name: Configure (CMake)
-        shell: pwsh
+      - name: Install vcpkg packages
         run: |
-          cmake -B build `
-            -G "Visual Studio 17 2022" -A x64 `
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
-            -DYUZU_BUILD_TESTS=ON
+          & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
+            --triplet x64-windows `
+            --x-manifest-root="${{ github.workspace }}"
+
+      - name: Configure (Meson)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson setup builddir ^
+            --buildtype=${{ matrix.build_type }} ^
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-windows ^
+            -Dbuild_tests=true ^
+            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson compile -C builddir
 
       - name: Test
-        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          meson test -C builddir --print-errorlogs
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────────
   macos:
@@ -129,9 +144,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, Release]
+        build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'Release' || 'NONE' }}
+          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -146,7 +161,9 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Install dependencies
-        run: brew install cmake ninja
+        run: |
+          brew install cmake ninja
+          pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -154,20 +171,26 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
-      - name: Configure (CMake)
+      - name: Install vcpkg packages
         run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=arm64-osx \
-            -DYUZU_BUILD_TESTS=ON
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet arm64-osx \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson)
+        run: |
+          meson setup builddir \
+            --native-file meson/native/macos-appleclang.ini \
+            --buildtype=${{ matrix.build_type }} \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-osx \
+            -Dbuild_tests=true \
+            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+        run: meson compile -C builddir
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: meson test -C builddir --print-errorlogs
 
   # ── ARM64 Linux cross-compile ──────────────────────────────────────────────
   arm64-cross:
@@ -176,9 +199,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, Release]
+        build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'Release' || 'NONE' }}
+          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -189,7 +212,16 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            pkg-config curl zip unzip tar
+            pkg-config curl zip unzip tar \
+            python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -197,14 +229,19 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
 
-      - name: Configure (CMake — cross)
+      - name: Install vcpkg packages (cross)
         run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${{ github.workspace }}/cmake/toolchains/aarch64-linux-gnu.cmake \
-            -DVCPKG_TARGET_TRIPLET=arm64-linux
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet arm64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson — cross)
+        run: |
+          meson setup builddir \
+            --cross-file meson/cross/aarch64-linux-gnu.ini \
+            --buildtype=${{ matrix.build_type }} \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-linux \
+            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: meson compile -C builddir

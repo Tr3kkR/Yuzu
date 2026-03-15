@@ -17,8 +17,21 @@ project(
 cxx = meson.get_compiler('cpp')
 host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
-if host_machine.system() == 'windows'
-  add_project_arguments('/wd4251','/wd4127','/wd4275', language: 'cpp')
+if cxx.get_id() == 'msvc'
+  add_project_arguments(
+    '/wd4251', '/wd4127', '/wd4275',
+    '/permissive-', '/Zc:__cplusplus', '/utf-8',
+    language: 'cpp',
+  )
+else
+  add_project_arguments(
+    '-Wno-unused-parameter',
+    '-fvisibility=hidden',
+    language: 'cpp',
+  )
+  if cxx.get_id() == 'clang'
+    add_project_arguments('-Wno-gnu-zero-variadic-macro-arguments', language: 'cpp')
+  endif
 endif
 
 # ── Build number from git ────────────────────────────────────────────────────
