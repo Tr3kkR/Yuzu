@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--management", cfg.management_address,   "Management gRPC address (host:port)")
        ->default_val("0.0.0.0:50052");
     app.add_option("--web-address", cfg.web_address,         "Web UI bind address")
-       ->default_val("0.0.0.0");
+       ->default_val("127.0.0.1");
     app.add_option("--web-port",    cfg.web_port,            "Web UI port")
        ->default_val(8080);
     app.add_flag  ("--no-tls",    "Disable TLS (insecure, for development only)")

@@ -13,6 +13,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+
 jobs:
   analyze:
     name: Analyze C++
@@ -34,22 +37,27 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build \
             gcc-13 g++-13 \
-            pkg-config curl zip unzip tar
+            pkg-config curl zip unzip tar \
+            python3-pip
+          pip3 install meson==1.9.2
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v8
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ${{ github.workspace }}/vcpkg/installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
-        env:
-          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -57,20 +65,16 @@ jobs:
           languages: c-cpp
           queries: +security-extended
 
-      - name: Configure (CMake)
-        env:
-          CC: gcc-13
-          CXX: g++-13
+      - name: Configure (Meson)
         run: |
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake \
-            -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DYUZU_BUILD_TESTS=OFF
+          meson setup builddir \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dbuild_tests=false
 
       - name: Build
-        run: cmake --build build --parallel $(nproc)
+        run: meson compile -C builddir
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4

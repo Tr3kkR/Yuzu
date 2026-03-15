@@ -29,12 +29,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <string_view>
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -221,7 +222,7 @@ public:
         {
             std::lock_guard lock(mu_);
             snapshot.reserve(agents_.size());
-            for (auto& [id, s] : agents_) {
+            for (auto& s : agents_ | std::views::values) {
                 snapshot.push_back(s);
             }
         }
@@ -245,7 +246,7 @@ public:
         std::lock_guard lock(mu_);
 
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             arr.push_back({
                 {"agent_id",      s->agent_id},
                 {"hostname",      s->hostname},
@@ -263,7 +264,7 @@ public:
 
         // Deduplicate plugins by name (take the richest action list)
         std::unordered_map<std::string, const PluginMeta*> best;
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             for (const auto& pm : s->plugin_meta) {
                 auto it = best.find(pm.name);
                 if (it == best.end() || pm.actions.size() > it->second->actions.size()) {
@@ -275,8 +276,8 @@ public:
         // Sort by plugin name
         std::vector<const PluginMeta*> sorted;
         sorted.reserve(best.size());
-        for (const auto& [name, pm] : best) sorted.push_back(pm);
-        std::sort(sorted.begin(), sorted.end(),
+        for (const auto* pm : best | std::views::values) sorted.push_back(pm);
+        std::ranges::sort(sorted,
             [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
         nlohmann::json plugins_arr = nlohmann::json::array();
@@ -307,7 +308,7 @@ public:
         std::lock_guard lock(mu_);
         std::vector<std::string> ids;
         ids.reserve(agents_.size());
-        for (const auto& [id, s] : agents_) {
+        for (const auto& id : agents_ | std::views::keys) {
             ids.push_back(id);
         }
         return ids;
@@ -398,10 +399,10 @@ public:
                      yuzu::MetricsRegistry& metrics,
                      bool gateway_mode = false)
         : registry_(registry), bus_(bus),
-          require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
           metrics_(metrics),
+          require_client_identity_(require_client_identity),
           gateway_mode_(gateway_mode) {}
 
     grpc::Status Register(
@@ -599,7 +600,7 @@ public:
                 // Track first response for server-side latency
                 {
                     std::lock_guard lock(cmd_times_mu_);
-                    if (cmd_first_seen_.find(resp.command_id()) == cmd_first_seen_.end()) {
+                    if (!cmd_first_seen_.contains(resp.command_id())) {
                         cmd_first_seen_.insert(resp.command_id());
                         auto it = cmd_send_times_.find(resp.command_id());
                         if (it != cmd_send_times_.end()) {
@@ -1029,6 +1030,9 @@ public:
     explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
           auth_mgr_(auth_mgr),
+          auto_approve_(),
+          metrics_(),
+          event_bus_(),
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
@@ -1206,10 +1210,10 @@ private:
         }
 
         grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
-        pair.private_key = std::move(key);
-        pair.cert_chain  = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(pair));
+        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
+        key_cert.private_key = std::move(key);
+        key_cert.cert_chain  = std::move(cert);
+        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
 
         if (!ca_path.empty()) {
             auto ca = detail::read_file_contents(ca_path);
@@ -1230,8 +1234,8 @@ private:
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& pair : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(pair.private_key);
+        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
+            yuzu::secure_zero(kc.private_key);
         }
         return creds;
     }
@@ -1974,7 +1978,9 @@ private:
 
                 auto role = auth::string_to_role(role_str);
                 auth_mgr_.upsert_user(username, password, role);
-                auth_mgr_.save_config();
+                if (!auth_mgr_.save_config()) {
+                    spdlog::error("Failed to save config after user upsert");
+                }
                 spdlog::info("User '{}' added/updated (role={})", username, role_str);
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
@@ -1985,7 +1991,9 @@ private:
                 if (!require_admin(req, res)) return;
                 auto username = req.matches[1].str();
                 if (auth_mgr_.remove_user(username)) {
-                    auth_mgr_.save_config();
+                    if (!auth_mgr_.save_config()) {
+                        spdlog::error("Failed to save config after user removal");
+                    }
                     spdlog::info("User '{}' removed", username);
                 }
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");

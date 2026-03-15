@@ -482,6 +482,26 @@ public:
             }
 
             subscribe_ctx_.store(nullptr, std::memory_order_release);
+
+            // Shutdown plugins first — signals long-running commands (e.g. chargen)
+            // to stop, so their exec threads can finish and release the stream.
+            for (auto& handle : plugins_) {
+                if (handle.descriptor()->shutdown) {
+                    handle.descriptor()->shutdown(
+                        reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
+                }
+            }
+
+            // Join all exec threads BEFORE stream goes out of scope,
+            // since they hold raw pointers to the stream for Write() calls.
+            {
+                std::lock_guard lock(exec_mu_);
+                for (auto& t : exec_threads_) {
+                    if (t.joinable()) t.join();
+                }
+                exec_threads_.clear();
+            }
+
             spdlog::info("Subscribe stream ended");
         }
 
