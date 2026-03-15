@@ -1206,10 +1206,10 @@ private:
         }
 
         grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
-        pair.private_key = std::move(key);
-        pair.cert_chain  = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(pair));
+        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
+        key_cert.private_key = std::move(key);
+        key_cert.cert_chain  = std::move(cert);
+        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
 
         if (!ca_path.empty()) {
             auto ca = detail::read_file_contents(ca_path);
@@ -1230,8 +1230,8 @@ private:
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& pair : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(pair.private_key);
+        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
+            yuzu::secure_zero(kc.private_key);
         }
         return creds;
     }
