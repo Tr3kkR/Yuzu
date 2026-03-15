@@ -24,11 +24,11 @@ R"HTM(<!DOCTYPE html>
       background: var(--bg); color: var(--fg);
       display: grid; height: 100vh;
       grid-template-rows: auto 1fr auto;
-      grid-template-columns: 1fr 260px;
+      grid-template-columns: 220px 1fr 260px;
       grid-template-areas:
-        "instrbar  scope"
-        "results   scope"
-        "footer    scope";
+        "history instrbar  scope"
+        "history results   scope"
+        "history footer    scope";
     }
 
     /* ── Instruction Bar ─────────────────────────────────────── */
@@ -192,6 +192,49 @@ R"HTM(<!DOCTYPE html>
       margin-right: 0.35rem; vertical-align: middle;
     }
 
+    /* ── History Panel ───────────────────────────────────────── */
+    .history {
+      grid-area: history;
+      display: flex; flex-direction: column;
+      border-right: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .history-header {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.8rem; font-weight: 600;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .history-header button {
+      background: none; border: none; color: #8b949e; cursor: pointer;
+      font-size: 0.7rem; padding: 0.15rem 0.4rem;
+    }
+    .history-header button:hover { color: var(--fg); }
+    .history-list {
+      flex: 1; overflow-y: auto; padding: 0.25rem 0;
+    }
+    .history-item {
+      padding: 0.4rem 1rem; cursor: pointer;
+      border-left: 3px solid transparent;
+      transition: background 0.1s;
+    }
+    .history-item:hover { background: rgba(88,166,255,0.06); }
+    .history-item.active {
+      background: rgba(88,166,255,0.1);
+      border-left-color: var(--accent);
+    }
+    .history-cmd {
+      font-size: 0.78rem; font-family: var(--mono); color: var(--fg);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .history-meta {
+      font-size: 0.6rem; color: #8b949e; margin-top: 0.1rem;
+    }
+    .history-empty {
+      padding: 1.5rem 1rem; text-align: center;
+      font-size: 0.75rem; color: #484f58;
+    }
+
     /* ── Footer ──────────────────────────────────────────────── */
     footer {
       grid-area: footer;
@@ -302,6 +345,17 @@ R"HTM(<!DOCTYPE html>
 )HTM"
 // Part 2: HTML body continued
 R"HTM(
+  <!-- ── History Panel ──────────────────────────────────────── -->
+  <div class="history">
+    <div class="history-header">
+      History
+      <button onclick="clearHistory()" title="Clear history">&times; Clear</button>
+    </div>
+    <div class="history-list" id="history-list">
+      <div class="history-empty" id="history-empty">No commands yet</div>
+    </div>
+  </div>
+
   <!-- ── Results ────────────────────────────────────────────── -->
   <div class="results">
     <div class="results-header">
@@ -344,6 +398,7 @@ R"HTM(
     var currentInstruction = '';
     var agents = {};   // agent_id -> { hostname, os, arch }
     var evtSource = null;
+    var commandHistory = [];  // { cmd, scope, timestamp }
 
     /* ── Instruction mapping (built dynamically from /api/help) ── */
     var instructionMap = {};
@@ -600,12 +655,16 @@ R"HTM(
       /* Set up columns for this plugin */
       var schema = columnSchemas[mapped.plugin] || ['Agent', 'Output'];
       setColumns(schema);
+      clearResults();
 
       /* Determine target agent IDs */
       var agentIds = [];
       if (selectedScope !== '__all__') {
         agentIds.push(selectedScope);
       }
+
+      var scopeLabel = selectedScope === '__all__' ? 'all agents' : agentDisplayName(selectedScope);
+      addHistory(raw, scopeLabel);
 
       var payload = JSON.stringify({
         plugin:    mapped.plugin,
@@ -619,8 +678,7 @@ R"HTM(
       xhr.onload = function() {
         if (xhr.status === 200) {
           setBadge('running');
-          document.getElementById('result-context').textContent = raw + ' → scope: ' +
-            (selectedScope === '__all__' ? 'all agents' : agentDisplayName(selectedScope));
+          document.getElementById('result-context').textContent = raw + ' → scope: ' + scopeLabel;
         } else {
           setBadge('error');
           try {
@@ -632,6 +690,48 @@ R"HTM(
         }
       };
       xhr.send(payload);
+    }
+
+    /* ── Command history ─────────────────────────────────── */
+    function addHistory(cmd, scope) {
+      var now = new Date();
+      var ts = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      commandHistory.unshift({ cmd: cmd, scope: scope, timestamp: ts });
+      if (commandHistory.length > 50) commandHistory.length = 50;
+      renderHistory();
+    }
+
+    function renderHistory() {
+      var list = document.getElementById('history-list');
+      var empty = document.getElementById('history-empty');
+      /* Remove all items except the empty placeholder */
+      var items = list.querySelectorAll('.history-item');
+      for (var i = 0; i < items.length; i++) items[i].remove();
+
+      if (commandHistory.length === 0) {
+        empty.style.display = '';
+        return;
+      }
+      empty.style.display = 'none';
+
+      for (var i = 0; i < commandHistory.length; i++) {
+        var h = commandHistory[i];
+        var div = document.createElement('div');
+        div.className = 'history-item' + (i === 0 ? ' active' : '');
+        div.innerHTML = '<div class="history-cmd">' + escapeHtml(h.cmd) + '</div>' +
+          '<div class="history-meta">' + escapeHtml(h.timestamp) + ' &middot; ' + escapeHtml(h.scope) + '</div>';
+        div.setAttribute('data-cmd', h.cmd);
+        div.addEventListener('click', function() {
+          document.getElementById('instr-input').value = this.getAttribute('data-cmd');
+          sendInstruction();
+        });
+        list.appendChild(div);
+      }
+    }
+
+    function clearHistory() {
+      commandHistory = [];
+      renderHistory();
     }
 
     /* ── Autocomplete ────────────────────────────────────── */
