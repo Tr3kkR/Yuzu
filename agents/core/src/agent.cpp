@@ -72,6 +72,12 @@ struct CommandContextImpl {
     std::atomic<bool> first_output_sent{false};
 };
 
+template <typename F>
+struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
+};
+
 }  // anonymous namespace
 
 // ── C ABI context function implementations ────────────────────────────────────
@@ -179,6 +185,24 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
+        // Scope guard: shutdown plugins and join exec threads on any exit path
+        ScopeExit cleanup{[this]() {
+            for (auto& handle : plugins_) {
+                if (handle.descriptor()->shutdown) {
+                    handle.descriptor()->shutdown(
+                        reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
+                }
+            }
+            {
+                std::lock_guard lock(exec_mu_);
+                for (auto& t : exec_threads_) {
+                    if (t.joinable()) t.join();
+                }
+                exec_threads_.clear();
+            }
+            spdlog::info("Yuzu agent stopped");
+        }};
+
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
         grpc::ChannelArguments ch_args;
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
@@ -209,7 +233,7 @@ public:
                 ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
                 if (ssl_opts.pem_root_certs.empty()) {
                     spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
-                    goto shutdown_plugins;
+                    return;
                 }
             }
 
@@ -222,7 +246,7 @@ public:
 
                 if (!store_result.ok()) {
                     spdlog::error("Certificate store error: {}", store_result.error);
-                    goto shutdown_plugins;
+                    return;
                 }
 
                 ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
@@ -233,7 +257,7 @@ public:
                 const bool has_client_key = !cfg_.tls_client_key.empty();
                 if (has_client_cert != has_client_key) {
                     spdlog::error("mTLS requires both --client-cert and --client-key");
-                    goto shutdown_plugins;
+                    return;
                 }
 
                 if (has_client_cert && has_client_key) {
@@ -241,7 +265,7 @@ public:
                     ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
                     if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
                         spdlog::error("Failed to read client cert/key for mTLS");
-                        goto shutdown_plugins;
+                        return;
                     } else {
                         spdlog::info("mTLS enabled: using client certificate files");
                     }
@@ -315,19 +339,19 @@ public:
             if (!status.ok()) {
                 spdlog::error("Failed to register with server: {}",
                     status.error_message());
-                goto shutdown_plugins;
+                return;
             }
             if (!resp.accepted()) {
                 spdlog::error("Server rejected registration: {}",
                     resp.reject_reason());
-                goto shutdown_plugins;
+                return;
             }
 
             auto enrollment_status = resp.enrollment_status();
             if (enrollment_status == "pending") {
                 spdlog::warn("Registration pending admin approval — agent will not receive commands until approved");
                 spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard", cfg_.agent_id);
-                goto shutdown_plugins;
+                return;
             }
 
             session_id_ = resp.session_id();
@@ -347,7 +371,7 @@ public:
             if (!stream) {
                 spdlog::error("Failed to open Subscribe stream");
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
-                goto shutdown_plugins;
+                return;
             }
             spdlog::info("Subscribe stream opened — waiting for commands");
 
@@ -459,25 +483,6 @@ public:
             spdlog::info("Subscribe stream ended");
         }
 
-    shutdown_plugins:
-        // 6. Shutdown plugins (signals running commands like chargen to stop)
-        for (auto& handle : plugins_) {
-            if (handle.descriptor()->shutdown) {
-                handle.descriptor()->shutdown(
-                    reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
-            }
-        }
-
-        // 7. Wait for executing command threads to finish
-        {
-            std::lock_guard lock(exec_mu_);
-            for (auto& t : exec_threads_) {
-                if (t.joinable()) t.join();
-            }
-            exec_threads_.clear();
-        }
-
-        spdlog::info("Yuzu agent stopped");
     }
 
     void stop() noexcept override {
