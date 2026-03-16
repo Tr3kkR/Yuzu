@@ -122,6 +122,24 @@ int main(int argc, char* argv[]) {
     app.add_flag  ("--no-ota", "Disable OTA agent updates")
        ->each([&cfg](const std::string&) { cfg.ota_enabled = false; });
 
+    // HTTPS web dashboard options
+    app.add_flag  ("--https", "Enable HTTPS for the web dashboard")
+       ->each([&cfg](const std::string&) { cfg.https_enabled = true; });
+    app.add_option("--https-port",  cfg.https_port,      "HTTPS port (default: 8443)")
+       ->default_val(8443);
+    app.add_option("--https-cert",  cfg.https_cert_path,  "PEM certificate for HTTPS");
+    app.add_option("--https-key",   cfg.https_key_path,   "PEM private key for HTTPS");
+    app.add_flag  ("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+       ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
+
+    // Data infrastructure options
+    app.add_option("--response-retention-days", cfg.response_retention_days,
+                   "Response retention period in days (default: 90)")
+       ->default_val(90);
+    app.add_option("--audit-retention-days", cfg.audit_retention_days,
+                   "Audit log retention period in days (default: 365)")
+       ->default_val(365);
+
     CLI11_PARSE(app, argc, argv);
 
     cfg.nvd_sync_interval = std::chrono::seconds(nvd_sync_hours * 3600);

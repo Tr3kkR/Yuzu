@@ -6,6 +6,10 @@
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
 #include "update_registry.hpp"
+#include "response_store.hpp"
+#include "audit_store.hpp"
+#include "tag_store.hpp"
+#include "scope_engine.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -124,6 +128,7 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    std::unordered_map<std::string, std::string> scopable_tags;
 
     // Stream pointer — valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -144,6 +149,9 @@ public:
         session->os            = info.platform().os();
         session->arch          = info.platform().arch();
         session->agent_version = info.agent_version();
+        for (const auto& [k, v] : info.scopable_tags()) {
+            session->scopable_tags[k] = v;
+        }
         for (const auto& p : info.plugins()) {
             session->plugin_names.push_back(p.name());
             PluginMeta pm;
@@ -332,6 +340,45 @@ public:
         return agents_.size();
     }
 
+    // Get a session by agent_id (for scope evaluation).
+    std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        return it != agents_.end() ? it->second : nullptr;
+    }
+
+    // Evaluate a scope expression against all agents, return matching agent IDs.
+    std::vector<std::string> evaluate_scope(
+        const yuzu::scope::Expression& expr,
+        const TagStore* tag_store) const
+    {
+        std::vector<std::string> matched;
+        std::lock_guard lock(mu_);
+        for (const auto& [id, session] : agents_) {
+            auto resolver = [&](std::string_view attr) -> std::string {
+                auto key = std::string(attr);
+                if (key == "ostype")        return session->os;
+                if (key == "hostname")      return session->hostname;
+                if (key == "arch")          return session->arch;
+                if (key == "agent_version") return session->agent_version;
+                // tag:X lookups
+                if (key.starts_with("tag:")) {
+                    auto tag_key = key.substr(4);
+                    // First check in-memory scopable_tags
+                    auto it = session->scopable_tags.find(tag_key);
+                    if (it != session->scopable_tags.end()) return it->second;
+                    // Then check persistent TagStore
+                    if (tag_store) return tag_store->get_tag(id, tag_key);
+                }
+                return {};
+            };
+            if (yuzu::scope::evaluate(expr, resolver)) {
+                matched.push_back(id);
+            }
+        }
+        return matched;
+    }
+
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
@@ -409,6 +456,8 @@ public:
           update_registry_(update_registry) {}
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+    void set_response_store(ResponseStore* store) { response_store_ = store; }
+    void set_tag_store(TagStore* store) { tag_store_ = store; }
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -524,6 +573,15 @@ public:
 
         registry_.register_agent(info);
 
+        // Sync agent-reported tags to persistent TagStore
+        if (tag_store_ && !info.scopable_tags().empty()) {
+            std::unordered_map<std::string, std::string> tags;
+            for (const auto& [k, v] : info.scopable_tags()) {
+                tags[k] = v;
+            }
+            tag_store_->sync_agent_tags(info.agent_id(), tags);
+        }
+
         auto session_id = "session-" + auth::AuthManager::bytes_to_hex(
             auth::AuthManager::random_bytes(16));
         response->set_session_id(session_id);
@@ -625,11 +683,34 @@ public:
                 bus_.publish("output",
                     agent_id + "|" + plugin + "|" + resp.output());
 
+                // Store streaming response
+                if (response_store_) {
+                    StoredResponse sr;
+                    sr.instruction_id = resp.command_id();
+                    sr.agent_id = agent_id;
+                    sr.status = static_cast<int>(resp.status());
+                    sr.output = resp.output();
+                    response_store_->store(sr);
+                }
+
             } else {
                 spdlog::info("Command {} completed: status={}, exit_code={}",
                     resp.command_id(),
                     static_cast<int>(resp.status()),
                     resp.exit_code());
+
+                // Store completion response
+                if (response_store_) {
+                    StoredResponse sr;
+                    sr.instruction_id = resp.command_id();
+                    sr.agent_id = agent_id;
+                    sr.status = static_cast<int>(resp.status());
+                    sr.output = resp.output();
+                    if (resp.has_error()) {
+                        sr.error_detail = resp.error().message();
+                    }
+                    response_store_->store(sr);
+                }
 
                 std::string status_str =
                     (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -868,6 +949,8 @@ private:
     bool require_client_identity_{false};
     bool gateway_mode_{false};
     UpdateRegistry* update_registry_{nullptr};
+    ResponseStore* response_store_{nullptr};
+    TagStore* tag_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1204,6 +1287,37 @@ public:
             update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
             agent_service_.set_update_registry(update_registry_.get());
         }
+
+        // Wire up cross-references for AgentServiceImpl
+        // (done after stores are created below)
+
+        // Initialize response store
+        {
+            auto resp_db = cfg_.auth_config_path.parent_path() / "responses.db";
+            response_store_ = std::make_unique<ResponseStore>(resp_db, cfg_.response_retention_days);
+            if (response_store_->is_open()) {
+                response_store_->start_cleanup();
+            }
+        }
+
+        // Initialize audit store
+        {
+            auto audit_db = cfg_.auth_config_path.parent_path() / "audit.db";
+            audit_store_ = std::make_unique<AuditStore>(audit_db, cfg_.audit_retention_days);
+            if (audit_store_->is_open()) {
+                audit_store_->start_cleanup();
+            }
+        }
+
+        // Initialize tag store
+        {
+            auto tag_db = cfg_.auth_config_path.parent_path() / "tags.db";
+            tag_store_ = std::make_unique<TagStore>(tag_db);
+        }
+
+        // Wire up store pointers for AgentServiceImpl
+        if (response_store_) agent_service_.set_response_store(response_store_.get());
+        if (tag_store_) agent_service_.set_tag_store(tag_store_.get());
     }
 
     void run() override {
@@ -1287,6 +1401,15 @@ public:
 
         if (nvd_sync_) {
             nvd_sync_->stop();
+        }
+        if (response_store_) response_store_->stop_cleanup();
+        if (audit_store_)    audit_store_->stop_cleanup();
+
+        if (redirect_server_) {
+            redirect_server_->stop();
+        }
+        if (redirect_thread_.joinable()) {
+            redirect_thread_.join();
         }
         if (web_server_) {
             web_server_->stop();
@@ -1963,8 +2086,79 @@ private:
 
     // -- Web server -----------------------------------------------------------
 
+    // Cookie attribute helper — adds Secure flag when HTTPS is enabled
+    std::string session_cookie_attrs() const {
+        std::string attrs = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800";
+        if (cfg_.https_enabled) {
+            attrs += "; Secure";
+        }
+        return attrs;
+    }
+
+    // Audit helper — extract context from HTTP request
+    AuditEvent make_audit_event(const httplib::Request& req,
+                                const std::string& action,
+                                const std::string& result) {
+        AuditEvent event;
+        event.action = action;
+        event.result = result;
+        event.source_ip = req.remote_addr;
+        event.user_agent = req.get_header_value("User-Agent");
+
+        // Extract principal from session
+        auto token = extract_session_cookie(req);
+        auto session = auth_mgr_.validate_session(token);
+        if (session) {
+            event.principal = session->username;
+            event.principal_role = auth::role_to_string(session->role);
+            event.session_id = token;
+        }
+        return event;
+    }
+
+    void audit_log(const httplib::Request& req, const std::string& action,
+                   const std::string& result,
+                   const std::string& target_type = {},
+                   const std::string& target_id = {},
+                   const std::string& detail = {}) {
+        if (!audit_store_) return;
+        auto event = make_audit_event(req, action, result);
+        event.target_type = target_type;
+        event.target_id = target_id;
+        event.detail = detail;
+        audit_store_->log(event);
+    }
+
     void start_web_server() {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled) {
+            if (cfg_.https_cert_path.empty() || cfg_.https_key_path.empty()) {
+                spdlog::error("HTTPS enabled but --https-cert and --https-key are required");
+                return;
+            }
+            if (!std::filesystem::exists(cfg_.https_cert_path)) {
+                spdlog::error("HTTPS cert not found: {}", cfg_.https_cert_path.string());
+                return;
+            }
+            if (!std::filesystem::exists(cfg_.https_key_path)) {
+                spdlog::error("HTTPS key not found: {}", cfg_.https_key_path.string());
+                return;
+            }
+            web_server_ = std::make_unique<httplib::SSLServer>(
+                cfg_.https_cert_path.string().c_str(),
+                cfg_.https_key_path.string().c_str());
+            spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})",
+                         cfg_.https_port, cfg_.https_cert_path.string(),
+                         cfg_.https_key_path.string());
+        } else {
+            web_server_ = std::make_unique<httplib::Server>();
+        }
+#else
+        if (cfg_.https_enabled) {
+            spdlog::warn("HTTPS requested but OpenSSL support not compiled in; falling back to HTTP");
+        }
         web_server_ = std::make_unique<httplib::Server>();
+#endif
 
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler(
@@ -2008,18 +2202,20 @@ private:
                     res.status = 401;
                     res.set_content(R"({"error":"Invalid username or password"})",
                                     "application/json");
+                    audit_log(req, "auth.login_failed", "failure", "user", username);
                     return;
                 }
 
                 res.set_header("Set-Cookie",
-                    "yuzu_session=" + *token +
-                    "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800");
+                    "yuzu_session=" + *token + session_cookie_attrs());
                 res.set_content(R"({"status":"ok"})", "application/json");
+                audit_log(req, "auth.login", "success", "user", username);
             });
 
         // -- Logout -----------------------------------------------------------
         web_server_->Post("/logout",
             [this](const httplib::Request& req, httplib::Response& res) {
+                audit_log(req, "auth.logout", "success");
                 auto token = extract_session_cookie(req);
                 if (!token.empty()) {
                     auth_mgr_.invalidate_session(token);
@@ -2724,8 +2920,27 @@ private:
 
                 agent_service_.record_send_time(command_id);
 
+                // Check for scope-based targeting
+                auto scope_expr = extract_json_string(req.body, "scope");
+
                 int sent = 0;
-                if (agent_ids.empty()) {
+                if (!scope_expr.empty()) {
+                    // Scope-based dispatch
+                    auto parsed = yuzu::scope::parse(scope_expr);
+                    if (!parsed) {
+                        res.status = 400;
+                        res.set_content(
+                            nlohmann::json({{"error", "invalid scope: " + parsed.error()}}).dump(),
+                            "application/json");
+                        return;
+                    }
+                    auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get());
+                    for (const auto& aid : matched_ids) {
+                        if (registry_.send_to(aid, cmd)) {
+                            ++sent;
+                        }
+                    }
+                } else if (agent_ids.empty()) {
                     // Broadcast to all agents
                     sent = registry_.send_to_all(cmd);
                 } else {
@@ -2746,6 +2961,8 @@ private:
                 metrics_.counter("yuzu_commands_dispatched_total").increment();
                 spdlog::info("Command dispatched: {}:{} → {} agent(s)",
                     plugin, action, sent);
+                audit_log(req, "command.dispatch", "success", "command", command_id,
+                          plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
                 res.set_content(
                     nlohmann::json({{"status", "sent"},
                                     {"command_id", command_id},
@@ -2784,10 +3001,334 @@ private:
                     "application/json");
             });
 
-        web_thread_ = std::thread([this] {
-            spdlog::info("Web UI available at http://{}:{}/",
-                cfg_.web_address, cfg_.web_port);
-            web_server_->listen(cfg_.web_address, cfg_.web_port);
+        // -- Response API ---------------------------------------------------------
+        web_server_->Get(R"(/api/responses/(.+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto instruction_id = req.matches[1].str();
+                if (instruction_id.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"instruction_id required"})", "application/json");
+                    return;
+                }
+
+                if (!response_store_ || !response_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"response store not available"})", "application/json");
+                    return;
+                }
+
+                ResponseQuery q;
+                if (req.has_param("agent_id"))
+                    q.agent_id = req.get_param_value("agent_id");
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+
+                auto results = response_store_->query(instruction_id, q);
+
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : results) {
+                    arr.push_back({
+                        {"id", r.id},
+                        {"instruction_id", r.instruction_id},
+                        {"agent_id", r.agent_id},
+                        {"timestamp", r.timestamp},
+                        {"status", r.status},
+                        {"output", r.output},
+                        {"error_detail", r.error_detail}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"responses", arr},
+                                    {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Audit API (admin-only) -------------------------------------------
+        web_server_->Get("/api/audit",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+
+                if (!audit_store_ || !audit_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"audit store not available"})", "application/json");
+                    return;
+                }
+
+                AuditQuery q;
+                if (req.has_param("principal"))
+                    q.principal = req.get_param_value("principal");
+                if (req.has_param("action"))
+                    q.action = req.get_param_value("action");
+                if (req.has_param("target_type"))
+                    q.target_type = req.get_param_value("target_type");
+                if (req.has_param("target_id"))
+                    q.target_id = req.get_param_value("target_id");
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+
+                auto results = audit_store_->query(q);
+
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& e : results) {
+                    arr.push_back({
+                        {"id", e.id},
+                        {"timestamp", e.timestamp},
+                        {"principal", e.principal},
+                        {"principal_role", e.principal_role},
+                        {"action", e.action},
+                        {"target_type", e.target_type},
+                        {"target_id", e.target_id},
+                        {"detail", e.detail},
+                        {"source_ip", e.source_ip},
+                        {"result", e.result}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"events", arr},
+                                    {"count", arr.size()},
+                                    {"total", audit_store_->total_count()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Tags API ---------------------------------------------------------
+        web_server_->Get("/api/tags",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                if (!tag_store_ || !tag_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = req.get_param_value("agent_id");
+                if (agent_id.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id parameter required"})", "application/json");
+                    return;
+                }
+
+                auto tags = tag_store_->get_all_tags(agent_id);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& t : tags) {
+                    arr.push_back({
+                        {"key", t.key},
+                        {"value", t.value},
+                        {"source", t.source},
+                        {"updated_at", t.updated_at}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"agent_id", agent_id},
+                                    {"tags", arr}}).dump(),
+                    "application/json");
+            });
+
+        web_server_->Post("/api/tags/set",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = extract_json_string(req.body, "agent_id");
+                auto key = extract_json_string(req.body, "key");
+                auto value = extract_json_string(req.body, "value");
+
+                if (agent_id.empty() || key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    return;
+                }
+
+                if (!TagStore::validate_key(key)) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid tag key"})", "application/json");
+                    return;
+                }
+
+                tag_store_->set_tag(agent_id, key, value, "api");
+                audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        web_server_->Post("/api/tags/delete",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = extract_json_string(req.body, "agent_id");
+                auto key = extract_json_string(req.body, "key");
+
+                if (agent_id.empty() || key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    return;
+                }
+
+                bool deleted = tag_store_->delete_tag(agent_id, key);
+                audit_log(req, "tag.delete", deleted ? "success" : "not_found",
+                          "tag", agent_id + ":" + key);
+                res.set_content(
+                    nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        web_server_->Post("/api/tags/query",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto key = extract_json_string(req.body, "key");
+                auto value = extract_json_string(req.body, "value");
+
+                if (key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"key required"})", "application/json");
+                    return;
+                }
+
+                auto agents = tag_store_->agents_with_tag(key, value);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& a : agents) arr.push_back(a);
+                res.set_content(
+                    nlohmann::json({{"agents", arr},
+                                    {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Scope API --------------------------------------------------------
+        web_server_->Post("/api/scope/validate",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto expression = extract_json_string(req.body, "expression");
+                if (expression.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"expression required"})", "application/json");
+                    return;
+                }
+
+                auto result = yuzu::scope::validate(expression);
+                if (result) {
+                    res.set_content(R"({"valid":true})", "application/json");
+                } else {
+                    res.set_content(
+                        nlohmann::json({{"valid", false},
+                                        {"error", result.error()}}).dump(),
+                        "application/json");
+                }
+            });
+
+        web_server_->Post("/api/scope/estimate",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto expression = extract_json_string(req.body, "expression");
+                if (expression.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"expression required"})", "application/json");
+                    return;
+                }
+
+                auto parsed = yuzu::scope::parse(expression);
+                if (!parsed) {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", parsed.error()}}).dump(), "application/json");
+                    return;
+                }
+
+                auto matched = registry_.evaluate_scope(*parsed, tag_store_.get());
+                res.set_content(
+                    nlohmann::json({{"matched", matched.size()},
+                                    {"total", registry_.agent_count()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Listen -----------------------------------------------------------
+
+        int listen_port = cfg_.web_port;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled) {
+            listen_port = cfg_.https_port;
+
+            // Start HTTP→HTTPS redirect server
+            if (cfg_.https_redirect) {
+                redirect_server_ = std::make_unique<httplib::Server>();
+                auto https_port = cfg_.https_port;
+                auto web_address = cfg_.web_address;
+                redirect_server_->set_pre_routing_handler(
+                    [web_address, https_port](const httplib::Request& req, httplib::Response& res)
+                        -> httplib::Server::HandlerResponse {
+                        auto host = req.get_header_value("Host");
+                        // Strip port from host if present
+                        auto colon = host.find(':');
+                        if (colon != std::string::npos) {
+                            host = host.substr(0, colon);
+                        }
+                        if (host.empty()) host = web_address;
+                        auto location = "https://" + host + ":" + std::to_string(https_port) + req.path;
+                        if (!req.params.empty()) {
+                            location += "?";
+                            bool first = true;
+                            for (const auto& [k, v] : req.params) {
+                                if (!first) location += "&";
+                                location += k + "=" + v;
+                                first = false;
+                            }
+                        }
+                        res.set_redirect(location, 301);
+                        return httplib::Server::HandlerResponse::Handled;
+                    });
+                redirect_thread_ = std::thread([this] {
+                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/",
+                        cfg_.web_address, cfg_.web_port);
+                    redirect_server_->listen(cfg_.web_address, cfg_.web_port);
+                });
+            }
+        }
+#endif
+
+        web_thread_ = std::thread([this, listen_port] {
+            if (cfg_.https_enabled) {
+                spdlog::info("Web UI available at https://{}:{}/",
+                    cfg_.web_address, listen_port);
+            } else {
+                spdlog::info("Web UI available at http://{}:{}/",
+                    cfg_.web_address, listen_port);
+            }
+            web_server_->listen(cfg_.web_address, listen_port);
         });
     }
 
@@ -2864,12 +3405,21 @@ private:
     std::unique_ptr<httplib::Server>           web_server_;
     std::thread                                web_thread_;
 
+    // HTTPS redirect server
+    std::unique_ptr<httplib::Server>           redirect_server_;
+    std::thread                                redirect_thread_;
+
     // NVD CVE feed
     std::shared_ptr<NvdDatabase>               nvd_db_;
     std::unique_ptr<NvdSyncManager>            nvd_sync_;
 
     // OTA agent updates
     std::unique_ptr<UpdateRegistry>            update_registry_;
+
+    // Phase 1: Data infrastructure
+    std::unique_ptr<ResponseStore>             response_store_;
+    std::unique_ptr<AuditStore>                audit_store_;
+    std::unique_ptr<TagStore>                  tag_store_;
 };
 
 // -- Factory ------------------------------------------------------------------

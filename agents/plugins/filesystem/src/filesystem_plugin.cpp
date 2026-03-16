@@ -271,7 +271,7 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {
             "exists", "list_dir", "file_hash",
-            "create_temp", "create_temp_dir", nullptr
+            "create_temp", "create_temp_dir", "read", nullptr
         };
         return acts;
     }
@@ -299,6 +299,9 @@ public:
         }
         if (action == "create_temp_dir") {
             return do_create_temp_dir(ctx, params);
+        }
+        if (action == "read") {
+            return do_read(ctx, params);
         }
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -502,6 +505,108 @@ private:
             ctx.write_output("cleanup|deleted");
         }
 
+        return 0;
+    }
+
+    int do_read(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        auto file_size = fs::file_size(validated, ec);
+        if (ec) file_size = 0;
+
+        // Cap at 100 MB
+        constexpr std::uintmax_t kMaxReadSize = 100ULL * 1024 * 1024;
+        if (file_size > kMaxReadSize) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {})",
+                                         file_size, kMaxReadSize));
+            return 1;
+        }
+
+        // Parse offset and limit
+        int offset = 1;  // 1-based line number
+        int limit = 100;
+        constexpr int kMaxLimit = 10000;
+
+        auto offset_str = params.get("offset");
+        if (!offset_str.empty()) {
+            try { offset = std::stoi(std::string{offset_str}); }
+            catch (...) { offset = 1; }
+            if (offset < 1) offset = 1;
+        }
+
+        auto limit_str = params.get("limit");
+        if (!limit_str.empty()) {
+            try { limit = std::stoi(std::string{limit_str}); }
+            catch (...) { limit = 100; }
+            if (limit < 1) limit = 1;
+            if (limit > kMaxLimit) limit = kMaxLimit;
+        }
+
+        // Binary detection: probe first 512 bytes for NUL
+        {
+            std::ifstream probe(validated, std::ios::binary);
+            char buf[512]{};
+            probe.read(buf, sizeof(buf));
+            auto bytes_read = probe.gcount();
+            for (std::streamsize i = 0; i < bytes_read; ++i) {
+                if (buf[i] == '\0') {
+                    ctx.write_output("error|file appears to be binary");
+                    return 1;
+                }
+            }
+        }
+
+        // Read lines with offset and limit
+        std::ifstream f(validated);
+        if (!f) {
+            ctx.write_output("error|failed to open file");
+            return 1;
+        }
+
+        std::string line;
+        int line_num = 0;
+        int collected = 0;
+        int total_lines = 0;
+
+        while (std::getline(f, line)) {
+            ++line_num;
+            ++total_lines;
+
+            if (line_num < offset) continue;
+            if (collected >= limit) {
+                // Keep counting total lines
+                while (std::getline(f, line)) ++total_lines;
+                break;
+            }
+
+            // Strip trailing \r for CRLF
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
+            ctx.write_output(std::format("line|{}|{}", line_num, line));
+            ++collected;
+        }
+
+        ctx.write_output(std::format("total_lines|{}", total_lines));
+        ctx.write_output(std::format("file_size|{}", file_size));
         return 0;
     }
 

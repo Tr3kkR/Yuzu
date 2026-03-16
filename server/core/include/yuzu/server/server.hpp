@@ -47,6 +47,19 @@ struct Config {
     // OTA agent updates
     std::filesystem::path update_dir;         // Directory for agent binaries (default: <config_dir>/agent-updates/)
     bool                  ota_enabled{true};   // Master switch for OTA updates
+
+    // HTTPS for web dashboard
+    bool                  https_enabled{false};
+    int                   https_port{8443};
+    std::filesystem::path https_cert_path;
+    std::filesystem::path https_key_path;
+    bool                  https_redirect{true};  // HTTP→HTTPS 301 redirect
+
+    // Response persistence
+    int                   response_retention_days{90};
+
+    // Audit trail
+    int                   audit_retention_days{365};
 };
 
 /**

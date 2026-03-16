@@ -41,6 +41,7 @@ message AgentInfo {
   yuzu.common.v1.Platform platform = 3;
   string agent_version = 4;
   repeated yuzu.common.v1.PluginInfo plugins = 5;
+  map<string, string> scopable_tags = 6;  // Tags for scope evaluation
 }
 
 message RegisterRequest {

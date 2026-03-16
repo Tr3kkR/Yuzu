@@ -507,7 +507,7 @@ public:
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {
-            "adapters", "ip_addresses", "dns_servers", "proxy", nullptr
+            "adapters", "ip_addresses", "dns_servers", "proxy", "dns_cache", nullptr
         };
         return acts;
     }
@@ -525,9 +525,113 @@ public:
         if (action == "ip_addresses") return do_ip_addresses(ctx);
         if (action == "dns_servers")  return do_dns_servers(ctx);
         if (action == "proxy")        return do_proxy(ctx);
+        if (action == "dns_cache")    return do_dns_cache(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
+    }
+
+private:
+    static int do_dns_cache(yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+        // Dynamically load DnsGetCacheDataTable from dnsapi.dll
+        using DNS_CACHE_ENTRY = struct _DNS_CACHE_ENTRY {
+            struct _DNS_CACHE_ENTRY* pNext;
+            PWSTR pszName;
+            WORD wType;
+            WORD wDataLength;
+            DWORD dwFlags;
+        };
+        using DnsGetCacheDataTableFn = BOOL(WINAPI*)(DNS_CACHE_ENTRY*);
+
+        auto hDnsApi = LoadLibraryA("dnsapi.dll");
+        if (!hDnsApi) {
+            ctx.write_output("dns_cache|not_available|dnsapi.dll not found");
+            return 0;
+        }
+
+        auto pFunc = reinterpret_cast<DnsGetCacheDataTableFn>(
+            GetProcAddress(hDnsApi, "DnsGetCacheDataTable"));
+        if (!pFunc) {
+            FreeLibrary(hDnsApi);
+            ctx.write_output("dns_cache|not_available|DnsGetCacheDataTable not found");
+            return 0;
+        }
+
+        DNS_CACHE_ENTRY root{};
+        if (pFunc(&root)) {
+            int count = 0;
+            for (auto* entry = root.pNext; entry; entry = entry->pNext) {
+                if (entry->pszName) {
+                    auto name = wide_to_utf8(entry->pszName);
+                    // wType: 1=A, 28=AAAA, 5=CNAME, etc.
+                    const char* type = "unknown";
+                    switch (entry->wType) {
+                        case 1:  type = "A"; break;
+                        case 28: type = "AAAA"; break;
+                        case 5:  type = "CNAME"; break;
+                        case 12: type = "PTR"; break;
+                        case 15: type = "MX"; break;
+                        case 33: type = "SRV"; break;
+                    }
+                    ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
+                    ++count;
+                }
+            }
+            if (count == 0) {
+                ctx.write_output("dns_cache|empty");
+            }
+        } else {
+            ctx.write_output("dns_cache|not_available|query failed");
+        }
+        FreeLibrary(hDnsApi);
+
+#elif defined(__linux__)
+        auto result = run_command("resolvectl cache 2>/dev/null");
+        if (!result.empty() && result.find("not found") == std::string::npos) {
+            std::istringstream ss(result);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (!line.empty()) {
+                    ctx.write_output(std::format("cache_entry|{}", line));
+                }
+            }
+        } else {
+            // Fallback: try systemd-resolve --statistics
+            auto stats = run_command("systemd-resolve --statistics 2>/dev/null");
+            if (!stats.empty()) {
+                std::istringstream ss(stats);
+                std::string line;
+                while (std::getline(ss, line)) {
+                    auto trimmed = line;
+                    auto start = trimmed.find_first_not_of(" \t");
+                    if (start != std::string::npos) trimmed = trimmed.substr(start);
+                    if (trimmed.starts_with("Current Cache Size:") ||
+                        trimmed.starts_with("Cache Hits:") ||
+                        trimmed.starts_with("Cache Misses:")) {
+                        ctx.write_output(std::format("dns_stats|{}", trimmed));
+                    }
+                }
+            } else {
+                ctx.write_output("dns_cache|not_available|no systemd-resolved");
+            }
+        }
+
+#elif defined(__APPLE__)
+        auto result = run_command("dscacheutil -cachedump -entries 2>/dev/null");
+        if (!result.empty()) {
+            std::istringstream ss(result);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (!line.empty()) {
+                    ctx.write_output(std::format("cache_entry|{}", line));
+                }
+            }
+        } else {
+            ctx.write_output("dns_cache|not_available");
+        }
+#endif
+        return 0;
     }
 };
 

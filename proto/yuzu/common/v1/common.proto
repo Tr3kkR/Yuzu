@@ -30,3 +30,30 @@ message ErrorDetail {
 message Timestamp {
   int64 millis_epoch = 1;
 }
+
+// ── Scope Expressions ────────────────────────────────────────────────────────
+
+// ScopeExpression defines a filter for targeting devices.
+message ScopeExpression {
+  oneof expr {
+    ScopeCondition  condition  = 1;
+    ScopeCombinator combinator = 2;
+  }
+}
+
+message ScopeCondition {
+  string attribute        = 1;  // e.g. "ostype", "tag:env"
+  string op               = 2;  // "==", "!=", "LIKE", "<", ">", "<=", ">=", "IN", "CONTAINS"
+  string value            = 3;  // single value
+  repeated string values  = 4;  // for IN operator
+}
+
+message ScopeCombinator {
+  enum Op {
+    AND = 0;
+    OR  = 1;
+    NOT = 2;
+  }
+  Op op = 1;
+  repeated ScopeExpression children = 2;
+}

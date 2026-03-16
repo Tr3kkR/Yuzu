@@ -160,6 +160,11 @@ public:
         plugin_ctx_.config["agent.verbose_logging"]    = cfg_.verbose_logging ? "true" : "false";
         plugin_ctx_.config["agent.reconnect_count"]    = "0";
 
+        // Record start time for uptime calculation
+        auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        plugin_ctx_.config["agent.start_time_epoch"] = std::to_string(start_epoch);
+
         size_t module_index = 0;
         auto record_module = [this, &module_index](
                                  std::string_view name,
@@ -341,6 +346,46 @@ public:
                 }
             }
 
+            // Load agent tags from tags.json and populate scopable_tags
+            {
+                auto tags_path = cfg_.data_dir / "tags.json";
+                std::error_code tag_ec;
+                if (std::filesystem::exists(tags_path, tag_ec)) {
+                    std::ifstream tags_file(tags_path);
+                    if (tags_file) {
+                        try {
+                            std::string tags_content = read_file_contents(tags_path);
+                            auto* tags_map = info->mutable_scopable_tags();
+                            // Quick manual JSON parse for flat {"key":"value",...} objects
+                            size_t pos = 0;
+                            while ((pos = tags_content.find('"', pos)) != std::string::npos) {
+                                size_t key_start = pos + 1;
+                                size_t key_end = tags_content.find('"', key_start);
+                                if (key_end == std::string::npos) break;
+                                std::string key = tags_content.substr(key_start, key_end - key_start);
+                                pos = key_end + 1;
+                                pos = tags_content.find(':', pos);
+                                if (pos == std::string::npos) break;
+                                pos = tags_content.find('"', pos);
+                                if (pos == std::string::npos) break;
+                                size_t val_start = pos + 1;
+                                size_t val_end = tags_content.find('"', val_start);
+                                if (val_end == std::string::npos) break;
+                                std::string val = tags_content.substr(val_start, val_end - val_start);
+                                (*tags_map)[key] = val;
+                                pos = val_end + 1;
+                            }
+                            if (!tags_map->empty()) {
+                                spdlog::info("Loaded {} tags from {}", tags_map->size(),
+                                             tags_path.string());
+                            }
+                        } catch (...) {
+                            spdlog::warn("Failed to parse tags.json");
+                        }
+                    }
+                }
+            }
+
             for (const auto& handle : plugins_) {
                 auto* pi = info->add_plugins();
                 pi->set_name(handle.descriptor()->name);
@@ -370,6 +415,7 @@ public:
             }
 
             pb::RegisterResponse resp;
+            auto register_start = std::chrono::steady_clock::now();
             auto status = stub->Register(&ctx, req, &resp);
             if (!status.ok()) {
                 spdlog::error("Failed to register with server: {}",
@@ -394,6 +440,25 @@ public:
                 std::chrono::system_clock::now().time_since_epoch()).count();
             plugin_ctx_.config["agent.session_id"] = session_id_;
             plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+
+            // Measure Register RPC latency
+            auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - register_start).count();
+            plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
+
+            // Query gRPC channel state
+            if (channel) {
+                auto state = channel->GetState(false);
+                const char* state_str = "UNKNOWN";
+                switch (state) {
+                    case GRPC_CHANNEL_IDLE: state_str = "IDLE"; break;
+                    case GRPC_CHANNEL_CONNECTING: state_str = "CONNECTING"; break;
+                    case GRPC_CHANNEL_READY: state_str = "READY"; break;
+                    case GRPC_CHANNEL_TRANSIENT_FAILURE: state_str = "TRANSIENT_FAILURE"; break;
+                    case GRPC_CHANNEL_SHUTDOWN: state_str = "SHUTDOWN"; break;
+                }
+                plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
+            }
             spdlog::info("Registered with server (session={}, enrollment={})",
                 session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
         }

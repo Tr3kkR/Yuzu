@@ -1,0 +1,266 @@
+/**
+ * test_response_store.cpp — Unit tests for ResponseStore
+ *
+ * Covers: CRUD, query filters, TTL, count, multi-agent, ordering.
+ */
+
+#include "response_store.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <string>
+#include <thread>
+
+using namespace yuzu::server;
+
+// ── Lifecycle ──────────────────────────────────────────────────────────────
+
+TEST_CASE("ResponseStore: open in-memory", "[response_store][db]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+}
+
+TEST_CASE("ResponseStore: store and retrieve", "[response_store]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-abc123";
+    resp.agent_id = "agent-1";
+    resp.status = 1;  // SUCCESS
+    resp.output = "hostname|WORKSTATION-01";
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-abc123");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].instruction_id == "cmd-abc123");
+    CHECK(results[0].agent_id == "agent-1");
+    CHECK(results[0].status == 1);
+    CHECK(results[0].output == "hostname|WORKSTATION-01");
+}
+
+TEST_CASE("ResponseStore: multiple responses same instruction", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-multi";
+        resp.agent_id = "agent-" + std::to_string(i);
+        resp.status = 1;
+        resp.output = "data-" + std::to_string(i);
+        store.store(resp);
+    }
+
+    auto results = store.get_by_instruction("cmd-multi");
+    REQUIRE(results.size() == 5);
+}
+
+TEST_CASE("ResponseStore: query with agent_id filter", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (const auto& aid : {"agent-a", "agent-b", "agent-a"}) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-filter";
+        resp.agent_id = aid;
+        resp.status = 1;
+        resp.output = "ok";
+        store.store(resp);
+    }
+
+    ResponseQuery q;
+    q.agent_id = "agent-a";
+    auto results = store.query("cmd-filter", q);
+    REQUIRE(results.size() == 2);
+}
+
+TEST_CASE("ResponseStore: query with status filter", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    StoredResponse r1;
+    r1.instruction_id = "cmd-status";
+    r1.agent_id = "agent-1";
+    r1.status = 1;  // SUCCESS
+    r1.output = "ok";
+    store.store(r1);
+
+    StoredResponse r2;
+    r2.instruction_id = "cmd-status";
+    r2.agent_id = "agent-1";
+    r2.status = 2;  // FAILURE
+    r2.output = "fail";
+    store.store(r2);
+
+    ResponseQuery q;
+    q.status = 2;
+    auto results = store.query("cmd-status", q);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].output == "fail");
+}
+
+TEST_CASE("ResponseStore: query with limit and offset", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (int i = 0; i < 10; ++i) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-page";
+        resp.agent_id = "agent-1";
+        resp.status = 1;
+        resp.output = "row-" + std::to_string(i);
+        store.store(resp);
+    }
+
+    ResponseQuery q;
+    q.limit = 3;
+    q.offset = 0;
+    auto page1 = store.query("cmd-page", q);
+    REQUIRE(page1.size() == 3);
+
+    q.offset = 3;
+    auto page2 = store.query("cmd-page", q);
+    REQUIRE(page2.size() == 3);
+}
+
+TEST_CASE("ResponseStore: empty query returns empty", "[response_store]") {
+    ResponseStore store(":memory:");
+    auto results = store.get_by_instruction("nonexistent");
+    REQUIRE(results.empty());
+}
+
+TEST_CASE("ResponseStore: total_count", "[response_store]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.total_count() == 0);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-count";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "ok";
+    store.store(resp);
+
+    REQUIRE(store.total_count() == 1);
+}
+
+TEST_CASE("ResponseStore: error_detail stored", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-err";
+    resp.agent_id = "agent-1";
+    resp.status = 2;
+    resp.output = "";
+    resp.error_detail = "plugin not found";
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-err");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].error_detail == "plugin not found");
+}
+
+TEST_CASE("ResponseStore: large output stored", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-large";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = std::string(100000, 'X');
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-large");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].output.size() == 100000);
+}
+
+TEST_CASE("ResponseStore: timestamp ordering", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (int64_t ts : {100, 300, 200}) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-order";
+        resp.agent_id = "agent-1";
+        resp.timestamp = ts;
+        resp.status = 1;
+        resp.output = std::to_string(ts);
+        store.store(resp);
+    }
+
+    auto results = store.get_by_instruction("cmd-order");
+    REQUIRE(results.size() == 3);
+    // DESC ordering
+    CHECK(results[0].timestamp >= results[1].timestamp);
+    CHECK(results[1].timestamp >= results[2].timestamp);
+}
+
+TEST_CASE("ResponseStore: query with time range", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (int64_t ts : {100, 200, 300, 400, 500}) {
+        StoredResponse resp;
+        resp.instruction_id = "cmd-range";
+        resp.agent_id = "agent-1";
+        resp.timestamp = ts;
+        resp.status = 1;
+        resp.output = "t" + std::to_string(ts);
+        store.store(resp);
+    }
+
+    ResponseQuery q;
+    q.since = 200;
+    q.until = 400;
+    auto results = store.query("cmd-range", q);
+    REQUIRE(results.size() == 3);
+}
+
+TEST_CASE("ResponseStore: db_size_bytes for in-memory", "[response_store]") {
+    ResponseStore store(":memory:");
+    CHECK(store.db_size_bytes() == 0);
+}
+
+TEST_CASE("ResponseStore: multiple instructions", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    for (const auto& id : {"cmd-1", "cmd-2", "cmd-3"}) {
+        StoredResponse resp;
+        resp.instruction_id = id;
+        resp.agent_id = "agent-1";
+        resp.status = 1;
+        resp.output = "ok";
+        store.store(resp);
+    }
+
+    CHECK(store.get_by_instruction("cmd-1").size() == 1);
+    CHECK(store.get_by_instruction("cmd-2").size() == 1);
+    CHECK(store.get_by_instruction("cmd-99").size() == 0);
+    CHECK(store.total_count() == 3);
+}
+
+TEST_CASE("ResponseStore: ttl_expires_at set from retention", "[response_store]") {
+    ResponseStore store(":memory:", 30);  // 30 days retention
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-ttl";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "ok";
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-ttl");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].ttl_expires_at > 0);
+}
+
+TEST_CASE("ResponseStore: custom ttl_expires_at preserved", "[response_store]") {
+    ResponseStore store(":memory:");
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-custom-ttl";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "ok";
+    resp.ttl_expires_at = 999999;
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-custom-ttl");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].ttl_expires_at == 999999);
+}
