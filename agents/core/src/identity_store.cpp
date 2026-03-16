@@ -77,9 +77,14 @@ std::string generate_uuid_v4() {
 
 auto default_data_dir() -> std::filesystem::path {
 #ifdef _WIN32
-    if (const char* local = std::getenv("LOCALAPPDATA"); local && *local) {
-        return std::filesystem::path(local) / "yuzu";
+    char* local = nullptr;
+    size_t local_len = 0;
+    if (_dupenv_s(&local, &local_len, "LOCALAPPDATA") == 0 && local && *local) {
+        std::filesystem::path path = std::filesystem::path(local) / "yuzu";
+        free(local);
+        return path;
     }
+    free(local);
     return std::filesystem::current_path() / "yuzu_data";
 #elif defined(__APPLE__)
     if (const char* home = std::getenv("HOME"); home && *home) {

@@ -1,13 +1,13 @@
 /**
- * status_plugin.cpp — Agent status plugin for Yuzu
+ * status_plugin.cpp - Agent status plugin for Yuzu
  *
  * Actions:
- *   "version"    — Returns agent version, build number, and git commit hash.
- *   "info"       — Returns platform OS, architecture, and hostname.
- *   "health"     — Returns uptime, current timestamp, and memory RSS.
- *   "plugins"    — Returns list of installed plugins with version/description.
- *   "connection" — Returns server address, TLS status, debug mode, verbose.
- *   "config"     — Returns full agent configuration.
+ *   "version"    - Returns agent version, build number, and git commit hash.
+ *   "info"       - Returns platform OS, architecture, and hostname.
+ *   "health"     - Returns uptime, current timestamp, and memory RSS.
+ *   "plugins"    - Returns list of installed plugins with version/description.
+ *   "connection" - Returns server address, TLS status, debug mode, verbose.
+ *   "config"     - Returns full agent configuration.
  *
  * Output is pipe-delimited, one field per line via write_output():
  *   key|value
@@ -48,7 +48,7 @@
 
 namespace {
 
-// ── version action ──────────────────────────────────────────────────────────
+// version action
 
 int do_version(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("version|{}", yuzu::kFullVersionString));
@@ -57,7 +57,7 @@ int do_version(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-// ── info action ─────────────────────────────────────────────────────────────
+// info action
 
 int do_info(yuzu::CommandContext& ctx) {
 #if defined(__linux__) || defined(__APPLE__)
@@ -99,7 +99,7 @@ int do_info(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-// ── health helpers ──────────────────────────────────────────────────────────
+// health helpers
 
 long long get_memory_rss_kb() {
 #ifdef __linux__
@@ -152,12 +152,12 @@ public:
     std::string_view name()        const noexcept override { return "status"; }
     std::string_view version()     const noexcept override { return yuzu::kVersionString; }
     std::string_view description() const noexcept override {
-        return "Reports agent version, system info, health, plugins, connection, and config";
+        return "Reports agent version, system info, health, modules, connection, switch, and config";
     }
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {
-            "version", "info", "health", "plugins", "connection", "config", nullptr
+            "version", "info", "health", "plugins", "modules", "connection", "switch", "config", nullptr
         };
         return acts;
     }
@@ -183,7 +183,9 @@ public:
         if (action == "info")       return do_info(ctx);
         if (action == "health")     return do_health(ctx);
         if (action == "plugins")    return do_plugins(ctx);
+        if (action == "modules")    return do_modules(ctx);
         if (action == "connection") return do_connection(ctx);
+        if (action == "switch")     return do_switch(ctx);
         if (action == "config")     return do_config(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -201,7 +203,7 @@ private:
         return val ? std::string_view{val} : std::string_view{};
     }
 
-    // ── plugins action ──────────────────────────────────────────────────────
+    // plugins action
 
     int do_plugins(yuzu::CommandContext& ctx) {
         auto count_sv = cfg("agent.plugins.count");
@@ -225,7 +227,7 @@ private:
         return 0;
     }
 
-    // ── connection action ───────────────────────────────────────────────────
+    // connection action
 
     int do_connection(yuzu::CommandContext& ctx) {
         ctx.write_output(std::format("server_address|{}", cfg("agent.server_address")));
@@ -241,7 +243,42 @@ private:
         return 0;
     }
 
-    // ── config action ───────────────────────────────────────────────────────
+    int do_modules(yuzu::CommandContext& ctx) {
+        auto count_sv = cfg("agent.modules.count");
+        if (count_sv.empty()) {
+            ctx.write_output("modules_count|0");
+            return 0;
+        }
+
+        int count = 0;
+        std::from_chars(count_sv.data(), count_sv.data() + count_sv.size(), count);
+        ctx.write_output(std::format("modules_count|{}", count));
+
+        for (int i = 0; i < count; ++i) {
+            auto prefix = std::format("agent.modules.{}", i);
+            auto name = cfg(prefix + ".name");
+            auto version = cfg(prefix + ".version");
+            auto status = cfg(prefix + ".status");
+            ctx.write_output(std::format("module|{}|{}|{}", name, version, status));
+
+            auto description = cfg(prefix + ".description");
+            if (!description.empty()) {
+                ctx.write_output(std::format("module_description|{}|{}", name, description));
+            }
+        }
+
+        return 0;
+    }
+
+    int do_switch(yuzu::CommandContext& ctx) {
+        ctx.write_output(std::format("switch_address|{}", cfg("agent.server_address")));
+        ctx.write_output(std::format("session_id|{}", cfg("agent.session_id")));
+        ctx.write_output(std::format("connected_since|{}", cfg("agent.connected_since")));
+        ctx.write_output(std::format("reconnect_count|{}", cfg("agent.reconnect_count")));
+        return 0;
+    }
+
+    // config action
 
     int do_config(yuzu::CommandContext& ctx) {
         ctx.write_output(std::format("agent_id|{}",            cfg("agent.id")));
@@ -259,7 +296,7 @@ private:
         return 0;
     }
 
-    // ── health action ───────────────────────────────────────────────────────
+    // health action
 
     int do_health(yuzu::CommandContext& ctx) {
         auto now = std::chrono::steady_clock::now();
