@@ -5,6 +5,7 @@
 #include <yuzu/secure_zero.hpp>
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "update_registry.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -397,13 +398,17 @@ public:
                      auth::AuthManager& auth_mgr,
                      auth::AutoApproveEngine& auto_approve,
                      yuzu::MetricsRegistry& metrics,
-                     bool gateway_mode = false)
+                     bool gateway_mode = false,
+                     UpdateRegistry* update_registry = nullptr)
         : registry_(registry), bus_(bus),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
           metrics_(metrics),
           require_client_identity_(require_client_identity),
-          gateway_mode_(gateway_mode) {}
+          gateway_mode_(gateway_mode),
+          update_registry_(update_registry) {}
+
+    void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -750,6 +755,99 @@ private:
         return command_id;
     }
 
+    // ── OTA Update RPCs ─────────────────────────────────────────────────────
+
+    grpc::Status CheckForUpdate(
+        grpc::ServerContext* /*context*/,
+        const pb::CheckForUpdateRequest* request,
+        pb::CheckForUpdateResponse* response) override
+    {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "CheckForUpdate"}, {"status", "received"}}).increment();
+
+        if (!update_registry_) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        auto latest = update_registry_->latest_for(
+            request->platform().os(), request->platform().arch());
+
+        if (!latest) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        // Compare: if agent already has latest or newer, no update
+        if (compare_versions(latest->version, request->current_version()) <= 0) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        bool eligible = UpdateRegistry::is_eligible(
+            request->agent_id(), latest->rollout_pct);
+
+        response->set_update_available(true);
+        response->set_latest_version(latest->version);
+        response->set_sha256(latest->sha256);
+        response->set_mandatory(latest->mandatory);
+        response->set_eligible(eligible);
+        response->set_file_size(latest->file_size);
+
+        spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
+                     request->agent_id(), request->current_version(),
+                     latest->version, eligible, latest->mandatory);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status DownloadUpdate(
+        grpc::ServerContext* /*context*/,
+        const pb::DownloadUpdateRequest* request,
+        grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) override
+    {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "DownloadUpdate"}, {"status", "received"}}).increment();
+
+        if (!update_registry_) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
+        }
+
+        auto pkg = update_registry_->latest_for(
+            request->platform().os(), request->platform().arch());
+        if (!pkg || pkg->version != request->version()) {
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
+        }
+
+        auto file_path = update_registry_->binary_path(*pkg);
+        std::ifstream file(file_path, std::ios::binary);
+        if (!file) {
+            spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
+        }
+
+        constexpr std::size_t kChunkSize = 64 * 1024;  // 64KB
+        std::vector<char> buffer(kChunkSize);
+        int64_t offset = 0;
+
+        while (file.read(buffer.data(), static_cast<std::streamsize>(kChunkSize)) || file.gcount() > 0) {
+            pb::DownloadUpdateChunk chunk;
+            chunk.set_data(buffer.data(), static_cast<std::size_t>(file.gcount()));
+            chunk.set_offset(offset);
+            chunk.set_total_size(pkg->file_size);
+
+            if (!writer->Write(chunk)) {
+                spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
+                return grpc::Status::CANCELLED;
+            }
+
+            offset += file.gcount();
+        }
+
+        spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}",
+                     offset, pkg->version, request->agent_id());
+        return grpc::Status::OK;
+    }
+
     AgentRegistry& registry_;
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
@@ -769,6 +867,7 @@ private:
     std::unordered_set<std::string> cmd_first_seen_;
     bool require_client_identity_{false};
     bool gateway_mode_{false};
+    UpdateRegistry* update_registry_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1092,6 +1191,18 @@ public:
             nvd_sync_ = std::make_unique<NvdSyncManager>(
                 nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval);
             nvd_sync_->start();
+        }
+
+        // Initialize OTA update registry
+        if (cfg_.ota_enabled) {
+            auto update_db_path = cfg_.auth_config_path.parent_path() / "update_packages.db";
+            auto update_dir = cfg_.update_dir.empty()
+                ? cfg_.auth_config_path.parent_path() / "agent-updates"
+                : cfg_.update_dir;
+            std::error_code ec;
+            std::filesystem::create_directories(update_dir, ec);
+            update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
+            agent_service_.set_update_registry(update_registry_.get());
         }
     }
 
@@ -1728,6 +1839,128 @@ private:
         return html;
     }
 
+    // -- OTA Updates fragment renderer ----------------------------------------
+
+    std::string render_updates_fragment() {
+        if (!update_registry_) {
+            return "<span style=\"color:#484f58\">OTA updates are disabled "
+                   "(start server with <code>--ota-enabled</code>).</span>";
+        }
+
+        auto packages = update_registry_->list_packages();
+        std::string html;
+
+        // Fleet version summary
+        {
+            auto agents_json_str = registry_.to_json();
+            std::unordered_map<std::string, int> version_counts;
+            try {
+                auto arr = nlohmann::json::parse(agents_json_str);
+                for (const auto& a : arr) {
+                    auto v = a.value("agent_version", std::string("unknown"));
+                    version_counts[v]++;
+                }
+            } catch (...) {}
+
+            if (!version_counts.empty()) {
+                html += "<div style=\"margin-bottom:1rem;padding:0.5rem 0.75rem;"
+                        "background:#0d1117;border:1px solid #30363d;border-radius:0.3rem\">"
+                        "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+                        "margin-bottom:0.3rem;text-transform:uppercase;letter-spacing:0.05em\">"
+                        "Fleet Versions</div>";
+                for (const auto& [ver, cnt] : version_counts) {
+                    html += "<span style=\"display:inline-block;margin-right:1rem;"
+                            "font-size:0.75rem\"><code>" + html_escape(ver) +
+                            "</code> &times; " + std::to_string(cnt) + "</span>";
+                }
+                html += "</div>";
+            }
+        }
+
+        // Packages table
+        html += "<table class=\"user-table\">"
+                "<thead><tr><th>Platform</th><th>Arch</th><th>Version</th>"
+                "<th>Size</th><th>Rollout</th><th>Mandatory</th><th></th></tr></thead>"
+                "<tbody>";
+
+        if (packages.empty()) {
+            html += "<tr><td colspan=\"7\" style=\"color:#484f58\">"
+                    "No update packages uploaded</td></tr>";
+        } else {
+            for (const auto& pkg : packages) {
+                auto size_str = pkg.file_size < 1024 * 1024
+                    ? std::to_string(pkg.file_size / 1024) + " KB"
+                    : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
+
+                html += "<tr>"
+                        "<td>" + html_escape(pkg.platform) + "</td>"
+                        "<td>" + html_escape(pkg.arch) + "</td>"
+                        "<td><code style=\"font-size:0.75rem\">" + html_escape(pkg.version) + "</code></td>"
+                        "<td style=\"font-size:0.75rem\">" + size_str + "</td>"
+                        "<td>"
+                        "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                        "hx-post=\"/api/settings/updates/" + html_escape(pkg.platform) + "/" +
+                        html_escape(pkg.arch) + "/" + html_escape(pkg.version) + "/rollout\" "
+                        "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                        "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                        "value=\"" + std::to_string(pkg.rollout_pct) + "\" "
+                        "style=\"width:60px\" "
+                        "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                        "<span style=\"font-size:0.7rem;width:2.5em\">" +
+                        std::to_string(pkg.rollout_pct) + "%</span>"
+                        "<button class=\"btn btn-secondary\" type=\"submit\" "
+                        "style=\"padding:0.15rem 0.5rem;font-size:0.65rem\">Set</button>"
+                        "</form></td>"
+                        "<td style=\"font-size:0.75rem\">" +
+                        std::string(pkg.mandatory ? "Yes" : "No") + "</td>"
+                        "<td><button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/updates/" + html_escape(pkg.platform) + "/" +
+                        html_escape(pkg.arch) + "/" + html_escape(pkg.version) + "\" "
+                        "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Delete update package " + html_escape(pkg.version) +
+                        " for " + html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "?\""
+                        ">Delete</button></td></tr>";
+            }
+        }
+
+        html += "</tbody></table>";
+
+        // Upload form
+        html += "<div class=\"add-user-form\">"
+                "<form hx-post=\"/api/settings/updates/upload\" "
+                "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                "hx-encoding=\"multipart/form-data\" "
+                "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
+                "<div class=\"mini-field\">"
+                "<label>Platform</label>"
+                "<select name=\"platform\" style=\"width:100px\">"
+                "<option value=\"windows\">Windows</option>"
+                "<option value=\"linux\">Linux</option>"
+                "<option value=\"darwin\">macOS</option>"
+                "</select></div>"
+                "<div class=\"mini-field\">"
+                "<label>Arch</label>"
+                "<select name=\"arch\" style=\"width:100px\">"
+                "<option value=\"x86_64\">x86_64</option>"
+                "<option value=\"aarch64\">aarch64</option>"
+                "</select></div>"
+                "<div class=\"mini-field\">"
+                "<label>Binary</label>"
+                "<input type=\"file\" name=\"file\" required></div>"
+                "<div class=\"mini-field\">"
+                "<label>Rollout %</label>"
+                "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
+                "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
+                "<label>Mandatory</label>"
+                "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
+                "<button class=\"btn btn-primary\" type=\"submit\">Upload</button>"
+                "</form></div>"
+                "<div class=\"feedback\" id=\"updates-feedback\"></div>";
+
+        return html;
+    }
+
     // -- Web server -----------------------------------------------------------
 
     void start_web_server() {
@@ -2159,6 +2392,159 @@ private:
                 res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
             });
 
+        // -- Settings HTMX fragment: OTA Updates ---------------------------------
+
+        web_server_->Get("/fragments/settings/updates",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Upload new update package
+        web_server_->Post("/api/settings/updates/upload",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">OTA disabled.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+
+                std::string platform, arch, rollout_s, mandatory_s;
+                if (req.form.has_field("platform"))    platform    = req.form.get_field("platform");
+                if (req.form.has_field("arch"))         arch        = req.form.get_field("arch");
+                if (req.form.has_field("rollout_pct"))  rollout_s   = req.form.get_field("rollout_pct");
+                if (req.form.has_field("mandatory"))    mandatory_s = req.form.get_field("mandatory");
+
+                if (!req.form.has_file("file")) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">No file uploaded.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                const auto& uploaded = req.form.get_file("file");
+                if (uploaded.content.empty()) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">Empty file.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+
+                int rollout_pct = 100;
+                try { if (!rollout_s.empty()) rollout_pct = std::stoi(rollout_s); }
+                catch (...) {}
+                if (rollout_pct < 0) rollout_pct = 0;
+                if (rollout_pct > 100) rollout_pct = 100;
+
+                // Derive version from filename (strip extension to use as version)
+                auto orig_name = uploaded.filename.empty()
+                    ? "yuzu-agent-" + platform + "-" + arch
+                    : uploaded.filename;
+
+                // Use filename as-is for storage
+                auto out_path = update_registry_->binary_path(
+                    UpdatePackage{platform, arch, "", "", orig_name});
+                std::error_code ec;
+                std::filesystem::create_directories(out_path.parent_path(), ec);
+                {
+                    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                    if (!f.is_open()) {
+                        res.status = 500;
+                        res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+                    f.write(uploaded.content.data(),
+                            static_cast<std::streamsize>(uploaded.content.size()));
+                }
+
+                auto sha = auth::AuthManager::sha256_hex(uploaded.content);
+                auto version = orig_name;  // use filename as version identifier
+                // Strip common extensions for a cleaner version string
+                for (const auto* ext : {".exe", ".bin", ".tar.gz", ".zip", ".msi"}) {
+                    if (version.size() > std::strlen(ext) &&
+                        version.substr(version.size() - std::strlen(ext)) == ext) {
+                        version = version.substr(0, version.size() - std::strlen(ext));
+                        break;
+                    }
+                }
+
+                UpdatePackage pkg;
+                pkg.platform    = platform;
+                pkg.arch        = arch;
+                pkg.version     = version;
+                pkg.sha256      = sha;
+                pkg.filename    = orig_name;
+                pkg.mandatory   = (mandatory_s == "true");
+                pkg.rollout_pct = rollout_pct;
+                pkg.file_size   = static_cast<int64_t>(uploaded.content.size());
+
+                update_registry_->upsert_package(pkg);
+                spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)",
+                             platform, arch, version, pkg.file_size, rollout_pct);
+
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Delete an update package
+        web_server_->Delete(R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) { res.status = 400; return; }
+
+                auto platform = req.matches[1].str();
+                auto arch     = req.matches[2].str();
+                auto version  = req.matches[3].str();
+
+                // Find the package to get filename for disk cleanup
+                auto packages = update_registry_->list_packages();
+                for (const auto& pkg : packages) {
+                    if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
+                        auto bin_path = update_registry_->binary_path(pkg);
+                        std::error_code ec;
+                        std::filesystem::remove(bin_path, ec);
+                        break;
+                    }
+                }
+
+                update_registry_->remove_package(platform, arch, version);
+                spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Update rollout percentage
+        web_server_->Post(R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) { res.status = 400; return; }
+
+                auto platform = req.matches[1].str();
+                auto arch     = req.matches[2].str();
+                auto version  = req.matches[3].str();
+                auto pct_s    = extract_form_value(req.body, "rollout_pct");
+
+                int pct = 100;
+                try { if (!pct_s.empty()) pct = std::stoi(pct_s); }
+                catch (...) {}
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+
+                // Find and update the package
+                auto packages = update_registry_->list_packages();
+                for (auto pkg : packages) {
+                    if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
+                        pkg.rollout_pct = pct;
+                        update_registry_->upsert_package(pkg);
+                        spdlog::info("OTA rollout updated: {}/{} v{} → {}%",
+                                     platform, arch, version, pct);
+                        break;
+                    }
+                }
+
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
             res.set_redirect("/");
@@ -2481,6 +2867,9 @@ private:
     // NVD CVE feed
     std::shared_ptr<NvdDatabase>               nvd_db_;
     std::unique_ptr<NvdSyncManager>            nvd_sync_;
+
+    // OTA agent updates
+    std::unique_ptr<UpdateRegistry>            update_registry_;
 };
 
 // -- Factory ------------------------------------------------------------------

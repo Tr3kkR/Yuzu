@@ -13,6 +13,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -361,6 +362,39 @@ public:
                 session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
         }
 
+        // 3b. OTA updater: rollback check and old binary cleanup
+        {
+#if defined(_WIN32)
+            constexpr const char* kOsString   = "windows";
+            constexpr const char* kArchString = "x86_64";
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+            constexpr const char* kOsString   = "darwin";
+            constexpr const char* kArchString = "aarch64";
+#  else
+            constexpr const char* kOsString   = "darwin";
+            constexpr const char* kArchString = "x86_64";
+#  endif
+#elif defined(__aarch64__)
+            constexpr const char* kOsString   = "linux";
+            constexpr const char* kArchString = "aarch64";
+#else
+            constexpr const char* kOsString   = "linux";
+            constexpr const char* kArchString = "x86_64";
+#endif
+            updater_ = std::make_unique<Updater>(
+                UpdateConfig{cfg_.auto_update, cfg_.update_check_interval},
+                cfg_.agent_id,
+                std::string{yuzu::kFullVersionString},
+                kOsString, kArchString,
+                current_executable_path());
+
+            if (updater_->rollback_if_needed()) {
+                spdlog::warn("OTA rollback was triggered — running previous binary");
+            }
+            updater_->cleanup_old_binary();
+        }
+
         // 4. Open Subscribe bidi stream
         {
             grpc::ClientContext sub_ctx;
@@ -377,10 +411,49 @@ public:
             }
             spdlog::info("Subscribe stream opened — waiting for commands");
 
+            // 4b. Spawn OTA update check thread
+            if (cfg_.auto_update && updater_) {
+                auto* raw_stub = static_cast<void*>(stub.get());
+                update_thread_ = std::thread([this, raw_stub]() {
+                    spdlog::info("OTA update checker started (interval={}s)",
+                        cfg_.update_check_interval.count());
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        auto result = updater_->check_and_apply(raw_stub);
+                        if (result.has_value() && result.value()) {
+                            spdlog::info("OTA update applied — agent will restart");
+                            stop();
+                            return;
+                        }
+                        if (!result.has_value()) {
+                            spdlog::warn("OTA update check failed: {}",
+                                result.error().message);
+                        }
+                        // Sleep in small increments so we can respond to stop quickly
+                        auto remaining = cfg_.update_check_interval;
+                        while (remaining.count() > 0
+                               && !stop_requested_.load(std::memory_order_acquire)) {
+                            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
+                            std::this_thread::sleep_for(sleep_time);
+                            remaining -= sleep_time;
+                        }
+                    }
+                });
+            }
+
             // 5. Read commands from server and dispatch to plugins
+            bool update_verified = false;
             pb::CommandRequest cmd;
             while (stream->Read(&cmd)) {
                 if (stop_requested_.load(std::memory_order_acquire)) break;
+
+                // Write health marker after first successful read (OTA rollback guard)
+                if (!update_verified) {
+                    update_verified = true;
+                    auto marker = current_executable_path().parent_path()
+                                  / ".yuzu-update-verified";
+                    std::ofstream{marker} << "ok";
+                    spdlog::debug("Wrote update verification marker: {}", marker.string());
+                }
 
                 spdlog::info("Received command: plugin={}, action={}, id={}",
                     cmd.plugin(), cmd.action(), cmd.command_id());
@@ -502,6 +575,14 @@ public:
                 exec_threads_.clear();
             }
 
+            // Stop and join the OTA update thread
+            if (updater_) {
+                updater_->stop();
+            }
+            if (update_thread_.joinable()) {
+                update_thread_.join();
+            }
+
             spdlog::info("Subscribe stream ended");
         }
 
@@ -509,6 +590,7 @@ public:
 
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
+        if (updater_) updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
@@ -534,6 +616,8 @@ private:
     std::mutex                          stream_write_mu_;
     std::mutex                          exec_mu_;
     std::vector<std::thread>            exec_threads_;
+    std::unique_ptr<Updater>            updater_;
+    std::thread                         update_thread_;
 };
 
 // ── Factory ───────────────────────────────────────────────────────────────────

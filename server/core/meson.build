@@ -30,6 +30,7 @@ yuzu_server_core_lib = static_library(
     'src/nvd_db.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
+    'src/update_registry.cpp',
   ),
   include_directories: ['include'],
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,

@@ -117,6 +117,11 @@ int main(int argc, char* argv[]) {
     app.add_flag  ("--no-nvd-sync", "Disable NVD CVE feed sync")
        ->each([&cfg](const std::string&) { cfg.nvd_sync_enabled = false; });
 
+    // OTA agent update options
+    app.add_option("--update-dir", cfg.update_dir, "Directory for agent update binaries");
+    app.add_flag  ("--no-ota", "Disable OTA agent updates")
+       ->each([&cfg](const std::string&) { cfg.ota_enabled = false; });
+
     CLI11_PARSE(app, argc, argv);
 
     cfg.nvd_sync_interval = std::chrono::seconds(nvd_sync_hours * 3600);

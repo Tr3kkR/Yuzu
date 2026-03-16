@@ -43,6 +43,10 @@ struct Config {
     std::string           nvd_proxy;                              // HTTP proxy for NVD API (e.g. "http://proxy:8080")
     std::chrono::seconds  nvd_sync_interval{4 * 3600};            // Default: 4 hours
     bool                  nvd_sync_enabled{true};
+
+    // OTA agent updates
+    std::filesystem::path update_dir;         // Directory for agent binaries (default: <config_dir>/agent-updates/)
+    bool                  ota_enabled{true};   // Master switch for OTA updates
 };
 
 /**

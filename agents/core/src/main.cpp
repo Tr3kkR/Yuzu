@@ -81,8 +81,16 @@ int main(int argc, char* argv[]) {
        ->default_val("info");
     app.add_option("--log-format", log_format,         "Log format: text|json")
        ->default_val("text");
+    app.add_flag  ("--no-auto-update", "Disable OTA auto-updates")
+       ->each([&cfg](const std::string&) { cfg.auto_update = false; });
+    int update_interval_sec = 21600;
+    app.add_option("--update-check-interval", update_interval_sec,
+                   "Update check interval in seconds (default: 21600 = 6h)")
+       ->default_val(21600);
 
     CLI11_PARSE(app, argc, argv);
+
+    cfg.update_check_interval = std::chrono::seconds(update_interval_sec);
 
     cfg.log_level = log_level;
     if (cfg.verbose_logging) {
