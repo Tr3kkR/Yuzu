@@ -191,10 +191,11 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 | cl.exe | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe` |
 | cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` (needed by Meson's cmake dep method) |
 | ninja.exe | Installed with CMake or VS BuildTools |
-| meson | `pip install meson==1.9.2` (Python) |
-| vcpkg | `C:\Users\natha\vcpkg` (`VCPKG_ROOT`) |
-| protoc | `C:\Users\natha\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
-| grpc_cpp_plugin | `C:\Users\natha\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
+| python | `C:\Python314\python.exe` (system-wide, installed via Chocolatey) |
+| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.9.2`) |
+| vcpkg | `C:\vcpkg` (`VCPKG_ROOT`) |
+| protoc | `C:\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
+| grpc_cpp_plugin | `C:\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
 
 ## Authentication & Authorization
 
