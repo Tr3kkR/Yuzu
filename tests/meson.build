@@ -3,8 +3,8 @@ catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: '
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 agent_test_exe = executable(
   'yuzu_agent_tests',
-  files('unit/test_plugin_loader.cpp', 'unit/test_temp_file.cpp', 'unit/test_updater.cpp'),
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, catch2_dep],
+  files('unit/test_plugin_loader.cpp', 'unit/test_sdk_utilities.cpp', 'unit/test_temp_file.cpp', 'unit/test_updater.cpp'),
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
 )
 test('agent unit tests', agent_test_exe)
 

@@ -150,6 +150,60 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
  */
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key);
 
+/* ── SDK utility functions (format conversion) ──────────────────────────────── */
+
+/**
+ * Free a string allocated by SDK utility functions (table_to_json, etc.).
+ * Passing NULL is safe (no-op).
+ */
+YUZU_EXPORT void yuzu_free_string(char* str);
+
+/**
+ * Convert pipe-delimited rows to a JSON array of objects.
+ *
+ * @param input         Pipe-delimited text (UTF-8, newline-separated rows).
+ * @param column_names  Array of column name strings.
+ * @param column_count  Length of column_names array.
+ * @return Allocated JSON string, or NULL on error. Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_table_to_json(
+    const char*         input,
+    const char* const*  column_names,
+    size_t              column_count);
+
+/**
+ * Convert a JSON array of objects to pipe-delimited rows.
+ *
+ * @param json_input    JSON string (must be an array of objects).
+ * @param column_names  Array of column name strings (keys to extract, in order).
+ * @param column_count  Length of column_names array.
+ * @return Allocated pipe-delimited string, or NULL on error.
+ *         Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_json_to_table(
+    const char*         json_input,
+    const char* const*  column_names,
+    size_t              column_count);
+
+/**
+ * Normalize line endings in a string: \r\n and \r become \n.
+ *
+ * @param input  UTF-8 text with any mix of line endings.
+ * @return Allocated string with normalized \n endings.
+ *         Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_split_lines(const char* input);
+
+/**
+ * Generate a newline-separated sequence of numbered identifiers.
+ *
+ * @param start   Starting number.
+ * @param count   How many identifiers to generate.
+ * @param prefix  Prefix prepended to each number (may be NULL for no prefix).
+ * @return Allocated string, or NULL on error. Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefix);
+
 /* ── Secure temporary file utilities ────────────────────────────────────────── */
 
 /**
