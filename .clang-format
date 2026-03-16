@@ -1,0 +1,66 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+Standard: c++23
+ColumnLimit: 100
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+IndentCaseLabels: false
+
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+AllowShortLambdasOnASingleLine: Inline
+
+NamespaceIndentation: None
+CompactNamespaces: true
+FixNamespaceComments: true
+
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Project headers (yuzu/)
+  - Regex: '^[<"]yuzu/'
+    Priority: 1
+  # Local/private headers (quoted, no yuzu/ prefix)
+  - Regex: '^"'
+    Priority: 2
+  # Generated protobuf headers
+  - Regex: '\.pb\.h[">]$'
+    Priority: 3
+  # Third-party headers
+  - Regex: '^<(spdlog|httplib|nlohmann|grpcpp|grpc/|google/|absl/|sqlite3|CLI/|catch2/)'
+    Priority: 4
+  # System/STL headers
+  - Regex: '^<'
+    Priority: 5
+SortIncludes: CaseInsensitive
+
+BinPackArguments: true
+BinPackParameters: true
+AlignAfterOpenBracket: Align
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 0
+
+SpaceAfterCStyleCast: false
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpacesInAngles: Never
+
+EmptyLineBeforeAccessModifier: LogicalBlock
+SeparateDefinitionBlocks: Leave
+
+# Keep raw string literals readable
+RawStringFormats:
+  - Language: TextProto
+    Delimiters: ['pb']
+    BasedOnStyle: google
