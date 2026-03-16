@@ -1,105 +1,190 @@
 # Yuzu
 
-A multi-platform agent and server framework for real-time endpoint management. Yuzu is the successor to a popular automation and orchestration suite, built from the ground up in C++23 with a focus on extensibility, performance, and cross-platform portability.
+**Enterprise endpoint management platform.** Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.
+
+Yuzu gives operations and security teams a single control plane to query, command, patch, and enforce policy on every managed endpoint in real time. Agents are lightweight, plugin-extensible, and report structured telemetry that is natively compatible with Prometheus, Grafana, ClickHouse, and Splunk.
+
+## What Yuzu Does
+
+- **Real-time querying** — Ask questions ("which machines are missing patch KB5034441?") and get streaming answers from thousands of endpoints in seconds.
+- **Command orchestration** — Dispatch actions (restart a service, kill a process, deploy a package) to one device or an entire fleet, with approval workflows and scheduling.
+- **Continuous compliance** — Define desired-state policies ("BitLocker must be enabled") that agents evaluate locally on triggers (file change, service crash, interval) and auto-remediate.
+- **Security response** — Quarantine compromised devices, check indicators of compromise, inventory certificates, and collect forensic data.
+- **Plugin extensibility** — A stable C ABI means plugins can be written in any language that produces a shared library. 29 plugins ship out of the box covering hardware, network, security, software, and more.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Yuzu Server                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │   Gateway   │  │  Agent Mgr   │  │   Plugin Host     │  │
-│  │  (gRPC/TLS) │  │  (Sessions)  │  │  (Server Plugins) │  │
-│  └─────────────┘  └──────────────┘  └───────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-              │ gRPC (Protobuf / TLS)
-┌─────────────────────────────────────────────────────────────┐
-│                    Yuzu Agent (per endpoint)                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │   Comms     │  │  Plugin Mgr  │  │  Platform Adapter │  │
-│  │  (gRPC)     │  │  (.so/.dll)  │  │  Win/Lin/mac/ARM  │  │
-│  └─────────────┘  └──────────────┘  └───────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+                        ┌──────────────────────────────────────────────────────────┐
+                        │                      Yuzu Server                          │
+                        │                                                          │
+  Operators ──────────► │  ┌────────────┐  ┌─────────────┐  ┌──────────────────┐  │
+  (Browser / API)       │  │  REST API  │  │  Instruction │  │  Policy Engine   │  │
+                        │  │  (v1)      │  │  Engine      │  │  (Guaranteed     │  │
+                        │  └────────────┘  └─────────────┘  │   State)         │  │
+                        │  ┌────────────┐  ┌─────────────┐  └──────────────────┘  │
+                        │  │  HTMX      │  │  Response    │  ┌──────────────────┐  │
+                        │  │  Dashboard │  │  Store       │  │  RBAC / Auth     │  │
+                        │  └────────────┘  │  (SQLite)    │  │  OIDC · API Keys │  │
+                        │  ┌────────────┐  └─────────────┘  └──────────────────┘  │
+                        │  │  Metrics   │  ┌─────────────┐  ┌──────────────────┐  │
+  Prometheus ◄───────── │  │  /metrics  │  │  Audit Log  │  │  Scheduler       │  │
+  Grafana               │  └────────────┘  └─────────────┘  └──────────────────┘  │
+                        │                                                          │
+                        └────────────────────────┬─────────────────────────────────┘
+                                                 │
+                              gRPC / Protobuf / mTLS (bidirectional streaming)
+                                                 │
+           ┌─────────────────────────────────────┼──────────────────────────────────┐
+           │                                     │                                  │
+   ┌───────┴───────┐                   ┌─────────┴────────┐             ┌───────────┴──────┐
+   │  Yuzu Agent   │                   │   Yuzu Agent     │             │   Yuzu Agent     │
+   │  (Windows)    │                   │   (Linux)        │             │   (macOS)        │
+   │               │                   │                  │             │                  │
+   │  Plugin Host  │                   │  Plugin Host     │             │  Plugin Host     │
+   │  Trigger Eng. │                   │  Trigger Eng.    │             │  Trigger Eng.    │
+   │  KV Storage   │                   │  KV Storage      │             │  KV Storage      │
+   │  Metrics      │                   │  Metrics         │             │  Metrics         │
+   └───────────────┘                   └──────────────────┘             └──────────────────┘
 ```
 
-### Key Design Decisions
+### Optional: Gateway Nodes
+
+For large or distributed deployments, gateway nodes sit between agents and the server to reduce WAN traffic, batch heartbeats, and provide local TLS termination.
+
+```
+  Agents ──► Gateway (branch office) ──► Server (datacenter)
+```
+
+## Observability and Integration
+
+Yuzu is designed to be a first-class data source in modern observability stacks:
+
+| Integration | How |
+|---|---|
+| **Prometheus** | `/metrics` endpoint on both server and agent. Counters, gauges, histograms with labels. Grafana-ready. |
+| **Grafana** | Pre-built dashboard templates for fleet health, command throughput, policy compliance, and agent connectivity. |
+| **ClickHouse** | Structured response data and inventory use columnar-friendly schemas (typed columns, timestamps, agent IDs). Feed via the REST API or response offloading webhooks. |
+| **Splunk** | Audit logs and event subscriptions emit structured JSON. Agents can POST directly to Splunk HEC via the `http_client` plugin. |
+| **Webhooks** | Event subscriptions push JSON payloads to any HTTP endpoint on agent lifecycle, policy compliance changes, and instruction completion. |
+
+### Metrics Philosophy
+
+Every metric follows the Prometheus naming convention (`yuzu_server_*`, `yuzu_agent_*`) with consistent labels (`agent_id`, `plugin`, `method`, `status`). This makes it trivial to build Grafana dashboards, set up alerting rules, or feed data into ClickHouse materialized views for long-term analysis.
+
+Response data is typed (bool, int32, int64, string, datetime, CLOB) and schematized per instruction definition, making it straightforward to map into ClickHouse tables or Splunk sourcetypes for correlation workflows.
+
+## Key Design Decisions
 
 | Concern | Choice | Rationale |
 |---|---|---|
-| Language | C++23 | `std::expected`, ranges, modules (where available) |
-| Build | CMake 3.28+ + Meson 1.3+ | CMake for broad IDE support; Meson for fast, clean builds |
-| Transport | gRPC + Protobuf | Bidirectional streaming, strongly typed, TLS built-in |
-| Deps | vcpkg (manifest mode) | Reproducible, cross-platform, CMake/Meson integration |
-| Plugin ABI | C stable ABI | Language-agnostic, binary-stable, dlopen/.dll safe |
-| Platforms | Windows, Linux, macOS, ARM | Enterprise + embedded coverage |
+| Language | C++23 | `std::expected`, ranges, `std::format`. Low memory footprint for agents on constrained endpoints. |
+| Build | Meson + vcpkg | Fast builds, reproducible dependencies, cross-platform. CMake available as a dependency method only. |
+| Transport | gRPC + Protobuf | Bidirectional streaming, strongly typed, TLS built-in, language-neutral. |
+| Plugin ABI | Stable C ABI | Binary-stable across compiler versions. Language-agnostic. `dlopen`/`LoadLibrary` safe. |
+| Web UI | HTMX + server-rendered HTML | No JavaScript framework. Server renders fragments. Minimal client complexity. |
+| Storage | SQLite (embedded) | Zero-config, single-file, fast. Agent uses it for KV storage and identity. Server uses it for responses, audit, and config. |
+| Auth | PBKDF2 + RBAC + OIDC | Session cookies for browsers, API tokens for automation, OIDC for enterprise SSO. |
+| Platforms | Windows, Linux, macOS, ARM | Enterprise + edge coverage. Cross-compiled from CI. |
 
 ## Project Layout
 
 ```
 Yuzu/
-├── agents/core/          # Agent daemon (connects to server, loads plugins)
-├── server/core/          # Server daemon (manages agent sessions)
-├── server/gateway/       # gRPC gateway / TLS termination
-├── sdk/                  # Public SDK: plugin ABI headers + C++ wrappers
-├── proto/                # Protobuf definitions (source of truth for the wire protocol)
-├── cmake/                # CMake modules and cross-compilation toolchains
-├── tools/                # Developer scripts (codegen, linting, packaging)
-├── tests/                # Unit and integration tests
-└── .github/workflows/    # CI for Windows / Linux / macOS / ARM
+├── agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
+├── agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
+├── server/core/              Server daemon (sessions, auth, dashboard, REST API)
+├── server/gateway/           Gateway node for scale-out deployments
+├── sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
+├── proto/                    Protobuf definitions (source of truth for wire protocol)
+│   ├── yuzu/agent/v1/        AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
+│   ├── yuzu/common/v1/       Shared types: Platform, Timestamp, ErrorDetail
+│   ├── yuzu/server/v1/       ManagementService: ListAgents, SendCommand, WatchEvents
+│   └── yuzu/gateway/v1/      GatewayUpstream: ProxyRegister, BatchHeartbeat
+├── docs/                     Architecture and roadmap documentation
+├── meson/                    Cross-compilation and native files
+├── scripts/                  Build helpers (setup.sh, deploy_build_dlls.py)
+├── tests/unit/               Catch2 unit tests
+└── .github/workflows/        CI: Linux, Windows, macOS, ARM64 cross-compile
 ```
 
 ## Building
 
 ### Prerequisites
 
-- CMake ≥ 3.28 or Meson ≥ 1.3
-- A C++23-capable compiler:
-  - MSVC 19.38+ (VS 2022 17.8+)
-  - GCC 13+
-  - Clang 17+
-- [vcpkg](https://github.com/microsoft/vcpkg) (or set `VCPKG_ROOT`)
+- Meson 1.9.2, Ninja
+- CMake (required by Meson's cmake dependency method)
+- C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
+- [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
 
-### With CMake
+### Quick Start
 
 ```bash
-cmake --preset linux-debug       # or windows-debug, macos-debug, arm64-debug
-cmake --build --preset linux-debug
+./scripts/setup.sh                              # debug build
+./scripts/setup.sh --buildtype release --lto    # release + LTO
+./scripts/setup.sh --tests                      # enable unit tests
 ```
 
-### With Meson
+### Manual
 
 ```bash
-meson setup builddir -Dbuildtype=debug
+vcpkg install --triplet x64-linux --x-manifest-root=.
+meson setup builddir --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux
 meson compile -C builddir
 ```
 
-### CMake Presets
+### Windows (MSYS2 bash)
 
-| Preset | Platform | Compiler | Config |
-|---|---|---|---|
-| `linux-debug` | Linux x64 | GCC/Clang | Debug |
-| `linux-release` | Linux x64 | GCC/Clang | Release |
-| `windows-debug` | Windows x64 | MSVC | Debug |
-| `windows-release` | Windows x64 | MSVC | Release |
-| `macos-debug` | macOS (Apple Silicon / x64) | Apple Clang | Debug |
-| `macos-release` | macOS | Apple Clang | Release |
-| `arm64-linux-debug` | Linux ARM64 | aarch64-gcc | Debug (cross) |
+```bash
+source ./setup_msvc_env.sh
+meson compile -C builddir
+```
+
+### Build Options
+
+| Option | Default | Notes |
+|---|---|---|
+| `-Dbuild_agent` | true | Agent daemon |
+| `-Dbuild_server` | true | Server daemon |
+| `-Dbuild_tests` | false | Catch2 test suite |
+| `-Dbuild_examples` | true | Example plugins |
+| `-Db_lto` | false | Link-time optimisation |
+| `-Db_sanitize=address,undefined` | — | ASan + UBSan |
 
 ## Writing a Plugin
 
-Plugins are in-process shared libraries (`.dll` / `.so`) that export a single C-ABI descriptor function. See [`sdk/include/yuzu/plugin.h`](sdk/include/yuzu/plugin.h) and the example plugin in [`agents/plugins/example/`](agents/plugins/example/).
+Plugins are shared libraries (`.dll`/`.so`) exporting a C ABI descriptor. See [`sdk/include/yuzu/plugin.h`](sdk/include/yuzu/plugin.h) and [`agents/plugins/example/`](agents/plugins/example/).
 
 ```cpp
 #include <yuzu/plugin.hpp>
 
 class MyPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name() const noexcept override { return "my-plugin"; }
-    // ...
+    std::string_view name()    const noexcept override { return "my-plugin"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
+    // implement execute() to handle actions...
 };
 
 YUZU_PLUGIN_EXPORT(MyPlugin)
 ```
+
+## Running
+
+```bash
+# Start the server
+./builddir/server/core/yuzu-server --listen 0.0.0.0:50051 --web-port 8080
+
+# Start an agent (connects to server)
+./builddir/agents/core/yuzu-agent --server localhost:50051 --plugin-dir ./builddir/agents/plugins
+```
+
+Open `http://localhost:8080` for the web dashboard.
+
+## Roadmap
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.
+
+See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (139 capabilities across 24 domains).
 
 ## License
 
