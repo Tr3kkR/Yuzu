@@ -1,21 +1,26 @@
 /**
- * filesystem_plugin.cpp — Filesystem query plugin for Yuzu
+ * filesystem_plugin.cpp — Filesystem operations plugin for Yuzu
  *
  * Actions:
- *   "exists"    — Check if a path exists, report type and size.
- *   "list_dir"  — List directory contents (max 1000 entries).
- *   "file_hash" — Compute SHA-256 (or SHA-1) hash of a file.
+ *   "exists"          — Check if a path exists, report type and size.
+ *   "list_dir"        — List directory contents (max 1000 entries).
+ *   "file_hash"       — Compute SHA-256 (or SHA-1) hash of a file.
+ *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
+ *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *
  * Security:
  *   - All paths are canonicalized via std::filesystem::canonical() to
  *     resolve symlinks and prevent traversal attacks.
  *   - An optional base_dir parameter restricts access to a subtree.
+ *   - Temp files use mkstemps() (POSIX) / CreateFile+CREATE_NEW (Windows)
+ *     with restrictive permissions to prevent TOCTOU races.
  *   - This plugin requires admin role on the server side.
  *
  * Output is pipe-delimited via write_output():
  *   exists|true/false, type|file/directory/other, size|N
  *   entry|name|type|size
  *   hash|HEXSTRING, algorithm|sha256, size|N
+ *   path|/tmp/yuzu-XXXXXX.tmp, persist|true/false
  */
 
 #include <yuzu/plugin.hpp>
@@ -258,13 +263,16 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 class FilesystemPlugin final : public yuzu::Plugin {
 public:
     std::string_view name()        const noexcept override { return "filesystem"; }
-    std::string_view version()     const noexcept override { return "0.2.0"; }
+    std::string_view version()     const noexcept override { return "0.3.0"; }
     std::string_view description() const noexcept override {
-        return "Filesystem queries — exists, list_dir, file_hash (admin-only)";
+        return "Filesystem operations — exists, list_dir, file_hash, create_temp, create_temp_dir (admin-only)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "exists", "list_dir", "file_hash", nullptr };
+        static const char* acts[] = {
+            "exists", "list_dir", "file_hash",
+            "create_temp", "create_temp_dir", nullptr
+        };
         return acts;
     }
 
@@ -285,6 +293,12 @@ public:
         }
         if (action == "file_hash") {
             return do_file_hash(ctx, params);
+        }
+        if (action == "create_temp") {
+            return do_create_temp(ctx, params);
+        }
+        if (action == "create_temp_dir") {
+            return do_create_temp_dir(ctx, params);
         }
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -443,6 +457,92 @@ private:
         ctx.write_output(std::format("hash|{}", hash));
         ctx.write_output(std::format("algorithm|{}", algo_str));
         ctx.write_output(std::format("size|{}", file_size));
+        return 0;
+    }
+
+    int do_create_temp(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto prefix    = params.get("prefix", "yuzu-");
+        auto suffix    = params.get("suffix", ".tmp");
+        auto directory = params.get("directory");
+        auto persist   = params.get("persist", "true");
+
+        // Validate directory if provided
+        if (!directory.empty()) {
+            auto validated = validate_path(directory, {});
+            if (validated.empty()) {
+                ctx.write_output("error|directory does not exist or is not accessible");
+                return 1;
+            }
+            std::error_code ec;
+            if (!fs::is_directory(validated, ec)) {
+                ctx.write_output("error|specified directory is not a directory");
+                return 1;
+            }
+        }
+
+        char path_buf[512]{};
+        int rc = yuzu_create_temp_file(
+            std::string{prefix}.c_str(),
+            std::string{suffix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            path_buf, sizeof(path_buf));
+
+        if (rc != 0) {
+            ctx.write_output("error|failed to create temporary file");
+            return 1;
+        }
+
+        ctx.write_output(std::format("path|{}", path_buf));
+        ctx.write_output(std::format("persist|{}", persist));
+
+        // If not persistent, delete the file when this action completes
+        if (persist != "true") {
+            std::error_code ec;
+            fs::remove(path_buf, ec);
+            ctx.write_output("cleanup|deleted");
+        }
+
+        return 0;
+    }
+
+    int do_create_temp_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto prefix    = params.get("prefix", "yuzu-");
+        auto directory = params.get("directory");
+        auto persist   = params.get("persist", "true");
+
+        if (!directory.empty()) {
+            auto validated = validate_path(directory, {});
+            if (validated.empty()) {
+                ctx.write_output("error|directory does not exist or is not accessible");
+                return 1;
+            }
+            std::error_code ec;
+            if (!fs::is_directory(validated, ec)) {
+                ctx.write_output("error|specified directory is not a directory");
+                return 1;
+            }
+        }
+
+        char path_buf[512]{};
+        int rc = yuzu_create_temp_dir(
+            std::string{prefix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            path_buf, sizeof(path_buf));
+
+        if (rc != 0) {
+            ctx.write_output("error|failed to create temporary directory");
+            return 1;
+        }
+
+        ctx.write_output(std::format("path|{}", path_buf));
+        ctx.write_output(std::format("persist|{}", persist));
+
+        if (persist != "true") {
+            std::error_code ec;
+            fs::remove_all(path_buf, ec);
+            ctx.write_output("cleanup|deleted");
+        }
+
         return 0;
     }
 };

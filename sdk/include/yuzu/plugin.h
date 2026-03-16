@@ -150,6 +150,44 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
  */
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key);
 
+/* ── Secure temporary file utilities ────────────────────────────────────────── */
+
+/**
+ * Create a secure temporary file with restricted permissions.
+ * POSIX: uses mkstemps() with mode 0600 (owner read/write only).
+ * Windows: uses CreateFile with CREATE_NEW and owner-only DACL.
+ *
+ * @param prefix       Filename prefix (e.g., "yuzu-"). NULL defaults to "yuzu-".
+ * @param suffix       File extension (e.g., ".tmp"). NULL defaults to ".tmp".
+ * @param directory    Override temp directory. NULL uses the system default.
+ * @param path_out     Buffer to receive the null-terminated absolute path.
+ * @param path_out_size Size of path_out in bytes (recommend >= 512).
+ * @return             0 on success, non-zero on failure.
+ */
+YUZU_EXPORT int yuzu_create_temp_file(
+    const char* prefix,
+    const char* suffix,
+    const char* directory,
+    char*       path_out,
+    size_t      path_out_size);
+
+/**
+ * Create a secure temporary directory with restricted permissions.
+ * POSIX: uses mkdtemp() with mode 0700 (owner only).
+ * Windows: creates directory with owner-only DACL.
+ *
+ * @param prefix       Directory name prefix (e.g., "yuzu-"). NULL defaults to "yuzu-".
+ * @param directory    Override parent directory. NULL uses the system default.
+ * @param path_out     Buffer to receive the null-terminated absolute path.
+ * @param path_out_size Size of path_out in bytes (recommend >= 512).
+ * @return             0 on success, non-zero on failure.
+ */
+YUZU_EXPORT int yuzu_create_temp_dir(
+    const char* prefix,
+    const char* directory,
+    char*       path_out,
+    size_t      path_out_size);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

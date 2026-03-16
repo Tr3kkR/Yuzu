@@ -19,7 +19,7 @@ struct LoadError {
  * PluginHandle owns a loaded plugin shared library and its descriptor.
  * Unloads the library (dlclose / FreeLibrary) on destruction.
  */
-class PluginHandle {
+class YUZU_EXPORT PluginHandle {
 public:
     PluginHandle() = default;
     PluginHandle(const PluginHandle&) = delete;
@@ -44,7 +44,7 @@ private:
  * PluginLoader scans a directory for .so/.dll files, loads each one,
  * verifies the ABI version, and returns handles.
  */
-class PluginLoader {
+class YUZU_EXPORT PluginLoader {
 public:
     struct ScanResult {
         std::vector<PluginHandle>  loaded;
