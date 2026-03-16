@@ -34,7 +34,8 @@ bootstrap: |
   # Configure with Meson (generates compile_commands.json in build/)
   meson setup build \
     --buildtype=debug \
-    -Dcmake_prefix_path=/tmp/vcpkg/installed/x64-linux \
+    -Dcmake_prefix_path=vcpkg_installed/x64-linux \
+    -Dcpp_std=c++23 \
     -Dbuild_tests=false
   # Build so generated protobuf headers exist for clang-tidy resolution
   meson compile -C build

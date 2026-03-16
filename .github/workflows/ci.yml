@@ -46,7 +46,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -66,7 +66,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang17.ini' }} \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -101,7 +101,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -120,7 +120,7 @@ jobs:
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-windows `
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=true `
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -154,7 +154,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -174,7 +174,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-osx \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -211,7 +211,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -231,7 +231,7 @@ jobs:
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-linux \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
@@ -280,7 +280,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -300,7 +300,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined
 
@@ -333,7 +333,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -353,7 +353,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_sanitize=thread
 
@@ -384,7 +384,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
@@ -404,7 +404,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_coverage=true
 

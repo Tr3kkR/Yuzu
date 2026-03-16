@@ -35,6 +35,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -67,7 +68,7 @@ struct PluginContextImpl {
 };
 
 struct CommandContextImpl {
-    SubscribeStream* stream;
+    std::shared_ptr<SubscribeStream> stream;
     std::mutex*      write_mu;   // protects concurrent stream->Write()
     std::string      command_id;
     std::chrono::steady_clock::time_point start_time;
@@ -403,7 +404,7 @@ public:
             }
             subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
 
-            auto stream = stub->Subscribe(&sub_ctx);
+            std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
             if (!stream) {
                 spdlog::error("Failed to open Subscribe stream");
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
@@ -481,12 +482,13 @@ public:
                 // Dispatch execute() in a background thread.
                 // chargen_start blocks until chargen_stop sets the atomic flag,
                 // so concurrent dispatch is required.
-                auto* raw_stream = stream.get();
-                std::thread exec_thread([this, target, cmd, raw_stream]() {
+                // Each thread captures the shared_ptr to guarantee the stream
+                // outlives all writers (fixes use-after-free risk from #66).
+                std::thread exec_thread([this, target, cmd, stream]() {
                     metrics_.counter("yuzu_agent_commands_executed_total",
                         {{"plugin", cmd.plugin()}}).increment();
                     CommandContextImpl ctx_impl{
-                        .stream     = raw_stream,
+                        .stream     = stream,
                         .write_mu   = &stream_write_mu_,
                         .command_id = cmd.command_id(),
                         .start_time = std::chrono::steady_clock::now(),
@@ -524,7 +526,7 @@ public:
                         timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(timing_resp, grpc::WriteOptions());
+                        stream->Write(timing_resp, grpc::WriteOptions());
                     }
 
                     // Send final status
@@ -541,7 +543,7 @@ public:
                         final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(final_resp, grpc::WriteOptions());
+                        stream->Write(final_resp, grpc::WriteOptions());
                     }
 
                     spdlog::info("Command {} finished (rc={}, exec={}ms)",
