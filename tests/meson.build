@@ -3,8 +3,18 @@ catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: '
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 agent_test_exe = executable(
   'yuzu_agent_tests',
-  files('unit/test_plugin_loader.cpp', 'unit/test_sdk_utilities.cpp', 'unit/test_temp_file.cpp', 'unit/test_updater.cpp',
-        'unit/test_filesystem_read.cpp'),
+  files(
+    'unit/test_plugin_loader.cpp',
+    'unit/test_sdk_utilities.cpp',
+    'unit/test_temp_file.cpp',
+    'unit/test_updater.cpp',
+    'unit/test_filesystem_read.cpp',
+    'unit/test_string_utils.cpp',
+    'unit/test_vuln_rules.cpp',
+  ),
+  include_directories: [
+    include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
+  ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
 )
 test('agent unit tests', agent_test_exe)
@@ -23,9 +33,10 @@ if build_server
       'unit/server/test_audit_store.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
+      'unit/server/test_web_utils.cpp',
     ),
     include_directories: [
-      include_directories('../server/core/src'),  # private headers (nvd_db.hpp, response_store.hpp, etc.)
+      include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
     ],
     dependencies: [yuzu_server_core_dep, catch2_dep],
   )
