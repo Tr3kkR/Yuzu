@@ -60,6 +60,17 @@ struct Config {
 
     // Audit trail
     int                   audit_retention_days{365};
+
+    // Analytics
+    bool                  analytics_enabled{true};
+    int                   analytics_drain_interval_seconds{10};
+    int                   analytics_batch_size{100};
+    std::string           clickhouse_url;           // empty = disabled
+    std::string           clickhouse_database{"yuzu"};
+    std::string           clickhouse_table{"yuzu_events"};
+    std::string           clickhouse_username;
+    std::string           clickhouse_password;
+    std::filesystem::path analytics_jsonl_path;     // empty = disabled
 };
 
 /**

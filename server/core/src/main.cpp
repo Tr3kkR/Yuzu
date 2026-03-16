@@ -140,6 +140,30 @@ int main(int argc, char* argv[]) {
                    "Audit log retention period in days (default: 365)")
        ->default_val(365);
 
+    // Analytics options
+    app.add_flag  ("--no-analytics", "Disable analytics event collection")
+       ->each([&cfg](const std::string&) { cfg.analytics_enabled = false; });
+    app.add_option("--analytics-drain-interval", cfg.analytics_drain_interval_seconds,
+                   "Analytics drain interval in seconds (default: 10)")
+       ->default_val(10);
+    app.add_option("--analytics-batch-size", cfg.analytics_batch_size,
+                   "Analytics drain batch size (default: 100)")
+       ->default_val(100);
+    app.add_option("--analytics-jsonl", cfg.analytics_jsonl_path,
+                   "Path for JSON Lines analytics output file");
+    app.add_option("--clickhouse-url", cfg.clickhouse_url,
+                   "ClickHouse HTTP URL (e.g. http://localhost:8123)");
+    app.add_option("--clickhouse-database", cfg.clickhouse_database,
+                   "ClickHouse database name (default: yuzu)")
+       ->default_val("yuzu");
+    app.add_option("--clickhouse-table", cfg.clickhouse_table,
+                   "ClickHouse table name (default: yuzu_events)")
+       ->default_val("yuzu_events");
+    app.add_option("--clickhouse-user", cfg.clickhouse_username,
+                   "ClickHouse username");
+    app.add_option("--clickhouse-password", cfg.clickhouse_password,
+                   "ClickHouse password");
+
     CLI11_PARSE(app, argc, argv);
 
     cfg.nvd_sync_interval = std::chrono::seconds(nvd_sync_hours * 3600);
