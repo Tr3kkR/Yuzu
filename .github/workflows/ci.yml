@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main, "feature/**", "fix/**"]
+    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
   pull_request:
     branches: [main]
+    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,9 +18,29 @@ env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
+  # ── Lint (fast gate — blocks all builds) ──────────────────────────────────
+  lint:
+    name: "Lint (clang-format)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-17
+
+      - name: Check formatting
+        run: |
+          find agents server sdk tests \
+            -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
+            | grep -v '\.pb\.' \
+            | xargs clang-format-17 --dry-run --Werror
+
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -26,8 +48,10 @@ jobs:
         compiler: [gcc-13, clang-17]
         build_type: [debug, release]
         exclude:
-          # PRs only run debug to halve feedback time; push to main runs all.
+          # PRs: only gcc-13 debug (one compiler is enough to validate)
+          # Push to main: full matrix
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-17' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -89,6 +113,7 @@ jobs:
   # ── Windows (MSVC) ─────────────────────────────────────────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -152,6 +177,7 @@ jobs:
   # ── macOS (Apple Clang) ────────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: macos-14  # Apple Silicon
     strategy:
       fail-fast: false
@@ -215,6 +241,7 @@ jobs:
   # ── ARM64 Linux cross-compile ──────────────────────────────────────────────
   arm64-cross:
     name: "Linux ARM64 cross-compile ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -274,28 +301,11 @@ jobs:
       - name: Build
         run: meson compile -C builddir
 
-  # ── Lint (clang-format) ───────────────────────────────────────────────────
-  lint:
-    name: "Lint (clang-format)"
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install clang-format
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-17
-
-      - name: Check formatting
-        run: |
-          find agents server sdk tests \
-            -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
-            | grep -v '\.pb\.' \
-            | xargs clang-format-17 --dry-run --Werror
-
-  # ── Sanitizers (ASan + UBSan) ───────────────────────────────────────────
+  # ── Sanitizers (ASan + UBSan) — main/push only, after Linux passes ──────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
@@ -356,9 +366,11 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-  # ── Sanitizers (TSan) ───────────────────────────────────────────────────
+  # ── Sanitizers (TSan) — main/push only, after Linux passes ──────────────
   sanitize-tsan:
     name: "Sanitizers (TSan)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
@@ -418,9 +430,11 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-  # ── Coverage ────────────────────────────────────────────────────────────
+  # ── Coverage — main/push only, after Linux passes ────────────────────────
   coverage:
     name: "Coverage (GCC 13)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
 
     steps:
