@@ -64,4 +64,8 @@ private:
     void create_tables();
 };
 
+/// Compare two version strings numerically (e.g. "1.10.0" > "1.9.0").
+/// Returns <0 if a < b, 0 if equal, >0 if a > b.
+int compare_versions(std::string_view a, std::string_view b);
+
 }  // namespace yuzu::server

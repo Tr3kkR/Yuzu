@@ -573,6 +573,7 @@ R"HTM(
                 '<span class="scope-item-meta">' +
                 escapeHtml(ids[i].substring(0, 12)) + ' · ' +
                 escapeHtml(a.os || '?') + '/' + escapeHtml(a.arch || '?') +
+                (a.agent_version ? ' · v' + escapeHtml(a.agent_version) : '') +
                 '</span></div>';
       }
 

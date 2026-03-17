@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <utility>
 
 namespace yuzu::agent {
@@ -17,6 +18,21 @@ struct CertKeyPair {
     const char* source;
 };
 
+std::string getenv_string(const char* name) {
+#ifdef _WIN32
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value) return {};
+
+    std::string result{value};
+    free(value);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    return value ? std::string{value} : std::string{};
+#endif
+}
+
 bool file_exists_and_readable(const std::filesystem::path& p) {
     std::error_code ec;
     auto status = std::filesystem::status(p, ec);
@@ -28,9 +44,9 @@ bool file_exists_and_readable(const std::filesystem::path& p) {
 
 std::optional<DiscoveredCert> discover_client_cert() {
     // 1. Environment variables (all platforms)
-    const char* env_cert = std::getenv("YUZU_CLIENT_CERT");
-    const char* env_key  = std::getenv("YUZU_CLIENT_KEY");
-    if (env_cert && env_key && env_cert[0] && env_key[0]) {
+    auto env_cert = getenv_string("YUZU_CLIENT_CERT");
+    auto env_key  = getenv_string("YUZU_CLIENT_KEY");
+    if (!env_cert.empty() && !env_key.empty()) {
         std::filesystem::path cert_path{env_cert};
         std::filesystem::path key_path{env_key};
         if (file_exists_and_readable(cert_path) && file_exists_and_readable(key_path)) {

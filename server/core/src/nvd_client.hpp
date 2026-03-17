@@ -27,6 +27,9 @@ public:
     // Fetch CVEs matching a keyword search (for initial targeted sync).
     NvdFetchResult fetch_by_keyword(const std::string& keyword, int start_index = 0);
 
+    /// Parse a raw NVD API JSON response into CveRecords.
+    NvdFetchResult parse_response(const std::string& json_body);
+
 private:
     std::string api_key_;
     std::string proxy_host_;
@@ -35,7 +38,6 @@ private:
 
     void rate_limit();
     void apply_proxy(httplib::Client& client) const;
-    NvdFetchResult parse_response(const std::string& json_body);
 };
 
 }  // namespace yuzu::server

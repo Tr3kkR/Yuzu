@@ -2,15 +2,21 @@
 
 ## Getting Started
 
-1. **Prerequisites**: CMake 3.28+, Ninja, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
+1. **Prerequisites**: Meson 1.9.2, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
    git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu
-   cmake --preset linux-debug
-   cmake --build --preset linux-debug
-   ctest --preset linux-debug
+   ./scripts/setup.sh
+   meson compile -C builddir
    ```
-   Or use `make configure && make build && make test` on Linux.
+
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for how components interact.
+
+See [`docs/roadmap.md`](docs/roadmap.md) for the development plan.
+
+See [`docs/capability-map.md`](docs/capability-map.md) for the target feature set.
 
 ## Branch Naming
 
@@ -32,11 +38,20 @@ The project follows C++23 conventions enforced by `.clang-tidy`:
 
 - **Naming**: PascalCase classes, snake_case functions/variables, `k`-prefix constants, trailing `_` for private members
 - **Error handling**: Use `std::expected<T, E>` — no exceptions in core code
-- **Includes**: `#pragma once`, ordered STL -> third-party -> project
+- **Includes**: `#pragma once`, ordered STL → third-party → project
 - **Strings**: Prefer `std::string_view` for parameters, `std::format` for formatting
 - **Memory**: No raw `new`/`delete`; use smart pointers and RAII
 
 See [CLAUDE.md](CLAUDE.md) for the complete coding conventions.
+
+## Observability Standards
+
+When adding new features:
+
+- **Metrics**: Use Prometheus naming (`yuzu_server_*` / `yuzu_agent_*`) with consistent labels (`agent_id`, `plugin`, `method`, `status`)
+- **Response schemas**: All instruction responses must declare typed columns (bool, int32, int64, string, datetime) for downstream analytics
+- **Audit events**: Use the structured format: `{timestamp, principal, action, target_type, target_id, detail}`
+- **Events**: Follow the common envelope: `{event_type, timestamp, source, payload}`
 
 ## Writing Plugins
 
@@ -44,17 +59,20 @@ Plugins use a stable C ABI (`sdk/include/yuzu/plugin.h`) with a C++ wrapper (`sd
 
 1. Copy `agents/plugins/example/` as a starting point
 2. Implement your plugin class using the `YUZU_PLUGIN_EXPORT` macro
-3. Add a `CMakeLists.txt` that links against `yuzu::sdk`
-4. Register your plugin directory in the root `CMakeLists.txt`
+3. Add a `meson.build` that builds a shared library
+4. Register your plugin directory in the parent `meson.build`
 
-See the existing plugins (`chargen`, `status`, `device_identity`) for patterns.
+See the existing plugins for patterns.
 
 ## Running Tests
 
 ```bash
-cmake --preset linux-debug          # configure with tests enabled
-cmake --build --preset linux-debug  # build
-ctest --preset linux-debug          # run tests
+./scripts/setup.sh --tests
+meson test -C builddir --print-errorlogs
 ```
 
 Tests use [Catch2](https://github.com/catchorg/Catch2) and live in `tests/unit/`.
+
+## Build System
+
+Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory.** Do not use CMake as a build system (it exists only as a Meson dependency method).

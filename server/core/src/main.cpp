@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--management", cfg.management_address,   "Management gRPC address (host:port)")
        ->default_val("0.0.0.0:50052");
     app.add_option("--web-address", cfg.web_address,         "Web UI bind address")
-       ->default_val("0.0.0.0");
+       ->default_val("127.0.0.1");
     app.add_option("--web-port",    cfg.web_port,            "Web UI port")
        ->default_val(8080);
     app.add_flag  ("--no-tls",    "Disable TLS (insecure, for development only)")
@@ -116,6 +116,53 @@ int main(int argc, char* argv[]) {
        ->default_val(4);
     app.add_flag  ("--no-nvd-sync", "Disable NVD CVE feed sync")
        ->each([&cfg](const std::string&) { cfg.nvd_sync_enabled = false; });
+
+    // OTA agent update options
+    app.add_option("--update-dir", cfg.update_dir, "Directory for agent update binaries");
+    app.add_flag  ("--no-ota", "Disable OTA agent updates")
+       ->each([&cfg](const std::string&) { cfg.ota_enabled = false; });
+
+    // HTTPS web dashboard options
+    app.add_flag  ("--https", "Enable HTTPS for the web dashboard")
+       ->each([&cfg](const std::string&) { cfg.https_enabled = true; });
+    app.add_option("--https-port",  cfg.https_port,      "HTTPS port (default: 8443)")
+       ->default_val(8443);
+    app.add_option("--https-cert",  cfg.https_cert_path,  "PEM certificate for HTTPS");
+    app.add_option("--https-key",   cfg.https_key_path,   "PEM private key for HTTPS");
+    app.add_flag  ("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+       ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
+
+    // Data infrastructure options
+    app.add_option("--response-retention-days", cfg.response_retention_days,
+                   "Response retention period in days (default: 90)")
+       ->default_val(90);
+    app.add_option("--audit-retention-days", cfg.audit_retention_days,
+                   "Audit log retention period in days (default: 365)")
+       ->default_val(365);
+
+    // Analytics options
+    app.add_flag  ("--no-analytics", "Disable analytics event collection")
+       ->each([&cfg](const std::string&) { cfg.analytics_enabled = false; });
+    app.add_option("--analytics-drain-interval", cfg.analytics_drain_interval_seconds,
+                   "Analytics drain interval in seconds (default: 10)")
+       ->default_val(10);
+    app.add_option("--analytics-batch-size", cfg.analytics_batch_size,
+                   "Analytics drain batch size (default: 100)")
+       ->default_val(100);
+    app.add_option("--analytics-jsonl", cfg.analytics_jsonl_path,
+                   "Path for JSON Lines analytics output file");
+    app.add_option("--clickhouse-url", cfg.clickhouse_url,
+                   "ClickHouse HTTP URL (e.g. http://localhost:8123)");
+    app.add_option("--clickhouse-database", cfg.clickhouse_database,
+                   "ClickHouse database name (default: yuzu)")
+       ->default_val("yuzu");
+    app.add_option("--clickhouse-table", cfg.clickhouse_table,
+                   "ClickHouse table name (default: yuzu_events)")
+       ->default_val("yuzu_events");
+    app.add_option("--clickhouse-user", cfg.clickhouse_username,
+                   "ClickHouse username");
+    app.add_option("--clickhouse-password", cfg.clickhouse_password,
+                   "ClickHouse password");
 
     CLI11_PARSE(app, argc, argv);
 

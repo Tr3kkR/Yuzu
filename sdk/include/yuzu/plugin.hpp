@@ -16,6 +16,7 @@
 #include "plugin.h"
 
 #include <expected>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <string_view>
@@ -138,6 +139,146 @@ public:
     virtual int execute(CommandContext& ctx,
                         std::string_view action,
                         Params params) = 0;
+};
+
+// ── Secure temporary file RAII wrapper ──────────────────────────────────────
+
+/**
+ * RAII wrapper around a securely created temporary file.
+ * On destruction, the file is deleted unless release() was called or
+ * the file was created with persist=true.
+ */
+class TempFile {
+public:
+    /**
+     * Create a secure temporary file.
+     * @param prefix    Filename prefix (default "yuzu-").
+     * @param suffix    File extension (default ".tmp").
+     * @param directory Override temp directory (empty = system default).
+     * @param persist   If false, file is deleted in destructor.
+     */
+    static Result<TempFile> create(
+            std::string_view prefix = "yuzu-",
+            std::string_view suffix = ".tmp",
+            std::string_view directory = {},
+            bool persist = false)
+    {
+        char buf[512]{};
+        int rc = yuzu_create_temp_file(
+            std::string{prefix}.c_str(),
+            std::string{suffix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            buf, sizeof(buf));
+        if (rc != 0) {
+            return std::unexpected(PluginError{rc, "Failed to create temp file"});
+        }
+        return TempFile{std::string{buf}, persist};
+    }
+
+    ~TempFile() {
+        if (!persist_ && !path_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path_, ec);
+        }
+    }
+
+    TempFile(TempFile&& o) noexcept
+        : path_{std::move(o.path_)}, persist_{o.persist_} {
+        o.path_.clear();
+    }
+
+    TempFile& operator=(TempFile&& o) noexcept {
+        if (this != &o) {
+            if (!persist_ && !path_.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(path_, ec);
+            }
+            path_ = std::move(o.path_);
+            persist_ = o.persist_;
+            o.path_.clear();
+        }
+        return *this;
+    }
+
+    TempFile(const TempFile&) = delete;
+    TempFile& operator=(const TempFile&) = delete;
+
+    [[nodiscard]] const std::string& path() const noexcept { return path_; }
+
+    /** Release ownership — destructor will NOT delete the file. */
+    void release() noexcept { persist_ = true; }
+
+private:
+    TempFile(std::string path, bool persist)
+        : path_{std::move(path)}, persist_{persist} {}
+
+    std::string path_;
+    bool persist_;
+};
+
+// ── Secure temporary directory RAII wrapper ────────────────────────────────
+
+/**
+ * RAII wrapper around a securely created temporary directory.
+ * On destruction, the directory and its contents are removed unless
+ * release() was called or created with persist=true.
+ */
+class TempDir {
+public:
+    static Result<TempDir> create(
+            std::string_view prefix = "yuzu-",
+            std::string_view directory = {},
+            bool persist = false)
+    {
+        char buf[512]{};
+        int rc = yuzu_create_temp_dir(
+            std::string{prefix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            buf, sizeof(buf));
+        if (rc != 0) {
+            return std::unexpected(PluginError{rc, "Failed to create temp directory"});
+        }
+        return TempDir{std::string{buf}, persist};
+    }
+
+    ~TempDir() {
+        if (!persist_ && !path_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(path_, ec);
+        }
+    }
+
+    TempDir(TempDir&& o) noexcept
+        : path_{std::move(o.path_)}, persist_{o.persist_} {
+        o.path_.clear();
+    }
+
+    TempDir& operator=(TempDir&& o) noexcept {
+        if (this != &o) {
+            if (!persist_ && !path_.empty()) {
+                std::error_code ec;
+                std::filesystem::remove_all(path_, ec);
+            }
+            path_ = std::move(o.path_);
+            persist_ = o.persist_;
+            o.path_.clear();
+        }
+        return *this;
+    }
+
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+
+    [[nodiscard]] const std::string& path() const noexcept { return path_; }
+
+    void release() noexcept { persist_ = true; }
+
+private:
+    TempDir(std::string path, bool persist)
+        : path_{std::move(path)}, persist_{persist} {}
+
+    std::string path_;
+    bool persist_;
 };
 
 }  // namespace yuzu

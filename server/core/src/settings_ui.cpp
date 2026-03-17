@@ -293,6 +293,22 @@ R"HTM(<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- ── Agent Updates (OTA) ────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Agent Updates (OTA)</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Upload agent binaries and manage fleet-wide update rollout.
+        </p>
+        <div id="updates-section"
+             hx-get="/fragments/settings/updates"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Directory Integration (coming soon) ───────────── -->
     <div class="section coming-soon">
       <span class="coming-soon-badge">COMING SOON</span>

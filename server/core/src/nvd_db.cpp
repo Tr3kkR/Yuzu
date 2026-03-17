@@ -16,7 +16,7 @@ namespace yuzu::server {
 // Splits on '.' and '-', compares each segment numerically where possible.
 // Same algorithm as agents/plugins/vuln_scan/src/cve_rules.hpp.
 
-static int compare_versions(std::string_view a, std::string_view b) {
+int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
         if (s.empty()) return {};
         auto pos = s.find_first_of(".-");

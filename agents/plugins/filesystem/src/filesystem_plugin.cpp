@@ -1,21 +1,26 @@
 /**
- * filesystem_plugin.cpp — Filesystem query plugin for Yuzu
+ * filesystem_plugin.cpp — Filesystem operations plugin for Yuzu
  *
  * Actions:
- *   "exists"    — Check if a path exists, report type and size.
- *   "list_dir"  — List directory contents (max 1000 entries).
- *   "file_hash" — Compute SHA-256 (or SHA-1) hash of a file.
+ *   "exists"          — Check if a path exists, report type and size.
+ *   "list_dir"        — List directory contents (max 1000 entries).
+ *   "file_hash"       — Compute SHA-256 (or SHA-1) hash of a file.
+ *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
+ *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
  *
  * Security:
  *   - All paths are canonicalized via std::filesystem::canonical() to
  *     resolve symlinks and prevent traversal attacks.
  *   - An optional base_dir parameter restricts access to a subtree.
+ *   - Temp files use mkstemps() (POSIX) / CreateFile+CREATE_NEW (Windows)
+ *     with restrictive permissions to prevent TOCTOU races.
  *   - This plugin requires admin role on the server side.
  *
  * Output is pipe-delimited via write_output():
  *   exists|true/false, type|file/directory/other, size|N
  *   entry|name|type|size
  *   hash|HEXSTRING, algorithm|sha256, size|N
+ *   path|/tmp/yuzu-XXXXXX.tmp, persist|true/false
  */
 
 #include <yuzu/plugin.hpp>
@@ -258,13 +263,16 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 class FilesystemPlugin final : public yuzu::Plugin {
 public:
     std::string_view name()        const noexcept override { return "filesystem"; }
-    std::string_view version()     const noexcept override { return "0.2.0"; }
+    std::string_view version()     const noexcept override { return "0.3.0"; }
     std::string_view description() const noexcept override {
-        return "Filesystem queries — exists, list_dir, file_hash (admin-only)";
+        return "Filesystem operations — exists, list_dir, file_hash, create_temp, create_temp_dir (admin-only)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "exists", "list_dir", "file_hash", nullptr };
+        static const char* acts[] = {
+            "exists", "list_dir", "file_hash",
+            "create_temp", "create_temp_dir", "read", nullptr
+        };
         return acts;
     }
 
@@ -285,6 +293,15 @@ public:
         }
         if (action == "file_hash") {
             return do_file_hash(ctx, params);
+        }
+        if (action == "create_temp") {
+            return do_create_temp(ctx, params);
+        }
+        if (action == "create_temp_dir") {
+            return do_create_temp_dir(ctx, params);
+        }
+        if (action == "read") {
+            return do_read(ctx, params);
         }
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -443,6 +460,194 @@ private:
         ctx.write_output(std::format("hash|{}", hash));
         ctx.write_output(std::format("algorithm|{}", algo_str));
         ctx.write_output(std::format("size|{}", file_size));
+        return 0;
+    }
+
+    int do_create_temp(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto prefix    = params.get("prefix", "yuzu-");
+        auto suffix    = params.get("suffix", ".tmp");
+        auto directory = params.get("directory");
+        auto persist   = params.get("persist", "true");
+
+        // Validate directory if provided
+        if (!directory.empty()) {
+            auto validated = validate_path(directory, {});
+            if (validated.empty()) {
+                ctx.write_output("error|directory does not exist or is not accessible");
+                return 1;
+            }
+            std::error_code ec;
+            if (!fs::is_directory(validated, ec)) {
+                ctx.write_output("error|specified directory is not a directory");
+                return 1;
+            }
+        }
+
+        char path_buf[512]{};
+        int rc = yuzu_create_temp_file(
+            std::string{prefix}.c_str(),
+            std::string{suffix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            path_buf, sizeof(path_buf));
+
+        if (rc != 0) {
+            ctx.write_output("error|failed to create temporary file");
+            return 1;
+        }
+
+        ctx.write_output(std::format("path|{}", path_buf));
+        ctx.write_output(std::format("persist|{}", persist));
+
+        // If not persistent, delete the file when this action completes
+        if (persist != "true") {
+            std::error_code ec;
+            fs::remove(path_buf, ec);
+            ctx.write_output("cleanup|deleted");
+        }
+
+        return 0;
+    }
+
+    int do_read(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        auto file_size = fs::file_size(validated, ec);
+        if (ec) file_size = 0;
+
+        // Cap at 100 MB
+        constexpr std::uintmax_t kMaxReadSize = 100ULL * 1024 * 1024;
+        if (file_size > kMaxReadSize) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {})",
+                                         file_size, kMaxReadSize));
+            return 1;
+        }
+
+        // Parse offset and limit
+        int offset = 1;  // 1-based line number
+        int limit = 100;
+        constexpr int kMaxLimit = 10000;
+
+        auto offset_str = params.get("offset");
+        if (!offset_str.empty()) {
+            try { offset = std::stoi(std::string{offset_str}); }
+            catch (...) { offset = 1; }
+            if (offset < 1) offset = 1;
+        }
+
+        auto limit_str = params.get("limit");
+        if (!limit_str.empty()) {
+            try { limit = std::stoi(std::string{limit_str}); }
+            catch (...) { limit = 100; }
+            if (limit < 1) limit = 1;
+            if (limit > kMaxLimit) limit = kMaxLimit;
+        }
+
+        // Binary detection: probe first 512 bytes for NUL
+        {
+            std::ifstream probe(validated, std::ios::binary);
+            char buf[512]{};
+            probe.read(buf, sizeof(buf));
+            auto bytes_read = probe.gcount();
+            for (std::streamsize i = 0; i < bytes_read; ++i) {
+                if (buf[i] == '\0') {
+                    ctx.write_output("error|file appears to be binary");
+                    return 1;
+                }
+            }
+        }
+
+        // Read lines with offset and limit
+        std::ifstream f(validated);
+        if (!f) {
+            ctx.write_output("error|failed to open file");
+            return 1;
+        }
+
+        std::string line;
+        int line_num = 0;
+        int collected = 0;
+        int total_lines = 0;
+
+        while (std::getline(f, line)) {
+            ++line_num;
+            ++total_lines;
+
+            if (line_num < offset) continue;
+            if (collected >= limit) {
+                // Keep counting total lines
+                while (std::getline(f, line)) ++total_lines;
+                break;
+            }
+
+            // Strip trailing \r for CRLF
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
+            ctx.write_output(std::format("line|{}|{}", line_num, line));
+            ++collected;
+        }
+
+        ctx.write_output(std::format("total_lines|{}", total_lines));
+        ctx.write_output(std::format("file_size|{}", file_size));
+        return 0;
+    }
+
+    int do_create_temp_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto prefix    = params.get("prefix", "yuzu-");
+        auto directory = params.get("directory");
+        auto persist   = params.get("persist", "true");
+
+        if (!directory.empty()) {
+            auto validated = validate_path(directory, {});
+            if (validated.empty()) {
+                ctx.write_output("error|directory does not exist or is not accessible");
+                return 1;
+            }
+            std::error_code ec;
+            if (!fs::is_directory(validated, ec)) {
+                ctx.write_output("error|specified directory is not a directory");
+                return 1;
+            }
+        }
+
+        char path_buf[512]{};
+        int rc = yuzu_create_temp_dir(
+            std::string{prefix}.c_str(),
+            directory.empty() ? nullptr : std::string{directory}.c_str(),
+            path_buf, sizeof(path_buf));
+
+        if (rc != 0) {
+            ctx.write_output("error|failed to create temporary directory");
+            return 1;
+        }
+
+        ctx.write_output(std::format("path|{}", path_buf));
+        ctx.write_output(std::format("persist|{}", persist));
+
+        if (persist != "true") {
+            std::error_code ec;
+            fs::remove_all(path_buf, ec);
+            ctx.write_output("cleanup|deleted");
+        }
+
         return 0;
     }
 };

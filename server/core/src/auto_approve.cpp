@@ -89,9 +89,14 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
 }
 
 void AutoApproveEngine::save() const {
+    std::lock_guard lock(mu_);
+    save_locked();
+}
+
+// Must be called with mu_ held.
+void AutoApproveEngine::save_locked() const {
     if (config_path_.empty()) return;
 
-    std::lock_guard lock(mu_);
     std::ofstream f(config_path_, std::ios::trunc);
     if (!f.is_open()) {
         spdlog::error("Failed to save auto-approve config to {}", config_path_.string());
@@ -222,14 +227,14 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr,
 void AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
     std::lock_guard lock(mu_);
     rules_.push_back(rule);
-    save();
+    save_locked();
 }
 
 void AutoApproveEngine::remove_rule(size_t index) {
     std::lock_guard lock(mu_);
     if (index < rules_.size()) {
         rules_.erase(rules_.begin() + static_cast<std::ptrdiff_t>(index));
-        save();
+        save_locked();
     }
 }
 
@@ -237,7 +242,7 @@ void AutoApproveEngine::set_enabled(size_t index, bool enabled) {
     std::lock_guard lock(mu_);
     if (index < rules_.size()) {
         rules_[index].enabled = enabled;
-        save();
+        save_locked();
     }
 }
 

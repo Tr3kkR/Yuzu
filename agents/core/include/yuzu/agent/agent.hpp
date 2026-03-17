@@ -28,6 +28,10 @@ struct Config {
     std::string              log_level{"info"};  // Current log level
     bool                     debug_mode{false};  // Debug mode flag (diagnostic features)
     bool                     verbose_logging{false}; // Verbose logging flag
+
+    // OTA updates
+    bool                     auto_update{true};                          // --no-auto-update disables
+    std::chrono::seconds     update_check_interval{6 * 3600};           // --update-check-interval
 };
 
 /**

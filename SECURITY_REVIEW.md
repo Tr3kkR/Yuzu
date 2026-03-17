@@ -1,6 +1,6 @@
 # Yuzu Codebase Security Review
 
-**Date:** 2026-03-07
+**Date:** 2026-03-07 (refreshed against code + local issue index on 2026-03-16)
 **Scope:** RAII & memory safety, mTLS implementation, authentication/authorization, HTTP API security, enterprise deployment readiness
 
 ---
@@ -10,6 +10,39 @@
 Yuzu is a well-structured C++23 agent/server framework with a solid foundation. The mTLS implementation is above-average for a project at this stage — it includes proper certificate identity binding and peer verification. However, several issues would need to be addressed before enterprise deployment: unauthenticated HTTP endpoints, a thread-safety race in the agent command dispatch, manual JSON construction vulnerable to injection, and the absence of deployment infrastructure (containers, service units, config files).
 
 **Overall assessment:** Good for development/lab use. Needs targeted hardening for production enterprise deployment.
+
+## 0. 2026-03-16 Delta Check (Code + Git Issue Backlog)
+
+This review was cross-checked against:
+
+- `docs/roadmap.md` (GitHub issue index / backlog)
+- `github-issues/26-enterprise-storage-migration-plugin.md` (local issue export)
+- current server/agent/auth code paths
+
+> Note: direct GitHub issue state queries were not available from this environment, so this section compares local issue references and the live code in-repo.
+
+### Findings that are now **outdated** in this document
+
+1. **Session IDs are no longer timestamp-derived.** The server now generates session IDs from cryptographically secure random bytes (`random_bytes(16)`), so the previous “insecure session IDs” finding is no longer accurate.
+2. **Enrollment token validation is implemented for agent registration.** `Register()` now rejects invalid enrollment tokens when token mode is enabled.
+3. **Signal handler safety improved.** Both agent and server signal handlers now avoid `spdlog` and use async-signal-safe writes; agent global pointer is now `std::atomic<Agent*>`.
+4. **Agent dispatch lifecycle improved.** Execution threads are explicitly joined before the subscribe stream goes out of scope, reducing the use-after-free risk documented in section 1.
+5. **`/api/command` is no longer unauthenticated.** It now requires authentication, and admin-only plugin actions are role-gated.
+6. **Agent list JSON construction now uses `nlohmann::json`.** The prior manual-string JSON injection concern in `AgentRegistry::to_json()` is resolved.
+
+### Findings that remain valid (or partially valid)
+
+1. **Not all HTTP routes are authenticated.** `/api/agents`, `/events`, and some legacy status endpoints are still exposed without auth checks.
+2. **Web dashboard still defaults to `0.0.0.0` bind.**
+3. **No HTTPS termination on the dashboard listener by default.**
+4. **Security headers/CSP are still absent.**
+5. **Hand-rolled JSON extraction helpers (`extract_json_string*`) are still used in command parsing and remain fragile.**
+
+### Issue-backlog alignment notes
+
+- The roadmap tracks **HTTPS for dashboard** as issue **#146**, **Token-based API auth** as **#157**, and **Granular RBAC** as **#154**.
+- Code indicates #157/#154 are at least partially implemented (session auth + basic role checks), while #146 appears still pending.
+- Recommendation: add explicit state labels in `docs/roadmap.md` (open/in-progress/closed) so security docs can reference issue status unambiguously.
 
 ---
 

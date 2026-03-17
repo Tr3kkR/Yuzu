@@ -60,6 +60,7 @@ private:
     bool match_rule(const AutoApproveRule& rule, const ApprovalContext& ctx) const;
     bool match_hostname_glob(const std::string& pattern, const std::string& hostname) const;
     bool match_ip_subnet(const std::string& cidr, const std::string& ip) const;
+    void save_locked() const;  // must be called with mu_ held
 
     mutable std::mutex mu_;
     std::vector<AutoApproveRule> rules_;

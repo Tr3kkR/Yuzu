@@ -43,6 +43,34 @@ struct Config {
     std::string           nvd_proxy;                              // HTTP proxy for NVD API (e.g. "http://proxy:8080")
     std::chrono::seconds  nvd_sync_interval{4 * 3600};            // Default: 4 hours
     bool                  nvd_sync_enabled{true};
+
+    // OTA agent updates
+    std::filesystem::path update_dir;         // Directory for agent binaries (default: <config_dir>/agent-updates/)
+    bool                  ota_enabled{true};   // Master switch for OTA updates
+
+    // HTTPS for web dashboard
+    bool                  https_enabled{false};
+    int                   https_port{8443};
+    std::filesystem::path https_cert_path;
+    std::filesystem::path https_key_path;
+    bool                  https_redirect{true};  // HTTP→HTTPS 301 redirect
+
+    // Response persistence
+    int                   response_retention_days{90};
+
+    // Audit trail
+    int                   audit_retention_days{365};
+
+    // Analytics
+    bool                  analytics_enabled{true};
+    int                   analytics_drain_interval_seconds{10};
+    int                   analytics_batch_size{100};
+    std::string           clickhouse_url;           // empty = disabled
+    std::string           clickhouse_database{"yuzu"};
+    std::string           clickhouse_table{"yuzu_events"};
+    std::string           clickhouse_username;
+    std::string           clickhouse_password;
+    std::filesystem::path analytics_jsonl_path;     // empty = disabled
 };
 
 /**

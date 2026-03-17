@@ -13,6 +13,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
@@ -34,6 +35,7 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include <filesystem>
 #include <fstream>
 #include <format>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -55,10 +57,10 @@ std::string read_file_contents(const std::filesystem::path& p) {
 }
 
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
-// (Subscribe RPC: stream CommandResponse → stream CommandRequest)
+// (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
-// ── Context implementations ────────────────────────────────────────────────────
+// Context implementations
 // These are passed to plugins; they bridge the C ABI callbacks to gRPC streams.
 
 struct PluginContextImpl {
@@ -66,7 +68,7 @@ struct PluginContextImpl {
 };
 
 struct CommandContextImpl {
-    SubscribeStream* stream;
+    std::shared_ptr<SubscribeStream> stream;
     std::mutex*      write_mu;   // protects concurrent stream->Write()
     std::string      command_id;
     std::chrono::steady_clock::time_point start_time;
@@ -81,7 +83,7 @@ struct ScopeExit {
 
 }  // anonymous namespace
 
-// ── C ABI context function implementations ────────────────────────────────────
+// C ABI context function implementations
 
 extern "C" {
 
@@ -118,7 +120,7 @@ YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* 
 
 }  // extern "C"
 
-// ── AgentImpl ─────────────────────────────────────────────────────────────────
+// AgentImpl
 
 class AgentImpl final : public Agent {
 public:
@@ -156,24 +158,60 @@ public:
         plugin_ctx_.config["agent.log_level"]          = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"]         = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"]    = cfg_.verbose_logging ? "true" : "false";
+        plugin_ctx_.config["agent.reconnect_count"]    = "0";
+
+        // Record start time for uptime calculation
+        auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        plugin_ctx_.config["agent.start_time_epoch"] = std::to_string(start_epoch);
+
+        size_t module_index = 0;
+        auto record_module = [this, &module_index](
+                                 std::string_view name,
+                                 std::string_view version,
+                                 std::string_view description,
+                                 std::string_view status) {
+            auto prefix = std::format("agent.modules.{}", module_index++);
+            plugin_ctx_.config[prefix + ".name"] = std::string{name};
+            plugin_ctx_.config[prefix + ".version"] = std::string{version};
+            plugin_ctx_.config[prefix + ".description"] = std::string{description};
+            plugin_ctx_.config[prefix + ".status"] = std::string{status};
+        };
+
+        for (const auto& err : scan.errors) {
+            auto module_name = std::filesystem::path{err.path}.stem().string();
+            record_module(module_name, "", err.reason, "load_failed");
+        }
 
         auto* raw_plugin_ctx = reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
 
         for (auto& handle : candidates) {
+            const auto* descriptor = handle.descriptor();
             if (handle.descriptor()->init) {
                 int rc = handle.descriptor()->init(raw_plugin_ctx);
                 if (rc != 0) {
                     spdlog::warn("Plugin {} init returned {}, skipping",
                         handle.descriptor()->name, rc);
+                    record_module(
+                        descriptor->name,
+                        descriptor->version,
+                        std::format("{} (init rc={})", descriptor->description, rc),
+                        "init_failed");
                     continue;
                 }
             }
+            record_module(
+                descriptor->name,
+                descriptor->version,
+                descriptor->description,
+                "loaded");
             plugin_names_.emplace_back(handle.descriptor()->name);
             plugins_.push_back(std::move(handle));
         }
 
         // Populate plugin list in config (available to all plugins via get_config)
         plugin_ctx_.config["agent.plugins.count"] = std::to_string(plugins_.size());
+        plugin_ctx_.config["agent.modules.count"] = std::to_string(module_index);
         for (size_t i = 0; i < plugins_.size(); ++i) {
             auto prefix = std::format("agent.plugins.{}", i);
             plugin_ctx_.config[prefix + ".name"]        = plugins_[i].descriptor()->name;
@@ -308,6 +346,46 @@ public:
                 }
             }
 
+            // Load agent tags from tags.json and populate scopable_tags
+            {
+                auto tags_path = cfg_.data_dir / "tags.json";
+                std::error_code tag_ec;
+                if (std::filesystem::exists(tags_path, tag_ec)) {
+                    std::ifstream tags_file(tags_path);
+                    if (tags_file) {
+                        try {
+                            std::string tags_content = read_file_contents(tags_path);
+                            auto* tags_map = info->mutable_scopable_tags();
+                            // Quick manual JSON parse for flat {"key":"value",...} objects
+                            size_t pos = 0;
+                            while ((pos = tags_content.find('"', pos)) != std::string::npos) {
+                                size_t key_start = pos + 1;
+                                size_t key_end = tags_content.find('"', key_start);
+                                if (key_end == std::string::npos) break;
+                                std::string key = tags_content.substr(key_start, key_end - key_start);
+                                pos = key_end + 1;
+                                pos = tags_content.find(':', pos);
+                                if (pos == std::string::npos) break;
+                                pos = tags_content.find('"', pos);
+                                if (pos == std::string::npos) break;
+                                size_t val_start = pos + 1;
+                                size_t val_end = tags_content.find('"', val_start);
+                                if (val_end == std::string::npos) break;
+                                std::string val = tags_content.substr(val_start, val_end - val_start);
+                                (*tags_map)[key] = val;
+                                pos = val_end + 1;
+                            }
+                            if (!tags_map->empty()) {
+                                spdlog::info("Loaded {} tags from {}", tags_map->size(),
+                                             tags_path.string());
+                            }
+                        } catch (...) {
+                            spdlog::warn("Failed to parse tags.json");
+                        }
+                    }
+                }
+            }
+
             for (const auto& handle : plugins_) {
                 auto* pi = info->add_plugins();
                 pi->set_name(handle.descriptor()->name);
@@ -337,6 +415,7 @@ public:
             }
 
             pb::RegisterResponse resp;
+            auto register_start = std::chrono::steady_clock::now();
             auto status = stub->Register(&ctx, req, &resp);
             if (!status.ok()) {
                 spdlog::error("Failed to register with server: {}",
@@ -351,14 +430,70 @@ public:
 
             auto enrollment_status = resp.enrollment_status();
             if (enrollment_status == "pending") {
-                spdlog::warn("Registration pending admin approval — agent will not receive commands until approved");
+                spdlog::warn("Registration pending admin approval - agent will not receive commands until approved");
                 spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard", cfg_.agent_id);
                 return;
             }
 
             session_id_ = resp.session_id();
+            auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            plugin_ctx_.config["agent.session_id"] = session_id_;
+            plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+
+            // Measure Register RPC latency
+            auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - register_start).count();
+            plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
+
+            // Query gRPC channel state
+            if (channel) {
+                auto state = channel->GetState(false);
+                const char* state_str = "UNKNOWN";
+                switch (state) {
+                    case GRPC_CHANNEL_IDLE: state_str = "IDLE"; break;
+                    case GRPC_CHANNEL_CONNECTING: state_str = "CONNECTING"; break;
+                    case GRPC_CHANNEL_READY: state_str = "READY"; break;
+                    case GRPC_CHANNEL_TRANSIENT_FAILURE: state_str = "TRANSIENT_FAILURE"; break;
+                    case GRPC_CHANNEL_SHUTDOWN: state_str = "SHUTDOWN"; break;
+                }
+                plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
+            }
             spdlog::info("Registered with server (session={}, enrollment={})",
                 session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
+        }
+
+        // 3b. OTA updater: rollback check and old binary cleanup
+        {
+#if defined(_WIN32)
+            constexpr const char* kOsString   = "windows";
+            constexpr const char* kArchString = "x86_64";
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+            constexpr const char* kOsString   = "darwin";
+            constexpr const char* kArchString = "aarch64";
+#  else
+            constexpr const char* kOsString   = "darwin";
+            constexpr const char* kArchString = "x86_64";
+#  endif
+#elif defined(__aarch64__)
+            constexpr const char* kOsString   = "linux";
+            constexpr const char* kArchString = "aarch64";
+#else
+            constexpr const char* kOsString   = "linux";
+            constexpr const char* kArchString = "x86_64";
+#endif
+            updater_ = std::make_unique<Updater>(
+                UpdateConfig{cfg_.auto_update, cfg_.update_check_interval},
+                cfg_.agent_id,
+                std::string{yuzu::kFullVersionString},
+                kOsString, kArchString,
+                current_executable_path());
+
+            if (updater_->rollback_if_needed()) {
+                spdlog::warn("OTA rollback was triggered - running previous binary");
+            }
+            updater_->cleanup_old_binary();
         }
 
         // 4. Open Subscribe bidi stream
@@ -369,18 +504,57 @@ public:
             }
             subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
 
-            auto stream = stub->Subscribe(&sub_ctx);
+            std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
             if (!stream) {
                 spdlog::error("Failed to open Subscribe stream");
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
                 return;
             }
-            spdlog::info("Subscribe stream opened — waiting for commands");
+            spdlog::info("Subscribe stream opened - waiting for commands");
+
+            // 4b. Spawn OTA update check thread
+            if (cfg_.auto_update && updater_) {
+                auto* raw_stub = static_cast<void*>(stub.get());
+                update_thread_ = std::thread([this, raw_stub]() {
+                    spdlog::info("OTA update checker started (interval={}s)",
+                        cfg_.update_check_interval.count());
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        auto result = updater_->check_and_apply(raw_stub);
+                        if (result.has_value() && result.value()) {
+                            spdlog::info("OTA update applied - agent will restart");
+                            stop();
+                            return;
+                        }
+                        if (!result.has_value()) {
+                            spdlog::warn("OTA update check failed: {}",
+                                result.error().message);
+                        }
+                        // Sleep in small increments so we can respond to stop quickly
+                        auto remaining = cfg_.update_check_interval;
+                        while (remaining.count() > 0
+                               && !stop_requested_.load(std::memory_order_acquire)) {
+                            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
+                            std::this_thread::sleep_for(sleep_time);
+                            remaining -= sleep_time;
+                        }
+                    }
+                });
+            }
 
             // 5. Read commands from server and dispatch to plugins
+            bool update_verified = false;
             pb::CommandRequest cmd;
             while (stream->Read(&cmd)) {
                 if (stop_requested_.load(std::memory_order_acquire)) break;
+
+                // Write health marker after first successful read (OTA rollback guard)
+                if (!update_verified) {
+                    update_verified = true;
+                    auto marker = current_executable_path().parent_path()
+                                  / ".yuzu-update-verified";
+                    std::ofstream{marker} << "ok";
+                    spdlog::debug("Wrote update verification marker: {}", marker.string());
+                }
 
                 spdlog::info("Received command: plugin={}, action={}, id={}",
                     cmd.plugin(), cmd.action(), cmd.command_id());
@@ -408,19 +582,20 @@ public:
                 // Dispatch execute() in a background thread.
                 // chargen_start blocks until chargen_stop sets the atomic flag,
                 // so concurrent dispatch is required.
-                auto* raw_stream = stream.get();
-                std::thread exec_thread([this, target, cmd, raw_stream]() {
+                // Each thread captures the shared_ptr to guarantee the stream
+                // outlives all writers (fixes use-after-free risk from #66).
+                std::thread exec_thread([this, target, cmd, stream]() {
                     metrics_.counter("yuzu_agent_commands_executed_total",
                         {{"plugin", cmd.plugin()}}).increment();
                     CommandContextImpl ctx_impl{
-                        .stream     = raw_stream,
+                        .stream     = stream,
                         .write_mu   = &stream_write_mu_,
                         .command_id = cmd.command_id(),
                         .start_time = std::chrono::steady_clock::now(),
                     };
                     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
 
-                    // Convert protobuf parameter map → C ABI YuzuParam array
+                    // Convert protobuf parameter map -> C ABI YuzuParam array
                     std::vector<std::string> keys, values;
                     for (const auto& [k, v] : cmd.parameters()) {
                         keys.push_back(k);
@@ -451,7 +626,7 @@ public:
                         timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(timing_resp, grpc::WriteOptions());
+                        stream->Write(timing_resp, grpc::WriteOptions());
                     }
 
                     // Send final status
@@ -468,7 +643,7 @@ public:
                         final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                         std::lock_guard lock(stream_write_mu_);
-                        raw_stream->Write(final_resp, grpc::WriteOptions());
+                        stream->Write(final_resp, grpc::WriteOptions());
                     }
 
                     spdlog::info("Command {} finished (rc={}, exec={}ms)",
@@ -482,6 +657,34 @@ public:
             }
 
             subscribe_ctx_.store(nullptr, std::memory_order_release);
+
+            // Shutdown plugins first - signals long-running commands (e.g. chargen)
+            // to stop, so their exec threads can finish and release the stream.
+            for (auto& handle : plugins_) {
+                if (handle.descriptor()->shutdown) {
+                    handle.descriptor()->shutdown(
+                        reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
+                }
+            }
+
+            // Join all exec threads BEFORE stream goes out of scope,
+            // since they hold raw pointers to the stream for Write() calls.
+            {
+                std::lock_guard lock(exec_mu_);
+                for (auto& t : exec_threads_) {
+                    if (t.joinable()) t.join();
+                }
+                exec_threads_.clear();
+            }
+
+            // Stop and join the OTA update thread
+            if (updater_) {
+                updater_->stop();
+            }
+            if (update_thread_.joinable()) {
+                update_thread_.join();
+            }
+
             spdlog::info("Subscribe stream ended");
         }
 
@@ -489,6 +692,7 @@ public:
 
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
+        if (updater_) updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
@@ -514,9 +718,11 @@ private:
     std::mutex                          stream_write_mu_;
     std::mutex                          exec_mu_;
     std::vector<std::thread>            exec_threads_;
+    std::unique_ptr<Updater>            updater_;
+    std::thread                         update_thread_;
 };
 
-// ── Factory ───────────────────────────────────────────────────────────────────
+// Factory
 
 std::unique_ptr<Agent> Agent::create(Config config) {
     return std::make_unique<AgentImpl>(std::move(config));

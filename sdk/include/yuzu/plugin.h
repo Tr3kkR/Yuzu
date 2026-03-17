@@ -150,6 +150,98 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
  */
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key);
 
+/* ── SDK utility functions (format conversion) ──────────────────────────────── */
+
+/**
+ * Free a string allocated by SDK utility functions (table_to_json, etc.).
+ * Passing NULL is safe (no-op).
+ */
+YUZU_EXPORT void yuzu_free_string(char* str);
+
+/**
+ * Convert pipe-delimited rows to a JSON array of objects.
+ *
+ * @param input         Pipe-delimited text (UTF-8, newline-separated rows).
+ * @param column_names  Array of column name strings.
+ * @param column_count  Length of column_names array.
+ * @return Allocated JSON string, or NULL on error. Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_table_to_json(
+    const char*         input,
+    const char* const*  column_names,
+    size_t              column_count);
+
+/**
+ * Convert a JSON array of objects to pipe-delimited rows.
+ *
+ * @param json_input    JSON string (must be an array of objects).
+ * @param column_names  Array of column name strings (keys to extract, in order).
+ * @param column_count  Length of column_names array.
+ * @return Allocated pipe-delimited string, or NULL on error.
+ *         Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_json_to_table(
+    const char*         json_input,
+    const char* const*  column_names,
+    size_t              column_count);
+
+/**
+ * Normalize line endings in a string: \r\n and \r become \n.
+ *
+ * @param input  UTF-8 text with any mix of line endings.
+ * @return Allocated string with normalized \n endings.
+ *         Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_split_lines(const char* input);
+
+/**
+ * Generate a newline-separated sequence of numbered identifiers.
+ *
+ * @param start   Starting number.
+ * @param count   How many identifiers to generate.
+ * @param prefix  Prefix prepended to each number (may be NULL for no prefix).
+ * @return Allocated string, or NULL on error. Free with yuzu_free_string().
+ */
+YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefix);
+
+/* ── Secure temporary file utilities ────────────────────────────────────────── */
+
+/**
+ * Create a secure temporary file with restricted permissions.
+ * POSIX: uses mkstemps() with mode 0600 (owner read/write only).
+ * Windows: uses CreateFile with CREATE_NEW and owner-only DACL.
+ *
+ * @param prefix       Filename prefix (e.g., "yuzu-"). NULL defaults to "yuzu-".
+ * @param suffix       File extension (e.g., ".tmp"). NULL defaults to ".tmp".
+ * @param directory    Override temp directory. NULL uses the system default.
+ * @param path_out     Buffer to receive the null-terminated absolute path.
+ * @param path_out_size Size of path_out in bytes (recommend >= 512).
+ * @return             0 on success, non-zero on failure.
+ */
+YUZU_EXPORT int yuzu_create_temp_file(
+    const char* prefix,
+    const char* suffix,
+    const char* directory,
+    char*       path_out,
+    size_t      path_out_size);
+
+/**
+ * Create a secure temporary directory with restricted permissions.
+ * POSIX: uses mkdtemp() with mode 0700 (owner only).
+ * Windows: creates directory with owner-only DACL.
+ *
+ * @param prefix       Directory name prefix (e.g., "yuzu-"). NULL defaults to "yuzu-".
+ * @param directory    Override parent directory. NULL uses the system default.
+ * @param path_out     Buffer to receive the null-terminated absolute path.
+ * @param path_out_size Size of path_out in bytes (recommend >= 512).
+ * @return             0 on success, non-zero on failure.
+ */
+YUZU_EXPORT int yuzu_create_temp_dir(
+    const char* prefix,
+    const char* directory,
+    char*       path_out,
+    size_t      path_out_size);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

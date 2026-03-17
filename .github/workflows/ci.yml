@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   MESON_VERSION: "1.9.2"
+  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
 
 jobs:
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
@@ -33,13 +33,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
       - name: Install system packages
         run: |
           sudo apt-get update
@@ -50,11 +43,17 @@ jobs:
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
         run: |
@@ -67,7 +66,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang17.ini' }} \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -93,21 +92,23 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
         run: |
@@ -116,26 +117,18 @@ jobs:
             --x-manifest-root="${{ github.workspace }}"
 
       - name: Configure (Meson)
-        shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson setup builddir ^
-            --buildtype=${{ matrix.build_type }} ^
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-windows ^
-            -Dbuild_tests=true ^
+          meson setup builddir `
+            --buildtype=${{ matrix.build_type }} `
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
+            -Dbuild_tests=true `
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson compile -C builddir
+        run: meson compile -C builddir
 
       - name: Test
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          meson test -C builddir --print-errorlogs
+        run: meson test -C builddir --print-errorlogs
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────────
   macos:
@@ -153,23 +146,22 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v8
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
       - name: Install dependencies
         run: |
-          brew install cmake ninja
-          pip3 install meson==${{ env.MESON_VERSION }}
+          brew install cmake ninja pipx
+          pipx install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
         run: |
@@ -182,7 +174,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-osx \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -216,18 +208,17 @@ jobs:
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v8
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: 'c1f21baeaf7127c13ee141fe1bdaa49eed371c0c'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages (cross)
         run: |
@@ -240,8 +231,208 @@ jobs:
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/arm64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-linux \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
         run: meson compile -C builddir
+
+  # ── Lint (clang-format) ───────────────────────────────────────────────────
+  lint:
+    name: "Lint (clang-format)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-17
+
+      - name: Check formatting
+        run: |
+          find agents server sdk tests \
+            -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
+            | grep -v '\.pb\.' \
+            | xargs clang-format-17 --dry-run --Werror
+
+  # ── Sanitizers (ASan + UBSan) ───────────────────────────────────────────
+  sanitize-asan:
+    name: "Sanitizers (ASan+UBSan)"
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + ASan/UBSan)
+        run: |
+          meson setup builddir \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_sanitize=address,undefined
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+  # ── Sanitizers (TSan) ───────────────────────────────────────────────────
+  sanitize-tsan:
+    name: "Sanitizers (TSan)"
+    runs-on: ubuntu-24.04
+    env:
+      TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + TSan)
+        run: |
+          meson setup builddir \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_sanitize=thread
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+  # ── Coverage ────────────────────────────────────────────────────────────
+  coverage:
+    name: "Coverage (GCC 13)"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }} gcovr
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + coverage)
+        run: |
+          meson setup builddir \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_coverage=true
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Test
+        run: meson test -C builddir --print-errorlogs
+
+      - name: Generate coverage reports
+        run: |
+          gcovr --root . \
+            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
+            --exclude '.*\.pb\.(h|cc)$' \
+            --xml -o builddir/coverage.xml
+          gcovr --root . \
+            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
+            --exclude '.*\.pb\.(h|cc)$' \
+            --html --html-details -o builddir/coverage-html/index.html
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: builddir/coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: builddir/coverage-html/

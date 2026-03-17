@@ -25,6 +25,12 @@ service AgentService {
 
   // ReportInventory pushes full inventory data to the server.
   rpc ReportInventory(InventoryReport) returns (InventoryAck);
+
+  // CheckForUpdate queries whether a newer agent binary is available.
+  rpc CheckForUpdate(CheckForUpdateRequest) returns (CheckForUpdateResponse);
+
+  // DownloadUpdate streams the agent binary in chunks over the mTLS channel.
+  rpc DownloadUpdate(DownloadUpdateRequest) returns (stream DownloadUpdateChunk);
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -35,6 +41,7 @@ message AgentInfo {
   yuzu.common.v1.Platform platform = 3;
   string agent_version = 4;
   repeated yuzu.common.v1.PluginInfo plugins = 5;
+  map<string, string> scopable_tags = 6;  // Tags for scope evaluation
 }
 
 message RegisterRequest {
@@ -118,4 +125,33 @@ message InventoryReport {
 
 message InventoryAck {
   bool received = 1;
+}
+
+// ── OTA Updates ─────────────────────────────────────────────────────────────
+
+message CheckForUpdateRequest {
+  string agent_id        = 1;
+  string current_version = 2;  // e.g. "0.1.0+42"
+  yuzu.common.v1.Platform platform = 3;
+}
+
+message CheckForUpdateResponse {
+  bool   update_available = 1;
+  string latest_version   = 2;  // e.g. "0.2.0+87"
+  string sha256           = 3;  // Hex-encoded SHA-256 of the binary
+  bool   mandatory        = 4;  // If true, agent must update immediately
+  bool   eligible         = 5;  // Rollout eligibility for this agent
+  int64  file_size        = 6;  // Binary size in bytes
+}
+
+message DownloadUpdateRequest {
+  string agent_id = 1;
+  string version  = 2;  // Version to download (from CheckForUpdateResponse)
+  yuzu.common.v1.Platform platform = 3;
+}
+
+message DownloadUpdateChunk {
+  bytes data       = 1;  // Chunk payload (up to 64 KB)
+  int64 offset     = 2;  // Byte offset within the file
+  int64 total_size = 3;  // Total file size (repeated for resilience)
 }

@@ -5,6 +5,17 @@
 #include <yuzu/secure_zero.hpp>
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "update_registry.hpp"
+#include "response_store.hpp"
+#include "audit_store.hpp"
+#include "tag_store.hpp"
+#include "scope_engine.hpp"
+#include "instruction_store.hpp"
+#include "execution_tracker.hpp"
+#include "approval_manager.hpp"
+#include "schedule_engine.hpp"
+#include "analytics_event.hpp"
+#include "analytics_event_store.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -29,12 +40,13 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <ranges>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <string_view>
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -46,6 +58,10 @@ extern const char* const kProcfetchIndexHtml;
 // Login and Settings pages (separate TUs).
 extern const char* const kLoginHtml;
 extern const char* const kSettingsHtml;
+
+// Help and Instruction management pages (separate TUs).
+extern const char* const kHelpHtml;
+extern const char* const kInstructionPageHtml;
 
 namespace yuzu::server {
 
@@ -122,6 +138,7 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
+    std::unordered_map<std::string, std::string> scopable_tags;
 
     // Stream pointer — valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -142,6 +159,9 @@ public:
         session->os            = info.platform().os();
         session->arch          = info.platform().arch();
         session->agent_version = info.agent_version();
+        for (const auto& [k, v] : info.scopable_tags()) {
+            session->scopable_tags[k] = v;
+        }
         for (const auto& p : info.plugins()) {
             session->plugin_names.push_back(p.name());
             PluginMeta pm;
@@ -221,7 +241,7 @@ public:
         {
             std::lock_guard lock(mu_);
             snapshot.reserve(agents_.size());
-            for (auto& [id, s] : agents_) {
+            for (auto& s : agents_ | std::views::values) {
                 snapshot.push_back(s);
             }
         }
@@ -245,7 +265,7 @@ public:
         std::lock_guard lock(mu_);
 
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             arr.push_back({
                 {"agent_id",      s->agent_id},
                 {"hostname",      s->hostname},
@@ -263,7 +283,7 @@ public:
 
         // Deduplicate plugins by name (take the richest action list)
         std::unordered_map<std::string, const PluginMeta*> best;
-        for (const auto& [id, s] : agents_) {
+        for (const auto& s : agents_ | std::views::values) {
             for (const auto& pm : s->plugin_meta) {
                 auto it = best.find(pm.name);
                 if (it == best.end() || pm.actions.size() > it->second->actions.size()) {
@@ -275,8 +295,8 @@ public:
         // Sort by plugin name
         std::vector<const PluginMeta*> sorted;
         sorted.reserve(best.size());
-        for (const auto& [name, pm] : best) sorted.push_back(pm);
-        std::sort(sorted.begin(), sorted.end(),
+        for (const auto* pm : best | std::views::values) sorted.push_back(pm);
+        std::ranges::sort(sorted,
             [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
         nlohmann::json plugins_arr = nlohmann::json::array();
@@ -307,7 +327,7 @@ public:
         std::lock_guard lock(mu_);
         std::vector<std::string> ids;
         ids.reserve(agents_.size());
-        for (const auto& [id, s] : agents_) {
+        for (const auto& id : agents_ | std::views::keys) {
             ids.push_back(id);
         }
         return ids;
@@ -328,6 +348,45 @@ public:
     std::size_t agent_count() const {
         std::lock_guard lock(mu_);
         return agents_.size();
+    }
+
+    // Get a session by agent_id (for scope evaluation).
+    std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        return it != agents_.end() ? it->second : nullptr;
+    }
+
+    // Evaluate a scope expression against all agents, return matching agent IDs.
+    std::vector<std::string> evaluate_scope(
+        const yuzu::scope::Expression& expr,
+        const TagStore* tag_store) const
+    {
+        std::vector<std::string> matched;
+        std::lock_guard lock(mu_);
+        for (const auto& [id, session] : agents_) {
+            auto resolver = [&](std::string_view attr) -> std::string {
+                auto key = std::string(attr);
+                if (key == "ostype")        return session->os;
+                if (key == "hostname")      return session->hostname;
+                if (key == "arch")          return session->arch;
+                if (key == "agent_version") return session->agent_version;
+                // tag:X lookups
+                if (key.starts_with("tag:")) {
+                    auto tag_key = key.substr(4);
+                    // First check in-memory scopable_tags
+                    auto it = session->scopable_tags.find(tag_key);
+                    if (it != session->scopable_tags.end()) return it->second;
+                    // Then check persistent TagStore
+                    if (tag_store) return tag_store->get_tag(id, tag_key);
+                }
+                return {};
+            };
+            if (yuzu::scope::evaluate(expr, resolver)) {
+                matched.push_back(id);
+            }
+        }
+        return matched;
     }
 
 private:
@@ -396,13 +455,20 @@ public:
                      auth::AuthManager& auth_mgr,
                      auth::AutoApproveEngine& auto_approve,
                      yuzu::MetricsRegistry& metrics,
-                     bool gateway_mode = false)
+                     bool gateway_mode = false,
+                     UpdateRegistry* update_registry = nullptr)
         : registry_(registry), bus_(bus),
-          require_client_identity_(require_client_identity),
           auth_mgr_(auth_mgr),
           auto_approve_(auto_approve),
           metrics_(metrics),
-          gateway_mode_(gateway_mode) {}
+          require_client_identity_(require_client_identity),
+          gateway_mode_(gateway_mode),
+          update_registry_(update_registry) {}
+
+    void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+    void set_response_store(ResponseStore* store) { response_store_ = store; }
+    void set_tag_store(TagStore* store) { tag_store_ = store; }
+    void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -436,6 +502,17 @@ public:
                 response->set_accepted(false);
                 response->set_reject_reason("invalid, expired, or exhausted enrollment token");
                 response->set_enrollment_status("denied");
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_denied";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    ae.severity = Severity::kWarn;
+                    ae.attributes = {{"reason", "invalid_token"}};
+                    analytics_store_->emit(std::move(ae));
+                }
                 return grpc::Status::OK;
             }
             spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
@@ -490,6 +567,15 @@ public:
                 response->set_enrollment_status("pending");
                 bus_.publish("pending-agent", info.agent_id());
                 spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_pending";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    analytics_store_->emit(std::move(ae));
+                }
                 return grpc::Status::OK;
             }
 
@@ -504,6 +590,17 @@ public:
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
+                    if (analytics_store_) {
+                        AnalyticsEvent ae;
+                        ae.event_type = "agent.enrollment_denied";
+                        ae.agent_id = info.agent_id();
+                        ae.hostname = info.hostname();
+                        ae.os = info.platform().os();
+                        ae.arch = info.platform().arch();
+                        ae.severity = Severity::kWarn;
+                        ae.attributes = {{"reason", "admin_denied"}};
+                        analytics_store_->emit(std::move(ae));
+                    }
                     return grpc::Status::OK;
 
                 case auth::PendingStatus::approved:
@@ -517,6 +614,32 @@ public:
         // ── Agent is enrolled — proceed with registration ────────────────
 
         registry_.register_agent(info);
+
+        if (analytics_store_) {
+            AnalyticsEvent ae;
+            ae.event_type = "agent.registered";
+            ae.agent_id = info.agent_id();
+            ae.hostname = info.hostname();
+            ae.os = info.platform().os();
+            ae.arch = info.platform().arch();
+            ae.agent_version = info.agent_version();
+            ae.attributes = {{"enrollment_method", enrollment_token.empty() ? "approval" : "token"}};
+            nlohmann::json plugins_list = nlohmann::json::array();
+            for (const auto& p : info.plugins()) {
+                plugins_list.push_back(p.name());
+            }
+            ae.payload = {{"plugins", plugins_list}};
+            analytics_store_->emit(std::move(ae));
+        }
+
+        // Sync agent-reported tags to persistent TagStore
+        if (tag_store_ && !info.scopable_tags().empty()) {
+            std::unordered_map<std::string, std::string> tags;
+            for (const auto& [k, v] : info.scopable_tags()) {
+                tags[k] = v;
+            }
+            tag_store_->sync_agent_tags(info.agent_id(), tags);
+        }
 
         auto session_id = "session-" + auth::AuthManager::bytes_to_hex(
             auth::AuthManager::random_bytes(16));
@@ -584,6 +707,16 @@ public:
         spdlog::info("Agent subscribe stream opened for {}", agent_id);
         registry_.set_stream(agent_id, stream);
 
+        auto subscribe_start = std::chrono::steady_clock::now();
+        if (analytics_store_) {
+            AnalyticsEvent ae;
+            ae.event_type = "agent.connected";
+            ae.agent_id = agent_id;
+            ae.session_id = session_id;
+            ae.attributes = {{"via", "direct"}};
+            analytics_store_->emit(std::move(ae));
+        }
+
         // Read loop — process responses from the agent
         pb::CommandResponse resp;
         while (stream->Read(&resp)) {
@@ -599,7 +732,7 @@ public:
                 // Track first response for server-side latency
                 {
                     std::lock_guard lock(cmd_times_mu_);
-                    if (cmd_first_seen_.find(resp.command_id()) == cmd_first_seen_.end()) {
+                    if (!cmd_first_seen_.contains(resp.command_id())) {
                         cmd_first_seen_.insert(resp.command_id());
                         auto it = cmd_send_times_.find(resp.command_id());
                         if (it != cmd_send_times_.end()) {
@@ -619,11 +752,44 @@ public:
                 bus_.publish("output",
                     agent_id + "|" + plugin + "|" + resp.output());
 
+                // Store streaming response
+                if (response_store_) {
+                    StoredResponse sr;
+                    sr.instruction_id = resp.command_id();
+                    sr.agent_id = agent_id;
+                    sr.status = static_cast<int>(resp.status());
+                    sr.output = resp.output();
+                    response_store_->store(sr);
+                }
+
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "command.response";
+                    ae.agent_id = agent_id;
+                    ae.plugin = plugin;
+                    ae.correlation_id = resp.command_id();
+                    ae.payload = {{"output_bytes", resp.output().size()}};
+                    analytics_store_->emit(std::move(ae));
+                }
+
             } else {
                 spdlog::info("Command {} completed: status={}, exit_code={}",
                     resp.command_id(),
                     static_cast<int>(resp.status()),
                     resp.exit_code());
+
+                // Store completion response
+                if (response_store_) {
+                    StoredResponse sr;
+                    sr.instruction_id = resp.command_id();
+                    sr.agent_id = agent_id;
+                    sr.status = static_cast<int>(resp.status());
+                    sr.output = resp.output();
+                    if (resp.has_error()) {
+                        sr.error_detail = resp.error().message();
+                    }
+                    response_store_->store(sr);
+                }
 
                 std::string status_str =
                     (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -631,6 +797,22 @@ public:
                     {{"status", status_str}}).increment();
                 bus_.publish("command-status",
                     resp.command_id() + "|" + status_str);
+
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "command.completed";
+                    ae.agent_id = agent_id;
+                    ae.plugin = extract_plugin(resp.command_id());
+                    ae.correlation_id = resp.command_id();
+                    ae.severity = (resp.status() == pb::CommandResponse::SUCCESS)
+                                  ? Severity::kInfo : Severity::kError;
+                    ae.payload = {{"status", status_str},
+                                  {"exit_code", resp.exit_code()}};
+                    if (resp.has_error()) {
+                        ae.payload["error_message"] = resp.error().message();
+                    }
+                    analytics_store_->emit(std::move(ae));
+                }
 
                 // Publish total round-trip and clean up timing maps
                 {
@@ -655,6 +837,17 @@ public:
         registry_.clear_stream(agent_id);
         registry_.remove_agent(agent_id);
         spdlog::info("Agent subscribe stream closed for {}", agent_id);
+
+        if (analytics_store_) {
+            auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - subscribe_start).count();
+            AnalyticsEvent ae;
+            ae.event_type = "agent.disconnected";
+            ae.agent_id = agent_id;
+            ae.session_id = session_id;
+            ae.payload = {{"session_duration_ms", session_duration}};
+            analytics_store_->emit(std::move(ae));
+        }
 
         return grpc::Status::OK;
     }
@@ -749,6 +942,99 @@ private:
         return command_id;
     }
 
+    // ── OTA Update RPCs ─────────────────────────────────────────────────────
+
+    grpc::Status CheckForUpdate(
+        grpc::ServerContext* /*context*/,
+        const pb::CheckForUpdateRequest* request,
+        pb::CheckForUpdateResponse* response) override
+    {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "CheckForUpdate"}, {"status", "received"}}).increment();
+
+        if (!update_registry_) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        auto latest = update_registry_->latest_for(
+            request->platform().os(), request->platform().arch());
+
+        if (!latest) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        // Compare: if agent already has latest or newer, no update
+        if (compare_versions(latest->version, request->current_version()) <= 0) {
+            response->set_update_available(false);
+            return grpc::Status::OK;
+        }
+
+        bool eligible = UpdateRegistry::is_eligible(
+            request->agent_id(), latest->rollout_pct);
+
+        response->set_update_available(true);
+        response->set_latest_version(latest->version);
+        response->set_sha256(latest->sha256);
+        response->set_mandatory(latest->mandatory);
+        response->set_eligible(eligible);
+        response->set_file_size(latest->file_size);
+
+        spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
+                     request->agent_id(), request->current_version(),
+                     latest->version, eligible, latest->mandatory);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status DownloadUpdate(
+        grpc::ServerContext* /*context*/,
+        const pb::DownloadUpdateRequest* request,
+        grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) override
+    {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "DownloadUpdate"}, {"status", "received"}}).increment();
+
+        if (!update_registry_) {
+            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
+        }
+
+        auto pkg = update_registry_->latest_for(
+            request->platform().os(), request->platform().arch());
+        if (!pkg || pkg->version != request->version()) {
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
+        }
+
+        auto file_path = update_registry_->binary_path(*pkg);
+        std::ifstream file(file_path, std::ios::binary);
+        if (!file) {
+            spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
+        }
+
+        constexpr std::size_t kChunkSize = 64 * 1024;  // 64KB
+        std::vector<char> buffer(kChunkSize);
+        int64_t offset = 0;
+
+        while (file.read(buffer.data(), static_cast<std::streamsize>(kChunkSize)) || file.gcount() > 0) {
+            pb::DownloadUpdateChunk chunk;
+            chunk.set_data(buffer.data(), static_cast<std::size_t>(file.gcount()));
+            chunk.set_offset(offset);
+            chunk.set_total_size(pkg->file_size);
+
+            if (!writer->Write(chunk)) {
+                spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
+                return grpc::Status::CANCELLED;
+            }
+
+            offset += file.gcount();
+        }
+
+        spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}",
+                     offset, pkg->version, request->agent_id());
+        return grpc::Status::OK;
+    }
+
     AgentRegistry& registry_;
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
@@ -768,6 +1054,10 @@ private:
     std::unordered_set<std::string> cmd_first_seen_;
     bool require_client_identity_{false};
     bool gateway_mode_{false};
+    UpdateRegistry* update_registry_{nullptr};
+    ResponseStore* response_store_{nullptr};
+    TagStore* tag_store_{nullptr};
+    AnalyticsEventStore* analytics_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1029,6 +1319,9 @@ public:
     explicit ServerImpl(Config cfg, auth::AuthManager& auth_mgr)
         : cfg_(std::move(cfg)),
           auth_mgr_(auth_mgr),
+          auto_approve_(),
+          metrics_(),
+          event_bus_(),
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_,
               cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
@@ -1088,6 +1381,96 @@ public:
             nvd_sync_ = std::make_unique<NvdSyncManager>(
                 nvd_db_, cfg_.nvd_api_key, cfg_.nvd_proxy, cfg_.nvd_sync_interval);
             nvd_sync_->start();
+        }
+
+        // Initialize OTA update registry
+        if (cfg_.ota_enabled) {
+            auto update_db_path = cfg_.auth_config_path.parent_path() / "update_packages.db";
+            auto update_dir = cfg_.update_dir.empty()
+                ? cfg_.auth_config_path.parent_path() / "agent-updates"
+                : cfg_.update_dir;
+            std::error_code ec;
+            std::filesystem::create_directories(update_dir, ec);
+            update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
+            agent_service_.set_update_registry(update_registry_.get());
+        }
+
+        // Wire up cross-references for AgentServiceImpl
+        // (done after stores are created below)
+
+        // Initialize response store
+        {
+            auto resp_db = cfg_.auth_config_path.parent_path() / "responses.db";
+            response_store_ = std::make_unique<ResponseStore>(resp_db, cfg_.response_retention_days);
+            if (response_store_->is_open()) {
+                response_store_->start_cleanup();
+            }
+        }
+
+        // Initialize audit store
+        {
+            auto audit_db = cfg_.auth_config_path.parent_path() / "audit.db";
+            audit_store_ = std::make_unique<AuditStore>(audit_db, cfg_.audit_retention_days);
+            if (audit_store_->is_open()) {
+                audit_store_->start_cleanup();
+            }
+        }
+
+        // Initialize tag store
+        {
+            auto tag_db = cfg_.auth_config_path.parent_path() / "tags.db";
+            tag_store_ = std::make_unique<TagStore>(tag_db);
+        }
+
+        // Initialize analytics event store
+        if (cfg_.analytics_enabled) {
+            auto analytics_db = cfg_.auth_config_path.parent_path() / "analytics.db";
+            analytics_store_ = std::make_unique<AnalyticsEventStore>(
+                analytics_db, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
+            if (analytics_store_->is_open()) {
+                if (!cfg_.analytics_jsonl_path.empty()) {
+                    analytics_store_->add_sink(make_jsonlines_sink(cfg_.analytics_jsonl_path));
+                }
+                if (!cfg_.clickhouse_url.empty()) {
+                    analytics_store_->add_sink(make_clickhouse_sink(
+                        cfg_.clickhouse_url, cfg_.clickhouse_database,
+                        cfg_.clickhouse_table, cfg_.clickhouse_username,
+                        cfg_.clickhouse_password));
+                }
+                analytics_store_->start_drain();
+            }
+        }
+
+        // Wire up store pointers for AgentServiceImpl
+        if (response_store_) agent_service_.set_response_store(response_store_.get());
+        if (tag_store_) agent_service_.set_tag_store(tag_store_.get());
+        if (analytics_store_) agent_service_.set_analytics_store(analytics_store_.get());
+
+        // Initialize instruction store (Phase 2)
+        {
+            auto instr_db = cfg_.auth_config_path.parent_path() / "instructions.db";
+            instruction_store_ = std::make_unique<InstructionStore>(instr_db);
+            if (instruction_store_ && instruction_store_->is_open()) {
+                // ExecutionTracker, ApprovalManager, ScheduleEngine share the same DB
+                // They use the raw db pointer from InstructionStore's internal handle
+                // Since they need the same db, we open a second connection for them
+                sqlite3* shared_db = nullptr;
+                int rc = sqlite3_open(instr_db.string().c_str(), &shared_db);
+                if (rc == SQLITE_OK) {
+                    sqlite3_exec(shared_db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+                    sqlite3_exec(shared_db, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+                    shared_instr_db_ = shared_db;
+
+                    execution_tracker_ = std::make_unique<ExecutionTracker>(shared_db);
+                    execution_tracker_->create_tables();
+
+                    approval_manager_ = std::make_unique<ApprovalManager>(shared_db);
+                    approval_manager_->create_tables();
+
+                    schedule_engine_ = std::make_unique<ScheduleEngine>(shared_db);
+                    schedule_engine_->create_tables();
+                }
+            }
         }
     }
 
@@ -1170,8 +1553,19 @@ public:
     void stop() noexcept override {
         spdlog::info("Shutting down server...");
 
+        if (schedule_engine_) schedule_engine_->stop();
         if (nvd_sync_) {
             nvd_sync_->stop();
+        }
+        if (analytics_store_) analytics_store_->stop_drain();
+        if (response_store_) response_store_->stop_cleanup();
+        if (audit_store_)    audit_store_->stop_cleanup();
+
+        if (redirect_server_) {
+            redirect_server_->stop();
+        }
+        if (redirect_thread_.joinable()) {
+            redirect_thread_.join();
         }
         if (web_server_) {
             web_server_->stop();
@@ -1179,6 +1573,12 @@ public:
         if (web_thread_.joinable()) {
             web_thread_.join();
         }
+
+        // Release Phase 2 components before closing shared DB
+        execution_tracker_.reset();
+        approval_manager_.reset();
+        schedule_engine_.reset();
+        if (shared_instr_db_) { sqlite3_close(shared_instr_db_); shared_instr_db_ = nullptr; }
 
         if (agent_server_) agent_server_->Shutdown();
         if (mgmt_server_)  mgmt_server_->Shutdown();
@@ -1206,10 +1606,10 @@ private:
         }
 
         grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
-        pair.private_key = std::move(key);
-        pair.cert_chain  = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(pair));
+        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
+        key_cert.private_key = std::move(key);
+        key_cert.cert_chain  = std::move(cert);
+        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
 
         if (!ca_path.empty()) {
             auto ca = detail::read_file_contents(ca_path);
@@ -1230,8 +1630,8 @@ private:
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& pair : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(pair.private_key);
+        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
+            yuzu::secure_zero(kc.private_key);
         }
         return creds;
     }
@@ -1724,10 +2124,226 @@ private:
         return html;
     }
 
+    // -- OTA Updates fragment renderer ----------------------------------------
+
+    std::string render_updates_fragment() {
+        if (!update_registry_) {
+            return "<span style=\"color:#484f58\">OTA updates are disabled "
+                   "(start server with <code>--ota-enabled</code>).</span>";
+        }
+
+        auto packages = update_registry_->list_packages();
+        std::string html;
+
+        // Fleet version summary
+        {
+            auto agents_json_str = registry_.to_json();
+            std::unordered_map<std::string, int> version_counts;
+            try {
+                auto arr = nlohmann::json::parse(agents_json_str);
+                for (const auto& a : arr) {
+                    auto v = a.value("agent_version", std::string("unknown"));
+                    version_counts[v]++;
+                }
+            } catch (...) {}
+
+            if (!version_counts.empty()) {
+                html += "<div style=\"margin-bottom:1rem;padding:0.5rem 0.75rem;"
+                        "background:#0d1117;border:1px solid #30363d;border-radius:0.3rem\">"
+                        "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+                        "margin-bottom:0.3rem;text-transform:uppercase;letter-spacing:0.05em\">"
+                        "Fleet Versions</div>";
+                for (const auto& [ver, cnt] : version_counts) {
+                    html += "<span style=\"display:inline-block;margin-right:1rem;"
+                            "font-size:0.75rem\"><code>" + html_escape(ver) +
+                            "</code> &times; " + std::to_string(cnt) + "</span>";
+                }
+                html += "</div>";
+            }
+        }
+
+        // Packages table
+        html += "<table class=\"user-table\">"
+                "<thead><tr><th>Platform</th><th>Arch</th><th>Version</th>"
+                "<th>Size</th><th>Rollout</th><th>Mandatory</th><th></th></tr></thead>"
+                "<tbody>";
+
+        if (packages.empty()) {
+            html += "<tr><td colspan=\"7\" style=\"color:#484f58\">"
+                    "No update packages uploaded</td></tr>";
+        } else {
+            for (const auto& pkg : packages) {
+                auto size_str = pkg.file_size < 1024 * 1024
+                    ? std::to_string(pkg.file_size / 1024) + " KB"
+                    : std::to_string(pkg.file_size / (1024 * 1024)) + " MB";
+
+                html += "<tr>"
+                        "<td>" + html_escape(pkg.platform) + "</td>"
+                        "<td>" + html_escape(pkg.arch) + "</td>"
+                        "<td><code style=\"font-size:0.75rem\">" + html_escape(pkg.version) + "</code></td>"
+                        "<td style=\"font-size:0.75rem\">" + size_str + "</td>"
+                        "<td>"
+                        "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
+                        "hx-post=\"/api/settings/updates/" + html_escape(pkg.platform) + "/" +
+                        html_escape(pkg.arch) + "/" + html_escape(pkg.version) + "/rollout\" "
+                        "hx-target=\"#updates-section\" hx-swap=\"innerHTML\">"
+                        "<input type=\"range\" name=\"rollout_pct\" min=\"0\" max=\"100\" "
+                        "value=\"" + std::to_string(pkg.rollout_pct) + "\" "
+                        "style=\"width:60px\" "
+                        "onchange=\"this.nextElementSibling.textContent=this.value+'%'\">"
+                        "<span style=\"font-size:0.7rem;width:2.5em\">" +
+                        std::to_string(pkg.rollout_pct) + "%</span>"
+                        "<button class=\"btn btn-secondary\" type=\"submit\" "
+                        "style=\"padding:0.15rem 0.5rem;font-size:0.65rem\">Set</button>"
+                        "</form></td>"
+                        "<td style=\"font-size:0.75rem\">" +
+                        std::string(pkg.mandatory ? "Yes" : "No") + "</td>"
+                        "<td><button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/updates/" + html_escape(pkg.platform) + "/" +
+                        html_escape(pkg.arch) + "/" + html_escape(pkg.version) + "\" "
+                        "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Delete update package " + html_escape(pkg.version) +
+                        " for " + html_escape(pkg.platform) + "/" + html_escape(pkg.arch) + "?\""
+                        ">Delete</button></td></tr>";
+            }
+        }
+
+        html += "</tbody></table>";
+
+        // Upload form
+        html += "<div class=\"add-user-form\">"
+                "<form hx-post=\"/api/settings/updates/upload\" "
+                "hx-target=\"#updates-section\" hx-swap=\"innerHTML\" "
+                "hx-encoding=\"multipart/form-data\" "
+                "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
+                "<div class=\"mini-field\">"
+                "<label>Platform</label>"
+                "<select name=\"platform\" style=\"width:100px\">"
+                "<option value=\"windows\">Windows</option>"
+                "<option value=\"linux\">Linux</option>"
+                "<option value=\"darwin\">macOS</option>"
+                "</select></div>"
+                "<div class=\"mini-field\">"
+                "<label>Arch</label>"
+                "<select name=\"arch\" style=\"width:100px\">"
+                "<option value=\"x86_64\">x86_64</option>"
+                "<option value=\"aarch64\">aarch64</option>"
+                "</select></div>"
+                "<div class=\"mini-field\">"
+                "<label>Binary</label>"
+                "<input type=\"file\" name=\"file\" required></div>"
+                "<div class=\"mini-field\">"
+                "<label>Rollout %</label>"
+                "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
+                "<div class=\"mini-field\" style=\"display:flex;align-items:center;gap:0.3rem\">"
+                "<label>Mandatory</label>"
+                "<input type=\"checkbox\" name=\"mandatory\" value=\"true\"></div>"
+                "<button class=\"btn btn-primary\" type=\"submit\">Upload</button>"
+                "</form></div>"
+                "<div class=\"feedback\" id=\"updates-feedback\"></div>";
+
+        return html;
+    }
+
     // -- Web server -----------------------------------------------------------
 
+    // Cookie attribute helper — adds Secure flag when HTTPS is enabled
+    std::string session_cookie_attrs() const {
+        std::string attrs = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800";
+        if (cfg_.https_enabled) {
+            attrs += "; Secure";
+        }
+        return attrs;
+    }
+
+    // Audit helper — extract context from HTTP request
+    AuditEvent make_audit_event(const httplib::Request& req,
+                                const std::string& action,
+                                const std::string& result) {
+        AuditEvent event;
+        event.action = action;
+        event.result = result;
+        event.source_ip = req.remote_addr;
+        event.user_agent = req.get_header_value("User-Agent");
+
+        // Extract principal from session
+        auto token = extract_session_cookie(req);
+        auto session = auth_mgr_.validate_session(token);
+        if (session) {
+            event.principal = session->username;
+            event.principal_role = auth::role_to_string(session->role);
+            event.session_id = token;
+        }
+        return event;
+    }
+
+    void audit_log(const httplib::Request& req, const std::string& action,
+                   const std::string& result,
+                   const std::string& target_type = {},
+                   const std::string& target_id = {},
+                   const std::string& detail = {}) {
+        if (!audit_store_) return;
+        auto event = make_audit_event(req, action, result);
+        event.target_type = target_type;
+        event.target_id = target_id;
+        event.detail = detail;
+        audit_store_->log(event);
+    }
+
+    // Analytics helper — emit an analytics event with HTTP request context
+    void emit_event(const std::string& event_type,
+                    const httplib::Request& req,
+                    const nlohmann::json& attrs = {},
+                    const nlohmann::json& payload_data = {},
+                    Severity sev = Severity::kInfo) {
+        if (!analytics_store_) return;
+        AnalyticsEvent ae;
+        ae.event_type = event_type;
+        ae.severity = sev;
+        ae.attributes = attrs;
+        ae.payload = payload_data;
+
+        auto token = extract_session_cookie(req);
+        auto session = auth_mgr_.validate_session(token);
+        if (session) {
+            ae.principal = session->username;
+            ae.principal_role = auth::role_to_string(session->role);
+            ae.session_id = token;
+        }
+        analytics_store_->emit(std::move(ae));
+    }
+
     void start_web_server() {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled) {
+            if (cfg_.https_cert_path.empty() || cfg_.https_key_path.empty()) {
+                spdlog::error("HTTPS enabled but --https-cert and --https-key are required");
+                return;
+            }
+            if (!std::filesystem::exists(cfg_.https_cert_path)) {
+                spdlog::error("HTTPS cert not found: {}", cfg_.https_cert_path.string());
+                return;
+            }
+            if (!std::filesystem::exists(cfg_.https_key_path)) {
+                spdlog::error("HTTPS key not found: {}", cfg_.https_key_path.string());
+                return;
+            }
+            web_server_ = std::make_unique<httplib::SSLServer>(
+                cfg_.https_cert_path.string().c_str(),
+                cfg_.https_key_path.string().c_str());
+            spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})",
+                         cfg_.https_port, cfg_.https_cert_path.string(),
+                         cfg_.https_key_path.string());
+        } else {
+            web_server_ = std::make_unique<httplib::Server>();
+        }
+#else
+        if (cfg_.https_enabled) {
+            spdlog::warn("HTTPS requested but OpenSSL support not compiled in; falling back to HTTP");
+        }
         web_server_ = std::make_unique<httplib::Server>();
+#endif
 
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler(
@@ -1771,18 +2387,27 @@ private:
                     res.status = 401;
                     res.set_content(R"({"error":"Invalid username or password"})",
                                     "application/json");
+                    audit_log(req, "auth.login_failed", "failure", "user", username);
+                    emit_event("auth.login_failed", req,
+                               {{"source_ip", req.remote_addr}, {"username", username}},
+                               {}, Severity::kWarn);
                     return;
                 }
 
                 res.set_header("Set-Cookie",
-                    "yuzu_session=" + *token +
-                    "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800");
+                    "yuzu_session=" + *token + session_cookie_attrs());
                 res.set_content(R"({"status":"ok"})", "application/json");
+                audit_log(req, "auth.login", "success", "user", username);
+                emit_event("auth.login", req,
+                           {{"source_ip", req.remote_addr},
+                            {"user_agent", req.get_header_value("User-Agent")}});
             });
 
         // -- Logout -----------------------------------------------------------
         web_server_->Post("/logout",
             [this](const httplib::Request& req, httplib::Response& res) {
+                audit_log(req, "auth.logout", "success");
+                emit_event("auth.logout", req);
                 auto token = extract_session_cookie(req);
                 if (!token.empty()) {
                     auth_mgr_.invalidate_session(token);
@@ -1974,7 +2599,9 @@ private:
 
                 auto role = auth::string_to_role(role_str);
                 auth_mgr_.upsert_user(username, password, role);
-                auth_mgr_.save_config();
+                if (!auth_mgr_.save_config()) {
+                    spdlog::error("Failed to save config after user upsert");
+                }
                 spdlog::info("User '{}' added/updated (role={})", username, role_str);
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
@@ -1985,7 +2612,9 @@ private:
                 if (!require_admin(req, res)) return;
                 auto username = req.matches[1].str();
                 if (auth_mgr_.remove_user(username)) {
-                    auth_mgr_.save_config();
+                    if (!auth_mgr_.save_config()) {
+                        spdlog::error("Failed to save config after user removal");
+                    }
                     spdlog::info("User '{}' removed", username);
                 }
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
@@ -2149,6 +2778,159 @@ private:
                 auto_approve_.remove_rule(idx);
                 spdlog::info("Auto-approve rule {} removed", idx);
                 res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+            });
+
+        // -- Settings HTMX fragment: OTA Updates ---------------------------------
+
+        web_server_->Get("/fragments/settings/updates",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Upload new update package
+        web_server_->Post("/api/settings/updates/upload",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">OTA disabled.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+
+                std::string platform, arch, rollout_s, mandatory_s;
+                if (req.form.has_field("platform"))    platform    = req.form.get_field("platform");
+                if (req.form.has_field("arch"))         arch        = req.form.get_field("arch");
+                if (req.form.has_field("rollout_pct"))  rollout_s   = req.form.get_field("rollout_pct");
+                if (req.form.has_field("mandatory"))    mandatory_s = req.form.get_field("mandatory");
+
+                if (!req.form.has_file("file")) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">No file uploaded.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                const auto& uploaded = req.form.get_file("file");
+                if (uploaded.content.empty()) {
+                    res.status = 400;
+                    res.set_content("<span class=\"feedback-error\">Empty file.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+
+                int rollout_pct = 100;
+                try { if (!rollout_s.empty()) rollout_pct = std::stoi(rollout_s); }
+                catch (...) {}
+                if (rollout_pct < 0) rollout_pct = 0;
+                if (rollout_pct > 100) rollout_pct = 100;
+
+                // Derive version from filename (strip extension to use as version)
+                auto orig_name = uploaded.filename.empty()
+                    ? "yuzu-agent-" + platform + "-" + arch
+                    : uploaded.filename;
+
+                // Use filename as-is for storage
+                auto out_path = update_registry_->binary_path(
+                    UpdatePackage{platform, arch, "", "", orig_name});
+                std::error_code ec;
+                std::filesystem::create_directories(out_path.parent_path(), ec);
+                {
+                    std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                    if (!f.is_open()) {
+                        res.status = 500;
+                        res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+                    f.write(uploaded.content.data(),
+                            static_cast<std::streamsize>(uploaded.content.size()));
+                }
+
+                auto sha = auth::AuthManager::sha256_hex(uploaded.content);
+                auto version = orig_name;  // use filename as version identifier
+                // Strip common extensions for a cleaner version string
+                for (const auto* ext : {".exe", ".bin", ".tar.gz", ".zip", ".msi"}) {
+                    if (version.size() > std::strlen(ext) &&
+                        version.substr(version.size() - std::strlen(ext)) == ext) {
+                        version = version.substr(0, version.size() - std::strlen(ext));
+                        break;
+                    }
+                }
+
+                UpdatePackage pkg;
+                pkg.platform    = platform;
+                pkg.arch        = arch;
+                pkg.version     = version;
+                pkg.sha256      = sha;
+                pkg.filename    = orig_name;
+                pkg.mandatory   = (mandatory_s == "true");
+                pkg.rollout_pct = rollout_pct;
+                pkg.file_size   = static_cast<int64_t>(uploaded.content.size());
+
+                update_registry_->upsert_package(pkg);
+                spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)",
+                             platform, arch, version, pkg.file_size, rollout_pct);
+
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Delete an update package
+        web_server_->Delete(R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) { res.status = 400; return; }
+
+                auto platform = req.matches[1].str();
+                auto arch     = req.matches[2].str();
+                auto version  = req.matches[3].str();
+
+                // Find the package to get filename for disk cleanup
+                auto packages = update_registry_->list_packages();
+                for (const auto& pkg : packages) {
+                    if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
+                        auto bin_path = update_registry_->binary_path(pkg);
+                        std::error_code ec;
+                        std::filesystem::remove(bin_path, ec);
+                        break;
+                    }
+                }
+
+                update_registry_->remove_package(platform, arch, version);
+                spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            });
+
+        // Update rollout percentage
+        web_server_->Post(R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!update_registry_) { res.status = 400; return; }
+
+                auto platform = req.matches[1].str();
+                auto arch     = req.matches[2].str();
+                auto version  = req.matches[3].str();
+                auto pct_s    = extract_form_value(req.body, "rollout_pct");
+
+                int pct = 100;
+                try { if (!pct_s.empty()) pct = std::stoi(pct_s); }
+                catch (...) {}
+                if (pct < 0) pct = 0;
+                if (pct > 100) pct = 100;
+
+                // Find and update the package
+                auto packages = update_registry_->list_packages();
+                for (auto pkg : packages) {
+                    if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
+                        pkg.rollout_pct = pct;
+                        update_registry_->upsert_package(pkg);
+                        spdlog::info("OTA rollout updated: {}/{} v{} → {}%",
+                                     platform, arch, version, pct);
+                        break;
+                    }
+                }
+
+                res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
             });
 
         // Legacy routes — redirect to dashboard
@@ -2330,8 +3112,27 @@ private:
 
                 agent_service_.record_send_time(command_id);
 
+                // Check for scope-based targeting
+                auto scope_expr = extract_json_string(req.body, "scope");
+
                 int sent = 0;
-                if (agent_ids.empty()) {
+                if (!scope_expr.empty()) {
+                    // Scope-based dispatch
+                    auto parsed = yuzu::scope::parse(scope_expr);
+                    if (!parsed) {
+                        res.status = 400;
+                        res.set_content(
+                            nlohmann::json({{"error", "invalid scope: " + parsed.error()}}).dump(),
+                            "application/json");
+                        return;
+                    }
+                    auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get());
+                    for (const auto& aid : matched_ids) {
+                        if (registry_.send_to(aid, cmd)) {
+                            ++sent;
+                        }
+                    }
+                } else if (agent_ids.empty()) {
                     // Broadcast to all agents
                     sent = registry_.send_to_all(cmd);
                 } else {
@@ -2352,6 +3153,12 @@ private:
                 metrics_.counter("yuzu_commands_dispatched_total").increment();
                 spdlog::info("Command dispatched: {}:{} → {} agent(s)",
                     plugin, action, sent);
+                audit_log(req, "command.dispatch", "success", "command", command_id,
+                          plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
+                emit_event("command.dispatched", req,
+                           {{"target_count", sent}},
+                           {{"plugin", plugin}, {"action", action},
+                            {"command_id", command_id}, {"scope", scope_expr}});
                 res.set_content(
                     nlohmann::json({{"status", "sent"},
                                     {"command_id", command_id},
@@ -2390,10 +3197,1054 @@ private:
                     "application/json");
             });
 
-        web_thread_ = std::thread([this] {
-            spdlog::info("Web UI available at http://{}:{}/",
-                cfg_.web_address, cfg_.web_port);
-            web_server_->listen(cfg_.web_address, cfg_.web_port);
+        // -- Response API ---------------------------------------------------------
+        web_server_->Get(R"(/api/responses/(.+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto instruction_id = req.matches[1].str();
+                if (instruction_id.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"instruction_id required"})", "application/json");
+                    return;
+                }
+
+                if (!response_store_ || !response_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"response store not available"})", "application/json");
+                    return;
+                }
+
+                ResponseQuery q;
+                if (req.has_param("agent_id"))
+                    q.agent_id = req.get_param_value("agent_id");
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+
+                auto results = response_store_->query(instruction_id, q);
+
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : results) {
+                    arr.push_back({
+                        {"id", r.id},
+                        {"instruction_id", r.instruction_id},
+                        {"agent_id", r.agent_id},
+                        {"timestamp", r.timestamp},
+                        {"status", r.status},
+                        {"output", r.output},
+                        {"error_detail", r.error_detail}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"responses", arr},
+                                    {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Audit API (admin-only) -------------------------------------------
+        web_server_->Get("/api/audit",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+
+                if (!audit_store_ || !audit_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"audit store not available"})", "application/json");
+                    return;
+                }
+
+                AuditQuery q;
+                if (req.has_param("principal"))
+                    q.principal = req.get_param_value("principal");
+                if (req.has_param("action"))
+                    q.action = req.get_param_value("action");
+                if (req.has_param("target_type"))
+                    q.target_type = req.get_param_value("target_type");
+                if (req.has_param("target_id"))
+                    q.target_id = req.get_param_value("target_id");
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+
+                auto results = audit_store_->query(q);
+
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& e : results) {
+                    arr.push_back({
+                        {"id", e.id},
+                        {"timestamp", e.timestamp},
+                        {"principal", e.principal},
+                        {"principal_role", e.principal_role},
+                        {"action", e.action},
+                        {"target_type", e.target_type},
+                        {"target_id", e.target_id},
+                        {"detail", e.detail},
+                        {"source_ip", e.source_ip},
+                        {"result", e.result}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"events", arr},
+                                    {"count", arr.size()},
+                                    {"total", audit_store_->total_count()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Tags API ---------------------------------------------------------
+        web_server_->Get("/api/tags",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                if (!tag_store_ || !tag_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = req.get_param_value("agent_id");
+                if (agent_id.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id parameter required"})", "application/json");
+                    return;
+                }
+
+                auto tags = tag_store_->get_all_tags(agent_id);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& t : tags) {
+                    arr.push_back({
+                        {"key", t.key},
+                        {"value", t.value},
+                        {"source", t.source},
+                        {"updated_at", t.updated_at}
+                    });
+                }
+                res.set_content(
+                    nlohmann::json({{"agent_id", agent_id},
+                                    {"tags", arr}}).dump(),
+                    "application/json");
+            });
+
+        web_server_->Post("/api/tags/set",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = extract_json_string(req.body, "agent_id");
+                auto key = extract_json_string(req.body, "key");
+                auto value = extract_json_string(req.body, "value");
+
+                if (agent_id.empty() || key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    return;
+                }
+
+                if (!TagStore::validate_key(key)) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid tag key"})", "application/json");
+                    return;
+                }
+
+                tag_store_->set_tag(agent_id, key, value, "api");
+                audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+                res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        web_server_->Post("/api/tags/delete",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto agent_id = extract_json_string(req.body, "agent_id");
+                auto key = extract_json_string(req.body, "key");
+
+                if (agent_id.empty() || key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    return;
+                }
+
+                bool deleted = tag_store_->delete_tag(agent_id, key);
+                audit_log(req, "tag.delete", deleted ? "success" : "not_found",
+                          "tag", agent_id + ":" + key);
+                res.set_content(
+                    nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        web_server_->Post("/api/tags/query",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!tag_store_) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    return;
+                }
+
+                auto key = extract_json_string(req.body, "key");
+                auto value = extract_json_string(req.body, "value");
+
+                if (key.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"key required"})", "application/json");
+                    return;
+                }
+
+                auto agents = tag_store_->agents_with_tag(key, value);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& a : agents) arr.push_back(a);
+                res.set_content(
+                    nlohmann::json({{"agents", arr},
+                                    {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Help page --------------------------------------------------------
+        web_server_->Get("/help", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(kHelpHtml, "text/html; charset=utf-8");
+        });
+
+        // -- Instruction management page --------------------------------------
+        web_server_->Get("/instructions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) { res.set_redirect("/login"); return; }
+                res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
+            });
+
+        // -- Instruction Definitions API --------------------------------------
+
+        web_server_->Get("/api/instructions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!instruction_store_ || !instruction_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"instruction store not available"})", "application/json");
+                    return;
+                }
+
+                InstructionQuery q;
+                if (req.has_param("name")) q.name_filter = req.get_param_value("name");
+                if (req.has_param("plugin")) q.plugin_filter = req.get_param_value("plugin");
+                if (req.has_param("type")) q.type_filter = req.get_param_value("type");
+                if (req.has_param("set_id")) q.set_id_filter = req.get_param_value("set_id");
+                if (req.has_param("enabled_only")) q.enabled_only = true;
+                if (req.has_param("limit")) q.limit = std::stoi(req.get_param_value("limit"));
+
+                auto defs = instruction_store_->query_definitions(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : defs) {
+                    arr.push_back({
+                        {"id", d.id}, {"name", d.name}, {"version", d.version},
+                        {"type", d.type}, {"plugin", d.plugin}, {"action", d.action},
+                        {"description", d.description}, {"enabled", d.enabled},
+                        {"instruction_set_id", d.instruction_set_id},
+                        {"created_at", d.created_at}, {"updated_at", d.updated_at}
+                    });
+                }
+                res.set_content(nlohmann::json({{"definitions", arr}, {"count", arr.size()}}).dump(), "application/json");
+            });
+
+        web_server_->Post("/api/instructions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                try {
+                    auto j = nlohmann::json::parse(req.body);
+                    InstructionDefinition def;
+                    def.name = j.value("name", "");
+                    def.version = j.value("version", "1.0");
+                    def.type = j.value("type", "");
+                    def.plugin = j.value("plugin", "");
+                    def.action = j.value("action", "");
+                    def.description = j.value("description", "");
+                    def.enabled = j.value("enabled", true);
+                    def.instruction_set_id = j.value("instruction_set_id", "");
+                    def.gather_ttl_seconds = j.value("gather_ttl_seconds", 300);
+                    def.response_ttl_days = j.value("response_ttl_days", 90);
+
+                    auto token = extract_session_cookie(req);
+                    auto session = auth_mgr_.validate_session(token);
+                    if (session) def.created_by = session->username;
+
+                    auto result = instruction_store_->create_definition(def);
+                    if (!result) {
+                        res.status = 400;
+                        res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                        return;
+                    }
+                    audit_log(req, "instruction.create", "success", "instruction", *result, def.name);
+                    emit_event("instruction.created", req,
+                               {{"name", def.name}, {"plugin", def.plugin}, {"action", def.action}, {"type", def.type}},
+                               {{"instruction_id", *result}});
+                    res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+                } catch (const std::exception& e) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                }
+            });
+
+        web_server_->Get(R"(/api/instructions/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto def = instruction_store_->get_definition(id);
+                if (!def) { res.status = 404; res.set_content(R"({"error":"not found"})", "application/json"); return; }
+
+                res.set_content(nlohmann::json({
+                    {"id", def->id}, {"name", def->name}, {"version", def->version},
+                    {"type", def->type}, {"plugin", def->plugin}, {"action", def->action},
+                    {"description", def->description}, {"enabled", def->enabled},
+                    {"instruction_set_id", def->instruction_set_id},
+                    {"gather_ttl_seconds", def->gather_ttl_seconds},
+                    {"response_ttl_days", def->response_ttl_days},
+                    {"created_by", def->created_by},
+                    {"created_at", def->created_at}, {"updated_at", def->updated_at}
+                }).dump(), "application/json");
+            });
+
+        web_server_->Put(R"(/api/instructions/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                try {
+                    auto j = nlohmann::json::parse(req.body);
+                    InstructionDefinition def;
+                    def.id = id;
+                    def.name = j.value("name", "");
+                    def.version = j.value("version", "1.0");
+                    def.type = j.value("type", "");
+                    def.plugin = j.value("plugin", "");
+                    def.action = j.value("action", "");
+                    def.description = j.value("description", "");
+                    def.enabled = j.value("enabled", true);
+                    def.instruction_set_id = j.value("instruction_set_id", "");
+
+                    auto result = instruction_store_->update_definition(def);
+                    if (!result) {
+                        res.status = 400;
+                        res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                        return;
+                    }
+                    audit_log(req, "instruction.update", "success", "instruction", id);
+                    emit_event("instruction.updated", req, {}, {{"instruction_id", id}});
+                    res.set_content(R"({"status":"ok"})", "application/json");
+                } catch (const std::exception& e) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                }
+            });
+
+        web_server_->Delete(R"(/api/instructions/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                bool deleted = instruction_store_->delete_definition(id);
+                if (deleted) {
+                    audit_log(req, "instruction.delete", "success", "instruction", id);
+                    emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
+                }
+                res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        web_server_->Get(R"(/api/instructions/([^/]+)/export)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto json = instruction_store_->export_definition_json(id);
+                res.set_content(json, "application/json");
+            });
+
+        web_server_->Post("/api/instructions/import",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto result = instruction_store_->import_definition_json(req.body);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "instruction.import", "success", "instruction", *result);
+                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+            });
+
+        // -- Instruction Sets API ---------------------------------------------
+
+        web_server_->Get("/api/instruction-sets",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto sets = instruction_store_->list_sets();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : sets) {
+                    arr.push_back({{"id", s.id}, {"name", s.name}, {"description", s.description},
+                                   {"created_by", s.created_by}, {"created_at", s.created_at}});
+                }
+                res.set_content(nlohmann::json({{"sets", arr}}).dump(), "application/json");
+            });
+
+        web_server_->Post("/api/instruction-sets",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto name = extract_json_string(req.body, "name");
+                auto desc = extract_json_string(req.body, "description");
+                InstructionSet s;
+                s.name = name;
+                s.description = desc;
+                auto result = instruction_store_->create_set(s);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+            });
+
+        web_server_->Delete(R"(/api/instruction-sets/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!instruction_store_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                bool deleted = instruction_store_->delete_set(id);
+                res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        // -- Execution API ----------------------------------------------------
+
+        web_server_->Get("/api/executions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                ExecutionQuery q;
+                if (req.has_param("definition_id")) q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("status")) q.status = req.get_param_value("status");
+                if (req.has_param("limit")) q.limit = std::stoi(req.get_param_value("limit"));
+
+                auto execs = execution_tracker_->query_executions(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& e : execs) {
+                    arr.push_back({
+                        {"id", e.id}, {"definition_id", e.definition_id},
+                        {"status", e.status}, {"dispatched_by", e.dispatched_by},
+                        {"dispatched_at", e.dispatched_at},
+                        {"agents_targeted", e.agents_targeted},
+                        {"agents_responded", e.agents_responded},
+                        {"agents_success", e.agents_success},
+                        {"agents_failure", e.agents_failure},
+                        {"completed_at", e.completed_at},
+                        {"rerun_of", e.rerun_of}
+                    });
+                }
+                res.set_content(nlohmann::json({{"executions", arr}, {"count", arr.size()}}).dump(), "application/json");
+            });
+
+        web_server_->Get(R"(/api/executions/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto exec = execution_tracker_->get_execution(id);
+                if (!exec) { res.status = 404; res.set_content(R"({"error":"not found"})", "application/json"); return; }
+
+                res.set_content(nlohmann::json({
+                    {"id", exec->id}, {"definition_id", exec->definition_id},
+                    {"status", exec->status}, {"scope_expression", exec->scope_expression},
+                    {"parameter_values", exec->parameter_values},
+                    {"dispatched_by", exec->dispatched_by},
+                    {"dispatched_at", exec->dispatched_at},
+                    {"agents_targeted", exec->agents_targeted},
+                    {"agents_responded", exec->agents_responded},
+                    {"agents_success", exec->agents_success},
+                    {"agents_failure", exec->agents_failure},
+                    {"completed_at", exec->completed_at},
+                    {"parent_id", exec->parent_id},
+                    {"rerun_of", exec->rerun_of}
+                }).dump(), "application/json");
+            });
+
+        web_server_->Get(R"(/api/executions/([^/]+)/summary)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto summary = execution_tracker_->get_summary(id);
+                res.set_content(nlohmann::json({
+                    {"id", summary.id}, {"status", summary.status},
+                    {"agents_targeted", summary.agents_targeted},
+                    {"agents_responded", summary.agents_responded},
+                    {"agents_success", summary.agents_success},
+                    {"agents_failure", summary.agents_failure},
+                    {"progress_pct", summary.progress_pct}
+                }).dump(), "application/json");
+            });
+
+        web_server_->Get(R"(/api/executions/([^/]+)/agents)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto agents = execution_tracker_->get_agent_statuses(id);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& a : agents) {
+                    arr.push_back({
+                        {"agent_id", a.agent_id}, {"status", a.status},
+                        {"dispatched_at", a.dispatched_at},
+                        {"first_response_at", a.first_response_at},
+                        {"completed_at", a.completed_at},
+                        {"exit_code", a.exit_code},
+                        {"error_detail", a.error_detail}
+                    });
+                }
+                res.set_content(nlohmann::json({{"agents", arr}}).dump(), "application/json");
+            });
+
+        web_server_->Post(R"(/api/executions/([^/]+)/rerun)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto scope_filter = extract_json_string(req.body, "scope");
+                bool failed_only = (scope_filter == "failed_only");
+
+                auto token = extract_session_cookie(req);
+                auto session = auth_mgr_.validate_session(token);
+                auto user = session ? session->username : "unknown";
+
+                auto result = execution_tracker_->create_rerun(id, user, failed_only);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "execution.rerun", "success", "execution", *result, "rerun of " + id);
+                emit_event("execution.created", req, {},
+                           {{"execution_id", *result}, {"parent_id", id}, {"trigger", "rerun"}});
+                res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+            });
+
+        web_server_->Post(R"(/api/executions/([^/]+)/cancel)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto token = extract_session_cookie(req);
+                auto session = auth_mgr_.validate_session(token);
+                auto user = session ? session->username : "unknown";
+
+                execution_tracker_->mark_cancelled(id, user);
+                audit_log(req, "execution.cancel", "success", "execution", id);
+                emit_event("execution.completed", req,
+                           {{"status", "cancelled"}},
+                           {{"execution_id", id}});
+                res.set_content(R"({"status":"cancelled"})", "application/json");
+            });
+
+        web_server_->Get(R"(/api/executions/([^/]+)/children)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto children = execution_tracker_->get_children(id);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& c : children) {
+                    arr.push_back({{"id", c.id}, {"status", c.status},
+                                   {"dispatched_at", c.dispatched_at}});
+                }
+                res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
+            });
+
+        // -- Schedule API -----------------------------------------------------
+
+        web_server_->Get("/api/schedules",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!schedule_engine_) { res.status = 503; return; }
+
+                ScheduleQuery q;
+                if (req.has_param("definition_id")) q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only")) q.enabled_only = true;
+
+                auto scheds = schedule_engine_->query_schedules(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : scheds) {
+                    arr.push_back({
+                        {"id", s.id}, {"name", s.name}, {"definition_id", s.definition_id},
+                        {"enabled", s.enabled}, {"frequency_type", s.frequency_type},
+                        {"next_execution_at", s.next_execution_at},
+                        {"last_executed_at", s.last_executed_at},
+                        {"execution_count", s.execution_count}
+                    });
+                }
+                res.set_content(nlohmann::json({{"schedules", arr}}).dump(), "application/json");
+            });
+
+        web_server_->Post("/api/schedules",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!schedule_engine_) { res.status = 503; return; }
+
+                try {
+                    auto j = nlohmann::json::parse(req.body);
+                    InstructionSchedule sched;
+                    sched.name = j.value("name", "");
+                    sched.definition_id = j.value("definition_id", "");
+                    sched.frequency_type = j.value("frequency_type", "once");
+                    sched.interval_minutes = j.value("interval_minutes", 60);
+                    sched.time_of_day = j.value("time_of_day", "00:00");
+                    sched.day_of_week = j.value("day_of_week", 0);
+                    sched.day_of_month = j.value("day_of_month", 1);
+                    sched.scope_expression = j.value("scope_expression", "");
+                    sched.requires_approval = j.value("requires_approval", false);
+
+                    auto token = extract_session_cookie(req);
+                    auto session = auth_mgr_.validate_session(token);
+                    if (session) sched.created_by = session->username;
+
+                    auto result = schedule_engine_->create_schedule(sched);
+                    if (!result) {
+                        res.status = 400;
+                        res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                        return;
+                    }
+                    audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
+                    res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+                } catch (const std::exception& e) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                }
+            });
+
+        web_server_->Delete(R"(/api/schedules/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!schedule_engine_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                bool deleted = schedule_engine_->delete_schedule(id);
+                if (deleted) audit_log(req, "schedule.delete", "success", "schedule", id);
+                res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        web_server_->Post(R"(/api/schedules/([^/]+)/enable)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!schedule_engine_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto enabled_str = extract_json_string(req.body, "enabled");
+                bool enabled = (enabled_str != "false");
+                schedule_engine_->set_enabled(id, enabled);
+                res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
+            });
+
+        // -- Approval API -----------------------------------------------------
+
+        web_server_->Get("/api/approvals",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!approval_manager_) { res.status = 503; return; }
+
+                ApprovalQuery q;
+                if (req.has_param("status")) q.status = req.get_param_value("status");
+                if (req.has_param("submitted_by")) q.submitted_by = req.get_param_value("submitted_by");
+
+                auto approvals = approval_manager_->query(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& a : approvals) {
+                    arr.push_back({
+                        {"id", a.id}, {"definition_id", a.definition_id},
+                        {"status", a.status}, {"submitted_by", a.submitted_by},
+                        {"submitted_at", a.submitted_at},
+                        {"reviewed_by", a.reviewed_by},
+                        {"reviewed_at", a.reviewed_at},
+                        {"review_comment", a.review_comment},
+                        {"scope_expression", a.scope_expression}
+                    });
+                }
+                res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");
+            });
+
+        web_server_->Get("/api/approvals/pending/count",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!approval_manager_) {
+                    res.set_content(R"({"count":0})", "application/json");
+                    return;
+                }
+                auto count = approval_manager_->pending_count();
+                res.set_content(nlohmann::json({{"count", count}}).dump(), "application/json");
+            });
+
+        web_server_->Post(R"(/api/approvals/([^/]+)/approve)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!approval_manager_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto comment = extract_json_string(req.body, "comment");
+                auto token = extract_session_cookie(req);
+                auto session = auth_mgr_.validate_session(token);
+                auto reviewer = session ? session->username : "unknown";
+
+                auto result = approval_manager_->approve(id, reviewer, comment);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "approval.approve", "success", "approval", id);
+                emit_event("approval.approved", req,
+                           {{"reviewer", reviewer}},
+                           {{"approval_id", id}});
+                res.set_content(R"({"status":"approved"})", "application/json");
+            });
+
+        web_server_->Post(R"(/api/approvals/([^/]+)/reject)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res)) return;
+                if (!approval_manager_) { res.status = 503; return; }
+
+                auto id = req.matches[1].str();
+                auto comment = extract_json_string(req.body, "comment");
+                auto token = extract_session_cookie(req);
+                auto session = auth_mgr_.validate_session(token);
+                auto reviewer = session ? session->username : "unknown";
+
+                auto result = approval_manager_->reject(id, reviewer, comment);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "approval.reject", "success", "approval", id);
+                emit_event("approval.rejected", req,
+                           {{"reviewer", reviewer}, {"comment", comment}},
+                           {{"approval_id", id}});
+                res.set_content(R"({"status":"rejected"})", "application/json");
+            });
+
+        // -- Analytics API ---------------------------------------------------------
+
+        web_server_->Get("/api/analytics/status",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                nlohmann::json j;
+                if (analytics_store_) {
+                    j["enabled"] = true;
+                    j["pending_count"] = analytics_store_->pending_count();
+                    j["total_emitted"] = analytics_store_->total_emitted();
+                } else {
+                    j["enabled"] = false;
+                    j["pending_count"] = 0;
+                    j["total_emitted"] = 0;
+                }
+                res.set_content(j.dump(), "application/json");
+            });
+
+        web_server_->Get("/api/analytics/recent",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                int limit = 50;
+                if (req.has_param("limit")) {
+                    try { limit = std::stoi(req.get_param_value("limit")); }
+                    catch (...) {}
+                }
+                if (!analytics_store_) {
+                    res.set_content(R"({"events":[],"count":0})", "application/json");
+                    return;
+                }
+                auto events = analytics_store_->query_recent(limit);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& e : events) {
+                    arr.push_back(e);
+                }
+                res.set_content(
+                    nlohmann::json({{"events", arr}, {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // -- HTMX Fragment Routes for Instructions UI -------------------------
+
+        web_server_->Get("/fragments/instructions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!instruction_store_) { res.set_content("<div class=\"empty-state\">Not available</div>", "text/html"); return; }
+
+                auto defs = instruction_store_->query_definitions();
+                std::string html;
+                if (defs.empty()) {
+                    html = "<div class=\"empty-state\">No instruction definitions yet. Use the API to create one.</div>";
+                } else {
+                    html = "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
+                    for (const auto& d : defs) {
+                        auto type_cls = d.type == "question" ? "status-running" : "status-pending";
+                        html += "<tr><td><strong>" + html_escape(d.name) + "</strong><br><span style=\"font-size:0.65rem;color:#8b949e\">" + html_escape(d.id.substr(0, 12)) + "</span></td>"
+                                "<td><code>" + html_escape(d.plugin) + ":" + html_escape(d.action) + "</code></td>"
+                                "<td><span class=\"status-badge " + type_cls + "\">" + html_escape(d.type) + "</span></td>"
+                                "<td>" + std::string(d.enabled ? "Yes" : "No") + "</td>"
+                                "<td>" + html_escape(d.instruction_set_id.empty() ? "-" : d.instruction_set_id.substr(0, 8)) + "</td>"
+                                "<td><button class=\"btn btn-danger\" style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                "hx-delete=\"/api/instructions/" + d.id + "\" hx-target=\"#tab-definitions\" hx-swap=\"innerHTML\" "
+                                "hx-confirm=\"Delete definition '" + html_escape(d.name) + "'?\">Delete</button></td></tr>";
+                    }
+                    html += "</tbody></table>";
+                }
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/executions",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!execution_tracker_) { res.set_content("<div class=\"empty-state\">Not available</div>", "text/html"); return; }
+
+                ExecutionQuery q;
+                q.limit = 50;
+                auto execs = execution_tracker_->query_executions(q);
+                std::string html;
+                if (execs.empty()) {
+                    html = "<div class=\"empty-state\">No executions yet.</div>";
+                } else {
+                    html = "<table><thead><tr><th>ID</th><th>Status</th><th>Progress</th><th>Dispatched By</th><th>Time</th></tr></thead><tbody>";
+                    for (const auto& e : execs) {
+                        auto pct = e.agents_targeted > 0 ? (e.agents_responded * 100 / e.agents_targeted) : 0;
+                        auto status_cls = "status-" + e.status;
+                        html += "<tr><td><code style=\"font-size:0.7rem\">" + html_escape(e.id.substr(0, 12)) + "</code></td>"
+                                "<td><span class=\"status-badge " + status_cls + "\">" + html_escape(e.status) + "</span></td>"
+                                "<td><div class=\"progress-bar\"><div class=\"progress-fill\" style=\"width:" + std::to_string(pct) + "%\"></div></div>"
+                                "<span style=\"font-size:0.65rem\">" + std::to_string(e.agents_responded) + "/" + std::to_string(e.agents_targeted) + "</span></td>"
+                                "<td>" + html_escape(e.dispatched_by) + "</td>"
+                                "<td style=\"font-size:0.7rem\">" + std::to_string(e.dispatched_at) + "</td></tr>";
+                    }
+                    html += "</tbody></table>";
+                }
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/schedules",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!schedule_engine_) { res.set_content("<div class=\"empty-state\">Not available</div>", "text/html"); return; }
+
+                auto scheds = schedule_engine_->query_schedules();
+                std::string html;
+                if (scheds.empty()) {
+                    html = "<div class=\"empty-state\">No schedules configured.</div>";
+                } else {
+                    html = "<table><thead><tr><th>Name</th><th>Frequency</th><th>Enabled</th><th>Next Run</th><th>Count</th><th></th></tr></thead><tbody>";
+                    for (const auto& s : scheds) {
+                        html += "<tr><td>" + html_escape(s.name) + "</td>"
+                                "<td><code>" + html_escape(s.frequency_type) + "</code></td>"
+                                "<td>" + std::string(s.enabled ? "Yes" : "No") + "</td>"
+                                "<td style=\"font-size:0.7rem\">" + (s.next_execution_at > 0 ? std::to_string(s.next_execution_at) : "-") + "</td>"
+                                "<td>" + std::to_string(s.execution_count) + "</td>"
+                                "<td><button class=\"btn btn-danger\" style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                "hx-delete=\"/api/schedules/" + s.id + "\" hx-target=\"#tab-schedules\" hx-swap=\"innerHTML\" "
+                                "hx-confirm=\"Delete schedule?\">Delete</button></td></tr>";
+                    }
+                    html += "</tbody></table>";
+                }
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+        web_server_->Get("/fragments/approvals",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+                if (!approval_manager_) { res.set_content("<div class=\"empty-state\">Not available</div>", "text/html"); return; }
+
+                auto approvals = approval_manager_->query();
+                std::string html;
+                if (approvals.empty()) {
+                    html = "<div class=\"empty-state\">No approval requests.</div>";
+                } else {
+                    html = "<table><thead><tr><th>ID</th><th>Status</th><th>Submitted By</th><th>Scope</th><th></th></tr></thead><tbody>";
+                    for (const auto& a : approvals) {
+                        auto status_cls = "status-" + a.status;
+                        html += "<tr><td><code style=\"font-size:0.7rem\">" + html_escape(a.id.substr(0, 12)) + "</code></td>"
+                                "<td><span class=\"status-badge " + status_cls + "\">" + html_escape(a.status) + "</span></td>"
+                                "<td>" + html_escape(a.submitted_by) + "</td>"
+                                "<td><code style=\"font-size:0.7rem\">" + html_escape(a.scope_expression) + "</code></td>"
+                                "<td>";
+                        if (a.status == "pending") {
+                            html += "<button class=\"btn btn-primary\" style=\"font-size:0.65rem;padding:0.15rem 0.5rem;margin-right:0.3rem\" "
+                                    "hx-post=\"/api/approvals/" + a.id + "/approve\" hx-target=\"#tab-approvals\" hx-swap=\"innerHTML\">Approve</button>"
+                                    "<button class=\"btn btn-danger\" style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                    "hx-post=\"/api/approvals/" + a.id + "/reject\" hx-target=\"#tab-approvals\" hx-swap=\"innerHTML\">Reject</button>";
+                        }
+                        html += "</td></tr>";
+                    }
+                    html += "</tbody></table>";
+                }
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+        // -- Scope API --------------------------------------------------------
+        web_server_->Post("/api/scope/validate",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto expression = extract_json_string(req.body, "expression");
+                if (expression.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"expression required"})", "application/json");
+                    return;
+                }
+
+                auto result = yuzu::scope::validate(expression);
+                if (result) {
+                    res.set_content(R"({"valid":true})", "application/json");
+                } else {
+                    res.set_content(
+                        nlohmann::json({{"valid", false},
+                                        {"error", result.error()}}).dump(),
+                        "application/json");
+                }
+            });
+
+        web_server_->Post("/api/scope/estimate",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto expression = extract_json_string(req.body, "expression");
+                if (expression.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"expression required"})", "application/json");
+                    return;
+                }
+
+                auto parsed = yuzu::scope::parse(expression);
+                if (!parsed) {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", parsed.error()}}).dump(), "application/json");
+                    return;
+                }
+
+                auto matched = registry_.evaluate_scope(*parsed, tag_store_.get());
+                res.set_content(
+                    nlohmann::json({{"matched", matched.size()},
+                                    {"total", registry_.agent_count()}}).dump(),
+                    "application/json");
+            });
+
+        // -- Listen -----------------------------------------------------------
+
+        int listen_port = cfg_.web_port;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (cfg_.https_enabled) {
+            listen_port = cfg_.https_port;
+
+            // Start HTTP→HTTPS redirect server
+            if (cfg_.https_redirect) {
+                redirect_server_ = std::make_unique<httplib::Server>();
+                auto https_port = cfg_.https_port;
+                auto web_address = cfg_.web_address;
+                redirect_server_->set_pre_routing_handler(
+                    [web_address, https_port](const httplib::Request& req, httplib::Response& res)
+                        -> httplib::Server::HandlerResponse {
+                        auto host = req.get_header_value("Host");
+                        // Strip port from host if present
+                        auto colon = host.find(':');
+                        if (colon != std::string::npos) {
+                            host = host.substr(0, colon);
+                        }
+                        if (host.empty()) host = web_address;
+                        auto location = "https://" + host + ":" + std::to_string(https_port) + req.path;
+                        if (!req.params.empty()) {
+                            location += "?";
+                            bool first = true;
+                            for (const auto& [k, v] : req.params) {
+                                if (!first) location += "&";
+                                location += k + "=" + v;
+                                first = false;
+                            }
+                        }
+                        res.set_redirect(location, 301);
+                        return httplib::Server::HandlerResponse::Handled;
+                    });
+                redirect_thread_ = std::thread([this] {
+                    spdlog::info("HTTP→HTTPS redirect on http://{}:{}/",
+                        cfg_.web_address, cfg_.web_port);
+                    redirect_server_->listen(cfg_.web_address, cfg_.web_port);
+                });
+            }
+        }
+#endif
+
+        web_thread_ = std::thread([this, listen_port] {
+            if (cfg_.https_enabled) {
+                spdlog::info("Web UI available at https://{}:{}/",
+                    cfg_.web_address, listen_port);
+            } else {
+                spdlog::info("Web UI available at http://{}:{}/",
+                    cfg_.web_address, listen_port);
+            }
+            web_server_->listen(cfg_.web_address, listen_port);
         });
     }
 
@@ -2470,9 +4321,31 @@ private:
     std::unique_ptr<httplib::Server>           web_server_;
     std::thread                                web_thread_;
 
+    // HTTPS redirect server
+    std::unique_ptr<httplib::Server>           redirect_server_;
+    std::thread                                redirect_thread_;
+
     // NVD CVE feed
     std::shared_ptr<NvdDatabase>               nvd_db_;
     std::unique_ptr<NvdSyncManager>            nvd_sync_;
+
+    // OTA agent updates
+    std::unique_ptr<UpdateRegistry>            update_registry_;
+
+    // Analytics
+    std::unique_ptr<AnalyticsEventStore>       analytics_store_;
+
+    // Phase 1: Data infrastructure
+    std::unique_ptr<ResponseStore>             response_store_;
+    std::unique_ptr<AuditStore>                audit_store_;
+    std::unique_ptr<TagStore>                  tag_store_;
+
+    // Phase 2: Instruction system
+    std::unique_ptr<InstructionStore>          instruction_store_;
+    std::unique_ptr<ExecutionTracker>          execution_tracker_;
+    std::unique_ptr<ApprovalManager>           approval_manager_;
+    std::unique_ptr<ScheduleEngine>            schedule_engine_;
+    sqlite3*                                   shared_instr_db_{nullptr};
 };
 
 // -- Factory ------------------------------------------------------------------
