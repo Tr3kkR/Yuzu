@@ -20,6 +20,9 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_bef
 
 #include <atomic>
 #include <csignal>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <filesystem>
 #include <format>

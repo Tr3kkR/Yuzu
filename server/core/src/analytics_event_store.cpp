@@ -131,22 +131,43 @@ void AnalyticsEventStore::start_drain() {
     if (!db_ || drain_interval_seconds_ <= 0) return;
     std::lock_guard lock(mu_);
     if (sinks_.empty()) return;
+#ifdef __cpp_lib_jthread
     drain_thread_ = std::jthread([this](std::stop_token stop) { run_drain(stop); });
+#else
+    stop_requested_ = false;
+    drain_thread_ = std::thread([this] { run_drain(); });
+#endif
 }
 
 void AnalyticsEventStore::stop_drain() {
+#ifdef __cpp_lib_jthread
     if (drain_thread_.joinable()) {
         drain_thread_.request_stop();
         drain_thread_.join();
     }
+#else
+    if (drain_thread_.joinable()) {
+        stop_requested_ = true;
+        drain_thread_.join();
+    }
+#endif
 }
 
+#ifdef __cpp_lib_jthread
 void AnalyticsEventStore::run_drain(std::stop_token stop) {
     while (!stop.stop_requested()) {
         for (int i = 0; i < drain_interval_seconds_ && !stop.stop_requested(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         if (stop.stop_requested()) break;
+#else
+void AnalyticsEventStore::run_drain() {
+    while (!stop_requested_.load()) {
+        for (int i = 0; i < drain_interval_seconds_ && !stop_requested_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (stop_requested_.load()) break;
+#endif
         drain_batch();
     }
 }

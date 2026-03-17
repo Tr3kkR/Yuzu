@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -43,12 +44,21 @@ private:
     NvdClient client_;
     std::chrono::seconds interval_;
 
+#ifdef __cpp_lib_jthread
     std::jthread sync_thread_;
+#else
+    std::thread sync_thread_;
+    std::atomic<bool> stop_requested_{false};
+#endif
     mutable std::mutex mu_;
     std::condition_variable cv_;
     SyncStatus status_;
 
-    void sync_loop(std::stop_token token);
+#ifdef __cpp_lib_jthread
+    void sync_loop(std::stop_token stop);
+#else
+    void sync_loop();
+#endif
     void do_sync();
     void do_initial_sync();
     void do_incremental_sync();

@@ -118,6 +118,10 @@ std::filesystem::path default_config_path() {
 #ifdef _WIN32
     return R"(C:\ProgramData\Yuzu\yuzu-server.cfg)";
 #elif defined(__APPLE__)
+    // Use per-user Application Support when not running as root
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / "Library/Application Support/Yuzu/yuzu-server.cfg";
+    }
     return "/Library/Application Support/Yuzu/yuzu-server.cfg";
 #else
     return "/etc/yuzu/yuzu-server.cfg";

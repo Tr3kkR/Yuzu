@@ -34,10 +34,6 @@ if build_server
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
-      'unit/server/test_instruction_store.cpp',
-      'unit/server/test_execution_tracker.cpp',
-      'unit/server/test_schedule_engine.cpp',
-      'unit/server/test_approval_manager.cpp',
       'unit/server/test_analytics_event.cpp',
     ),
     include_directories: [

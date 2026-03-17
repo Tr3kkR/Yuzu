@@ -15,17 +15,13 @@
 #include <array>
 #include <cstdio>
 #include <format>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 #if defined(__linux__)
-#include <fstream>
-#include <sstream>
 #include <cstdlib>
-#endif
-
-#if defined(__APPLE__)
-#include <sstream>
+#include <fstream>
 #endif
 
 #ifdef _WIN32

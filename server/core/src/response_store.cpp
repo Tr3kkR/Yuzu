@@ -168,22 +168,43 @@ std::uintmax_t ResponseStore::db_size_bytes() const {
 
 void ResponseStore::start_cleanup() {
     if (!db_ || cleanup_interval_min_ <= 0) return;
+#ifdef __cpp_lib_jthread
     cleanup_thread_ = std::jthread([this](std::stop_token stop) { run_cleanup(stop); });
+#else
+    stop_requested_ = false;
+    cleanup_thread_ = std::thread([this]() { run_cleanup(); });
+#endif
 }
 
 void ResponseStore::stop_cleanup() {
+#ifdef __cpp_lib_jthread
     if (cleanup_thread_.joinable()) {
         cleanup_thread_.request_stop();
         cleanup_thread_.join();
     }
+#else
+    stop_requested_ = true;
+    if (cleanup_thread_.joinable()) {
+        cleanup_thread_.join();
+    }
+#endif
 }
 
+#ifdef __cpp_lib_jthread
 void ResponseStore::run_cleanup(std::stop_token stop) {
     while (!stop.stop_requested()) {
         for (int i = 0; i < cleanup_interval_min_ * 60 && !stop.stop_requested(); ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         if (stop.stop_requested()) break;
+#else
+void ResponseStore::run_cleanup() {
+    while (!stop_requested_.load()) {
+        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop_requested_.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (stop_requested_.load()) break;
+#endif
 
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();

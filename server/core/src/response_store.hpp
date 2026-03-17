@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -58,10 +59,19 @@ private:
     std::filesystem::path db_path_;
     int retention_days_;
     int cleanup_interval_min_;
+#ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
+#else
+    std::thread cleanup_thread_;
+    std::atomic<bool> stop_requested_{false};
+#endif
 
     void create_tables();
+#ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
+#else
+    void run_cleanup();
+#endif
 };
 
 }  // namespace yuzu::server

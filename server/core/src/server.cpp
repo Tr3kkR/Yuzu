@@ -76,9 +76,12 @@ namespace gw = ::yuzu::gateway::v1;
 #ifdef _WIN32
     return R"(C:\ProgramData\Yuzu\logs\agent.log)";
 #elif defined(__APPLE__)
-    return "/Library/Logs/Yuzu/agent.log";
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / "Library/Logs/Yuzu/server.log";
+    }
+    return "/Library/Logs/Yuzu/server.log";
 #else
-    return "/var/log/yuzu/agent.log";
+    return "/var/log/yuzu/server.log";
 #endif
 }
 

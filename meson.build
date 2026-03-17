@@ -5,7 +5,7 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++latest',
+    'cpp_std=c++23',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -19,6 +19,7 @@ host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
 if cxx.get_id() == 'msvc'
   add_project_arguments(
+    '/std:c++latest',           # upgrade beyond c++23 default for MSVC
     '/wd4251', '/wd4127', '/wd4275',
     '/permissive-', '/Zc:__cplusplus', '/utf-8',
     language: 'cpp',
@@ -69,6 +70,12 @@ nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
 httplib_dep     = dependency('httplib',   required: true)
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'], required: true)
+
+# macOS frameworks needed by gRPC, abseil, and cpp-httplib
+if host_os == 'darwin'
+  corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
+  grpcpp_dep = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
 subdir('proto')

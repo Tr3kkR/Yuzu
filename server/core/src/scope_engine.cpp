@@ -1,9 +1,10 @@
 #include "scope_engine.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <charconv>
+#include <cctype>
 #include <format>
+#include <string>
 #include <sstream>
 
 namespace yuzu::scope {
@@ -368,10 +369,19 @@ bool wildcard_match(std::string_view pattern, std::string_view text) {
 
 bool try_numeric_compare(std::string_view a, std::string_view b, CompOp op) {
     double da = 0, db = 0;
+
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     auto [pa, eca] = std::from_chars(a.data(), a.data() + a.size(), da);
     auto [pb, ecb] = std::from_chars(b.data(), b.data() + b.size(), db);
-
     if (eca != std::errc{} || ecb != std::errc{}) {
+#else
+    // Apple libc++ does not support std::from_chars for floating-point types,
+    // so we fall back to std::stod on platforms that lack the feature.
+    try {
+        da = std::stod(std::string(a));
+        db = std::stod(std::string(b));
+    } catch (...) {
+#endif
         // Fall back to string comparison
         int cmp = std::string(a).compare(std::string(b));
         switch (op) {

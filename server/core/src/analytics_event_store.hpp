@@ -2,6 +2,7 @@
 
 #include "analytics_event.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -67,12 +68,21 @@ private:
     sqlite3* db_{nullptr};
     int drain_interval_seconds_;
     int batch_size_;
+#ifdef __cpp_lib_jthread
     std::jthread drain_thread_;
+#else
+    std::thread drain_thread_;
+    std::atomic<bool> stop_requested_{false};
+#endif
     mutable std::mutex mu_;
     std::vector<std::unique_ptr<AnalyticsEventSink>> sinks_;
 
     void create_tables();
+#ifdef __cpp_lib_jthread
     void run_drain(std::stop_token stop);
+#else
+    void run_drain();
+#endif
     void drain_batch();
 };
 

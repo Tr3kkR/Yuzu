@@ -42,7 +42,12 @@ void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
         return;  // already running
     }
-    sync_thread_ = std::jthread([this](std::stop_token token) { sync_loop(token); });
+#ifdef __cpp_lib_jthread
+    sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
+#else
+    stop_requested_ = false;
+    sync_thread_ = std::thread([this] { sync_loop(); });
+#endif
     spdlog::info("NVD sync manager started (interval={}s)", interval_.count());
 }
 
@@ -50,12 +55,21 @@ void NvdSyncManager::stop() {
     if (!sync_thread_.joinable()) {
         return;
     }
+#ifdef __cpp_lib_jthread
     sync_thread_.request_stop();
     {
         std::lock_guard<std::mutex> lock{mu_};
         cv_.notify_all();
     }
     sync_thread_.join();
+#else
+    stop_requested_ = true;
+    {
+        std::lock_guard<std::mutex> lock{mu_};
+        cv_.notify_all();
+    }
+    sync_thread_.join();
+#endif
     spdlog::info("NVD sync manager stopped");
 }
 
@@ -68,7 +82,11 @@ NvdSyncManager::SyncStatus NvdSyncManager::status() const {
     return status_;
 }
 
-void NvdSyncManager::sync_loop(std::stop_token token) {
+#ifdef __cpp_lib_jthread
+void NvdSyncManager::sync_loop(std::stop_token stop) {
+#else
+void NvdSyncManager::sync_loop() {
+#endif
     // Seed built-in rules on first run
     try {
         db_->seed_builtin_rules();
@@ -81,10 +99,17 @@ void NvdSyncManager::sync_loop(std::stop_token token) {
     do_sync();
 
     // Periodic sync loop
-    while (!token.stop_requested()) {
+#ifdef __cpp_lib_jthread
+    while (!stop.stop_requested()) {
         std::unique_lock<std::mutex> lock{mu_};
-        cv_.wait_for(lock, interval_, [&] { return token.stop_requested(); });
-        if (token.stop_requested()) break;
+        cv_.wait_for(lock, interval_, [&stop] { return stop.stop_requested(); });
+        if (stop.stop_requested()) break;
+#else
+    while (!stop_requested_.load()) {
+        std::unique_lock<std::mutex> lock{mu_};
+        cv_.wait_for(lock, interval_, [this] { return stop_requested_.load(); });
+        if (stop_requested_.load()) break;
+#endif
         lock.unlock();
         do_sync();
     }
