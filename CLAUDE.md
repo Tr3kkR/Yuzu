@@ -57,7 +57,7 @@ When working on any issue, check the roadmap for dependencies and the capability
 ### Prerequisites
 - Meson 1.9.2, Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
-- C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
+- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
 
 ### Quick start (setup script)
@@ -119,7 +119,7 @@ proto/                    Protobuf definitions (source of truth for wire protoco
   gen_proto.py            Codegen script (invoked by meson.build)
 docs/                     Architecture docs, roadmap, capability map
 meson/cross/              Cross-compilation files (aarch64, armv7)
-meson/native/             Native files for CI compilers (gcc-13, clang-17, etc.)
+meson/native/             Native files for CI compilers (gcc-13, clang-18, etc.)
 scripts/setup.sh          vcpkg install + meson setup convenience wrapper
 tests/unit/               Catch2 unit tests
 ```
@@ -142,7 +142,7 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 ## CI matrix (`.github/workflows/ci.yml`)
 | Job | Runner | Compiler | Triplet |
 |---|---|---|---|
-| linux | ubuntu-24.04 | GCC 13, Clang 17 | x64-linux |
+| linux | ubuntu-24.04 | GCC 13, Clang 18 | x64-linux |
 | windows | windows-2022 | MSVC (VS 17 2022) | x64-windows |
 | macos | macos-14 (Apple Silicon) | Apple Clang | arm64-osx |
 | arm64-cross | ubuntu-24.04 | aarch64-linux-gnu gcc | arm64-linux |

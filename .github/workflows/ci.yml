@@ -28,14 +28,14 @@ jobs:
       - name: Install clang-format
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format-17
+          sudo apt-get install -y clang-format-18
 
       - name: Check formatting
         run: |
           find agents server sdk tests \
             -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
             | grep -v '\.pb\.' \
-            | xargs clang-format-17 --dry-run --Werror
+            | xargs clang-format-18 --dry-run --Werror
 
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
   linux:
@@ -45,13 +45,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc-13, clang-17]
+        compiler: [gcc-13, clang-18]
         build_type: [debug, release]
         exclude:
           # PRs: only gcc-13 debug (one compiler is enough to validate)
           # Push to main: full matrix
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
-          - compiler: ${{ github.event_name == 'pull_request' && 'clang-17' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-18' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -63,7 +63,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build \
-            gcc-13 g++-13 clang-17 \
+            gcc-13 g++-13 clang-18 \
             pkg-config curl zip unzip tar \
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
@@ -98,7 +98,7 @@ jobs:
       - name: Configure (Meson)
         run: |
           meson setup builddir \
-            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang17.ini' }} \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
