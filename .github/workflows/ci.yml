@@ -13,6 +13,7 @@ concurrency:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
@@ -43,11 +44,20 @@ jobs:
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -98,11 +108,20 @@ jobs:
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-windows-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -151,11 +170,20 @@ jobs:
           brew install cmake ninja pipx
           pipx install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-arm64-osx-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -208,11 +236,20 @@ jobs:
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-arm64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -277,11 +314,20 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -330,11 +376,20 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -381,11 +436,20 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }} gcovr
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
