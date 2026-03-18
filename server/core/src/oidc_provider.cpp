@@ -209,6 +209,13 @@ OidcProvider::parse_id_token(const std::string& jwt) {
         }
     }
 
+    // groups claim: array of Entra security group object IDs
+    if (j.contains("groups") && j["groups"].is_array()) {
+        for (auto& g : j["groups"])
+            if (g.is_string())
+                claims.groups.push_back(g.get<std::string>());
+    }
+
     return claims;
 }
 

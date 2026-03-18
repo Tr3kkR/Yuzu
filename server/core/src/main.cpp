@@ -148,6 +148,8 @@ int main(int argc, char* argv[]) {
                    "OIDC client secret (required for Entra/Azure AD web apps)");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
                    "OIDC redirect URI (default: auto-computed from web address/port)");
+    app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
+                   "Entra group object ID that maps to admin role");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,

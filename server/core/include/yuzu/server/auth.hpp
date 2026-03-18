@@ -93,10 +93,12 @@ public:
     bool has_users() const;
 
     /// Create a session for an externally-authenticated user (OIDC).
-    /// Role: admin if email/name matches a local admin account, else user.
+    /// Role: admin if user is in the admin group, or email/name matches a local admin.
     std::string create_oidc_session(const std::string& display_name,
                                     const std::string& email,
-                                    const std::string& oidc_sub);
+                                    const std::string& oidc_sub,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group_id = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

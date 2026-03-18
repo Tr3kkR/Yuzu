@@ -1514,7 +1514,8 @@ public:
             oidc_cfg.issuer        = cfg_.oidc_issuer;
             oidc_cfg.client_id     = cfg_.oidc_client_id;
             oidc_cfg.client_secret = cfg_.oidc_client_secret;
-            oidc_cfg.redirect_uri  = cfg_.oidc_redirect_uri;
+            oidc_cfg.redirect_uri   = cfg_.oidc_redirect_uri;
+            oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             // Fallback endpoints for Entra ID — OidcProvider constructor will
             // override from the OIDC discovery document if reachable.
             // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
@@ -2799,7 +2800,9 @@ private:
                 auto& claims = result.value();
                 auto email   = claims.email.empty() ? claims.preferred_username : claims.email;
                 auto display = claims.name.empty() ? email : claims.name;
-                auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub);
+                auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+                auto session_token = auth_mgr_.create_oidc_session(
+                    display, email, claims.sub, claims.groups, admin_gid);
 
                 res.set_header("Set-Cookie",
                                "yuzu_session=" + session_token + session_cookie_attrs());

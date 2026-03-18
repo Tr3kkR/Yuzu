@@ -438,15 +438,28 @@ bool AuthManager::remove_user(const std::string& username) {
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
                                               const std::string& email,
-                                              const std::string& oidc_sub) {
+                                              const std::string& oidc_sub,
+                                              const std::vector<std::string>& groups,
+                                              const std::string& admin_group_id) {
     std::lock_guard lock(mu_);
 
-    // Determine role: admin if email or display_name matches a local admin account
+    // Determine role: admin if user is in the configured admin group,
+    // or if email/display_name matches a local admin account
     Role role = Role::user;
-    for (const auto& [name, entry] : users_) {
-        if (entry.role == Role::admin && (name == email || name == display_name)) {
-            role = Role::admin;
-            break;
+    if (!admin_group_id.empty()) {
+        for (const auto& gid : groups) {
+            if (gid == admin_group_id) {
+                role = Role::admin;
+                break;
+            }
+        }
+    }
+    if (role != Role::admin) {
+        for (const auto& [name, entry] : users_) {
+            if (entry.role == Role::admin && (name == email || name == display_name)) {
+                role = Role::admin;
+                break;
+            }
         }
     }
 

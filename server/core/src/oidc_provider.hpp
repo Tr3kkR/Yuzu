@@ -17,6 +17,7 @@ struct OidcConfig {
     std::string authorization_endpoint;
     std::string token_endpoint;
     std::string exchange_script;    // Path to oidc_token_exchange.py
+    std::string admin_group_id;    // Entra group ID that maps to admin role
 
     bool is_enabled() const { return !issuer.empty() && !client_id.empty(); }
 };
@@ -40,6 +41,7 @@ struct IdTokenClaims {
     std::string nonce;
     int64_t     exp{0};
     int64_t     iat{0};
+    std::vector<std::string> groups;  // Entra security group object IDs
 };
 
 class OidcProvider {
