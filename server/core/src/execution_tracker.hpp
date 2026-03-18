@@ -71,6 +71,10 @@ public:
     std::vector<Execution> get_children(const std::string& parent_id) const;
 
     // Mutation
+    std::expected<std::string, std::string> create_execution(const Execution& exec);
+    void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
+    void refresh_counts(const std::string& execution_id);
+
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
 

@@ -36,6 +36,10 @@ public:
 
     void create_tables();
 
+    std::expected<std::string, std::string> submit(const std::string& definition_id,
+                                                   const std::string& submitted_by,
+                                                   const std::string& scope_expression);
+
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
     int pending_count() const;
 
@@ -46,6 +50,11 @@ public:
                                             const std::string& comment);
 
 private:
+    std::expected<void, std::string> set_review_status(const std::string& id,
+                                                       const std::string& status,
+                                                       const std::string& reviewer,
+                                                       const std::string& comment);
+
     sqlite3* db_;
 };
 

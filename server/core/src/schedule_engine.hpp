@@ -49,6 +49,9 @@ public:
     bool delete_schedule(const std::string& id);
     void set_enabled(const std::string& id, bool enabled);
 
+    std::vector<InstructionSchedule> evaluate_due() const;
+    void advance_schedule(const std::string& id);
+
 private:
     sqlite3* db_;
 };
