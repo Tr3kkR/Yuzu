@@ -27,17 +27,17 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 ```
-Foundation   [===============================_]  32/33 done  (97%)
-Advanced     [====---------------------------]  12/84 done   (14%)
+Foundation   [================================]  33/33 done  (100%)
+Advanced     [=========---------------------]   24/84 done   (29%)
 Future       [-------------------------------]   0/22 done   (0%)
 ─────────────────────────────────────────────────────────────────
-Overall      [==========--------------------]   44/139 done  (32%)
+Overall      [==============----------------]   57/139 done  (41%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
 | 1. Agent Lifecycle | 9 | 6 | 1 | 2 |
-| 2. Command Execution | 13 | 5 | 1 | 7 |
+| 2. Command Execution | 13 | 13 | 0 | 0 |
 | 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
 | 4. Network Info & Discovery | 11 | 6 | 0 | 5 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
@@ -53,14 +53,14 @@ Overall      [==========--------------------]   44/139 done  (32%)
 | 15. Inventory & Data Collection | 5 | 2 | 0 | 3 |
 | 16. Policy & Compliance Engine | 8 | 0 | 0 | 8 |
 | 17. Triggers & Automation | 7 | 0 | 0 | 7 |
-| 18. Auth & Authorization | 9 | 3 | 0 | 6 |
+| 18. Auth & Authorization | 9 | 5 | 0 | 4 |
 | 19. Device & Group Mgmt | 7 | 3 | 0 | 4 |
-| 20. Response Collection | 7 | 3 | 0 | 4 |
+| 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 2 | 0 | 3 |
 | 22. System & Infrastructure | 8 | 0 | 2 | 6 |
 | 23. Agent Key-Value Storage | 3 | 0 | 0 | 3 |
-| 24. Integration & Extensibility | 7 | 3 | 0 | 4 |
-| **TOTAL** | **139** | **44** | **5** | **90** |
+| 24. Integration & Extensibility | 7 | 3 | 1 | 3 |
+| **TOTAL** | **139** | **57** | **5** | **77** |
 
 ---
 
@@ -148,51 +148,37 @@ No per-agent metrics on commands executed, success rate, or average duration.
 
 `Subscribe` bidi-streaming RPC as alternative to polling.
 
-### 2.6 Instruction Templates / Definitions :x: `T2`
+### 2.6 Instruction Templates / Definitions :white_check_mark: `T2`
 
-Commands are ad-hoc `plugin + action + params`. No saved or named instruction templates.
+`InstructionStore` with full CRUD. Named, versioned definitions with YAML source, parameter schema (JSON Schema), result schema (typed columns), approval mode, concurrency mode, platform constraints. JSON import/export. Stored in SQLite.
 
-> **Need:** Reusable instruction definitions with parameter schemas, versioning, and digital signing.
+### 2.7 Instruction Sets (Grouping) :white_check_mark: `T2`
 
-### 2.7 Instruction Sets (Grouping) :x: `T2`
+`InstructionSet` CRUD in `InstructionStore`. Named logical groupings with cascade delete. Definitions belong to at most one set. RBAC permissions scoped at set level.
 
-No concept of grouped or chained instructions.
+### 2.8 Instruction Hierarchies (Workflows) :white_check_mark: `T2`
 
-> **Need:** Workflow chaining (instruction A output feeds instruction B). Sets provide organizational hierarchy and access control scoping.
+`ExecutionTracker` supports parent/child execution hierarchy via `parent_execution_id`. Query children by parent. Follow-up instructions use parent response data as scope input.
 
-### 2.8 Instruction Hierarchies (Workflows) :x: `T2`
+### 2.9 Instruction Scheduling :white_check_mark: `T2`
 
-No parent-child instruction relationships.
+`ScheduleEngine` with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via `/api/schedules`.
 
-> **Need:** DAG-based workflow execution with branching, conditionals, and follow-up instruction tracking.
+### 2.10 Instruction Approval Workflows :white_check_mark: `T2`
 
-### 2.9 Instruction Scheduling :x: `T2`
+`ApprovalManager` with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always).
 
-All commands are immediate. No deferred or recurring execution.
+### 2.11 Target Estimation :white_check_mark: `T2`
 
-> **Need:** Cron-style scheduling with recurrence patterns, target scope expressions, and execution history tracking.
+`ScopeEngine` with `/api/scope/estimate` endpoint. Evaluates scope expression against connected agents and returns matching count and agent list before execution.
 
-### 2.10 Instruction Approval Workflows :x: `T2`
+### 2.12 Instruction Progress Tracking :white_check_mark: `T2`
 
-No approval gates before execution.
+`ExecutionTracker` with per-agent status tracking (dispatched, responded, success, failure), aggregate progress percentage, summary with agent state counts. Dashboard progress bars via REST API.
 
-> **Need:** Approval submission, review, notification pipeline, and per-instruction approval.
+### 2.13 Instruction Rerun and Cancellation :white_check_mark: `T2`
 
-### 2.11 Target Estimation :x: `T2`
-
-No pre-execution estimate of how many agents match a scope filter.
-
-> **Need:** Safety check before large-scale operations via an `ApproxTarget` endpoint.
-
-### 2.12 Instruction Progress Tracking :large_orange_diamond: `T2`
-
-`CommandResponse.Status` tracks RUNNING/SUCCESS/FAILURE per agent.
-
-> **Gap:** No aggregate progress (e.g., "247/1000 agents complete"), no summary/detail statistics views.
-
-### 2.13 Instruction Rerun and Cancellation :x: `T2`
-
-No mechanism to rerun failed instructions or cancel in-flight ones.
+`ExecutionTracker` supports rerun (clone with same parameters, optional failed-only targeting) and cancellation with user attribution. REST endpoints: `POST /api/executions/{id}/rerun`, `POST /api/executions/{id}/cancel`.
 
 ---
 
@@ -768,19 +754,17 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `admin` (full access) and `user` (read-only).
 
-### 18.3 Granular RBAC :x: `T2`
+### 18.3 Granular RBAC :white_check_mark: `T2`
 
-Only two hardcoded roles.
-
-> **Need:** Custom roles, per-operation permissions (Create/Read/Execute/Write/Delete), securable type mapping, and instance-level security.
+`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle.
 
 ### 18.4 Management-Group-Scoped Roles :x: `T2`
 
 Not implemented. Role applies to specific device groups only.
 
-### 18.5 OIDC / SSO Integration :x: `T2`
+### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 
-Login page has greyed-out SSO stub. Full OIDC flow needed.
+`OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active.
 
 ### 18.6 Active Directory / Entra Integration :x: `T2`
 
@@ -848,17 +832,17 @@ SSE-based streaming to dashboard. gRPC streaming for programmatic access.
 
 `ResponseStore` with SQLite backend. `ResponseQuery` struct: agent_id, status, time range (since/until), limit/offset pagination. Exposed via `GET /api/responses/{instruction_id}` with query parameters.
 
-### 20.3 Response Aggregation :x: `T2`
+### 20.3 Response Aggregation :white_check_mark: `T2`
 
-Not implemented. Summarize responses across agents (counts, averages, distributions).
+`ResponseStore` aggregation engine with COUNT, SUM, AVG, MIN, MAX. Multi-column GROUP BY, incremental computation as responses arrive. REST endpoint with drill-down from aggregate to raw rows.
 
 ### 20.4 Per-Device Error Tracking :white_check_mark: `T2`
 
 `ResponseStore` persists per-response `error_detail` alongside status. Queryable by agent_id, status code, and time range for error history.
 
-### 20.5 CSV / Data Export :x: `T2`
+### 20.5 CSV / Data Export :white_check_mark: `T2`
 
-Not implemented. Export query results for external tools.
+CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV with streaming via chunked transfer encoding. Generic JSON-to-CSV conversion.
 
 ### 20.6 Response Templates :x: `T3`
 
@@ -968,11 +952,11 @@ Stable `plugin.h` C ABI with `plugin.hpp` CRTP wrapper. `YUZU_PLUGIN_EXPORT` mac
 
 `ManagementService` with list/get/send/watch/query.
 
-### 24.3 REST / HTTP Management API :x: `T2`
+### 24.3 REST / HTTP Management API :large_orange_diamond: `T2`
 
-Dashboard endpoints exist but no formal REST API.
+70+ JSON endpoints covering instructions, executions, schedules, approvals, responses, audit, tags, scope, and settings. Session cookie and OIDC auth.
 
-> **Need:** Versioned REST API for external integration. All UIs and external integrations should use the same endpoints.
+> **Gap:** Not yet under a versioned `/api/v1/` prefix. Needs consistent URL patterns and CORS configuration.
 
 ### 24.4 Consumer (External System) Registration :x: `T3`
 

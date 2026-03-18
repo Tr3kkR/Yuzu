@@ -32,10 +32,10 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 2.10 | [#207](https://github.com/Tr3kkR/Yuzu/issues/207) | YAML Authoring UI (Form + CodeMirror) | Open |
 | | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Open |
 | | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Open |
-| **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Open |
+| **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Done |
 | | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Open |
 | | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Open |
-| | 3.4 | [#159](https://github.com/Tr3kkR/Yuzu/issues/159) | OIDC / SSO Integration | Open |
+| | 3.4 | [#159](https://github.com/Tr3kkR/Yuzu/issues/159) | OIDC / SSO Integration | Done |
 | | 3.5 | [#161](https://github.com/Tr3kkR/Yuzu/issues/161) | REST / HTTP Management API (v1) | Open |
 | | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) | Open |
 | | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Open |
@@ -86,12 +86,12 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 0: Foundation | 5 | 0 | 5 | 100% |
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
 | 2: Instruction System | 7 | 5 | 12 | 58% |
-| 3: Security & RBAC | 0 | 9 | 9 | 0% |
+| 3: Security & RBAC | 2 | 7 | 9 | 22% |
 | 4: Agent Infrastructure | 0 | 8 | 8 | 0% |
 | 5: Policy Engine | 0 | 5 | 5 | 0% |
 | 6: Windows Depth | 0 | 6 | 6 | 0% |
 | 7: Scale & Integration | 0 | 19 | 19 | 0% |
-| **Total** | **19** | **52** | **71** | |
+| **Total** | **21** | **50** | **71** | |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
