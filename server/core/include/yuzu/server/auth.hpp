@@ -24,6 +24,8 @@ struct Session {
     std::string username;
     Role        role;
     std::chrono::steady_clock::time_point expires_at;
+    std::string auth_source{"local"};  // "local" or "oidc"
+    std::string oidc_sub;              // OIDC subject claim (empty for local auth)
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
@@ -89,6 +91,14 @@ public:
 
     /// Check whether any users are configured.
     bool has_users() const;
+
+    /// Create a session for an externally-authenticated user (OIDC).
+    /// Role: admin if user is in the admin group, or email/name matches a local admin.
+    std::string create_oidc_session(const std::string& display_name,
+                                    const std::string& email,
+                                    const std::string& oidc_sub,
+                                    const std::vector<std::string>& groups = {},
+                                    const std::string& admin_group_id = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

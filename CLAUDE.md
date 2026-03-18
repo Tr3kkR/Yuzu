@@ -36,13 +36,31 @@ Yuzu Server
     └── Metrics — Prometheus-compatible, per-plugin counters
 ```
 
+## Instruction Engine
+
+The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:
+
+```
+ProductPack → InstructionSet → InstructionDefinition
+                                 ├── Parameter Schema (JSON Schema subset)
+                                 ├── Result Schema (typed columns)
+                                 └── Execution Spec (plugin + action)
+```
+
+Key design documents:
+- `docs/Instruction-Engine.md` — Full architecture blueprint
+- `docs/yaml-dsl-spec.md` — YAML DSL formal specification (6 content kinds)
+- `docs/getting-started.md` — Beginner's guide with tutorial
+
+The YAML DSL uses `apiVersion: yuzu.io/v1alpha1` and supports 6 `kind` values: `InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`. Definitions are stored with `yaml_source` (verbatim YAML, source of truth) plus denormalized columns for queries.
+
 ## Development Roadmap
 
-The full roadmap is in `docs/roadmap.md` with 56 issues across 7 phases. The capability map (`docs/capability-map.md`) tracks 139 capabilities. Current progress: 30/139 done (22%).
+The full roadmap is in `docs/roadmap.md` with 56 issues across 7 phases. The capability map (`docs/capability-map.md`) tracks 139 capabilities. Current progress: 44/139 done (32%).
 
 **Phase execution order:**
-0. Foundation completion (HTTPS, OTA updates, SDK utilities)
-1. Server data infrastructure (response store, audit, tags, scope engine)
+0. Foundation completion (HTTPS, OTA updates, SDK utilities) — **Done**
+1. Server data infrastructure (response store, audit, tags, scope engine) — **Done**
 2. Instruction system (definitions, sets, scheduling, approvals, workflows)
 3. Security & RBAC (granular permissions, management groups, OIDC, REST API)
 4. Agent infrastructure (KV storage, triggers, content distribution, user interaction)
@@ -57,7 +75,7 @@ When working on any issue, check the roadmap for dependencies and the capability
 ### Prerequisites
 - Meson 1.9.2, Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
-- C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
+- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
 
 ### Quick start (setup script)
@@ -109,17 +127,17 @@ Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by v
 agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
 agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
 server/core/              Server daemon (sessions, auth, dashboard, REST API, policy engine)
-server/gateway/           gRPC gateway / TLS termination (proto defined, not yet implemented)
+gateway/                  Erlang/OTP gateway node (standalone rebar3 project, see docs/erlang-gateway-blueprint.md)
 sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
 proto/                    Protobuf definitions (source of truth for wire protocol)
   yuzu/agent/v1/          AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
   yuzu/common/v1/         Shared types: Platform, Timestamp, ErrorDetail
   yuzu/server/v1/         ManagementService API
-  yuzu/gateway/v1/        GatewayUpstream: ProxyRegister, BatchHeartbeat
+  yuzu/gateway/v1/        GatewayUpstream — server-side RPCs the Erlang gateway calls into
   gen_proto.py            Codegen script (invoked by meson.build)
 docs/                     Architecture docs, roadmap, capability map
 meson/cross/              Cross-compilation files (aarch64, armv7)
-meson/native/             Native files for CI compilers (gcc-13, clang-17, etc.)
+meson/native/             Native files for CI compilers (gcc-13, clang-18, etc.)
 scripts/setup.sh          vcpkg install + meson setup convenience wrapper
 tests/unit/               Catch2 unit tests
 ```
@@ -142,7 +160,7 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 ## CI matrix (`.github/workflows/ci.yml`)
 | Job | Runner | Compiler | Triplet |
 |---|---|---|---|
-| linux | ubuntu-24.04 | GCC 13, Clang 17 | x64-linux |
+| linux | ubuntu-24.04 | GCC 13, Clang 18 | x64-linux |
 | windows | windows-2022 | MSVC (VS 17 2022) | x64-windows |
 | macos | macos-14 (Apple Silicon) | Apple Clang | arm64-osx |
 | arm64-cross | ubuntu-24.04 | aarch64-linux-gnu gcc | arm64-linux |

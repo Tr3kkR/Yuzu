@@ -55,6 +55,13 @@ struct Config {
     std::filesystem::path https_key_path;
     bool                  https_redirect{true};  // HTTP→HTTPS 301 redirect
 
+    // OIDC SSO
+    std::string           oidc_issuer;        // e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
+    std::string           oidc_client_id;     // App registration client ID
+    std::string           oidc_client_secret; // Client secret (required for Entra web platform)
+    std::string           oidc_redirect_uri;  // Callback URL (auto-computed from web port if empty)
+    std::string           oidc_admin_group;   // Entra group ID that maps to admin role
+
     // Response persistence
     int                   response_retention_days{90};
 

@@ -5,7 +5,7 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++latest',
+    'cpp_std=c++23',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -19,6 +19,7 @@ host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
 if cxx.get_id() == 'msvc'
   add_project_arguments(
+    '/std:c++latest',           # upgrade beyond c++23 default for MSVC
     '/wd4251', '/wd4127', '/wd4275',
     '/permissive-', '/Zc:__cplusplus', '/utf-8',
     language: 'cpp',
@@ -70,6 +71,12 @@ cli11_dep       = dependency('CLI11',         required: true)
 httplib_dep     = dependency('httplib',   required: true)
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'], required: true)
 
+# macOS frameworks needed by gRPC, abseil, and cpp-httplib
+if host_os == 'darwin'
+  corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
+  grpcpp_dep = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+endif
+
 # ── Proto codegen ─────────────────────────────────────────────────────────────
 subdir('proto')
 
@@ -116,7 +123,6 @@ endif
 # ── Server ────────────────────────────────────────────────────────────────────
 if build_server
   subdir('server/core')
-  subdir('server/gateway')
 endif
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -128,25 +134,32 @@ endif
 _rebar3 = find_program('rebar3', required: false)
 if _rebar3.found()
   _gw_src = meson.project_source_root() / 'gateway'
+  _gw_build_script = meson.project_source_root() / 'scripts' / 'build_gateway.py'
   # rebar3 must run from inside the gateway/ directory.
-  # Meson custom_target has no workdir param, so we use 'cmd /c cd ... &&'
-  # on Windows or 'sh -c cd ... &&' on POSIX.
-  if host_machine.system() == 'windows'
-    custom_target('gateway',
-      command: ['cmd', '/c', 'cd /d ' + _gw_src + ' && rebar3 compile'],
-      output: '.gateway_built',
-      build_always_stale: true,
-      build_by_default: true,
-    )
-  else
-    _sh = find_program('sh')
-    custom_target('gateway',
-      command: [_sh, '-c', 'cd ' + _gw_src + ' && rebar3 compile'],
-      output: '.gateway_built',
-      build_always_stale: true,
-      build_by_default: true,
-    )
-  endif
+  # We use a Python wrapper instead of 'cmd /c cd ... && rebar3 compile'
+  # because Ninja quotes compound commands as a single argument, which
+  # breaks cmd.exe on Windows.
+  custom_target('gateway',
+    command: [find_program('python3'), _gw_build_script, _gw_src],
+    output: '.gateway_built',
+    build_always_stale: true,
+    build_by_default: true,
+  )
+  # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
+  _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
+  _python3 = find_program('python3')
+  test('gateway eunit',
+    _python3,
+    args: [_gw_test_script, _gw_src, 'eunit'],
+    suite: 'gateway',
+    timeout: 120,
+  )
+  test('gateway ct',
+    _python3,
+    args: [_gw_test_script, _gw_src, 'ct'],
+    suite: 'gateway',
+    timeout: 300,
+  )
   message('Erlang gateway: enabled (rebar3 found)')
 else
   message('Erlang gateway: skipped (rebar3 not found)')

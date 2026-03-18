@@ -1,0 +1,245 @@
+%%%-------------------------------------------------------------------
+%%% @doc Tests for heartbeat status_tags piggybacking through the
+%%% gateway's BatchHeartbeat upstream path.
+%%%
+%%% Verifies that status_tags (yuzu.os, yuzu.arch, yuzu.uptime_s, etc.)
+%%% are preserved end-to-end: queued into the heartbeat buffer, batched,
+%%% and forwarded in the BatchHeartbeat RPC to the upstream server.
+%%%
+%%% Mocks grpcbox_client to inspect what the gateway actually sends.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(yuzu_gw_heartbeat_metrics_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+%%%===================================================================
+%%% Test fixture
+%%%===================================================================
+
+heartbeat_metrics_test_() ->
+    {setup,
+     fun setup/0,
+     fun cleanup/1,
+     [
+      {"status_tags are preserved in queued heartbeats", fun tags_preserved/0},
+      {"multiple agents with different status_tags", fun multi_agent_tags/0},
+      {"status_tags survive buffer retention on failure", fun tags_survive_failure/0},
+      {"empty status_tags heartbeat is valid", fun empty_tags_valid/0},
+      {"status_tags are maps not lists", fun tags_are_maps/0}
+     ]}.
+
+setup() ->
+    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {ok, #{acknowledged_count => 0}, #{}}
+    end),
+    meck:new(telemetry, [passthrough, no_link]),
+    meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
+    %% Use a long interval so flushes don't happen automatically during tests.
+    application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
+    {ok, Pid} = yuzu_gw_upstream:start_link(),
+    Pid.
+
+cleanup(Pid) ->
+    unlink(Pid),
+    exit(Pid, shutdown),
+    timer:sleep(50),
+    meck:unload([grpcbox_client, telemetry]),
+    ok.
+
+%%%===================================================================
+%%% Helpers
+%%%===================================================================
+
+%% Build a heartbeat map with status_tags for a given agent.
+make_heartbeat(SessionId, Tags) ->
+    #{session_id => SessionId,
+      sent_at => #{millis_epoch => 1700000000000},
+      status_tags => Tags}.
+
+%% Standard set of status_tags for a Linux agent.
+linux_tags() ->
+    #{<<"yuzu.os">> => <<"linux">>,
+      <<"yuzu.arch">> => <<"x86_64">>,
+      <<"yuzu.uptime_s">> => <<"3600">>,
+      <<"yuzu.commands_executed">> => <<"42">>,
+      <<"yuzu.plugins_loaded">> => <<"7">>,
+      <<"yuzu.agent_version">> => <<"0.3.0">>,
+      <<"yuzu.healthy">> => <<"1">>}.
+
+%% Drain any stale heartbeats from prior tests, then reset meck history.
+drain_buffer() ->
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {ok, #{acknowledged_count => 0}, #{}}
+    end),
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(50),
+    meck:reset(grpcbox_client).
+
+%% Extract all BatchHeartbeat request maps from meck history.
+batch_requests() ->
+    Calls = meck:history(grpcbox_client),
+    [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+            binary:match(Path, <<"BatchHeartbeat">>) =/= nomatch].
+
+%% Set up the unary mock so BatchHeartbeat succeeds and returns ack count.
+mock_batch_success() ->
+    meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
+        case binary:match(Path, <<"BatchHeartbeat">>) of
+            nomatch -> {ok, #{}, #{}};
+            _ ->
+                HBs = maps:get(heartbeats, Req, []),
+                {ok, #{acknowledged_count => length(HBs)}, #{}}
+        end
+    end).
+
+%%%===================================================================
+%%% Tests
+%%%===================================================================
+
+tags_preserved() ->
+    drain_buffer(),
+    mock_batch_success(),
+
+    HB = make_heartbeat(<<"s1">>, linux_tags()),
+    yuzu_gw_upstream:queue_heartbeat(HB),
+    timer:sleep(20),
+
+    %% Trigger flush.
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(1, length(HBs)),
+    [Sent] = HBs,
+    SentTags = maps:get(status_tags, Sent),
+    ?assertEqual(<<"linux">>, maps:get(<<"yuzu.os">>, SentTags)),
+    ?assertEqual(<<"x86_64">>, maps:get(<<"yuzu.arch">>, SentTags)),
+    ?assertEqual(<<"3600">>, maps:get(<<"yuzu.uptime_s">>, SentTags)),
+    ?assertEqual(<<"42">>, maps:get(<<"yuzu.commands_executed">>, SentTags)),
+    ?assertEqual(<<"7">>, maps:get(<<"yuzu.plugins_loaded">>, SentTags)),
+    ?assertEqual(<<"0.3.0">>, maps:get(<<"yuzu.agent_version">>, SentTags)),
+    ?assertEqual(<<"1">>, maps:get(<<"yuzu.healthy">>, SentTags)).
+
+multi_agent_tags() ->
+    drain_buffer(),
+    mock_batch_success(),
+
+    HB1 = make_heartbeat(<<"agent-linux">>, #{
+        <<"yuzu.os">> => <<"linux">>,
+        <<"yuzu.arch">> => <<"x86_64">>,
+        <<"yuzu.uptime_s">> => <<"7200">>
+    }),
+    HB2 = make_heartbeat(<<"agent-win">>, #{
+        <<"yuzu.os">> => <<"windows">>,
+        <<"yuzu.arch">> => <<"x86_64">>,
+        <<"yuzu.uptime_s">> => <<"1800">>
+    }),
+    HB3 = make_heartbeat(<<"agent-mac">>, #{
+        <<"yuzu.os">> => <<"darwin">>,
+        <<"yuzu.arch">> => <<"arm64">>,
+        <<"yuzu.uptime_s">> => <<"600">>
+    }),
+
+    yuzu_gw_upstream:queue_heartbeat(HB1),
+    yuzu_gw_upstream:queue_heartbeat(HB2),
+    yuzu_gw_upstream:queue_heartbeat(HB3),
+    timer:sleep(20),
+
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(3, length(HBs)),
+
+    %% Build a map of session_id -> status_tags for easy lookup.
+    BySession = maps:from_list([{maps:get(session_id, H), maps:get(status_tags, H)} || H <- HBs]),
+    ?assertEqual(<<"linux">>,   maps:get(<<"yuzu.os">>, maps:get(<<"agent-linux">>, BySession))),
+    ?assertEqual(<<"windows">>, maps:get(<<"yuzu.os">>, maps:get(<<"agent-win">>, BySession))),
+    ?assertEqual(<<"darwin">>,  maps:get(<<"yuzu.os">>, maps:get(<<"agent-mac">>, BySession))),
+    ?assertEqual(<<"arm64">>,   maps:get(<<"yuzu.arch">>, maps:get(<<"agent-mac">>, BySession))).
+
+tags_survive_failure() ->
+    drain_buffer(),
+
+    %% Queue heartbeats with tags.
+    HB1 = make_heartbeat(<<"fail1">>, #{<<"yuzu.os">> => <<"linux">>, <<"yuzu.healthy">> => <<"1">>}),
+    HB2 = make_heartbeat(<<"fail2">>, #{<<"yuzu.os">> => <<"windows">>, <<"yuzu.healthy">> => <<"0">>}),
+    yuzu_gw_upstream:queue_heartbeat(HB1),
+    yuzu_gw_upstream:queue_heartbeat(HB2),
+    timer:sleep(20),
+
+    %% Make flush fail.
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {error, connection_refused}
+    end),
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    %% Now make flush succeed and retry.
+    meck:reset(grpcbox_client),
+    mock_batch_success(),
+
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(2, length(HBs)),
+
+    %% Verify tags survived the failure cycle.
+    BySession = maps:from_list([{maps:get(session_id, H), maps:get(status_tags, H)} || H <- HBs]),
+    ?assertEqual(<<"linux">>,   maps:get(<<"yuzu.os">>, maps:get(<<"fail1">>, BySession))),
+    ?assertEqual(<<"1">>,       maps:get(<<"yuzu.healthy">>, maps:get(<<"fail1">>, BySession))),
+    ?assertEqual(<<"windows">>, maps:get(<<"yuzu.os">>, maps:get(<<"fail2">>, BySession))),
+    ?assertEqual(<<"0">>,       maps:get(<<"yuzu.healthy">>, maps:get(<<"fail2">>, BySession))).
+
+empty_tags_valid() ->
+    drain_buffer(),
+    mock_batch_success(),
+
+    HB = make_heartbeat(<<"empty-tags">>, #{}),
+    yuzu_gw_upstream:queue_heartbeat(HB),
+    timer:sleep(20),
+
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(1, length(HBs)),
+    [Sent] = HBs,
+    ?assertEqual(#{}, maps:get(status_tags, Sent)).
+
+tags_are_maps() ->
+    drain_buffer(),
+    mock_batch_success(),
+
+    Tags = linux_tags(),
+    HB = make_heartbeat(<<"map-check">>, Tags),
+    yuzu_gw_upstream:queue_heartbeat(HB),
+    timer:sleep(20),
+
+    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    timer:sleep(100),
+
+    Batches = batch_requests(),
+    ?assert(length(Batches) > 0),
+    [BatchReq | _] = Batches,
+    HBs = maps:get(heartbeats, BatchReq, []),
+    ?assertEqual(1, length(HBs)),
+    [Sent] = HBs,
+    SentTags = maps:get(status_tags, Sent),
+    ?assert(is_map(SentTags)),
+    ?assertNot(is_list(SentTags)).

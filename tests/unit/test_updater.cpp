@@ -38,26 +38,23 @@ void write_fake_binary(const fs::path& path) {
     out << "fake-binary-content";
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ── current_executable_path ─────────────────────────────────────────────────
 
-TEST_CASE("current_executable_path returns non-empty path",
-          "[updater][exe_path]") {
+TEST_CASE("current_executable_path returns non-empty path", "[updater][exe_path]") {
     auto path = current_executable_path();
     REQUIRE_FALSE(path.empty());
 }
 
-TEST_CASE("current_executable_path points to existing file",
-          "[updater][exe_path]") {
+TEST_CASE("current_executable_path points to existing file", "[updater][exe_path]") {
     auto path = current_executable_path();
     REQUIRE(fs::exists(path));
 }
 
 // ── cleanup_old_binary ──────────────────────────────────────────────────────
 
-TEST_CASE("cleanup_old_binary deletes .old file if present",
-          "[updater][cleanup]") {
+TEST_CASE("cleanup_old_binary deletes .old file if present", "[updater][cleanup]") {
     auto dir = make_temp_dir("cleanup_present");
 
 #ifdef _WIN32
@@ -78,13 +75,12 @@ TEST_CASE("cleanup_old_binary deletes .old file if present",
     updater.cleanup_old_binary();
 
     REQUIRE_FALSE(fs::exists(old_path));
-    REQUIRE(fs::exists(exe_path));  // Current exe must still exist
+    REQUIRE(fs::exists(exe_path)); // Current exe must still exist
 
     cleanup_dir(dir);
 }
 
-TEST_CASE("cleanup_old_binary does nothing if no .old exists",
-          "[updater][cleanup]") {
+TEST_CASE("cleanup_old_binary does nothing if no .old exists", "[updater][cleanup]") {
     auto dir = make_temp_dir("cleanup_absent");
 
 #ifdef _WIN32
@@ -108,8 +104,7 @@ TEST_CASE("cleanup_old_binary does nothing if no .old exists",
 
 // ── rollback_if_needed ──────────────────────────────────────────────────────
 
-TEST_CASE("rollback_if_needed returns false when no .old exists",
-          "[updater][rollback]") {
+TEST_CASE("rollback_if_needed returns false when no .old exists", "[updater][rollback]") {
     auto dir = make_temp_dir("rollback_no_old");
 
 #ifdef _WIN32
@@ -144,7 +139,7 @@ TEST_CASE("rollback_if_needed returns false when .old exists AND verified marker
 
     write_fake_binary(exe_path);
     write_fake_binary(old_path);
-    write_fake_binary(marker_path);  // Verification marker exists
+    write_fake_binary(marker_path); // Verification marker exists
 
     UpdateConfig config;
     Updater updater(config, "test-agent", "0.1.0", "windows", "x86_64", exe_path);

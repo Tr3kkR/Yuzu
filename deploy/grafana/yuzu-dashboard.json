@@ -199,6 +199,62 @@
           "unit": "ops"
         }
       }
+    },
+    {
+      "title": "Fleet Health",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 28 },
+      "collapsed": false
+    },
+    {
+      "title": "Healthy Agents",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 29 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "yuzu_fleet_agents_healthy",
+          "legendFormat": "Healthy"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Heartbeat Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 29 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "rate(yuzu_heartbeats_received_total[5m])",
+          "legendFormat": "{{via}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "Agents by OS",
+      "type": "piechart",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 29 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "yuzu_fleet_agents_by_os",
+          "legendFormat": "{{os}}"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
@@ -209,5 +265,17 @@
   "timezone": "browser",
   "title": "Yuzu Server Dashboard",
   "uid": "yuzu-server",
-  "version": 1
+  "version": 2,
+  "links": [
+    {
+      "title": "Yuzu Fleet Overview",
+      "url": "/d/yuzu-fleet",
+      "type": "link"
+    },
+    {
+      "title": "Yuzu Gateway Dashboard",
+      "url": "/d/yuzu-gateway",
+      "type": "link"
+    }
+  ]
 }

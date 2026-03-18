@@ -15,11 +15,13 @@
 %%--------------------------------------------------------------------
 
 start(_StartType, _StartArgs) ->
-    %% Create the pg scope before anything tries to join groups.
-    pg:start_link(yuzu_gw),
-
     %% Attach telemetry/prometheus handlers.
     yuzu_gw_telemetry:setup(),
+
+    %% Start Prometheus HTTP exporter for /metrics endpoint.
+    Port = application:get_env(yuzu_gw, prometheus_port, 9568),
+    {ok, _} = prometheus_httpd:start([{port, Port}, {path, "/metrics"}]),
+    logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
 
     %% Start the supervision tree.
     yuzu_gw_sup:start_link().

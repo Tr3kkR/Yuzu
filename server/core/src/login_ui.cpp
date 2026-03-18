@@ -2,7 +2,7 @@
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kLoginHtml =
-R"HTM(<!DOCTYPE html>
+    R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -72,7 +72,13 @@ R"HTM(<!DOCTYPE html>
       background: var(--surface); color: #484f58;
       border: 1px solid var(--border); border-radius: 0.375rem;
       cursor: not-allowed; opacity: 0.5;
+      transition: opacity 0.15s, border-color 0.15s;
     }
+    .btn-sso.enabled {
+      color: var(--fg); cursor: pointer; opacity: 1;
+      border-color: var(--accent);
+    }
+    .btn-sso.enabled:hover { background: #1c2128; }
     .sso-label {
       font-size: 0.7rem; color: #484f58; margin-top: 0.4rem;
     }
@@ -98,13 +104,15 @@ R"HTM(<!DOCTYPE html>
       <div class="error-msg" id="error-msg"></div>
     </form>
 
-    <div class="sso-section">
-      <button class="btn-sso" disabled>Sign in with SSO (OIDC)</button>
-      <div class="sso-label">Coming soon</div>
+    <div class="sso-section" id="sso-section">
+      <button class="btn-sso" id="btn-sso" disabled>Sign in with SSO (OIDC)</button>
+      <div class="sso-label" id="sso-label">Coming soon</div>
     </div>
   </div>
 
   <script>
+    /*OIDC_CONFIG*/
+
     function doLogin(e) {
       e.preventDefault();
       var btn = document.getElementById('btn-login');
@@ -138,6 +146,35 @@ R"HTM(<!DOCTYPE html>
       xhr.send('username=' + encodeURIComponent(username) +
                '&password=' + encodeURIComponent(password));
     }
+
+    function startOidc() {
+      window.location.href = '/auth/oidc/start';
+    }
+
+    // Enable SSO button if OIDC is configured (server injects window.OIDC_ENABLED)
+    if (window.OIDC_ENABLED) {
+      var ssoBtn = document.getElementById('btn-sso');
+      ssoBtn.disabled = false;
+      ssoBtn.classList.add('enabled');
+      ssoBtn.textContent = 'Sign in with Microsoft Entra ID';
+      ssoBtn.onclick = startOidc;
+      document.getElementById('sso-label').textContent = '';
+    }
+
+    // Show OIDC error if redirected back with error param
+    (function() {
+      var params = new URLSearchParams(window.location.search);
+      var err = params.get('error');
+      if (err) {
+        var errEl = document.getElementById('error-msg');
+        var msgs = {
+          'sso_denied': 'SSO sign-in was denied by the identity provider',
+          'sso_failed': 'SSO authentication failed',
+          'sso_invalid': 'Invalid SSO response'
+        };
+        errEl.textContent = msgs[err] || 'SSO error';
+      }
+    })();
   </script>
 </body>
 </html>

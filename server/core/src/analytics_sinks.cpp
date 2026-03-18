@@ -1,10 +1,10 @@
 #include "analytics_event_store.hpp"
 
-#include <fstream>
-#include <string>
-
 #include <httplib.h>
 #include <spdlog/spdlog.h>
+
+#include <fstream>
+#include <string>
 
 namespace yuzu::server {
 
@@ -12,8 +12,7 @@ namespace yuzu::server {
 
 class JsonLinesSink : public AnalyticsEventSink {
 public:
-    explicit JsonLinesSink(std::filesystem::path path)
-        : path_(std::move(path)) {}
+    explicit JsonLinesSink(std::filesystem::path path) : path_(std::move(path)) {}
 
     bool send(std::span<const AnalyticsEvent> batch) override {
         std::ofstream out(path_, std::ios::app);
@@ -38,13 +37,10 @@ private:
 
 class ClickHouseSink : public AnalyticsEventSink {
 public:
-    ClickHouseSink(std::string url, std::string database, std::string table,
-                   std::string username, std::string password)
-        : url_(std::move(url)),
-          database_(std::move(database)),
-          table_(std::move(table)),
-          username_(std::move(username)),
-          password_(std::move(password)) {}
+    ClickHouseSink(std::string url, std::string database, std::string table, std::string username,
+                   std::string password)
+        : url_(std::move(url)), database_(std::move(database)), table_(std::move(table)),
+          username_(std::move(username)), password_(std::move(password)) {}
 
     bool send(std::span<const AnalyticsEvent> batch) override {
         // Build JSONEachRow body
@@ -65,8 +61,10 @@ public:
         auto insert_sql = "INSERT INTO " + table_ + " FORMAT JSONEachRow";
         std::string encoded;
         for (char c : insert_sql) {
-            if (c == ' ') encoded += "%20";
-            else encoded += c;
+            if (c == ' ')
+                encoded += "%20";
+            else
+                encoded += c;
         }
         auto query = "/?database=" + database_ + "&query=" + encoded;
 
@@ -101,8 +99,8 @@ private:
     std::string username_;
     std::string password_;
 
-    static void parse_url(const std::string& url,
-                          std::string& scheme, std::string& host, int& port) {
+    static void parse_url(const std::string& url, std::string& scheme, std::string& host,
+                          int& port) {
         // Simple parser for "http://host:port"
         auto scheme_end = url.find("://");
         if (scheme_end == std::string::npos) {
@@ -128,11 +126,10 @@ std::unique_ptr<AnalyticsEventSink> make_jsonlines_sink(const std::filesystem::p
     return std::make_unique<JsonLinesSink>(path);
 }
 
-std::unique_ptr<AnalyticsEventSink> make_clickhouse_sink(
-    const std::string& url, const std::string& database, const std::string& table,
-    const std::string& username, const std::string& password)
-{
+std::unique_ptr<AnalyticsEventSink>
+make_clickhouse_sink(const std::string& url, const std::string& database, const std::string& table,
+                     const std::string& username, const std::string& password) {
     return std::make_unique<ClickHouseSink>(url, database, table, username, password);
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

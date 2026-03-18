@@ -21,12 +21,8 @@ static std::unique_ptr<AutoApproveEngine> make_engine() {
     return std::make_unique<AutoApproveEngine>();
 }
 
-static ApprovalContext make_ctx(
-    const std::string& hostname = "",
-    const std::string& ip = "",
-    const std::string& ca_fp = "",
-    const std::string& attest = "")
-{
+static ApprovalContext make_ctx(const std::string& hostname = "", const std::string& ip = "",
+                                const std::string& ca_fp = "", const std::string& attest = "") {
     return ApprovalContext{hostname, ip, ca_fp, attest};
 }
 
@@ -205,7 +201,7 @@ TEST_CASE("save and reload auto-approve config", "[auto_approve][config]") {
 
     {
         AutoApproveEngine engine;
-        engine.load(tmp);  // sets config_path_ (file doesn't exist yet, returns false)
+        engine.load(tmp); // sets config_path_ (file doesn't exist yet, returns false)
         engine.set_require_all(true);
         engine.add_rule({AutoApproveRuleType::hostname_glob, "*.prod.com", "prod"});
         engine.add_rule({AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "private", false});

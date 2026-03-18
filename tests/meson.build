@@ -11,6 +11,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_read.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_metrics.cpp',
+    'unit/test_metrics_perf.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -34,11 +36,18 @@ if build_server
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_analytics_event.cpp',
+      'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_execution_tracker.cpp',
-      'unit/server/test_schedule_engine.cpp',
       'unit/server/test_approval_manager.cpp',
-      'unit/server/test_analytics_event.cpp',
+      'unit/server/test_schedule_engine.cpp',
+      'unit/server/test_rbac_store.cpp',
+      'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_error_codes.cpp',
+      'unit/server/test_result_envelope.cpp',
+      'unit/server/test_concurrency_manager.cpp',
+      'unit/server/test_legacy_shim.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

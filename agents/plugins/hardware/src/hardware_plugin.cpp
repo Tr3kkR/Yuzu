@@ -20,12 +20,12 @@
 #include <cstdio>
 #include <format>
 #include <map>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 #if defined(__linux__)
 #include <fstream>
-#include <sstream>
 #endif
 
 #if defined(__APPLE__)

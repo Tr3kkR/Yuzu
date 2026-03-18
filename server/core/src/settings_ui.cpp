@@ -3,7 +3,7 @@
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kSettingsHtml =
-R"HTM(<!DOCTYPE html>
+    R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">

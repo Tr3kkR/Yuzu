@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main, "feature/**", "fix/**"]
+    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
   pull_request:
     branches: [main]
+    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,20 +15,44 @@ concurrency:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
+  # ── Lint (fast gate — blocks all builds) ──────────────────────────────────
+  lint:
+    name: "Lint (clang-format)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: Check formatting
+        run: |
+          find agents server sdk tests \
+            -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
+            | grep -v '\.pb\.' \
+            | xargs clang-format-18 --dry-run --Werror
+
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc-13, clang-17]
+        compiler: [gcc-13, clang-18]
         build_type: [debug, release]
         exclude:
-          # PRs only run debug to halve feedback time; push to main runs all.
+          # PRs: only gcc-13 debug (one compiler is enough to validate)
+          # Push to main: full matrix
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-18' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -37,17 +63,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build \
-            gcc-13 g++-13 clang-17 \
-            pkg-config curl zip unzip tar \
-            python3-pip
+            cmake ninja-build pkg-config curl zip unzip tar python3-pip \
+            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18' }}
           pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -62,9 +98,12 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson)
+        env:
+          CC: sccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
+          CXX: sccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
         run: |
           meson setup builddir \
-            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang17.ini' }} \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
@@ -76,9 +115,13 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
+      - name: sccache stats
+        run: sccache --show-stats
+
   # ── Windows (MSVC) ─────────────────────────────────────────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -98,11 +141,23 @@ jobs:
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-windows-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -117,6 +172,9 @@ jobs:
             --x-manifest-root="${{ github.workspace }}"
 
       - name: Configure (Meson)
+        env:
+          CC: sccache cl
+          CXX: sccache cl
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
@@ -130,9 +188,13 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
+      - name: sccache stats
+        run: sccache --show-stats
+
   # ── macOS (Apple Clang) ────────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: macos-14  # Apple Silicon
     strategy:
       fail-fast: false
@@ -151,11 +213,23 @@ jobs:
           brew install cmake ninja pipx
           pipx install meson==${{ env.MESON_VERSION }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-arm64-osx-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -170,6 +244,9 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson)
+        env:
+          CC: sccache cc
+          CXX: sccache c++
         run: |
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
@@ -184,9 +261,13 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
+      - name: sccache stats
+        run: sccache --show-stats
+
   # ── ARM64 Linux cross-compile ──────────────────────────────────────────────
   arm64-cross:
     name: "Linux ARM64 cross-compile ${{ matrix.build_type }}"
+    needs: [lint]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -208,11 +289,23 @@ jobs:
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-arm64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -227,6 +320,9 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson — cross)
+        env:
+          CC: sccache aarch64-linux-gnu-gcc
+          CXX: sccache aarch64-linux-gnu-g++
         run: |
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
@@ -237,28 +333,14 @@ jobs:
       - name: Build
         run: meson compile -C builddir
 
-  # ── Lint (clang-format) ───────────────────────────────────────────────────
-  lint:
-    name: "Lint (clang-format)"
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
+      - name: sccache stats
+        run: sccache --show-stats
 
-      - name: Install clang-format
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-17
-
-      - name: Check formatting
-        run: |
-          find agents server sdk tests \
-            -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \
-            | grep -v '\.pb\.' \
-            | xargs clang-format-17 --dry-run --Werror
-
-  # ── Sanitizers (ASan + UBSan) ───────────────────────────────────────────
+  # ── Sanitizers (ASan + UBSan) — main/push only, after Linux passes ──────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
@@ -277,11 +359,23 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -296,6 +390,9 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + ASan/UBSan)
+        env:
+          CC: sccache gcc-13
+          CXX: sccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -310,9 +407,11 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-  # ── Sanitizers (TSan) ───────────────────────────────────────────────────
+  # ── Sanitizers (TSan) — main/push only, after Linux passes ──────────────
   sanitize-tsan:
     name: "Sanitizers (TSan)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
@@ -330,11 +429,23 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -349,6 +460,9 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + TSan)
+        env:
+          CC: sccache gcc-13
+          CXX: sccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -363,9 +477,11 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-  # ── Coverage ────────────────────────────────────────────────────────────
+  # ── Coverage — main/push only, after Linux passes ────────────────────────
   coverage:
     name: "Coverage (GCC 13)"
+    if: github.event_name == 'push'
+    needs: [linux]
     runs-on: ubuntu-24.04
 
     steps:
@@ -381,11 +497,20 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }} gcovr
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11

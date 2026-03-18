@@ -3,8 +3,8 @@
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kDashboardIndexHtml =
-// Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
-R"HTM(<!DOCTYPE html>
+    // Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
+    R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -322,7 +322,9 @@ R"HTM(<!DOCTYPE html>
       <button class="hamburger-btn" onclick="toggleMenu()" title="Menu">&#9776;</button>
       <div class="hamburger-menu" id="hamburger-menu">
         <div class="hamburger-user" id="menu-user">Signed in</div>
+        <a href="/instructions">Instructions</a>
         <a href="/settings">Settings</a>
+        <a href="/help">Help</a>
         <button onclick="showAbout()">About</button>
         <div class="divider"></div>
         <button onclick="doLogout()">Logout</button>
@@ -334,17 +336,24 @@ R"HTM(<!DOCTYPE html>
   <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
     <div class="modal">
       <h2>Yuzu</h2>
-      <div class="version">Agent &amp; Server Management Platform</div>
-      <p>Real-time endpoint management with gRPC/Protobuf transport,
-         plugin architecture, and multi-platform support.</p>
-      <p style="font-size:0.7rem">Built with C++23, gRPC, httplib, spdlog.</p>
+      <div class="version">Endpoint Management Platform</div>
+      <p id="about-details" style="font-size:0.75rem;color:#8b949e;line-height:1.7;margin-bottom:0.75rem">
+        Loading...
+      </p>
+      <p style="font-size:0.7rem;margin-bottom:0.75rem">Built with C++23, gRPC, Protobuf, SQLite</p>
+      <p style="font-size:0.7rem;margin-bottom:1rem">
+        <a href="https://github.com/anthropics/yuzu" target="_blank" style="color:#58a6ff;text-decoration:none">GitHub</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/help" style="color:#58a6ff;text-decoration:none">Documentation</a>
+      </p>
+      <p style="font-size:0.65rem;color:#484f58;margin-bottom:1rem">Apache 2.0 License</p>
       <button class="btn-close" onclick="closeAbout()">Close</button>
     </div>
   </div>
 
 )HTM"
-// Part 2: HTML body continued
-R"HTM(
+    // Part 2: HTML body continued
+    R"HTM(
   <!-- ── History Panel ──────────────────────────────────────── -->
   <div class="history">
     <div class="history-header">
@@ -389,8 +398,8 @@ R"HTM(
 
   <footer>Yuzu Server &mdash; Dashboard</footer>
 )HTM"
-// Part 2: JavaScript
-R"HTM(
+    // Part 2: JavaScript
+    R"HTM(
   <script>
     /* ── State ─────────────────────────────────────────────── */
     var selectedScope = '__all__';
@@ -461,8 +470,8 @@ R"HTM(
       'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
     };
 )HTM"
-// Part 3: Helpers and table management
-R"HTM(
+    // Part 3: Helpers and table management
+    R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -824,8 +833,8 @@ R"HTM(
       }
     });
 )HTM"
-// Part 4: SSE + menu JavaScript
-R"HTM(
+    // Part 4: SSE + menu JavaScript
+    R"HTM(
     /* ── SSE ──────────────────────────────────────────────── */
     function connectSSE() {
       if (evtSource) evtSource.close();
@@ -946,6 +955,10 @@ R"HTM(
     function showAbout() {
       document.getElementById('hamburger-menu').classList.remove('open');
       document.getElementById('about-modal').classList.add('open');
+      /* Populate dynamic about info */
+      var agentCount = Object.keys(agents).length;
+      var details = 'Agents: ' + agentCount + ' connected';
+      document.getElementById('about-details').textContent = details;
     }
     function closeAbout(e) {
       if (!e || e.target === document.getElementById('about-modal')) {

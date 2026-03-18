@@ -122,7 +122,9 @@ if $LTO; then
 fi
 
 # Extra args from user
-MESON_ARGS+=("${EXTRA_ARGS[@]}")
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  MESON_ARGS+=("${EXTRA_ARGS[@]}")
+fi
 
 # Wipe existing builddir if present (meson setup fails if it already exists
 # with a different configuration).

@@ -1,10 +1,14 @@
-#include <catch2/catch_test_macros.hpp>
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
 #include <fstream>
 #include <string>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -44,8 +48,8 @@ TEST_CASE("create_temp_file respects custom directory", "[temp_file]") {
     fs::create_directories(custom_dir);
 
     char path[512]{};
-    int rc = yuzu_create_temp_file(
-        "custom-", ".tmp", custom_dir.string().c_str(), path, sizeof(path));
+    int rc =
+        yuzu_create_temp_file("custom-", ".tmp", custom_dir.string().c_str(), path, sizeof(path));
     REQUIRE(rc == 0);
 
     fs::path p(path);
@@ -80,7 +84,8 @@ TEST_CASE("create_temp_file fails with buffer too small", "[temp_file]") {
 
 TEST_CASE("create_temp_file fails with nonexistent directory", "[temp_file]") {
     char path[512]{};
-    REQUIRE(yuzu_create_temp_file(nullptr, nullptr, "/nonexistent/dir/xyz", path, sizeof(path)) != 0);
+    REQUIRE(yuzu_create_temp_file(nullptr, nullptr, "/nonexistent/dir/xyz", path, sizeof(path)) !=
+            0);
 }
 
 #ifndef _WIN32

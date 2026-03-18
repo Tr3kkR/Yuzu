@@ -1,5 +1,5 @@
 %%%-------------------------------------------------------------------
-%%% @doc gRPC client pool to the C++ yuzu-server (control plane).
+%%% @doc gRPC client to the C++ yuzu-server (control plane).
 %%%
 %%% Proxies Register, Heartbeat (batched), Inventory, and stream
 %%% status notifications to the upstream server.
@@ -7,10 +7,18 @@
 %%% Heartbeats are batched: individual agent heartbeats are buffered
 %%% and sent in a single BatchHeartbeat RPC at a configurable interval,
 %%% reducing upstream load from O(agents/interval) to O(nodes/interval).
+%%%
+%%% On RPC failure, heartbeat buffers are retained (capped) for retry
+%%% on the next flush cycle rather than being silently discarded.
+%%%
+%%% Upstream connection is managed by grpcbox via the `default_channel`
+%%% configured in sys.config.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_upstream).
 -behaviour(gen_server).
+
+-include_lib("grpcbox/include/grpcbox.hrl").
 
 %% API
 -export([start_link/0,
@@ -23,14 +31,15 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
+-define(DEFAULT_MAX_HB_BUFFER, 10000).
+-define(MAX_NOTIFY_INFLIGHT, 10).
 
 -record(state, {
-    channel       :: grpcbox_channel:t() | undefined,
-    upstream_addr :: string(),
-    upstream_port :: non_neg_integer(),
     hb_buffer     :: [map()],           %% buffered heartbeat requests
     hb_timer      :: reference() | undefined,
-    hb_interval   :: non_neg_integer()  %% ms
+    hb_interval   :: non_neg_integer(), %% ms
+    max_hb_buffer :: non_neg_integer(), %% cap for retained buffer on failure
+    notify_pids   :: #{pid() => true}   %% in-flight notification processes
 }).
 
 %%%===================================================================
@@ -65,33 +74,28 @@ notify_stream_status(AgentId, SessionId, Event, PeerAddr) ->
 %%%===================================================================
 
 init([]) ->
-    Addr = application:get_env(yuzu_gw, upstream_addr, "127.0.0.1"),
-    Port = application:get_env(yuzu_gw, upstream_port, 50050),
     Interval = application:get_env(yuzu_gw, heartbeat_batch_interval_ms, 10000),
-
-    %% Connect to upstream C++ server.
-    Channel = connect_upstream(Addr, Port),
+    MaxBuf = application:get_env(yuzu_gw, max_heartbeat_buffer, ?DEFAULT_MAX_HB_BUFFER),
 
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
 
-    logger:info("Upstream client started, target=~s:~b, hb_interval=~bms",
-                [Addr, Port, Interval]),
+    logger:info("Upstream client started, hb_interval=~bms, max_buf=~b",
+                [Interval, MaxBuf]),
 
     {ok, #state{
-        channel       = Channel,
-        upstream_addr = Addr,
-        upstream_port = Port,
         hb_buffer     = [],
         hb_timer      = TRef,
-        hb_interval   = Interval
+        hb_interval   = Interval,
+        max_hb_buffer = MaxBuf,
+        notify_pids   = #{}
     }}.
 
-handle_call({proxy_register, RegisterReq}, _From, #state{channel = Channel} = State) ->
-    Result = do_rpc(Channel, 'ProxyRegister', RegisterReq, register),
+handle_call({proxy_register, RegisterReq}, _From, State) ->
+    Result = do_rpc('ProxyRegister', RegisterReq, register),
     {reply, Result, State};
 
-handle_call({proxy_inventory, InventoryReport}, _From, #state{channel = Channel} = State) ->
-    Result = do_rpc(Channel, 'ProxyInventory', InventoryReport, inventory),
+handle_call({proxy_inventory, InventoryReport}, _From, State) ->
+    Result = do_rpc('ProxyInventory', InventoryReport, inventory),
     {reply, Result, State};
 
 handle_call(_Request, _From, State) ->
@@ -101,24 +105,30 @@ handle_cast({queue_heartbeat, HbReq}, #state{hb_buffer = Buf} = State) ->
     {noreply, State#state{hb_buffer = [HbReq | Buf]}};
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
-            #state{channel = Channel} = State) ->
-    Notification = #{
-        agent_id     => AgentId,
-        session_id   => ensure_binary(SessionId),
-        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
-        peer_addr    => PeerAddr,
-        gateway_node => atom_to_binary(node(), utf8)
-    },
-    %% Fire-and-forget: stream status is best-effort.
-    spawn(fun() ->
-        case do_rpc(Channel, 'NotifyStreamStatus', Notification, notify_stream) of
-            {ok, _} -> ok;
-            {error, Reason} ->
-                logger:warning("Failed to notify stream status for ~s: ~p",
-                               [AgentId, Reason])
-        end
-    end),
-    {noreply, State};
+            #state{notify_pids = Pids} = State) ->
+    case map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT of
+        true ->
+            %% At capacity — drop this notification (best-effort).
+            logger:debug("Dropping stream status notification for ~s (at capacity)", [AgentId]),
+            {noreply, State};
+        false ->
+            Notification = #{
+                agent_id     => AgentId,
+                session_id   => ensure_binary(SessionId),
+                event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
+                peer_addr    => PeerAddr,
+                gateway_node => atom_to_binary(node(), utf8)
+            },
+            {Pid, _MonRef} = spawn_monitor(fun() ->
+                case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                    {ok, _} -> ok;
+                    {error, Reason} ->
+                        logger:warning("Failed to notify stream status for ~s: ~p",
+                                       [AgentId, Reason])
+                end
+            end),
+            {noreply, State#state{notify_pids = Pids#{Pid => true}}}
+    end;
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -127,33 +137,35 @@ handle_info(flush_heartbeats, #state{hb_buffer = [], hb_interval = Interval} = S
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
     {noreply, State#state{hb_timer = TRef}};
 
-handle_info(flush_heartbeats, #state{hb_buffer = Buf, channel = Channel,
-                                       hb_interval = Interval} = State) ->
+handle_info(flush_heartbeats, #state{hb_buffer = Buf, hb_interval = Interval,
+                                       max_hb_buffer = MaxBuf} = State) ->
     BatchReq = #{
         heartbeats   => lists:reverse(Buf),
         gateway_node => atom_to_binary(node(), utf8)
     },
 
-    StartTime = erlang:monotonic_time(millisecond),
-    case do_rpc(Channel, 'BatchHeartbeat', BatchReq, batch_heartbeat) of
+    NewBuf = case do_rpc('BatchHeartbeat', BatchReq, batch_heartbeat) of
         {ok, #{acknowledged_count := Count}} ->
-            Duration = erlang:monotonic_time(millisecond) - StartTime,
-            telemetry:execute([yuzu, gw, upstream, rpc_latency],
-                              #{duration_ms => Duration},
-                              #{rpc_name => <<"BatchHeartbeat">>}),
-            logger:debug("Flushed ~b heartbeats (ack=~b)", [length(Buf), Count]);
+            logger:debug("Flushed ~b heartbeats (ack=~b)", [length(Buf), Count]),
+            [];
         {ok, _} ->
-            ok;
+            [];
         {error, Reason} ->
             logger:warning("BatchHeartbeat failed (~b buffered): ~p",
                            [length(Buf), Reason]),
-            telemetry:execute([yuzu, gw, upstream, rpc_error],
-                              #{count => 1},
-                              #{rpc_name => <<"BatchHeartbeat">>, code => Reason})
+            %% Retain buffer for retry, capped to prevent unbounded growth.
+            case length(Buf) > MaxBuf of
+                true  -> lists:sublist(Buf, MaxBuf);
+                false -> Buf
+            end
     end,
 
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
-    {noreply, State#state{hb_buffer = [], hb_timer = TRef}};
+    {noreply, State#state{hb_buffer = NewBuf, hb_timer = TRef}};
+
+handle_info({'DOWN', _MonRef, process, Pid, _Reason},
+            #state{notify_pids = Pids} = State) ->
+    {noreply, State#state{notify_pids = maps:remove(Pid, Pids)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -165,22 +177,28 @@ terminate(_Reason, _State) ->
 %%% Internal
 %%%===================================================================
 
-connect_upstream(Addr, Port) ->
-    Endpoint = #{scheme => http, host => Addr, port => Port},
-    case grpcbox_channel:pick(Endpoint, #{}) of
-        {ok, Channel} -> Channel;
-        {error, _} ->
-            %% Channel will be lazily connected on first RPC.
-            logger:warning("Could not pre-connect to upstream ~s:~b", [Addr, Port]),
-            Endpoint
-    end.
+%% Map each GatewayUpstream RPC to its protobuf input/output message types.
+rpc_types('ProxyRegister')      -> {'yuzu.agent.v1.RegisterRequest',
+                                    'yuzu.agent.v1.RegisterResponse'};
+rpc_types('BatchHeartbeat')     -> {'yuzu.gateway.v1.BatchHeartbeatRequest',
+                                    'yuzu.gateway.v1.BatchHeartbeatResponse'};
+rpc_types('ProxyInventory')     -> {'yuzu.agent.v1.InventoryReport',
+                                    'yuzu.agent.v1.InventoryAck'};
+rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',
+                                    'yuzu.gateway.v1.StreamStatusAck'}.
 
-do_rpc(Channel, Method, Request, Tag) ->
+do_rpc(Method, Request, Tag) ->
+    {InputType, OutputType} = rpc_types(Method),
+    Def = #grpcbox_def{
+        service       = 'yuzu.gateway.v1.GatewayUpstream',
+        message_type  = atom_to_binary(InputType, utf8),
+        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+        unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
+    },
+    Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
-    Service = 'yuzu.gateway.v1.GatewayUpstream',
-    Result = grpcbox_client:unary(Channel, <<(atom_to_binary(Service, utf8))/binary,
-                                              "/", (atom_to_binary(Method, utf8))/binary>>,
-                                   Request, #{}, #{}),
+    Result = grpcbox_client:unary(ctx:background(), Path, Request, Def,
+                                  #{channel => default_channel}),
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
         {ok, Response, _Headers} ->
@@ -200,7 +218,7 @@ do_rpc(Channel, Method, Request, Tag) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Reason}),
-            {error, Reason}
+            {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
     end.
 
 ensure_binary(undefined) -> <<>>;

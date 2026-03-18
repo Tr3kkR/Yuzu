@@ -1,13 +1,13 @@
 #include "nvd_db.hpp"
 
+#include <spdlog/spdlog.h>
+#include <sqlite3.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <string_view>
 #include <utility>
-
-#include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
 namespace yuzu::server {
 
@@ -18,7 +18,8 @@ namespace yuzu::server {
 
 int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
-        if (s.empty()) return {};
+        if (s.empty())
+            return {};
         auto pos = s.find_first_of(".-");
         std::string_view seg;
         if (pos == std::string_view::npos) {
@@ -32,10 +33,12 @@ int compare_versions(std::string_view a, std::string_view b) {
     };
 
     auto to_num = [](std::string_view seg) -> std::pair<bool, long long> {
-        if (seg.empty()) return {true, 0};
+        if (seg.empty())
+            return {true, 0};
         long long val = 0;
         for (char c : seg) {
-            if (c < '0' || c > '9') return {false, 0};
+            if (c < '0' || c > '9')
+                return {false, 0};
             val = val * 10 + (c - '0');
         }
         return {true, val};
@@ -50,10 +53,12 @@ int compare_versions(std::string_view a, std::string_view b) {
         auto [b_num, b_val] = to_num(sb);
 
         if (a_num && b_num) {
-            if (a_val != b_val) return (a_val < b_val) ? -1 : 1;
+            if (a_val != b_val)
+                return (a_val < b_val) ? -1 : 1;
         } else {
             int cmp = sa.compare(sb);
-            if (cmp != 0) return cmp;
+            if (cmp != 0)
+                return cmp;
         }
     }
     return 0;
@@ -95,12 +100,9 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
      "SSL_select_next_proto buffer overread"},
 
     // curl
-    {"CVE-2023-38545", "curl", "8.4.0", "8.4.0", "CRITICAL",
-     "SOCKS5 heap buffer overflow"},
-    {"CVE-2023-38546", "curl", "8.4.0", "8.4.0", "LOW",
-     "Cookie injection with none file"},
-    {"CVE-2024-2398", "curl", "8.7.1", "8.7.1", "MEDIUM",
-     "HTTP/2 push headers memory leak"},
+    {"CVE-2023-38545", "curl", "8.4.0", "8.4.0", "CRITICAL", "SOCKS5 heap buffer overflow"},
+    {"CVE-2023-38546", "curl", "8.4.0", "8.4.0", "LOW", "Cookie injection with none file"},
+    {"CVE-2024-2398", "curl", "8.7.1", "8.7.1", "MEDIUM", "HTTP/2 push headers memory leak"},
 
     // sudo
     {"CVE-2021-3156", "sudo", "1.9.5p2", "1.9.5p2", "CRITICAL",
@@ -137,8 +139,7 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
      "zipfile quoted-overlap zipbomb protection bypass"},
 
     // Node.js
-    {"CVE-2023-44487", "node", "20.8.1", "20.8.1", "HIGH",
-     "HTTP/2 Rapid Reset denial of service"},
+    {"CVE-2023-44487", "node", "20.8.1", "20.8.1", "HIGH", "HTTP/2 Rapid Reset denial of service"},
     {"CVE-2024-22019", "node", "20.11.1", "20.11.1", "HIGH",
      "Reading unprocessed HTTP request with unbounded chunk extension"},
 
@@ -157,8 +158,7 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
     // .NET Runtime
     {"CVE-2024-21319", "dotnet", "8.0.1", "8.0.1", "HIGH",
      "Denial of service via SignedCms degenerate certificates"},
-    {"CVE-2024-38168", "dotnet", "8.0.8", "8.0.8", "HIGH",
-     "ASP.NET Core denial of service"},
+    {"CVE-2024-38168", "dotnet", "8.0.8", "8.0.8", "HIGH", "ASP.NET Core denial of service"},
 
     // Java / OpenJDK
     {"CVE-2024-20918", "openjdk", "21.0.2", "21.0.2", "HIGH",
@@ -173,10 +173,8 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
      "Print Spooler privilege escalation"},
 
     // nginx
-    {"CVE-2022-41741", "nginx", "1.23.2", "1.23.2", "HIGH",
-     "mp4 module memory corruption"},
-    {"CVE-2024-7347", "nginx", "1.27.1", "1.27.1", "MEDIUM",
-     "Worker process crash in mp4 module"},
+    {"CVE-2022-41741", "nginx", "1.23.2", "1.23.2", "HIGH", "mp4 module memory corruption"},
+    {"CVE-2024-7347", "nginx", "1.27.1", "1.27.1", "MEDIUM", "Worker process crash in mp4 module"},
 
     // PostgreSQL
     {"CVE-2023-5868", "postgresql", "16.1", "16.1", "MEDIUM",
@@ -203,10 +201,8 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
      "NIST P-521 private key recovery from ECDSA signatures"},
 
     // PHP
-    {"CVE-2024-4577", "php", "8.3.8", "8.3.8", "CRITICAL",
-     "CGI argument injection on Windows"},
-    {"CVE-2024-2756", "php", "8.3.4", "8.3.4", "MEDIUM",
-     "Cookie __Host-/__Secure- prefix bypass"},
+    {"CVE-2024-4577", "php", "8.3.8", "8.3.8", "CRITICAL", "CGI argument injection on Windows"},
+    {"CVE-2024-2756", "php", "8.3.4", "8.3.4", "MEDIUM", "Cookie __Host-/__Secure- prefix bypass"},
 });
 
 // ── NvdDatabase implementation ───────────────────────────────────────────────
@@ -214,8 +210,7 @@ static constexpr auto kBuiltinRules = std::to_array<BuiltinRule>({
 NvdDatabase::NvdDatabase(const std::filesystem::path& db_path) {
     int rc = sqlite3_open(db_path.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
-        spdlog::error("NvdDatabase: failed to open {}: {}", db_path.string(),
-                       sqlite3_errmsg(db_));
+        spdlog::error("NvdDatabase: failed to open {}: {}", db_path.string(), sqlite3_errmsg(db_));
         if (db_) {
             sqlite3_close(db_);
             db_ = nullptr;
@@ -247,7 +242,8 @@ bool NvdDatabase::is_open() const {
 }
 
 void NvdDatabase::create_tables() {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* sql = R"(
         CREATE TABLE IF NOT EXISTS cve (
@@ -280,7 +276,8 @@ void NvdDatabase::create_tables() {
 }
 
 void NvdDatabase::upsert_cve(const CveRecord& record) {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* sql = R"(
         INSERT OR REPLACE INTO cve
@@ -309,15 +306,16 @@ void NvdDatabase::upsert_cve(const CveRecord& record) {
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
-        spdlog::error("NvdDatabase: upsert_cve step failed for {}: {}",
-                       record.cve_id, sqlite3_errmsg(db_));
+        spdlog::error("NvdDatabase: upsert_cve step failed for {}: {}", record.cve_id,
+                      sqlite3_errmsg(db_));
     }
 
     sqlite3_finalize(stmt);
 }
 
 void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
-    if (!db_ || records.empty()) return;
+    if (!db_ || records.empty())
+        return;
 
     char* err_msg = nullptr;
     int rc = sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg);
@@ -340,11 +338,12 @@ void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
     }
 }
 
-std::vector<CveMatch> NvdDatabase::match_inventory(
-    const std::vector<SoftwareItem>& inventory) const {
+std::vector<CveMatch>
+NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
 
     std::vector<CveMatch> matches;
-    if (!db_ || inventory.empty()) return matches;
+    if (!db_ || inventory.empty())
+        return matches;
 
     const char* sql = "SELECT cve_id, product, affected_below, fixed_in, severity, "
                       "description, source FROM cve WHERE product LIKE ?";
@@ -357,7 +356,8 @@ std::vector<CveMatch> NvdDatabase::match_inventory(
     }
 
     for (const auto& item : inventory) {
-        if (item.name.empty() || item.version.empty()) continue;
+        if (item.name.empty() || item.version.empty())
+            continue;
 
         std::string name_lower = to_lower(item.name);
         std::string pattern = "%" + name_lower + "%";
@@ -368,7 +368,8 @@ std::vector<CveMatch> NvdDatabase::match_inventory(
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             const char* affected_below =
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-            if (!affected_below) continue;
+            if (!affected_below)
+                continue;
 
             // Version is vulnerable if installed_version < affected_below
             if (compare_versions(item.version, affected_below) < 0) {
@@ -395,7 +396,8 @@ std::vector<CveMatch> NvdDatabase::match_inventory(
 }
 
 std::string NvdDatabase::get_meta(const std::string& key) const {
-    if (!db_) return {};
+    if (!db_)
+        return {};
 
     const char* sql = "SELECT value FROM sync_meta WHERE key = ?";
     sqlite3_stmt* stmt = nullptr;
@@ -410,7 +412,8 @@ std::string NvdDatabase::get_meta(const std::string& key) const {
     std::string result;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         const char* val = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        if (val) result = val;
+        if (val)
+            result = val;
     }
 
     sqlite3_finalize(stmt);
@@ -418,7 +421,8 @@ std::string NvdDatabase::get_meta(const std::string& key) const {
 }
 
 void NvdDatabase::set_meta(const std::string& key, const std::string& value) {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* sql = "INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)";
     sqlite3_stmt* stmt = nullptr;
@@ -440,7 +444,8 @@ void NvdDatabase::set_meta(const std::string& key, const std::string& value) {
 }
 
 void NvdDatabase::seed_builtin_rules() {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     // Only seed if no builtin records exist yet
     const char* check_sql = "SELECT COUNT(*) FROM cve WHERE source = 'builtin'";
@@ -459,7 +464,7 @@ void NvdDatabase::seed_builtin_rules() {
 
     if (existing_count > 0) {
         spdlog::debug("NvdDatabase: {} builtin rules already present, skipping seed",
-                       existing_count);
+                      existing_count);
         return;
     }
 
@@ -486,7 +491,8 @@ void NvdDatabase::seed_builtin_rules() {
 }
 
 std::size_t NvdDatabase::total_cve_count() const {
-    if (!db_) return 0;
+    if (!db_)
+        return 0;
 
     const char* sql = "SELECT COUNT(*) FROM cve";
     sqlite3_stmt* stmt = nullptr;
@@ -505,4 +511,4 @@ std::size_t NvdDatabase::total_cve_count() const {
     return count;
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

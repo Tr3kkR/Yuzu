@@ -1,6 +1,7 @@
-#include <catch2/catch_test_macros.hpp>
 #include <yuzu/plugin.h>
 #include <yuzu/sdk_utilities.hpp>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
 #include <string>
@@ -123,9 +124,8 @@ TEST_CASE("table_to_json mismatched column count fills missing with empty", "[sd
 
 TEST_CASE("table_to_json with type hints", "[sdk_utilities]") {
     std::vector<std::string_view> cols = {"name", "count", "ratio", "active"};
-    std::vector<ColumnType> types = {
-        ColumnType::kString, ColumnType::kInt, ColumnType::kFloat, ColumnType::kBool
-    };
+    std::vector<ColumnType> types = {ColumnType::kString, ColumnType::kInt, ColumnType::kFloat,
+                                     ColumnType::kBool};
     auto result = table_to_json("widget|42|3.14|true", cols, types);
     REQUIRE(result.has_value());
 
@@ -178,8 +178,8 @@ TEST_CASE("table_to_json with unicode", "[sdk_utilities]") {
 
 TEST_CASE("json_to_table basic conversion", "[sdk_utilities]") {
     std::vector<std::string_view> cols = {"name", "role"};
-    auto result = json_to_table(
-        R"([{"name":"alice","role":"admin"},{"name":"bob","role":"user"}])", cols);
+    auto result =
+        json_to_table(R"([{"name":"alice","role":"admin"},{"name":"bob","role":"user"}])", cols);
     REQUIRE(result.has_value());
     CHECK(*result == "alice|admin\nbob|user");
 }
@@ -395,5 +395,5 @@ TEST_CASE("C ABI generate_sequence zero count returns null", "[sdk_utilities][c_
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("C ABI free_string accepts null safely", "[sdk_utilities][c_abi]") {
-    yuzu_free_string(nullptr);  // must not crash
+    yuzu_free_string(nullptr); // must not crash
 }

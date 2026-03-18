@@ -2,6 +2,9 @@
 
 #include "analytics_event.hpp"
 
+#include <sqlite3.h>
+
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -11,8 +14,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <sqlite3.h>
 
 namespace yuzu::server {
 
@@ -33,8 +34,7 @@ public:
 class AnalyticsEventStore {
 public:
     explicit AnalyticsEventStore(const std::filesystem::path& db_path,
-                                 int drain_interval_seconds = 10,
-                                 int batch_size = 100);
+                                 int drain_interval_seconds = 10, int batch_size = 100);
     ~AnalyticsEventStore();
 
     AnalyticsEventStore(const AnalyticsEventStore&) = delete;
@@ -67,12 +67,21 @@ private:
     sqlite3* db_{nullptr};
     int drain_interval_seconds_;
     int batch_size_;
+#ifdef __cpp_lib_jthread
     std::jthread drain_thread_;
+#else
+    std::thread drain_thread_;
+    std::atomic<bool> stop_requested_{false};
+#endif
     mutable std::mutex mu_;
     std::vector<std::unique_ptr<AnalyticsEventSink>> sinks_;
 
     void create_tables();
+#ifdef __cpp_lib_jthread
     void run_drain(std::stop_token stop);
+#else
+    void run_drain();
+#endif
     void drain_batch();
 };
 
@@ -80,8 +89,8 @@ private:
 std::unique_ptr<AnalyticsEventSink> make_jsonlines_sink(const std::filesystem::path& path);
 
 /// Factory: create a ClickHouse HTTP sink.
-std::unique_ptr<AnalyticsEventSink> make_clickhouse_sink(
-    const std::string& url, const std::string& database, const std::string& table,
-    const std::string& username, const std::string& password);
+std::unique_ptr<AnalyticsEventSink>
+make_clickhouse_sink(const std::string& url, const std::string& database, const std::string& table,
+                     const std::string& username, const std::string& password);
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

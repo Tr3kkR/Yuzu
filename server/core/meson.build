@@ -1,7 +1,8 @@
 # Platform-specific crypto for auth module
 if host_machine.system() == 'windows'
   bcrypt_dep = cxx.find_library('bcrypt')
-  auth_crypto_deps = [bcrypt_dep]
+  winhttp_dep = cxx.find_library('winhttp')
+  auth_crypto_deps = [bcrypt_dep, winhttp_dep]
 else
   openssl_dep = dependency('openssl', required: true)
   auth_crypto_deps = [openssl_dep]
@@ -59,14 +60,21 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
+    'src/analytics_event_store.cpp',
+    'src/analytics_sinks.cpp',
+    'src/data_export.cpp',
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
-    'src/analytics_event_store.cpp',
-    'src/analytics_sinks.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
+    'src/rbac_store.cpp',
+    'src/oidc_provider.cpp',
+    'src/error_codes.cpp',
+    'src/result_envelope.cpp',
+    'src/concurrency_manager.cpp',
+    'src/legacy_shim.cpp',
   ),
   include_directories: ['include'],
   cpp_args: https_cpp_args + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),

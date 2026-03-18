@@ -19,7 +19,7 @@ inline std::string labels_key(const Labels& labels) {
     std::string key;
     for (const auto& [k, v] : labels) {
         if (!key.empty()) key += ',';
-        key += k + "=" + v;
+        key += k + "=\"" + v + "\"";
     }
     return key;
 }
@@ -155,6 +155,11 @@ public:
         T metric;
     };
 
+    void clear() {
+        std::lock_guard lock(mu_);
+        instances_.clear();
+    }
+
     // For serialization
     std::vector<std::pair<std::string, T*>> all() {
         std::lock_guard lock(mu_);
@@ -211,6 +216,13 @@ public:
     Histogram& histogram(const std::string& name, const Labels& l) {
         std::lock_guard lock(mu_);
         return histograms_[name].labels(l);
+    }
+
+    void clear_gauge_family(const std::string& name) {
+        std::lock_guard lock(mu_);
+        if (auto it = gauges_.find(name); it != gauges_.end()) {
+            it->second.clear();
+        }
     }
 
     void describe(const std::string& name, const std::string& help,

@@ -5,8 +5,8 @@
  *         NvdClient::parse_response().
  */
 
-#include "nvd_db.hpp"
 #include "nvd_client.hpp"
+#include "nvd_db.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -187,7 +187,7 @@ TEST_CASE("NvdDatabase: match_inventory case-insensitive product", "[nvd][match]
     NvdDatabase db(":memory:");
     CveRecord rec;
     rec.cve_id = "CVE-2024-0001";
-    rec.product = "openssl";  // lowercase in DB
+    rec.product = "openssl"; // lowercase in DB
     rec.affected_below = "3.0.7";
     rec.source = "nvd";
     db.upsert_cve(rec);

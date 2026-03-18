@@ -27,7 +27,7 @@ TEST_CASE("ResponseStore: store and retrieve", "[response_store]") {
     StoredResponse resp;
     resp.instruction_id = "cmd-abc123";
     resp.agent_id = "agent-1";
-    resp.status = 1;  // SUCCESS
+    resp.status = 1; // SUCCESS
     resp.output = "hostname|WORKSTATION-01";
     store.store(resp);
 
@@ -79,14 +79,14 @@ TEST_CASE("ResponseStore: query with status filter", "[response_store]") {
     StoredResponse r1;
     r1.instruction_id = "cmd-status";
     r1.agent_id = "agent-1";
-    r1.status = 1;  // SUCCESS
+    r1.status = 1; // SUCCESS
     r1.output = "ok";
     store.store(r1);
 
     StoredResponse r2;
     r2.instruction_id = "cmd-status";
     r2.agent_id = "agent-1";
-    r2.status = 2;  // FAILURE
+    r2.status = 2; // FAILURE
     r2.output = "fail";
     store.store(r2);
 
@@ -235,7 +235,7 @@ TEST_CASE("ResponseStore: multiple instructions", "[response_store]") {
 }
 
 TEST_CASE("ResponseStore: ttl_expires_at set from retention", "[response_store]") {
-    ResponseStore store(":memory:", 30);  // 30 days retention
+    ResponseStore store(":memory:", 30); // 30 days retention
 
     StoredResponse resp;
     resp.instruction_id = "cmd-ttl";

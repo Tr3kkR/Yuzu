@@ -5,6 +5,7 @@
 #include <charconv>
 #include <format>
 #include <sstream>
+#include <string>
 
 namespace yuzu::scope {
 
@@ -13,14 +14,29 @@ namespace {
 // -- Tokenizer ---------------------------------------------------------------
 
 enum class TokenType {
-    Ident, String, LParen, RParen, Comma,
-    OpEq, OpNeq, OpLike, OpLt, OpGt, OpLe, OpGe, OpIn, OpContains,
-    KwAnd, KwOr, KwNot,
-    Eof, Error
+    Ident,
+    String,
+    LParen,
+    RParen,
+    Comma,
+    OpEq,
+    OpNeq,
+    OpLike,
+    OpLt,
+    OpGt,
+    OpLe,
+    OpGe,
+    OpIn,
+    OpContains,
+    KwAnd,
+    KwOr,
+    KwNot,
+    Eof,
+    Error
 };
 
 struct Token {
-    TokenType   type;
+    TokenType type;
     std::string value;
     std::size_t pos{0};
 };
@@ -31,31 +47,51 @@ public:
 
     Token next() {
         skip_whitespace();
-        if (pos_ >= input_.size()) return {TokenType::Eof, "", pos_};
+        if (pos_ >= input_.size())
+            return {TokenType::Eof, "", pos_};
 
         auto start = pos_;
         char c = input_[pos_];
 
         // Single-char tokens
-        if (c == '(') { ++pos_; return {TokenType::LParen, "(", start}; }
-        if (c == ')') { ++pos_; return {TokenType::RParen, ")", start}; }
-        if (c == ',') { ++pos_; return {TokenType::Comma, ",", start}; }
+        if (c == '(') {
+            ++pos_;
+            return {TokenType::LParen, "(", start};
+        }
+        if (c == ')') {
+            ++pos_;
+            return {TokenType::RParen, ")", start};
+        }
+        if (c == ',') {
+            ++pos_;
+            return {TokenType::Comma, ",", start};
+        }
 
         // Operators
         if (c == '=' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
-            pos_ += 2; return {TokenType::OpEq, "==", start};
+            pos_ += 2;
+            return {TokenType::OpEq, "==", start};
         }
         if (c == '!' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
-            pos_ += 2; return {TokenType::OpNeq, "!=", start};
+            pos_ += 2;
+            return {TokenType::OpNeq, "!=", start};
         }
         if (c == '<' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
-            pos_ += 2; return {TokenType::OpLe, "<=", start};
+            pos_ += 2;
+            return {TokenType::OpLe, "<=", start};
         }
         if (c == '>' && pos_ + 1 < input_.size() && input_[pos_ + 1] == '=') {
-            pos_ += 2; return {TokenType::OpGe, ">=", start};
+            pos_ += 2;
+            return {TokenType::OpGe, ">=", start};
         }
-        if (c == '<') { ++pos_; return {TokenType::OpLt, "<", start}; }
-        if (c == '>') { ++pos_; return {TokenType::OpGt, ">", start}; }
+        if (c == '<') {
+            ++pos_;
+            return {TokenType::OpLt, "<", start};
+        }
+        if (c == '>') {
+            ++pos_;
+            return {TokenType::OpGt, ">", start};
+        }
 
         // Quoted string
         if (c == '"' || c == '\'') {
@@ -94,7 +130,7 @@ private:
     }
 
     Token read_string(char quote, std::size_t start) {
-        ++pos_;  // skip opening quote
+        ++pos_; // skip opening quote
         std::string val;
         while (pos_ < input_.size() && input_[pos_] != quote) {
             if (input_[pos_] == '\\' && pos_ + 1 < input_.size()) {
@@ -105,7 +141,7 @@ private:
         if (pos_ >= input_.size()) {
             return {TokenType::Error, "unterminated string", start};
         }
-        ++pos_;  // skip closing quote
+        ++pos_; // skip closing quote
         return {TokenType::String, val, start};
     }
 
@@ -126,20 +162,27 @@ private:
         std::transform(upper.begin(), upper.end(), upper.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 
-        if (upper == "AND")      return {TokenType::KwAnd, val, start};
-        if (upper == "OR")       return {TokenType::KwOr, val, start};
-        if (upper == "NOT")      return {TokenType::KwNot, val, start};
-        if (upper == "LIKE")     return {TokenType::OpLike, val, start};
-        if (upper == "IN")       return {TokenType::OpIn, val, start};
-        if (upper == "CONTAINS") return {TokenType::OpContains, val, start};
+        if (upper == "AND")
+            return {TokenType::KwAnd, val, start};
+        if (upper == "OR")
+            return {TokenType::KwOr, val, start};
+        if (upper == "NOT")
+            return {TokenType::KwNot, val, start};
+        if (upper == "LIKE")
+            return {TokenType::OpLike, val, start};
+        if (upper == "IN")
+            return {TokenType::OpIn, val, start};
+        if (upper == "CONTAINS")
+            return {TokenType::OpContains, val, start};
 
         return {TokenType::Ident, val, start};
     }
 
     Token read_number(std::size_t start) {
-        if (input_[pos_] == '-') ++pos_;
-        while (pos_ < input_.size() && (std::isdigit(static_cast<unsigned char>(input_[pos_])) ||
-               input_[pos_] == '.')) {
+        if (input_[pos_] == '-')
+            ++pos_;
+        while (pos_ < input_.size() &&
+               (std::isdigit(static_cast<unsigned char>(input_[pos_])) || input_[pos_] == '.')) {
             ++pos_;
         }
         return {TokenType::Ident, std::string(input_.substr(start, pos_ - start)), start};
@@ -154,7 +197,8 @@ public:
 
     std::expected<Expression, std::string> parse_expression() {
         auto result = parse_or();
-        if (!result) return result;
+        if (!result)
+            return result;
 
         auto tok = tokenizer_.peek();
         if (tok.type != TokenType::Eof) {
@@ -172,12 +216,14 @@ private:
 
     std::expected<Expression, std::string> parse_or() {
         auto left = parse_and();
-        if (!left) return left;
+        if (!left)
+            return left;
 
         while (tokenizer_.peek().type == TokenType::KwOr) {
-            tokenizer_.next();  // consume OR
+            tokenizer_.next(); // consume OR
             auto right = parse_and();
-            if (!right) return right;
+            if (!right)
+                return right;
 
             auto comb = std::make_unique<Combinator>();
             comb->op = CombOp::Or;
@@ -190,12 +236,14 @@ private:
 
     std::expected<Expression, std::string> parse_and() {
         auto left = parse_not();
-        if (!left) return left;
+        if (!left)
+            return left;
 
         while (tokenizer_.peek().type == TokenType::KwAnd) {
-            tokenizer_.next();  // consume AND
+            tokenizer_.next(); // consume AND
             auto right = parse_not();
-            if (!right) return right;
+            if (!right)
+                return right;
 
             auto comb = std::make_unique<Combinator>();
             comb->op = CombOp::And;
@@ -208,9 +256,10 @@ private:
 
     std::expected<Expression, std::string> parse_not() {
         if (tokenizer_.peek().type == TokenType::KwNot) {
-            tokenizer_.next();  // consume NOT
+            tokenizer_.next(); // consume NOT
             auto child = parse_not();
-            if (!child) return child;
+            if (!child)
+                return child;
 
             auto comb = std::make_unique<Combinator>();
             comb->op = CombOp::Not;
@@ -224,13 +273,14 @@ private:
         auto tok = tokenizer_.peek();
 
         if (tok.type == TokenType::LParen) {
-            tokenizer_.next();  // consume (
+            tokenizer_.next(); // consume (
             if (++depth_ > kMaxDepth) {
                 return std::unexpected("maximum nesting depth exceeded");
             }
             auto result = parse_or();
             --depth_;
-            if (!result) return result;
+            if (!result)
+                return result;
 
             auto close = tokenizer_.next();
             if (close.type != TokenType::RParen) {
@@ -246,27 +296,43 @@ private:
     std::expected<Expression, std::string> parse_condition() {
         auto attr_tok = tokenizer_.next();
         if (attr_tok.type != TokenType::Ident) {
-            return std::unexpected(
-                std::format("expected attribute name at position {}, got '{}'",
-                            attr_tok.pos, attr_tok.value));
+            return std::unexpected(std::format("expected attribute name at position {}, got '{}'",
+                                               attr_tok.pos, attr_tok.value));
         }
 
         auto op_tok = tokenizer_.next();
         CompOp op;
         switch (op_tok.type) {
-            case TokenType::OpEq:       op = CompOp::Eq; break;
-            case TokenType::OpNeq:      op = CompOp::Neq; break;
-            case TokenType::OpLike:     op = CompOp::Like; break;
-            case TokenType::OpLt:       op = CompOp::Lt; break;
-            case TokenType::OpGt:       op = CompOp::Gt; break;
-            case TokenType::OpLe:       op = CompOp::Le; break;
-            case TokenType::OpGe:       op = CompOp::Ge; break;
-            case TokenType::OpIn:       op = CompOp::In; break;
-            case TokenType::OpContains: op = CompOp::Contains; break;
-            default:
-                return std::unexpected(
-                    std::format("expected operator at position {}, got '{}'",
-                                op_tok.pos, op_tok.value));
+        case TokenType::OpEq:
+            op = CompOp::Eq;
+            break;
+        case TokenType::OpNeq:
+            op = CompOp::Neq;
+            break;
+        case TokenType::OpLike:
+            op = CompOp::Like;
+            break;
+        case TokenType::OpLt:
+            op = CompOp::Lt;
+            break;
+        case TokenType::OpGt:
+            op = CompOp::Gt;
+            break;
+        case TokenType::OpLe:
+            op = CompOp::Le;
+            break;
+        case TokenType::OpGe:
+            op = CompOp::Ge;
+            break;
+        case TokenType::OpIn:
+            op = CompOp::In;
+            break;
+        case TokenType::OpContains:
+            op = CompOp::Contains;
+            break;
+        default:
+            return std::unexpected(std::format("expected operator at position {}, got '{}'",
+                                               op_tok.pos, op_tok.value));
         }
 
         if (op == CompOp::In) {
@@ -276,8 +342,7 @@ private:
         auto val_tok = tokenizer_.next();
         if (val_tok.type != TokenType::Ident && val_tok.type != TokenType::String) {
             return std::unexpected(
-                std::format("expected value at position {}, got '{}'",
-                            val_tok.pos, val_tok.value));
+                std::format("expected value at position {}, got '{}'", val_tok.pos, val_tok.value));
         }
 
         Condition cond;
@@ -290,8 +355,7 @@ private:
     std::expected<Expression, std::string> parse_in_values(const std::string& attr) {
         auto lparen = tokenizer_.next();
         if (lparen.type != TokenType::LParen) {
-            return std::unexpected(
-                std::format("expected '(' after IN at position {}", lparen.pos));
+            return std::unexpected(std::format("expected '(' after IN at position {}", lparen.pos));
         }
 
         std::vector<std::string> values;
@@ -313,8 +377,7 @@ private:
 
         auto rparen = tokenizer_.next();
         if (rparen.type != TokenType::RParen) {
-            return std::unexpected(
-                std::format("expected ')' at position {}", rparen.pos));
+            return std::unexpected(std::format("expected ')' at position {}", rparen.pos));
         }
 
         Condition cond;
@@ -328,7 +391,8 @@ private:
 // -- Helper: case-insensitive compare ----------------------------------------
 
 bool ci_equal(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size())
+        return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
         if (std::tolower(static_cast<unsigned char>(a[i])) !=
             std::tolower(static_cast<unsigned char>(b[i]))) {
@@ -345,11 +409,11 @@ bool wildcard_match(std::string_view pattern, std::string_view text) {
     std::size_t star_p = std::string_view::npos, star_t = 0;
 
     while (ti < text.size()) {
-        if (pi < pattern.size() &&
-            (std::tolower(static_cast<unsigned char>(pattern[pi])) ==
-             std::tolower(static_cast<unsigned char>(text[ti])) ||
-             pattern[pi] == '?')) {
-            ++pi; ++ti;
+        if (pi < pattern.size() && (std::tolower(static_cast<unsigned char>(pattern[pi])) ==
+                                        std::tolower(static_cast<unsigned char>(text[ti])) ||
+                                    pattern[pi] == '?')) {
+            ++pi;
+            ++ti;
         } else if (pi < pattern.size() && pattern[pi] == '*') {
             star_p = pi++;
             star_t = ti;
@@ -360,7 +424,8 @@ bool wildcard_match(std::string_view pattern, std::string_view text) {
             return false;
         }
     }
-    while (pi < pattern.size() && pattern[pi] == '*') ++pi;
+    while (pi < pattern.size() && pattern[pi] == '*')
+        ++pi;
     return pi == pattern.size();
 }
 
@@ -368,35 +433,56 @@ bool wildcard_match(std::string_view pattern, std::string_view text) {
 
 bool try_numeric_compare(std::string_view a, std::string_view b, CompOp op) {
     double da = 0, db = 0;
+
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     auto [pa, eca] = std::from_chars(a.data(), a.data() + a.size(), da);
     auto [pb, ecb] = std::from_chars(b.data(), b.data() + b.size(), db);
-
     if (eca != std::errc{} || ecb != std::errc{}) {
+#else
+    // Apple libc++ does not support std::from_chars for floating-point types,
+    // so we fall back to std::stod on platforms that lack the feature.
+    try {
+        da = std::stod(std::string(a));
+        db = std::stod(std::string(b));
+    } catch (...) {
+#endif
         // Fall back to string comparison
         int cmp = std::string(a).compare(std::string(b));
         switch (op) {
-            case CompOp::Lt: return cmp < 0;
-            case CompOp::Gt: return cmp > 0;
-            case CompOp::Le: return cmp <= 0;
-            case CompOp::Ge: return cmp >= 0;
-            default: return false;
+        case CompOp::Lt:
+            return cmp < 0;
+        case CompOp::Gt:
+            return cmp > 0;
+        case CompOp::Le:
+            return cmp <= 0;
+        case CompOp::Ge:
+            return cmp >= 0;
+        default:
+            return false;
         }
     }
 
     switch (op) {
-        case CompOp::Lt: return da < db;
-        case CompOp::Gt: return da > db;
-        case CompOp::Le: return da <= db;
-        case CompOp::Ge: return da >= db;
-        default: return false;
+    case CompOp::Lt:
+        return da < db;
+    case CompOp::Gt:
+        return da > db;
+    case CompOp::Le:
+        return da <= db;
+    case CompOp::Ge:
+        return da >= db;
+    default:
+        return false;
     }
 }
 
 // -- Helper: contains (case-insensitive substring) ----------------------------
 
 bool ci_contains(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) return true;
-    if (haystack.size() < needle.size()) return false;
+    if (needle.empty())
+        return true;
+    if (haystack.size() < needle.size())
+        return false;
     for (std::size_t i = 0; i <= haystack.size() - needle.size(); ++i) {
         bool match = true;
         for (std::size_t j = 0; j < needle.size(); ++j) {
@@ -406,7 +492,8 @@ bool ci_contains(std::string_view haystack, std::string_view needle) {
                 break;
             }
         }
-        if (match) return true;
+        if (match)
+            return true;
     }
     return false;
 }
@@ -417,25 +504,30 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
     auto resolved = resolver(cond.attribute);
 
     switch (cond.op) {
-        case CompOp::Eq:       return ci_equal(resolved, cond.value);
-        case CompOp::Neq:      return !ci_equal(resolved, cond.value);
-        case CompOp::Like:     return wildcard_match(cond.value, resolved);
-        case CompOp::Lt:
-        case CompOp::Gt:
-        case CompOp::Le:
-        case CompOp::Ge:
-            return try_numeric_compare(resolved, cond.value, cond.op);
-        case CompOp::In:
-            for (const auto& v : cond.values) {
-                if (ci_equal(resolved, v)) return true;
-            }
-            return false;
-        case CompOp::Contains: return ci_contains(resolved, cond.value);
+    case CompOp::Eq:
+        return ci_equal(resolved, cond.value);
+    case CompOp::Neq:
+        return !ci_equal(resolved, cond.value);
+    case CompOp::Like:
+        return wildcard_match(cond.value, resolved);
+    case CompOp::Lt:
+    case CompOp::Gt:
+    case CompOp::Le:
+    case CompOp::Ge:
+        return try_numeric_compare(resolved, cond.value, cond.op);
+    case CompOp::In:
+        for (const auto& v : cond.values) {
+            if (ci_equal(resolved, v))
+                return true;
+        }
+        return false;
+    case CompOp::Contains:
+        return ci_contains(resolved, cond.value);
     }
     return false;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // -- Public API --------------------------------------------------------------
 
@@ -448,36 +540,41 @@ std::expected<Expression, std::string> parse(std::string_view input) {
 }
 
 bool evaluate(const Expression& expr, const AttributeResolver& resolver) {
-    return std::visit([&](const auto& node) -> bool {
-        using T = std::decay_t<decltype(node)>;
-        if constexpr (std::is_same_v<T, Condition>) {
-            return eval_condition(node, resolver);
-        } else {
-            // std::unique_ptr<Combinator>
-            const auto& comb = *node;
-            switch (comb.op) {
+    return std::visit(
+        [&](const auto& node) -> bool {
+            using T = std::decay_t<decltype(node)>;
+            if constexpr (std::is_same_v<T, Condition>) {
+                return eval_condition(node, resolver);
+            } else {
+                // std::unique_ptr<Combinator>
+                const auto& comb = *node;
+                switch (comb.op) {
                 case CombOp::And:
                     for (const auto& child : comb.children) {
-                        if (!evaluate(child, resolver)) return false;
+                        if (!evaluate(child, resolver))
+                            return false;
                     }
                     return true;
                 case CombOp::Or:
                     for (const auto& child : comb.children) {
-                        if (evaluate(child, resolver)) return true;
+                        if (evaluate(child, resolver))
+                            return true;
                     }
                     return false;
                 case CombOp::Not:
                     return !comb.children.empty() && !evaluate(comb.children[0], resolver);
+                }
+                return false;
             }
-            return false;
-        }
-    }, expr);
+        },
+        expr);
 }
 
 std::expected<void, std::string> validate(std::string_view input) {
     auto result = parse(input);
-    if (result) return {};
+    if (result)
+        return {};
     return std::unexpected(result.error());
 }
 
-}  // namespace yuzu::scope
+} // namespace yuzu::scope

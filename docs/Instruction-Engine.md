@@ -1,156 +1,119 @@
-## Yuzu Revised Design Note
+# Yuzu Instruction Engine — Design & Architecture
 
-**Document status:** Proposed design note  
-**Basis:** Review of the public `dev` branch of `Tr3kkR/Yuzu` as of 2026-03-16  
-**Audience:** Yuzu platform architect / maintainer  
-
----
-
-## 1. Epistemic status
-
-### Verified from the repository
-
-- Yuzu positions itself as an enterprise endpoint management platform for **Windows, Linux, and macOS** fleets, with real-time visibility, orchestration, and compliance. It explicitly describes command orchestration, continuous compliance, security response, and a plugin-extensible model.  
-  Source: GitHub `dev` branch README.
-- The current public architecture description includes a **REST API, Instruction Engine, Policy Engine, Response Store, RBAC/Auth, Audit Log, and Scheduler** in the target architecture diagram and feature description.  
-  Source: GitHub `dev` branch README.
-- The plugin ABI is intentionally stable and C-compatible, with a single exported plugin descriptor entrypoint for shared libraries.  
-  Source: `sdk/include/yuzu/plugin.h`.
-- The capability map states that ad-hoc `plugin + action + params` execution exists today, but **Instruction Templates/Definitions, Instruction Sets, Instruction Hierarchies, Scheduling, Approval Workflows, and Product Packs are not yet implemented**.  
-  Source: `docs/capability-map.md`.
-- The roadmap explicitly lists **Instruction Definitions, Instruction Sets, Instruction Scheduling, Instruction Approval Workflows, Instruction Hierarchies and Follow-Up Workflows, Policy Rules and Fragments, Trigger Framework, Desktop User Interaction, and Product Packs** as planned work items.  
-  Source: `docs/roadmap.md`.
-- The capability map lists the currently documented plugin coverage matrix, including 24 cross-platform plugins, 3 Windows-only plugins, and 2 test/debug plugins.  
-  Source: `docs/capability-map.md`.
-
-### Proposed in this design note
-
-Everything in Sections 4 onward is a proposed design, not a claim that the repository already implements it.
+**Document status:** Living design document — implementation guide
+**Basis:** `dev` branch at commit `dce7f7c` (2026-03-18)
+**Audience:** Yuzu contributors and integrators
 
 ---
 
-## 2. Executive summary
+## 1. Epistemic Status
 
-Yuzu now has a credible **execution substrate** but still lacks a finished **content plane**.
+### Verified from implementation
 
-The existing substrate appears sufficient for:
+- **Phase 0** complete — HTTPS, OTA updates (`agents/core/src/updater.cpp`), secure temp files (`sdk/include/yuzu/plugin.h`), SDK utilities (`yuzu_table_to_json`, `yuzu_json_to_table`, `yuzu_split_lines`, `yuzu_generate_sequence`).
+- **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
+- **Phase 2** implemented — `InstructionStore` (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), `ExecutionTracker` (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), `ApprovalManager` (submit/approve/reject with ownership validation — reviewer != submitter, pending count), `ScheduleEngine` (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by SQLite with WAL mode.
+- **30 plugins** across `agents/plugins/`: 24 cross-platform, 4 Windows-only (`bitlocker`, `msi_packages`, `sccm`, `windows_updates`), 2 test/debug (`chargen`, `example`).
+- **Plugin ABI** v1 stable: `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`.
+- **Wire protocol**: gRPC/Protobuf — `CommandRequest` (plugin + action + parameters + expires_at), `CommandResponse` (status enum: RUNNING/SUCCESS/FAILURE/TIMEOUT/REJECTED, streaming output).
+- **Scope DSL grammar**: `expr → or_expr → and_expr → not_expr → primary → condition`. Operators: `==`, `!=`, `LIKE`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`. Max nesting depth 10.
+- **Dashboard** — HTMX-based instruction management page (`instruction_ui.cpp`) with tabs for Definitions, Executions, Schedules, Approvals. All load fragments via `hx-get`.
 
-- endpoint discovery and targeting,
-- plugin-based remote execution,
-- streaming output,
-- process / service / network / software / filesystem operations,
-- basic security and inventory workloads.
+### Proposed in this document
 
-The missing layer is what turns those primitives into a 1E-like platform:
-
-- reusable **InstructionDefinitions**,
-- grouped **InstructionSets**,
-- declarative **PolicyFragments** and **Policies**,
-- server-managed **TriggerTemplates**,
-- signed, versioned **ProductPacks**,
-- approval, scheduling, rollout, and audit semantics,
-- typed result schemas and stable composition rules.
-
-### Core recommendation
-
-Yuzu should treat plugins as the **privileged execution substrate** and should build a separate **declarative content model** above them. Users should author instructions, policies, triggers, and packs against stable builtins and typed schemas, not against raw syscalls or ad-hoc plugin parameters.
-
----
-
-## 3. Verified current-state assessment of Yuzu
-
-### 3.1 What is already strong
-
-The capability map shows strong T1 foundation coverage for:
-
-- process enumeration and termination,
-- service enumeration and control,
-- logged-on user enumeration,
-- installed application inventory,
-- software uninstall,
-- antivirus / firewall / BitLocker / vulnerability / event-log capabilities,
-- filesystem listing, search, hashing, deletion, and path checks,
-- a stable plugin SDK and gRPC management API.
-
-This is enough to support a serious endpoint action runtime.
-
-### 3.2 What is still missing
-
-The same capability map explicitly says the following are not yet implemented:
-
-- instruction templates / definitions,
-- instruction sets,
-- workflow hierarchies,
-- scheduling,
-- approval workflows,
-- policy rules and enforcement,
-- trigger framework,
-- product packs,
-- formal REST management API,
-- audit trail of user actions,
-- event subscriptions.
-
-### 3.3 Architectural implication
-
-Yuzu should not continue to scale primarily by adding bespoke plugins and ad-hoc commands. It should add a first-class content plane that makes the substrate composable, governable, and distributable.
+- Unified substrate primitive table (Section 7) — consolidation of per-OS tables.
+- Expression language evolution path (Section 8) — extend scope DSL now, adopt CEL for policy in Phase 5.
+- Error model with 4-category taxonomy (Section 9).
+- Concurrency model with 5 modes (Section 10).
+- YAML authoring in dashboard (Section 11).
+- File upload patterns (Section 12).
+- ProductPack Ed25519 trust chain (Section 13).
+- Agent compatibility and rollback (Section 14).
+- Legacy command shim (Section 15).
+- `service.set_start_mode` primitive (Section 16).
+- Scale design for 100K+ agents (Section 17).
 
 ---
 
-## 4. Design principles
+## 2. Executive Summary
 
-1. **Capabilities over syscalls**  
-   Content authors should use stable builtins. Raw OS-specific APIs should stay behind plugins or core adapters.
+Yuzu's **execution substrate is strong**: 30 plugins, stable C ABI, gRPC streaming, mTLS, and OTA updates are production-ready. The **data infrastructure is built**: response storage, audit logging, device tagging, and scope-based targeting are implemented and tested. The **content plane is scaffolded**: instruction definitions, execution tracking, approvals, and scheduling have struct definitions and DDL but no business logic.
 
-2. **Typed content over ad-hoc params**  
-   Every reusable instruction should have parameter schemas, output schemas, versioning, compatibility rules, and human-readable metadata.
+The next step is to wire the scaffolded components into a governed instruction lifecycle — YAML-defined instruction definitions with typed parameter and result schemas, executed through the existing `CommandRequest` wire protocol, tracked by `ExecutionTracker`, stored by `ResponseStore`, and audited by `AuditStore`.
 
-3. **Idempotent remediation where possible**  
-   Fixes and policies should prefer convergent desired-state semantics.
-
-4. **Workflow composition without imperative sprawl**  
-   Most endpoint logic should be expressed declaratively through composition, filtering, branching, retry, approval, and trigger binding.
-
-5. **Signed, portable content bundles**  
-   Product packs should distribute definitions and templates, not arbitrary native code.
-
-6. **One execution model**  
-   UI, API, scheduler, policy engine, and trigger engine should all execute the same instruction model.
-
-7. **Structured output first**  
-   Pipe-delimited output is serviceable for bootstrap but should be replaced with typed rowsets / JSON-native interchange as the canonical substrate.
+This document is the architectural blueprint for that work.
 
 ---
 
-## 5. Proposed content model
+## 3. Current-State Assessment
 
-The proposed object model is:
+| Component | File(s) | Status | Notes |
+|---|---|---|---|
+| **InstructionStore** | `instruction_store.hpp` | Stub | DDL, CRUD signatures, `InstructionDefinition` struct (id, name, version, type, plugin, action, description, enabled, instruction_set_id, gather_ttl, response_ttl, created_by, timestamps). Import/export JSON signatures defined. |
+| **ExecutionTracker** | `execution_tracker.hpp` | Stub | `Execution` struct (id, definition_id, status, scope_expression, parameter_values, dispatched_by, agent counts, parent_id, rerun_of). `AgentExecStatus` struct (agent_id, status, timestamps, exit_code, error_detail). `ExecutionSummary` with progress_pct. Rerun and cancel signatures. |
+| **ApprovalManager** | `approval_manager.hpp` | Stub | `Approval` struct (id, definition_id, status, submitted_by, reviewed_by, review_comment, scope_expression). Query, approve, reject, pending_count signatures. |
+| **ScheduleEngine** | `schedule_engine.hpp` | Stub | `InstructionSchedule` struct (id, name, definition_id, frequency_type, interval_minutes, time_of_day, day_of_week, day_of_month, scope_expression, requires_approval, enabled, next/last execution, execution_count). CRUD + enable/disable signatures. |
+| **ScopeEngine** | `scope_engine.cpp` (494 LOC) | **Real** | Full recursive-descent parser. 9 comparison operators. AND/OR/NOT combinators. Wildcard LIKE matching. Numeric comparison with fallback. `AttributeResolver` callback for evaluation. |
+| **ResponseStore** | `response_store.hpp` | **Real** | SQLite-backed. `StoredResponse` with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread. |
+| **AuditStore** | `audit_store.hpp` | **Real** | SQLite-backed. `AuditEvent` with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup. |
+| **TagStore** | `tag_store.hpp` | **Real** | SQLite-backed. `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
+| **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
-- **InstructionDefinition**: reusable action or question template bound to a substrate primitive
-- **InstructionSet**: grouped collection of definitions, workflows, and policy fragments; primary permission boundary
-- **PolicyFragment**: reusable check/fix pair
-- **Policy**: scope + desired state + trigger/schedule + remediation + compliance semantics
-- **TriggerTemplate**: reusable event source template with parameterization and debounce semantics
-- **ProductPack**: signed bundle of definitions, sets, fragments, policies, triggers, views, and metadata
+**Overall progress:** 44/139 capabilities done (32%). Phases 0, 1, and 2 complete. Phase 2 business logic fully implemented.
 
-### 5.1 Relationship summary
+---
 
-```text
+## 4. Design Principles
+
+1. **Substrate, not scripts.** Expose stable builtin primitives; keep OS-specific syscalls inside plugin adapters. Content authors should never need to write shell commands.
+
+2. **Everything is an InstructionDefinition.** Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all flow through the same definition → execution → response pipeline.
+
+3. **Cross-platform by default.** Primitives target all three OSes. Platform-specific behavior is declared in the definition's `platforms` field and handled by the plugin layer.
+
+4. **Typed end-to-end.** Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export). No untyped string bags at the content layer.
+
+5. **Governed execution.** Every state-changing action can require approval. Every execution is audited. Every response is persisted. The platform enforces organizational policy, not just technical capability.
+
+6. **Composition over complexity.** InstructionSets group definitions. PolicyFragments compose check+fix. Policies bind fragments to triggers. ProductPacks bundle everything for distribution. Each layer adds governance without adding new execution semantics.
+
+7. **Plugin ABI is sacred.** The C boundary in `plugin.h` must remain stable across compiler and platform upgrades. All content-layer evolution happens above this line.
+
+---
+
+## 5. Content Model
+
+```
 ProductPack
-âââ InstructionSet(s)
-â   âââ InstructionDefinition(s)
-â   âââ Workflow template(s)
-â   âââ PolicyFragment reference(s)
-âââ PolicyFragment(s)
-âââ Policy(s)
-âââ TriggerTemplate(s)
-âââ Export / dashboard / documentation metadata
+ └── InstructionSet[]
+      └── InstructionDefinition[]
+           ├── Parameter Schema
+           ├── Result Schema
+           └── Execution Spec (plugin + action + defaults)
+
+PolicyFragment
+ ├── Check: ref → InstructionDefinition
+ ├── Compliance expression
+ ├── Fix: ref → InstructionDefinition
+ └── PostCheck: ref → InstructionDefinition
+
+Policy
+ ├── Scope (device targeting)
+ ├── Fragment ref + parameter bindings
+ ├── Trigger refs
+ └── Rollout strategy
+
+TriggerTemplate
+ ├── Source type (interval, file, service, event_log, registry, startup)
+ ├── Parameter schema
+ └── Debounce config
 ```
 
+**Hierarchy:** `ProductPack` → `InstructionSet` → `InstructionDefinition`. A definition can exist without a set (standalone) and without a pack (user-created). Sets are the permission boundary. Packs are the distribution boundary.
+
 ---
 
-## 6. YAML schemas
-
-These are proposed wire/storage schemas, not direct extracts from the repository.
+## 6. YAML Schemas
 
 ### 6.1 InstructionDefinition
 
@@ -158,25 +121,25 @@ These are proposed wire/storage schemas, not direct extracts from the repository
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
-  id: windows.service.restart
-  displayName: Restart Windows Service
-  version: 1.0.0
-  description: Restart a named Windows service and return the post-action state.
-  labels:
-    domain: services
-    os: windows
-  annotations:
-    owner: platform-core
-    maturity: draft
+  id: crossplatform.service.inspect
+  displayName: Inspect Service Status
+  version: 1.2.0
+  description: Returns the current state, startup type, and PID of a named service.
+  tags:
+    - services
+    - operations
 spec:
-  type: action            # action | question
+  type: question                         # question (read-only) | action (may modify state)
   platforms:
     - windows
-  substrate:
-    primitive: service.restart
-    builtin: service.restart
+    - linux
+    - darwin
+  execution:
     plugin: services
-    action: restart
+    action: inspect
+    concurrency: per-device              # per-device | per-definition | per-set | global:<N> | unlimited
+    stagger:
+      maxDelaySeconds: 0                 # 0 = no stagger
   parameters:
     type: object
     required:
@@ -184,54 +147,47 @@ spec:
     properties:
       serviceName:
         type: string
-        title: Service name
-        minLength: 1
-      timeoutSeconds:
-        type: integer
-        minimum: 1
-        maximum: 600
-        default: 60
-      requireRunningAfter:
+        displayName: Service Name
+        description: The name of the service to inspect.
+        validation:
+          maxLength: 256
+      verbose:
         type: boolean
-        default: true
-  resultSchema:
-    type: object
-    required:
-      - serviceName
-      - stateBefore
-      - stateAfter
-      - success
-    properties:
-      serviceName:
+        default: false
+  result:
+    columns:
+      - name: serviceName
         type: string
-      stateBefore:
+      - name: state
         type: string
-      stateAfter:
+      - name: startupType
         type: string
-      success:
-        type: boolean
-      message:
-        type: string
-  execution:
-    timeoutSeconds: 90
-    idempotent: false
-    concurrency: per-device
-    approvalMode: inherit
-    retry:
-      maxAttempts: 1
-  safety:
-    risk: medium
-    allowedScopes:
-      - device
-      - group
-    rollback:
-      supported: false
-  observability:
-    emitAuditEvent: true
-    persistResponses: true
-    defaultAggregation:
-      mode: count_by
-      field: stateAfter
+      - name: pid
+        type: int32
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+  readablePayload: "Inspect service '${serviceName}'"
+  gather:
+    ttlSeconds: 300                      # agent must respond within this window
+  response:
+    retentionDays: 90
+  approval:
+    mode: auto                           # auto | role-gated | always
+  permissions:
+    executeRoles:
+      - endpoint-operator
+      - endpoint-admin
+    authorRoles:
+      - content-author
+  compatibility:
+    minAgentVersion: 0.9.0
+    requiredPlugins:
+      - services
+  legacy_shim:
+    enabled: true                        # auto-generate from plugin descriptor if true
 status:
   phase: proposed
 ```
@@ -242,13 +198,14 @@ status:
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionSet
 metadata:
-  id: core.windows.services
-  displayName: Windows Service Operations
+  id: core.crossplatform.services
+  displayName: Cross-Platform Service Management
   version: 1.0.0
-  description: Group of reusable service interrogation and remediation definitions.
-spec:
+  description: Inspect, start, stop, and restart services across all platforms.
   platforms:
     - windows
+    - linux
+    - darwin
   permissions:
     executeRoles:
       - endpoint-operator
@@ -260,14 +217,15 @@ spec:
       - endpoint-admin
   contents:
     instructionDefinitions:
-      - windows.service.inspect
-      - windows.service.start
-      - windows.service.stop
-      - windows.service.restart
+      - crossplatform.service.inspect
+      - crossplatform.service.start
+      - crossplatform.service.stop
+      - crossplatform.service.restart
+      - crossplatform.service.set_start_mode
     policyFragments:
-      - fragment.windows.service.must_be_running
+      - fragment.service.must_be_running
     workflowTemplates:
-      - workflow.windows.restart_then_verify
+      - workflow.restart_then_verify
   defaults:
     approvalMode: role-gated
     responseRetentionDays: 30
@@ -285,13 +243,15 @@ status:
 apiVersion: yuzu.io/v1alpha1
 kind: PolicyFragment
 metadata:
-  id: fragment.windows.service.must_be_running
+  id: fragment.service.must_be_running
   displayName: Service must be running
   version: 1.0.0
   description: Reusable fragment that checks a service and optionally restarts it.
 spec:
   platforms:
     - windows
+    - linux
+    - darwin
   inputs:
     type: object
     required:
@@ -303,7 +263,7 @@ spec:
         type: boolean
         default: true
   check:
-    ref: windows.service.inspect
+    ref: crossplatform.service.inspect
     with:
       serviceName: ${inputs.serviceName}
   compliance:
@@ -314,11 +274,11 @@ spec:
       error: result.error != null
   fix:
     when: ${inputs.autoRemediate} == true
-    ref: windows.service.restart
+    ref: crossplatform.service.restart
     with:
       serviceName: ${inputs.serviceName}
   postCheck:
-    ref: windows.service.inspect
+    ref: crossplatform.service.inspect
     with:
       serviceName: ${inputs.serviceName}
   debounce:
@@ -350,13 +310,13 @@ spec:
     managementGroups:
       - workstations
   fragment:
-    ref: fragment.windows.service.must_be_running
+    ref: fragment.service.must_be_running
     with:
       serviceName: Spooler
       autoRemediate: true
   triggers:
     - ref: trigger.interval.five_minutes
-    - ref: trigger.windows.service_status_changed
+    - ref: trigger.service_status_changed
       with:
         serviceName: Spooler
   schedule:
@@ -456,15 +416,15 @@ spec:
       - yuzu.io/v1alpha1
   contents:
     instructionSets:
-      - core.windows.services
+      - core.crossplatform.services
       - core.crossplatform.processes
     instructionDefinitions:
-      - windows.service.inspect
-      - windows.service.restart
+      - crossplatform.service.inspect
+      - crossplatform.service.restart
       - crossplatform.process.list
       - crossplatform.process.kill
     policyFragments:
-      - fragment.windows.service.must_be_running
+      - fragment.service.must_be_running
     policies:
       - policy.windows.spooler.running
     triggerTemplates:
@@ -481,12 +441,19 @@ spec:
       - event_logs
     packs: []
   security:
-    signature:
+    signing:
       algorithm: ed25519
-      keyId: yuzu-core-release
-      value: <base64-signature>
+      keyId: yuzu-core-release-2026
+      keyFingerprint: "SHA256:..."
+    signature:
+      manifestHash: <sha256-of-manifest>
+      value: <base64-ed25519-signature>
     checksums:
       manifestSha256: <sha256>
+    trustChain:
+      rootKeyFingerprint: "SHA256:..."
+      signingKeyCertificate: <base64-der>
+    revocationListUrl: "https://packs.yuzu.example/crl.json"
   distribution:
     format: tar.zst
     importMode: staged
@@ -497,480 +464,821 @@ status:
 
 ---
 
-## 7. Proposed substrate primitives
+## 7. Unified Substrate Primitive Table
 
-This section enumerates the proposed stable primitives that the content plane should target.
+This table replaces the previous per-OS tables (Sections 9, 10, 11 of the original document) with a single cross-platform view. Each row is a stable builtin name that content authors target. Platform availability is marked per-column.
 
-### 7.1 System and identity
+**Status key:**
+- **Verified** — grounded in existing plugin code in `agents/plugins/`
+- **Planned** — in roadmap with GitHub issue
+- **Proposed** — recommended in this document
 
-- `system.info`
-- `system.status`
-- `device.identity`
-- `hardware.inventory`
-- `device.tags.get`
-- `device.tags.set`
-- `agent.health`
-- `agent.restart`
-- `agent.sleep`
-- `agent.log.read`
+### 7.1 System and Identity
 
-### 7.2 Process and execution
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `system.info` | `os_info` | Y | Y | Y | Verified | OS name, version, build, kernel |
+| `system.status` | `status` | Y | Y | Y | Verified | Agent uptime, resource usage |
+| `device.identity` | `device_identity` | Y | Y | Y | Verified | UUID, hostname, domain, FQDN |
+| `hardware.inventory` | `hardware` | Y | Y | Y | Verified | CPU, RAM, disk geometry |
+| `device.tags.get` | `tags` | Y | Y | Y | Verified | Read scopable/freeform tags |
+| `device.tags.set` | `tags` | Y | Y | Y | Verified | Write scopable/freeform tags |
+| `agent.health` | `diagnostics` | Y | Y | Y | Verified | Plugin list, uptime, resource stats |
+| `agent.restart` | `agent_actions` | Y | Y | Y | Verified | Self-restart |
+| `agent.sleep` | agent core | Y | Y | Y | Planned | Pause agent for N seconds |
+| `agent.log.read` | `diagnostics` | Y | Y | Y | Planned | Tail agent log, set log level |
 
-- `process.list`
-- `process.inspect`
-- `process.kill`
-- `process.start`
-- `script.run`
-- `command.run`
-- `execution.wait`
-- `execution.timeout`
+### 7.2 Process and Execution
 
-### 7.3 Services and daemons
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `process.list` | `processes` | Y | Y | Y | Verified | PID, name, user, CPU, memory |
+| `process.inspect` | `procfetch` | Y | Y | Y | Verified | Formatted view with exe hash |
+| `process.kill` | `processes` | Y | Y | Y | Verified | Signal/terminate by PID |
+| `process.start` | `script_exec` | Y | Y | Y | Proposed | Spawn process (wraps script_exec) |
+| `script.run` | `script_exec` | Y | Y | Y | Verified | Inline or file-based script execution |
+| `command.run` | `script_exec` | Y | Y | Y | Verified | OS command execution |
 
-- `service.list`
-- `service.inspect`
-- `service.start`
-- `service.stop`
-- `service.restart`
-- `service.set_start_mode`
+### 7.3 Services and Daemons
 
-### 7.4 User, session, and identity context
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `service.list` | `services` | Y | Y | Y | Verified | Name, state, startup type |
+| `service.inspect` | `services` | Y | Y | Y | Proposed | Detail view for single service |
+| `service.start` | `services` | Y | Y | Y | Verified | Start named service |
+| `service.stop` | `services` | Y | Y | Y | Verified | Stop named service |
+| `service.restart` | `services` | Y | Y | Y | Verified | Restart named service |
+| `service.set_start_mode` | `services` | Y | Y | Y | Proposed | See Section 16 for details |
 
-- `user.list`
-- `user.logged_on`
-- `user.group_membership`
-- `session.list`
-- `session.active_user`
-- `session.notify`
-- `session.prompt`
+### 7.4 User, Session, and Identity
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `user.list` | `users` | Y | Y | Y | Verified | Local user accounts |
+| `user.logged_on` | `users` | Y | Y | Y | Verified | Currently logged-on users |
+| `user.group_membership` | `users` (ext) | Y | Y | Y | Planned | Local group members |
+| `session.list` | `users` (ext) | Y | Y | Y | Planned | RDP, console, SSH sessions |
+| `session.active_user` | `users` (ext) | Y | Y | Y | Planned | Primary/console user |
+| `session.notify` | `interaction` | Y | - | - | Planned | Toast notification to user |
+| `session.prompt` | `interaction` | Y | - | - | Planned | Yes/No dialog |
 
 ### 7.5 Network
 
-- `network.config.get`
-- `network.route.list`
-- `network.connection.list`
-- `network.socket.owner`
-- `network.dns.flush`
-- `network.diagnostics.run`
-- `network.adapter.enable`
-- `network.adapter.disable`
-- `network.quarantine`
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `network.config.get` | `network_config` | Y | Y | Y | Verified | Interfaces, IPs, ARP table |
+| `network.route.list` | `network_config` | Y | Y | Y | Verified | Routing table |
+| `network.connection.list` | `netstat` | Y | Y | Y | Verified | TCP/UDP connections |
+| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified | Socket → process mapping |
+| `network.dns.flush` | `network_actions` | Y | Y | Y | Verified | Flush DNS cache |
+| `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified | Ping, traceroute |
+| `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified | Enable network adapter |
+| `network.adapter.disable` | `network_actions` | Y | Y | Y | Verified | Disable network adapter |
+| `network.quarantine` | `quarantine` | Y | Y | - | Planned | Isolate device (Phase 3) |
 
-### 7.6 Software and patching
+### 7.6 Software and Patching
 
-- `software.inventory`
-- `software.package.inventory`
-- `software.uninstall`
-- `software.install`
-- `software.update`
-- `patch.inventory`
-- `patch.install`
-- `patch.scan`
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `software.inventory` | `installed_apps` | Y | Y | Y | Verified | Installed applications |
+| `software.package.inventory` | `msi_packages` | Y | - | - | Verified | MSI package details |
+| `software.uninstall` | `software_actions` | Y | Y | Y | Verified | Uninstall by identifier |
+| `software.install` | content staging | Y | Y | Y | Planned | Stage + silent install |
+| `software.update` | pkg adapter | Y | Y | Y | Proposed | OS package manager update |
+| `software.sccm.query` | `sccm` | Y | - | - | Verified | SCCM client integration |
+| `patch.inventory` | `windows_updates` | Y | - | - | Verified | Installed/pending updates |
+| `patch.install` | `patch` | Y | Y | Y | Planned | Orchestrated patch deploy |
+| `patch.scan` | `vuln_scan` | Y | Y | Y | Verified | NVD-based vulnerability scan |
 
-### 7.7 Filesystem and content staging
+### 7.7 Filesystem and Content Staging
 
-- `file.list`
-- `file.search`
-- `file.read`
-- `file.write`
-- `file.hash`
-- `file.delete`
-- `file.exists`
-- `file.permissions.inspect`
-- `file.signature.verify`
-- `file.temp.create`
-- `content.download`
-- `content.upload`
-- `content.stage`
-- `content.execute`
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `file.list` | `filesystem` | Y | Y | Y | Verified | Directory listing |
+| `file.search` | `filesystem` | Y | Y | Y | Verified | Search by name pattern |
+| `file.read` | `filesystem` | Y | Y | Y | Verified | Read file contents |
+| `file.write` | `filesystem` (ext) | Y | Y | Y | Planned | Write/append text |
+| `file.hash` | `filesystem` | Y | Y | Y | Verified | SHA-256 hash computation |
+| `file.delete` | `filesystem` | Y | Y | Y | Verified | Delete file |
+| `file.exists` | `filesystem` | Y | Y | Y | Verified | Path existence check |
+| `file.permissions.inspect` | `filesystem` (ext) | Y | Y | Y | Planned | ACL/permission enumeration |
+| `file.signature.verify` | `filesystem` (ext) | Y | - | Y | Planned | Authenticode / codesign |
+| `file.temp.create` | SDK (`yuzu_create_temp_file`) | Y | Y | Y | Verified | Secure temp file (0600/owner-only DACL) |
+| `content.download` | `http_client` | Y | Y | Y | Planned | HTTP GET with hash verify |
+| `content.upload` | `http_client` | Y | Y | Y | Planned | Upload file to server |
+| `content.stage` | `content_dist` | Y | Y | Y | Planned | Download manifest to staging dir |
+| `content.execute` | `content_dist` | Y | Y | Y | Planned | Stage + execute + cleanup |
 
-### 7.8 Security and compliance
+### 7.8 Security and Compliance
 
-- `security.antivirus.status`
-- `security.firewall.status`
-- `security.firewall.rules.list`
-- `security.disk_encryption.status`
-- `security.vulnerability.scan`
-- `security.event_log.query`
-- `security.ioc.check`
-- `security.certificate.inventory`
-- `security.certificate.renew`
+| Primitive | Backing Plugin | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `security.antivirus.status` | `antivirus` | Y | Y | Y | Verified | AV product, definitions age |
+| `security.firewall.status` | `firewall` | Y | Y | Y | Verified | Firewall state and rules |
+| `security.disk_encryption.status` | `bitlocker` | Y | - | - | Verified | BitLocker status (Windows) |
+| `security.disk_encryption.status` | LUKS/FileVault adapter | - | Y | Y | Proposed | Linux LUKS, macOS FileVault |
+| `security.vulnerability.scan` | `vuln_scan` | Y | Y | Y | Verified | NVD-backed scan |
+| `security.event_log.query` | `event_logs` | Y | Y | Y | Verified | Event/journal log query |
+| `security.ioc.check` | `ioc` | Y | Y | Y | Planned | Hash/IP/domain IOC matching |
+| `security.certificate.inventory` | `certificates` | Y | Y | Y | Planned | Enumerate system cert stores |
 
-### 7.9 Data, shaping, and workflow
+### 7.9 Workflow Primitives
 
-- `result.filter`
-- `result.project`
-- `result.join`
-- `result.group_by`
-- `result.count`
-- `result.sort`
-- `json.parse`
-- `json.path`
-- `string.regex_match`
-- `string.regex_extract`
-- `time.now`
-- `time.window`
-- `workflow.if`
-- `workflow.switch`
-- `workflow.foreach`
-- `workflow.parallel`
-- `workflow.retry`
-- `workflow.fail`
-- `workflow.assert`
+| Primitive | Backing | Status | Notes |
+|---|---|---|---|
+| `result.filter` | Server-side (ResponseStore) | Planned | Filter response rows by expression |
+| `result.group_by` | Server-side (ResponseStore) | Planned | Group + aggregate |
+| `result.sort` | Server-side (ResponseStore) | Planned | Multi-column sort |
+| `result.count` | Server-side (ResponseStore) | Planned | Count matching rows |
+| `workflow.if` | Server orchestrator | Proposed | Branch on expression |
+| `workflow.foreach` | Server orchestrator | Proposed | Iterate over result rows |
+| `workflow.retry` | Server orchestrator | Proposed | Retry with backoff |
 
-### 7.10 Trigger and policy primitives
+### 7.10 Trigger Primitives
 
-- `trigger.interval`
-- `trigger.filesystem_change`
-- `trigger.service_change`
-- `trigger.windows_event_log`
-- `trigger.registry_change`
-- `trigger.agent_startup`
-- `policy.check`
-- `policy.fix`
-- `policy.evaluate`
-- `policy.suppress`
-- `policy.exempt`
-- `policy.recheck`
+| Primitive | Backing | Win | Linux | macOS | Status | Notes |
+|---|---|:---:|:---:|:---:|---|---|
+| `trigger.interval` | Trigger engine | Y | Y | Y | Planned | Timer-based (min 30s) |
+| `trigger.filesystem_change` | Trigger engine | Y | Y | Y | Planned | ReadDirectoryChangesW / inotify / FSEvents |
+| `trigger.service_change` | Trigger engine | Y | Y | - | Planned | SCM / systemd notifications |
+| `trigger.windows_event_log` | Trigger engine | Y | - | - | Planned | XPath filter on event log |
+| `trigger.registry_change` | Trigger engine | Y | - | - | Planned | Registry key notification |
+| `trigger.agent_startup` | Agent core | Y | Y | Y | Planned | Fire on agent boot |
 
-### 7.11 Approval, scope, and governance
+### 7.11 Governance Primitives
 
-- `scope.estimate_targets`
-- `scope.resolve_devices`
-- `approval.submit`
-- `approval.approve`
-- `approval.reject`
-- `audit.emit`
-- `response.persist`
-- `response.aggregate`
-- `response.export`
+| Primitive | Backing | Status | Notes |
+|---|---|---|---|
+| `scope.estimate_targets` | ScopeEngine | Proposed | Preview device count before dispatch |
+| `scope.resolve_devices` | ScopeEngine | Proposed | Return matched agent IDs |
+| `approval.submit` | ApprovalManager | Planned | Submit execution for approval |
+| `approval.approve` | ApprovalManager | Planned | Approve pending execution |
+| `approval.reject` | ApprovalManager | Planned | Reject pending execution |
+| `audit.emit` | AuditStore | Verified | Log structured audit event |
+| `response.persist` | ResponseStore | Verified | Store command response |
+| `response.aggregate` | ResponseStore | Planned | Aggregate across agents |
+| `response.export` | Data export | Planned | CSV/JSON export |
+| `policy.check` | Policy engine | Planned | Evaluate compliance |
+| `policy.fix` | Policy engine | Planned | Execute remediation |
+| `policy.evaluate` | Policy engine | Planned | Full check → fix → postcheck cycle |
+| `policy.recheck` | Policy engine | Planned | Force re-evaluation |
 
----
+### 7.12 OS-Specific Native Adapters
 
-## 8. Mapping substrate primitives to current or proposed Yuzu builtins
+These are internal implementation details behind the stable builtins — not directly exposed to content authors.
 
-### 8.1 Notes on interpretation
+**Windows:**
+Service Control Manager, Event Log API, Registry APIs, WMI/CIM, ReadDirectoryChangesW, Task Scheduler, Certificate Store / CryptoAPI / CNG, Firewall APIs (NetSecurity), BitLocker WMI, WinHTTP / BITS, session/notification APIs, SetupAPI / PnP.
 
-- **Mapped builtin/plugin** means the primitive can plausibly be backed by a documented existing plugin or clearly planned subsystem.
-- **Status** values:
-  - `Verified` = grounded in the public repo/capability map
-  - `Planned` = grounded in roadmap/capability map but not implemented
-  - `Proposed` = recommended here as an explicit builtin surface
-- The tables below use Yuzu builtin names as the stable authoring surface. Internally, Yuzu can map them to plugins or OS adapters.
+**Linux:**
+systemd / D-Bus, inotify, procfs / sysfs, journald / syslog, package managers (apt, dnf, yum, zypper), nftables / iptables, POSIX account/group management, certificate store / OpenSSL, LUKS / dm-crypt.
 
----
-
-## 9. Windows builtin mapping
-
-| Primitive | Yuzu builtin | Backing plugin / adapter | Status | Notes |
-|---|---|---|---|---|
-| `system.info` | `system.info` | `os_info` | Verified | Cross-platform inventory primitive |
-| `system.status` | `system.status` | `status` | Verified | Device / agent status |
-| `device.identity` | `device.identity` | `device_identity` | Verified | Agent/device identity |
-| `hardware.inventory` | `hardware.inventory` | `hardware` | Verified | CPU, RAM, disks |
-| `process.list` | `process.list` | `processes`, `procfetch` | Verified | `procfetch` adds formatted/hash-oriented view |
-| `process.kill` | `process.kill` | `processes` | Verified | Basic kill supported |
-| `process.start` | `process.start` | `script_exec` / future process adapter | Proposed | Current repo documents execution primitives, not a dedicated process-start contract |
-| `service.list` | `service.list` | `services` | Verified | Cross-platform service enumeration |
-| `service.inspect` | `service.inspect` | `services` | Proposed | Natural builtin over existing service plugin |
-| `service.start` | `service.start` | `services` | Verified | Documented in capability map |
-| `service.stop` | `service.stop` | `services` | Verified | Documented in capability map |
-| `service.restart` | `service.restart` | `services` | Verified | Documented in capability map |
-| `user.logged_on` | `user.logged_on` | `users` | Verified | Logged-on user enumeration |
-| `user.group_membership` | `user.group_membership` | future users/groups plugin | Planned | Roadmap includes user sessions and group membership plugins |
-| `network.config.get` | `network.config.get` | `network_config` | Verified | Adapter/IP configuration |
-| `network.connection.list` | `network.connection.list` | `netstat` | Verified | Connections and listeners |
-| `network.socket.owner` | `network.socket.owner` | `sockwho` | Verified | Socket-to-process ownership |
-| `network.diagnostics.run` | `network.diagnostics.run` | `network_diag` | Verified | Ping/traceroute-style diagnostics surface |
-| `network.adapter.enable` | `network.adapter.enable` | `network_actions` | Verified | Cross-platform network actions category |
-| `network.adapter.disable` | `network.adapter.disable` | `network_actions` | Verified | Cross-platform network actions category |
-| `network.quarantine` | `network.quarantine` | future quarantine subsystem | Planned | Roadmap issue exists |
-| `software.inventory` | `software.inventory` | `installed_apps` | Verified | Cross-platform installed apps |
-| `software.package.inventory` | `software.package.inventory` | `msi_packages` | Verified | Windows-only MSI inventory |
-| `software.uninstall` | `software.uninstall` | `software_actions` | Verified | Capability map documents uninstall |
-| `software.install` | `software.install` | content staging + installer execution | Planned | Needs content staging / execution path |
-| `patch.inventory` | `patch.inventory` | `windows_updates` | Verified | Windows-only patch primitive |
-| `patch.install` | `patch.install` | `windows_updates` / future workflow | Proposed | Likely needs richer workflow semantics |
-| `file.list` | `file.list` | `filesystem` | Verified | Admin-required |
-| `file.search` | `file.search` | `filesystem` | Verified | Search by name |
-| `file.read` | `file.read` | `filesystem` | Verified | Basic read only |
-| `file.write` | `file.write` | future filesystem advanced ops | Planned | Roadmap issue exists |
-| `file.hash` | `file.hash` | `filesystem` | Verified | Hash computation |
-| `file.delete` | `file.delete` | `filesystem` | Verified | Deletion supported |
-| `file.exists` | `file.exists` | `filesystem` | Verified | Path existence check |
-| `file.permissions.inspect` | `file.permissions.inspect` | ACL adapter | Planned | Capability map marks not implemented |
-| `file.signature.verify` | `file.signature.verify` | Authenticode adapter | Planned | Capability map marks not implemented |
-| `file.temp.create` | `file.temp.create` | secure temp-file helper | Planned | Foundation gap called out |
-| `content.download` | `content.download` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.upload` | `content.upload` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.stage` | `content.stage` | content staging subsystem | Planned | Roadmap issue exists |
-| `content.execute` | `content.execute` | `script_exec` + staging | Planned | Roadmap issue exists |
-| `security.antivirus.status` | `security.antivirus.status` | `antivirus` | Verified | Cross-platform AV detection |
-| `security.firewall.status` | `security.firewall.status` | `firewall` | Verified | Cross-platform firewall status/rules |
-| `security.firewall.rules.list` | `security.firewall.rules.list` | `firewall` | Verified | Capability map mentions rule enumeration |
-| `security.disk_encryption.status` | `security.disk_encryption.status` | `bitlocker` | Verified | Windows-only today |
-| `security.vulnerability.scan` | `security.vulnerability.scan` | `vuln_scan` | Verified | NVD-backed scan workflow |
-| `security.event_log.query` | `security.event_log.query` | `event_logs` | Verified | Event log collection |
-| `security.ioc.check` | `security.ioc.check` | future IOC subsystem | Planned | Roadmap issue exists |
-| `security.certificate.inventory` | `security.certificate.inventory` | future certificate plugin | Planned | Roadmap issue exists |
-| `security.certificate.renew` | `security.certificate.renew` | cert-store / enrollment adapter | Proposed | Good high-value enterprise primitive |
-| `trigger.interval` | `trigger.interval` | trigger framework | Planned | Capability map marks not implemented |
-| `trigger.filesystem_change` | `trigger.filesystem_change` | filesystem watcher | Planned | Capability map marks not implemented |
-| `trigger.service_change` | `trigger.service_change` | SCM/service watcher | Planned | Capability map marks not implemented |
-| `trigger.windows_event_log` | `trigger.windows_event_log` | event-log subscription adapter | Planned | Capability map marks not implemented |
-| `trigger.registry_change` | `trigger.registry_change` | registry watcher | Planned | Capability map marks not implemented |
-| `trigger.agent_startup` | `trigger.agent_startup` | agent lifecycle hook | Planned | Capability map marks not implemented |
-| `policy.check` | `policy.check` | policy engine | Planned | Capability map marks not implemented |
-| `policy.fix` | `policy.fix` | policy engine | Planned | Capability map marks not implemented |
-| `policy.evaluate` | `policy.evaluate` | policy engine | Planned | Capability map marks not implemented |
-| `policy.recheck` | `policy.recheck` | policy engine | Planned | Capability map marks not implemented |
-| `approval.submit` | `approval.submit` | instruction approval workflow | Planned | Roadmap issue exists |
-| `response.persist` | `response.persist` | SQLite response store | Planned | Roadmap issue exists |
-| `response.aggregate` | `response.aggregate` | aggregation engine | Planned | Roadmap issue exists |
-| `response.export` | `response.export` | CSV/JSON export | Planned | Roadmap issue exists |
-
-### 9.1 Recommended Windows native adapters behind builtins
-
-These should remain internal implementation details, not direct content-author interfaces:
-
-- Service Control Manager
-- Event Log API / Windows Eventing
-- Registry APIs
-- WMI / CIM
-- ReadDirectoryChangesW
-- Task Scheduler
-- Certificate Store / enrollment APIs
-- Firewall APIs / NetSecurity surfaces
-- BitLocker APIs / WMI bridges
-- WinHTTP / BITS or equivalent download path
-- session / notification APIs for user interaction
-- SetupAPI / PnP for device and driver operations
+**macOS:**
+launchd, FSEvents, unified logging, system profiler, softwareupdate, codesign / notarization, FileVault, Keychain, user notification frameworks.
 
 ---
 
-## 10. Linux builtin mapping
+## 8. Expression Language
 
-| Primitive | Yuzu builtin | Backing plugin / adapter | Status | Notes |
-|---|---|---|---|---|
-| `system.info` | `system.info` | `os_info` | Verified | Cross-platform |
-| `system.status` | `system.status` | `status` | Verified | Cross-platform |
-| `device.identity` | `device.identity` | `device_identity` | Verified | Cross-platform |
-| `hardware.inventory` | `hardware.inventory` | `hardware` | Verified | Cross-platform |
-| `process.list` | `process.list` | `processes`, `procfetch` | Verified | Cross-platform |
-| `process.kill` | `process.kill` | `processes` | Verified | Cross-platform |
-| `process.start` | `process.start` | `script_exec` / future process adapter | Proposed | Same rationale as Windows |
-| `service.list` | `service.list` | `services` | Verified | Likely systemd/service abstraction |
-| `service.inspect` | `service.inspect` | `services` | Proposed | Natural structured wrapper |
-| `service.start` | `service.start` | `services` | Verified | Supported |
-| `service.stop` | `service.stop` | `services` | Verified | Supported |
-| `service.restart` | `service.restart` | `services` | Verified | Supported |
-| `user.logged_on` | `user.logged_on` | `users` | Verified | Cross-platform |
-| `user.group_membership` | `user.group_membership` | future users/groups plugin | Planned | Roadmap issue exists |
-| `network.config.get` | `network.config.get` | `network_config` | Verified | Cross-platform |
-| `network.connection.list` | `network.connection.list` | `netstat` | Verified | Cross-platform |
-| `network.socket.owner` | `network.socket.owner` | `sockwho` | Verified | Cross-platform |
-| `network.diagnostics.run` | `network.diagnostics.run` | `network_diag` | Verified | Cross-platform |
-| `network.adapter.enable` | `network.adapter.enable` | `network_actions` | Verified | Cross-platform |
-| `network.adapter.disable` | `network.adapter.disable` | `network_actions` | Verified | Cross-platform |
-| `network.quarantine` | `network.quarantine` | future quarantine subsystem | Planned | Requires Linux enforcement adapter |
-| `software.inventory` | `software.inventory` | `installed_apps` | Verified | Cross-platform high-level inventory |
-| `software.package.inventory` | `software.package.inventory` | distro-specific package adapter | Proposed | Useful explicit Linux primitive |
-| `software.uninstall` | `software.uninstall` | `software_actions` | Verified | Cross-platform uninstall surface |
-| `software.install` | `software.install` | staged package execution | Planned | Needs content staging |
-| `software.update` | `software.update` | package-manager adapter | Proposed | High-value Linux builtin |
-| `patch.scan` | `patch.scan` | vuln/package adapter | Proposed | Enterprise patch assessment |
-| `file.list` | `file.list` | `filesystem` | Verified | Cross-platform |
-| `file.search` | `file.search` | `filesystem` | Verified | Cross-platform |
-| `file.read` | `file.read` | `filesystem` | Verified | Basic read |
-| `file.write` | `file.write` | future filesystem advanced ops | Planned | Roadmap issue exists |
-| `file.hash` | `file.hash` | `filesystem` | Verified | Supported |
-| `file.delete` | `file.delete` | `filesystem` | Verified | Supported |
-| `file.exists` | `file.exists` | `filesystem` | Verified | Supported |
-| `file.permissions.inspect` | `file.permissions.inspect` | POSIX ACL / stat adapter | Planned | Not yet implemented in capability map |
-| `file.signature.verify` | `file.signature.verify` | package/file signature adapter | Planned | Not yet implemented |
-| `file.temp.create` | `file.temp.create` | secure temp-file helper | Planned | Foundation gap |
-| `content.download` | `content.download` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.upload` | `content.upload` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.stage` | `content.stage` | content staging subsystem | Planned | Roadmap issue exists |
-| `content.execute` | `content.execute` | `script_exec` + staging | Planned | Roadmap issue exists |
-| `security.antivirus.status` | `security.antivirus.status` | `antivirus` | Verified | Cross-platform |
-| `security.firewall.status` | `security.firewall.status` | `firewall` | Verified | Cross-platform |
-| `security.firewall.rules.list` | `security.firewall.rules.list` | `firewall` | Verified | Cross-platform rule-oriented surface |
-| `security.disk_encryption.status` | `security.disk_encryption.status` | LUKS adapter | Proposed | Capability map says Linux coverage absent today |
-| `security.vulnerability.scan` | `security.vulnerability.scan` | `vuln_scan` | Verified | Cross-platform |
-| `security.event_log.query` | `security.event_log.query` | `event_logs` | Verified | Likely journald/syslog abstraction |
-| `security.ioc.check` | `security.ioc.check` | future IOC subsystem | Planned | Roadmap issue exists |
-| `security.certificate.inventory` | `security.certificate.inventory` | future certificate plugin | Planned | Roadmap issue exists |
-| `trigger.interval` | `trigger.interval` | trigger framework | Planned | Not implemented |
-| `trigger.filesystem_change` | `trigger.filesystem_change` | filesystem watcher | Planned | Not implemented |
-| `trigger.service_change` | `trigger.service_change` | service watcher | Planned | Not implemented |
-| `trigger.agent_startup` | `trigger.agent_startup` | agent lifecycle hook | Planned | Not implemented |
-| `policy.check` | `policy.check` | policy engine | Planned | Not implemented |
-| `policy.fix` | `policy.fix` | policy engine | Planned | Not implemented |
-| `policy.evaluate` | `policy.evaluate` | policy engine | Planned | Not implemented |
-| `approval.submit` | `approval.submit` | instruction approval workflow | Planned | Roadmap issue exists |
-| `response.persist` | `response.persist` | SQLite response store | Planned | Roadmap issue exists |
-| `response.aggregate` | `response.aggregate` | aggregation engine | Planned | Roadmap issue exists |
-| `response.export` | `response.export` | CSV/JSON export | Planned | Roadmap issue exists |
+### 8.1 Current State: Scope DSL
 
-### 10.1 Recommended Linux native adapters behind builtins
+The scope engine (`server/core/src/scope_engine.cpp`, 494 LOC) implements a recursive-descent parser for device targeting expressions.
 
-- systemd / D-Bus
-- inotify
-- procfs / sysfs
-- journald / syslog
-- package managers (`apt`, `dnf`, `yum`, `zypper`, etc.)
-- nftables / iptables or higher-level firewall APIs
-- POSIX account / group management surfaces
-- certificate store / OpenSSL / distro CA tooling as needed
+**Grammar:**
+```
+expr       ::= or_expr
+or_expr    ::= and_expr ('OR' and_expr)*
+and_expr   ::= not_expr ('AND' not_expr)*
+not_expr   ::= 'NOT' not_expr | primary
+primary    ::= '(' expr ')' | condition
+condition  ::= IDENT op value
+op         ::= '==' | '!=' | 'LIKE' | '<' | '>' | '<=' | '>=' | 'IN' | 'CONTAINS'
+value      ::= QUOTED_STRING | '(' value_list ')' | IDENT
+value_list ::= value (',' value)*
+```
+
+**Examples:**
+```
+ostype == "windows" AND tag:env == "production"
+hostname LIKE "web-*" OR hostname LIKE "api-*"
+arch IN ("x86_64", "aarch64") AND NOT tag:quarantined == "true"
+agent_version >= "0.9.0"
+```
+
+**Features:**
+- Case-insensitive keyword matching (AND, OR, NOT, LIKE, IN, CONTAINS)
+- Wildcard LIKE with `*` and `?` globbing
+- Numeric comparison with `std::from_chars` fallback to `std::stod` (Apple libc++ compat)
+- Case-insensitive substring search via CONTAINS
+- Max nesting depth of 10
+- `AttributeResolver` callback decouples parsing from data access
+
+### 8.2 Planned Extensions to Scope DSL
+
+These extensions keep the current parser and add operators as needed:
+
+| Extension | Syntax | Use Case |
+|---|---|---|
+| `MATCHES` | `hostname MATCHES "^web-\\d+$"` | Regex matching for complex patterns |
+| `EXISTS` | `EXISTS tag:env` | Tag presence check (no value comparison) |
+| `len()` | `len(tag:name) > 5` | String length for validation |
+| `startswith()` | `startswith(hostname, "web-")` | Prefix check (more readable than LIKE) |
+
+Implementation: add new `TokenType` variants and `CompOp` cases. The parser architecture (tokenizer → recursive descent → AST → evaluator) supports these without structural changes.
+
+### 8.3 CEL Adoption Path (Phase 5)
+
+**Decision:** Adopt [Common Expression Language (CEL)](https://github.com/google/cel-spec) for typed policy evaluation expressions in Phase 5. Do not use CEL for device targeting (the scope DSL is simpler and sufficient).
+
+**Rationale:**
+- abseil is already a transitive dependency via gRPC → cel-cpp is a natural addition
+- Policy compliance expressions need typed evaluation (bool, int, string, timestamp comparisons on structured result data)
+- CEL is sandboxed, deterministic, and designed for exactly this use case
+- The scope DSL cannot evaluate typed result data — it only handles string attribute comparisons
+
+**Where CEL applies:**
+- `spec.compliance.expression` in PolicyFragments
+- `spec.fix.when` conditional expressions
+- `spec.rollout.condition` for staged rollouts
+
+**Where the scope DSL stays:**
+- All device targeting (`spec.scope.selector`)
+- `ScopeEngine` evaluation in dispatch path
+- Dashboard filter expressions
 
 ---
 
-## 11. macOS builtin mapping
+## 9. Error Model and Partial Failure
 
-| Primitive | Yuzu builtin | Backing plugin / adapter | Status | Notes |
-|---|---|---|---|---|
-| `system.info` | `system.info` | `os_info` | Verified | Cross-platform |
-| `system.status` | `system.status` | `status` | Verified | Cross-platform |
-| `device.identity` | `device.identity` | `device_identity` | Verified | Cross-platform |
-| `hardware.inventory` | `hardware.inventory` | `hardware` | Verified | Cross-platform |
-| `process.list` | `process.list` | `processes`, `procfetch` | Verified | Cross-platform |
-| `process.kill` | `process.kill` | `processes` | Verified | Cross-platform |
-| `process.start` | `process.start` | `script_exec` / future process adapter | Proposed | Same rationale as other OSes |
-| `service.list` | `service.list` | `services` | Verified | Should abstract launchd/service concepts |
-| `service.inspect` | `service.inspect` | `services` | Proposed | Natural wrapper |
-| `service.start` | `service.start` | `services` | Verified | Supported |
-| `service.stop` | `service.stop` | `services` | Verified | Supported |
-| `service.restart` | `service.restart` | `services` | Verified | Supported |
-| `user.logged_on` | `user.logged_on` | `users` | Verified | Cross-platform |
-| `user.group_membership` | `user.group_membership` | future users/groups plugin | Planned | Roadmap issue exists |
-| `network.config.get` | `network.config.get` | `network_config` | Verified | Cross-platform |
-| `network.connection.list` | `network.connection.list` | `netstat` | Verified | Cross-platform |
-| `network.socket.owner` | `network.socket.owner` | `sockwho` | Verified | Cross-platform |
-| `network.diagnostics.run` | `network.diagnostics.run` | `network_diag` | Verified | Cross-platform |
-| `network.adapter.enable` | `network.adapter.enable` | `network_actions` | Verified | Cross-platform |
-| `network.adapter.disable` | `network.adapter.disable` | `network_actions` | Verified | Cross-platform |
-| `software.inventory` | `software.inventory` | `installed_apps` | Verified | Cross-platform |
-| `software.package.inventory` | `software.package.inventory` | pkg/app bundle adapter | Proposed | Desirable explicit builtin |
-| `software.uninstall` | `software.uninstall` | `software_actions` | Verified | Cross-platform uninstall surface |
-| `software.install` | `software.install` | staged pkg execution | Planned | Needs content staging |
-| `software.update` | `software.update` | pkg / softwareupdate adapter | Proposed | High-value explicit builtin |
-| `file.list` | `file.list` | `filesystem` | Verified | Cross-platform |
-| `file.search` | `file.search` | `filesystem` | Verified | Cross-platform |
-| `file.read` | `file.read` | `filesystem` | Verified | Basic read |
-| `file.write` | `file.write` | future filesystem advanced ops | Planned | Roadmap issue exists |
-| `file.hash` | `file.hash` | `filesystem` | Verified | Supported |
-| `file.delete` | `file.delete` | `filesystem` | Verified | Supported |
-| `file.exists` | `file.exists` | `filesystem` | Verified | Supported |
-| `file.permissions.inspect` | `file.permissions.inspect` | ACL / stat adapter | Planned | Not yet implemented |
-| `file.signature.verify` | `file.signature.verify` | codesign verification adapter | Planned | Not yet implemented |
-| `file.temp.create` | `file.temp.create` | secure temp-file helper | Planned | Foundation gap |
-| `content.download` | `content.download` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.upload` | `content.upload` | agent HTTP transfer | Planned | Roadmap issue exists |
-| `content.stage` | `content.stage` | content staging subsystem | Planned | Roadmap issue exists |
-| `content.execute` | `content.execute` | `script_exec` + staging | Planned | Roadmap issue exists |
-| `security.antivirus.status` | `security.antivirus.status` | `antivirus` | Verified | Cross-platform |
-| `security.firewall.status` | `security.firewall.status` | `firewall` | Verified | Cross-platform |
-| `security.firewall.rules.list` | `security.firewall.rules.list` | `firewall` | Verified | Cross-platform surface |
-| `security.disk_encryption.status` | `security.disk_encryption.status` | FileVault adapter | Proposed | Capability map says macOS encryption coverage absent today |
-| `security.vulnerability.scan` | `security.vulnerability.scan` | `vuln_scan` | Verified | Cross-platform |
-| `security.event_log.query` | `security.event_log.query` | `event_logs` | Verified | macOS logging abstraction |
-| `security.certificate.inventory` | `security.certificate.inventory` | future certificate plugin | Planned | Roadmap issue exists |
-| `trigger.interval` | `trigger.interval` | trigger framework | Planned | Not implemented |
-| `trigger.filesystem_change` | `trigger.filesystem_change` | filesystem watcher | Planned | Not implemented |
-| `trigger.service_change` | `trigger.service_change` | launchd/service watcher | Planned | Not implemented |
-| `trigger.agent_startup` | `trigger.agent_startup` | agent lifecycle hook | Planned | Not implemented |
-| `policy.check` | `policy.check` | policy engine | Planned | Not implemented |
-| `policy.fix` | `policy.fix` | policy engine | Planned | Not implemented |
-| `policy.evaluate` | `policy.evaluate` | policy engine | Planned | Not implemented |
-| `approval.submit` | `approval.submit` | instruction approval workflow | Planned | Roadmap issue exists |
-| `response.persist` | `response.persist` | SQLite response store | Planned | Roadmap issue exists |
-| `response.aggregate` | `response.aggregate` | aggregation engine | Planned | Roadmap issue exists |
-| `response.export` | `response.export` | CSV/JSON export | Planned | Roadmap issue exists |
+### 9.1 Error Code Taxonomy
 
-### 11.1 Recommended macOS native adapters behind builtins
+Errors are categorized into four domains with non-overlapping numeric ranges:
 
-- launchd
-- FSEvents
-- unified logging
-- system profiler / package inventory surfaces
-- `softwareupdate` / package installation surfaces
-- `codesign` / notarization verification surfaces
-- FileVault status interfaces
-- user notification frameworks
+#### 1xxx — Plugin Errors
 
----
+| Code | Name | Description | Retry |
+|---|---|---|---|
+| 1001 | `PLUGIN_ACTION_NOT_FOUND` | Plugin does not support the requested action | Never |
+| 1002 | `PLUGIN_PARAM_INVALID` | Parameter validation failed | Never |
+| 1003 | `PLUGIN_PERMISSION_DENIED` | OS-level permission denied (e.g., non-admin) | Never |
+| 1004 | `PLUGIN_RESOURCE_MISSING` | Target resource does not exist (service, file, etc.) | Never |
+| 1005 | `PLUGIN_OPERATION_FAILED` | Action executed but failed (non-zero exit, exception) | Transient: yes; Deterministic: no |
+| 1006 | `PLUGIN_CRASH` | Plugin segfaulted or threw unhandled exception | Never |
+| 1007 | `PLUGIN_TIMEOUT` | Plugin did not complete within gather TTL | Yes (once) |
 
-## 12. Recommended builtin surface for content authors
+#### 2xxx — Transport Errors
 
-These are the names content authors should see, regardless of OS:
+| Code | Name | Description | Retry |
+|---|---|---|---|
+| 2001 | `TRANSPORT_DISCONNECTED` | Agent lost connection during execution | Always |
+| 2002 | `TRANSPORT_STREAM_ERROR` | gRPC stream broken mid-response | Always |
+| 2003 | `TRANSPORT_RESPONSE_TOO_LARGE` | Response exceeds max message size | Never |
 
-### 12.1 Core action builtins
+#### 3xxx — Orchestration Errors
 
-- `system.info`
-- `hardware.inventory`
-- `process.list`
-- `process.kill`
-- `service.inspect`
-- `service.restart`
-- `software.inventory`
-- `software.uninstall`
-- `patch.inventory`
-- `file.exists`
-- `file.hash`
-- `security.firewall.status`
-- `security.disk_encryption.status`
-- `security.vulnerability.scan`
+| Code | Name | Description | Retry |
+|---|---|---|---|
+| 3001 | `ORCH_EXPIRED` | Instruction passed its `expires_at` before dispatch | Never |
+| 3002 | `ORCH_AGENT_MISSING` | Target agent not connected at dispatch time | Yes (on reconnect) |
+| 3003 | `ORCH_CONCURRENCY_LIMIT` | Concurrency mode blocked execution | Yes (after slot frees) |
+| 3004 | `ORCH_APPROVAL_REQUIRED` | Execution blocked pending approval | No (awaits human) |
+| 3005 | `ORCH_CANCELLED` | Execution cancelled by operator | Never |
 
-### 12.2 Workflow builtins
+#### 4xxx — Agent Errors
 
-- `workflow.if`
-- `workflow.switch`
-- `workflow.foreach`
-- `workflow.parallel`
-- `workflow.retry`
-- `workflow.assert`
-- `result.filter`
-- `result.join`
-- `result.group_by`
-- `response.aggregate`
+| Code | Name | Description | Retry |
+|---|---|---|---|
+| 4001 | `AGENT_PLUGIN_NOT_LOADED` | Required plugin not available on agent | Never |
+| 4002 | `AGENT_SHUTTING_DOWN` | Agent is in shutdown sequence | Yes (on reconnect) |
+| 4003 | `AGENT_VERSION_INCOMPATIBLE` | Agent version below `minAgentVersion` | Never |
 
-### 12.3 Governance builtins
+### 9.2 Retry Semantics
 
-- `scope.estimate_targets`
-- `approval.submit`
-- `audit.emit`
-- `response.persist`
-- `policy.evaluate`
-- `policy.recheck`
+| Category | Default Retry | Max Attempts | Backoff |
+|---|---|---|---|
+| Transport (2xxx) | Always | 3 | Exponential (1s, 2s, 4s) |
+| Transient plugin (1005, 1007) | If `retryable: true` in definition | 2 | Linear (5s) |
+| Deterministic plugin (1001-1004, 1006) | Never | 0 | — |
+| Agent (4001-4003) | Never (except 4002 on reconnect) | 1 | — |
+| Orchestration (3001-3005) | Per-code as noted | — | — |
 
-### 12.4 Trigger builtins
+### 9.3 Partial Failure
 
-- `trigger.interval`
-- `trigger.filesystem_change`
-- `trigger.service_change`
-- `trigger.windows_event_log`
-- `trigger.agent_startup`
+Each InstructionDefinition can specify:
+
+```yaml
+spec:
+  execution:
+    minSuccessPercent: 100    # default: all agents must succeed
+    # or: 0 = best-effort, 80 = at least 80% must succeed
+```
+
+**Aggregate status computation:**
+
+| Condition | Status |
+|---|---|
+| All agents succeeded | `succeeded` |
+| ≥ minSuccessPercent succeeded | `completed` |
+| < minSuccessPercent succeeded, all responded | `failed` |
+| Some agents haven't responded, TTL not expired | `running` |
+| TTL expired, some agents never responded | `timed_out` |
+| Operator cancelled | `cancelled` |
+| Mixed success/failure within threshold | `partial` |
+
+Per-agent tracking uses the `AgentExecStatus` struct already defined in `execution_tracker.hpp`:
+```cpp
+struct AgentExecStatus {
+    std::string agent_id;
+    std::string status;          // dispatched, running, success, failure, timeout, rejected
+    int64_t     dispatched_at;
+    int64_t     first_response_at;
+    int64_t     completed_at;
+    int         exit_code;
+    std::string error_detail;    // structured error code + message
+};
+```
 
 ---
 
-## 13. Data model and result-shaping recommendations
+## 10. Concurrency Model
 
-Because the capability map notes that plugin output is currently pipe-delimited, Yuzu should define a canonical structured result format before building a full instruction ecosystem.
+Five concurrency modes control parallel execution. The default (`per-device`) requires zero server coordination and scales to any fleet size.
 
-### 13.1 Proposed canonical result envelope
+### 10.1 Modes
+
+| Mode | Enforcement | Scope | Use Case |
+|---|---|---|---|
+| `per-device` | Agent-side | One execution of this definition per device at a time | Default. Prevents conflicting ops on same device. |
+| `per-definition` | Server-side | One fleet-wide execution of this definition at a time | Dangerous global operations (schema migration, bulk delete). |
+| `per-set` | Agent-side | One execution of any definition in this set per device | Set-level mutual exclusion (e.g., all patch operations). |
+| `global:<N>` | Server-side | At most N concurrent executions fleet-wide | Patch rollouts, license-limited operations. Server maintains semaphore in SQLite. |
+| `unlimited` | None | No limits | Read-only queries, diagnostic gathering. |
+
+### 10.2 Implementation
+
+**Agent-side (`per-device`, `per-set`):** Agent maintains an in-memory `std::unordered_set` of active definition IDs (or set IDs). On `CommandRequest` arrival, check the set; if occupied, return `REJECTED` with error code `3003`. No server round-trip, no coordination overhead.
+
+**Server-side (`per-definition`, `global:<N>`):** Server checks a `concurrency_locks` SQLite table before dispatch. If the lock is held, the execution enters a wait queue. Lock is released when execution completes or times out.
+
+**Configuration in YAML:**
+```yaml
+spec:
+  execution:
+    concurrency: per-device          # default
+    # concurrency: global:50         # at most 50 concurrent across fleet
+    # concurrency: unlimited         # no limits
+```
+
+---
+
+## 11. YAML Authoring in Dashboard
+
+### 11.1 Storage
+
+Instruction definitions are stored in the `InstructionStore` SQLite database with:
+- `yaml_source` — `TEXT` column containing the original YAML document (source of truth)
+- Denormalized columns (`name`, `version`, `type`, `plugin`, `action`, `enabled`, etc.) parsed from YAML for efficient queries
+
+On save, the server parses `yaml_source`, validates against the JSON Schema, and populates the denormalized columns. The YAML is always preserved verbatim.
+
+### 11.2 UI Modes
+
+The instruction management page (`instruction_ui.cpp`) will offer two editing modes:
+
+**Form mode** (default for simple definitions):
+- Input fields for name, description, plugin, action, type
+- Parameter builder (add/remove parameter rows with name, type, default, validation)
+- Result column builder
+- Form submission generates YAML on the server side
+
+**YAML mode** (for power users):
+- Textarea with the full YAML document
+- Syntax highlighting via a lightweight client-side library (e.g., CodeMirror 6)
+- Server-side validation on save with error messages
+- Toggle between form and YAML mode preserves content
+
+### 11.3 Validation Pipeline
+
+```
+User input (form or YAML)
+    ↓
+YAML parse (yaml-cpp or nlohmann/json YAML mode)
+    ↓
+JSON Schema validation (nlohmann/json's json_schema_validator)
+    ↓
+Semantic validation:
+  - Plugin exists in registered plugin list
+  - Action exists in plugin's actions array
+  - Parameter types match supported set (string, bool, int32, int64, datetime, guid)
+  - Result column types match supported set
+  - Referenced InstructionSet exists (if specified)
+    ↓
+Store: YAML → yaml_source column, parsed fields → denormalized columns
+    ↓
+Audit: log "definition.create" or "definition.update" event
+```
+
+### 11.4 Import/Export
+
+**Import:** `POST /api/v1/definitions/import` accepts `multipart/form-data` with `.yaml` or `.json` files. Each file is validated through the pipeline above. Returns success/failure per file.
+
+**Export:** `GET /api/v1/definitions/{id}/export?format=yaml` returns the `yaml_source` verbatim. `format=json` returns the parsed JSON representation.
+
+**Pattern:** Follow the existing HTMX fragment pattern from `settings_ui.cpp` — form submissions use `hx-post` with `hx-swap="innerHTML"` to update a feedback div without full page reload.
+
+---
+
+## 12. File Upload
+
+### 12.1 Existing Pattern
+
+The server already handles multipart file uploads for:
+- TLS certificate PEM upload (Settings page)
+- OTA agent binary upload (Settings page)
+
+Both use cpp-httplib's built-in multipart parser via `server.Post()` with `req.get_file_value()`.
+
+### 12.2 New Upload Endpoints
+
+| Endpoint | Purpose | Max Size | Validation |
+|---|---|---|---|
+| `POST /api/v1/definitions/import` | YAML/JSON definition files | 1 MB | YAML parse + JSON Schema |
+| `POST /api/v1/packs/import` | ProductPack archives (tar.zst) | 100 MB (configurable) | Signature verify → extract → per-file SHA-256 |
+| `POST /api/v1/content/upload` | Content files for staging | 500 MB (configurable) | SHA-256 verification |
+
+### 12.3 Implementation
+
+Size limits are set per-endpoint using cpp-httplib's `set_payload_max_length`:
+
+```cpp
+// In server setup, after creating the httplib::Server:
+svr.set_payload_max_length(1 * 1024 * 1024);  // global 1MB default
+
+// Override per-route by checking Content-Length in handler:
+svr.Post("/api/v1/content/upload", [](const auto& req, auto& res) {
+    if (req.body.size() > 500 * 1024 * 1024) {
+        res.status = 413;
+        return;
+    }
+    // ... handle upload
+});
+```
+
+**Validation order:**
+1. Size check (reject before reading body if possible)
+2. Content-Type check (`multipart/form-data`)
+3. File extension check (`.yaml`, `.json`, `.tar.zst`, etc.)
+4. Parse/verify content
+5. Store to disk or database
+6. Audit log the upload event
+
+---
+
+## 13. ProductPack Trust Chain
+
+### 13.1 Algorithm Choice: Ed25519
+
+- **Fast:** ~70,000 signatures/sec on commodity hardware
+- **Small:** 32-byte keys, 64-byte signatures
+- **No padding attacks:** Unlike RSA, Ed25519 has a single valid signature per message
+- **Widely supported:** libsodium, OpenSSL 1.1.1+, BoringSSL
+
+### 13.2 Key Hierarchy
+
+```
+Org Root Key (Ed25519)
+    │
+    │  Signs pack-signing key certificates
+    │
+    ├── Pack-Signing Key A (Ed25519)
+    │       │
+    │       └── Signs pack manifests
+    │
+    └── Pack-Signing Key B (Ed25519)
+            │
+            └── Signs pack manifests (rotation)
+```
+
+**Org root key:** Generated once, stored in HSM (PKCS#11) for production or PEM file for development. Never directly signs packs. Only signs pack-signing key certificates.
+
+**Pack-signing key:** Used to sign pack manifests. Can be rotated by generating a new key and having the root key sign its certificate. Old keys are added to the revocation list.
+
+### 13.3 Pack Signing Flow
+
+```
+1. Author creates pack contents (YAML definitions, policies, etc.)
+2. Build tool generates manifest.json:
+   - SHA-256 hash of each file in the pack
+   - Pack metadata (id, version, publisher, compatibility)
+3. Sign manifest hash with pack-signing key:
+   signature = Ed25519_Sign(signing_key, SHA256(manifest.json))
+4. Bundle into tar.zst:
+   manifest.json
+   manifest.sig      (64-byte Ed25519 signature)
+   signing-key.der   (pack-signing key certificate, signed by root)
+   definitions/
+   policies/
+   triggers/
+   docs/
+```
+
+### 13.4 Import Verification Flow
+
+```
+1. Extract tar.zst to temp directory
+2. Load signing-key.der
+3. Verify signing key certificate against org root key (or trust store)
+4. Check signing key not in revocation list (JSON CRL)
+5. Load manifest.sig
+6. Verify: Ed25519_Verify(signing_key, SHA256(manifest.json), manifest.sig)
+7. For each file in manifest.json:
+   - Compute SHA-256 of extracted file
+   - Compare against manifest hash
+   - Reject on mismatch
+8. If all pass: import definitions, policies, triggers into database
+9. Audit log the import event
+```
+
+### 13.5 Key Management
+
+**Self-signing for development:**
+```bash
+yuzu-server --generate-pack-key --self-signed
+# Generates root key + signing key in server config directory
+# Dashboard shows warning banner: "Self-signed pack keys in use"
+```
+
+Controlled by server config:
+```ini
+[packs]
+require_signed = true          # reject unsigned packs
+allow_self_signed = true       # allow self-signed for dev (default: false)
+trust_store_path = /etc/yuzu/pack-trust/
+revocation_list_url = https://packs.example.com/crl.json
+```
+
+**Key rotation:**
+1. Generate new signing key
+2. Sign its certificate with root key
+3. Distribute new key to trust store
+4. Add old key fingerprint to revocation list with timestamp
+5. Packs signed with old key are still valid until revocation list is updated
+
+---
+
+## 14. Agent Compatibility and Rollback
+
+### 14.1 Per-Definition Compatibility
+
+Each InstructionDefinition declares its requirements:
+
+```yaml
+spec:
+  compatibility:
+    minAgentVersion: 0.9.0      # agent must be at least this version
+    requiredPlugins:
+      - services                 # agent must have these plugins loaded
+```
+
+**Server-side check before dispatch:**
+1. Compare agent's `agent_version` (from `RegisterRequest.AgentInfo`) against `minAgentVersion`
+2. Compare agent's `plugins[]` list against `requiredPlugins`
+3. If incompatible → skip agent, record `REJECTED(4003)` in `AgentExecStatus`
+
+### 14.2 Agent-Side Rejection
+
+If a `CommandRequest` arrives for a plugin or action the agent doesn't have, the agent returns `CommandResponse` with:
+- `status = REJECTED`
+- `error.code = "4001"` (plugin not loaded) or `"1001"` (action not found)
+
+This is already the current behavior — the instruction engine formalizes it.
+
+### 14.3 Plugin ABI Evolution
+
+The plugin ABI (`plugin.h`) uses a single `abi_version` field (currently `YUZU_PLUGIN_ABI_VERSION = 1`).
+
+**Rules:**
+- `YuzuPluginDescriptor` can only grow by appending new fields after `execute`
+- ABI version 1 plugins work with any agent that supports version 1
+- When ABI version 2 arrives, agents check `abi_version_range` (a new field) to determine compatibility
+- Plugins are never broken by agent upgrades — the agent checks `abi_version` at load time
+
+### 14.4 Mixed-Version Fleet
+
+During fleet upgrades, older agents coexist with newer agents:
+- Older agents receive ad-hoc `CommandRequest` messages (plugin + action + params) — same as today
+- Newer agents receive the same `CommandRequest` — the wire protocol doesn't change
+- InstructionDefinitions with `minAgentVersion` higher than an agent's version are simply not dispatched to that agent
+- No forced upgrades; the OTA update mechanism is opt-in per rollout configuration
+
+### 14.5 OTA Rollback
+
+The existing OTA updater (`agents/core/src/updater.cpp`) already implements:
+1. Download new binary to temp location
+2. Verify SHA-256 hash
+3. Rename current binary to `.old`
+4. Move new binary into place
+5. Signal restart
+6. On startup, verify new binary works (health check)
+7. If health check fails: rename `.old` back to current, restart
+
+No changes needed for instruction engine compatibility.
+
+---
+
+## 15. Legacy Command Shim
+
+### 15.1 Design Decision: No Separate Legacy Path
+
+Every `InstructionDefinition` execution maps 1:1 to a `CommandRequest`:
+
+```
+InstructionDefinition.spec.execution.plugin  →  CommandRequest.plugin
+InstructionDefinition.spec.execution.action  →  CommandRequest.action
+InstructionDefinition parameter values       →  CommandRequest.parameters (map<string,string>)
+```
+
+There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions with `additionalProperties: {type: string}` parameter schemas.
+
+### 15.2 Auto-Generation from Plugin Descriptors
+
+Every plugin exposes its capabilities via `YuzuPluginDescriptor`:
+- `name` — plugin identifier
+- `actions` — null-terminated array of action names
+
+A CLI tool generates stub InstructionDefinitions from plugin descriptors:
+
+```bash
+yuzu-admin generate-definitions --output definitions/
+# For each plugin:
+#   For each action:
+#     Emit a YAML InstructionDefinition with:
+#       - id: <plugin>.<action>
+#       - plugin: <plugin>
+#       - action: <action>
+#       - parameters: { additionalProperties: { type: string } }  # open schema
+#       - result: { columns: [{ name: output, type: string }] }   # raw output
+```
+
+### 15.3 Schema Inference Roadmap
+
+**ABI v1 (current):** Plugins don't declare their parameter schemas. Auto-generated definitions use open `additionalProperties`.
+
+**ABI v2 (future):** Add optional `parameter_schema` and `result_schema` fields to `YuzuPluginDescriptor`. Plugins that populate these get fully typed auto-generated definitions. Plugins that don't still get open-schema stubs.
+
+### 15.4 Migration Path
+
+1. **Today:** All commands are ad-hoc (`plugin + action + params`). Works unchanged.
+2. **Phase B:** InstructionDefinition CRUD added. Ad-hoc commands continue to work via auto-generated "untyped" definitions.
+3. **Over time:** Authors create typed definitions with parameter schemas and result columns. Typed definitions gradually replace untyped stubs.
+4. **No breaking change:** The `CommandRequest` wire protocol never changes. The agent doesn't know or care whether the command came from a typed definition or an ad-hoc dispatch.
+
+---
+
+## 16. `service.set_start_mode`
+
+### 16.1 Semantics
+
+Change the startup type of a system service.
+
+**Parameters:**
+
+```yaml
+parameters:
+  type: object
+  required:
+    - serviceName
+    - mode
+  properties:
+    serviceName:
+      type: string
+      description: Name of the service (e.g., "Spooler", "sshd", "com.apple.ftp-proxy")
+    mode:
+      type: string
+      enum:
+        - automatic
+        - manual
+        - disabled
+        - masked
+      description: |
+        Target startup mode. "masked" is Linux-only; maps to "disabled" on other platforms.
+```
+
+### 16.2 Platform Implementation
+
+**Windows:**
+```cpp
+// ChangeServiceConfigW(hService, SERVICE_NO_CHANGE, startType, ...)
+// automatic → SERVICE_AUTO_START
+// manual    → SERVICE_DEMAND_START
+// disabled  → SERVICE_DISABLED
+// masked    → SERVICE_DISABLED (with warning: "masked not supported on Windows")
+```
+
+**Linux (systemd):**
+```bash
+# automatic → systemctl enable <service>
+# manual    → systemctl disable <service>  (still startable manually)
+# disabled  → systemctl disable <service>
+# masked    → systemctl mask <service>     (prevents any start, even manual)
+```
+
+**macOS:**
+```bash
+# automatic → launchctl enable system/<service>  (or set Disabled=false in plist)
+# manual    → launchctl disable system/<service>
+# disabled  → launchctl disable system/<service>
+# masked    → disabled (with warning: "masked not supported on macOS")
+```
+
+### 16.3 Return Schema
+
+```yaml
+result:
+  columns:
+    - name: serviceName
+      type: string
+    - name: previousMode
+      type: string
+    - name: newMode
+      type: string
+    - name: effectiveMode
+      type: string
+    - name: warning
+      type: string
+```
+
+`effectiveMode` may differ from `newMode` if the requested mode isn't supported (e.g., `masked` on Windows returns `effectiveMode: disabled`).
+
+---
+
+## 17. Scale Design
+
+### 17.1 Target: 100K Agents
+
+**Gateway batching:** 10-50 gateway nodes, each handling 2K-10K agent connections. Gateways proxy `Register`, batch `Heartbeat` messages (reducing per-agent RPC overhead), and forward `Subscribe` streams. Defined in `proto/yuzu/gateway/v1/gateway.proto` (GatewayUpstream service).
+
+**Connection state:** In-memory on each gateway. Gateways report stream status to the upstream server. Server maintains a `connected_agents` table with gateway_id, last_heartbeat, and connection quality.
+
+### 17.2 Sub-Second Dispatch
+
+**Scope evaluation:** The scope engine evaluates expressions against all agents in memory. Complexity is O(A × E) where A = agent count and E = expression complexity.
+
+| Fleet Size | Expression Nodes | Estimated Eval Time |
+|---|---|---|
+| 10K agents | 5 | ~10 ms |
+| 100K agents | 5 | ~100 ms |
+| 100K agents | 20 | ~400 ms |
+
+Acceptable for interactive use. For very large fleets, scope results can be cached (expressions are deterministic for a given agent attribute snapshot).
+
+**gRPC dispatch:** Non-blocking writes to agent streams. The server iterates matched agents and enqueues `CommandRequest` messages. With 100K matches, this takes ~50ms (gRPC protobuf serialization is fast).
+
+### 17.3 Response Storage at Scale
+
+**SQLite WAL mode:** Concurrent reads don't block writes. Batch inserts (100 rows per transaction) sustain ~50K inserts/sec on commodity hardware.
+
+**Retention:** TTL-based cleanup runs on a background thread (configurable interval, default 60 min). Expired rows are deleted in batches to avoid long transactions.
+
+**Optional ClickHouse export:** For analytics workloads beyond what SQLite supports, responses can be forwarded to ClickHouse via:
+- Direct INSERT over HTTP (server-side batch job)
+- Prometheus remote_write (for metrics)
+- Kafka intermediate topic (for high-volume environments)
+
+SQLite remains the primary store; ClickHouse is an optional analytics sink.
+
+### 17.4 Definition and Policy Caching
+
+**Definitions:** Read-heavy, write-rare. Server maintains an in-memory LRU cache of parsed InstructionDefinitions. Cache invalidated on create/update/delete. With thousands of definitions, the cache uses ~10-50 MB.
+
+**Policies:** Compiled policy documents are hashed and pushed to agents. Agents cache the policy locally. Re-download only when the server's policy hash changes (checked on heartbeat).
+
+### 17.5 Policy Evaluation Distribution
+
+Policy rules evaluate **agent-side** (distributed across the fleet). The server does not evaluate policies — it only collects compliance status in batches. This means:
+- Policy evaluation scales linearly with fleet size (no server bottleneck)
+- Compliance status is eventually consistent (agents report on trigger/interval)
+- Server aggregates compliance summaries for dashboard display
+
+---
+
+## 18. Data Model and Result Shaping
+
+### 18.1 Canonical Result Envelope
+
+Every instruction execution produces results in this structured format:
 
 ```yaml
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionResult
 metadata:
-  instructionRunId: irun_01J...
-  instructionDefinitionId: windows.service.inspect
+  executionId: exec_01J...
+  definitionId: crossplatform.service.inspect
   agentId: 28d5...
-  deviceId: 28d5...
-  timestamp: 2026-03-16T18:20:00Z
+  timestamp: 2026-03-17T18:20:00Z
 spec:
-  status: success        # success | failure | partial | timeout | cancelled
+  status: success        # success | failure | partial | timeout | cancelled | rejected
+  errorCode: null        # error code from taxonomy (Section 9) if status != success
   durationMs: 182
   columns:
     - name: serviceName
@@ -979,152 +1287,167 @@ spec:
       type: string
     - name: startupType
       type: string
+    - name: pid
+      type: int32
   rows:
     - serviceName: Spooler
       state: running
       startupType: automatic
+      pid: 4592
   diagnostics:
     stdout: ""
     stderr: ""
     warnings: []
 ```
 
-### 13.2 Why this matters
+### 18.2 Why This Matters
 
-Without a typed result envelope, the following become fragile:
+Without a typed result envelope:
+- **Workflow chaining** breaks — downstream definitions can't reference upstream output fields
+- **Filtering and pagination** are unreliable — column types affect sort order and comparison
+- **Aggregate views** are impossible — you can't `COUNT` or `GROUP BY` untyped strings
+- **Policy evaluation** can't compare values — `result.state == "running"` requires knowing `state` is a string
+- **Data export** loses fidelity — CSV/JSON export needs column types for formatting
+- **Pack portability** suffers — definitions can't declare their output contract
 
-- workflow chaining,
-- filtering and pagination,
-- aggregate progress views,
-- policy evaluation,
-- data export,
-- pack portability,
-- dashboard composition.
+### 18.3 Supported Column Types
 
----
-
-## 14. Recommended implementation order
-
-### Phase A â make responses first-class
-
-1. Server-side response persistence  
-2. Filtering, pagination, sorting  
-3. Aggregation engine  
-4. Canonical structured result envelope  
-5. CSV/JSON export
-
-### Phase B â build the instruction plane
-
-6. InstructionDefinition store  
-7. InstructionSet model  
-8. Parameter schemas  
-9. Result schemas  
-10. Signing/versioning  
-11. Target estimation
-
-### Phase C â add governed execution
-
-12. Scheduling  
-13. Approval workflows  
-14. Progress/statistics  
-15. Rerun/cancel semantics  
-16. Audit trail
-
-### Phase D â add policy and triggers
-
-17. Trigger framework  
-18. PolicyFragments  
-19. Policy assignment  
-20. Compliance views  
-21. Suppression/exemption model  
-22. Re-evaluation controls
-
-### Phase E â add distribution
-
-23. ProductPack format  
-24. Signatures/checksums  
-25. Import/export workflow  
-26. Dependency resolution  
-27. Staged rollout and pack promotion
+| Type | Wire Format | SQLite Type | ClickHouse Type | Notes |
+|---|---|---|---|---|
+| `bool` | `"true"` / `"false"` | INTEGER (0/1) | UInt8 | |
+| `int32` | Decimal string | INTEGER | Int32 | |
+| `int64` | Decimal string | INTEGER | Int64 | |
+| `string` | UTF-8 | TEXT | String | |
+| `datetime` | ISO 8601 | TEXT | DateTime64 | |
+| `guid` | UUID string | TEXT | UUID | |
+| `clob` | UTF-8 | TEXT | String | Large text, configurable truncation |
 
 ---
 
-## 15. Concrete design judgments
+## 19. Implementation Order
 
-### 15.1 What Yuzu should expose
+Updated to reflect current state (Phase 0 and 1 complete, Phase 2 scaffolded).
+
+### Phase A — Response Integration (remaining Phase 1 work) :white_check_mark: Complete
+
+1. ~~Wire `ResponseStore` into command dispatch path~~ — done
+2. ~~Implement structured result envelope parsing~~ — done
+3. ~~Response search HTTP endpoint~~ — done (`GET /api/responses/{id}` with query params)
+4. ~~CSV/JSON export endpoints~~ — done (`GET /api/responses/{id}/export?format=csv|json`, `POST /api/export/json-to-csv`)
+5. ~~Response aggregation engine~~ — done (`GET /api/responses/{id}/aggregate` with GROUP BY + count/sum/avg/min/max)
+
+### Phase B — Instruction Plane (Phase 2 core)
+
+6. `InstructionStore` business logic — CRUD with YAML source storage
+7. Parameter schema validation (JSON Schema via nlohmann-json)
+8. Result schema declaration and typed storage
+9. Legacy command shim — auto-generate definitions from plugin descriptors
+10. YAML authoring UI in dashboard (form mode + YAML mode)
+11. Import/export endpoints (`/api/v1/definitions/import`, `/api/v1/definitions/{id}/export`)
+
+### Phase C — Governed Execution
+
+12. `ScheduleEngine` business logic — cron evaluation, scope-based dispatch
+13. `ApprovalManager` business logic — submit/approve/reject with ownership rules
+14. `ExecutionTracker` business logic — progress tracking, aggregate status computation
+15. Rerun/cancel — clone completed executions, send cancel to agents
+16. Concurrency enforcement — agent-side per-device/per-set, server-side per-definition/global
+
+### Phase D — Policy and Triggers (Phases 4-5)
+
+17. Agent-side trigger framework (interval, file, service, event_log, registry, startup)
+18. PolicyFragment CRUD — check/fix/postcheck references, compliance expressions
+19. Policy assignment to management groups
+20. Agent-side policy evaluation — trigger fire → check → fix → postcheck → report
+21. CEL adoption for typed compliance expressions
+22. Compliance dashboard — fleet posture, per-rule drill-down
+
+### Phase E — Distribution (Phase 7)
+
+23. ProductPack format — tar.zst with manifest.json
+24. Ed25519 signing — key generation, manifest signing, verification
+25. Trust chain — root key, signing key certificates, revocation list
+26. Import/export workflow — upload, verify, extract, store
+27. Dependency resolution — required plugins, required packs, version constraints
+
+---
+
+## 20. Design Judgments and Source Notes
+
+### 20.1 What Yuzu Exposes to Content Authors
 
 Expose:
+- Stable builtin primitives (Section 7)
+- Typed parameter and result schemas
+- Result-shaping operators (filter, group, sort, aggregate)
+- Trigger templates
+- Governance primitives (scope, approval, audit)
+- Content-pack metadata and distribution
 
-- stable builtins,
-- typed schemas,
-- result-shaping operators,
-- trigger templates,
-- governance primitives,
-- content-pack metadata.
+### 20.2 What Yuzu Does NOT Expose to Content Authors
 
-### 15.2 What Yuzu should not expose directly
+Do not expose directly:
+- Win32 / SCM / Registry / WMI syscalls
+- Linux `ioctl` / `procfs` / `dbus-send` internals
+- macOS FSEvents / launchd / codesign invocation details
+- Arbitrary shell text as the primary authoring model
 
-Do **not** expose directly to content authors:
+These remain internal adapters behind stable builtins. Content authors target `service.restart`, not `systemctl restart` or `Restart-Service`.
 
-- Win32/SCM/Registry/WMI syscalls,
-- Linux `ioctl` / `procfs` / `dbus-send` level details,
-- macOS FSEvents / launchd / codesign invocation details,
-- arbitrary shell text as the primary authoring model.
+### 20.3 Permission Boundary
 
-Those should remain internal adapters behind stable builtins.
+**InstructionSet** is the primary operational permission boundary:
+- Users execute definitions within sets
+- Authors publish to sets
+- Approvers approve set-governed actions
+- Packs distribute sets as units of capability
 
-### 15.3 What the principal permission boundary should be
+This is cleaner than per-plugin ACLs. The RBAC system (Phase 3) will bind `Principal + Role + SecurableType(InstructionSet) + Operation(Execute|Author|Approve)`.
 
-Use **InstructionSet** as the main operational permission boundary:
+### 20.4 Minimal Viable Content Plane
 
-- users execute sets or definitions within sets,
-- authors publish to sets,
-- approvers approve set-governed actions,
-- packs distribute sets as units of capability.
+A pragmatic MVP includes only:
+- `InstructionDefinition` CRUD with YAML storage
+- `InstructionSet` grouping
+- Structured result envelope
+- Response persistence (already done)
+- Legacy command shim (auto-generated definitions)
+- YAML authoring UI
 
-This is cleaner than per-plugin ACLs as the user-facing governance model.
+This is enough to move Yuzu from "plugin executor" to "governed endpoint instruction platform". Scheduling, approvals, policies, and packs are additive — they build on the same definition model without changing the execution semantics.
 
----
+### 20.5 Key Architectural Decisions Summary
 
-## 16. Minimal viable v1 content plane
+| Decision | Choice | Rationale |
+|---|---|---|
+| Expression language | Extend scope DSL now; CEL for policy in Phase 5 | Current 494-LOC engine is clean and sufficient for device targeting; CEL justified only for typed policy evaluation |
+| Error codes | 4-category 1xxx-4xxx taxonomy | Clear domain separation; non-overlapping ranges; retry semantics per category |
+| Partial failure | Configurable `minSuccessPercent`, default 100% | Supports "all must succeed" (compliance) and "best effort" (diagnostics) |
+| YAML storage | SQLite TEXT + denormalized columns | Single source of truth; queryable without re-parsing |
+| Concurrency default | `per-device` (agent-enforced) | Zero server overhead at any fleet size |
+| Pack signing | Ed25519, 3-level key hierarchy | Fast, small signatures; no padding attacks; HSM-compatible |
+| Agent compat | `minAgentVersion` per definition, graceful REJECTED | No forced upgrades; mixed-version fleet support |
+| Legacy shim | Every definition maps 1:1 to CommandRequest | No separate path; seamless migration from ad-hoc to governed |
 
-A pragmatic MVP would include only:
+### 20.6 Source References
 
-- `InstructionDefinition`
-- `InstructionSet`
-- `PolicyFragment`
-- `Policy`
-- `TriggerTemplate`
-- `ProductPack`
-- structured result envelope
-- response store
-- scheduling
-- approval workflow
+This document is grounded in the following implementation files:
 
-That is enough to move Yuzu from âplugin executorâ to âgoverned endpoint instruction platformâ.
-
----
-
-## 17. Final recommendation
-
-The repository now clearly points toward the correct product destination, but most of that destination is still roadmap rather than implementation.
-
-The right move is therefore:
-
-- **freeze a stable builtin surface**,
-- **build the content plane above it**,
-- **keep OS-specific complexity inside adapters/plugins**,
-- **ship signed packs of definitions and policies rather than more bespoke plugin logic**.
-
-That is the path that best matches Yuzuâs stated architecture, current plugin substrate, and future ambition.
-
----
-
-## 18. Source notes
-
-This design note was grounded in the following public sources from the Yuzu `dev` branch:
-
-1. Repository README / architecture and positioning
-2. `docs/capability-map.md`
-3. `docs/roadmap.md`
-4. `sdk/include/yuzu/plugin.h`
+| File | Role |
+|---|---|
+| `server/core/src/scope_engine.cpp` (494 LOC) | Expression language implementation |
+| `server/core/src/scope_engine.hpp` | Expression AST types, parser/evaluator API |
+| `server/core/src/instruction_store.hpp` | InstructionDefinition, InstructionSet structs |
+| `server/core/src/execution_tracker.hpp` | Execution, AgentExecStatus, ExecutionSummary structs |
+| `server/core/src/approval_manager.hpp` | Approval struct, ApprovalManager API |
+| `server/core/src/schedule_engine.hpp` | InstructionSchedule struct, ScheduleEngine API |
+| `server/core/src/response_store.hpp` | StoredResponse struct, ResponseStore API |
+| `server/core/src/audit_store.hpp` | AuditEvent struct, AuditStore API |
+| `server/core/src/tag_store.hpp` | DeviceTag struct, TagStore API |
+| `server/core/src/instruction_ui.cpp` | HTMX instruction management page |
+| `server/core/src/settings_ui.cpp` | File upload UI pattern (TLS certs, OTA binaries) |
+| `sdk/include/yuzu/plugin.h` | Plugin ABI v1, command handler signature |
+| `proto/yuzu/agent/v1/agent.proto` | CommandRequest/Response, RegisterRequest, AgentInfo |
+| `proto/yuzu/common/v1/common.proto` | ScopeExpression, ErrorDetail, Platform, PluginInfo |
+| `docs/capability-map.md` | 139 capabilities, 30 done (22%) |
+| `docs/roadmap.md` | 56 issues across 7 phases |

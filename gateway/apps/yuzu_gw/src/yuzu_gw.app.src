@@ -13,6 +13,7 @@
         kernel,
         stdlib,
         sasl,
+        inets,
         grpcbox,
         telemetry,
         prometheus

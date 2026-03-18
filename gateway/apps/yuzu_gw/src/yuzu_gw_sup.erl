@@ -11,7 +11,7 @@
 -module(yuzu_gw_sup).
 -behaviour(supervisor).
 
--export([start_link/0]).
+-export([start_link/0, start_pg/0]).
 -export([init/1]).
 
 -define(SERVER, ?MODULE).
@@ -22,6 +22,14 @@
 
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+
+%% @doc Start the pg scope, tolerating already-started.
+start_pg() ->
+    case pg:start_link(yuzu_gw) of
+        {ok, Pid}                       -> {ok, Pid};
+        {error, {already_started, Pid}} -> link(Pid), {ok, Pid};
+        Error                           -> Error
+    end.
 
 %%--------------------------------------------------------------------
 %% supervisor callback
@@ -35,6 +43,12 @@ init([]) ->
     },
 
     Children = [
+        #{id       => pg_scope,
+          start    => {yuzu_gw_sup, start_pg, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
         #{id       => yuzu_gw_registry,
           start    => {yuzu_gw_registry, start_link, []},
           restart  => permanent,
@@ -49,6 +63,12 @@ init([]) ->
 
         #{id       => yuzu_gw_router,
           start    => {yuzu_gw_router, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        #{id       => yuzu_gw_gauge,
+          start    => {yuzu_gw_gauge, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},

@@ -16,12 +16,12 @@
 #include <array>
 #include <cstdio>
 #include <format>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 #if defined(__linux__)
 #include <fstream>
-#include <sstream>
 #include <utmp.h>
 #include <ctime>
 #include <pwd.h>

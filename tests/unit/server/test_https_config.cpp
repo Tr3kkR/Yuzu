@@ -47,15 +47,15 @@ TEST_CASE("HTTPS config: redirect disabled", "[https][config]") {
 // ── Cookie security helper ─────────────────────────────────────────────────
 
 namespace {
-    // Simulates the session_cookie_attrs helper
-    std::string session_cookie_attrs(bool https_enabled) {
-        std::string attrs = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800";
-        if (https_enabled) {
-            attrs += "; Secure";
-        }
-        return attrs;
+// Simulates the session_cookie_attrs helper
+std::string session_cookie_attrs(bool https_enabled) {
+    std::string attrs = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800";
+    if (https_enabled) {
+        attrs += "; Secure";
     }
+    return attrs;
 }
+} // namespace
 
 TEST_CASE("HTTPS cookie: no Secure flag when HTTP", "[https][cookie]") {
     auto attrs = session_cookie_attrs(false);

@@ -16,9 +16,7 @@ using namespace yuzu::scope;
 
 // ── Helper ─────────────────────────────────────────────────────────────────
 
-static AttributeResolver make_resolver(
-    const std::unordered_map<std::string, std::string>& attrs)
-{
+static AttributeResolver make_resolver(const std::unordered_map<std::string, std::string>& attrs) {
     return [&attrs](std::string_view key) -> std::string {
         auto it = attrs.find(std::string(key));
         return it != attrs.end() ? it->second : std::string{};
@@ -118,9 +116,11 @@ TEST_CASE("ScopeEngine: parse error on unmatched paren", "[scope][parser]") {
 TEST_CASE("ScopeEngine: parse error on max depth", "[scope][parser]") {
     // Build deeply nested expression
     std::string expr;
-    for (int i = 0; i < 12; ++i) expr += "(";
+    for (int i = 0; i < 12; ++i)
+        expr += "(";
     expr += R"(ostype == "Windows")";
-    for (int i = 0; i < 12; ++i) expr += ")";
+    for (int i = 0; i < 12; ++i)
+        expr += ")";
 
     auto result = parse(expr);
     REQUIRE(!result.has_value());
@@ -129,9 +129,8 @@ TEST_CASE("ScopeEngine: parse error on max depth", "[scope][parser]") {
 // ── Evaluator tests ────────────────────────────────────────────────────────
 
 TEST_CASE("ScopeEngine: eval equality match", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Windows"}, {"arch", "x86_64"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Windows"},
+                                                          {"arch", "x86_64"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype == "Windows")");
@@ -140,9 +139,7 @@ TEST_CASE("ScopeEngine: eval equality match", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval equality mismatch", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Linux"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Linux"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype == "Windows")");
@@ -151,9 +148,7 @@ TEST_CASE("ScopeEngine: eval equality mismatch", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval case insensitive", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "windows"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "windows"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype == "Windows")");
@@ -162,9 +157,8 @@ TEST_CASE("ScopeEngine: eval case insensitive", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval AND", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Windows"}, {"arch", "x86_64"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Windows"},
+                                                          {"arch", "x86_64"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype == "Windows" AND arch == "x86_64")");
@@ -177,9 +171,7 @@ TEST_CASE("ScopeEngine: eval AND", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval OR", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Linux"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Linux"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype == "Windows" OR ostype == "Linux")");
@@ -188,9 +180,7 @@ TEST_CASE("ScopeEngine: eval OR", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval NOT", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Windows"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Windows"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(NOT ostype == "Linux")");
@@ -199,9 +189,7 @@ TEST_CASE("ScopeEngine: eval NOT", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval LIKE wildcard", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"hostname", "web-prod-01"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "web-prod-01"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(hostname LIKE "web-*")");
@@ -214,26 +202,20 @@ TEST_CASE("ScopeEngine: eval LIKE wildcard", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval IN", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Linux"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"ostype", "Linux"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(ostype IN ("Windows", "Linux", "Darwin"))");
     REQUIRE(expr.has_value());
     CHECK(evaluate(*expr, resolver) == true);
 
-    std::unordered_map<std::string, std::string> attrs2 = {
-        {"ostype", "FreeBSD"}
-    };
+    std::unordered_map<std::string, std::string> attrs2 = {{"ostype", "FreeBSD"}};
     auto resolver2 = make_resolver(attrs2);
     CHECK(evaluate(*expr, resolver2) == false);
 }
 
 TEST_CASE("ScopeEngine: eval CONTAINS", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"hostname", "web-prod-01"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "web-prod-01"}};
     auto resolver = make_resolver(attrs);
 
     auto expr = parse(R"(hostname CONTAINS "prod")");
@@ -242,9 +224,7 @@ TEST_CASE("ScopeEngine: eval CONTAINS", "[scope][eval]") {
 }
 
 TEST_CASE("ScopeEngine: eval numeric comparison", "[scope][eval]") {
-    std::unordered_map<std::string, std::string> attrs = {
-        {"version", "2.5"}
-    };
+    std::unordered_map<std::string, std::string> attrs = {{"version", "2.5"}};
     auto resolver = make_resolver(attrs);
 
     auto gt = parse(R"(version > "1.0")");
@@ -266,17 +246,16 @@ TEST_CASE("ScopeEngine: parse performance", "[scope][perf]") {
     }
     auto elapsed = std::chrono::steady_clock::now() - start;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    REQUIRE(ms < 5000);  // 10k parses should take less than 5s
+    REQUIRE(ms < 5000); // 10k parses should take less than 5s
 }
 
 TEST_CASE("ScopeEngine: eval performance", "[scope][perf]") {
-    auto expr = parse(R"((ostype == "Windows" AND arch == "x86_64") OR (tag:env == "prod" AND NOT tag:locked == "true"))");
+    auto expr = parse(
+        R"((ostype == "Windows" AND arch == "x86_64") OR (tag:env == "prod" AND NOT tag:locked == "true"))");
     REQUIRE(expr.has_value());
 
     std::unordered_map<std::string, std::string> attrs = {
-        {"ostype", "Windows"}, {"arch", "x86_64"},
-        {"tag:env", "prod"}, {"tag:locked", "false"}
-    };
+        {"ostype", "Windows"}, {"arch", "x86_64"}, {"tag:env", "prod"}, {"tag:locked", "false"}};
     auto resolver = make_resolver(attrs);
 
     auto start = std::chrono::steady_clock::now();
@@ -285,5 +264,5 @@ TEST_CASE("ScopeEngine: eval performance", "[scope][perf]") {
     }
     auto elapsed = std::chrono::steady_clock::now() - start;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    REQUIRE(ms < 5000);  // 100k evals should take less than 5s
+    REQUIRE(ms < 5000); // 100k evals should take less than 5s
 }

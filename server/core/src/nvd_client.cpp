@@ -1,3 +1,9 @@
+#include "nvd_client.hpp"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -6,12 +12,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
-
-#include "nvd_client.hpp"
 
 namespace yuzu::server {
 
@@ -22,15 +22,13 @@ constexpr const char* kNvdPath = "/rest/json/cves/2.0";
 constexpr int kResultsPerPage = 2000;
 
 // Rate limit intervals
-constexpr auto kPublicInterval = std::chrono::milliseconds(6000);   // 5 req / 30s
-constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);    // 50 req / 30s
+constexpr auto kPublicInterval = std::chrono::milliseconds(6000); // 5 req / 30s
+constexpr auto kApiKeyInterval = std::chrono::milliseconds(600);  // 50 req / 30s
 
 std::string current_iso_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t_now = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  now.time_since_epoch()) %
-              1000;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
     std::tm utc_tm{};
 #ifdef _WIN32
@@ -40,8 +38,8 @@ std::string current_iso_timestamp() {
 #endif
 
     std::ostringstream oss;
-    oss << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%S")
-        << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    oss << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%S") << '.' << std::setfill('0') << std::setw(3)
+        << ms.count();
     return oss.str();
 }
 
@@ -50,18 +48,17 @@ std::string url_encode(const std::string& value) {
     escaped.fill('0');
     escaped << std::hex;
     for (char c : value) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' ||
-            c == '.' || c == '~') {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' ||
+            c == '~') {
             escaped << c;
         } else {
-            escaped << '%' << std::setw(2)
-                    << static_cast<int>(static_cast<unsigned char>(c));
+            escaped << '%' << std::setw(2) << static_cast<int>(static_cast<unsigned char>(c));
         }
     }
     return escaped.str();
 }
 
-}  // namespace
+} // namespace
 
 NvdClient::NvdClient(std::string api_key, std::string proxy_url)
     : api_key_(std::move(api_key)),
@@ -70,10 +67,13 @@ NvdClient::NvdClient(std::string api_key, std::string proxy_url)
     if (!proxy_url.empty()) {
         auto url = proxy_url;
         // Strip scheme
-        if (url.starts_with("http://"))  url = url.substr(7);
-        if (url.starts_with("https://")) url = url.substr(8);
+        if (url.starts_with("http://"))
+            url = url.substr(7);
+        if (url.starts_with("https://"))
+            url = url.substr(8);
         // Strip trailing slash
-        if (!url.empty() && url.back() == '/') url.pop_back();
+        if (!url.empty() && url.back() == '/')
+            url.pop_back();
 
         auto colon = url.rfind(':');
         if (colon != std::string::npos) {
@@ -168,8 +168,8 @@ NvdFetchResult NvdClient::fetch_modified_since(const std::string& iso_timestamp)
                                 std::make_move_iterator(page.records.begin()),
                                 std::make_move_iterator(page.records.end()));
 
-        spdlog::info("NVD fetch progress: {}/{} total results",
-                     combined.records.size(), combined.total_results);
+        spdlog::info("NVD fetch progress: {}/{} total results", combined.records.size(),
+                     combined.total_results);
 
         start_index += kResultsPerPage;
         if (start_index >= combined.total_results) {
@@ -188,8 +188,7 @@ NvdFetchResult NvdClient::fetch_by_keyword(const std::string& keyword, int start
     client.set_read_timeout(60);
     apply_proxy(client);
 
-    std::string query = std::string(kNvdPath) + "?" +
-                        "keywordSearch=" + url_encode(keyword) +
+    std::string query = std::string(kNvdPath) + "?" + "keywordSearch=" + url_encode(keyword) +
                         "&resultsPerPage=" + std::to_string(kResultsPerPage) +
                         "&startIndex=" + std::to_string(start_index);
 
@@ -261,7 +260,8 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
             bool found = false;
 
             for (const char* metric_key : {"cvssMetricV31", "cvssMetricV30"}) {
-                if (found) break;
+                if (found)
+                    break;
                 if (metrics.contains(metric_key) && metrics[metric_key].is_array() &&
                     !metrics[metric_key].empty()) {
                     const auto& first = metrics[metric_key][0];
@@ -334,10 +334,12 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
                         std::string product = parts[4];
 
                         // Normalize to lowercase
-                        std::transform(product.begin(), product.end(), product.begin(),
-                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        std::transform(vendor.begin(), vendor.end(), vendor.begin(),
-                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        std::transform(
+                            product.begin(), product.end(), product.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        std::transform(
+                            vendor.begin(), vendor.end(), vendor.begin(),
+                            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
                         // Extract version constraint
                         std::string affected_below;
@@ -380,10 +382,10 @@ NvdFetchResult NvdClient::parse_response(const std::string& json_body) {
         }
     }
 
-    spdlog::debug("NVD parsed {} records from {} vulnerabilities",
-                  result.records.size(), doc["vulnerabilities"].size());
+    spdlog::debug("NVD parsed {} records from {} vulnerabilities", result.records.size(),
+                  doc["vulnerabilities"].size());
 
     return result;
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

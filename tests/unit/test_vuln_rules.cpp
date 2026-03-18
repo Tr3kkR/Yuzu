@@ -104,17 +104,15 @@ TEST_CASE("CveRule: all CVE IDs follow CVE-YYYY-NNNNN format", "[vuln][rules]") 
     for (const auto& rule : kCveRules) {
         CAPTURE(rule.cve_id);
         CHECK(rule.cve_id.starts_with("CVE-"));
-        CHECK(rule.cve_id.size() >= 13);  // CVE-YYYY-NNNNN minimum
+        CHECK(rule.cve_id.size() >= 13); // CVE-YYYY-NNNNN minimum
     }
 }
 
 TEST_CASE("CveRule: all severities are valid", "[vuln][rules]") {
     for (const auto& rule : kCveRules) {
         CAPTURE(rule.cve_id);
-        bool valid = (rule.severity == "CRITICAL" ||
-                      rule.severity == "HIGH" ||
-                      rule.severity == "MEDIUM" ||
-                      rule.severity == "LOW");
+        bool valid = (rule.severity == "CRITICAL" || rule.severity == "HIGH" ||
+                      rule.severity == "MEDIUM" || rule.severity == "LOW");
         CHECK(valid);
     }
 }

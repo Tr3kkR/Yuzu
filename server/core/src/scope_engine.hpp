@@ -18,9 +18,9 @@ enum class CompOp { Eq, Neq, Like, Lt, Gt, Le, Ge, In, Contains };
 
 struct Condition {
     std::string attribute;
-    CompOp      op;
+    CompOp op;
     std::string value;
-    std::vector<std::string> values;  // for In operator
+    std::vector<std::string> values; // for In operator
 };
 
 struct Combinator;
@@ -60,4 +60,4 @@ bool evaluate(const Expression& expr, const AttributeResolver& resolver);
 /// Check if an expression is syntactically valid (convenience).
 std::expected<void, std::string> validate(std::string_view input);
 
-}  // namespace yuzu::scope
+} // namespace yuzu::scope

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <sqlite3.h>
+
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,13 +10,11 @@
 #include <thread>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct AuditEvent {
-    int64_t     id{0};
-    int64_t     timestamp{0};     // epoch seconds
+    int64_t id{0};
+    int64_t timestamp{0}; // epoch seconds
     std::string principal;
     std::string principal_role;
     std::string action;
@@ -23,7 +24,7 @@ struct AuditEvent {
     std::string source_ip;
     std::string user_agent;
     std::string session_id;
-    std::string result;           // "success", "failure", "denied"
+    std::string result; // "success", "failure", "denied"
 };
 
 struct AuditQuery {
@@ -31,16 +32,15 @@ struct AuditQuery {
     std::string action;
     std::string target_type;
     std::string target_id;
-    int64_t     since{0};
-    int64_t     until{0};
-    int         limit{100};
-    int         offset{0};
+    int64_t since{0};
+    int64_t until{0};
+    int limit{100};
+    int offset{0};
 };
 
 class AuditStore {
 public:
-    explicit AuditStore(const std::filesystem::path& db_path,
-                        int retention_days = 365,
+    explicit AuditStore(const std::filesystem::path& db_path, int retention_days = 365,
                         int cleanup_interval_min = 60);
     ~AuditStore();
 
@@ -60,10 +60,19 @@ private:
     sqlite3* db_{nullptr};
     int retention_days_;
     int cleanup_interval_min_;
+#ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
+#else
+    std::thread cleanup_thread_;
+    std::atomic<bool> stop_requested_{false};
+#endif
 
     void create_tables();
+#ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
+#else
+    void run_cleanup();
+#endif
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

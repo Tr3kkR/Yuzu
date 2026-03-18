@@ -1,0 +1,203 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Yuzu Server Dashboard",
+      "url": "/d/yuzu-server",
+      "type": "link"
+    },
+    {
+      "title": "Yuzu Fleet Overview",
+      "url": "/d/yuzu-fleet",
+      "type": "link"
+    }
+  ],
+  "panels": [
+    {
+      "title": "Current Agents",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(yuzu_gw_agents_current)",
+          "legendFormat": "Connected"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Total Connections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(yuzu_gw_agents_connected_total)",
+          "legendFormat": "Connections"
+        }
+      ]
+    },
+    {
+      "title": "Total Disconnections",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "sum(yuzu_gw_agents_disconnected_total)",
+          "legendFormat": "Disconnections"
+        }
+      ]
+    },
+    {
+      "title": "Commands Dispatched Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "rate(yuzu_gw_commands_dispatched_total[5m])",
+          "legendFormat": "{{plugin}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "Command Latency (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yuzu_gw_command_duration_ms_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yuzu_gw_command_duration_ms_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(yuzu_gw_command_duration_ms_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "title": "Upstream RPC Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(yuzu_gw_upstream_rpc_duration_ms_bucket[5m]))",
+          "legendFormat": "p50 {{rpc_name}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(yuzu_gw_upstream_rpc_duration_ms_bucket[5m]))",
+          "legendFormat": "p95 {{rpc_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "title": "Upstream RPC Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "rate(yuzu_gw_upstream_rpc_errors_total[5m])",
+          "legendFormat": "{{rpc_name}} ({{code}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "title": "BEAM Process Count",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "yuzu_gw_beam_process_count",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "title": "BEAM Memory Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "yuzu_gw_beam_memory_bytes",
+          "legendFormat": "{{type}} ({{node}})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes" }
+      }
+    },
+    {
+      "title": "Scheduler Utilization",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        {
+          "expr": "yuzu_gw_beam_scheduler_util",
+          "legendFormat": "{{node}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["yuzu", "gateway", "observability"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Yuzu Gateway",
+  "uid": "yuzu-gateway",
+  "version": 1
+}
