@@ -1,0 +1,157 @@
+syntax = "proto3";
+
+package yuzu.agent.v1;
+
+import "yuzu/common/v1/common.proto";
+
+option cc_enable_arenas = true;
+
+// AgentService is the primary service implemented by the server.
+// Agents connect to it and maintain a long-lived session.
+service AgentService {
+  // Register is the first call an agent makes. Returns a session token.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Heartbeat keeps the session alive and receives pending commands.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // ExecuteCommand dispatches a command to a plugin on this agent.
+  // Results stream back as they are produced.
+  rpc ExecuteCommand(CommandRequest) returns (stream CommandResponse);
+
+  // Subscribe opens a bidirectional command channel (alternative to polling).
+  // The server pushes CommandRequests; the agent streams CommandResponses.
+  rpc Subscribe(stream CommandResponse) returns (stream CommandRequest);
+
+  // ReportInventory pushes full inventory data to the server.
+  rpc ReportInventory(InventoryReport) returns (InventoryAck);
+
+  // CheckForUpdate queries whether a newer agent binary is available.
+  rpc CheckForUpdate(CheckForUpdateRequest) returns (CheckForUpdateResponse);
+
+  // DownloadUpdate streams the agent binary in chunks over the mTLS channel.
+  rpc DownloadUpdate(DownloadUpdateRequest) returns (stream DownloadUpdateChunk);
+}
+
+// ── Registration ─────────────────────────────────────────────────────────────
+
+message AgentInfo {
+  string agent_id  = 1;  // Stable UUID for this endpoint
+  string hostname  = 2;
+  yuzu.common.v1.Platform platform = 3;
+  string agent_version = 4;
+  repeated yuzu.common.v1.PluginInfo plugins = 5;
+  map<string, string> scopable_tags = 6;  // Tags for scope evaluation
+}
+
+message RegisterRequest {
+  AgentInfo info = 1;
+
+  // Tier 2: Pre-shared enrollment token (admin-generated).
+  string enrollment_token = 2;
+
+  // Tier 3 (future): Platform trust — machine certificate / attestation.
+  bytes  machine_certificate    = 3;   // DER-encoded X.509
+  bytes  attestation_signature  = 4;   // Signed challenge
+  string attestation_provider   = 5;   // "ad-cs", "aws", "azure", etc.
+}
+
+message RegisterResponse {
+  string session_id    = 1;
+  bool   accepted      = 2;
+  string reject_reason = 3;  // Populated if accepted == false
+  // Server may send initial commands immediately after registration
+  repeated CommandRequest pending_commands = 4;
+
+  // Enrollment status: "enrolled", "pending", "denied"
+  string enrollment_status = 5;
+  // Persistent agent credential for reconnection (future use)
+  string agent_credential = 6;
+}
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp sent_at = 2;
+  // Lightweight status fields; full inventory uses ReportInventory
+  map<string, string> status_tags = 3;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  yuzu.common.v1.Timestamp server_time = 2;
+  repeated CommandRequest pending_commands = 3;
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+message CommandRequest {
+  string command_id = 1;  // Unique per invocation
+  string plugin     = 2;  // Target plugin name (e.g. "inventory", "patch")
+  string action     = 3;  // Action within the plugin
+  map<string, string> parameters = 4;
+  yuzu.common.v1.Timestamp expires_at = 5;  // Agent should discard after this
+}
+
+message CommandResponse {
+  string command_id = 1;
+
+  enum Status {
+    RUNNING  = 0;
+    SUCCESS  = 1;
+    FAILURE  = 2;
+    TIMEOUT  = 3;
+    REJECTED = 4;
+  }
+  Status status = 2;
+
+  string output    = 3;  // Streamed stdout / structured output
+  int32  exit_code = 4;
+
+  yuzu.common.v1.ErrorDetail error  = 5;
+  yuzu.common.v1.Timestamp   sent_at = 6;
+}
+
+// ── Inventory ─────────────────────────────────────────────────────────────────
+
+message InventoryReport {
+  string session_id = 1;
+  yuzu.common.v1.Timestamp collected_at = 2;
+
+  // Key-value blobs per plugin; plugins define their own schemas.
+  map<string, bytes> plugin_data = 3;
+}
+
+message InventoryAck {
+  bool received = 1;
+}
+
+// ── OTA Updates ─────────────────────────────────────────────────────────────
+
+message CheckForUpdateRequest {
+  string agent_id        = 1;
+  string current_version = 2;  // e.g. "0.1.0+42"
+  yuzu.common.v1.Platform platform = 3;
+}
+
+message CheckForUpdateResponse {
+  bool   update_available = 1;
+  string latest_version   = 2;  // e.g. "0.2.0+87"
+  string sha256           = 3;  // Hex-encoded SHA-256 of the binary
+  bool   mandatory        = 4;  // If true, agent must update immediately
+  bool   eligible         = 5;  // Rollout eligibility for this agent
+  int64  file_size        = 6;  // Binary size in bytes
+}
+
+message DownloadUpdateRequest {
+  string agent_id = 1;
+  string version  = 2;  // Version to download (from CheckForUpdateResponse)
+  yuzu.common.v1.Platform platform = 3;
+}
+
+message DownloadUpdateChunk {
+  bytes data       = 1;  // Chunk payload (up to 64 KB)
+  int64 offset     = 2;  // Byte offset within the file
+  int64 total_size = 3;  // Total file size (repeated for resilience)
+}

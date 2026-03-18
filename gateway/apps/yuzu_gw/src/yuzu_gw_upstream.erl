@@ -12,6 +12,8 @@
 -module(yuzu_gw_upstream).
 -behaviour(gen_server).
 
+-include_lib("grpcbox/include/grpcbox.hrl").
+
 %% API
 -export([start_link/0,
          proxy_register/1,
@@ -175,12 +177,30 @@ connect_upstream(Addr, Port) ->
             Endpoint
     end.
 
-do_rpc(Channel, Method, Request, Tag) ->
+%% Map each GatewayUpstream RPC to its protobuf input/output message types.
+rpc_types('ProxyRegister')      -> {'yuzu.agent.v1.RegisterRequest',
+                                    'yuzu.agent.v1.RegisterResponse'};
+rpc_types('BatchHeartbeat')     -> {'yuzu.gateway.v1.BatchHeartbeatRequest',
+                                    'yuzu.gateway.v1.BatchHeartbeatResponse'};
+rpc_types('ProxyInventory')     -> {'yuzu.agent.v1.InventoryReport',
+                                    'yuzu.agent.v1.InventoryAck'};
+rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',
+                                    'yuzu.gateway.v1.StreamStatusAck'}.
+
+do_rpc(_Channel, Method, Request, Tag) ->
+    {InputType, OutputType} = rpc_types(Method),
+    Def = #grpcbox_def{
+        service       = 'yuzu.gateway.v1.GatewayUpstream',
+        message_type  = atom_to_binary(InputType, utf8),
+        marshal_fun   = fun(Msg) -> gateway_pb:encode_msg(Msg, InputType) end,
+        unmarshal_fun = fun(Bin) -> gateway_pb:decode_msg(Bin, OutputType) end
+    },
+    Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
-    Service = 'yuzu.gateway.v1.GatewayUpstream',
-    Result = grpcbox_client:unary(Channel, <<(atom_to_binary(Service, utf8))/binary,
-                                              "/", (atom_to_binary(Method, utf8))/binary>>,
-                                   Request, #{}, #{}),
+    %% Use ctx:background() as context; default_channel is selected via grpcbox_client
+    %% get_channel(Options, unary) which defaults to the 'default_channel' atom when
+    %% no 'channel' key is in Options.
+    Result = grpcbox_client:unary(ctx:background(), Path, Request, Def, #{}),
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of
         {ok, Response, _Headers} ->

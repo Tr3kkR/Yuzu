@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package yuzu.common.v1;
+
+option cc_enable_arenas = true;
+
+// Platform identifies the operating system and architecture of an endpoint.
+message Platform {
+  string os      = 1;  // "windows", "linux", "darwin"
+  string arch    = 2;  // "x86_64", "aarch64", "armv7"
+  string version = 3;  // OS version string
+}
+
+// PluginInfo describes a loaded plugin on an agent.
+message PluginInfo {
+  string name        = 1;
+  string version     = 2;
+  string description = 3;
+  repeated string capabilities = 4;
+}
+
+// ErrorDetail carries structured error information.
+message ErrorDetail {
+  string code    = 1;
+  string message = 2;
+  map<string, string> metadata = 3;
+}
+
+// Timestamp wraps unix epoch millis for consistency.
+message Timestamp {
+  int64 millis_epoch = 1;
+}
+
+// ── Scope Expressions ────────────────────────────────────────────────────────
+
+// ScopeExpression defines a filter for targeting devices.
+message ScopeExpression {
+  oneof expr {
+    ScopeCondition  condition  = 1;
+    ScopeCombinator combinator = 2;
+  }
+}
+
+message ScopeCondition {
+  string attribute        = 1;  // e.g. "ostype", "tag:env"
+  string op               = 2;  // "==", "!=", "LIKE", "<", ">", "<=", ">=", "IN", "CONTAINS"
+  string value            = 3;  // single value
+  repeated string values  = 4;  // for IN operator
+}
+
+message ScopeCombinator {
+  enum Op {
+    AND = 0;
+    OR  = 1;
+    NOT = 2;
+  }
+  Op op = 1;
+  repeated ScopeExpression children = 2;
+}

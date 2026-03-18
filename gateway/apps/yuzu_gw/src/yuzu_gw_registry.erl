@@ -172,10 +172,13 @@ terminate(_Reason, _State) ->
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, _, _}] ->
+        [{_, Pid, _, _, Plugins, _}] ->
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes on process exit, but leave explicitly for clarity.
             catch pg:leave(?PG_SCOPE, all_agents, Pid),
+            lists:foreach(fun(Plugin) ->
+                catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
+            end, Plugins),
             %% Find and remove the monitor ref.
             Mons2 = maps:filter(fun(_Ref, Id) -> Id =/= AgentId end, Mons),
             {noreply, State#state{monitor_refs = Mons2}};
@@ -185,8 +188,11 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
 
 maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, OldPid, _, _, _, _}] ->
+        [{_, OldPid, _, _, OldPlugins, _}] ->
             catch pg:leave(?PG_SCOPE, all_agents, OldPid),
+            lists:foreach(fun(Plugin) ->
+                catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)
+            end, OldPlugins),
             ets:delete(?TABLE, AgentId),
             %% Demonitor old process.
             maps:foreach(fun(Ref, Id) ->

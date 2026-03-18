@@ -9,9 +9,15 @@
 %%% - Heartbeat: buffered for batch upstream delivery
 %%% - ReportInventory: proxied upstream
 %%% - ExecuteCommand: not used (Subscribe is the primary channel)
+%%%
+%%% grpcbox calling conventions (v0.17.1):
+%%%   Unary:   Module:Fun(Ctx, Request)   -> {ok, Response, Ctx} | {grpc_error, {Status, Msg}}
+%%%   Bidi:    Module:Fun(Ref, State)     -> any()  (loops until stream ends)
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_service).
+
+-include_lib("grpcbox/include/grpcbox.hrl").
 
 %% grpcbox service callbacks
 -export([register/2,
@@ -24,9 +30,10 @@
 %% Register — proxy to C++ server
 %%--------------------------------------------------------------------
 
-register(RegisterReq, #{headers := Headers} = _Ctx) ->
-    PeerAddr = maps:get(<<"x-forwarded-for">>, Headers,
-                        maps:get(<<":authority">>, Headers, <<"unknown">>)),
+register(Ctx, RegisterReq) ->
+    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
+    PeerAddr = maps:get(<<":authority">>, Headers,
+                        maps:get(<<"x-forwarded-for">>, Headers, <<"unknown">>)),
 
     case yuzu_gw_upstream:proxy_register(RegisterReq) of
         {ok, Response} ->
@@ -47,31 +54,44 @@ register(RegisterReq, #{headers := Headers} = _Ctx) ->
 
             logger:info("Agent ~s registered (session=~s), awaiting Subscribe",
                         [AgentId, SessionId]),
-            {ok, Response, #{}};
+            {ok, Response, Ctx};
 
         {error, Reason} ->
             logger:warning("Upstream Register failed: ~p", [Reason]),
-            {error, #{status => 13,  %% INTERNAL
-                      message => iolist_to_binary(
-                          io_lib:format("Upstream registration failed: ~p", [Reason]))}}
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          iolist_to_binary(
+                              io_lib:format("Upstream registration failed: ~p", [Reason]))}}
     end.
 
 %%--------------------------------------------------------------------
 %% Subscribe — terminate bidi stream locally
+%%
+%% grpcbox calls this as subscribe(Ref, State) where:
+%%   Ref   = make_ref() used as the mailbox key for incoming agent data
+%%   State = grpcbox_stream:state() (opaque record; use grpcbox_stream API)
+%%
+%% Incoming data (agent -> gateway) arrives as {Ref, DecodedMap} messages.
+%% To send data (gateway -> agent) use grpcbox_stream:send(Msg, State).
+%% Stream end is signalled as {Ref, eos}.
 %%--------------------------------------------------------------------
 
-subscribe(StreamRef, #{headers := Headers} = _Ctx) ->
+subscribe(Ref, State) ->
+    Ctx = grpcbox_stream:ctx(State),
+    Headers = grpcbox_metadata:from_incoming_ctx(Ctx),
     SessionId = maps:get(<<"x-yuzu-session-id">>, Headers, undefined),
 
     case SessionId of
         undefined ->
-            {error, #{status => 3,  %% INVALID_ARGUMENT
-                      message => <<"Missing x-yuzu-session-id header">>}};
+            logger:warning("Subscribe: missing x-yuzu-session-id header"),
+            throw({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
+                                <<"Missing x-yuzu-session-id header">>}});
         _ ->
             case persistent_term:get({yuzu_gw_pending, SessionId}, undefined) of
                 undefined ->
-                    {error, #{status => 5,  %% NOT_FOUND
-                              message => <<"No pending registration for session">>}};
+                    logger:warning("Subscribe: no pending registration for session ~s",
+                                   [SessionId]),
+                    throw({grpc_error, {?GRPC_STATUS_NOT_FOUND,
+                                        <<"No pending registration for session">>}});
 
                 #{agent_id := AgentId, agent_info := AgentInfo,
                   peer_addr := PeerAddr} ->
@@ -79,33 +99,55 @@ subscribe(StreamRef, #{headers := Headers} = _Ctx) ->
                     persistent_term:erase({yuzu_gw_pending, SessionId}),
 
                     %% Spawn the agent process — it owns this stream.
+                    %% We pass stream_pid=self() so the agent process sends
+                    %% commands back to us via {send_command, Cmd} messages.
                     Args = #{agent_id   => AgentId,
                              session_id => SessionId,
-                             stream_ref => StreamRef,
+                             stream_pid => self(),
                              agent_info => AgentInfo,
                              peer_addr  => PeerAddr},
 
                     case yuzu_gw_agent_sup:start_agent(Args) of
-                        {ok, _Pid} ->
-                            %% The agent process will read from / write to
-                            %% the stream via its mailbox. grpcbox routes
-                            %% incoming frames as messages to the owning process.
-                            {ok, StreamRef, #{}};
+                        {ok, AgentPid} ->
+                            stream_loop(Ref, State, AgentPid);
 
                         {error, Reason} ->
                             logger:error("Failed to start agent process for ~s: ~p",
                                          [AgentId, Reason]),
-                            {error, #{status => 13,
-                                      message => <<"Internal: agent process start failed">>}}
+                            throw({grpc_error, {?GRPC_STATUS_INTERNAL,
+                                                <<"Internal: agent process start failed">>}})
                     end
             end
+    end.
+
+%% Subscribe stream loop: relay messages between grpcbox and the agent process.
+stream_loop(Ref, State, AgentPid) ->
+    receive
+        {Ref, eos} ->
+            %% Agent disconnected (gRPC stream closed by client).
+            AgentPid ! stream_closed,
+            ok;
+
+        {Ref, DataFromAgent} ->
+            %% Data from the agent (CommandResponse frame).
+            AgentPid ! {stream_data, DataFromAgent},
+            stream_loop(Ref, State, AgentPid);
+
+        {send_command, Cmd} ->
+            %% Command from the agent gen_statem to send to the agent.
+            grpcbox_stream:send(Cmd, State),
+            stream_loop(Ref, State, AgentPid);
+
+        close_stream ->
+            %% Agent process requested graceful disconnect.
+            ok
     end.
 
 %%--------------------------------------------------------------------
 %% Heartbeat — buffer for batch upstream delivery
 %%--------------------------------------------------------------------
 
-heartbeat(HeartbeatReq, _Ctx) ->
+heartbeat(Ctx, HeartbeatReq) ->
     yuzu_gw_upstream:queue_heartbeat(HeartbeatReq),
 
     %% Respond immediately — the agent doesn't need to wait for upstream ack.
@@ -114,29 +156,29 @@ heartbeat(HeartbeatReq, _Ctx) ->
         server_time  => #{millis_epoch => erlang:system_time(millisecond)},
         pending_commands => []
     },
-    {ok, Response, #{}}.
+    {ok, Response, Ctx}.
 
 %%--------------------------------------------------------------------
 %% ExecuteCommand — not used (Subscribe is the primary channel)
 %%--------------------------------------------------------------------
 
-execute_command(_CommandReq, _Ctx) ->
-    {error, #{status => 12,  %% UNIMPLEMENTED
-              message => <<"Use Subscribe for command delivery">>}}.
+execute_command(_Ctx, _CommandReq) ->
+    {grpc_error, {?GRPC_STATUS_UNIMPLEMENTED,
+                  <<"Use Subscribe for command delivery">>}}.
 
 %%--------------------------------------------------------------------
 %% ReportInventory — proxy upstream
 %%--------------------------------------------------------------------
 
-report_inventory(InventoryReport, _Ctx) ->
+report_inventory(Ctx, InventoryReport) ->
     case yuzu_gw_upstream:proxy_inventory(InventoryReport) of
         {ok, Response} ->
-            {ok, Response, #{}};
+            {ok, Response, Ctx};
         {error, Reason} ->
             logger:warning("Upstream ReportInventory failed: ~p", [Reason]),
-            {error, #{status => 13,
-                      message => iolist_to_binary(
-                          io_lib:format("Upstream inventory report failed: ~p", [Reason]))}}
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          iolist_to_binary(
+                              io_lib:format("Upstream inventory report failed: ~p", [Reason]))}}
     end.
 
 %%--------------------------------------------------------------------
