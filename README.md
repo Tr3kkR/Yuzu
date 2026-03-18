@@ -12,6 +12,33 @@ Yuzu gives operations and security teams a single control plane to query, comman
 - **Security response** — Quarantine compromised devices, check indicators of compromise, inventory certificates, and collect forensic data.
 - **Plugin extensibility** — A stable C ABI means plugins can be written in any language that produces a shared library. 29 plugins ship out of the box covering hardware, network, security, software, and more.
 
+## Instruction Engine
+
+Every operation in Yuzu flows through the **instruction engine** — a governed lifecycle that transforms ad-hoc commands into reusable, versioned, auditable definitions.
+
+**Content model:**
+
+```
+ProductPack                    (signed distribution bundle)
+ └── InstructionSet            (permission boundary, grouping)
+      └── InstructionDefinition (reusable operation template)
+           ├── Parameter Schema (typed inputs with validation)
+           ├── Result Schema    (typed output columns)
+           └── Execution Spec   (plugin + action + defaults)
+```
+
+**How it works:**
+
+1. **Author** an InstructionDefinition in YAML — declare the plugin, action, typed parameters, result columns, approval mode, and platform compatibility.
+2. **Import** it via the dashboard or REST API. The server validates the schema and stores the YAML verbatim alongside denormalized columns for efficient queries.
+3. **Execute** the definition against a scope expression (`ostype == "windows" AND tag:env == "production"`). The engine validates parameters, checks approvals, dispatches via gRPC, and tracks per-agent progress.
+4. **Analyze** results using typed aggregation, filtering, and CSV/JSON export.
+5. **Schedule** recurring executions with cron-style frequency and scope-based targeting.
+
+Definitions are `question` (read-only, auto-approved) or `action` (may modify state, approval-gated). Every execution is audited, every response is persisted, and every state-changing action can require approval.
+
+See [`docs/Instruction-Engine.md`](docs/Instruction-Engine.md) for the full architecture, [`docs/yaml-dsl-spec.md`](docs/yaml-dsl-spec.md) for the YAML specification, and [`docs/getting-started.md`](docs/getting-started.md) for a hands-on tutorial.
+
 ## Architecture
 
 ```

@@ -187,91 +187,92 @@ Export response data and inventory as CSV or JSON. Support:
 
 ## Phase 2: Instruction System
 
-*Transform ad-hoc commands into a managed instruction lifecycle with definitions, scheduling, approval, and workflow orchestration.*
+*Transform ad-hoc commands into a governed instruction lifecycle. YAML-defined instruction definitions with typed parameter and result schemas, executed through the existing `CommandRequest` wire protocol, tracked by `ExecutionTracker`, stored by `ResponseStore`, and audited by `AuditStore`. See `docs/Instruction-Engine.md` for the full architectural blueprint and `docs/yaml-dsl-spec.md` for the YAML specification.*
 
 ### Issue 2.1: Instruction Definitions
 **Capability:** 2.6 | **Scope:** Server + Proto
 
-Named, versioned, reusable instruction templates. Each definition includes:
-- Name (unique, versioned with dotted notation)
-- Type: `question` (read-only) or `action` (may modify state)
-- Payload: plugin + action + parameter template
-- Parameter schema: name, type, default, validation (regex, allowed values, min/max)
-- Response schema: column definitions with types
-- Aggregation definition: group-by + operations
-- Description and readable payload with parameter substitution
-- TTL ranges (instruction gather period + response keep period)
+YAML-first InstructionDefinitions (see `docs/yaml-dsl-spec.md` Section 3). Each definition stored with `yaml_source` column (verbatim YAML, source of truth) plus denormalized columns for efficient queries. Features:
+- **Content model:** `apiVersion: yuzu.io/v1alpha1`, `kind: InstructionDefinition`, `metadata` + `spec` + `status`
+- **Type:** `question` (read-only) or `action` (may modify state)
+- **Execution spec:** plugin, action, concurrency mode (per-device/per-definition/per-set/global:N/unlimited), stagger
+- **Parameter schema:** JSON Schema subset — type (string, boolean, int32, int64, datetime, guid), required, validation (maxLength, pattern, enum, min/max)
+- **Result schema:** Typed columns (bool, int32, int64, string, datetime, guid, clob) with aggregation config (groupBy + operations)
+- **Approval mode:** auto (default for questions), role-gated (default for actions), always
+- **Compatibility:** minAgentVersion, requiredPlugins — server-side pre-dispatch check
+- **Legacy command shim:** Auto-generate definitions from plugin descriptors on server startup (Section 15 of Instruction-Engine.md)
 
-CRUD via management API and REST. Import/export as JSON.
+CRUD via REST API. Import/export as YAML and JSON.
 
-**Files:** `proto/yuzu/server/v1/management.proto`, new `server/core/src/instruction_store.cpp`, `server/core/src/server.cpp`
+**Files:** `server/core/src/instruction_store.hpp`, `server/core/src/instruction_store.cpp`, `server/core/src/server.cpp`
 
 ### Issue 2.2: Instruction Sets (Grouping and Organization)
 **Capability:** 2.7 | **Scope:** Server
 
-Logical groupings of instruction definitions for organization and permission scoping. Definitions can belong to one set or be unassigned. Sets have names, descriptions, and are the unit of permission assignment (who can run which instructions). CRUD via management API.
+InstructionSets are the **permission boundary** (see `docs/yaml-dsl-spec.md` Section 4). Users execute definitions within sets; authors publish to sets; approvers approve set-governed actions. Sets declare:
+- `contents` — list of InstructionDefinition IDs, PolicyFragment IDs, workflow templates
+- `permissions` — executeRoles, authorRoles, approveRoles
+- `defaults` — approvalMode, responseRetentionDays, targetEstimationRequiredAbove
+- `publishing` — signed flag, visibility (org/public)
 
-**Files:** `server/core/src/instruction_store.cpp`, `proto/yuzu/server/v1/management.proto`
+CRUD via management API. RBAC system (Phase 3) binds `Principal + Role + SecurableType(InstructionSet) + Operation`.
+
+**Files:** `server/core/src/instruction_store.hpp`, `server/core/src/instruction_store.cpp`
 
 ### Issue 2.3: Instruction Scheduling
 **Capability:** 2.9 | **Scope:** Server
 
-Schedule instructions for deferred or recurring execution. Schedule model:
-- Frequency type (daily, weekly, monthly)
-- Sub-day granularity (every N minutes/hours)
-- Active date/time windows
-- Scope expression for targeting
-- Parameter values
-- Last/next execution tracking
+`ScheduleEngine` evaluates due schedules on a background thread (60-second tick). Schedule model:
+- frequency_type (daily, weekly, monthly, interval)
+- interval_minutes for sub-day granularity
+- time_of_day, day_of_week, day_of_month for calendar schedules
+- scope_expression for device targeting (evaluated by `ScopeEngine`)
+- requires_approval flag — creates approval record instead of immediate dispatch
+- next/last execution tracking, execution_count
 
-Server evaluates schedules on a timer, dispatches matching instructions. CRUD for scheduled instructions via management API.
+Dispatches via the same `CommandRequest` path. CRUD via management API.
 
-**Files:** New `server/core/src/scheduler.cpp`, `proto/yuzu/server/v1/management.proto`, `server/core/src/server.cpp`
+**Files:** `server/core/src/schedule_engine.hpp`, `server/core/src/schedule_engine.cpp`, `server/core/src/server.cpp`
 
 ### Issue 2.4: Instruction Approval Workflows
 **Capability:** 2.10 | **Scope:** Server
 
-Configurable approval gates before instruction execution. Default workflow:
-- Questions: auto-approved
-- Actions: require approval
+`ApprovalManager` implements approval gating per Instruction-Engine.md Section 6.1 `spec.approval.mode`:
+- `auto` — questions auto-approved, no gate
+- `role-gated` — actions require approval from a user with an approveRole on the InstructionSet
+- `always` — all executions require explicit approval
 
-Support:
-- Submit for approval, approve/reject with comments
-- Ownership rules (cannot approve own actions)
-- Notification of pending approvals
-- Per-instruction and per-scheduled-instruction approval
-- Bypass for admin roles (configurable)
+Rules: submitter cannot approve own actions. Approval record includes submitted_by, reviewed_by, review_comment, scope_expression. On approval, dispatch proceeds automatically. On rejection, execution is marked rejected with comment.
 
-**Files:** New `server/core/src/approval.cpp`, `proto/yuzu/server/v1/management.proto`, `server/core/src/server.cpp`
+**Files:** `server/core/src/approval_manager.hpp`, `server/core/src/approval_manager.cpp`, `server/core/src/server.cpp`
 
 ### Issue 2.5: Instruction Hierarchies and Follow-Up Workflows
 **Capability:** 2.8 | **Scope:** Server
 
-Parent-child instruction relationships for drill-down workflows. When an instruction completes, follow-up instructions can be dispatched using the parent's response data as input. Track hierarchy as a tree (parent_id, children). Previous-result filters allow chaining: instruction A's output is filtered, then feeds instruction B.
+`Execution.parent_id` tracks parent-child relationships. Follow-up instructions dispatched using parent's response data as input. `ExecutionTracker.get_children()` enables drill-down. Previous-result filtering: server extracts columns from parent response, passes as parameters to child definition.
 
-**Files:** `server/core/src/instruction_store.cpp`, `proto/yuzu/server/v1/management.proto`
+**Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`
 
 ### Issue 2.6: Instruction Progress Tracking and Statistics
 **Capabilities:** 2.12, 1.9 | **Scope:** Server + Agent
 
-Aggregate progress tracking for in-flight instructions:
-- Total agents targeted, responded, success, failure, pending
-- Average execution time, response size
-- Per-agent execution history with timing and status
+`ExecutionTracker` maintains per-execution aggregate status per Instruction-Engine.md Section 9.3:
+- `Execution` struct: agents_targeted, agents_responded, agents_success, agents_failure
+- `AgentExecStatus` struct: per-agent dispatched_at, first_response_at, completed_at, exit_code, error_detail
+- `ExecutionSummary` with progress_pct
+- Aggregate status: succeeded, completed (≥minSuccessPercent), failed, timed_out, cancelled, partial
 
-Agent-side: track in-memory statistics (instructions executed, success rate, avg duration) and expose via new `stats` action on `diagnostics` plugin.
+Error codes follow the 4-category taxonomy (1xxx plugin, 2xxx transport, 3xxx orchestration, 4xxx agent).
 
-Server-side: summary and detail views for each instruction instance, batch lookup by IDs.
-
-**Files:** `server/core/src/response_store.cpp`, `agents/plugins/diagnostics/src/diagnostics_plugin.cpp`, `proto/yuzu/server/v1/management.proto`
+**Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/server.cpp`
 
 ### Issue 2.7: Instruction Rerun and Cancellation
 **Capability:** 2.13 | **Scope:** Server + Agent
 
-- **Rerun:** Clone a completed/failed instruction with the same parameters and scope, creating a new instance.
-- **Cancel:** Send a cancellation signal to agents with in-flight instructions. Agent kills the running plugin thread and reports cancellation status. Server marks the instruction as cancelled.
+- **Rerun:** `ExecutionTracker.create_rerun()` — clone execution with same params/scope, set `rerun_of`, optionally target only failed agents
+- **Cancel:** `ExecutionTracker.mark_cancelled()` — set status=cancelled, send cancel signal to agents via heartbeat flag or new `CancelCommand` message
 
-**Files:** `server/core/src/server.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/agent/v1/agent.proto` (new `CancelCommand` message)
+**Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/server.cpp`, `agents/core/src/agent.cpp`
 
 ---
 

@@ -1,7 +1,7 @@
 # Yuzu Instruction Engine — Design & Architecture
 
 **Document status:** Living design document — implementation guide
-**Basis:** `dev` branch at commit `98f1265` (2026-03-17)
+**Basis:** `dev` branch at commit `dce7f7c` (2026-03-18)
 **Audience:** Yuzu contributors and integrators
 
 ---
@@ -11,7 +11,7 @@
 ### Verified from implementation
 
 - **Phase 0** complete — HTTPS, OTA updates (`agents/core/src/updater.cpp`), secure temp files (`sdk/include/yuzu/plugin.h`), SDK utilities (`yuzu_table_to_json`, `yuzu_json_to_table`, `yuzu_split_lines`, `yuzu_generate_sequence`).
-- **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching). All in `server/core/src/`. **Not yet started:** response aggregation engine (#168 — COUNT/SUM/AVG/GROUP BY, incremental computation) and CSV/JSON export (#172 — currently returns stub `"{}"`).
+- **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
 - **Phase 2** scaffolded — `InstructionStore` (DDL, CRUD, import/export JSON), `ExecutionTracker` (Execution/AgentExecStatus structs, rerun, cancel), `ApprovalManager` (submit/approve/reject, pending count), `ScheduleEngine` (frequency types, scope expression, approval gating). All stubs with table creation and struct definitions; business logic not yet wired.
 - **30 plugins** across `agents/plugins/`: 24 cross-platform, 4 Windows-only (`bitlocker`, `msi_packages`, `sccm`, `windows_updates`), 2 test/debug (`chargen`, `example`).
 - **Plugin ABI** v1 stable: `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`.
@@ -59,7 +59,7 @@ This document is the architectural blueprint for that work.
 | **TagStore** | `tag_store.hpp` | **Real** | SQLite-backed. `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
-**Overall progress:** 30/139 capabilities done (22%). Phase 0 and 1 complete. Phase 2 scaffolded.
+**Overall progress:** 44/139 capabilities done (32%). Phase 0 and 1 complete. Phase 2 scaffolded (DDL + struct definitions; business logic in progress).
 
 ---
 
@@ -1328,13 +1328,13 @@ Without a typed result envelope:
 
 Updated to reflect current state (Phase 0 and 1 complete, Phase 2 scaffolded).
 
-### Phase A — Response Integration (remaining Phase 1 work)
+### Phase A — Response Integration (remaining Phase 1 work) :white_check_mark: Complete
 
-1. Wire `ResponseStore` into command dispatch path (store every `CommandResponse`)
-2. Implement structured result envelope parsing (extract columns from plugin output)
-3. Response search HTTP endpoint (`POST /api/responses/search`)
-4. CSV/JSON export endpoints
-5. Response aggregation engine (group-by + count/sum/min/max)
+1. ~~Wire `ResponseStore` into command dispatch path~~ — done
+2. ~~Implement structured result envelope parsing~~ — done
+3. ~~Response search HTTP endpoint~~ — done (`GET /api/responses/{id}` with query params)
+4. ~~CSV/JSON export endpoints~~ — done (`GET /api/responses/{id}/export?format=csv|json`, `POST /api/export/json-to-csv`)
+5. ~~Response aggregation engine~~ — done (`GET /api/responses/{id}/aggregate` with GROUP BY + count/sum/avg/min/max)
 
 ### Phase B — Instruction Plane (Phase 2 core)
 
