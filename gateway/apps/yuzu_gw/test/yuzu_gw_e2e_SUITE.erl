@@ -138,7 +138,7 @@ full_agent_lifecycle(_Config) ->
     %% Phase 2: Subscribe (simulated - we start the agent process directly)
     %% In a real scenario, Subscribe would be called via gRPC bidi stream.
     %% For testing, we simulate by starting the agent process.
-    PendingData = persistent_term:get({yuzu_gw_pending, SessionId}, undefined),
+    PendingData = yuzu_gw_registry:take_pending(SessionId),
     ?assertNotEqual(undefined, PendingData),
 
     %% Start agent process (simulates Subscribe handler).
@@ -184,7 +184,8 @@ concurrent_agent_connections(_Config) ->
     Ref = make_ref(),
 
     %% Spawn N concurrent registration processes.
-    lists:foreach(fun(I) ->
+    %% Each worker acts as stream_pid, so it must stay alive until assertions complete.
+    Workers = lists:map(fun(I) ->
         spawn_link(fun() ->
             AgentId = iolist_to_binary(io_lib:format("concurrent-~b", [I])),
 
@@ -200,7 +201,7 @@ concurrent_agent_connections(_Config) ->
             SessionId = maps:get(session_id, Resp),
 
             %% Start agent process.
-            Pending = persistent_term:get({yuzu_gw_pending, SessionId}),
+            Pending = yuzu_gw_registry:take_pending(SessionId),
             Args = #{
                 agent_id => AgentId,
                 session_id => SessionId,
@@ -210,7 +211,9 @@ concurrent_agent_connections(_Config) ->
             },
             {ok, _Pid} = yuzu_gw_agent:start_link(Args),
 
-            Self ! {registered, Ref, AgentId}
+            Self ! {registered, Ref, AgentId},
+            %% Stay alive as stream_pid until told to stop.
+            receive stop -> ok end
         end)
     end, lists:seq(1, N)),
 
@@ -227,6 +230,10 @@ concurrent_agent_connections(_Config) ->
     lists:foreach(fun(AgentId) ->
         ?assertMatch({ok, _}, yuzu_gw_registry:lookup(AgentId))
     end, Registered),
+
+    %% Cleanup: stop workers (triggers agent disconnect via stream_pid monitor).
+    lists:foreach(fun(W) -> W ! stop end, Workers),
+    timer:sleep(50),
 
     ct:pal("Concurrent connections test passed").
 
@@ -391,7 +398,7 @@ connect_agent(AgentId) ->
     {ok, Resp, _} = yuzu_gw_agent_service:register(ctx:background(), RegisterReq),
     SessionId = maps:get(session_id, Resp),
 
-    Pending = persistent_term:get({yuzu_gw_pending, SessionId}),
+    Pending = yuzu_gw_registry:take_pending(SessionId),
     Args = #{
         agent_id => AgentId,
         session_id => SessionId,

@@ -15,6 +15,10 @@
 %%% To send a command to the agent, we send {send_command, Cmd} to the
 %%% stream_pid (the subscribe handler process), which calls
 %%% grpcbox_stream:send(Cmd, State) to write it to the HTTP/2 stream.
+%%%
+%%% The agent process monitors stream_pid so that if the stream handler
+%%% crashes without sending stream_closed, we still transition to
+%%% disconnected and clean up.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent).
@@ -34,6 +38,7 @@
     agent_id    :: binary(),
     session_id  :: binary() | undefined,
     stream_pid  :: pid() | undefined,     %% subscribe handler process
+    stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
     agent_info  :: map(),
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference()}},  %% command_id => {reply_to, mon_ref}
@@ -74,10 +79,18 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
        stream_pid := StreamPid, peer_addr := PeerAddr} = Args) ->
     SessionId = maps:get(session_id, Args, undefined),
     Plugins = extract_plugin_names(AgentInfo),
+
+    %% Monitor the stream handler process.
+    StreamMon = case StreamPid of
+        undefined -> undefined;
+        _         -> monitor(process, StreamPid)
+    end,
+
     Data = #data{
         agent_id    = AgentId,
         session_id  = SessionId,
         stream_pid  = StreamPid,
+        stream_mon  = StreamMon,
         agent_info  = AgentInfo,
         plugins     = Plugins,
         pending     = #{},
@@ -117,8 +130,10 @@ connecting(enter, _OldState, _Data) ->
     keep_state_and_data;
 
 connecting(cast, {stream_ready, StreamPid}, Data) ->
+    Mon = monitor(process, StreamPid),
     {next_state, streaming, Data#data{stream_pid = StreamPid,
-                                      connected_at = erlang:system_time(millisecond)}};
+                                       stream_mon = Mon,
+                                       connected_at = erlang:system_time(millisecond)}};
 
 connecting(cast, {dispatch, _CommandReq, {ReplyTo, FanoutRef}}, Data) ->
     %% Cannot dispatch while still connecting — reject immediately.
@@ -129,6 +144,10 @@ connecting({call, From}, get_info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, format_info(Data, connecting)}}]};
 
 connecting(info, stream_closed, Data) ->
+    {next_state, disconnected, Data};
+
+connecting(info, {'DOWN', MonRef, process, _Pid, _Reason},
+           #data{stream_mon = MonRef} = Data) ->
     {next_state, disconnected, Data};
 
 connecting(cast, disconnect, Data) ->
@@ -196,6 +215,11 @@ streaming(info, stream_closed, Data) ->
 
 streaming(info, {stream_error, Reason}, Data) ->
     logger:warning("Stream error for agent ~s: ~p", [Data#data.agent_id, Reason]),
+    {next_state, disconnected, Data};
+
+streaming(info, {'DOWN', MonRef, process, _Pid, _Reason},
+          #data{stream_mon = MonRef} = Data) ->
+    logger:warning("Stream handler died for agent ~s", [Data#data.agent_id]),
     {next_state, disconnected, Data};
 
 streaming({call, From}, get_info, Data) ->

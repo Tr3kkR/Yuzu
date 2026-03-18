@@ -260,14 +260,10 @@ agent_register_via_service(_Config) ->
 
     ?assertEqual(<<"test-session-1">>, maps:get(session_id, Response)),
 
-    %% Verify pending registration was stored.
-    PendingKey = {yuzu_gw_pending, <<"test-session-1">>},
-    Pending = persistent_term:get(PendingKey, undefined),
+    %% Verify pending registration was stored (take_pending retrieves and deletes).
+    Pending = yuzu_gw_registry:take_pending(<<"test-session-1">>),
     ?assertNotEqual(undefined, Pending),
-    ?assertEqual(<<"integration-agent-1">>, maps:get(agent_id, Pending)),
-
-    %% Cleanup.
-    persistent_term:erase(PendingKey).
+    ?assertEqual(<<"integration-agent-1">>, maps:get(agent_id, Pending)).
 
 agent_heartbeat_batching(_Config) ->
     BatchRef = make_ref(),
@@ -310,7 +306,7 @@ agent_subscribe_lifecycle(_Config) ->
     SessionId = <<"subscribe-sess-1">>,
     AgentId = <<"subscribe-agent-1">>,
 
-    persistent_term:put({yuzu_gw_pending, SessionId}, #{
+    yuzu_gw_registry:store_pending(SessionId, #{
         agent_id => AgentId,
         agent_info => #{plugins => [#{name => <<"svc">>}]},
         peer_addr => <<"127.0.0.1">>,

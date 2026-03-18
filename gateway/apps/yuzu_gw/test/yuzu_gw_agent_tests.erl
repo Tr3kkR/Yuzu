@@ -15,6 +15,7 @@
 %%%   - Agent cleans up and STOPS on stream close
 %%%   - Pending command waiters are notified on disconnect
 %%%   - Orphaned responses are silently dropped
+%%%   - Stream handler death triggers disconnect (monitor)
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_agent_tests).
@@ -41,7 +42,9 @@ agent_test_() ->
       {"agent stops on stream_closed", fun stops_on_close/0},
       {"agent stops on stream_error", fun stops_on_error/0},
       {"disconnect notifies pending waiters", fun disconnect_notifies_pending/0},
-      {"get_info returns state", fun get_info_works/0}
+      {"get_info returns state", fun get_info_works/0},
+      {"stream handler death triggers disconnect", fun stream_handler_death/0},
+      {"stream handler death in connecting state", fun stream_handler_death_connecting/0}
      ]}.
 
 setup() ->
@@ -211,6 +214,66 @@ get_info_works() ->
     ?assertEqual(streaming, maps:get(state, Info)),
     ?assert(is_integer(maps:get(connected_at, Info))),
     stop_agent(Pid).
+
+stream_handler_death() ->
+    %% Start agent with a separate process as stream_pid.
+    StreamHandler = spawn(fun() -> receive stop -> ok end end),
+    Args = #{agent_id   => <<"shd-1">>,
+             session_id => <<"sess-shd-1">>,
+             stream_pid => StreamHandler,
+             agent_info => #{plugins => [#{name => <<"svc">>}]},
+             peer_addr  => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    timer:sleep(20),
+
+    %% Verify agent is streaming.
+    {ok, Info} = yuzu_gw_agent:get_info(Pid),
+    ?assertEqual(streaming, maps:get(state, Info)),
+
+    %% Kill the stream handler — agent should detect via monitor.
+    exit(StreamHandler, kill),
+
+    %% Agent should transition to disconnected and stop.
+    ok = wait_for_death(Pid, 2000),
+    ?assertEqual(error, yuzu_gw_registry:lookup(<<"shd-1">>)).
+
+stream_handler_death_connecting() ->
+    %% Start in connecting state with a stream_pid that dies.
+    StreamHandler = spawn(fun() -> receive stop -> ok end end),
+    Args = #{agent_id   => <<"shdc-1">>,
+             session_id => <<"sess-shdc-1">>,
+             stream_pid => StreamHandler,
+             agent_info => #{plugins => []},
+             peer_addr  => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    timer:sleep(20),
+
+    %% Agent starts in streaming since stream_pid was provided.
+    %% To test connecting state, start with undefined then supply pid.
+    %% Let's test with a direct pid that dies immediately instead.
+    %% Actually, if stream_pid is provided, it starts in streaming.
+    %% So let's test: start in connecting (undefined), send stream_ready
+    %% with a process that then dies.
+    {Pid2, _} = start_agent(<<"shdc-2">>, undefined),
+    StreamHandler2 = spawn(fun() -> receive stop -> ok end end),
+    gen_statem:cast(Pid2, {stream_ready, StreamHandler2}),
+    timer:sleep(20),
+
+    {ok, Info2} = yuzu_gw_agent:get_info(Pid2),
+    ?assertEqual(streaming, maps:get(state, Info2)),
+
+    %% Kill the stream handler.
+    exit(StreamHandler2, kill),
+    ok = wait_for_death(Pid2, 2000),
+    ?assertEqual(error, yuzu_gw_registry:lookup(<<"shdc-2">>)),
+
+    %% Cleanup the first agent.
+    case is_process_alive(Pid) of
+        true  -> yuzu_gw_agent:disconnect(Pid), wait_for_death(Pid, 1000);
+        false -> ok
+    end.
 
 %%%===================================================================
 %%% Helpers

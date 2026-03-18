@@ -353,6 +353,21 @@ public:
         return agents_.size();
     }
 
+    // Map a session_id to an agent_id (called when Subscribe completes handshake).
+    void map_session(const std::string& session_id, const std::string& agent_id) {
+        std::lock_guard lock(mu_);
+        session_to_agent_[session_id] = agent_id;
+    }
+
+    // Look up agent session by session_id (for heartbeat validation).
+    std::shared_ptr<AgentSession> find_by_session(std::string_view session_id) const {
+        std::lock_guard lock(mu_);
+        auto sit = session_to_agent_.find(std::string(session_id));
+        if (sit == session_to_agent_.end()) return nullptr;
+        auto ait = agents_.find(sit->second);
+        return ait != agents_.end() ? ait->second : nullptr;
+    }
+
     // Get a session by agent_id (for scope evaluation).
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const {
         std::lock_guard lock(mu_);
@@ -395,6 +410,7 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
+    std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
 };
@@ -449,6 +465,102 @@ void sse_resource_release(
     bus.unsubscribe(state->sub_id);
 }
 
+// -- AgentHealthStore ---------------------------------------------------------
+// Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
+
+struct AgentHealthSnapshot {
+    std::string agent_id;
+    std::unordered_map<std::string, std::string> status_tags;
+    std::chrono::steady_clock::time_point last_seen;
+};
+
+class AgentHealthStore {
+public:
+    void upsert(const std::string& agent_id,
+                const google::protobuf::Map<std::string, std::string>& tags) {
+        std::lock_guard lock(mu_);
+        auto& snap = snapshots_[agent_id];
+        snap.agent_id = agent_id;
+        snap.status_tags.clear();
+        for (const auto& [k, v] : tags) {
+            snap.status_tags[k] = v;
+        }
+        snap.last_seen = std::chrono::steady_clock::now();
+    }
+
+    void remove(const std::string& agent_id) {
+        std::lock_guard lock(mu_);
+        snapshots_.erase(agent_id);
+    }
+
+    void recompute_metrics(yuzu::MetricsRegistry& metrics,
+                           std::chrono::seconds staleness) {
+        std::lock_guard lock(mu_);
+        auto now = std::chrono::steady_clock::now();
+
+        // Prune stale entries
+        std::erase_if(snapshots_, [&](const auto& pair) {
+            return (now - pair.second.last_seen) > staleness;
+        });
+
+        // Clear labeled gauge families before rebuilding
+        metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
+        metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
+        metrics.clear_gauge_family("yuzu_fleet_agents_by_version");
+
+        // Aggregate
+        std::unordered_map<std::string, int> os_counts;
+        std::unordered_map<std::string, int> arch_counts;
+        std::unordered_map<std::string, int> version_counts;
+        double total_commands = 0.0;
+        int healthy_count = 0;
+
+        for (const auto& [id, snap] : snapshots_) {
+            ++healthy_count;
+
+            auto get = [&](const std::string& key) -> std::string {
+                auto it = snap.status_tags.find(key);
+                return it != snap.status_tags.end() ? it->second : "";
+            };
+
+            auto os_val = get("yuzu.os");
+            if (!os_val.empty()) os_counts[os_val]++;
+
+            auto arch_val = get("yuzu.arch");
+            if (!arch_val.empty()) arch_counts[arch_val]++;
+
+            auto ver_val = get("yuzu.agent_version");
+            if (!ver_val.empty()) version_counts[ver_val]++;
+
+            auto cmd_val = get("yuzu.commands_executed");
+            if (!cmd_val.empty()) {
+                try { total_commands += std::stod(cmd_val); } catch (...) {}
+            }
+        }
+
+        metrics.gauge("yuzu_fleet_agents_healthy").set(
+            static_cast<double>(healthy_count));
+
+        for (const auto& [os, count] : os_counts) {
+            metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(
+                static_cast<double>(count));
+        }
+        for (const auto& [arch, count] : arch_counts) {
+            metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", arch}}).set(
+                static_cast<double>(count));
+        }
+        for (const auto& [ver, count] : version_counts) {
+            metrics.gauge("yuzu_fleet_agents_by_version", {{"version", ver}}).set(
+                static_cast<double>(count));
+        }
+        metrics.gauge("yuzu_fleet_commands_executed_total").set(total_commands);
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+};
+
 // -- AgentServiceImpl ---------------------------------------------------------
 
 class AgentServiceImpl : public pb::AgentService::Service {
@@ -472,6 +584,7 @@ public:
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    void set_health_store(AgentHealthStore* store) { health_store_ = store; }
 
     grpc::Status Register(
         grpc::ServerContext* context,
@@ -664,6 +777,52 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status Heartbeat(
+        grpc::ServerContext* /*context*/,
+        const pb::HeartbeatRequest* request,
+        pb::HeartbeatResponse* response) override
+    {
+        metrics_.counter("yuzu_grpc_requests_total",
+            {{"method", "Heartbeat"}, {"status", "received"}}).increment();
+
+        // Validate session
+        const auto& session_id = request->session_id();
+        std::string agent_id;
+        {
+            std::lock_guard lock(pending_mu_);
+            auto it = pending_by_session_id_.find(std::string(session_id));
+            if (it != pending_by_session_id_.end()) {
+                agent_id = it->second.agent_id;
+            }
+        }
+        if (agent_id.empty()) {
+            // Try the registry directly
+            auto session = registry_.find_by_session(session_id);
+            if (session) {
+                agent_id = session->agent_id;
+            }
+        }
+
+        if (agent_id.empty()) {
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
+        }
+
+        // Store health snapshot
+        if (health_store_) {
+            health_store_->upsert(agent_id, request->status_tags());
+        }
+        metrics_.counter("yuzu_heartbeats_received_total",
+            {{"via", "direct"}}).increment();
+
+        response->set_acknowledged(true);
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        response->mutable_server_time()->set_millis_epoch(now_ms);
+
+        spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
+        return grpc::Status::OK;
+    }
+
     grpc::Status Subscribe(
         grpc::ServerContext* context,
         grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) override
@@ -709,6 +868,7 @@ public:
 
         spdlog::info("Agent subscribe stream opened for {}", agent_id);
         registry_.set_stream(agent_id, stream);
+        registry_.map_session(session_id, agent_id);
 
         auto subscribe_start = std::chrono::steady_clock::now();
         if (analytics_store_) {
@@ -1061,6 +1221,7 @@ private:
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
+    AgentHealthStore* health_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1076,9 +1237,12 @@ class GatewayUpstreamServiceImpl : public gw::GatewayUpstream::Service {
 public:
     GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus,
                                auth::AuthManager& auth_mgr,
-                               auth::AutoApproveEngine& auto_approve)
+                               auth::AutoApproveEngine& auto_approve,
+                               yuzu::MetricsRegistry* metrics = nullptr,
+                               AgentHealthStore* health_store = nullptr)
         : registry_(registry), bus_(bus),
-          auth_mgr_(auth_mgr), auto_approve_(auto_approve) {}
+          auth_mgr_(auth_mgr), auto_approve_(auto_approve),
+          metrics_(metrics), health_store_(health_store) {}
 
     // -- ProxyRegister --------------------------------------------------------
     // Gateway forwards an agent's RegisterRequest.  We run the same enrollment
@@ -1200,8 +1364,14 @@ public:
                               hb.session_id());
                 continue;
             }
-            // TODO: Update last-heartbeat timestamp in registry when session
-            //       timeout tracking is implemented.
+            // Store agent health from piggybacked status_tags
+            if (health_store_) {
+                health_store_->upsert(agent_id, hb.status_tags());
+            }
+            if (metrics_) {
+                metrics_->counter("yuzu_heartbeats_received_total",
+                    {{"via", "gateway"}}).increment();
+            }
             ++acked;
         }
 
@@ -1298,6 +1468,8 @@ private:
     EventBus& bus_;
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine& auto_approve_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    AgentHealthStore* health_store_{nullptr};
 
     // Map of gateway session_id → agent_id for validation.
     std::mutex sessions_mu_;
@@ -1345,10 +1517,28 @@ public:
             "Total gRPC requests by method and status", "counter");
         metrics_.describe("yuzu_http_requests_total",
             "Total HTTP requests by path and status", "counter");
+        // Fleet health metrics (aggregated from agent heartbeat status_tags)
+        metrics_.describe("yuzu_fleet_agents_healthy",
+            "Number of agents reporting healthy via heartbeat", "gauge");
+        metrics_.describe("yuzu_fleet_agents_by_os",
+            "Connected agents by operating system", "gauge");
+        metrics_.describe("yuzu_fleet_agents_by_arch",
+            "Connected agents by CPU architecture", "gauge");
+        metrics_.describe("yuzu_fleet_agents_by_version",
+            "Connected agents by agent version", "gauge");
+        metrics_.describe("yuzu_fleet_commands_executed_total",
+            "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        metrics_.describe("yuzu_heartbeats_received_total",
+            "Total heartbeats received from agents", "counter");
+
+        // Wire health store into agent service
+        agent_service_.set_health_store(&health_store_);
+
         // Create gateway upstream service if configured
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
-                registry_, event_bus_, auth_mgr, auto_approve_);
+                registry_, event_bus_, auth_mgr, auto_approve_,
+                &metrics_, &health_store_);
         }
 
         // Load auto-approve policies
@@ -1550,11 +1740,32 @@ public:
         }
 
         start_web_server();
+
+        // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
+        health_recompute_thread_ = std::thread([this]() {
+            spdlog::info("Fleet health recomputation thread started (interval=15s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                // Sleep in small increments for responsive shutdown
+                for (int i = 0; i < 3 && !stop_requested_.load(std::memory_order_acquire); ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                }
+                if (stop_requested_.load(std::memory_order_acquire)) break;
+                health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+            }
+            spdlog::info("Fleet health recomputation thread stopped");
+        });
+
         agent_server_->Wait();
     }
 
     void stop() noexcept override {
         spdlog::info("Shutting down server...");
+        stop_requested_.store(true, std::memory_order_release);
+
+        // Join the fleet health recomputation thread
+        if (health_recompute_thread_.joinable()) {
+            health_recompute_thread_.join();
+        }
 
         if (schedule_engine_) schedule_engine_->stop();
         if (nvd_sync_) {
@@ -4349,6 +4560,11 @@ private:
     std::unique_ptr<ApprovalManager>           approval_manager_;
     std::unique_ptr<ScheduleEngine>            schedule_engine_;
     sqlite3*                                   shared_instr_db_{nullptr};
+
+    // Fleet health aggregation
+    detail::AgentHealthStore                   health_store_;
+    std::thread                                health_recompute_thread_;
+    std::atomic<bool>                          stop_requested_{false};
 };
 
 // -- Factory ------------------------------------------------------------------

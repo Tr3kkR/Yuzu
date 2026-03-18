@@ -58,3 +58,57 @@ groups:
         annotations:
           summary: "No commands processed"
           description: "Agents are connected but no commands have been dispatched or completed in 15 minutes."
+
+      # Fleet health: more than 10% of connected agents are not heartbeating.
+      - alert: YuzuFleetUnhealthy
+        expr: >
+          (yuzu_agents_connected - yuzu_fleet_agents_healthy)
+          / yuzu_agents_connected > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 10% of agents are not sending heartbeats"
+          description: "{{ $value | humanizePercentage }} of connected agents have not sent a heartbeat recently."
+
+      # Heartbeats have completely stopped.
+      - alert: YuzuHeartbeatsStopped
+        expr: >
+          yuzu_agents_connected > 0
+          and rate(yuzu_heartbeats_received_total[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No heartbeats received from any agent"
+          description: "Agents are connected but no heartbeats have been received in 5 minutes."
+
+      # Gateway upstream RPC errors.
+      - alert: YuzuGatewayUpstreamErrors
+        expr: rate(yuzu_gw_upstream_rpc_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway upstream RPC errors"
+          description: "Gateway is experiencing {{ $value }}/s upstream RPC errors."
+
+      # Gateway BEAM VM memory exceeds 4GB.
+      - alert: YuzuGatewayMemoryHigh
+        expr: yuzu_gw_beam_memory_bytes{type="total"} > 4294967296
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway BEAM VM memory exceeds 4GB"
+          description: "Gateway node {{ $labels.node }} is using {{ $value | humanize1024 }}B of memory."
+
+      # Gateway agent session churn.
+      - alert: YuzuGatewayHighChurn
+        expr: rate(yuzu_gw_agents_disconnected_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "High agent disconnect rate on gateway"
+          description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."

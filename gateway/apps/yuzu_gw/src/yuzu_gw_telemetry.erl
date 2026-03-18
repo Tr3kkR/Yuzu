@@ -61,10 +61,6 @@ setup() ->
         #{}
     ),
 
-    %% Start periodic gauge emitter.
-    Interval = application:get_env(yuzu_gw, telemetry_gauge_interval_ms, 10000),
-    spawn_link(fun() -> gauge_loop(Interval) end),
-
     ok.
 
 %%--------------------------------------------------------------------
@@ -231,45 +227,6 @@ declare_metrics() ->
         {help, "BEAM scheduler utilization (weighted average)"}]),
 
     ok.
-
-%% Periodic gauge emitter for agent count and BEAM VM stats.
-gauge_loop(Interval) ->
-    timer:sleep(Interval),
-
-    %% Agent count
-    Count = yuzu_gw_registry:agent_count(),
-    telemetry:execute([yuzu, gw, agent, count],
-                      #{count => Count}, #{}),
-
-    %% BEAM process count
-    telemetry:execute([yuzu, gw, vm, process_count],
-                      #{count => erlang:system_info(process_count)}, #{}),
-
-    %% BEAM memory
-    Mem = erlang:memory(),
-    telemetry:execute([yuzu, gw, vm, memory],
-                      #{total     => proplists:get_value(total, Mem, 0),
-                        processes => proplists:get_value(processes, Mem, 0),
-                        ets       => proplists:get_value(ets, Mem, 0),
-                        binary    => proplists:get_value(binary, Mem, 0)},
-                      #{}),
-
-    %% Scheduler utilization
-    case erlang:statistics(scheduler_wall_time_all) of
-        undefined ->
-            ok;
-        SchedTimes ->
-            Total = lists:sum([A || {_, A, _} <- SchedTimes]),
-            Active = lists:sum([W || {_, _, W} <- SchedTimes]),
-            Avg = case Total of
-                0 -> 0.0;
-                _ -> Active / Total
-            end,
-            telemetry:execute([yuzu, gw, vm, scheduler_util],
-                              #{weighted_avg => Avg}, #{})
-    end,
-
-    gauge_loop(Interval).
 
 node_labels(Meta) ->
     [maps:get(node, Meta, node())].

@@ -35,6 +35,12 @@ init([]) ->
     },
 
     Children = [
+        #{id       => pg_scope,
+          start    => {pg, start_link, [yuzu_gw]},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
         #{id       => yuzu_gw_registry,
           start    => {yuzu_gw_registry, start_link, []},
           restart  => permanent,
@@ -49,6 +55,12 @@ init([]) ->
 
         #{id       => yuzu_gw_router,
           start    => {yuzu_gw_router, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        #{id       => yuzu_gw_gauge,
+          start    => {yuzu_gw_gauge, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},

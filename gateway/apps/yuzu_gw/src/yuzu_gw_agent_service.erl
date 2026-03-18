@@ -46,7 +46,7 @@ register(Ctx, RegisterReq) ->
             AgentId = extract_agent_id(AgentInfo),
 
             %% Store pending registration for Subscribe matching.
-            persistent_term:put({yuzu_gw_pending, SessionId},
+            yuzu_gw_registry:store_pending(SessionId,
                                 #{agent_id  => AgentId,
                                   agent_info => AgentInfo,
                                   peer_addr  => PeerAddr,
@@ -86,7 +86,7 @@ subscribe(Ref, State) ->
             throw({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
                                 <<"Missing x-yuzu-session-id header">>}});
         _ ->
-            case persistent_term:get({yuzu_gw_pending, SessionId}, undefined) of
+            case yuzu_gw_registry:take_pending(SessionId) of
                 undefined ->
                     logger:warning("Subscribe: no pending registration for session ~s",
                                    [SessionId]),
@@ -95,8 +95,6 @@ subscribe(Ref, State) ->
 
                 #{agent_id := AgentId, agent_info := AgentInfo,
                   peer_addr := PeerAddr} ->
-                    %% Clean up the pending entry.
-                    persistent_term:erase({yuzu_gw_pending, SessionId}),
 
                     %% Spawn the agent process — it owns this stream.
                     %% We pass stream_pid=self() so the agent process sends

@@ -21,6 +21,8 @@
          watch_events/2,
          query_inventory/2]).
 
+-export([json_escape/1]).
+
 %%--------------------------------------------------------------------
 %% SendCommand — fan out to agents, stream responses back
 %%--------------------------------------------------------------------
@@ -49,7 +51,7 @@ send_command(Request, #{stream := StreamRef} = _Ctx) ->
 %% ListAgents — answered entirely from the gateway's ETS table
 %%--------------------------------------------------------------------
 
-list_agents(Request, _Ctx) ->
+list_agents(Request, Ctx) ->
     Limit  = maps:get(limit, Request, maps:get(<<"limit">>, Request, 100)),
     Cursor = maps:get(cursor, Request, maps:get(<<"cursor">>, Request, undefined)),
 
@@ -71,13 +73,13 @@ list_agents(Request, _Ctx) ->
         agents      => Summaries,
         next_cursor => case NextCursor of undefined -> <<>>; C -> C end
     },
-    {ok, Response, #{}}.
+    {ok, Response, Ctx}.
 
 %%--------------------------------------------------------------------
 %% GetAgent — query the agent process directly
 %%--------------------------------------------------------------------
 
-get_agent(Request, _Ctx) ->
+get_agent(Request, Ctx) ->
     AgentId = maps:get(agent_id, Request,
                        maps:get(<<"agent_id">>, Request, undefined)),
 
@@ -95,7 +97,7 @@ get_agent(Request, _Ctx) ->
                                                        maps:get(connected_at, Info, 0)}},
                         plugins => Plugins
                     },
-                    {ok, Response, #{}};
+                    {ok, Response, Ctx};
                 {error, Reason} ->
                     {error, #{status => 13,
                               message => iolist_to_binary(
@@ -121,7 +123,7 @@ watch_events(Request, #{stream := StreamRef} = _Ctx) ->
 %% QueryInventory — return agents connected to this gateway instance
 %%--------------------------------------------------------------------
 
-query_inventory(Request, _Ctx) ->
+query_inventory(Request, Ctx) ->
     ReqAgentId = maps:get(agent_id, Request,
                            maps:get(<<"agent_id">>, Request, <<>>)),
     Plugin     = maps:get(plugin, Request,
@@ -151,7 +153,7 @@ query_inventory(Request, _Ctx) ->
     Now = erlang:system_time(millisecond),
     {ok, #{agent_id     => ReqAgentId,
            plugin_data  => PluginData,
-           collected_at => #{millis_epoch => Now}}, #{}}.
+           collected_at => #{millis_epoch => Now}}, Ctx}.
 
 %%%===================================================================
 %%% Internal
@@ -172,28 +174,53 @@ watch_event_loop(StreamRef, FilterIds) ->
             end,
             watch_event_loop(StreamRef, FilterIds);
         stop_watching ->
+            pg:leave(yuzu_gw, event_watchers, self()),
             grpcbox_stream:send_trailing(StreamRef, #{})
     after 86400000 ->
         %% 24-hour safety timeout.
+        pg:leave(yuzu_gw, event_watchers, self()),
         grpcbox_stream:send_trailing(StreamRef, #{})
     end.
 
 %% Encode an agent summary (from the ETS-derived map) as a JSON binary.
 agent_to_json(Agent) ->
-    AgentId   = maps:get(agent_id, Agent, <<>>),
-    SessionId = maps:get(session_id, Agent, <<>>),
-    Node      = atom_to_binary(maps:get(node, Agent, node()), utf8),
+    AgentId   = json_escape(maps:get(agent_id, Agent, <<>>)),
+    SessionId = json_escape(maps:get(session_id, Agent, <<>>)),
+    Node      = json_escape(atom_to_binary(maps:get(node, Agent, node()), utf8)),
     ConnAt    = maps:get(connected_at, Agent, 0),
     Plugins   = maps:get(plugins, Agent, []),
     PluginsJson = iolist_to_binary(
         [<<"[">>,
-         lists:join(<<",">>, [<<$", P/binary, $">> || P <- Plugins]),
+         lists:join(<<",">>, [<<$", (json_escape(P))/binary, $">> || P <- Plugins]),
          <<"]">>]),
     iolist_to_binary(io_lib:format(
         "{\"agent_id\":\"~s\",\"session_id\":\"~s\",\"node\":\"~s\","
         "\"connected_at\":~b,\"plugins\":~s}",
         [AgentId, SessionId, Node, ConnAt, PluginsJson]
     )).
+
+%% @doc Escape a binary string for safe inclusion in JSON output.
+-spec json_escape(binary()) -> binary().
+json_escape(Bin) when is_binary(Bin) ->
+    json_escape_chars(Bin, <<>>).
+
+json_escape_chars(<<>>, Acc) ->
+    Acc;
+json_escape_chars(<<$", Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, $\\, $">>);
+json_escape_chars(<<$\\, Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, $\\, $\\>>);
+json_escape_chars(<<$\n, Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, $\\, $n>>);
+json_escape_chars(<<$\r, Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, $\\, $r>>);
+json_escape_chars(<<$\t, Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, $\\, $t>>);
+json_escape_chars(<<C, Rest/binary>>, Acc) when C < 16#20 ->
+    Hex = list_to_binary(io_lib:format("\\u~4.16.0b", [C])),
+    json_escape_chars(Rest, <<Acc/binary, Hex/binary>>);
+json_escape_chars(<<C, Rest/binary>>, Acc) ->
+    json_escape_chars(Rest, <<Acc/binary, C>>).
 
 %% Stream command responses back to the operator until fanout completes.
 stream_responses(StreamRef, FanoutRef) ->

@@ -49,6 +49,25 @@ namespace {
 namespace pb = ::yuzu::agent::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
+#if defined(_WIN32)
+constexpr const char* kAgentOs   = "windows";
+constexpr const char* kAgentArch = "x86_64";
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+constexpr const char* kAgentOs   = "darwin";
+constexpr const char* kAgentArch = "aarch64";
+#  else
+constexpr const char* kAgentOs   = "darwin";
+constexpr const char* kAgentArch = "x86_64";
+#  endif
+#elif defined(__aarch64__)
+constexpr const char* kAgentOs   = "linux";
+constexpr const char* kAgentArch = "aarch64";
+#else
+constexpr const char* kAgentOs   = "linux";
+constexpr const char* kAgentArch = "x86_64";
+#endif
+
 std::string read_file_contents(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) return {};
@@ -465,29 +484,11 @@ public:
 
         // 3b. OTA updater: rollback check and old binary cleanup
         {
-#if defined(_WIN32)
-            constexpr const char* kOsString   = "windows";
-            constexpr const char* kArchString = "x86_64";
-#elif defined(__APPLE__)
-#  if defined(__aarch64__)
-            constexpr const char* kOsString   = "darwin";
-            constexpr const char* kArchString = "aarch64";
-#  else
-            constexpr const char* kOsString   = "darwin";
-            constexpr const char* kArchString = "x86_64";
-#  endif
-#elif defined(__aarch64__)
-            constexpr const char* kOsString   = "linux";
-            constexpr const char* kArchString = "aarch64";
-#else
-            constexpr const char* kOsString   = "linux";
-            constexpr const char* kArchString = "x86_64";
-#endif
             updater_ = std::make_unique<Updater>(
                 UpdateConfig{cfg_.auto_update, cfg_.update_check_interval},
                 cfg_.agent_id,
                 std::string{yuzu::kFullVersionString},
-                kOsString, kArchString,
+                kAgentOs, kAgentArch,
                 current_executable_path());
 
             if (updater_->rollback_if_needed()) {
@@ -538,6 +539,56 @@ public:
                             remaining -= sleep_time;
                         }
                     }
+                });
+            }
+
+            // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
+            {
+                auto hb_stub = pb::AgentService::NewStub(channel);
+                heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
+                    spdlog::info("Heartbeat thread started (interval={}s)",
+                        cfg_.heartbeat_interval.count());
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        // Sleep in small increments for responsive shutdown
+                        auto remaining = cfg_.heartbeat_interval;
+                        while (remaining.count() > 0
+                               && !stop_requested_.load(std::memory_order_acquire)) {
+                            auto sleep_time = std::min(remaining, std::chrono::seconds{5});
+                            std::this_thread::sleep_for(sleep_time);
+                            remaining -= sleep_time;
+                        }
+                        if (stop_requested_.load(std::memory_order_acquire)) break;
+
+                        // Build heartbeat with piggybacked metrics
+                        grpc::ClientContext ctx;
+                        pb::HeartbeatRequest req;
+                        req.set_session_id(session_id_);
+                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
+                        req.mutable_sent_at()->set_millis_epoch(now_ms);
+
+                        auto& tags = *req.mutable_status_tags();
+                        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - start_time_).count();
+                        tags["yuzu.uptime_s"] = std::to_string(uptime);
+                        tags["yuzu.commands_executed"] = std::to_string(
+                            static_cast<int64_t>(metrics_.counter(
+                                "yuzu_agent_commands_executed_total").value()));
+                        tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                        tags["yuzu.os"] = kAgentOs;
+                        tags["yuzu.arch"] = kAgentArch;
+                        tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
+                        tags["yuzu.healthy"] = "1";
+
+                        pb::HeartbeatResponse resp;
+                        auto status = hb_stub->Heartbeat(&ctx, req, &resp);
+                        if (!status.ok()) {
+                            spdlog::warn("Heartbeat failed: {}", status.error_message());
+                        } else {
+                            spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
+                        }
+                    }
+                    spdlog::info("Heartbeat thread stopped");
                 });
             }
 
@@ -685,6 +736,11 @@ public:
                 update_thread_.join();
             }
 
+            // Stop and join the heartbeat thread
+            if (heartbeat_thread_.joinable()) {
+                heartbeat_thread_.join();
+            }
+
             spdlog::info("Subscribe stream ended");
         }
 
@@ -720,6 +776,7 @@ private:
     std::vector<std::thread>            exec_threads_;
     std::unique_ptr<Updater>            updater_;
     std::thread                         update_thread_;
+    std::thread                         heartbeat_thread_;
 };
 
 // Factory

@@ -2,9 +2,9 @@
 %%% @doc Tests for yuzu_gw_registry — ETS routing table + pg groups.
 %%%
 %%% Tests registration, lookup, deregistration, process monitor cleanup,
-%%% pg group membership, and cursor-based pagination.  Scale tests
-%%% verify O(1) lookup holds at 50K+ entries and that no monitors or
-%%% ETS rows leak under churn.
+%%% pg group membership, cursor-based pagination, pending registration
+%%% storage (store_pending/take_pending), TTL sweep, and monitor ref
+%%% leak prevention.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_registry_tests).
@@ -30,7 +30,15 @@ registry_test_() ->
       {"pagination returns correct pages", fun pagination_basic/0},
       {"pagination cursor advances correctly", fun pagination_cursor/0},
       {"deregister non-existent is safe", fun deregister_nonexistent/0},
-      {"lookup dead process returns error", fun lookup_dead_process/0}
+      {"lookup dead process returns error", fun lookup_dead_process/0},
+      %% Pending registration tests
+      {"store_pending and take_pending round-trip", fun pending_store_take/0},
+      {"take_pending returns undefined for unknown session", fun pending_take_unknown/0},
+      {"take_pending deletes entry atomically", fun pending_take_deletes/0},
+      {"pending sweep removes expired entries", fun pending_sweep_expired/0},
+      {"pending sweep preserves fresh entries", fun pending_sweep_preserves_fresh/0},
+      %% Monitor ref leak test
+      {"re-register does not leak monitor refs", fun reregister_no_monitor_leak/0}
      ]}.
 
 setup() ->
@@ -168,6 +176,82 @@ lookup_dead_process() ->
     receive {'DOWN', MonRef, process, Pid, _} -> ok after 1000 -> error(timeout) end,
     %% Process is confirmed dead; lookup checks is_process_alive and should return error.
     ?assertEqual(error, yuzu_gw_registry:lookup(<<"dead-lookup">>)).
+
+%%%===================================================================
+%%% Pending registration tests
+%%%===================================================================
+
+pending_store_take() ->
+    Info = #{agent_id => <<"pending-1">>, peer_addr => <<"1.2.3.4">>},
+    ok = yuzu_gw_registry:store_pending(<<"sess-pend-1">>, Info),
+    Result = yuzu_gw_registry:take_pending(<<"sess-pend-1">>),
+    ?assertEqual(Info, Result).
+
+pending_take_unknown() ->
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<"no-such-session">>)).
+
+pending_take_deletes() ->
+    Info = #{agent_id => <<"pending-2">>},
+    ok = yuzu_gw_registry:store_pending(<<"sess-pend-2">>, Info),
+    %% First take returns the data.
+    ?assertEqual(Info, yuzu_gw_registry:take_pending(<<"sess-pend-2">>)),
+    %% Second take returns undefined (already deleted).
+    ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<"sess-pend-2">>)).
+
+pending_sweep_expired() ->
+    %% Directly insert an expired entry into the ETS table.
+    ExpiredTime = erlang:system_time(millisecond) - 200000,  %% 200s ago (TTL is 120s)
+    ets:insert(yuzu_gw_pending, {<<"sweep-expired-1">>, #{agent_id => <<"x">>}, ExpiredTime}),
+
+    %% Trigger sweep.
+    yuzu_gw_registry ! sweep_pending,
+    timer:sleep(50),
+
+    %% Expired entry should be gone.
+    ?assertEqual([], ets:lookup(yuzu_gw_pending, <<"sweep-expired-1">>)).
+
+pending_sweep_preserves_fresh() ->
+    %% Insert a fresh entry.
+    FreshTime = erlang:system_time(millisecond),
+    ets:insert(yuzu_gw_pending, {<<"sweep-fresh-1">>, #{agent_id => <<"y">>}, FreshTime}),
+
+    %% Also insert an expired one.
+    ExpiredTime = erlang:system_time(millisecond) - 200000,
+    ets:insert(yuzu_gw_pending, {<<"sweep-expired-2">>, #{agent_id => <<"z">>}, ExpiredTime}),
+
+    %% Trigger sweep.
+    yuzu_gw_registry ! sweep_pending,
+    timer:sleep(50),
+
+    %% Fresh entry should still exist.
+    ?assertMatch([{_, _, _}], ets:lookup(yuzu_gw_pending, <<"sweep-fresh-1">>)),
+    %% Expired entry should be gone.
+    ?assertEqual([], ets:lookup(yuzu_gw_pending, <<"sweep-expired-2">>)),
+
+    %% Cleanup.
+    ets:delete(yuzu_gw_pending, <<"sweep-fresh-1">>).
+
+%%%===================================================================
+%%% Monitor ref leak tests
+%%%===================================================================
+
+reregister_no_monitor_leak() ->
+    %% Register agent, then re-register with a new process.
+    %% The old monitor ref should be removed from the map.
+    Pid1 = spawn_dummy(),
+    Pid2 = spawn_dummy(),
+    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid1, <<"s1">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid2, <<"s2">>, []),
+
+    %% Inspect the gen_server state via sys:get_state.
+    {state, MonRefs, _SweepTimer} = sys:get_state(yuzu_gw_registry),
+
+    %% There should be exactly one monitor ref for <<"leak-test">>.
+    RefCount = length([V || {_, V} <- maps:to_list(MonRefs), V =:= <<"leak-test">>]),
+    ?assertEqual(1, RefCount),
+
+    kill_dummy(Pid1),
+    kill_dummy(Pid2).
 
 %%%===================================================================
 %%% Helpers
