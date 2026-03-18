@@ -1,8 +1,12 @@
 # Build directories
 build/
 build-*/
+builddir/
 out/
 .cache/
+
+# Erlang / rebar3
+gateway/_build/
 
 # Meson
 .mesonpy/
@@ -23,6 +27,7 @@ vcpkg_installed/
 *.a
 *.lib
 *.pdb
+*.obj
 
 # Generated protobuf sources
 *.pb.h
