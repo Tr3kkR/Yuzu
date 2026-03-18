@@ -27,12 +27,11 @@ namespace yuzu {
 // ── Error type ────────────────────────────────────────────────────────────────
 
 struct PluginError {
-    int         code;
+    int code;
     std::string message;
 };
 
-template <typename T>
-using Result = std::expected<T, PluginError>;
+template <typename T> using Result = std::expected<T, PluginError>;
 
 // ── Parameter access ──────────────────────────────────────────────────────────
 
@@ -43,14 +42,16 @@ public:
     [[nodiscard]] std::string_view get(std::string_view key,
                                        std::string_view def = {}) const noexcept {
         for (const auto& p : raw_) {
-            if (p.key && key == p.key) return p.value ? p.value : def;
+            if (p.key && key == p.key)
+                return p.value ? p.value : def;
         }
         return def;
     }
 
     [[nodiscard]] bool has(std::string_view key) const noexcept {
         for (const auto& p : raw_) {
-            if (p.key && key == p.key) return true;
+            if (p.key && key == p.key)
+                return true;
         }
         return false;
     }
@@ -69,9 +70,7 @@ public:
         yuzu_ctx_write_output(raw_, std::string{text}.c_str());
     }
 
-    void report_progress(int percent) {
-        yuzu_ctx_report_progress(raw_, percent);
-    }
+    void report_progress(int percent) { yuzu_ctx_report_progress(raw_, percent); }
 
 private:
     YuzuCommandContext* raw_;
@@ -110,8 +109,8 @@ class Plugin {
 public:
     virtual ~Plugin() = default;
 
-    [[nodiscard]] virtual std::string_view name()        const noexcept = 0;
-    [[nodiscard]] virtual std::string_view version()     const noexcept = 0;
+    [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view version() const noexcept = 0;
     [[nodiscard]] virtual std::string_view description() const noexcept = 0;
 
     /**
@@ -136,9 +135,7 @@ public:
      * Thread-safety: the agent may call this concurrently for different command IDs.
      * @return 0 on success, non-zero error code on failure.
      */
-    virtual int execute(CommandContext& ctx,
-                        std::string_view action,
-                        Params params) = 0;
+    virtual int execute(CommandContext& ctx, std::string_view action, Params params) = 0;
 };
 
 // ── Secure temporary file RAII wrapper ──────────────────────────────────────
@@ -157,18 +154,13 @@ public:
      * @param directory Override temp directory (empty = system default).
      * @param persist   If false, file is deleted in destructor.
      */
-    static Result<TempFile> create(
-            std::string_view prefix = "yuzu-",
-            std::string_view suffix = ".tmp",
-            std::string_view directory = {},
-            bool persist = false)
-    {
+    static Result<TempFile> create(std::string_view prefix = "yuzu-",
+                                   std::string_view suffix = ".tmp",
+                                   std::string_view directory = {}, bool persist = false) {
         char buf[512]{};
-        int rc = yuzu_create_temp_file(
-            std::string{prefix}.c_str(),
-            std::string{suffix}.c_str(),
-            directory.empty() ? nullptr : std::string{directory}.c_str(),
-            buf, sizeof(buf));
+        int rc = yuzu_create_temp_file(std::string{prefix}.c_str(), std::string{suffix}.c_str(),
+                                       directory.empty() ? nullptr : std::string{directory}.c_str(),
+                                       buf, sizeof(buf));
         if (rc != 0) {
             return std::unexpected(PluginError{rc, "Failed to create temp file"});
         }
@@ -182,8 +174,7 @@ public:
         }
     }
 
-    TempFile(TempFile&& o) noexcept
-        : path_{std::move(o.path_)}, persist_{o.persist_} {
+    TempFile(TempFile&& o) noexcept : path_{std::move(o.path_)}, persist_{o.persist_} {
         o.path_.clear();
     }
 
@@ -209,8 +200,7 @@ public:
     void release() noexcept { persist_ = true; }
 
 private:
-    TempFile(std::string path, bool persist)
-        : path_{std::move(path)}, persist_{persist} {}
+    TempFile(std::string path, bool persist) : path_{std::move(path)}, persist_{persist} {}
 
     std::string path_;
     bool persist_;
@@ -225,16 +215,12 @@ private:
  */
 class TempDir {
 public:
-    static Result<TempDir> create(
-            std::string_view prefix = "yuzu-",
-            std::string_view directory = {},
-            bool persist = false)
-    {
+    static Result<TempDir> create(std::string_view prefix = "yuzu-",
+                                  std::string_view directory = {}, bool persist = false) {
         char buf[512]{};
-        int rc = yuzu_create_temp_dir(
-            std::string{prefix}.c_str(),
-            directory.empty() ? nullptr : std::string{directory}.c_str(),
-            buf, sizeof(buf));
+        int rc = yuzu_create_temp_dir(std::string{prefix}.c_str(),
+                                      directory.empty() ? nullptr : std::string{directory}.c_str(),
+                                      buf, sizeof(buf));
         if (rc != 0) {
             return std::unexpected(PluginError{rc, "Failed to create temp directory"});
         }
@@ -248,8 +234,7 @@ public:
         }
     }
 
-    TempDir(TempDir&& o) noexcept
-        : path_{std::move(o.path_)}, persist_{o.persist_} {
+    TempDir(TempDir&& o) noexcept : path_{std::move(o.path_)}, persist_{o.persist_} {
         o.path_.clear();
     }
 
@@ -274,14 +259,13 @@ public:
     void release() noexcept { persist_ = true; }
 
 private:
-    TempDir(std::string path, bool persist)
-        : path_{std::move(path)}, persist_{persist} {}
+    TempDir(std::string path, bool persist) : path_{std::move(path)}, persist_{persist} {}
 
     std::string path_;
     bool persist_;
 };
 
-}  // namespace yuzu
+} // namespace yuzu
 
 // ── Export macro ──────────────────────────────────────────────────────────────
 
@@ -293,47 +277,53 @@ private:
  *   class InventoryPlugin final : public yuzu::Plugin { ... };
  *   YUZU_PLUGIN_EXPORT(InventoryPlugin)
  */
-#define YUZU_PLUGIN_EXPORT(ClassName)                                          \
-    static ClassName _yuzu_plugin_instance_{};                                 \
-                                                                               \
-    /* Trampoline: init */                                                     \
-    static int _yuzu_init_(YuzuPluginContext* ctx) {                           \
-        yuzu::PluginContext wrap{ctx};                                          \
-        auto res = _yuzu_plugin_instance_.init(wrap);                          \
-        return res ? 0 : res.error().code;                                     \
-    }                                                                          \
-                                                                               \
-    /* Trampoline: shutdown */                                                  \
-    static void _yuzu_shutdown_(YuzuPluginContext* ctx) {                      \
-        yuzu::PluginContext wrap{ctx};                                          \
-        _yuzu_plugin_instance_.shutdown(wrap);                                 \
-    }                                                                          \
-                                                                               \
-    /* Trampoline: execute */                                                  \
-    static int _yuzu_execute_(YuzuCommandContext* ctx,                         \
-                               const char* action,                             \
-                               const YuzuParam* params,                        \
-                               size_t param_count) {                           \
-        yuzu::CommandContext cmd_ctx{ctx};                                     \
-        yuzu::Params         p{{params, param_count}};                         \
-        return _yuzu_plugin_instance_.execute(cmd_ctx, action, p);             \
-    }                                                                          \
-                                                                               \
-    static const YuzuPluginDescriptor _yuzu_descriptor_{                       \
-        .abi_version = YUZU_PLUGIN_ABI_VERSION,                                \
-        .name        = []() { static const std::string s{                      \
-                           _yuzu_plugin_instance_.name()}; return s.c_str(); }(),   \
-        .version     = []() { static const std::string s{                      \
-                           _yuzu_plugin_instance_.version()}; return s.c_str(); }(),\
-        .description = []() { static const std::string s{                      \
-                           _yuzu_plugin_instance_.description()}; return s.c_str(); }(), \
-        .actions     = _yuzu_plugin_instance_.actions(),                       \
-        .init        = _yuzu_init_,                                            \
-        .shutdown    = _yuzu_shutdown_,                                        \
-        .execute     = _yuzu_execute_,                                         \
-    };                                                                         \
-                                                                               \
-    extern "C" YUZU_PLUGIN_API                                                 \
-    const YuzuPluginDescriptor* yuzu_plugin_descriptor(void) {                 \
-        return &_yuzu_descriptor_;                                             \
+#define YUZU_PLUGIN_EXPORT(ClassName)                                                              \
+    static ClassName _yuzu_plugin_instance_{};                                                     \
+                                                                                                   \
+    /* Trampoline: init */                                                                         \
+    static int _yuzu_init_(YuzuPluginContext* ctx) {                                               \
+        yuzu::PluginContext wrap{ctx};                                                             \
+        auto res = _yuzu_plugin_instance_.init(wrap);                                              \
+        return res ? 0 : res.error().code;                                                         \
+    }                                                                                              \
+                                                                                                   \
+    /* Trampoline: shutdown */                                                                     \
+    static void _yuzu_shutdown_(YuzuPluginContext* ctx) {                                          \
+        yuzu::PluginContext wrap{ctx};                                                             \
+        _yuzu_plugin_instance_.shutdown(wrap);                                                     \
+    }                                                                                              \
+                                                                                                   \
+    /* Trampoline: execute */                                                                      \
+    static int _yuzu_execute_(YuzuCommandContext* ctx, const char* action,                         \
+                              const YuzuParam* params, size_t param_count) {                       \
+        yuzu::CommandContext cmd_ctx{ctx};                                                         \
+        yuzu::Params p{{params, param_count}};                                                     \
+        return _yuzu_plugin_instance_.execute(cmd_ctx, action, p);                                 \
+    }                                                                                              \
+                                                                                                   \
+    static const YuzuPluginDescriptor _yuzu_descriptor_{                                           \
+        .abi_version = YUZU_PLUGIN_ABI_VERSION,                                                    \
+        .name =                                                                                    \
+            []() {                                                                                 \
+                static const std::string s{_yuzu_plugin_instance_.name()};                         \
+                return s.c_str();                                                                  \
+            }(),                                                                                   \
+        .version =                                                                                 \
+            []() {                                                                                 \
+                static const std::string s{_yuzu_plugin_instance_.version()};                      \
+                return s.c_str();                                                                  \
+            }(),                                                                                   \
+        .description =                                                                             \
+            []() {                                                                                 \
+                static const std::string s{_yuzu_plugin_instance_.description()};                  \
+                return s.c_str();                                                                  \
+            }(),                                                                                   \
+        .actions = _yuzu_plugin_instance_.actions(),                                               \
+        .init = _yuzu_init_,                                                                       \
+        .shutdown = _yuzu_shutdown_,                                                               \
+        .execute = _yuzu_execute_,                                                                 \
+    };                                                                                             \
+                                                                                                   \
+    extern "C" YUZU_PLUGIN_API const YuzuPluginDescriptor* yuzu_plugin_descriptor(void) {          \
+        return &_yuzu_descriptor_;                                                                 \
     }

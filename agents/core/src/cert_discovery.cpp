@@ -22,7 +22,8 @@ std::string getenv_string(const char* name) {
 #ifdef _WIN32
     char* value = nullptr;
     size_t len = 0;
-    if (_dupenv_s(&value, &len, name) != 0 || !value) return {};
+    if (_dupenv_s(&value, &len, name) != 0 || !value)
+        return {};
 
     std::string result{value};
     free(value);
@@ -36,26 +37,25 @@ std::string getenv_string(const char* name) {
 bool file_exists_and_readable(const std::filesystem::path& p) {
     std::error_code ec;
     auto status = std::filesystem::status(p, ec);
-    if (ec) return false;
+    if (ec)
+        return false;
     return std::filesystem::is_regular_file(status);
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 std::optional<DiscoveredCert> discover_client_cert() {
     // 1. Environment variables (all platforms)
     auto env_cert = getenv_string("YUZU_CLIENT_CERT");
-    auto env_key  = getenv_string("YUZU_CLIENT_KEY");
+    auto env_key = getenv_string("YUZU_CLIENT_KEY");
     if (!env_cert.empty() && !env_key.empty()) {
         std::filesystem::path cert_path{env_cert};
         std::filesystem::path key_path{env_key};
         if (file_exists_and_readable(cert_path) && file_exists_and_readable(key_path)) {
             spdlog::info("Auto-discovered client cert from environment: {}", cert_path.string());
-            return DiscoveredCert{
-                .cert_path = std::move(cert_path),
-                .key_path  = std::move(key_path),
-                .source    = "env"
-            };
+            return DiscoveredCert{.cert_path = std::move(cert_path),
+                                  .key_path = std::move(key_path),
+                                  .source = "env"};
         }
         spdlog::debug("YUZU_CLIENT_CERT/KEY set but files not readable");
     }
@@ -66,7 +66,8 @@ std::optional<DiscoveredCert> discover_client_cert() {
         // Yuzu-specific path (works with FreeIPA certmonger provisioning)
         {"/etc/yuzu/agent.pem", "/etc/yuzu/agent-key.pem", "convention:/etc/yuzu"},
         // RHEL / CentOS / Fedora (standard PKI paths, works with certmonger)
-        {"/etc/pki/tls/certs/yuzu-agent.pem", "/etc/pki/tls/private/yuzu-agent.pem", "convention:/etc/pki"},
+        {"/etc/pki/tls/certs/yuzu-agent.pem", "/etc/pki/tls/private/yuzu-agent.pem",
+         "convention:/etc/pki"},
         // Debian / Ubuntu
         {"/etc/ssl/certs/yuzu-agent.pem", "/etc/ssl/private/yuzu-agent.pem", "convention:/etc/ssl"},
     }};
@@ -77,11 +78,9 @@ std::optional<DiscoveredCert> discover_client_cert() {
 
         if (file_exists_and_readable(cert_path) && file_exists_and_readable(key_path)) {
             spdlog::info("Auto-discovered client cert at {}", cert_path.string());
-            return DiscoveredCert{
-                .cert_path = std::move(cert_path),
-                .key_path  = std::move(key_path),
-                .source    = pair.source
-            };
+            return DiscoveredCert{.cert_path = std::move(cert_path),
+                                  .key_path = std::move(key_path),
+                                  .source = pair.source};
         }
         spdlog::debug("Cert discovery: {} not found", pair.cert);
     }
@@ -92,4 +91,4 @@ std::optional<DiscoveredCert> discover_client_cert() {
     return std::nullopt;
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

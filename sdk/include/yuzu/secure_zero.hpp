@@ -7,7 +7,8 @@ namespace yuzu {
 
 /// Securely zero a string's contents so key material does not persist in freed memory.
 inline void secure_zero(std::string& s) {
-    if (s.empty()) return;
+    if (s.empty())
+        return;
 #if defined(__linux__)
     explicit_bzero(s.data(), s.size());
 #else
@@ -21,4 +22,4 @@ inline void secure_zero(std::string& s) {
     s.clear();
 }
 
-}  // namespace yuzu
+} // namespace yuzu

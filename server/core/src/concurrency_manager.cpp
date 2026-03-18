@@ -101,8 +101,7 @@ void ConcurrencyManager::release(const std::string& definition_id,
     if (!db_)
         return;
 
-    const char* sql =
-        "DELETE FROM concurrency_locks WHERE definition_id = ? AND execution_id = ?";
+    const char* sql = "DELETE FROM concurrency_locks WHERE definition_id = ? AND execution_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("concurrency: prepare delete failed: {}", sqlite3_errmsg(db_));
@@ -157,7 +156,8 @@ int ConcurrencyManager::parse_global_limit(const std::string& mode) {
 }
 
 bool ConcurrencyManager::is_valid_mode(const std::string& mode) {
-    static const std::regex pattern(R"(^(per-device|per-definition|per-set|unlimited|global:\d+)$)");
+    static const std::regex pattern(
+        R"(^(per-device|per-definition|per-set|unlimited|global:\d+)$)");
     return std::regex_match(mode, pattern);
 }
 

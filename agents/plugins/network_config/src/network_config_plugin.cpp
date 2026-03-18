@@ -31,12 +31,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <iphlpapi.h>
+#include <vector>
+#include <windows.h>
+#include <winhttp.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
-#include <iphlpapi.h>
-#include <winhttp.h>
-#include <vector>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "winhttp.lib")
@@ -51,7 +51,8 @@ std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
     FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -66,14 +67,16 @@ std::string run_command(const char* cmd) {
 #ifdef _WIN32
 // Format a MAC address from a byte array
 std::string format_mac(const BYTE* addr, DWORD len) {
-    if (len < 6) return "-";
-    return std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+    if (len < 6)
+        return "-";
+    return std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", addr[0], addr[1], addr[2],
+                       addr[3], addr[4], addr[5]);
 }
 
 // Convert wide string to UTF-8
 std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws) return {};
+    if (!ws || !*ws)
+        return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
     std::string result(len > 0 ? len - 1 : 0, '\0');
     if (len > 0) {
@@ -109,23 +112,25 @@ int do_adapters(yuzu::CommandContext& ctx) {
 
     std::vector<BYTE> buffer(buf_size);
     auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) != NO_ERROR) {
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
+        NO_ERROR) {
         ctx.write_output("adapter|Error enumerating adapters|-|0|unknown");
         return 1;
     }
 
     for (auto* a = adapters; a; a = a->Next) {
         // Skip loopback and tunnel adapters
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        if (a->IfType == IF_TYPE_TUNNEL) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        if (a->IfType == IF_TYPE_TUNNEL)
+            continue;
 
         auto name = wide_to_utf8(a->FriendlyName);
         auto mac = format_mac(a->PhysicalAddress, a->PhysicalAddressLength);
         auto speed_mbps = a->TransmitLinkSpeed / 1'000'000;
         const char* status = (a->OperStatus == IfOperStatusUp) ? "up" : "down";
 
-        ctx.write_output(std::format("adapter|{}|{}|{}|{}",
-            name, mac, speed_mbps, status));
+        ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, speed_mbps, status));
     }
 
 #elif defined(__linux__)
@@ -134,16 +139,19 @@ int do_adapters(yuzu::CommandContext& ctx) {
         std::istringstream ss(ip_out);
         std::string line;
         while (std::getline(ss, line)) {
-            // Format: "2: eth0: <BROADCAST,...> mtu 1500 ... state UP ... link/ether aa:bb:cc:dd:ee:ff ..."
-            // Extract name
+            // Format: "2: eth0: <BROADCAST,...> mtu 1500 ... state UP ... link/ether
+            // aa:bb:cc:dd:ee:ff ..." Extract name
             auto colon1 = line.find(':');
-            if (colon1 == std::string::npos) continue;
+            if (colon1 == std::string::npos)
+                continue;
             auto colon2 = line.find(':', colon1 + 1);
-            if (colon2 == std::string::npos) continue;
+            if (colon2 == std::string::npos)
+                continue;
             auto name = line.substr(colon1 + 2, colon2 - colon1 - 2);
 
             // Skip loopback
-            if (name == "lo") continue;
+            if (name == "lo")
+                continue;
 
             // Extract state
             std::string status = "unknown";
@@ -153,9 +161,12 @@ int do_adapters(yuzu::CommandContext& ctx) {
                 auto end = line.find(' ', start);
                 status = line.substr(start, end - start);
                 // Normalize
-                if (status == "UP") status = "up";
-                else if (status == "DOWN") status = "down";
-                else status = "down";
+                if (status == "UP")
+                    status = "up";
+                else if (status == "DOWN")
+                    status = "down";
+                else
+                    status = "down";
             }
 
             // Extract MAC
@@ -172,11 +183,11 @@ int do_adapters(yuzu::CommandContext& ctx) {
             std::ifstream speed_file("/sys/class/net/" + name + "/speed");
             if (speed_file) {
                 std::getline(speed_file, speed);
-                if (speed.empty() || speed[0] == '-') speed = "0";
+                if (speed.empty() || speed[0] == '-')
+                    speed = "0";
             }
 
-            ctx.write_output(std::format("adapter|{}|{}|{}|{}",
-                name, mac, speed, status));
+            ctx.write_output(std::format("adapter|{}|{}|{}|{}", name, mac, speed, status));
         }
     }
 
@@ -193,8 +204,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
             if (!line.empty() && line[0] != '\t' && line[0] != ' ') {
                 // New adapter — emit previous
                 if (!first && !current_name.empty()) {
-                    ctx.write_output(std::format("adapter|{}|{}|0|{}",
-                        current_name, mac, status));
+                    ctx.write_output(std::format("adapter|{}|{}|0|{}", current_name, mac, status));
                 }
                 first = false;
                 auto colon = line.find(':');
@@ -208,7 +218,8 @@ int do_adapters(yuzu::CommandContext& ctx) {
             } else {
                 // Trim
                 auto start = line.find_first_not_of(" \t");
-                if (start == std::string::npos) continue;
+                if (start == std::string::npos)
+                    continue;
                 auto trimmed = line.substr(start);
                 if (trimmed.starts_with("ether ")) {
                     mac = trimmed.substr(6, 17);
@@ -219,8 +230,7 @@ int do_adapters(yuzu::CommandContext& ctx) {
             }
         }
         if (!current_name.empty()) {
-            ctx.write_output(std::format("adapter|{}|{}|0|{}",
-                current_name, mac, status));
+            ctx.write_output(std::format("adapter|{}|{}|0|{}", current_name, mac, status));
         }
     }
 #endif
@@ -233,17 +243,21 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     ULONG buf_size = 0;
     GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, nullptr, &buf_size);
-    if (buf_size == 0) return 0;
+    if (buf_size == 0)
+        return 0;
 
     std::vector<BYTE> buffer(buf_size);
     auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, adapters, &buf_size) != NO_ERROR) {
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_GATEWAYS, nullptr, adapters, &buf_size) !=
+        NO_ERROR) {
         return 1;
     }
 
     for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        if (a->IfType == IF_TYPE_TUNNEL) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        if (a->IfType == IF_TYPE_TUNNEL)
+            continue;
 
         auto adapter_name = wide_to_utf8(a->FriendlyName);
 
@@ -251,15 +265,19 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         std::string gateway = "-";
         for (auto* gw = a->FirstGatewayAddress; gw; gw = gw->Next) {
             auto addr = sockaddr_to_string(gw->Address.lpSockaddr);
-            if (!addr.empty()) { gateway = addr; break; }
+            if (!addr.empty()) {
+                gateway = addr;
+                break;
+            }
         }
 
         // List unicast addresses
         for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
             auto addr = sockaddr_to_string(ua->Address.lpSockaddr);
-            if (addr.empty()) continue;
-            ctx.write_output(std::format("ip|{}|{}|{}|{}",
-                adapter_name, addr, ua->OnLinkPrefixLength, gateway));
+            if (addr.empty())
+                continue;
+            ctx.write_output(
+                std::format("ip|{}|{}|{}|{}", adapter_name, addr, ua->OnLinkPrefixLength, gateway));
         }
     }
 
@@ -285,8 +303,10 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
             std::istringstream ls(line);
             std::string idx, name, family, addr_cidr;
             ls >> idx >> name >> family >> addr_cidr;
-            if (family != "inet" && family != "inet6") continue;
-            if (name == "lo") continue;
+            if (family != "inet" && family != "inet6")
+                continue;
+            if (name == "lo")
+                continue;
 
             // Split addr/prefix
             auto slash = addr_cidr.find('/');
@@ -297,8 +317,7 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
                 prefix = addr_cidr.substr(slash + 1);
             }
 
-            ctx.write_output(std::format("ip|{}|{}|{}|{}",
-                name, addr, prefix, default_gw));
+            ctx.write_output(std::format("ip|{}|{}|{}|{}", name, addr, prefix, default_gw));
         }
     }
 
@@ -310,7 +329,8 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
         auto colon = gw_out.find(':');
         if (colon != std::string::npos) {
             auto start = gw_out.find_first_not_of(" \t", colon + 1);
-            if (start != std::string::npos) default_gw = gw_out.substr(start);
+            if (start != std::string::npos)
+                default_gw = gw_out.substr(start);
         }
     }
 
@@ -324,23 +344,25 @@ int do_ip_addresses(yuzu::CommandContext& ctx) {
                 current_adapter = (colon != std::string::npos) ? line.substr(0, colon) : line;
             } else if (current_adapter != "lo0") {
                 auto start = line.find_first_not_of(" \t");
-                if (start == std::string::npos) continue;
+                if (start == std::string::npos)
+                    continue;
                 auto trimmed = line.substr(start);
                 if (trimmed.starts_with("inet ")) {
                     std::istringstream ls(trimmed);
                     std::string kw, addr, mask_kw, mask;
                     ls >> kw >> addr >> mask_kw >> mask;
-                    ctx.write_output(std::format("ip|{}|{}|{}|{}",
-                        current_adapter, addr, mask, default_gw));
+                    ctx.write_output(
+                        std::format("ip|{}|{}|{}|{}", current_adapter, addr, mask, default_gw));
                 } else if (trimmed.starts_with("inet6 ")) {
                     std::istringstream ls(trimmed);
                     std::string kw, addr, prefix_kw, prefix;
                     ls >> kw >> addr >> prefix_kw >> prefix;
                     // Remove %scope from addr
                     auto pct = addr.find('%');
-                    if (pct != std::string::npos) addr = addr.substr(0, pct);
-                    ctx.write_output(std::format("ip|{}|{}|{}|{}",
-                        current_adapter, addr, prefix, default_gw));
+                    if (pct != std::string::npos)
+                        addr = addr.substr(0, pct);
+                    ctx.write_output(
+                        std::format("ip|{}|{}|{}|{}", current_adapter, addr, prefix, default_gw));
                 }
             }
         }
@@ -355,23 +377,28 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     ULONG buf_size = 0;
     GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, nullptr, &buf_size);
-    if (buf_size == 0) return 0;
+    if (buf_size == 0)
+        return 0;
 
     std::vector<BYTE> buffer(buf_size);
     auto* adapters = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
-    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) != NO_ERROR) {
+    if (GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, nullptr, adapters, &buf_size) !=
+        NO_ERROR) {
         return 1;
     }
 
     for (auto* a = adapters; a; a = a->Next) {
-        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-        if (a->IfType == IF_TYPE_TUNNEL) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        if (a->IfType == IF_TYPE_TUNNEL)
+            continue;
 
         auto adapter_name = wide_to_utf8(a->FriendlyName);
 
         for (auto* dns = a->FirstDnsServerAddress; dns; dns = dns->Next) {
             auto addr = sockaddr_to_string(dns->Address.lpSockaddr);
-            if (addr.empty()) continue;
+            if (addr.empty())
+                continue;
             auto family = dns->Address.lpSockaddr->sa_family;
             const char* type = (family == AF_INET6) ? "IPv6" : "IPv4";
             ctx.write_output(std::format("dns|{}|{}|{}", adapter_name, addr, type));
@@ -392,12 +419,14 @@ int do_dns_servers(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto dns_out = run_command("scutil --dns 2>/dev/null | grep 'nameserver\\[' | awk '{print $3}'");
+    auto dns_out =
+        run_command("scutil --dns 2>/dev/null | grep 'nameserver\\[' | awk '{print $3}'");
     if (!dns_out.empty()) {
         std::istringstream ss(dns_out);
         std::string server;
         while (std::getline(ss, server)) {
-            if (server.empty()) continue;
+            if (server.empty())
+                continue;
             auto type = (server.find(':') != std::string::npos) ? "IPv6" : "IPv4";
             ctx.write_output(std::format("dns|system|{}|{}", server, type));
         }
@@ -414,7 +443,8 @@ int do_proxy(yuzu::CommandContext& ctx) {
     if (WinHttpGetIEProxyConfigForCurrentUser(&proxy_cfg)) {
         if (proxy_cfg.lpszAutoConfigUrl) {
             ctx.write_output(std::format("proxy_type|pac"));
-            ctx.write_output(std::format("proxy_address|{}", wide_to_utf8(proxy_cfg.lpszAutoConfigUrl)));
+            ctx.write_output(
+                std::format("proxy_address|{}", wide_to_utf8(proxy_cfg.lpszAutoConfigUrl)));
             GlobalFree(proxy_cfg.lpszAutoConfigUrl);
         }
         if (proxy_cfg.lpszProxy) {
@@ -440,8 +470,8 @@ int do_proxy(yuzu::CommandContext& ctx) {
 
 #elif defined(__linux__)
     bool found = false;
-    for (const char* var : {"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
-                            "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"}) {
+    for (const char* var : {"http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy",
+                            "ALL_PROXY", "no_proxy", "NO_PROXY"}) {
         const char* val = std::getenv(var);
         if (val && *val) {
             if (std::string_view(var).find("no_proxy") != std::string_view::npos ||
@@ -466,8 +496,10 @@ int do_proxy(yuzu::CommandContext& ctx) {
         std::string line;
         std::string server, port;
         while (std::getline(ss, line)) {
-            if (line.starts_with("Server: ")) server = line.substr(8);
-            if (line.starts_with("Port: ")) port = line.substr(6);
+            if (line.starts_with("Server: "))
+                server = line.substr(8);
+            if (line.starts_with("Port: "))
+                port = line.substr(6);
         }
         ctx.write_output("proxy_type|http");
         ctx.write_output(std::format("proxy_address|{}:{}", server, port));
@@ -491,37 +523,39 @@ int do_proxy(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class NetworkConfigPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "network_config"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "network_config"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Reports network adapter configuration, IP addresses, DNS servers, and proxy settings";
+        return "Reports network adapter configuration, IP addresses, DNS servers, and proxy "
+               "settings";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "adapters", "ip_addresses", "dns_servers", "proxy", "dns_cache", nullptr
-        };
+        static const char* acts[] = {"adapters", "ip_addresses", "dns_servers",
+                                     "proxy",    "dns_cache",    nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "adapters")     return do_adapters(ctx);
-        if (action == "ip_addresses") return do_ip_addresses(ctx);
-        if (action == "dns_servers")  return do_dns_servers(ctx);
-        if (action == "proxy")        return do_proxy(ctx);
-        if (action == "dns_cache")    return do_dns_cache(ctx);
+        if (action == "adapters")
+            return do_adapters(ctx);
+        if (action == "ip_addresses")
+            return do_ip_addresses(ctx);
+        if (action == "dns_servers")
+            return do_dns_servers(ctx);
+        if (action == "proxy")
+            return do_proxy(ctx);
+        if (action == "dns_cache")
+            return do_dns_cache(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
@@ -563,12 +597,24 @@ private:
                     // wType: 1=A, 28=AAAA, 5=CNAME, etc.
                     const char* type = "unknown";
                     switch (entry->wType) {
-                        case 1:  type = "A"; break;
-                        case 28: type = "AAAA"; break;
-                        case 5:  type = "CNAME"; break;
-                        case 12: type = "PTR"; break;
-                        case 15: type = "MX"; break;
-                        case 33: type = "SRV"; break;
+                    case 1:
+                        type = "A";
+                        break;
+                    case 28:
+                        type = "AAAA";
+                        break;
+                    case 5:
+                        type = "CNAME";
+                        break;
+                    case 12:
+                        type = "PTR";
+                        break;
+                    case 15:
+                        type = "MX";
+                        break;
+                    case 33:
+                        type = "SRV";
+                        break;
                     }
                     ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
                     ++count;
@@ -601,7 +647,8 @@ private:
                 while (std::getline(ss, line)) {
                     auto trimmed = line;
                     auto start = trimmed.find_first_not_of(" \t");
-                    if (start != std::string::npos) trimmed = trimmed.substr(start);
+                    if (start != std::string::npos)
+                        trimmed = trimmed.substr(start);
                     if (trimmed.starts_with("Current Cache Size:") ||
                         trimmed.starts_with("Cache Hits:") ||
                         trimmed.starts_with("Cache Misses:")) {

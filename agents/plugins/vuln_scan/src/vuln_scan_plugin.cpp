@@ -39,8 +39,8 @@
 #include <windows.h>
 #endif
 
-#include "cve_rules.hpp"
 #include "config_checks.hpp"
+#include "cve_rules.hpp"
 
 namespace {
 
@@ -51,7 +51,8 @@ std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
     FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -77,14 +78,15 @@ struct AppInfo {
 
 // Case-insensitive substring match
 bool icontains(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) return true;
-    if (haystack.size() < needle.size()) return false;
-    auto it = std::search(haystack.begin(), haystack.end(),
-        needle.begin(), needle.end(),
-        [](char a, char b) {
-            return std::tolower(static_cast<unsigned char>(a)) ==
-                   std::tolower(static_cast<unsigned char>(b));
-        });
+    if (needle.empty())
+        return true;
+    if (haystack.size() < needle.size())
+        return false;
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                          [](char a, char b) {
+                              return std::tolower(static_cast<unsigned char>(a)) ==
+                                     std::tolower(static_cast<unsigned char>(b));
+                          });
     return it != haystack.end();
 }
 
@@ -96,21 +98,32 @@ std::string sanitize_utf8(const std::string& s) {
     while (i < s.size()) {
         auto c = static_cast<unsigned char>(s[i]);
         if (c < 0x80) {
-            out += s[i]; ++i;
+            out += s[i];
+            ++i;
         } else if ((c >> 5) == 0x06 && i + 1 < s.size() &&
-                   (static_cast<unsigned char>(s[i+1]) >> 6) == 0x02) {
-            out += s[i]; out += s[i+1]; i += 2;
+                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02) {
+            out += s[i];
+            out += s[i + 1];
+            i += 2;
         } else if ((c >> 4) == 0x0E && i + 2 < s.size() &&
-                   (static_cast<unsigned char>(s[i+1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i+2]) >> 6) == 0x02) {
-            out += s[i]; out += s[i+1]; out += s[i+2]; i += 3;
+                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
+                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02) {
+            out += s[i];
+            out += s[i + 1];
+            out += s[i + 2];
+            i += 3;
         } else if ((c >> 3) == 0x1E && i + 3 < s.size() &&
-                   (static_cast<unsigned char>(s[i+1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i+2]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i+3]) >> 6) == 0x02) {
-            out += s[i]; out += s[i+1]; out += s[i+2]; out += s[i+3]; i += 4;
+                   (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
+                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02 &&
+                   (static_cast<unsigned char>(s[i + 3]) >> 6) == 0x02) {
+            out += s[i];
+            out += s[i + 1];
+            out += s[i + 2];
+            out += s[i + 3];
+            i += 4;
         } else {
-            out += '?'; ++i;
+            out += '?';
+            ++i;
         }
     }
     return out;
@@ -121,8 +134,10 @@ std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
-        if (c == '|') out += "\\|";
-        else out += c;
+        if (c == '|')
+            out += "\\|";
+        else
+            out += c;
     }
     return out;
 }
@@ -133,8 +148,8 @@ std::string escape_pipes(std::string_view s) {
 void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
                              std::vector<AppInfo>& apps) {
     HKEY hkey{};
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam,
-                      &hkey) != ERROR_SUCCESS) {
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | extra_sam, &hkey) !=
+        ERROR_SUCCESS) {
         return;
     }
 
@@ -142,8 +157,8 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
     DWORD idx = 0;
     DWORD name_len = sizeof(name_buf);
 
-    while (RegEnumKeyExA(hkey, idx++, name_buf, &name_len,
-                         nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+    while (RegEnumKeyExA(hkey, idx++, name_buf, &name_len, nullptr, nullptr, nullptr, nullptr) ==
+           ERROR_SUCCESS) {
         HKEY app_key{};
         if (RegOpenKeyExA(hkey, name_buf, 0, KEY_READ | extra_sam, &app_key) == ERROR_SUCCESS) {
             auto read_str = [&](const char* value_name) -> std::string {
@@ -176,8 +191,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
 
 std::vector<AppInfo> get_installed_apps() {
     std::vector<AppInfo> apps;
-    static const char* kUninstallKey =
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+    static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
     enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, apps);
     enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, apps);
     enumerate_uninstall_key(HKEY_CURRENT_USER, kUninstallKey, 0, apps);
@@ -186,9 +200,10 @@ std::vector<AppInfo> get_installed_apps() {
         return a.name < b.name || (a.name == b.name && a.version < b.version);
     });
     apps.erase(std::unique(apps.begin(), apps.end(),
-        [](const AppInfo& a, const AppInfo& b) {
-            return a.name == b.name && a.version == b.version;
-        }), apps.end());
+                           [](const AppInfo& a, const AppInfo& b) {
+                               return a.name == b.name && a.version == b.version;
+                           }),
+               apps.end());
 
     return apps;
 }
@@ -197,12 +212,12 @@ std::vector<AppInfo> get_installed_apps() {
     std::vector<AppInfo> apps;
 
     if (command_exists("dpkg-query")) {
-        auto out = run_command(
-            "dpkg-query -W -f='${Package}|${Version}|${Status}\\n' 2>/dev/null");
+        auto out = run_command("dpkg-query -W -f='${Package}|${Version}|${Status}\\n' 2>/dev/null");
         std::istringstream ss(out);
         std::string line;
         while (std::getline(ss, line)) {
-            if (line.find("install ok installed") == std::string::npos) continue;
+            if (line.find("install ok installed") == std::string::npos)
+                continue;
             std::istringstream ls(line);
             std::string name, version;
             std::getline(ls, name, '|');
@@ -210,8 +225,8 @@ std::vector<AppInfo> get_installed_apps() {
             apps.push_back({name, version});
         }
     } else if (command_exists("rpm")) {
-        auto out = run_command(
-            "rpm -qa --queryformat '%{NAME}|%{VERSION}-%{RELEASE}\\n' 2>/dev/null");
+        auto out =
+            run_command("rpm -qa --queryformat '%{NAME}|%{VERSION}-%{RELEASE}\\n' 2>/dev/null");
         std::istringstream ss(out);
         std::string line;
         while (std::getline(ss, line)) {
@@ -238,9 +253,8 @@ std::vector<AppInfo> get_installed_apps() {
 std::vector<AppInfo> get_installed_apps() {
     std::vector<AppInfo> apps;
 
-    auto out = run_command(
-        "system_profiler SPApplicationsDataType -detailLevel mini 2>/dev/null"
-        " | grep -E '^ {4}\\w|Version:'");
+    auto out = run_command("system_profiler SPApplicationsDataType -detailLevel mini 2>/dev/null"
+                           " | grep -E '^ {4}\\w|Version:'");
     if (!out.empty()) {
         std::istringstream ss(out);
         std::string line;
@@ -248,7 +262,8 @@ std::vector<AppInfo> get_installed_apps() {
         std::string current_version;
         while (std::getline(ss, line)) {
             auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos) continue;
+            if (start == std::string::npos)
+                continue;
             line = line.substr(start);
 
             if (line.find("Version:") == 0) {
@@ -291,7 +306,7 @@ std::vector<AppInfo> get_installed_apps() {
 
 struct Finding {
     std::string severity;
-    std::string category;  // "cve" or "config"
+    std::string category; // "cve" or "config"
     std::string title;
     std::string detail;
 };
@@ -304,18 +319,17 @@ std::vector<Finding> do_cve_scan_impl() {
 
     for (const auto& rule : yuzu::vuln::kCveRules) {
         for (const auto& app : apps) {
-            if (!icontains(app.name, rule.product)) continue;
-            if (app.version.empty()) continue;
+            if (!icontains(app.name, rule.product))
+                continue;
+            if (app.version.empty())
+                continue;
 
             // Check if installed version is below the fixed version
             if (yuzu::vuln::compare_versions(app.version, rule.affected_below) < 0) {
-                findings.push_back({
-                    std::string(rule.severity),
-                    "cve",
-                    std::format("{}: {}", rule.cve_id, rule.description),
-                    std::format("{} {} (fixed in {})",
-                        app.name, app.version, rule.fixed_in)
-                });
+                findings.push_back(
+                    {std::string(rule.severity), "cve",
+                     std::format("{}: {}", rule.cve_id, rule.description),
+                     std::format("{} {} (fixed in {})", app.name, app.version, rule.fixed_in)});
             }
         }
     }
@@ -331,12 +345,8 @@ std::vector<Finding> do_config_scan_impl() {
 
     for (const auto& check : checks) {
         // Report all checks (passed ones as INFO)
-        findings.push_back({
-            std::string(check.severity),
-            "config",
-            std::string(check.title),
-            check.detail
-        });
+        findings.push_back(
+            {std::string(check.severity), "config", std::string(check.title), check.detail});
     }
 
     return findings;
@@ -351,11 +361,9 @@ void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& find
     }
 
     for (const auto& f : findings) {
-        ctx.write_output(sanitize_utf8(std::format("{}|{}|{}|{}",
-            f.severity,
-            escape_pipes(f.category),
-            escape_pipes(f.title),
-            escape_pipes(f.detail))));
+        ctx.write_output(
+            sanitize_utf8(std::format("{}|{}|{}|{}", f.severity, escape_pipes(f.category),
+                                      escape_pipes(f.title), escape_pipes(f.detail))));
     }
 }
 
@@ -376,7 +384,8 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
     int issues = 0;
     for (const auto& [sev, count] : counts) {
         total += count;
-        if (sev != "INFO") issues += count;
+        if (sev != "INFO")
+            issues += count;
     }
 
     ctx.write_output(std::format("summary|TOTAL|{} findings ({} issues)", total, issues));
@@ -386,31 +395,27 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
     }
 }
 
-}  // namespace
+} // namespace
 
 class VulnScanPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "vuln_scan"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "vuln_scan"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Host vulnerability scanning — CVE matching and configuration compliance checks";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "scan", "cve_scan", "config_scan", "summary", "inventory", nullptr
-        };
+        static const char* acts[] = {"scan",    "cve_scan",  "config_scan",
+                                     "summary", "inventory", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 [[maybe_unused]] yuzu::Params params) override {
 
         if (action == "scan") {
@@ -451,9 +456,8 @@ public:
             // Format: name|version (one per line, pipe-delimited)
             auto apps = get_installed_apps();
             for (const auto& app : apps) {
-                ctx.write_output(std::format("{}|{}",
-                    escape_pipes(sanitize_utf8(app.name)),
-                    escape_pipes(sanitize_utf8(app.version))));
+                ctx.write_output(std::format("{}|{}", escape_pipes(sanitize_utf8(app.name)),
+                                             escape_pipes(sanitize_utf8(app.version))));
             }
             return 0;
         }

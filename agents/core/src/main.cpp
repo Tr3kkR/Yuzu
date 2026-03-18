@@ -1,22 +1,22 @@
 #ifdef _WIN32
-#  include <io.h>
-#  include <cstdio>
-#  pragma section(".CRT$XCB", read)
+#include <cstdio>
+#include <io.h>
+#pragma section(".CRT$XCB", read)
 static void __cdecl diag_before_static_init() {
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void (__cdecl *p_diag_init)() = diag_before_static_init;
+__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/identity_store.hpp>
-#include <yuzu/version.hpp>
 #include <yuzu/json_log_formatter.hpp>
+#include <yuzu/version.hpp>
 
 #include <CLI/CLI.hpp>
-#include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <csignal>
@@ -41,55 +41,62 @@ static void on_signal(int sig) {
     (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
 #endif
     (void)sig;
-    if (auto* a = g_agent.load(std::memory_order_acquire)) a->stop();
+    if (auto* a = g_agent.load(std::memory_order_acquire))
+        a->stop();
 }
 
 int main(int argc, char* argv[]) {
     fprintf(stderr, "[DIAG] main() entered\n");
     CLI::App app{"Yuzu Agent", "yuzu-agent"};
-    app.set_version_flag("--version", std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
+    app.set_version_flag("--version",
+                         std::format("{}  ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash));
 
     yuzu::agent::Config cfg;
     std::string log_level = "info";
 
-    app.add_option("--server",   cfg.server_address,  "Server address (host:port)")
-       ->default_val("localhost:50051");
-    app.add_option("--agent-id", cfg.agent_id,        "Stable agent UUID (auto-generated if empty)");
-    app.add_option("--data-dir", cfg.data_dir,        "Directory for persistent agent state")
-       ->default_val(yuzu::agent::default_data_dir().string());
+    app.add_option("--server", cfg.server_address, "Server address (host:port)")
+        ->default_val("localhost:50051");
+    app.add_option("--agent-id", cfg.agent_id, "Stable agent UUID (auto-generated if empty)");
+    app.add_option("--data-dir", cfg.data_dir, "Directory for persistent agent state")
+        ->default_val(yuzu::agent::default_data_dir().string());
     // Default plugin dir: <exe_dir>/../plugins (matches meson build layout)
     auto exe_dir = std::filesystem::path(argv[0]).parent_path();
-    if (exe_dir.empty()) exe_dir = std::filesystem::current_path();
-    app.add_option("--plugin-dir", cfg.plugin_dir,    "Directory containing plugin shared libraries")
-       ->default_val((exe_dir / ".." / "plugins").string());
-    app.add_option("--heartbeat", cfg.heartbeat_interval,
-                   "Heartbeat interval in seconds")->default_val(30);
-    app.add_flag  ("--no-tls",   "Disable TLS (insecure, for development only)")
-       ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
-    app.add_option("--ca-cert",      cfg.tls_ca_cert,     "PEM CA certificate for server verification");
-    app.add_option("--client-cert",  cfg.tls_client_cert, "PEM client certificate for mTLS");
-    app.add_option("--client-key",   cfg.tls_client_key,  "PEM client private key for mTLS");
-    app.add_option("--cert-store",      cfg.cert_store,      "Windows certificate store name (e.g. MY) for mTLS");
-    app.add_option("--cert-subject",    cfg.cert_subject,    "Subject CN match for cert store lookup");
-    app.add_option("--cert-thumbprint", cfg.cert_thumbprint, "SHA-1 thumbprint for cert store lookup (hex)");
-    app.add_flag  ("--no-cert-discovery", "Disable auto-discovery of certs from well-known paths")
-       ->each([&cfg](const std::string&) { cfg.cert_auto_discovery = false; });
-    app.add_option("--enrollment-token", cfg.enrollment_token, "Pre-shared enrollment token for server registration");
-    app.add_flag  ("--debug",    "Enable debug mode (diagnostic features)")
-       ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
-    app.add_flag  ("--verbose",  "Enable verbose logging")
-       ->each([&cfg](const std::string&) { cfg.verbose_logging = true; });
+    if (exe_dir.empty())
+        exe_dir = std::filesystem::current_path();
+    app.add_option("--plugin-dir", cfg.plugin_dir, "Directory containing plugin shared libraries")
+        ->default_val((exe_dir / ".." / "plugins").string());
+    app.add_option("--heartbeat", cfg.heartbeat_interval, "Heartbeat interval in seconds")
+        ->default_val(30);
+    app.add_flag("--no-tls", "Disable TLS (insecure, for development only)")
+        ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
+    app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA certificate for server verification");
+    app.add_option("--client-cert", cfg.tls_client_cert, "PEM client certificate for mTLS");
+    app.add_option("--client-key", cfg.tls_client_key, "PEM client private key for mTLS");
+    app.add_option("--cert-store", cfg.cert_store,
+                   "Windows certificate store name (e.g. MY) for mTLS");
+    app.add_option("--cert-subject", cfg.cert_subject, "Subject CN match for cert store lookup");
+    app.add_option("--cert-thumbprint", cfg.cert_thumbprint,
+                   "SHA-1 thumbprint for cert store lookup (hex)");
+    app.add_flag("--no-cert-discovery", "Disable auto-discovery of certs from well-known paths")
+        ->each([&cfg](const std::string&) { cfg.cert_auto_discovery = false; });
+    app.add_option("--enrollment-token", cfg.enrollment_token,
+                   "Pre-shared enrollment token for server registration");
+    app.add_flag("--debug", "Enable debug mode (diagnostic features)")
+        ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
+    app.add_flag("--verbose", "Enable verbose logging")->each([&cfg](const std::string&) {
+        cfg.verbose_logging = true;
+    });
     std::string log_format = "text";
-    app.add_option("--log-level", log_level,           "Log level: trace|debug|info|warn|error")
-       ->default_val("info");
-    app.add_option("--log-format", log_format,         "Log format: text|json")
-       ->default_val("text");
-    app.add_flag  ("--no-auto-update", "Disable OTA auto-updates")
-       ->each([&cfg](const std::string&) { cfg.auto_update = false; });
+    app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")
+        ->default_val("info");
+    app.add_option("--log-format", log_format, "Log format: text|json")->default_val("text");
+    app.add_flag("--no-auto-update", "Disable OTA auto-updates")->each([&cfg](const std::string&) {
+        cfg.auto_update = false;
+    });
     int update_interval_sec = 21600;
     app.add_option("--update-check-interval", update_interval_sec,
                    "Update check interval in seconds (default: 21600 = 6h)")
-       ->default_val(21600);
+        ->default_val(21600);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -104,8 +111,7 @@ int main(int argc, char* argv[]) {
     // Configure logging
     spdlog::set_level(spdlog::level::from_str(log_level));
     if (log_format == "json") {
-        spdlog::set_formatter(
-            std::make_unique<yuzu::JsonLogFormatter>("agent"));
+        spdlog::set_formatter(std::make_unique<yuzu::JsonLogFormatter>("agent"));
     } else {
         spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [%t] %v");
     }
@@ -113,8 +119,7 @@ int main(int argc, char* argv[]) {
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
     // Resolve persistent agent ID
-    auto id_result = yuzu::agent::resolve_agent_id(
-        cfg.agent_id, cfg.data_dir / "agent.db");
+    auto id_result = yuzu::agent::resolve_agent_id(cfg.agent_id, cfg.data_dir / "agent.db");
     if (!id_result) {
         spdlog::error("Failed to resolve agent ID: {}", id_result.error().message);
         return EXIT_FAILURE;
@@ -123,7 +128,7 @@ int main(int argc, char* argv[]) {
     spdlog::info("Agent ID: {}", cfg.agent_id);
 
     // Signal handling
-    std::signal(SIGINT,  on_signal);
+    std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
 
     auto agent = yuzu::agent::Agent::create(std::move(cfg));

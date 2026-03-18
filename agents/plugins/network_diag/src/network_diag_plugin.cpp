@@ -30,11 +30,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
 #include <iphlpapi.h>
 #include <vector>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -51,7 +51,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -70,11 +71,13 @@ std::string run_command(const char* cmd) {
 void list_listening_win(yuzu::CommandContext& ctx) {
     DWORD size = 0;
     GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
-    if (size == 0) return;
+    if (size == 0)
+        return;
 
     std::vector<BYTE> buffer(size);
-    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET,
-                            TCP_TABLE_OWNER_PID_LISTENER, 0) != NO_ERROR) return;
+    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_LISTENER,
+                            0) != NO_ERROR)
+        return;
 
     auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
@@ -91,16 +94,19 @@ void list_listening_win(yuzu::CommandContext& ctx) {
 void list_connections_win(yuzu::CommandContext& ctx) {
     DWORD size = 0;
     GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
-    if (size == 0) return;
+    if (size == 0)
+        return;
 
     std::vector<BYTE> buffer(size);
-    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET,
-                            TCP_TABLE_OWNER_PID_CONNECTIONS, 0) != NO_ERROR) return;
+    if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS,
+                            0) != NO_ERROR)
+        return;
 
     auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
     for (DWORD i = 0; i < table->dwNumEntries; ++i) {
         auto& row = table->table[i];
-        if (row.dwState != MIB_TCP_STATE_ESTAB) continue;
+        if (row.dwState != MIB_TCP_STATE_ESTAB)
+            continue;
 
         struct in_addr la{}, ra{};
         la.S_un.S_addr = row.dwLocalAddr;
@@ -110,8 +116,8 @@ void list_connections_win(yuzu::CommandContext& ctx) {
         inet_ntop(AF_INET, &ra, rip, sizeof(rip));
         auto lport = ntohs(static_cast<u_short>(row.dwLocalPort));
         auto rport = ntohs(static_cast<u_short>(row.dwRemotePort));
-        ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}",
-                                     lip, lport, rip, rport, row.dwOwningPid));
+        ctx.write_output(
+            std::format("conn|tcp|{}|{}|{}|{}|{}", lip, lport, rip, rport, row.dwOwningPid));
     }
 }
 
@@ -121,29 +127,31 @@ std::string hex_to_ip(const std::string& hex_addr) {
     if (hex_addr.length() == 8) {
         // IPv4
         unsigned long addr = std::strtoul(hex_addr.c_str(), nullptr, 16);
-        return std::format("{}.{}.{}.{}",
-                           addr & 0xFF, (addr >> 8) & 0xFF,
-                           (addr >> 16) & 0xFF, (addr >> 24) & 0xFF);
+        return std::format("{}.{}.{}.{}", addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF,
+                           (addr >> 24) & 0xFF);
     }
     // IPv6 — simplified: return hex representation
     return hex_addr;
 }
 
-void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path,
-                    const std::string& target_state, bool is_listen) {
+void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path, const std::string& target_state,
+                    bool is_listen) {
     std::ifstream f(path);
-    if (!f.is_open()) return;
+    if (!f.is_open())
+        return;
     std::string line;
     std::getline(f, line); // skip header
     while (std::getline(f, line)) {
         std::istringstream iss(line);
         std::string idx, local, remote, state_hex;
         iss >> idx >> local >> remote >> state_hex;
-        if (state_hex != target_state) continue;
+        if (state_hex != target_state)
+            continue;
 
         auto colon1 = local.find(':');
         auto colon2 = remote.find(':');
-        if (colon1 == std::string::npos || colon2 == std::string::npos) continue;
+        if (colon1 == std::string::npos || colon2 == std::string::npos)
+            continue;
 
         auto local_ip = hex_to_ip(local.substr(0, colon1));
         auto local_port = std::strtoul(local.substr(colon1 + 1).c_str(), nullptr, 16);
@@ -153,16 +161,16 @@ void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path,
         // Parse remaining fields to get inode (field 10 from start, 7 more after state)
         std::string tmp;
         // Fields after state: tx_queue:rx_queue, tr:tm->when, retrnsmt, uid, timeout, inode
-        for (int i = 0; i < 6; ++i) iss >> tmp;
+        for (int i = 0; i < 6; ++i)
+            iss >> tmp;
         std::string inode;
         iss >> inode;
 
         if (is_listen) {
             ctx.write_output(std::format("listen|tcp|{}|{}|{}", local_ip, local_port, inode));
         } else {
-            ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}",
-                                         local_ip, local_port,
-                                         remote_ip, remote_port, inode));
+            ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}", local_ip, local_port, remote_ip,
+                                         remote_port, inode));
         }
     }
 }
@@ -173,22 +181,21 @@ void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path,
 
 class NetworkDiagPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "network_diag"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "network_diag"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Network diagnostics — listening ports and established connections";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "listening", "connections", nullptr };
+        static const char* acts[] = {"listening", "connections", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
 
         if (action == "listening") {
@@ -242,9 +249,9 @@ public:
                     auto lc = local.rfind(':');
                     auto rc = remote.rfind(':');
                     if (lc != std::string::npos && rc != std::string::npos) {
-                        ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}",
-                            local.substr(0, lc), local.substr(lc + 1),
-                            remote.substr(0, rc), remote.substr(rc + 1), pid));
+                        ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}", local.substr(0, lc),
+                                                     local.substr(lc + 1), remote.substr(0, rc),
+                                                     remote.substr(rc + 1), pid));
                     }
                 }
             }

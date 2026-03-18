@@ -42,8 +42,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <psapi.h>
+#include <windows.h>
 #endif
 
 namespace {
@@ -79,10 +79,18 @@ int do_info(yuzu::CommandContext& ctx) {
     GetNativeSystemInfo(&si);
     const char* arch = "unknown";
     switch (si.wProcessorArchitecture) {
-        case PROCESSOR_ARCHITECTURE_AMD64: arch = "x86_64"; break;
-        case PROCESSOR_ARCHITECTURE_ARM64: arch = "aarch64"; break;
-        case PROCESSOR_ARCHITECTURE_INTEL: arch = "x86"; break;
-        case PROCESSOR_ARCHITECTURE_ARM:   arch = "arm"; break;
+    case PROCESSOR_ARCHITECTURE_AMD64:
+        arch = "x86_64";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM64:
+        arch = "aarch64";
+        break;
+    case PROCESSOR_ARCHITECTURE_INTEL:
+        arch = "x86";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM:
+        arch = "arm";
+        break;
     }
     ctx.write_output(std::format("arch|{}", arch));
 
@@ -104,7 +112,8 @@ int do_info(yuzu::CommandContext& ctx) {
 long long get_memory_rss_kb() {
 #ifdef __linux__
     std::ifstream status("/proc/self/status");
-    if (!status) return -1;
+    if (!status)
+        return -1;
 
     std::string line;
     while (std::getline(status, line)) {
@@ -112,11 +121,9 @@ long long get_memory_rss_kb() {
             long long kb = 0;
             auto pos = line.find_first_of("0123456789");
             if (pos != std::string::npos) {
-                auto [ptr, ec] = std::from_chars(
-                    line.data() + pos,
-                    line.data() + line.size(),
-                    kb);
-                if (ec == std::errc{}) return kb;
+                auto [ptr, ec] = std::from_chars(line.data() + pos, line.data() + line.size(), kb);
+                if (ec == std::errc{})
+                    return kb;
             }
             break;
         }
@@ -126,8 +133,8 @@ long long get_memory_rss_kb() {
 #elif defined(__APPLE__)
     mach_task_basic_info_data_t info{};
     mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS) {
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info),
+                  &count) == KERN_SUCCESS) {
         return static_cast<long long>(info.resident_size / 1024);
     }
     return -1;
@@ -145,20 +152,20 @@ long long get_memory_rss_kb() {
 #endif
 }
 
-}  // namespace
+} // namespace
 
 class StatusPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "status"; }
-    std::string_view version()     const noexcept override { return yuzu::kVersionString; }
+    std::string_view name() const noexcept override { return "status"; }
+    std::string_view version() const noexcept override { return yuzu::kVersionString; }
     std::string_view description() const noexcept override {
-        return "Reports agent version, system info, health, modules, connection, switch, and config";
+        return "Reports agent version, system info, health, modules, connection, switch, and "
+               "config";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "version", "info", "health", "plugins", "modules", "connection", "switch", "config", nullptr
-        };
+        static const char* acts[] = {"version",    "info",   "health", "plugins", "modules",
+                                     "connection", "switch", "config", nullptr};
         return acts;
     }
 
@@ -176,17 +183,24 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "version")    return do_version(ctx);
-        if (action == "info")       return do_info(ctx);
-        if (action == "health")     return do_health(ctx);
-        if (action == "plugins")    return do_plugins(ctx);
-        if (action == "modules")    return do_modules(ctx);
-        if (action == "connection") return do_connection(ctx);
-        if (action == "switch")     return do_switch(ctx);
-        if (action == "config")     return do_config(ctx);
+        if (action == "version")
+            return do_version(ctx);
+        if (action == "info")
+            return do_info(ctx);
+        if (action == "health")
+            return do_health(ctx);
+        if (action == "plugins")
+            return do_plugins(ctx);
+        if (action == "modules")
+            return do_modules(ctx);
+        if (action == "connection")
+            return do_connection(ctx);
+        if (action == "switch")
+            return do_switch(ctx);
+        if (action == "config")
+            return do_config(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
@@ -197,9 +211,9 @@ private:
     YuzuPluginContext* raw_plugin_ctx_{nullptr};
 
     std::string_view cfg(std::string_view key) const {
-        if (!raw_plugin_ctx_) return {};
-        const char* val = yuzu_ctx_get_config(raw_plugin_ctx_,
-                                              std::string{key}.c_str());
+        if (!raw_plugin_ctx_)
+            return {};
+        const char* val = yuzu_ctx_get_config(raw_plugin_ctx_, std::string{key}.c_str());
         return val ? std::string_view{val} : std::string_view{};
     }
 
@@ -219,7 +233,7 @@ private:
         for (int i = 0; i < count; ++i) {
             auto prefix = std::format("agent.plugins.{}", i);
             auto pname = cfg(prefix + ".name");
-            auto pver  = cfg(prefix + ".version");
+            auto pver = cfg(prefix + ".version");
             auto pdesc = cfg(prefix + ".description");
             ctx.write_output(std::format("plugin|{}|{}|{}", pname, pver, pdesc));
         }
@@ -281,18 +295,18 @@ private:
     // config action
 
     int do_config(yuzu::CommandContext& ctx) {
-        ctx.write_output(std::format("agent_id|{}",            cfg("agent.id")));
-        ctx.write_output(std::format("agent_version|{}",       cfg("agent.version")));
-        ctx.write_output(std::format("build_number|{}",        cfg("agent.build_number")));
-        ctx.write_output(std::format("git_commit|{}",          cfg("agent.git_commit")));
-        ctx.write_output(std::format("server_address|{}",      cfg("agent.server_address")));
-        ctx.write_output(std::format("tls_enabled|{}",         cfg("agent.tls_enabled")));
-        ctx.write_output(std::format("heartbeat_interval|{}",  cfg("agent.heartbeat_interval")));
-        ctx.write_output(std::format("plugin_dir|{}",          cfg("agent.plugin_dir")));
-        ctx.write_output(std::format("data_dir|{}",            cfg("agent.data_dir")));
-        ctx.write_output(std::format("log_level|{}",           cfg("agent.log_level")));
-        ctx.write_output(std::format("debug_mode|{}",          cfg("agent.debug_mode")));
-        ctx.write_output(std::format("verbose_logging|{}",     cfg("agent.verbose_logging")));
+        ctx.write_output(std::format("agent_id|{}", cfg("agent.id")));
+        ctx.write_output(std::format("agent_version|{}", cfg("agent.version")));
+        ctx.write_output(std::format("build_number|{}", cfg("agent.build_number")));
+        ctx.write_output(std::format("git_commit|{}", cfg("agent.git_commit")));
+        ctx.write_output(std::format("server_address|{}", cfg("agent.server_address")));
+        ctx.write_output(std::format("tls_enabled|{}", cfg("agent.tls_enabled")));
+        ctx.write_output(std::format("heartbeat_interval|{}", cfg("agent.heartbeat_interval")));
+        ctx.write_output(std::format("plugin_dir|{}", cfg("agent.plugin_dir")));
+        ctx.write_output(std::format("data_dir|{}", cfg("agent.data_dir")));
+        ctx.write_output(std::format("log_level|{}", cfg("agent.log_level")));
+        ctx.write_output(std::format("debug_mode|{}", cfg("agent.debug_mode")));
+        ctx.write_output(std::format("verbose_logging|{}", cfg("agent.verbose_logging")));
         return 0;
     }
 
@@ -300,13 +314,13 @@ private:
 
     int do_health(yuzu::CommandContext& ctx) {
         auto now = std::chrono::steady_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-            now - init_time_).count();
+        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - init_time_).count();
         ctx.write_output(std::format("uptime_seconds|{}", uptime));
 
         auto sys_now = std::chrono::system_clock::now();
-        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            sys_now.time_since_epoch()).count();
+        auto epoch_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(sys_now.time_since_epoch())
+                .count();
         ctx.write_output(std::format("timestamp_epoch_ms|{}", epoch_ms));
 
         auto rss = get_memory_rss_kb();

@@ -12,12 +12,12 @@ namespace yuzu::server::oidc {
 struct OidcConfig {
     std::string issuer;
     std::string client_id;
-    std::string client_secret;      // Required for web platform (Entra confidential client)
+    std::string client_secret; // Required for web platform (Entra confidential client)
     std::string redirect_uri;
     std::string authorization_endpoint;
     std::string token_endpoint;
-    std::string exchange_script;    // Path to oidc_token_exchange.py
-    std::string admin_group_id;    // Entra group ID that maps to admin role
+    std::string exchange_script; // Path to oidc_token_exchange.py
+    std::string admin_group_id;  // Entra group ID that maps to admin role
 
     bool is_enabled() const { return !issuer.empty() && !client_id.empty(); }
 };
@@ -27,7 +27,7 @@ struct PkceChallenge {
     std::string code_challenge;
     std::string state;
     std::string nonce;
-    std::string redirect_uri;  // The exact redirect_uri used for this flow
+    std::string redirect_uri; // The exact redirect_uri used for this flow
     std::chrono::steady_clock::time_point expires_at;
 };
 
@@ -39,9 +39,9 @@ struct IdTokenClaims {
     std::string iss;
     std::string aud;
     std::string nonce;
-    int64_t     exp{0};
-    int64_t     iat{0};
-    std::vector<std::string> groups;  // Entra security group object IDs
+    int64_t exp{0};
+    int64_t iat{0};
+    std::vector<std::string> groups; // Entra security group object IDs
 };
 
 class OidcProvider {
@@ -56,8 +56,8 @@ public:
     std::string start_auth_flow(const std::string& request_redirect_uri = {});
 
     /// Exchange authorization code for tokens, validate ID token, return claims.
-    std::expected<IdTokenClaims, std::string>
-    handle_callback(const std::string& code, const std::string& state);
+    std::expected<IdTokenClaims, std::string> handle_callback(const std::string& code,
+                                                              const std::string& state);
 
     /// Remove expired PKCE states.
     void cleanup_expired_states();
@@ -70,14 +70,14 @@ public:
     static std::expected<IdTokenClaims, std::string> parse_id_token(const std::string& jwt);
 
     std::expected<void, std::string> validate_claims(const IdTokenClaims& claims,
-                                                      const std::string& expected_nonce) const;
+                                                     const std::string& expected_nonce) const;
 
 private:
     static std::string url_encode(const std::string& value);
 
-    std::expected<std::string, std::string>
-    exchange_code(const std::string& code, const std::string& code_verifier,
-                  const std::string& redirect_uri);
+    std::expected<std::string, std::string> exchange_code(const std::string& code,
+                                                          const std::string& code_verifier,
+                                                          const std::string& redirect_uri);
 
     OidcConfig config_;
     std::string exchange_script_path_;
@@ -87,4 +87,4 @@ private:
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };
 
-}  // namespace yuzu::server::oidc
+} // namespace yuzu::server::oidc

@@ -52,7 +52,8 @@ std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
     FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -71,10 +72,11 @@ using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
 
 bool get_rtl_version(RTL_OSVERSIONINFOW& vi) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
-    auto fn = reinterpret_cast<RtlGetVersionFn>(
-        GetProcAddress(ntdll, "RtlGetVersion"));
-    if (!fn) return false;
+    if (!ntdll)
+        return false;
+    auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!fn)
+        return false;
     vi.dwOSVersionInfoSize = sizeof(vi);
     return fn(&vi) == 0; // STATUS_SUCCESS
 }
@@ -88,8 +90,8 @@ std::string read_registry_string(HKEY root, const char* subkey, const char* valu
     DWORD size = sizeof(buf);
     DWORD type = 0;
     std::string result;
-    if (RegQueryValueExA(hkey, value, nullptr, &type,
-                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
+        ERROR_SUCCESS) {
         if (type == REG_SZ && size > 0) {
             result.assign(buf, size - 1); // exclude null terminator
         }
@@ -106,8 +108,8 @@ DWORD read_registry_dword(HKEY root, const char* subkey, const char* value) {
     DWORD data = 0;
     DWORD size = sizeof(data);
     DWORD type = 0;
-    if (RegQueryValueExA(hkey, value, nullptr, &type,
-                         reinterpret_cast<LPBYTE>(&data), &size) != ERROR_SUCCESS) {
+    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(&data), &size) !=
+        ERROR_SUCCESS) {
         data = 0;
     }
     RegCloseKey(hkey);
@@ -116,8 +118,8 @@ DWORD read_registry_dword(HKEY root, const char* subkey, const char* value) {
 #endif
 
 std::string format_uptime(long long total_seconds) {
-    long long days    = total_seconds / 86400;
-    long long hours   = (total_seconds % 86400) / 3600;
+    long long days = total_seconds / 86400;
+    long long hours = (total_seconds % 86400) / 3600;
     long long minutes = (total_seconds % 3600) / 60;
     return std::format("{}d {}h {}m", days, hours, minutes);
 }
@@ -125,7 +127,8 @@ std::string format_uptime(long long total_seconds) {
 #ifdef __linux__
 std::string read_os_release_field(const char* field) {
     std::ifstream ifs("/etc/os-release");
-    if (!ifs) return {};
+    if (!ifs)
+        return {};
     std::string prefix = std::string(field) + "=";
     std::string line;
     while (std::getline(ifs, line)) {
@@ -142,15 +145,15 @@ std::string read_os_release_field(const char* field) {
 }
 #endif
 
-constexpr const char* kWinNtCurrentVersion =
-    "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+constexpr const char* kWinNtCurrentVersion = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
 
 // ── os_name action ──────────────────────────────────────────────────────────
 
 int do_os_name(yuzu::CommandContext& ctx) {
 #ifdef __linux__
     auto name = read_os_release_field("PRETTY_NAME");
-    if (name.empty()) name = "Linux";
+    if (name.empty())
+        name = "Linux";
     ctx.write_output(std::format("os_name|{}", name));
 
 #elif defined(__APPLE__)
@@ -163,15 +166,16 @@ int do_os_name(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    auto name = read_registry_string(HKEY_LOCAL_MACHINE,
-        kWinNtCurrentVersion, "ProductName");
+    auto name = read_registry_string(HKEY_LOCAL_MACHINE, kWinNtCurrentVersion, "ProductName");
     // Windows 11 shipped with build 22000+, but the registry ProductName
     // still says "Windows 10" on many builds. Correct it using the build number.
     if (!name.empty()) {
-        auto build_str = read_registry_string(HKEY_LOCAL_MACHINE,
-            kWinNtCurrentVersion, "CurrentBuildNumber");
+        auto build_str =
+            read_registry_string(HKEY_LOCAL_MACHINE, kWinNtCurrentVersion, "CurrentBuildNumber");
         int build = 0;
-        try { build = std::stoi(build_str); } catch (...) {}
+        try {
+            build = std::stoi(build_str);
+        } catch (...) {}
         if (build >= 22000) {
             auto pos = name.find("Windows 10");
             if (pos != std::string::npos) {
@@ -201,8 +205,8 @@ int do_os_version(yuzu::CommandContext& ctx) {
 #elif defined(_WIN32)
     RTL_OSVERSIONINFOW vi{};
     if (get_rtl_version(vi)) {
-        ctx.write_output(std::format("os_version|{}.{}.{}",
-            vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber));
+        ctx.write_output(std::format("os_version|{}.{}.{}", vi.dwMajorVersion, vi.dwMinorVersion,
+                                     vi.dwBuildNumber));
     } else {
         ctx.write_output("os_version|unknown");
     }
@@ -237,7 +241,8 @@ int do_os_build(yuzu::CommandContext& ctx) {
         for (auto ch : line) {
             if (ch == ' ') {
                 ++field;
-                if (field == 3) break;
+                if (field == 3)
+                    break;
                 token.clear();
             } else {
                 token += ch;
@@ -253,10 +258,9 @@ int do_os_build(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("os_build|{}", build.empty() ? "unknown" : build));
 
 #elif defined(_WIN32)
-    auto build_num = read_registry_string(HKEY_LOCAL_MACHINE,
-        kWinNtCurrentVersion, "CurrentBuildNumber");
-    auto ubr = read_registry_dword(HKEY_LOCAL_MACHINE,
-        kWinNtCurrentVersion, "UBR");
+    auto build_num =
+        read_registry_string(HKEY_LOCAL_MACHINE, kWinNtCurrentVersion, "CurrentBuildNumber");
+    auto ubr = read_registry_dword(HKEY_LOCAL_MACHINE, kWinNtCurrentVersion, "UBR");
     if (!build_num.empty()) {
         ctx.write_output(std::format("os_build|{}.{}", build_num, ubr));
     } else {
@@ -285,10 +289,18 @@ int do_os_arch(yuzu::CommandContext& ctx) {
     GetNativeSystemInfo(&si);
     const char* arch = "unknown";
     switch (si.wProcessorArchitecture) {
-        case PROCESSOR_ARCHITECTURE_AMD64: arch = "x86_64";  break;
-        case PROCESSOR_ARCHITECTURE_ARM64: arch = "aarch64"; break;
-        case PROCESSOR_ARCHITECTURE_INTEL: arch = "x86";     break;
-        case PROCESSOR_ARCHITECTURE_ARM:   arch = "arm";     break;
+    case PROCESSOR_ARCHITECTURE_AMD64:
+        arch = "x86_64";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM64:
+        arch = "aarch64";
+        break;
+    case PROCESSOR_ARCHITECTURE_INTEL:
+        arch = "x86";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM:
+        arch = "arm";
+        break;
     }
     ctx.write_output(std::format("os_arch|{}", arch));
 
@@ -333,37 +345,38 @@ int do_uptime(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class OsInfoPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "os_info"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "os_info"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Reports OS name, version, build, architecture, and system uptime";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "os_name", "os_version", "os_build", "os_arch", "uptime", nullptr
-        };
+        static const char* acts[] = {"os_name", "os_version", "os_build",
+                                     "os_arch", "uptime",     nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "os_name")    return do_os_name(ctx);
-        if (action == "os_version") return do_os_version(ctx);
-        if (action == "os_build")   return do_os_build(ctx);
-        if (action == "os_arch")    return do_os_arch(ctx);
-        if (action == "uptime")     return do_uptime(ctx);
+        if (action == "os_name")
+            return do_os_name(ctx);
+        if (action == "os_version")
+            return do_os_version(ctx);
+        if (action == "os_build")
+            return do_os_build(ctx);
+        if (action == "os_arch")
+            return do_os_arch(ctx);
+        if (action == "uptime")
+            return do_uptime(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

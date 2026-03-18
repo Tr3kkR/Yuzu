@@ -1,8 +1,8 @@
 #pragma once
 
+#include <spdlog/details/fmt_helper.h>
 #include <spdlog/formatter.h>
 #include <spdlog/pattern_formatter.h>
-#include <spdlog/details/fmt_helper.h>
 
 #include <chrono>
 #include <string>
@@ -16,12 +16,12 @@ public:
     explicit JsonLogFormatter(std::string component = "server")
         : component_(std::move(component)) {}
 
-    void format(const spdlog::details::log_msg& msg,
-                spdlog::memory_buf_t& dest) override {
+    void format(const spdlog::details::log_msg& msg, spdlog::memory_buf_t& dest) override {
         // ISO 8601 timestamp with milliseconds
         auto time_t = std::chrono::system_clock::to_time_t(msg.time);
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            msg.time.time_since_epoch()) % 1000;
+        auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(msg.time.time_since_epoch()) %
+            1000;
         std::tm tm_buf{};
 #ifdef _WIN32
         gmtime_s(&tm_buf, &time_t);
@@ -31,13 +31,15 @@ public:
 
         char ts[32];
         auto len = std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_buf);
-        auto ts_str = std::string(ts, len) + "." +
-            std::to_string(ms.count()) + "Z";
+        auto ts_str = std::string(ts, len) + "." + std::to_string(ms.count()) + "Z";
         // Pad ms to 3 digits
         auto ms_val = ms.count();
-        if (ms_val < 10) ts_str = std::string(ts, len) + ".00" + std::to_string(ms_val) + "Z";
-        else if (ms_val < 100) ts_str = std::string(ts, len) + ".0" + std::to_string(ms_val) + "Z";
-        else ts_str = std::string(ts, len) + "." + std::to_string(ms_val) + "Z";
+        if (ms_val < 10)
+            ts_str = std::string(ts, len) + ".00" + std::to_string(ms_val) + "Z";
+        else if (ms_val < 100)
+            ts_str = std::string(ts, len) + ".0" + std::to_string(ms_val) + "Z";
+        else
+            ts_str = std::string(ts, len) + "." + std::to_string(ms_val) + "Z";
 
         // Escape the message for JSON
         auto raw_msg = std::string_view(msg.payload.data(), msg.payload.size());
@@ -45,11 +47,10 @@ public:
 
         auto level_str = spdlog::level::to_string_view(msg.level);
 
-        auto line = std::string("{\"timestamp\":\"") + ts_str +
-            "\",\"level\":\"" + std::string(level_str.data(), level_str.size()) +
-            "\",\"component\":\"" + component_ +
-            "\",\"thread\":" + std::to_string(msg.thread_id) +
-            ",\"message\":\"" + escaped + "\"}\n";
+        auto line = std::string("{\"timestamp\":\"") + ts_str + "\",\"level\":\"" +
+                    std::string(level_str.data(), level_str.size()) + "\",\"component\":\"" +
+                    component_ + "\",\"thread\":" + std::to_string(msg.thread_id) +
+                    ",\"message\":\"" + escaped + "\"}\n";
 
         dest.append(line.data(), line.data() + line.size());
     }
@@ -64,20 +65,29 @@ private:
         out.reserve(s.size());
         for (char c : s) {
             switch (c) {
-                case '"':  out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\n': out += "\\n"; break;
-                case '\r': out += "\\r"; break;
-                case '\t': out += "\\t"; break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20) {
-                        char buf[8];
-                        std::snprintf(buf, sizeof(buf), "\\u%04x",
-                                      static_cast<unsigned int>(c));
-                        out += buf;
-                    } else {
-                        out += c;
-                    }
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+                    out += buf;
+                } else {
+                    out += c;
+                }
             }
         }
         return out;
@@ -86,4 +96,4 @@ private:
     std::string component_;
 };
 
-}  // namespace yuzu
+} // namespace yuzu

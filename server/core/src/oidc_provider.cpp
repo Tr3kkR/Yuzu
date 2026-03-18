@@ -83,13 +83,17 @@ std::string OidcProvider::base64url_encode(const std::vector<uint8_t>& data) {
 
     for (std::size_t i = 0; i < data.size(); i += 3) {
         uint32_t n = static_cast<uint32_t>(data[i]) << 16;
-        if (i + 1 < data.size()) n |= static_cast<uint32_t>(data[i + 1]) << 8;
-        if (i + 2 < data.size()) n |= static_cast<uint32_t>(data[i + 2]);
+        if (i + 1 < data.size())
+            n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < data.size())
+            n |= static_cast<uint32_t>(data[i + 2]);
 
         out += kAlphabet[(n >> 18) & 0x3F];
         out += kAlphabet[(n >> 12) & 0x3F];
-        if (i + 1 < data.size()) out += kAlphabet[(n >> 6) & 0x3F];
-        if (i + 2 < data.size()) out += kAlphabet[n & 0x3F];
+        if (i + 1 < data.size())
+            out += kAlphabet[(n >> 6) & 0x3F];
+        if (i + 2 < data.size())
+            out += kAlphabet[n & 0x3F];
     }
     // No padding (JWT convention)
     return out;
@@ -99,8 +103,10 @@ std::string OidcProvider::base64url_decode(const std::string& input) {
     // Convert base64url to standard base64 and decode
     std::string b64 = input;
     for (auto& c : b64) {
-        if (c == '-') c = '+';
-        else if (c == '_') c = '/';
+        if (c == '-')
+            c = '+';
+        else if (c == '_')
+            c = '/';
     }
     // Add padding
     while (b64.size() % 4 != 0)
@@ -126,7 +132,8 @@ std::string OidcProvider::base64url_decode(const std::string& input) {
     unsigned int val = 0;
     int bits = -8;
     for (unsigned char c : b64) {
-        if (kTable[c] == 64) continue;
+        if (kTable[c] == 64)
+            continue;
         val = (val << 6) | kTable[c];
         bits += 6;
         if (bits >= 0) {
@@ -148,8 +155,7 @@ std::string OidcProvider::url_encode(const std::string& value) {
             c == '~') {
             escaped << c;
         } else {
-            escaped << '%' << std::setw(2)
-                    << static_cast<int>(static_cast<unsigned char>(c));
+            escaped << '%' << std::setw(2) << static_cast<int>(static_cast<unsigned char>(c));
         }
     }
     return escaped.str();
@@ -169,8 +175,7 @@ std::string OidcProvider::compute_code_challenge(const std::string& verifier) {
 
 // ── JWT parsing ──────────────────────────────────────────────────────────────
 
-std::expected<IdTokenClaims, std::string>
-OidcProvider::parse_id_token(const std::string& jwt) {
+std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std::string& jwt) {
     // Split on '.'
     auto dot1 = jwt.find('.');
     if (dot1 == std::string::npos)
@@ -191,14 +196,22 @@ OidcProvider::parse_id_token(const std::string& jwt) {
     }
 
     IdTokenClaims claims;
-    if (j.contains("sub"))                claims.sub = j["sub"].get<std::string>();
-    if (j.contains("email"))              claims.email = j["email"].get<std::string>();
-    if (j.contains("preferred_username")) claims.preferred_username = j["preferred_username"].get<std::string>();
-    if (j.contains("name"))               claims.name = j["name"].get<std::string>();
-    if (j.contains("iss"))                claims.iss = j["iss"].get<std::string>();
-    if (j.contains("nonce"))              claims.nonce = j["nonce"].get<std::string>();
-    if (j.contains("exp"))                claims.exp = j["exp"].get<int64_t>();
-    if (j.contains("iat"))                claims.iat = j["iat"].get<int64_t>();
+    if (j.contains("sub"))
+        claims.sub = j["sub"].get<std::string>();
+    if (j.contains("email"))
+        claims.email = j["email"].get<std::string>();
+    if (j.contains("preferred_username"))
+        claims.preferred_username = j["preferred_username"].get<std::string>();
+    if (j.contains("name"))
+        claims.name = j["name"].get<std::string>();
+    if (j.contains("iss"))
+        claims.iss = j["iss"].get<std::string>();
+    if (j.contains("nonce"))
+        claims.nonce = j["nonce"].get<std::string>();
+    if (j.contains("exp"))
+        claims.exp = j["exp"].get<int64_t>();
+    if (j.contains("iat"))
+        claims.iat = j["iat"].get<int64_t>();
 
     // aud can be a string or array
     if (j.contains("aud")) {
@@ -221,7 +234,7 @@ OidcProvider::parse_id_token(const std::string& jwt) {
 
 std::expected<void, std::string>
 OidcProvider::validate_claims(const IdTokenClaims& claims,
-                               const std::string& expected_nonce) const {
+                              const std::string& expected_nonce) const {
     if (claims.iss != config_.issuer)
         return std::unexpected("iss mismatch: got '" + claims.iss + "', expected '" +
                                config_.issuer + "'");
@@ -264,10 +277,8 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         return {};
     }
 
-    HINTERNET session = WinHttpOpen(L"Yuzu-Server/1.0",
-                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                     WINHTTP_NO_PROXY_NAME,
-                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET session = WinHttpOpen(L"Yuzu-Server/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
         spdlog::error("WinHTTP: WinHttpOpen failed: {}", GetLastError());
         return {};
@@ -281,9 +292,8 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     }
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, nullptr,
-                                            WINHTTP_NO_REFERER,
-                                            WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
         spdlog::error("WinHTTP: WinHttpOpenRequest failed: {}", GetLastError());
         WinHttpCloseHandle(connect);
@@ -292,10 +302,9 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
     }
 
     const wchar_t* content_type = L"Content-Type: application/x-www-form-urlencoded";
-    BOOL ok = WinHttpSendRequest(request, content_type, -1L,
-                                  const_cast<char*>(form_body.data()),
-                                  static_cast<DWORD>(form_body.size()),
-                                  static_cast<DWORD>(form_body.size()), 0);
+    BOOL ok = WinHttpSendRequest(request, content_type, -1L, const_cast<char*>(form_body.data()),
+                                 static_cast<DWORD>(form_body.size()),
+                                 static_cast<DWORD>(form_body.size()), 0);
     if (!ok) {
         spdlog::error("WinHTTP: WinHttpSendRequest failed: {}", GetLastError());
         WinHttpCloseHandle(request);
@@ -338,10 +347,10 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
 
 std::expected<std::string, std::string>
 OidcProvider::exchange_code(const std::string& code, const std::string& code_verifier,
-                             const std::string& redirect_uri) {
+                            const std::string& redirect_uri) {
     std::string form_body = "grant_type=authorization_code"
-                            "&code=" + url_encode(code) +
-                            "&redirect_uri=" + url_encode(redirect_uri) +
+                            "&code=" +
+                            url_encode(code) + "&redirect_uri=" + url_encode(redirect_uri) +
                             "&client_id=" + url_encode(config_.client_id) +
                             "&code_verifier=" + url_encode(code_verifier);
     if (!config_.client_secret.empty())
@@ -363,9 +372,14 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     // Parse URL for httplib
     auto url = config_.token_endpoint;
     std::string scheme, host, path;
-    if (url.starts_with("https://")) { scheme = "https://"; url = url.substr(8); }
-    else if (url.starts_with("http://")) { scheme = "http://"; url = url.substr(7); }
-    else return std::unexpected("invalid token endpoint URL");
+    if (url.starts_with("https://")) {
+        scheme = "https://";
+        url = url.substr(8);
+    } else if (url.starts_with("http://")) {
+        scheme = "http://";
+        url = url.substr(7);
+    } else
+        return std::unexpected("invalid token endpoint URL");
     auto slash = url.find('/');
     host = (slash != std::string::npos) ? url.substr(0, slash) : url;
     path = (slash != std::string::npos) ? url.substr(slash) : "/";
@@ -375,8 +389,10 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     client.set_read_timeout(15);
     auto result = client.Post(path, form_body, "application/x-www-form-urlencoded");
     if (!result) {
-        spdlog::error("OIDC token exchange: httplib failed: {}", httplib::to_string(result.error()));
-        return std::unexpected("token endpoint request failed: " + httplib::to_string(result.error()));
+        spdlog::error("OIDC token exchange: httplib failed: {}",
+                      httplib::to_string(result.error()));
+        return std::unexpected("token endpoint request failed: " +
+                               httplib::to_string(result.error()));
     }
     if (result->status != 200) {
         spdlog::error("OIDC token exchange: status={} body={}", result->status,
@@ -412,8 +428,8 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 
 // ── OidcProvider ─────────────────────────────────────────────────────────────
 
-OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)),
-    exchange_script_path_(config_.exchange_script) {
+OidcProvider::OidcProvider(OidcConfig config)
+    : config_(std::move(config)), exchange_script_path_(config_.exchange_script) {
     // Fetch OIDC discovery document to get the real endpoints
     auto discovery_url = config_.issuer + "/.well-known/openid-configuration";
     spdlog::info("OidcProvider: fetching discovery from {}", discovery_url);
@@ -435,7 +451,7 @@ OidcProvider::OidcProvider(OidcConfig config) : config_(std::move(config)),
     httplib::Client client(scheme + host);
     client.set_connection_timeout(15);
     client.set_read_timeout(15);
-    client.enable_server_certificate_verification(false);  // Windows OpenSSL lacks system CA bundle
+    client.enable_server_certificate_verification(false); // Windows OpenSSL lacks system CA bundle
     auto result = client.Get(path);
 
     if (result && result->status == 200) {
@@ -463,21 +479,21 @@ bool OidcProvider::is_enabled() const {
 }
 
 std::string OidcProvider::start_auth_flow(const std::string& request_redirect_uri) {
-    auto verifier  = generate_code_verifier();
+    auto verifier = generate_code_verifier();
     auto challenge = compute_code_challenge(verifier);
-    auto state     = bytes_to_hex(random_bytes(32));
-    auto nonce     = bytes_to_hex(random_bytes(16));
+    auto state = bytes_to_hex(random_bytes(32));
+    auto nonce = bytes_to_hex(random_bytes(16));
 
     // Use the request-derived redirect URI if provided, otherwise fall back to config
     auto redirect_uri = request_redirect_uri.empty() ? config_.redirect_uri : request_redirect_uri;
 
     PkceChallenge pkce;
-    pkce.code_verifier  = verifier;
+    pkce.code_verifier = verifier;
     pkce.code_challenge = challenge;
-    pkce.state          = state;
-    pkce.nonce          = nonce;
-    pkce.redirect_uri   = redirect_uri;
-    pkce.expires_at     = std::chrono::steady_clock::now() + kChallengeTtl;
+    pkce.state = state;
+    pkce.nonce = nonce;
+    pkce.redirect_uri = redirect_uri;
+    pkce.expires_at = std::chrono::steady_clock::now() + kChallengeTtl;
 
     {
         std::lock_guard lock(mu_);
@@ -486,14 +502,10 @@ std::string OidcProvider::start_auth_flow(const std::string& request_redirect_ur
 
     cleanup_expired_states();
 
-    auto url = config_.authorization_endpoint +
-               "?client_id=" + url_encode(config_.client_id) +
-               "&response_type=code" +
-               "&scope=" + url_encode("openid profile email") +
-               "&redirect_uri=" + url_encode(redirect_uri) +
-               "&state=" + url_encode(state) +
-               "&nonce=" + url_encode(nonce) +
-               "&code_challenge=" + url_encode(challenge) +
+    auto url = config_.authorization_endpoint + "?client_id=" + url_encode(config_.client_id) +
+               "&response_type=code" + "&scope=" + url_encode("openid profile email") +
+               "&redirect_uri=" + url_encode(redirect_uri) + "&state=" + url_encode(state) +
+               "&nonce=" + url_encode(nonce) + "&code_challenge=" + url_encode(challenge) +
                "&code_challenge_method=S256";
 
     spdlog::debug("OIDC auth flow started: state={} redirect_uri={}", state.substr(0, 8),
@@ -501,8 +513,8 @@ std::string OidcProvider::start_auth_flow(const std::string& request_redirect_ur
     return url;
 }
 
-std::expected<IdTokenClaims, std::string>
-OidcProvider::handle_callback(const std::string& code, const std::string& state) {
+std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const std::string& code,
+                                                                        const std::string& state) {
     spdlog::info("OIDC handle_callback: state={} code_len={}", state.substr(0, 8), code.size());
 
     PkceChallenge challenge;
@@ -522,7 +534,7 @@ OidcProvider::handle_callback(const std::string& code, const std::string& state)
         }
 
         challenge = std::move(it->second);
-        pending_challenges_.erase(it);  // single-use
+        pending_challenges_.erase(it); // single-use
     }
 
     spdlog::info("OIDC handle_callback: found challenge, redirect_uri={}", challenge.redirect_uri);
@@ -553,8 +565,7 @@ OidcProvider::handle_callback(const std::string& code, const std::string& state)
         return std::unexpected(validation.error());
     }
 
-    spdlog::info("OIDC auth succeeded: sub={} email={} name={}",
-                 claims_result->sub,
+    spdlog::info("OIDC auth succeeded: sub={} email={} name={}", claims_result->sub,
                  claims_result->email.empty() ? "(none)" : claims_result->email,
                  claims_result->name.empty() ? "(none)" : claims_result->name);
 
@@ -572,4 +583,4 @@ void OidcProvider::cleanup_expired_states() {
     }
 }
 
-}  // namespace yuzu::server::oidc
+} // namespace yuzu::server::oidc

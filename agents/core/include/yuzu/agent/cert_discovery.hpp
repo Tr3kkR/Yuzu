@@ -1,6 +1,6 @@
 #pragma once
 
-#include <yuzu/plugin.h>  // YUZU_EXPORT
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <filesystem>
 #include <optional>
@@ -10,9 +10,9 @@ namespace yuzu::agent {
 
 /// Result of automatic certificate discovery from well-known filesystem paths.
 struct YUZU_EXPORT DiscoveredCert {
-    std::filesystem::path cert_path;   // PEM certificate file
-    std::filesystem::path key_path;    // PEM private key file
-    std::string source;                // Where it was found (e.g. "convention", "env")
+    std::filesystem::path cert_path; // PEM certificate file
+    std::filesystem::path key_path;  // PEM private key file
+    std::string source;              // Where it was found (e.g. "convention", "env")
 };
 
 /// Search well-known paths for a client certificate and private key pair.
@@ -27,4 +27,4 @@ struct YUZU_EXPORT DiscoveredCert {
 /// On Windows, only checks the environment variable path (use --cert-store instead).
 YUZU_EXPORT std::optional<DiscoveredCert> discover_client_cert();
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

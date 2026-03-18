@@ -41,10 +41,10 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
-#include <tlhelp32.h>
 #include <bcrypt.h>
 #include <charconv>
+#include <tlhelp32.h>
+#include <windows.h>
 #endif
 
 namespace {
@@ -68,7 +68,8 @@ std::string escape_pipes(std::string_view sv) {
 
 std::string read_first_line(const std::filesystem::path& path) {
     std::ifstream f(path);
-    if (!f) return {};
+    if (!f)
+        return {};
     std::string line;
     std::getline(f, line);
     return line;
@@ -84,10 +85,12 @@ std::string resolve_exe(const std::filesystem::path& link) {
 
 std::string sha1_of_file(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return {};
+    if (!f)
+        return {};
 
     auto* ctx = EVP_MD_CTX_new();
-    if (!ctx) return {};
+    if (!ctx)
+        return {};
 
     if (EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1) {
         EVP_MD_CTX_free(ctx);
@@ -100,7 +103,8 @@ std::string sha1_of_file(const std::filesystem::path& path) {
             EVP_MD_CTX_free(ctx);
             return {};
         }
-        if (f.gcount() < static_cast<std::streamsize>(sizeof(buf))) break;
+        if (f.gcount() < static_cast<std::streamsize>(sizeof(buf)))
+            break;
     }
 
     unsigned char hash[EVP_MAX_MD_SIZE];
@@ -124,18 +128,20 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::error_code ec;
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
-        if (!entry.is_directory(ec)) continue;
+        if (!entry.is_directory(ec))
+            continue;
 
         auto dirname = entry.path().filename().string();
         int pid = 0;
-        auto [ptr, errc] = std::from_chars(dirname.data(),
-                                            dirname.data() + dirname.size(),
-                                            pid);
-        if (errc != std::errc{} || ptr != dirname.data() + dirname.size()) continue;
-        if (pid <= 0) continue;
+        auto [ptr, errc] = std::from_chars(dirname.data(), dirname.data() + dirname.size(), pid);
+        if (errc != std::errc{} || ptr != dirname.data() + dirname.size())
+            continue;
+        if (pid <= 0)
+            continue;
 
         std::string name = read_first_line(entry.path() / "comm");
-        if (name.empty()) continue;
+        if (name.empty())
+            continue;
 
         std::string exe_path = resolve_exe(entry.path() / "exe");
         std::string sha1;
@@ -152,8 +158,8 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             }
         }
 
-        ctx.write_output(std::format("{}|{}|{}|{}",
-            pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+        ctx.write_output(
+            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
     }
 }
 
@@ -161,9 +167,11 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 #elif defined(_WIN32)
 
 std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws) return {};
+    if (!ws || !*ws)
+        return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
+    if (len <= 0)
+        return {};
     std::string s(static_cast<size_t>(len - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), len, nullptr, nullptr);
     return s;
@@ -171,21 +179,24 @@ std::string wide_to_utf8(const wchar_t* ws) {
 
 std::string get_process_image_path(DWORD pid) {
     HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!proc) return {};
+    if (!proc)
+        return {};
 
     wchar_t path_buf[MAX_PATH];
     DWORD path_len = MAX_PATH;
     BOOL ok = QueryFullProcessImageNameW(proc, 0, path_buf, &path_len);
     CloseHandle(proc);
 
-    if (!ok) return {};
+    if (!ok)
+        return {};
     return wide_to_utf8(path_buf);
 }
 
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return {};
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return {};
 
     BCRYPT_HASH_HANDLE hash_handle = nullptr;
     NTSTATUS status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
@@ -197,17 +208,18 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
     char buf[65536];
     DWORD bytes_read = 0;
     while (ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
-        status = BCryptHashData(hash_handle, reinterpret_cast<PUCHAR>(buf),
-                                bytes_read, 0);
-        if (status != 0) break;
+        status = BCryptHashData(hash_handle, reinterpret_cast<PUCHAR>(buf), bytes_read, 0);
+        if (status != 0)
+            break;
     }
     CloseHandle(file);
 
-    unsigned char hash[20];  // SHA-1 is 20 bytes
+    unsigned char hash[20]; // SHA-1 is 20 bytes
     status = BCryptFinishHash(hash_handle, hash, sizeof(hash), 0);
     BCryptDestroyHash(hash_handle);
 
-    if (status != 0) return {};
+    if (status != 0)
+        return {};
 
     std::string hex;
     hex.reserve(40);
@@ -219,11 +231,11 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
 
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
 
     BCRYPT_ALG_HANDLE alg = nullptr;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM,
-                                                  nullptr, 0);
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
     if (status != 0) {
         CloseHandle(snap);
         return;
@@ -243,7 +255,8 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     do {
         int pid = static_cast<int>(pe.th32ProcessID);
         std::string name = wide_to_utf8(pe.szExeFile);
-        if (name.empty()) continue;
+        if (name.empty())
+            continue;
 
         std::string exe_path = get_process_image_path(pe.th32ProcessID);
         std::string sha1;
@@ -257,22 +270,22 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             }
         }
 
-        ctx.write_output(std::format("{}|{}|{}|{}",
-            pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+        ctx.write_output(
+            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
     } while (Process32NextW(snap, &pe));
 
     BCryptCloseAlgorithmProvider(alg, 0);
     CloseHandle(snap);
 }
 
-#endif  // platform
+#endif // platform
 
-}  // namespace
+} // namespace
 
 class ProcfetchPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "procfetch"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "procfetch"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Enumerates running processes with SHA-1 hashes of executables";
     }
@@ -285,8 +298,7 @@ public:
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
         if (action == "procfetch_fetch") {
             return do_fetch(ctx);

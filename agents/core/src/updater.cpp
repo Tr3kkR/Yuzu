@@ -8,7 +8,7 @@
  */
 
 #include <yuzu/agent/updater.hpp>
-#include <yuzu/plugin.h>  // yuzu_create_temp_file
+#include <yuzu/plugin.h> // yuzu_create_temp_file
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
@@ -19,26 +19,26 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <format>
+#include <fstream>
 #include <string>
 #include <vector>
 
 #ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#  include <bcrypt.h>
-#  pragma comment(lib, "bcrypt.lib")
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <bcrypt.h>
+#include <windows.h>
+#pragma comment(lib, "bcrypt.lib")
 #else
-#  include <openssl/evp.h>
-#  ifdef __APPLE__
-#    include <mach-o/dyld.h>  // _NSGetExecutablePath
-#  endif
+#include <openssl/evp.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h> // _NSGetExecutablePath
+#endif
 #endif
 
 namespace yuzu::agent {
@@ -53,18 +53,17 @@ class Sha256Hasher {
 public:
     Sha256Hasher() {
 #ifdef _WIN32
-        NTSTATUS status = BCryptOpenAlgorithmProvider(
-            &alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            spdlog::error("BCryptOpenAlgorithmProvider failed: 0x{:08x}", static_cast<unsigned>(status));
+            spdlog::error("BCryptOpenAlgorithmProvider failed: 0x{:08x}",
+                          static_cast<unsigned>(status));
             valid_ = false;
             return;
         }
 
         DWORD obj_size = 0;
         DWORD data_len = 0;
-        status = BCryptGetProperty(alg_, BCRYPT_OBJECT_LENGTH,
-                                   reinterpret_cast<PUCHAR>(&obj_size),
+        status = BCryptGetProperty(alg_, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size),
                                    sizeof(DWORD), &data_len, 0);
         if (!BCRYPT_SUCCESS(status)) {
             spdlog::error("BCryptGetProperty failed: 0x{:08x}", static_cast<unsigned>(status));
@@ -74,9 +73,8 @@ public:
         }
 
         hash_obj_.resize(obj_size);
-        status = BCryptCreateHash(alg_, &hash_,
-                                  hash_obj_.data(), static_cast<ULONG>(hash_obj_.size()),
-                                  nullptr, 0, 0);
+        status = BCryptCreateHash(alg_, &hash_, hash_obj_.data(),
+                                  static_cast<ULONG>(hash_obj_.size()), nullptr, 0, 0);
         if (!BCRYPT_SUCCESS(status)) {
             spdlog::error("BCryptCreateHash failed: 0x{:08x}", static_cast<unsigned>(status));
             BCryptCloseAlgorithmProvider(alg_, 0);
@@ -88,7 +86,10 @@ public:
         ctx_ = EVP_MD_CTX_new();
         if (!ctx_ || EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) != 1) {
             spdlog::error("EVP_DigestInit_ex failed");
-            if (ctx_) { EVP_MD_CTX_free(ctx_); ctx_ = nullptr; }
+            if (ctx_) {
+                EVP_MD_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
             valid_ = false;
             return;
         }
@@ -98,10 +99,13 @@ public:
 
     ~Sha256Hasher() {
 #ifdef _WIN32
-        if (hash_)  BCryptDestroyHash(hash_);
-        if (alg_)   BCryptCloseAlgorithmProvider(alg_, 0);
+        if (hash_)
+            BCryptDestroyHash(hash_);
+        if (alg_)
+            BCryptCloseAlgorithmProvider(alg_, 0);
 #else
-        if (ctx_)    EVP_MD_CTX_free(ctx_);
+        if (ctx_)
+            EVP_MD_CTX_free(ctx_);
 #endif
     }
 
@@ -111,12 +115,11 @@ public:
     [[nodiscard]] bool is_valid() const noexcept { return valid_; }
 
     bool update(const void* data, size_t len) {
-        if (!valid_) return false;
+        if (!valid_)
+            return false;
 #ifdef _WIN32
-        NTSTATUS status = BCryptHashData(
-            hash_,
-            static_cast<PUCHAR>(const_cast<void*>(data)),
-            static_cast<ULONG>(len), 0);
+        NTSTATUS status = BCryptHashData(hash_, static_cast<PUCHAR>(const_cast<void*>(data)),
+                                         static_cast<ULONG>(len), 0);
         return BCRYPT_SUCCESS(status);
 #else
         return EVP_DigestUpdate(ctx_, data, len) == 1;
@@ -125,9 +128,10 @@ public:
 
     /// Finalize and return lowercase hex-encoded SHA-256 digest.
     [[nodiscard]] std::string finalize() {
-        if (!valid_) return {};
+        if (!valid_)
+            return {};
 
-        constexpr size_t kDigestLen = 32;  // SHA-256 = 256 bits = 32 bytes
+        constexpr size_t kDigestLen = 32; // SHA-256 = 256 bits = 32 bytes
         unsigned char digest[kDigestLen]{};
 
 #ifdef _WIN32
@@ -159,7 +163,7 @@ private:
     bool valid_{false};
 
 #ifdef _WIN32
-    BCRYPT_ALG_HANDLE  alg_{nullptr};
+    BCRYPT_ALG_HANDLE alg_{nullptr};
     BCRYPT_HASH_HANDLE hash_{nullptr};
     std::vector<unsigned char> hash_obj_;
 #else
@@ -169,14 +173,15 @@ private:
 
 /// Case-insensitive string equality.
 bool iequal(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
+    if (a.size() != b.size())
+        return false;
     return std::ranges::equal(a, b, [](char lhs, char rhs) {
         return std::tolower(static_cast<unsigned char>(lhs)) ==
                std::tolower(static_cast<unsigned char>(rhs));
     });
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ── current_executable_path ────────────────────────────────────────────────
 
@@ -217,16 +222,11 @@ std::filesystem::path current_executable_path() {
 
 // ── Updater ────────────────────────────────────────────────────────────────
 
-Updater::Updater(UpdateConfig config, std::string agent_id,
-                 std::string current_version, std::string os,
-                 std::string arch, std::filesystem::path exe_path)
-    : config_{std::move(config)}
-    , agent_id_{std::move(agent_id)}
-    , current_version_{std::move(current_version)}
-    , os_{std::move(os)}
-    , arch_{std::move(arch)}
-    , exe_path_{std::move(exe_path)}
-{}
+Updater::Updater(UpdateConfig config, std::string agent_id, std::string current_version,
+                 std::string os, std::string arch, std::filesystem::path exe_path)
+    : config_{std::move(config)}, agent_id_{std::move(agent_id)},
+      current_version_{std::move(current_version)}, os_{std::move(os)}, arch_{std::move(arch)},
+      exe_path_{std::move(exe_path)} {}
 
 void Updater::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
@@ -263,8 +263,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     if (!check_status.ok()) {
         return std::unexpected(UpdateError{
-            std::format("CheckForUpdate RPC failed: {} (code {})",
-                        check_status.error_message(),
+            std::format("CheckForUpdate RPC failed: {} (code {})", check_status.error_message(),
                         static_cast<int>(check_status.error_code()))});
     }
 
@@ -279,9 +278,8 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         return false;
     }
 
-    spdlog::info("Update available: {} -> {} ({} bytes, mandatory={})",
-                 current_version_, check_resp.latest_version(),
-                 check_resp.file_size(), check_resp.mandatory());
+    spdlog::info("Update available: {} -> {} ({} bytes, mandatory={})", current_version_,
+                 check_resp.latest_version(), check_resp.file_size(), check_resp.mandatory());
 
     if (stop_requested_.load(std::memory_order_acquire)) {
         return false;
@@ -360,13 +358,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     if (!dl_status.ok()) {
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
-        return std::unexpected(UpdateError{
-            std::format("DownloadUpdate RPC failed: {} (code {})",
-                        dl_status.error_message(),
-                        static_cast<int>(dl_status.error_code()))});
+        return std::unexpected(UpdateError{std::format("DownloadUpdate RPC failed: {} (code {})",
+                                                       dl_status.error_message(),
+                                                       static_cast<int>(dl_status.error_code()))});
     }
 
-    spdlog::info("Downloaded {} bytes for update {}", bytes_downloaded, check_resp.latest_version());
+    spdlog::info("Downloaded {} bytes for update {}", bytes_downloaded,
+                 check_resp.latest_version());
 
     // ── Step 4: Verify SHA-256 ─────────────────────────────────────────────
 
@@ -378,13 +376,12 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     }
 
     if (!iequal(actual_hash, check_resp.sha256())) {
-        spdlog::error("SHA-256 mismatch: expected='{}', actual='{}'",
-                      check_resp.sha256(), actual_hash);
+        spdlog::error("SHA-256 mismatch: expected='{}', actual='{}'", check_resp.sha256(),
+                      actual_hash);
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
-        return std::unexpected(UpdateError{
-            std::format("SHA-256 mismatch: expected '{}', got '{}'",
-                        check_resp.sha256(), actual_hash)});
+        return std::unexpected(UpdateError{std::format("SHA-256 mismatch: expected '{}', got '{}'",
+                                                       check_resp.sha256(), actual_hash)});
     }
 
     spdlog::info("SHA-256 verified: {}", actual_hash);
@@ -394,8 +391,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     return apply_update(temp_path);
 }
 
-std::expected<bool, UpdateError>
-Updater::apply_update(const std::filesystem::path& temp_path) {
+std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::path& temp_path) {
     namespace fs = std::filesystem;
     std::error_code ec;
 
@@ -410,9 +406,9 @@ Updater::apply_update(const std::filesystem::path& temp_path) {
     // Rename the running exe out of the way
     fs::rename(exe_path_, old_path, ec);
     if (ec) {
-        return std::unexpected(UpdateError{
-            std::format("Failed to rename running exe '{}' -> '{}': {}",
-                        exe_path_.string(), old_path.string(), ec.message())});
+        return std::unexpected(
+            UpdateError{std::format("Failed to rename running exe '{}' -> '{}': {}",
+                                    exe_path_.string(), old_path.string(), ec.message())});
     }
 
     // Move new binary into place
@@ -424,15 +420,13 @@ Updater::apply_update(const std::filesystem::path& temp_path) {
         if (rb_ec) {
             spdlog::error("CRITICAL: Rollback also failed: {}", rb_ec.message());
         }
-        return std::unexpected(UpdateError{
-            std::format("Failed to place new binary at '{}': {}",
-                        exe_path_.string(), ec.message())});
+        return std::unexpected(UpdateError{std::format("Failed to place new binary at '{}': {}",
+                                                       exe_path_.string(), ec.message())});
     }
 #else
     // POSIX: set executable permissions on the temp file first
     fs::permissions(temp_path,
-                    fs::perms::owner_exec | fs::perms::owner_read | fs::perms::owner_write,
-                    ec);
+                    fs::perms::owner_exec | fs::perms::owner_read | fs::perms::owner_write, ec);
     if (ec) {
         spdlog::warn("Failed to set permissions on temp file: {}", ec.message());
         // Non-fatal: continue and let rename fail if permissions are the issue
@@ -447,9 +441,9 @@ Updater::apply_update(const std::filesystem::path& temp_path) {
     // Rename current binary out of the way
     fs::rename(exe_path_, old_path, ec);
     if (ec) {
-        return std::unexpected(UpdateError{
-            std::format("Failed to rename current binary '{}' -> '{}': {}",
-                        exe_path_.string(), old_path.string(), ec.message())});
+        return std::unexpected(
+            UpdateError{std::format("Failed to rename current binary '{}' -> '{}': {}",
+                                    exe_path_.string(), old_path.string(), ec.message())});
     }
 
     // Move new binary into place
@@ -461,15 +455,13 @@ Updater::apply_update(const std::filesystem::path& temp_path) {
         if (rb_ec) {
             spdlog::error("CRITICAL: Rollback also failed: {}", rb_ec.message());
         }
-        return std::unexpected(UpdateError{
-            std::format("Failed to place new binary at '{}': {}",
-                        exe_path_.string(), ec.message())});
+        return std::unexpected(UpdateError{std::format("Failed to place new binary at '{}': {}",
+                                                       exe_path_.string(), ec.message())});
     }
 #endif
 
-    spdlog::info("Update applied successfully; old binary preserved at '{}'",
-                 old_path.string());
-    return true;  // Caller should restart the process
+    spdlog::info("Update applied successfully; old binary preserved at '{}'", old_path.string());
+    return true; // Caller should restart the process
 }
 
 void Updater::cleanup_old_binary() {
@@ -487,8 +479,7 @@ void Updater::cleanup_old_binary() {
         if (fs::remove(old_path, ec)) {
             spdlog::info("Cleaned up old binary: {}", old_path.string());
         } else {
-            spdlog::warn("Failed to remove old binary '{}': {}",
-                         old_path.string(), ec.message());
+            spdlog::warn("Failed to remove old binary '{}': {}", old_path.string(), ec.message());
         }
     }
 }
@@ -518,11 +509,10 @@ bool Updater::rollback_if_needed() {
         spdlog::info("Update verified (marker present); removing old binary");
         fs::remove(old_path, ec);
         if (ec) {
-            spdlog::warn("Failed to remove old binary during verified cleanup: {}",
-                         ec.message());
+            spdlog::warn("Failed to remove old binary during verified cleanup: {}", ec.message());
         }
         fs::remove(marker_path, ec);
-        return false;  // No rollback needed
+        return false; // No rollback needed
     }
 
     // The marker does not exist — the update may have failed (agent could not
@@ -531,13 +521,13 @@ bool Updater::rollback_if_needed() {
 
     fs::rename(old_path, exe_path_, ec);
     if (ec) {
-        spdlog::error("CRITICAL: Rollback failed: '{}' -> '{}': {}",
-                       old_path.string(), exe_path_.string(), ec.message());
+        spdlog::error("CRITICAL: Rollback failed: '{}' -> '{}': {}", old_path.string(),
+                      exe_path_.string(), ec.message());
         return false;
     }
 
     spdlog::info("Rolled back to previous binary: {}", exe_path_.string());
-    return true;  // Caller should restart with the rolled-back binary
+    return true; // Caller should restart with the rolled-back binary
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

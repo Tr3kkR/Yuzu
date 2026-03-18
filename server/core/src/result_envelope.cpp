@@ -20,13 +20,20 @@ ColumnType parse_column_type(const std::string& type_str) {
     for (char c : type_str)
         lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-    if (lower == "bool")     return ColumnType::Bool;
-    if (lower == "int32")    return ColumnType::Int32;
-    if (lower == "int64")    return ColumnType::Int64;
-    if (lower == "string")   return ColumnType::String;
-    if (lower == "datetime") return ColumnType::Datetime;
-    if (lower == "guid")     return ColumnType::Guid;
-    if (lower == "clob")     return ColumnType::Clob;
+    if (lower == "bool")
+        return ColumnType::Bool;
+    if (lower == "int32")
+        return ColumnType::Int32;
+    if (lower == "int64")
+        return ColumnType::Int64;
+    if (lower == "string")
+        return ColumnType::String;
+    if (lower == "datetime")
+        return ColumnType::Datetime;
+    if (lower == "guid")
+        return ColumnType::Guid;
+    if (lower == "clob")
+        return ColumnType::Clob;
 
     // Unknown type — default to String so we never lose data.
     return ColumnType::String;
@@ -34,13 +41,20 @@ ColumnType parse_column_type(const std::string& type_str) {
 
 std::string column_type_to_string(ColumnType type) {
     switch (type) {
-    case ColumnType::Bool:     return "bool";
-    case ColumnType::Int32:    return "int32";
-    case ColumnType::Int64:    return "int64";
-    case ColumnType::String:   return "string";
-    case ColumnType::Datetime: return "datetime";
-    case ColumnType::Guid:     return "guid";
-    case ColumnType::Clob:     return "clob";
+    case ColumnType::Bool:
+        return "bool";
+    case ColumnType::Int32:
+        return "int32";
+    case ColumnType::Int64:
+        return "int64";
+    case ColumnType::String:
+        return "string";
+    case ColumnType::Datetime:
+        return "datetime";
+    case ColumnType::Guid:
+        return "guid";
+    case ColumnType::Clob:
+        return "clob";
     }
     return "string"; // unreachable, but silences warnings
 }
@@ -56,21 +70,24 @@ bool is_valid_bool(std::string_view v) {
 }
 
 bool is_valid_int32(std::string_view v) {
-    if (v.empty()) return false;
+    if (v.empty())
+        return false;
     int32_t val{};
     auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), val);
     return ec == std::errc{} && ptr == v.data() + v.size();
 }
 
 bool is_valid_int64(std::string_view v) {
-    if (v.empty()) return false;
+    if (v.empty())
+        return false;
     int64_t val{};
     auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), val);
     return ec == std::errc{} && ptr == v.data() + v.size();
 }
 
 bool is_valid_datetime(std::string_view v) {
-    if (v.empty()) return false;
+    if (v.empty())
+        return false;
 
     // Accept a pure integer as epoch milliseconds.
     {
@@ -140,10 +157,9 @@ std::vector<std::string> validate_types(const InstructionResult& result) {
             }
 
             if (!valid) {
-                errors.push_back(
-                    "row " + std::to_string(row_idx) + ", column \"" +
-                    col_name + "\": value \"" + value +
-                    "\" is not a valid " + column_type_to_string(it->second));
+                errors.push_back("row " + std::to_string(row_idx) + ", column \"" + col_name +
+                                 "\": value \"" + value + "\" is not a valid " +
+                                 column_type_to_string(it->second));
             }
         }
     }
@@ -154,8 +170,7 @@ std::vector<std::string> validate_types(const InstructionResult& result) {
 // parse_result
 // ---------------------------------------------------------------------------
 
-InstructionResult parse_result(const std::string& output,
-                               const std::string& result_schema_json) {
+InstructionResult parse_result(const std::string& output, const std::string& result_schema_json) {
     InstructionResult result;
 
     // Build a name->type map from the schema if one was provided.
@@ -186,9 +201,8 @@ InstructionResult parse_result(const std::string& output,
         // Not JSON — handled below.
     }
 
-    if (parsed_json && doc.is_object() && doc.contains("columns") &&
-        doc.contains("rows") && doc["columns"].is_array() &&
-        doc["rows"].is_array()) {
+    if (parsed_json && doc.is_object() && doc.contains("columns") && doc.contains("rows") &&
+        doc["columns"].is_array() && doc["rows"].is_array()) {
 
         // ---- Structured result ----
 
@@ -199,8 +213,7 @@ InstructionResult parse_result(const std::string& output,
             std::string type_str = col_json.value("type", "string");
 
             // Schema takes precedence if it defines a type for this column.
-            if (auto it = schema_types.find(col.name);
-                it != schema_types.end()) {
+            if (auto it = schema_types.find(col.name); it != schema_types.end()) {
                 type_str = it->second;
             }
             col.type = parse_column_type(type_str);
@@ -265,21 +278,18 @@ nlohmann::json to_json(const InstructionResult& result) {
     nlohmann::json j;
 
     // Metadata
-    j["execution_id"]  = result.execution_id;
+    j["execution_id"] = result.execution_id;
     j["definition_id"] = result.definition_id;
-    j["agent_id"]      = result.agent_id;
-    j["timestamp"]     = result.timestamp;
-    j["status"]        = result.status;
-    j["error_code"]    = result.error_code;
-    j["duration_ms"]   = result.duration_ms;
+    j["agent_id"] = result.agent_id;
+    j["timestamp"] = result.timestamp;
+    j["status"] = result.status;
+    j["error_code"] = result.error_code;
+    j["duration_ms"] = result.duration_ms;
 
     // Columns
     j["columns"] = nlohmann::json::array();
     for (const auto& col : result.columns) {
-        j["columns"].push_back({
-            {"name", col.name},
-            {"type", column_type_to_string(col.type)}
-        });
+        j["columns"].push_back({{"name", col.name}, {"type", column_type_to_string(col.type)}});
     }
 
     // Rows

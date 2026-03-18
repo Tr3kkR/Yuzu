@@ -31,13 +31,12 @@ public:
     [[nodiscard]] const YuzuPluginDescriptor* descriptor() const noexcept { return descriptor_; }
     [[nodiscard]] std::string_view path() const noexcept { return path_; }
 
-    static std::expected<PluginHandle, LoadError>
-    load(const std::filesystem::path& so_path);
+    static std::expected<PluginHandle, LoadError> load(const std::filesystem::path& so_path);
 
 private:
-    void*                     handle_{nullptr};
+    void* handle_{nullptr};
     const YuzuPluginDescriptor* descriptor_{nullptr};
-    std::string               path_;
+    std::string path_;
 };
 
 /**
@@ -47,11 +46,11 @@ private:
 class YUZU_EXPORT PluginLoader {
 public:
     struct ScanResult {
-        std::vector<PluginHandle>  loaded;
-        std::vector<LoadError>     errors;
+        std::vector<PluginHandle> loaded;
+        std::vector<LoadError> errors;
     };
 
     [[nodiscard]] static ScanResult scan(const std::filesystem::path& plugin_dir);
 };
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

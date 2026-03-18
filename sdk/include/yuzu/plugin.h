@@ -29,7 +29,7 @@ extern "C" {
 
 /* ── Forward declarations ────────────────────────────────────────────────────── */
 
-typedef struct YuzuPluginContext  YuzuPluginContext;
+typedef struct YuzuPluginContext YuzuPluginContext;
 typedef struct YuzuCommandContext YuzuCommandContext;
 
 /* ── Key/value parameter bag ─────────────────────────────────────────────────── */
@@ -50,12 +50,8 @@ typedef struct {
  * @param param_count Length of the params array.
  * @return           0 on success, non-zero on failure.
  */
-typedef int (*YuzuCommandHandler)(
-    YuzuCommandContext* ctx,
-    const char*         action,
-    const YuzuParam*    params,
-    size_t              param_count
-);
+typedef int (*YuzuCommandHandler)(YuzuCommandContext* ctx, const char* action,
+                                  const YuzuParam* params, size_t param_count);
 
 /* ── Plugin descriptor ────────────────────────────────────────────────────────── */
 
@@ -109,20 +105,20 @@ typedef const YuzuPluginDescriptor* (*yuzu_plugin_descriptor_fn)(void);
 
 /* For agent core functions (import when used by plugins/agent) */
 #ifdef _WIN32
-#  ifdef YUZU_AGENT_CORE_BUILDING
-#    define YUZU_EXPORT __declspec(dllexport)
-#  else
-#    define YUZU_EXPORT __declspec(dllimport)
-#  endif
+#ifdef YUZU_AGENT_CORE_BUILDING
+#define YUZU_EXPORT __declspec(dllexport)
 #else
-#  define YUZU_EXPORT __attribute__((visibility("default")))
+#define YUZU_EXPORT __declspec(dllimport)
+#endif
+#else
+#define YUZU_EXPORT __attribute__((visibility("default")))
 #endif
 
 /* For plugin exports (always export from plugin DLLs) */
 #ifdef _WIN32
-#  define YUZU_PLUGIN_API __declspec(dllexport)
+#define YUZU_PLUGIN_API __declspec(dllexport)
 #else
-#  define YUZU_PLUGIN_API __attribute__((visibility("default")))
+#define YUZU_PLUGIN_API __attribute__((visibility("default")))
 #endif
 
 /* ── Context helpers (implemented by the agent host) ─────────────────────────── */
@@ -166,10 +162,8 @@ YUZU_EXPORT void yuzu_free_string(char* str);
  * @param column_count  Length of column_names array.
  * @return Allocated JSON string, or NULL on error. Free with yuzu_free_string().
  */
-YUZU_EXPORT char* yuzu_table_to_json(
-    const char*         input,
-    const char* const*  column_names,
-    size_t              column_count);
+YUZU_EXPORT char* yuzu_table_to_json(const char* input, const char* const* column_names,
+                                     size_t column_count);
 
 /**
  * Convert a JSON array of objects to pipe-delimited rows.
@@ -180,10 +174,8 @@ YUZU_EXPORT char* yuzu_table_to_json(
  * @return Allocated pipe-delimited string, or NULL on error.
  *         Free with yuzu_free_string().
  */
-YUZU_EXPORT char* yuzu_json_to_table(
-    const char*         json_input,
-    const char* const*  column_names,
-    size_t              column_count);
+YUZU_EXPORT char* yuzu_json_to_table(const char* json_input, const char* const* column_names,
+                                     size_t column_count);
 
 /**
  * Normalize line endings in a string: \r\n and \r become \n.
@@ -218,12 +210,8 @@ YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefi
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
  * @return             0 on success, non-zero on failure.
  */
-YUZU_EXPORT int yuzu_create_temp_file(
-    const char* prefix,
-    const char* suffix,
-    const char* directory,
-    char*       path_out,
-    size_t      path_out_size);
+YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, const char* directory,
+                                      char* path_out, size_t path_out_size);
 
 /**
  * Create a secure temporary directory with restricted permissions.
@@ -236,12 +224,9 @@ YUZU_EXPORT int yuzu_create_temp_file(
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
  * @return             0 on success, non-zero on failure.
  */
-YUZU_EXPORT int yuzu_create_temp_dir(
-    const char* prefix,
-    const char* directory,
-    char*       path_out,
-    size_t      path_out_size);
+YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
+                                     size_t path_out_size);
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif

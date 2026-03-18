@@ -9,17 +9,17 @@ namespace yuzu::server::auth {
 
 /// Types of auto-approve rules that bypass the pending queue.
 enum class AutoApproveRuleType {
-    trusted_ca,      // Match by CA certificate SHA-256 fingerprint
-    hostname_glob,   // Wildcard match on agent hostname
-    ip_subnet,       // CIDR match on agent peer IP
-    cloud_provider,  // Match by attestation_provider field
+    trusted_ca,     // Match by CA certificate SHA-256 fingerprint
+    hostname_glob,  // Wildcard match on agent hostname
+    ip_subnet,      // CIDR match on agent peer IP
+    cloud_provider, // Match by attestation_provider field
 };
 
 /// A single auto-approve rule.
 struct AutoApproveRule {
     AutoApproveRuleType type;
-    std::string value;       // e.g. "ab12cd..." / "*.prod.example.com" / "10.0.0.0/8" / "aws"
-    std::string label;       // Admin-friendly description
+    std::string value; // e.g. "ab12cd..." / "*.prod.example.com" / "10.0.0.0/8" / "aws"
+    std::string label; // Admin-friendly description
     bool enabled{true};
 };
 
@@ -60,7 +60,7 @@ private:
     bool match_rule(const AutoApproveRule& rule, const ApprovalContext& ctx) const;
     bool match_hostname_glob(const std::string& pattern, const std::string& hostname) const;
     bool match_ip_subnet(const std::string& cidr, const std::string& ip) const;
-    void save_locked() const;  // must be called with mu_ held
+    void save_locked() const; // must be called with mu_ held
 
     mutable std::mutex mu_;
     std::vector<AutoApproveRule> rules_;
@@ -68,4 +68,4 @@ private:
     std::filesystem::path config_path_;
 };
 
-}  // namespace yuzu::server::auth
+} // namespace yuzu::server::auth

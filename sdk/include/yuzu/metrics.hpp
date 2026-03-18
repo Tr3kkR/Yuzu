@@ -2,12 +2,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <format>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <format>
-#include <cmath>
 
 namespace yuzu {
 
@@ -18,17 +18,20 @@ using Labels = std::vector<std::pair<std::string, std::string>>;
 inline std::string labels_key(const Labels& labels) {
     std::string key;
     for (const auto& [k, v] : labels) {
-        if (!key.empty()) key += ',';
+        if (!key.empty())
+            key += ',';
         key += k + "=\"" + v + "\"";
     }
     return key;
 }
 
 inline std::string labels_prometheus(const Labels& labels) {
-    if (labels.empty()) return {};
+    if (labels.empty())
+        return {};
     std::string out = "{";
     for (size_t i = 0; i < labels.size(); ++i) {
-        if (i > 0) out += ',';
+        if (i > 0)
+            out += ',';
         out += labels[i].first + "=\"" + labels[i].second + "\"";
     }
     out += '}';
@@ -84,8 +87,7 @@ private:
 class Histogram {
 public:
     explicit Histogram(std::vector<double> buckets = default_buckets())
-        : boundaries_(std::move(buckets)),
-          bucket_counts_(boundaries_.size() + 1, 0) {}
+        : boundaries_(std::move(buckets)), bucket_counts_(boundaries_.size() + 1, 0) {}
 
     void observe(double value) {
         std::lock_guard lock(mu_);
@@ -96,7 +98,7 @@ public:
                 bucket_counts_[i]++;
             }
         }
-        bucket_counts_.back()++;  // +Inf bucket
+        bucket_counts_.back()++; // +Inf bucket
     }
 
     struct Snapshot {
@@ -137,8 +139,7 @@ private:
 
 // ── Labeled metric families ─────────────────────────────────────────────────
 
-template <typename T>
-class MetricFamily {
+template <typename T> class MetricFamily {
 public:
     T& labels(const Labels& l) {
         auto key = labels_key(l);
@@ -146,9 +147,7 @@ public:
         return instances_[key].metric;
     }
 
-    T& no_labels() {
-        return labels({});
-    }
+    T& no_labels() { return labels({}); }
 
     struct Entry {
         Labels label_set;
@@ -185,7 +184,7 @@ public:
     struct MetricInfo {
         std::string name;
         std::string help;
-        std::string type;  // "counter", "gauge", "histogram"
+        std::string type; // "counter", "gauge", "histogram"
     };
 
     Counter& counter(const std::string& name) {
@@ -225,8 +224,7 @@ public:
         }
     }
 
-    void describe(const std::string& name, const std::string& help,
-                  const std::string& type) {
+    void describe(const std::string& name, const std::string& help, const std::string& type) {
         std::lock_guard lock(mu_);
         descriptions_[name] = {name, help, type};
     }
@@ -262,18 +260,15 @@ public:
 
                 for (size_t i = 0; i < snap.boundaries.size(); ++i) {
                     auto le = format_double(snap.boundaries[i]);
-                    auto lbl = base_labels.empty()
-                        ? std::format("le=\"{}\"", le)
-                        : std::format("{},le=\"{}\"", base_labels, le);
-                    out += std::format("{}_bucket{{{}}} {}\n",
-                        name, lbl, snap.cumulative_counts[i]);
+                    auto lbl = base_labels.empty() ? std::format("le=\"{}\"", le)
+                                                   : std::format("{},le=\"{}\"", base_labels, le);
+                    out +=
+                        std::format("{}_bucket{{{}}} {}\n", name, lbl, snap.cumulative_counts[i]);
                 }
                 // +Inf bucket
-                auto inf_lbl = base_labels.empty()
-                    ? "le=\"+Inf\""
-                    : std::format("{},le=\"+Inf\"", base_labels);
-                out += std::format("{}_bucket{{{}}} {}\n",
-                    name, inf_lbl, snap.count);
+                auto inf_lbl = base_labels.empty() ? "le=\"+Inf\""
+                                                   : std::format("{},le=\"+Inf\"", base_labels);
+                out += std::format("{}_bucket{{{}}} {}\n", name, inf_lbl, snap.count);
 
                 auto sum_lbl = base_labels.empty() ? "" : ("{" + base_labels + "}");
                 out += std::format("{}_sum{} {}\n", name, sum_lbl, snap.sum);
@@ -310,4 +305,4 @@ private:
     std::unordered_map<std::string, MetricInfo> descriptions_;
 };
 
-}  // namespace yuzu
+} // namespace yuzu

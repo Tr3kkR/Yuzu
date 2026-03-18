@@ -32,7 +32,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -49,11 +50,10 @@ std::string run_command(const char* cmd) {
 #ifdef _WIN32
 
 void list_av_products_win(yuzu::CommandContext& ctx) {
-    auto output = run_command(
-        "powershell -NoProfile -Command \""
-        "Get-CimInstance -Namespace root/SecurityCenter2 "
-        "-ClassName AntiVirusProduct | "
-        "ForEach-Object { $_.displayName + '|' + $_.productState }\"");
+    auto output = run_command("powershell -NoProfile -Command \""
+                              "Get-CimInstance -Namespace root/SecurityCenter2 "
+                              "-ClassName AntiVirusProduct | "
+                              "ForEach-Object { $_.displayName + '|' + $_.productState }\"");
 
     if (output.empty()) {
         ctx.write_output("av_count|0");
@@ -66,7 +66,8 @@ void list_av_products_win(yuzu::CommandContext& ctx) {
     while (std::getline(iss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
             line.pop_back();
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
         auto sep = line.find('|');
         if (sep != std::string::npos) {
             auto name = line.substr(0, sep);
@@ -83,11 +84,10 @@ void list_av_products_win(yuzu::CommandContext& ctx) {
 }
 
 void defender_status_win(yuzu::CommandContext& ctx) {
-    auto output = run_command(
-        "powershell -NoProfile -Command \""
-        "Get-MpComputerStatus | Select-Object "
-        "RealTimeProtectionEnabled,AntivirusSignatureVersion,"
-        "AntivirusSignatureLastUpdated,QuickScanEndTime | Format-List\"");
+    auto output = run_command("powershell -NoProfile -Command \""
+                              "Get-MpComputerStatus | Select-Object "
+                              "RealTimeProtectionEnabled,AntivirusSignatureVersion,"
+                              "AntivirusSignatureLastUpdated,QuickScanEndTime | Format-List\"");
 
     if (output.empty()) {
         ctx.write_output("status|not_available");
@@ -99,19 +99,23 @@ void defender_status_win(yuzu::CommandContext& ctx) {
     while (std::getline(iss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
             line.pop_back();
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
 
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
 
         auto key = line.substr(0, colon);
         auto val = line.substr(colon + 1);
-        while (!key.empty() && key.back() == ' ') key.pop_back();
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+        while (!key.empty() && key.back() == ' ')
+            key.pop_back();
+        while (!val.empty() && val.front() == ' ')
+            val.erase(val.begin());
 
         if (key == "RealTimeProtectionEnabled") {
-            ctx.write_output(std::format("realtime_protection|{}",
-                val == "True" ? "enabled" : "disabled"));
+            ctx.write_output(
+                std::format("realtime_protection|{}", val == "True" ? "enabled" : "disabled"));
         } else if (key == "AntivirusSignatureVersion") {
             ctx.write_output(std::format("definition_version|{}", val));
         } else if (key == "AntivirusSignatureLastUpdated") {
@@ -183,22 +187,21 @@ void list_av_products_macos(yuzu::CommandContext& ctx) {
 
 class AntivirusPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "antivirus"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "antivirus"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Antivirus product detection and Defender status";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "products", "status", nullptr };
+        static const char* acts[] = {"products", "status", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
 
         if (action == "products") {

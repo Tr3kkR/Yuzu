@@ -3,11 +3,11 @@
 #include <sqlite3.h>
 
 #ifdef _WIN32
-#  include <windows.h>
-#  include <bcrypt.h>
-#  pragma comment(lib, "bcrypt.lib")
+#include <bcrypt.h>
+#include <windows.h>
+#pragma comment(lib, "bcrypt.lib")
 #else
-#  include <openssl/rand.h>
+#include <openssl/rand.h>
 #endif
 
 #include <array>
@@ -26,14 +26,13 @@ struct SqliteDbDeleter {
 struct SqliteStmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
-using SqliteDb   = std::unique_ptr<sqlite3, SqliteDbDeleter>;
+using SqliteDb = std::unique_ptr<sqlite3, SqliteDbDeleter>;
 using SqliteStmt = std::unique_ptr<sqlite3_stmt, SqliteStmtDeleter>;
 
 void crypto_random_bytes(uint8_t* buf, size_t n) {
 #ifdef _WIN32
-    auto status = BCryptGenRandom(nullptr, buf,
-                                  static_cast<ULONG>(n),
-                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    auto status =
+        BCryptGenRandom(nullptr, buf, static_cast<ULONG>(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     if (!BCRYPT_SUCCESS(status)) {
         throw std::runtime_error("BCryptGenRandom failed");
     }
@@ -63,17 +62,14 @@ std::string generate_uuid_v4() {
         return static_cast<uint8_t>((val >> (56 - idx * 8)) & 0xFF);
     };
 
-    return std::format(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        byte(hi, 0), byte(hi, 1), byte(hi, 2), byte(hi, 3),
-        byte(hi, 4), byte(hi, 5),
-        byte(hi, 6), byte(hi, 7),
-        byte(lo, 0), byte(lo, 1),
-        byte(lo, 2), byte(lo, 3), byte(lo, 4), byte(lo, 5), byte(lo, 6), byte(lo, 7)
-    );
+    return std::format("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:"
+                       "02x}{:02x}{:02x}{:02x}{:02x}",
+                       byte(hi, 0), byte(hi, 1), byte(hi, 2), byte(hi, 3), byte(hi, 4), byte(hi, 5),
+                       byte(hi, 6), byte(hi, 7), byte(lo, 0), byte(lo, 1), byte(lo, 2), byte(lo, 3),
+                       byte(lo, 4), byte(lo, 5), byte(lo, 6), byte(lo, 7));
 }
 
-}  // namespace
+} // namespace
 
 auto default_data_dir() -> std::filesystem::path {
 #ifdef _WIN32
@@ -102,10 +98,8 @@ auto default_data_dir() -> std::filesystem::path {
 #endif
 }
 
-auto resolve_agent_id(
-    std::string_view cli_override,
-    const std::filesystem::path& db_path
-) -> std::expected<std::string, IdentityError> {
+auto resolve_agent_id(std::string_view cli_override, const std::filesystem::path& db_path)
+    -> std::expected<std::string, IdentityError> {
 
     if (!cli_override.empty()) {
         return std::string(cli_override);
@@ -115,18 +109,17 @@ auto resolve_agent_id(
     std::error_code ec;
     std::filesystem::create_directories(db_path.parent_path(), ec);
     if (ec) {
-        return std::unexpected(IdentityError{
-            std::format("failed to create data directory {}: {}",
-                        db_path.parent_path().string(), ec.message())});
+        return std::unexpected(
+            IdentityError{std::format("failed to create data directory {}: {}",
+                                      db_path.parent_path().string(), ec.message())});
     }
 
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open(db_path.string().c_str(), &raw_db);
     SqliteDb db(raw_db);
     if (rc != SQLITE_OK) {
-        return std::unexpected(IdentityError{
-            std::format("failed to open database {}: {}", db_path.string(),
-                        sqlite3_errmsg(db.get()))});
+        return std::unexpected(IdentityError{std::format(
+            "failed to open database {}: {}", db_path.string(), sqlite3_errmsg(db.get()))});
     }
 
     // Create table if needed
@@ -137,8 +130,7 @@ auto resolve_agent_id(
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
-        return std::unexpected(IdentityError{
-            std::format("failed to create kv table: {}", err)});
+        return std::unexpected(IdentityError{std::format("failed to create kv table: {}", err)});
     }
 
     // Try to read existing agent_id
@@ -146,8 +138,8 @@ auto resolve_agent_id(
     sqlite3_stmt* raw_stmt = nullptr;
     rc = sqlite3_prepare_v2(db.get(), select_sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        return std::unexpected(IdentityError{
-            std::format("failed to prepare SELECT: {}", sqlite3_errmsg(db.get()))});
+        return std::unexpected(
+            IdentityError{std::format("failed to prepare SELECT: {}", sqlite3_errmsg(db.get()))});
     }
 
     {
@@ -170,8 +162,8 @@ auto resolve_agent_id(
     raw_stmt = nullptr;
     rc = sqlite3_prepare_v2(db.get(), insert_sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        return std::unexpected(IdentityError{
-            std::format("failed to prepare INSERT: {}", sqlite3_errmsg(db.get()))});
+        return std::unexpected(
+            IdentityError{std::format("failed to prepare INSERT: {}", sqlite3_errmsg(db.get()))});
     }
 
     SqliteStmt insert_stmt(raw_stmt);
@@ -179,11 +171,11 @@ auto resolve_agent_id(
     rc = sqlite3_step(insert_stmt.get());
 
     if (rc != SQLITE_DONE) {
-        return std::unexpected(IdentityError{
-            std::format("failed to insert agent_id: {}", sqlite3_errmsg(db.get()))});
+        return std::unexpected(
+            IdentityError{std::format("failed to insert agent_id: {}", sqlite3_errmsg(db.get()))});
     }
 
     return new_id;
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

@@ -40,8 +40,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <bcrypt.h>
+#include <windows.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <sys/wait.h>
@@ -60,22 +60,26 @@ constexpr std::uintmax_t kMaxHashFileSize = 10ULL * 1024 * 1024 * 1024;
 // Canonicalize a path and optionally enforce a base directory restriction.
 // Returns empty string on failure (path doesn't exist, escapes base_dir, etc.)
 std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
-    if (raw_path.empty()) return {};
+    if (raw_path.empty())
+        return {};
 
     std::error_code ec;
     std::string path_str{raw_path};
 
     // First check the path exists (canonical requires it to exist)
-    if (!fs::exists(path_str, ec)) return {};
+    if (!fs::exists(path_str, ec))
+        return {};
 
     // Resolve all symlinks and normalize the path
     auto canonical = fs::canonical(path_str, ec);
-    if (ec) return {};
+    if (ec)
+        return {};
 
     // If a base_dir is configured, ensure the canonical path is within it
     if (!base_dir.empty()) {
         auto canonical_base = fs::canonical(std::string{base_dir}, ec);
-        if (ec) return {};
+        if (ec)
+            return {};
 
         auto canon_str = canonical.string();
         auto base_str = canonical_base.string();
@@ -87,8 +91,7 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
         }
         // Ensure it's not just a prefix match on a directory name
         // e.g., /var/log vs /var/logbackup
-        if (canon_str.size() > base_str.size() &&
-            canon_str[base_str.size()] != '/' &&
+        if (canon_str.size() > base_str.size() && canon_str[base_str.size()] != '/' &&
             canon_str[base_str.size()] != '\\') {
             return {};
         }
@@ -99,7 +102,8 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
 
 // For paths that might not exist yet (exists check), validate the parent
 std::string validate_path_or_parent(std::string_view raw_path, std::string_view base_dir) {
-    if (raw_path.empty()) return {};
+    if (raw_path.empty())
+        return {};
 
     std::error_code ec;
     std::string path_str{raw_path};
@@ -111,14 +115,17 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
 
     // For non-existent paths, validate the parent directory
     auto parent = fs::path(path_str).parent_path();
-    if (parent.empty() || !fs::exists(parent, ec)) return {};
+    if (parent.empty() || !fs::exists(parent, ec))
+        return {};
 
     auto canonical_parent = fs::canonical(parent, ec);
-    if (ec) return {};
+    if (ec)
+        return {};
 
     if (!base_dir.empty()) {
         auto canonical_base = fs::canonical(std::string{base_dir}, ec);
-        if (ec) return {};
+        if (ec)
+            return {};
 
         auto parent_str = canonical_parent.string();
         auto base_str = canonical_base.string();
@@ -127,8 +134,7 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
             parent_str.compare(0, base_str.size(), base_str) != 0) {
             return {};
         }
-        if (parent_str.size() > base_str.size() &&
-            parent_str[base_str.size()] != '/' &&
+        if (parent_str.size() > base_str.size() && parent_str[base_str.size()] != '/' &&
             parent_str[base_str.size()] != '\\') {
             return {};
         }
@@ -165,8 +171,7 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
     std::vector<UCHAR> hash_object(object_length);
     std::vector<UCHAR> hash_value(hash_length);
 
-    if (BCryptCreateHash(alg, &hash, hash_object.data(),
-                         object_length, nullptr, 0, 0) != 0) {
+    if (BCryptCreateHash(alg, &hash, hash_object.data(), object_length, nullptr, 0, 0) != 0) {
         BCryptCloseAlgorithmProvider(alg, 0);
         return {};
     }
@@ -181,9 +186,10 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 
     std::array<char, 8192> buf{};
     while (ifs.read(buf.data(), static_cast<std::streamsize>(buf.size())) || ifs.gcount() > 0) {
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()),
-                       static_cast<ULONG>(ifs.gcount()), 0);
-        if (ifs.eof()) break;
+        BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()), static_cast<ULONG>(ifs.gcount()),
+                       0);
+        if (ifs.eof())
+            break;
     }
 
     BCryptFinishHash(hash, hash_value.data(), hash_length, 0);
@@ -204,7 +210,8 @@ std::string compute_hash_win(const std::string& path, std::string_view algorithm
 std::string compute_hash_unix(const std::string& path, std::string_view algorithm) {
     // Use execvp-based approach to avoid shell injection via path
     int pipe_fd[2];
-    if (pipe(pipe_fd) != 0) return {};
+    if (pipe(pipe_fd) != 0)
+        return {};
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -265,29 +272,24 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 
 class FilesystemPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "filesystem"; }
-    std::string_view version()     const noexcept override { return "0.3.0"; }
+    std::string_view name() const noexcept override { return "filesystem"; }
+    std::string_view version() const noexcept override { return "0.3.0"; }
     std::string_view description() const noexcept override {
-        return "Filesystem operations — exists, list_dir, file_hash, create_temp, create_temp_dir (admin-only)";
+        return "Filesystem operations — exists, list_dir, file_hash, create_temp, create_temp_dir "
+               "(admin-only)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "exists", "list_dir", "file_hash",
-            "create_temp", "create_temp_dir", "read", nullptr
-        };
+        static const char* acts[] = {"exists",          "list_dir", "file_hash", "create_temp",
+                                     "create_temp_dir", "read",     nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "exists") {
             return do_exists(ctx, params);
         }
@@ -381,9 +383,9 @@ private:
         constexpr int max_entries = 1000;
 
         for (auto it = fs::directory_iterator(validated, ec);
-             it != fs::directory_iterator() && count < max_entries;
-             it.increment(ec)) {
-            if (ec) continue;
+             it != fs::directory_iterator() && count < max_entries; it.increment(ec)) {
+            if (ec)
+                continue;
 
             const auto& entry = *it;
             std::string entry_name = entry.path().filename().string();
@@ -394,7 +396,8 @@ private:
             if (entry.is_regular_file(entry_ec)) {
                 entry_type = "file";
                 entry_size = entry.file_size(entry_ec);
-                if (entry_ec) entry_size = 0;
+                if (entry_ec)
+                    entry_size = 0;
             } else if (entry.is_directory(entry_ec)) {
                 entry_type = "directory";
             } else if (entry.is_symlink(entry_ec)) {
@@ -441,7 +444,8 @@ private:
         }
 
         auto file_size = fs::file_size(validated, ec);
-        if (ec) file_size = 0;
+        if (ec)
+            file_size = 0;
 
         if (file_size > kMaxHashFileSize) {
             ctx.write_output(std::format("error|file too large for hashing ({} bytes, max {})",
@@ -467,10 +471,10 @@ private:
     }
 
     int do_create_temp(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto prefix    = params.get("prefix", "yuzu-");
-        auto suffix    = params.get("suffix", ".tmp");
+        auto prefix = params.get("prefix", "yuzu-");
+        auto suffix = params.get("suffix", ".tmp");
         auto directory = params.get("directory");
-        auto persist   = params.get("persist", "true");
+        auto persist = params.get("persist", "true");
 
         // Validate directory if provided
         if (!directory.empty()) {
@@ -487,11 +491,9 @@ private:
         }
 
         char path_buf[512]{};
-        int rc = yuzu_create_temp_file(
-            std::string{prefix}.c_str(),
-            std::string{suffix}.c_str(),
-            directory.empty() ? nullptr : std::string{directory}.c_str(),
-            path_buf, sizeof(path_buf));
+        int rc = yuzu_create_temp_file(std::string{prefix}.c_str(), std::string{suffix}.c_str(),
+                                       directory.empty() ? nullptr : std::string{directory}.c_str(),
+                                       path_buf, sizeof(path_buf));
 
         if (rc != 0) {
             ctx.write_output("error|failed to create temporary file");
@@ -532,34 +534,44 @@ private:
         }
 
         auto file_size = fs::file_size(validated, ec);
-        if (ec) file_size = 0;
+        if (ec)
+            file_size = 0;
 
         // Cap at 100 MB
         constexpr std::uintmax_t kMaxReadSize = 100ULL * 1024 * 1024;
         if (file_size > kMaxReadSize) {
-            ctx.write_output(std::format("error|file too large ({} bytes, max {})",
-                                         file_size, kMaxReadSize));
+            ctx.write_output(
+                std::format("error|file too large ({} bytes, max {})", file_size, kMaxReadSize));
             return 1;
         }
 
         // Parse offset and limit
-        int offset = 1;  // 1-based line number
+        int offset = 1; // 1-based line number
         int limit = 100;
         constexpr int kMaxLimit = 10000;
 
         auto offset_str = params.get("offset");
         if (!offset_str.empty()) {
-            try { offset = std::stoi(std::string{offset_str}); }
-            catch (...) { offset = 1; }
-            if (offset < 1) offset = 1;
+            try {
+                offset = std::stoi(std::string{offset_str});
+            } catch (...) {
+                offset = 1;
+            }
+            if (offset < 1)
+                offset = 1;
         }
 
         auto limit_str = params.get("limit");
         if (!limit_str.empty()) {
-            try { limit = std::stoi(std::string{limit_str}); }
-            catch (...) { limit = 100; }
-            if (limit < 1) limit = 1;
-            if (limit > kMaxLimit) limit = kMaxLimit;
+            try {
+                limit = std::stoi(std::string{limit_str});
+            } catch (...) {
+                limit = 100;
+            }
+            if (limit < 1)
+                limit = 1;
+            if (limit > kMaxLimit)
+                limit = kMaxLimit;
         }
 
         // Binary detection: probe first 512 bytes for NUL
@@ -592,10 +604,12 @@ private:
             ++line_num;
             ++total_lines;
 
-            if (line_num < offset) continue;
+            if (line_num < offset)
+                continue;
             if (collected >= limit) {
                 // Keep counting total lines
-                while (std::getline(f, line)) ++total_lines;
+                while (std::getline(f, line))
+                    ++total_lines;
                 break;
             }
 
@@ -614,9 +628,9 @@ private:
     }
 
     int do_create_temp_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto prefix    = params.get("prefix", "yuzu-");
+        auto prefix = params.get("prefix", "yuzu-");
         auto directory = params.get("directory");
-        auto persist   = params.get("persist", "true");
+        auto persist = params.get("persist", "true");
 
         if (!directory.empty()) {
             auto validated = validate_path(directory, {});
@@ -632,10 +646,9 @@ private:
         }
 
         char path_buf[512]{};
-        int rc = yuzu_create_temp_dir(
-            std::string{prefix}.c_str(),
-            directory.empty() ? nullptr : std::string{directory}.c_str(),
-            path_buf, sizeof(path_buf));
+        int rc = yuzu_create_temp_dir(std::string{prefix}.c_str(),
+                                      directory.empty() ? nullptr : std::string{directory}.c_str(),
+                                      path_buf, sizeof(path_buf));
 
         if (rc != 0) {
             ctx.write_output("error|failed to create temporary directory");

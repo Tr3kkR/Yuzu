@@ -17,13 +17,11 @@ public:
     void create_tables();
 
     // Returns true if execution can proceed, false if blocked by concurrency limits
-    bool try_acquire(const std::string& definition_id,
-                     const std::string& execution_id,
+    bool try_acquire(const std::string& definition_id, const std::string& execution_id,
                      const std::string& concurrency_mode);
 
     // Release lock when execution completes
-    void release(const std::string& definition_id,
-                 const std::string& execution_id);
+    void release(const std::string& definition_id, const std::string& execution_id);
 
     // Count active executions for a definition
     int active_count(const std::string& definition_id) const;

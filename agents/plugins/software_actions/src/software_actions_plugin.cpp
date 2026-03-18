@@ -41,7 +41,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -63,12 +64,14 @@ std::vector<std::string> run_command_lines(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return lines;
+    if (!pipe)
+        return lines;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         std::string line(buf.data());
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
             line.pop_back();
-        if (!line.empty()) lines.push_back(std::move(line));
+        if (!line.empty())
+            lines.push_back(std::move(line));
     }
 #ifdef _WIN32
     _pclose(pipe);
@@ -83,8 +86,7 @@ std::vector<std::string> run_command_lines(const char* cmd) {
 int do_list_upgradable(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     // Use winget to list upgradable packages
-    auto lines = run_command_lines(
-        "winget upgrade --accept-source-agreements 2>nul");
+    auto lines = run_command_lines("winget upgrade --accept-source-agreements 2>nul");
     if (lines.empty()) {
         ctx.write_output("upgradable|none|-|-");
         return 0;
@@ -98,7 +100,10 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             // Look for the separator line (all dashes/spaces)
             bool is_sep = !line.empty();
             for (char ch : line) {
-                if (ch != '-' && ch != ' ') { is_sep = false; break; }
+                if (ch != '-' && ch != ' ') {
+                    is_sep = false;
+                    break;
+                }
             }
             if (is_sep && line.size() > 10) {
                 in_data = true;
@@ -110,7 +115,8 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             line.find("available") != std::string::npos) {
             continue;
         }
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
 
         // Parse columns — winget uses fixed-width columns.
         // We'll just output the whole line if we can't parse well.
@@ -135,7 +141,8 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
                 current += ch;
             }
         }
-        if (!current.empty()) parts.push_back(current);
+        if (!current.empty())
+            parts.push_back(current);
 
         if (parts.size() >= 4) {
             ctx.write_output(std::format("upgradable|{}|{}|{}", parts[0], parts[2], parts[3]));
@@ -154,7 +161,8 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     auto lines = run_command_lines("apt list --upgradable 2>/dev/null");
     bool found = false;
     for (const auto& line : lines) {
-        if (line.starts_with("Listing")) continue;
+        if (line.starts_with("Listing"))
+            continue;
         // Format: "name/repo new_ver arch [upgradable from: old_ver]"
         auto slash = line.find('/');
         auto space = line.find(' ');
@@ -169,7 +177,8 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
             if (from_pos != std::string::npos) {
                 old_ver = rest.substr(from_pos + 6);
                 auto bracket = old_ver.find(']');
-                if (bracket != std::string::npos) old_ver = old_ver.substr(0, bracket);
+                if (bracket != std::string::npos)
+                    old_ver = old_ver.substr(0, bracket);
             }
             ctx.write_output(std::format("upgradable|{}|{}|{}", name, old_ver, new_ver));
             found = true;
@@ -179,17 +188,22 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
         // Try yum
         lines = run_command_lines("yum check-update 2>/dev/null | grep -v '^$'");
         for (const auto& line : lines) {
-            if (line.starts_with("Loaded") || line.starts_with("Loading")) continue;
-            if (line.starts_with("Last metadata")) continue;
+            if (line.starts_with("Loaded") || line.starts_with("Loading"))
+                continue;
+            if (line.starts_with("Last metadata"))
+                continue;
             // Format: "package.arch  new_version  repo"
             std::string name, version, repo;
             size_t pos = 0;
             // Find first whitespace
-            while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') pos++;
+            while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t')
+                pos++;
             name = line.substr(0, pos);
-            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) pos++;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t'))
+                pos++;
             auto ver_start = pos;
-            while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') pos++;
+            while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t')
+                pos++;
             version = line.substr(ver_start, pos - ver_start);
             if (!name.empty()) {
                 ctx.write_output(std::format("upgradable|{}|-|{}", name, version));
@@ -207,10 +221,13 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
     for (const auto& line : lines) {
         auto trimmed = line;
         auto start = trimmed.find_first_not_of(" \t*");
-        if (start != std::string::npos) trimmed = trimmed.substr(start);
-        if (trimmed.empty()) continue;
+        if (start != std::string::npos)
+            trimmed = trimmed.substr(start);
+        if (trimmed.empty())
+            continue;
         if (trimmed.starts_with("Software Update") || trimmed.starts_with("Finding") ||
-            trimmed.starts_with("No new")) continue;
+            trimmed.starts_with("No new"))
+            continue;
         // Lines starting with "Label:" or containing version info
         if (trimmed.find("Label:") != std::string::npos) {
             auto label = trimmed.substr(trimmed.find(':') + 2);
@@ -236,11 +253,10 @@ int do_list_upgradable(yuzu::CommandContext& ctx) {
 
 int do_installed_count(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    auto result = run_command(
-        "powershell -NoProfile -Command \""
-        "(Get-ItemProperty "
-        "'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' "
-        "-ErrorAction SilentlyContinue).Count\"");
+    auto result = run_command("powershell -NoProfile -Command \""
+                              "(Get-ItemProperty "
+                              "'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' "
+                              "-ErrorAction SilentlyContinue).Count\"");
     if (result.empty()) {
         ctx.write_output("count|0");
     } else {
@@ -254,17 +270,20 @@ int do_installed_count(yuzu::CommandContext& ctx) {
     // Try dpkg first, then rpm
     auto result = run_command("dpkg --list 2>/dev/null | grep '^ii' | wc -l");
     if (!result.empty() && result != "0") {
-        while (!result.empty() && result.front() == ' ') result.erase(result.begin());
+        while (!result.empty() && result.front() == ' ')
+            result.erase(result.begin());
         ctx.write_output(std::format("count|{}", result));
     } else {
         result = run_command("rpm -qa 2>/dev/null | wc -l");
-        while (!result.empty() && result.front() == ' ') result.erase(result.begin());
+        while (!result.empty() && result.front() == ' ')
+            result.erase(result.begin());
         ctx.write_output(std::format("count|{}", result.empty() ? "0" : result));
     }
 
 #elif defined(__APPLE__)
     auto result = run_command("pkgutil --pkgs 2>/dev/null | wc -l");
-    while (!result.empty() && result.front() == ' ') result.erase(result.begin());
+    while (!result.empty() && result.front() == ' ')
+        result.erase(result.begin());
     ctx.write_output(std::format("count|{}", result.empty() ? "0" : result));
 
 #else
@@ -273,34 +292,31 @@ int do_installed_count(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class SoftwareActionsPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "software_actions"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "software_actions"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Lists upgradable packages and counts installed software";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "list_upgradable", "installed_count", nullptr
-        };
+        static const char* acts[] = {"list_upgradable", "installed_count", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "list_upgradable") return do_list_upgradable(ctx);
-        if (action == "installed_count") return do_installed_count(ctx);
+        if (action == "list_upgradable")
+            return do_list_upgradable(ctx);
+        if (action == "installed_count")
+            return do_installed_count(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

@@ -12,15 +12,15 @@
 
 #pragma once
 
+#include "plugin.hpp" // yuzu::PluginError, yuzu::Result
+
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
 #include <expected>
 #include <string>
 #include <string_view>
 #include <vector>
-
-#include <nlohmann/json.hpp>
-
-#include "plugin.hpp"   // yuzu::PluginError, yuzu::Result
 
 namespace yuzu::sdk {
 
@@ -42,7 +42,8 @@ enum class ColumnType {
  */
 inline std::vector<std::string_view> split_lines(std::string_view input) {
     std::vector<std::string_view> lines;
-    if (input.empty()) return lines;
+    if (input.empty())
+        return lines;
 
     size_t start = 0;
     while (start <= input.size()) {
@@ -53,9 +54,9 @@ inline std::vector<std::string_view> split_lines(std::string_view input) {
         }
         lines.push_back(input.substr(start, end - start));
         if (input[end] == '\r' && end + 1 < input.size() && input[end + 1] == '\n') {
-            start = end + 2;  // \r\n
+            start = end + 2; // \r\n
         } else {
-            start = end + 1;  // \r or \n
+            start = end + 1; // \r or \n
         }
     }
     return lines;
@@ -66,8 +67,7 @@ inline std::vector<std::string_view> split_lines(std::string_view input) {
 namespace detail {
 
 /** Parse one pipe-delimited field, handling \| escapes. Returns field end. */
-inline size_t parse_field(std::string_view line, size_t start,
-                          std::string& field_out) {
+inline size_t parse_field(std::string_view line, size_t start, std::string& field_out) {
     field_out.clear();
     size_t pos = start;
     while (pos < line.size()) {
@@ -81,34 +81,42 @@ inline size_t parse_field(std::string_view line, size_t start,
             ++pos;
         }
     }
-    return pos;  // points to '|' or end-of-line
+    return pos; // points to '|' or end-of-line
 }
 
 /** Escape pipe characters in a field value for pipe-delimited output. */
 inline void escape_field(std::string_view field, std::string& out) {
     for (char ch : field) {
-        if (ch == '|') out += "\\|";
-        else out += ch;
+        if (ch == '|')
+            out += "\\|";
+        else
+            out += ch;
     }
 }
 
 /** Apply a type hint to convert a string field to a typed JSON value. */
 inline nlohmann::json typed_value(const std::string& field, ColumnType type) {
     switch (type) {
-        case ColumnType::kInt:
-            try { return std::stoll(field); }
-            catch (...) { return field; }
-        case ColumnType::kFloat:
-            try { return std::stod(field); }
-            catch (...) { return field; }
-        case ColumnType::kBool:
-            return (field == "true" || field == "1");
-        default:
+    case ColumnType::kInt:
+        try {
+            return std::stoll(field);
+        } catch (...) {
             return field;
+        }
+    case ColumnType::kFloat:
+        try {
+            return std::stod(field);
+        } catch (...) {
+            return field;
+        }
+    case ColumnType::kBool:
+        return (field == "true" || field == "1");
+    default:
+        return field;
     }
 }
 
-}  // namespace detail
+} // namespace detail
 
 // ── table_to_json ────────────────────────────────────────────────────────
 
@@ -121,11 +129,9 @@ inline nlohmann::json typed_value(const std::string& field, ColumnType type) {
  *                      or empty to treat all fields as strings).
  * @return JSON string, or PluginError on failure.
  */
-inline Result<std::string> table_to_json(
-        std::string_view input,
-        std::span<const std::string_view> column_names,
-        std::span<const ColumnType> column_types = {})
-{
+inline Result<std::string> table_to_json(std::string_view input,
+                                         std::span<const std::string_view> column_names,
+                                         std::span<const ColumnType> column_types = {}) {
     if (column_names.empty()) {
         return std::unexpected(PluginError{1, "column_names must not be empty"});
     }
@@ -135,7 +141,8 @@ inline Result<std::string> table_to_json(
 
     std::string field;
     for (const auto& line : lines) {
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
 
         nlohmann::json obj = nlohmann::json::object();
         size_t col = 0;
@@ -146,11 +153,12 @@ inline Result<std::string> table_to_json(
 
             bool has_type = !column_types.empty() && col < column_types.size();
             std::string key{column_names[col]};
-            obj[key] = has_type ? detail::typed_value(field, column_types[col])
-                                : nlohmann::json(field);
+            obj[key] =
+                has_type ? detail::typed_value(field, column_types[col]) : nlohmann::json(field);
 
             ++col;
-            if (pos < line.size()) ++pos;  // skip '|'
+            if (pos < line.size())
+                ++pos; // skip '|'
         }
 
         // Fill missing columns with empty strings
@@ -173,10 +181,8 @@ inline Result<std::string> table_to_json(
  * @param column_names Keys to extract from each object, in order.
  * @return Pipe-delimited text, or PluginError on failure.
  */
-inline Result<std::string> json_to_table(
-        std::string_view json_input,
-        std::span<const std::string_view> column_names)
-{
+inline Result<std::string> json_to_table(std::string_view json_input,
+                                         std::span<const std::string_view> column_names) {
     if (column_names.empty()) {
         return std::unexpected(PluginError{1, "column_names must not be empty"});
     }
@@ -196,12 +202,13 @@ inline Result<std::string> json_to_table(
     for (size_t i = 0; i < arr.size(); ++i) {
         const auto& obj = arr[i];
         if (!obj.is_object()) {
-            return std::unexpected(PluginError{4,
-                "Element " + std::to_string(i) + " is not an object"});
+            return std::unexpected(
+                PluginError{4, "Element " + std::to_string(i) + " is not an object"});
         }
 
         for (size_t c = 0; c < column_names.size(); ++c) {
-            if (c > 0) result += '|';
+            if (c > 0)
+                result += '|';
 
             std::string key{column_names[c]};
             if (obj.contains(key)) {
@@ -217,7 +224,8 @@ inline Result<std::string> json_to_table(
             // missing key → empty field
         }
 
-        if (i + 1 < arr.size()) result += '\n';
+        if (i + 1 < arr.size())
+            result += '\n';
     }
 
     return result;
@@ -233,15 +241,15 @@ inline Result<std::string> json_to_table(
  * @param prefix  Optional prefix prepended to each number.
  * @return Newline-separated identifiers.
  */
-inline std::string generate_sequence(int start, int count,
-                                     std::string_view prefix = {}) {
+inline std::string generate_sequence(int start, int count, std::string_view prefix = {}) {
     std::string result;
     for (int i = 0; i < count; ++i) {
-        if (i > 0) result += '\n';
+        if (i > 0)
+            result += '\n';
         result += prefix;
         result += std::to_string(start + i);
     }
     return result;
 }
 
-}  // namespace yuzu::sdk
+} // namespace yuzu::sdk

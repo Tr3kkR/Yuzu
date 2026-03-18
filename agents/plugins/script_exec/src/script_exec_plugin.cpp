@@ -38,14 +38,14 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <wincrypt.h>
+#include <windows.h>
 #pragma comment(lib, "Crypt32.lib")
 #else
 #include <csignal>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <fcntl.h>
 #endif
 
 namespace {
@@ -54,11 +54,18 @@ namespace {
 
 int parse_timeout(yuzu::Params& params) {
     auto t = std::string(params.get("timeout"));
-    if (t.empty()) return 300;
+    if (t.empty())
+        return 300;
     int val = 300;
-    try { val = std::stoi(t); } catch (...) { val = 300; }
-    if (val < 1) val = 1;
-    if (val > 3600) val = 3600;
+    try {
+        val = std::stoi(t);
+    } catch (...) {
+        val = 300;
+    }
+    if (val < 1)
+        val = 1;
+    if (val > 3600)
+        val = 3600;
     return val;
 }
 
@@ -66,8 +73,8 @@ int parse_timeout(yuzu::Params& params) {
 
 #ifdef _WIN32
 
-int stream_from_handle(yuzu::CommandContext& ctx, HANDLE read_handle,
-                       HANDLE proc_handle, int timeout_secs) {
+int stream_from_handle(yuzu::CommandContext& ctx, HANDLE read_handle, HANDLE proc_handle,
+                       int timeout_secs) {
     auto start = std::chrono::steady_clock::now();
     bool timed_out = false;
 
@@ -85,13 +92,15 @@ int stream_from_handle(yuzu::CommandContext& ctx, HANDLE read_handle,
         DWORD avail = 0;
         if (!PeekNamedPipe(read_handle, nullptr, 0, nullptr, &avail, nullptr) || avail == 0) {
             // Check if process is still alive
-            if (WaitForSingleObject(proc_handle, 10) != WAIT_TIMEOUT) break;
+            if (WaitForSingleObject(proc_handle, 10) != WAIT_TIMEOUT)
+                break;
             continue;
         }
 
         DWORD bytes_read = 0;
-        if (!ReadFile(read_handle, buf.data(), static_cast<DWORD>(buf.size() - 1),
-                      &bytes_read, nullptr) || bytes_read == 0) {
+        if (!ReadFile(read_handle, buf.data(), static_cast<DWORD>(buf.size() - 1), &bytes_read,
+                      nullptr) ||
+            bytes_read == 0) {
             break;
         }
 
@@ -154,8 +163,8 @@ int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int 
     std::vector<char> cmd_buf(cmd_line.begin(), cmd_line.end());
     cmd_buf.push_back('\0');
 
-    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr,
-                        TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (!CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr,
+                        nullptr, &si, &pi)) {
         CloseHandle(stdout_read);
         CloseHandle(stdout_write);
         ctx.write_output("status|error");
@@ -163,7 +172,7 @@ int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int 
         return 1;
     }
 
-    CloseHandle(stdout_write);  // Close write end in parent
+    CloseHandle(stdout_write); // Close write end in parent
 
     int result = stream_from_handle(ctx, stdout_read, pi.hProcess, timeout_secs);
 
@@ -173,10 +182,9 @@ int run_process_win(yuzu::CommandContext& ctx, const std::string& cmd_line, int 
     return result;
 }
 
-#else  // POSIX
+#else // POSIX
 
-int run_process_posix(yuzu::CommandContext& ctx,
-                      const std::vector<std::string>& argv,
+int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>& argv,
                       int timeout_secs) {
     int pipe_fd[2];
     if (pipe(pipe_fd) != 0) {
@@ -209,7 +217,7 @@ int run_process_posix(yuzu::CommandContext& ctx,
         c_argv.push_back(nullptr);
 
         execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
-        _exit(127);  // exec failed
+        _exit(127); // exec failed
     }
 
     // Parent
@@ -245,15 +253,15 @@ int run_process_posix(yuzu::CommandContext& ctx,
                 }
             }
         } else if (n == 0) {
-            break;  // EOF
+            break; // EOF
         } else {
             // EAGAIN — no data yet, brief sleep
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct timespec ts = {0, 10'000'000};  // 10ms
+                struct timespec ts = {0, 10'000'000}; // 10ms
                 nanosleep(&ts, nullptr);
                 continue;
             }
-            break;  // Real error
+            break; // Real error
         }
     }
 
@@ -370,22 +378,20 @@ int do_powershell(yuzu::CommandContext& ctx, yuzu::Params params) {
     utf16le.reserve(script.size() * 2);
     for (char ch : script) {
         utf16le.push_back(static_cast<uint8_t>(ch));
-        utf16le.push_back(0);  // High byte (ASCII → UTF-16LE)
+        utf16le.push_back(0); // High byte (ASCII → UTF-16LE)
     }
 
     // Base64 encode
     DWORD b64_len = 0;
     CryptBinaryToStringA(utf16le.data(), static_cast<DWORD>(utf16le.size()),
-                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                         nullptr, &b64_len);
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, nullptr, &b64_len);
     std::string b64(b64_len, '\0');
     CryptBinaryToStringA(utf16le.data(), static_cast<DWORD>(utf16le.size()),
-                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                         b64.data(), &b64_len);
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64.data(), &b64_len);
     b64.resize(b64_len);
 
-    auto cmd_line = std::format(
-        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}", b64);
+    auto cmd_line =
+        std::format("powershell.exe -NoProfile -NonInteractive -EncodedCommand {}", b64);
 
     return run_process_win(ctx, cmd_line, timeout);
 #endif
@@ -413,35 +419,32 @@ int do_bash(yuzu::CommandContext& ctx, yuzu::Params params) {
 #endif
 }
 
-}  // namespace
+} // namespace
 
 class ScriptExecPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "script_exec"; }
-    std::string_view version()     const noexcept override { return "1.1.0"; }
+    std::string_view name() const noexcept override { return "script_exec"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
         return "Executes commands and scripts with streaming output (admin-only)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "exec", "powershell", "bash", nullptr
-        };
+        static const char* acts[] = {"exec", "powershell", "bash", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
-        if (action == "exec")       return do_exec(ctx, params);
-        if (action == "powershell") return do_powershell(ctx, params);
-        if (action == "bash")       return do_bash(ctx, params);
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
+        if (action == "exec")
+            return do_exec(ctx, params);
+        if (action == "powershell")
+            return do_powershell(ctx, params);
+        if (action == "bash")
+            return do_bash(ctx, params);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

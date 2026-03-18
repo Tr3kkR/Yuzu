@@ -11,12 +11,12 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <format>
 #include <string>
 #include <string_view>
-
-#include <spdlog/spdlog.h>
 
 namespace {
 
@@ -26,14 +26,14 @@ YuzuPluginContext* g_ctx = nullptr;
 
 class AgentActionsPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "agent_actions"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "agent_actions"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Agent runtime actions — set log level, query agent info";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "set_log_level", "info", nullptr };
+        static const char* acts[] = {"set_log_level", "info", nullptr};
         return acts;
     }
 
@@ -42,13 +42,9 @@ public:
         return {};
     }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        g_ctx = nullptr;
-    }
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override { g_ctx = nullptr; }
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "set_log_level") {
             return do_set_log_level(ctx, params);
         }
@@ -70,10 +66,8 @@ private:
 
         // Normalize to lowercase
         std::string level_lower{level_str};
-        std::transform(level_lower.begin(), level_lower.end(),
-                       level_lower.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
+        std::transform(level_lower.begin(), level_lower.end(), level_lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
         auto level = spdlog::level::from_str(level_lower);
         if (level == spdlog::level::off && level_lower != "off") {
@@ -96,18 +90,17 @@ private:
         };
 
         static constexpr InfoKey keys[] = {
-            {"agent.id",                 "agent.id"},
-            {"agent.version",            "agent.version"},
-            {"agent.server_address",     "agent.server_address"},
+            {"agent.id", "agent.id"},
+            {"agent.version", "agent.version"},
+            {"agent.server_address", "agent.server_address"},
             {"agent.heartbeat_interval", "agent.heartbeat_interval"},
-            {"agent.plugins.count",      "agent.plugins.count"},
+            {"agent.plugins.count", "agent.plugins.count"},
         };
 
         for (const auto& k : keys) {
             auto val = pctx.get_config(k.config_key);
-            ctx.write_output(std::format("{}|{}",
-                k.display,
-                val.empty() ? "(not set)" : std::string{val}));
+            ctx.write_output(
+                std::format("{}|{}", k.display, val.empty() ? "(not set)" : std::string{val}));
         }
         return 0;
     }

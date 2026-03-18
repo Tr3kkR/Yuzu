@@ -25,9 +25,9 @@
 namespace {
 
 // RFC 864: printable ASCII characters 32 (' ') through 126 ('~'), 95 chars total.
-constexpr int kFirstChar  = 32;   // ' '
-constexpr int kLastChar   = 126;  // '~'
-constexpr int kCharRange  = kLastChar - kFirstChar + 1;  // 95
+constexpr int kFirstChar = 32;                         // ' '
+constexpr int kLastChar = 126;                         // '~'
+constexpr int kCharRange = kLastChar - kFirstChar + 1; // 95
 constexpr int kLineLength = 72;
 
 // Generate one RFC 864 line starting at the given offset into the character set.
@@ -40,12 +40,12 @@ std::string generate_line(int offset) {
     return line;
 }
 
-}  // namespace
+} // namespace
 
 class ChargenPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "chargen"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "chargen"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "RFC 864 character generator — streams rotating ASCII lines";
     }
@@ -55,17 +55,11 @@ public:
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        stop_all();
-    }
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override { stop_all(); }
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 
         if (action == "chargen_start") {
             return start_chargen(ctx, params);
@@ -86,16 +80,19 @@ private:
         std::atomic<bool> running{true};
     };
 
-    std::mutex                                            mu_;
+    std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
 
     int start_chargen(yuzu::CommandContext& ctx, yuzu::Params params) {
         // Rate: milliseconds between lines (default 100ms = 10 lines/sec)
         auto rate_str = params.get("rate_ms", "100");
         int rate_ms = 100;
-        try { rate_ms = std::stoi(std::string{rate_str}); }
-        catch (const std::exception&) { /* invalid rate_ms param; keep default */ }
-        if (rate_ms < 1) rate_ms = 1;
+        try {
+            rate_ms = std::stoi(std::string{rate_str});
+        } catch (const std::exception&) { /* invalid rate_ms param; keep default */
+        }
+        if (rate_ms < 1)
+            rate_ms = 1;
 
         auto session = std::make_shared<Session>();
         {

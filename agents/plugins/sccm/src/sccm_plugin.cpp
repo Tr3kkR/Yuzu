@@ -43,7 +43,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -67,8 +68,8 @@ std::string read_registry_string(HKEY root, const char* subkey, const char* valu
     DWORD size = sizeof(buf);
     DWORD type = 0;
     std::string result;
-    if (RegQueryValueExA(hkey, value, nullptr, &type,
-                         reinterpret_cast<LPBYTE>(buf), &size) == ERROR_SUCCESS) {
+    if (RegQueryValueExA(hkey, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &size) ==
+        ERROR_SUCCESS) {
         if (type == REG_SZ && size > 0) {
             result.assign(buf, size - 1);
         }
@@ -83,8 +84,8 @@ std::string read_registry_string(HKEY root, const char* subkey, const char* valu
 int do_client_version(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     // Check registry for SCCM client version
-    auto version = read_registry_string(HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\SMS\\Mobile Client", "ProductVersion");
+    auto version = read_registry_string(
+        HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\SMS\\Mobile Client", "ProductVersion");
 
     if (!version.empty()) {
         ctx.write_output("installed|true");
@@ -119,23 +120,23 @@ int do_client_version(yuzu::CommandContext& ctx) {
 int do_site(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
     // Try registry first
-    auto site_code = read_registry_string(HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\SMS\\Mobile Client", "AssignedSiteCode");
+    auto site_code = read_registry_string(
+        HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\SMS\\Mobile Client", "AssignedSiteCode");
 
     if (site_code.empty()) {
         // Try alternate location
-        site_code = read_registry_string(HKEY_LOCAL_MACHINE,
-            "SOFTWARE\\Microsoft\\CCM", "AssignedSiteCode");
+        site_code = read_registry_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\CCM",
+                                         "AssignedSiteCode");
     }
 
     if (!site_code.empty()) {
         ctx.write_output(std::format("site_code|{}", site_code));
     } else {
         // Try COM object via PowerShell
-        auto ps_site = run_command(
-            "powershell -NoProfile -Command \""
-            "try { (New-Object -ComObject Microsoft.SMS.Client).GetAssignedSite() } "
-            "catch { 'unavailable' }\"");
+        auto ps_site =
+            run_command("powershell -NoProfile -Command \""
+                        "try { (New-Object -ComObject Microsoft.SMS.Client).GetAssignedSite() } "
+                        "catch { 'unavailable' }\"");
         if (!ps_site.empty() && ps_site != "unavailable") {
             ctx.write_output(std::format("site_code|{}", ps_site));
         } else {
@@ -144,19 +145,16 @@ int do_site(yuzu::CommandContext& ctx) {
     }
 
     // Get management point
-    auto mp = read_registry_string(HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\CCM", "Authority");
+    auto mp = read_registry_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\CCM", "Authority");
     if (mp.empty()) {
-        mp = read_registry_string(HKEY_LOCAL_MACHINE,
-            "SOFTWARE\\Microsoft\\CCM\\Authority\\SMS:{}",
-            "CurrentManagementPoint");
+        mp = read_registry_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\CCM\\Authority\\SMS:{}",
+                                  "CurrentManagementPoint");
     }
     if (mp.empty()) {
         // Try PowerShell
-        mp = run_command(
-            "powershell -NoProfile -Command \""
-            "try { (New-Object -ComObject Microsoft.SMS.Client)"
-            ".GetCurrentManagementPoint() } catch { '' }\"");
+        mp = run_command("powershell -NoProfile -Command \""
+                         "try { (New-Object -ComObject Microsoft.SMS.Client)"
+                         ".GetCurrentManagementPoint() } catch { '' }\"");
     }
     if (!mp.empty()) {
         ctx.write_output(std::format("management_point|{}", mp));
@@ -170,34 +168,31 @@ int do_site(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class SccmPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "sccm"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "sccm"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Reports SCCM/ConfigMgr client status, version, and site assignment";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "client_version", "site", nullptr
-        };
+        static const char* acts[] = {"client_version", "site", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "client_version") return do_client_version(ctx);
-        if (action == "site")           return do_site(ctx);
+        if (action == "client_version")
+            return do_client_version(ctx);
+        if (action == "site")
+            return do_site(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

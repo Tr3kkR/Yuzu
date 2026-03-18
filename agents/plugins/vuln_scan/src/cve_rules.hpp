@@ -7,10 +7,10 @@ namespace yuzu::vuln {
 
 struct CveRule {
     std::string_view cve_id;
-    std::string_view product;         // case-insensitive substring match on app name
-    std::string_view affected_below;  // versions below this are vulnerable
-    std::string_view fixed_in;        // informational: version that fixed it
-    std::string_view severity;        // CRITICAL, HIGH, MEDIUM, LOW
+    std::string_view product;        // case-insensitive substring match on app name
+    std::string_view affected_below; // versions below this are vulnerable
+    std::string_view fixed_in;       // informational: version that fixed it
+    std::string_view severity;       // CRITICAL, HIGH, MEDIUM, LOW
     std::string_view description;
 };
 
@@ -20,7 +20,8 @@ struct CveRule {
 
 inline int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
-        if (s.empty()) return {};
+        if (s.empty())
+            return {};
         auto pos = s.find_first_of(".-");
         std::string_view seg;
         if (pos == std::string_view::npos) {
@@ -34,10 +35,12 @@ inline int compare_versions(std::string_view a, std::string_view b) {
     };
 
     auto to_num = [](std::string_view seg) -> std::pair<bool, long long> {
-        if (seg.empty()) return {true, 0};
+        if (seg.empty())
+            return {true, 0};
         long long val = 0;
         for (char c : seg) {
-            if (c < '0' || c > '9') return {false, 0};
+            if (c < '0' || c > '9')
+                return {false, 0};
             val = val * 10 + (c - '0');
         }
         return {true, val};
@@ -52,10 +55,12 @@ inline int compare_versions(std::string_view a, std::string_view b) {
         auto [b_num, b_val] = to_num(sb);
 
         if (a_num && b_num) {
-            if (a_val != b_val) return (a_val < b_val) ? -1 : 1;
+            if (a_val != b_val)
+                return (a_val < b_val) ? -1 : 1;
         } else {
             int cmp = sa.compare(sb);
-            if (cmp != 0) return cmp;
+            if (cmp != 0)
+                return cmp;
         }
     }
     return 0;
@@ -76,12 +81,9 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
      "SSL_select_next_proto buffer overread"},
 
     // curl
-    {"CVE-2023-38545", "curl", "8.4.0", "8.4.0", "CRITICAL",
-     "SOCKS5 heap buffer overflow"},
-    {"CVE-2023-38546", "curl", "8.4.0", "8.4.0", "LOW",
-     "Cookie injection with none file"},
-    {"CVE-2024-2398", "curl", "8.7.1", "8.7.1", "MEDIUM",
-     "HTTP/2 push headers memory leak"},
+    {"CVE-2023-38545", "curl", "8.4.0", "8.4.0", "CRITICAL", "SOCKS5 heap buffer overflow"},
+    {"CVE-2023-38546", "curl", "8.4.0", "8.4.0", "LOW", "Cookie injection with none file"},
+    {"CVE-2024-2398", "curl", "8.7.1", "8.7.1", "MEDIUM", "HTTP/2 push headers memory leak"},
 
     // sudo
     {"CVE-2021-3156", "sudo", "1.9.5p2", "1.9.5p2", "CRITICAL",
@@ -118,8 +120,7 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
      "zipfile quoted-overlap zipbomb protection bypass"},
 
     // Node.js
-    {"CVE-2023-44487", "node", "20.8.1", "20.8.1", "HIGH",
-     "HTTP/2 Rapid Reset denial of service"},
+    {"CVE-2023-44487", "node", "20.8.1", "20.8.1", "HIGH", "HTTP/2 Rapid Reset denial of service"},
     {"CVE-2024-22019", "node", "20.11.1", "20.11.1", "HIGH",
      "Reading unprocessed HTTP request with unbounded chunk extension"},
 
@@ -138,8 +139,7 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
     // .NET Runtime
     {"CVE-2024-21319", "dotnet", "8.0.1", "8.0.1", "HIGH",
      "Denial of service via SignedCms degenerate certificates"},
-    {"CVE-2024-38168", "dotnet", "8.0.8", "8.0.8", "HIGH",
-     "ASP.NET Core denial of service"},
+    {"CVE-2024-38168", "dotnet", "8.0.8", "8.0.8", "HIGH", "ASP.NET Core denial of service"},
 
     // Java / OpenJDK
     {"CVE-2024-20918", "openjdk", "21.0.2", "21.0.2", "HIGH",
@@ -154,10 +154,8 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
      "Print Spooler privilege escalation"},
 
     // nginx
-    {"CVE-2022-41741", "nginx", "1.23.2", "1.23.2", "HIGH",
-     "mp4 module memory corruption"},
-    {"CVE-2024-7347", "nginx", "1.27.1", "1.27.1", "MEDIUM",
-     "Worker process crash in mp4 module"},
+    {"CVE-2022-41741", "nginx", "1.23.2", "1.23.2", "HIGH", "mp4 module memory corruption"},
+    {"CVE-2024-7347", "nginx", "1.27.1", "1.27.1", "MEDIUM", "Worker process crash in mp4 module"},
 
     // PostgreSQL
     {"CVE-2023-5868", "postgresql", "16.1", "16.1", "MEDIUM",
@@ -184,10 +182,8 @@ inline constexpr std::array kCveRules = std::to_array<CveRule>({
      "NIST P-521 private key recovery from ECDSA signatures"},
 
     // PHP
-    {"CVE-2024-4577", "php", "8.3.8", "8.3.8", "CRITICAL",
-     "CGI argument injection on Windows"},
-    {"CVE-2024-2756", "php", "8.3.4", "8.3.4", "MEDIUM",
-     "Cookie __Host-/__Secure- prefix bypass"},
+    {"CVE-2024-4577", "php", "8.3.8", "8.3.8", "CRITICAL", "CGI argument injection on Windows"},
+    {"CVE-2024-2756", "php", "8.3.4", "8.3.4", "MEDIUM", "Cookie __Host-/__Secure- prefix bypass"},
 });
 
-}  // namespace yuzu::vuln
+} // namespace yuzu::vuln
