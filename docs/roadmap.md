@@ -27,11 +27,11 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows | Done |
 | | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Done |
 | | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Done |
-| | 2.8 | [#205](https://github.com/Tr3kkR/Yuzu/issues/205) | Error Code Taxonomy (1xxx-4xxx) | Open |
-| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (5 Modes) | Open |
+| | 2.8 | [#205](https://github.com/Tr3kkR/Yuzu/issues/205) | Error Code Taxonomy (1xxx-4xxx) | Done |
+| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (5 Modes) | Done |
 | | 2.10 | [#207](https://github.com/Tr3kkR/Yuzu/issues/207) | YAML Authoring UI (Form + CodeMirror) | Open |
-| | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Open |
-| | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Open |
+| | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Done |
+| | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Done |
 | **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Done |
 | | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Open |
 | | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Open |
@@ -85,13 +85,13 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 |-------|:----:|:----:|:-----:|----------|
 | 0: Foundation | 5 | 0 | 5 | 100% |
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
-| 2: Instruction System | 7 | 5 | 12 | 58% |
+| 2: Instruction System | 11 | 1 | 12 | 92% |
 | 3: Security & RBAC | 2 | 7 | 9 | 22% |
 | 4: Agent Infrastructure | 0 | 8 | 8 | 0% |
 | 5: Policy Engine | 0 | 5 | 5 | 0% |
 | 6: Windows Depth | 0 | 6 | 6 | 0% |
 | 7: Scale & Integration | 0 | 19 | 19 | 0% |
-| **Total** | **21** | **50** | **71** | |
+| **Total** | **25** | **46** | **71** | |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
