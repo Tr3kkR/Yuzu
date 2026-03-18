@@ -139,6 +139,16 @@ int main(int argc, char* argv[]) {
     app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
 
+    // OIDC SSO options
+    app.add_option("--oidc-issuer", cfg.oidc_issuer,
+                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)");
+    app.add_option("--oidc-client-id", cfg.oidc_client_id,
+                   "OIDC client ID (app registration)");
+    app.add_option("--oidc-client-secret", cfg.oidc_client_secret,
+                   "OIDC client secret (required for Entra/Azure AD web apps)");
+    app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
+                   "OIDC redirect URI (default: auto-computed from web address/port)");
+
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
                    "Response retention period in days (default: 90)")
@@ -170,6 +180,13 @@ int main(int argc, char* argv[]) {
     app.add_option("--clickhouse-password", cfg.clickhouse_password, "ClickHouse password");
 
     CLI11_PARSE(app, argc, argv);
+
+    // Auto-compute OIDC redirect URI if not explicitly set
+    if (!cfg.oidc_issuer.empty() && cfg.oidc_redirect_uri.empty()) {
+        auto scheme = cfg.https_enabled ? "https" : "http";
+        auto port = cfg.https_enabled ? cfg.https_port : cfg.web_port;
+        cfg.oidc_redirect_uri = std::format("{}://localhost:{}/auth/callback", scheme, port);
+    }
 
     cfg.nvd_sync_interval = std::chrono::seconds(nvd_sync_hours * 3600);
 

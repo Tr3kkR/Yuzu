@@ -123,7 +123,6 @@ endif
 # ── Server ────────────────────────────────────────────────────────────────────
 if build_server
   subdir('server/core')
-  subdir('server/gateway')
 endif
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -135,25 +134,17 @@ endif
 _rebar3 = find_program('rebar3', required: false)
 if _rebar3.found()
   _gw_src = meson.project_source_root() / 'gateway'
+  _gw_build_script = meson.project_source_root() / 'scripts' / 'build_gateway.py'
   # rebar3 must run from inside the gateway/ directory.
-  # Meson custom_target has no workdir param, so we use 'cmd /c cd ... &&'
-  # on Windows or 'sh -c cd ... &&' on POSIX.
-  if host_machine.system() == 'windows'
-    custom_target('gateway',
-      command: ['cmd', '/c', 'cd /d ' + _gw_src + ' && rebar3 compile'],
-      output: '.gateway_built',
-      build_always_stale: true,
-      build_by_default: true,
-    )
-  else
-    _sh = find_program('sh')
-    custom_target('gateway',
-      command: [_sh, '-c', 'cd ' + _gw_src + ' && rebar3 compile'],
-      output: '.gateway_built',
-      build_always_stale: true,
-      build_by_default: true,
-    )
-  endif
+  # We use a Python wrapper instead of 'cmd /c cd ... && rebar3 compile'
+  # because Ninja quotes compound commands as a single argument, which
+  # breaks cmd.exe on Windows.
+  custom_target('gateway',
+    command: [find_program('python3'), _gw_build_script, _gw_src],
+    output: '.gateway_built',
+    build_always_stale: true,
+    build_by_default: true,
+  )
   message('Erlang gateway: enabled (rebar3 found)')
 else
   message('Erlang gateway: skipped (rebar3 not found)')

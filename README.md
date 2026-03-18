@@ -121,13 +121,13 @@ Yuzu/
 ├── agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
 ├── agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
 ├── server/core/              Server daemon (sessions, auth, dashboard, REST API)
-├── server/gateway/           Gateway node for scale-out deployments
+├── gateway/                  Erlang/OTP gateway node (standalone rebar3 project)
 ├── sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
 ├── proto/                    Protobuf definitions (source of truth for wire protocol)
 │   ├── yuzu/agent/v1/        AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
 │   ├── yuzu/common/v1/       Shared types: Platform, Timestamp, ErrorDetail
 │   ├── yuzu/server/v1/       ManagementService: ListAgents, SendCommand, WatchEvents
-│   └── yuzu/gateway/v1/      GatewayUpstream: ProxyRegister, BatchHeartbeat
+│   └── yuzu/gateway/v1/      GatewayUpstream — server-side RPCs the Erlang gateway calls into
 ├── docs/                     Architecture and roadmap documentation
 ├── meson/                    Cross-compilation and native files
 ├── scripts/                  Build helpers (setup.sh, deploy_build_dlls.py)

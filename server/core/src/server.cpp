@@ -16,6 +16,7 @@
 #include "management.grpc.pb.h"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "oidc_provider.hpp"
 #include "response_store.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
@@ -1506,6 +1507,42 @@ public:
         // Load auto-approve policies
         auto approve_path = cfg_.auth_config_path.parent_path() / "auto-approve.cfg";
         auto_approve_.load(approve_path);
+
+        // Initialize OIDC provider if configured
+        if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
+            oidc::OidcConfig oidc_cfg;
+            oidc_cfg.issuer        = cfg_.oidc_issuer;
+            oidc_cfg.client_id     = cfg_.oidc_client_id;
+            oidc_cfg.client_secret = cfg_.oidc_client_secret;
+            oidc_cfg.redirect_uri  = cfg_.oidc_redirect_uri;
+            // Fallback endpoints for Entra ID — OidcProvider constructor will
+            // override from the OIDC discovery document if reachable.
+            // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
+            auto issuer = cfg_.oidc_issuer;
+            auto v2_pos = issuer.rfind("/v2.0");
+            if (v2_pos != std::string::npos) {
+                auto base = issuer.substr(0, v2_pos);
+                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
+                oidc_cfg.token_endpoint         = base + "/oauth2/v2.0/token";
+            } else {
+                oidc_cfg.authorization_endpoint = issuer + "/authorize";
+                oidc_cfg.token_endpoint         = issuer + "/token";
+            }
+            // Token exchange helper script (Python subprocess workaround for
+            // httplib OpenSSL client issues on Windows)
+            auto script_dir = std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path()
+                              / "scripts" / "oidc_token_exchange.py";
+            // Try source tree location first (development), then installed location
+            auto src_script = std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
+            if (std::filesystem::exists(src_script))
+                oidc_cfg.exchange_script = src_script.string();
+            else if (std::filesystem::exists(script_dir))
+                oidc_cfg.exchange_script = script_dir.string();
+            spdlog::info("OIDC exchange script: {}", oidc_cfg.exchange_script);
+
+            oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
+        }
+
         // Setup file logger
         auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
@@ -2537,7 +2574,7 @@ private:
 
     // Cookie attribute helper — adds Secure flag when HTTPS is enabled
     std::string session_cookie_attrs() const {
-        std::string attrs = "; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800";
+        std::string attrs = "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800";
         if (cfg_.https_enabled) {
             attrs += "; Secure";
         }
@@ -2632,8 +2669,9 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page and metrics
-                if (req.path == "/login" || req.path == "/metrics") {
+                // Allow unauthenticated access to login page, metrics, and OIDC flow
+                if (req.path == "/login" || req.path == "/metrics" ||
+                    req.path == "/auth/oidc/start" || req.path == "/auth/callback") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -2655,8 +2693,15 @@ private:
             });
 
         // -- Login page -------------------------------------------------------
-        web_server_->Get("/login", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kLoginHtml, "text/html; charset=utf-8");
+        web_server_->Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
+            std::string html(kLoginHtml);
+            // Inject OIDC enablement flag into the page
+            if (oidc_provider_ && oidc_provider_->is_enabled()) {
+                auto pos = html.find("/*OIDC_CONFIG*/");
+                if (pos != std::string::npos)
+                    html.replace(pos, 15, "window.OIDC_ENABLED=true;");
+            }
+            res.set_content(html, "text/html; charset=utf-8");
         });
 
         web_server_->Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2691,9 +2736,83 @@ private:
                 auth_mgr_.invalidate_session(token);
             }
             res.set_header("Set-Cookie",
-                           "yuzu_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+                           "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
             res.set_content(R"({"status":"ok"})", "application/json");
         });
+
+        // -- OIDC SSO endpoints -----------------------------------------------
+        web_server_->Get("/auth/oidc/start",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"OIDC not configured"})", "application/json");
+                    return;
+                }
+                // Derive redirect URI from the request Host header so OIDC works
+                // regardless of which IP/hostname the operator used to reach us.
+                auto host = req.get_header_value("Host");
+                std::string redirect_uri;
+                if (!host.empty()) {
+                    auto scheme = cfg_.https_enabled ? "https" : "http";
+                    redirect_uri = std::string(scheme) + "://" + host + "/auth/callback";
+                }
+                auto auth_url = oidc_provider_->start_auth_flow(redirect_uri);
+                res.set_redirect(auth_url);
+            });
+
+        web_server_->Get("/auth/callback",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!oidc_provider_) {
+                    res.status = 404;
+                    res.set_content("OIDC not configured", "text/plain");
+                    return;
+                }
+
+                // Check for error response from IdP
+                auto error = req.get_param_value("error");
+                if (!error.empty()) {
+                    auto desc = req.get_param_value("error_description");
+                    spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+                    res.set_redirect("/login?error=sso_denied");
+                    return;
+                }
+
+                auto code  = req.get_param_value("code");
+                auto state = req.get_param_value("state");
+
+                if (code.empty() || state.empty()) {
+                    res.set_redirect("/login?error=sso_invalid");
+                    return;
+                }
+
+                auto result = oidc_provider_->handle_callback(code, state);
+                if (!result) {
+                    spdlog::warn("OIDC callback failed: {}", result.error());
+                    audit_log(req, "auth.oidc_login_failed", "failure");
+                    emit_event("auth.oidc_login_failed", req,
+                               {{"source_ip", req.remote_addr}, {"error", result.error()}},
+                               {}, Severity::kWarn);
+                    res.set_redirect("/login?error=sso_failed");
+                    return;
+                }
+
+                auto& claims = result.value();
+                auto email   = claims.email.empty() ? claims.preferred_username : claims.email;
+                auto display = claims.name.empty() ? email : claims.name;
+                auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub);
+
+                res.set_header("Set-Cookie",
+                               "yuzu_session=" + session_token + session_cookie_attrs());
+
+                audit_log(req, "auth.oidc_login", "success", "user", display);
+                emit_event("auth.oidc_login", req,
+                           {{"source_ip", req.remote_addr},
+                            {"oidc_sub", claims.sub},
+                            {"email", email},
+                            {"name", claims.name}});
+
+                res.set_redirect("/");
+            });
 
         // -- HTTP metrics (post-routing handler) --------------------------------
         web_server_->set_post_routing_handler(
@@ -5024,6 +5143,9 @@ private:
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;
     std::thread redirect_thread_;
+
+    // OIDC SSO
+    std::unique_ptr<oidc::OidcProvider> oidc_provider_;
 
     // NVD CVE feed
     std::shared_ptr<NvdDatabase> nvd_db_;

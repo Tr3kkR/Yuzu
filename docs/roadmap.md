@@ -1,6 +1,6 @@
 # Yuzu Development Roadmap
 
-**Version:** 1.1 | **Date:** 2026-03-18
+**Version:** 1.2 | **Date:** 2026-03-18
 
 This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.
 
@@ -27,6 +27,11 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows | Done |
 | | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Done |
 | | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Done |
+| | 2.8 | [#205](https://github.com/Tr3kkR/Yuzu/issues/205) | Error Code Taxonomy (1xxx-4xxx) | Open |
+| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (5 Modes) | Open |
+| | 2.10 | [#207](https://github.com/Tr3kkR/Yuzu/issues/207) | YAML Authoring UI (Form + CodeMirror) | Open |
+| | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Open |
+| | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Open |
 | **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Open |
 | | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Open |
 | | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Open |
@@ -35,6 +40,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) | Open |
 | | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Open |
 | | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management | Open |
+| | 3.9 | [#210](https://github.com/Tr3kkR/Yuzu/issues/210) | Scope DSL Extensions (MATCHES, EXISTS, len, startswith) | Open |
 | **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage | Open |
 | | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) | Open |
 | | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution | Open |
@@ -42,10 +48,12 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 4.5 | [#184](https://github.com/Tr3kkR/Yuzu/issues/184) | Trigger Framework (Agent-Side) | Open |
 | | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) | Open |
 | | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval | Open |
+| | 4.8 | [#212](https://github.com/Tr3kkR/Yuzu/issues/212) | service.set_start_mode Cross-Platform Primitive | Open |
 | **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Open |
 | | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment | Open |
 | | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics | Open |
 | | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation | Open |
+| | 5.5 | [#211](https://github.com/Tr3kkR/Yuzu/issues/211) | CEL Adoption for Policy Compliance Expressions | Open |
 | **6** | 6.1 | [#180](https://github.com/Tr3kkR/Yuzu/issues/180) | Registry Plugin (Read/Write/Enumerate) | Open |
 | | 6.2 | [#182](https://github.com/Tr3kkR/Yuzu/issues/182) | Per-User Registry Operations | Open |
 | | 6.3 | [#183](https://github.com/Tr3kkR/Yuzu/issues/183) | WMI Query and Method Invocation | Open |
@@ -64,6 +72,12 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Open |
 | | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Open |
 | | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) | Open |
+| | 7.13 | [#213](https://github.com/Tr3kkR/Yuzu/issues/213) | ProductPack Ed25519 Trust Chain and Verification | Open |
+| | 7.14 | [#214](https://github.com/Tr3kkR/Yuzu/issues/214) | Workflow Primitives (if, foreach, retry) | Open |
+| | 7.15 | [#215](https://github.com/Tr3kkR/Yuzu/issues/215) | WiFi Network Enumeration | Open |
+| | 7.16 | [#216](https://github.com/Tr3kkR/Yuzu/issues/216) | Wake-on-LAN Support | Open |
+| | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Open |
+| | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Open |
 
 ## Current Status
 
@@ -71,13 +85,13 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 |-------|:----:|:----:|:-----:|----------|
 | 0: Foundation | 5 | 0 | 5 | 100% |
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
-| 2: Instruction System | 7 | 0 | 7 | 100% |
-| 3: Security & RBAC | 0 | 8 | 8 | 0% |
-| 4: Agent Infrastructure | 0 | 7 | 7 | 0% |
-| 5: Policy Engine | 0 | 4 | 4 | 0% |
+| 2: Instruction System | 7 | 5 | 12 | 58% |
+| 3: Security & RBAC | 0 | 9 | 9 | 0% |
+| 4: Agent Infrastructure | 0 | 8 | 8 | 0% |
+| 5: Policy Engine | 0 | 5 | 5 | 0% |
 | 6: Windows Depth | 0 | 6 | 6 | 0% |
-| 7: Scale & Integration | 0 | 12 | 12 | 0% |
-| **Total** | **19** | **37** | **56** | |
+| 7: Scale & Integration | 0 | 19 | 19 | 0% |
+| **Total** | **19** | **52** | **71** | |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -274,6 +288,41 @@ Error codes follow the 4-category taxonomy (1xxx plugin, 2xxx transport, 3xxx or
 
 **Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/server.cpp`, `agents/core/src/agent.cpp`
 
+### Issue 2.8: Error Code Taxonomy (1xxx-4xxx)
+**Scope:** Server + Agent
+
+Implement the 4-category error code taxonomy from `docs/Instruction-Engine.md` Section 9: 1xxx plugin, 2xxx transport, 3xxx orchestration, 4xxx agent. Each code has defined retry semantics. Per-definition `minSuccessPercent` determines aggregate execution status.
+
+**Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/common/v1/common.proto`
+
+### Issue 2.9: Concurrency Enforcement (5 Modes)
+**Scope:** Server + Agent
+
+Implement 5 concurrency modes from `docs/Instruction-Engine.md` Section 10: `per-device` (agent-side, default), `per-definition` (server-side), `per-set` (agent-side), `global:<N>` (server-side semaphore), `unlimited`. Agent maintains in-memory lock set; server uses `concurrency_locks` SQLite table.
+
+**Files:** `agents/core/src/agent.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
+
+### Issue 2.10: YAML Authoring UI (Form + CodeMirror)
+**Scope:** Server
+
+Extend `instruction_ui.cpp` with form mode (input fields, parameter/result builders) and YAML mode (CodeMirror 6 editor, server-side validation). Import/export endpoints. Follows HTMX fragment pattern. Design: `docs/Instruction-Engine.md` Section 11.
+
+**Files:** `server/core/src/instruction_ui.cpp`, `server/core/src/instruction_store.cpp`, `server/core/src/server.cpp`
+
+### Issue 2.11: Legacy Command Shim
+**Scope:** Server
+
+Auto-generate InstructionDefinitions from plugin descriptors (`YuzuPluginDescriptor.actions[]`). Bridges ad-hoc commands into the governed pipeline with open-schema parameters. CLI tool: `yuzu-admin generate-definitions`. Design: `docs/Instruction-Engine.md` Section 15.
+
+**Files:** New `server/core/src/legacy_shim.cpp`, `server/core/src/instruction_store.cpp`, `server/core/src/server.cpp`
+
+### Issue 2.12: Structured Result Envelope
+**Scope:** Server + Agent
+
+Implement the canonical `InstructionResult` envelope from `docs/Instruction-Engine.md` Section 18. Typed columns (bool, int32, int64, string, datetime, guid, clob) with structured rows. Prerequisite for workflow chaining, policy evaluation, and typed data export.
+
+**Files:** `server/core/src/response_store.hpp`, `server/core/src/response_store.cpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`
+
 ---
 
 ## Phase 3: Security, RBAC, and Access Control
@@ -377,6 +426,13 @@ New `certificates` plugin:
 
 **Files:** New `agents/plugins/certificates/`
 
+### Issue 3.9: Scope DSL Extensions (MATCHES, EXISTS, len, startswith)
+**Scope:** Server
+
+Add 4 operators to `scope_engine.cpp`: `MATCHES` (regex), `EXISTS` (tag presence), `len()` (string length), `startswith()` (prefix check). Parser architecture supports these without structural changes — add `TokenType` variants and `CompOp` cases. Design: `docs/Instruction-Engine.md` Section 8.2.
+
+**Files:** `server/core/src/scope_engine.hpp`, `server/core/src/scope_engine.cpp`, `tests/unit/`
+
 ---
 
 ## Phase 4: Agent Infrastructure
@@ -469,6 +525,13 @@ Extend the `diagnostics` plugin:
 
 **Files:** `agents/plugins/diagnostics/src/diagnostics_plugin.cpp`, `agents/core/src/agent.cpp`
 
+### Issue 4.8: service.set_start_mode Cross-Platform Primitive
+**Scope:** Plugin
+
+Add `set_start_mode` action to the `services` plugin. Parameters: `serviceName`, `mode` (automatic/manual/disabled/masked). Cross-platform: Windows `ChangeServiceConfigW`, Linux `systemctl enable/disable/mask`, macOS `launchctl enable/disable`. `masked` maps to `disabled` with warning on non-Linux. Returns previous/new/effective mode. Design: `docs/Instruction-Engine.md` Section 16.
+
+**Files:** `agents/plugins/services/src/services_plugin.cpp`
+
 ---
 
 ## Phase 5: Policy Engine and Compliance
@@ -516,6 +579,14 @@ Core policy engine:
 - Expose both as actions dispatchable from the dashboard.
 
 **Files:** `agents/core/src/agent.cpp`, `server/core/src/server.cpp`
+
+### Issue 5.5: CEL Adoption for Policy Compliance Expressions
+**Scope:** Server
+**Depends on:** 5.1
+
+Adopt [Common Expression Language (CEL)](https://github.com/google/cel-spec) for typed policy evaluation. CEL handles `spec.compliance.expression`, `spec.fix.when`, and `spec.rollout.condition` — typed evaluation that the scope DSL cannot do. The scope DSL stays for device targeting. abseil is already a transitive dep via gRPC, making cel-cpp a natural addition. Design: `docs/Instruction-Engine.md` Section 8.3.
+
+**Files:** `vcpkg.json`, new `server/core/src/cel_evaluator.cpp`, `server/core/src/policy_engine.cpp`
 
 ---
 
@@ -597,17 +668,39 @@ Add `registry_change` trigger type to the trigger framework (Issue 4.5):
 *Multi-node architecture, external integrations, and remaining advanced/future capabilities.*
 
 ### Issue 7.1: Gateway Node Implementation
-**Capability:** 22.5 | **Scope:** New binary
+**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`)
 
-Implement the gateway node defined in `gateway.proto`:
-- Proxy agent registrations to upstream server
-- Batch heartbeats (reduce connection count on server)
-- Proxy subscribe streams
-- Report stream status to upstream
-- Gateway handles local TLS termination
+The Erlang gateway (`gateway/`) implements the command fanout plane. Core proxy
+functionality (Register, Subscribe, Heartbeat batching, Inventory, StreamStatus)
+is implemented. See `docs/erlang-gateway-blueprint.md`.
+
+Remaining work:
+- Proxy agent registrations to upstream server — **done**
+- Batch heartbeats (reduce connection count on server) — **done**
+- Proxy subscribe streams — **done**
+- Report stream status to upstream — **done**
+- Gateway handles local TLS termination — **done**
 - Deploy at branch offices to reduce WAN traffic
 
-**Files:** New `gateway/` directory, implement `GatewayUpstream` service
+**Files:** `gateway/` (Erlang/OTP, rebar3), `proto/yuzu/gateway/v1/gateway.proto`, `server/core/src/server.cpp` (GatewayUpstream handlers)
+
+### Issue 7.1.1: Gateway Adjacency, Load Shedding, and Latency-Based Redistribution
+**Capability:** 22.5 | **Scope:** Erlang gateway (`gateway/`)
+**Depends on:** 7.1
+
+Implement cluster-aware agent redistribution so gateway nodes can dynamically
+balance agent load based on measured latency and node capacity:
+
+- **Adjacency table** — each node tracks peer agent count, CPU/memory, inter-node RTT, drain state
+- **Load shedding** — shed agents via GOAWAY when overloaded, draining, or rebalancing for a new node; rate-limited to prevent reconnection storms
+- **Agent absorption** — accept reconnecting agents; optionally pull agents from overloaded peers
+- **Latency-based redistribution** — measure agent↔node RTT from heartbeats, compute affinity scores, migrate agents to lower-latency peers when improvement exceeds threshold
+- **Stability** — cooldown window and hysteresis to prevent oscillation
+- **Telemetry** — adjacency updates, shed/absorb counts, migration decisions exposed as Prometheus metrics
+
+**Design:** `docs/erlang-gateway-blueprint.md` § "Gateway Adjacency and Latency-Based Agent Redistribution"
+
+**Files:** `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl` (new), `gateway/apps/yuzu_gw/src/yuzu_gw_agent.erl`, `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`
 
 ### Issue 7.2: System Health Monitoring and Statistics
 **Capabilities:** 22.1, 22.6, 22.2 | **Scope:** Server
@@ -732,6 +825,50 @@ Push events to external systems:
 
 **Files:** New `server/core/src/event_subscriptions.cpp`, `server/core/src/server.cpp`
 
+### Issue 7.13: ProductPack Ed25519 Trust Chain and Verification
+**Scope:** Server
+**Depends on:** 7.9
+
+Implement Ed25519-based signing, 3-level key hierarchy (org root → signing key → manifest), and verification pipeline for ProductPacks. `tar.zst` format with `manifest.json` (per-file SHA-256), `manifest.sig`, `signing-key.der`. JSON revocation list. Server config: `require_signed`, `allow_self_signed`, `trust_store_path`. Self-signing CLI for dev. Design: `docs/Instruction-Engine.md` Section 13.
+
+**Files:** New `server/core/src/pack_signing.cpp`, `server/core/src/instruction_store.cpp`, `server/core/src/server.cpp`
+
+### Issue 7.14: Workflow Primitives (if, foreach, retry)
+**Scope:** Server
+**Depends on:** 2.5, 2.12
+
+Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions — no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9.
+
+**Files:** New `server/core/src/workflow_engine.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
+
+### Issue 7.15: WiFi Network Enumeration
+**Capability:** 4.6 | **Scope:** Plugin
+
+List visible SSIDs (signal, security, channel, BSSID) and saved WiFi profiles. Windows: WlanAPI. Linux: NetworkManager D-Bus / `nmcli`. macOS: CoreWLAN.
+
+**Files:** `agents/plugins/network_config/src/network_config_plugin.cpp` or new `agents/plugins/wifi/`
+
+### Issue 7.16: Wake-on-LAN Support
+**Capability:** 4.7 | **Scope:** Plugin + Server
+
+Send WoL magic packets from server or agent (peer wake for same-subnet). Check WoL adapter status. Windows: WMI. Linux: `ethtool`. macOS: `pmset`.
+
+**Files:** `agents/plugins/network_actions/src/network_actions_plugin.cpp`, `server/core/src/server.cpp`
+
+### Issue 7.17: Inventory Table Enumeration and Item Lookup
+**Capabilities:** 15.3, 15.4 | **Scope:** Agent SDK + Server
+
+`inventory.list_tables` — enumerate available data sources per plugin. `inventory.query` — query a table with optional filter, column subset, limit. Plugins declare tables via SDK. Server caches and exposes via REST.
+
+**Files:** `sdk/include/yuzu/plugin.h`, `agents/core/src/agent.cpp`, `server/core/src/server.cpp`
+
+### Issue 7.18: Device Discovery (Unmanaged Endpoints)
+**Capability:** 19.5 | **Scope:** Plugin + Server
+
+Discover unmanaged endpoints via agent-assisted subnet scanning (ARP, mDNS, ICMP), AD/DHCP import, or CSV upload. Server reconciles against registered agents: managed, unmanaged, or stale. Dashboard coverage view with deployment link (Issue 7.7).
+
+**Files:** New `agents/plugins/discovery/`, new `server/core/src/device_discovery.cpp`, `server/core/src/server.cpp`
+
 ---
 
 ## Future Phase (T3 Items — Not Scheduled)
@@ -776,21 +913,29 @@ Phase 1 (Data Infrastructure)
 Phase 2 (Instruction System)
   ├── Requires: Phase 1 (response store, scope engine)
   ├── 2.1 Definitions ───── prerequisite for ──→ 2.2 Sets, 2.3 Scheduling, 2.5 Hierarchies
-  └── 2.4 Approvals ─────── prerequisite for ──→ 2.3 Scheduling (approval gates)
+  ├── 2.4 Approvals ─────── prerequisite for ──→ 2.3 Scheduling (approval gates)
+  ├── 2.8 Error Codes ───── independent (can retrofit any time)
+  ├── 2.9 Concurrency ───── independent (can retrofit any time)
+  ├── 2.10 YAML UI ──────── requires 2.1 Definitions
+  ├── 2.11 Legacy Shim ──── requires 2.1 Definitions
+  └── 2.12 Result Envelope ─ prerequisite for ──→ 5.5 CEL, 7.14 Workflows
 
 Phase 3 (Security & RBAC)
   ├── 3.1 RBAC ──────────── prerequisite for ──→ 3.2 Management Groups
   ├── 3.2 Mgmt Groups ──── prerequisite for ──→ Phase 5 (Policy Assignment)
-  └── 3.5 REST API ──────── can start after Phase 1
+  ├── 3.5 REST API ──────── can start after Phase 1
+  └── 3.9 Scope DSL Ext ─── independent (extends 1.6 Scope Engine)
 
 Phase 4 (Agent Infrastructure)
   ├── 4.5 Triggers ──────── prerequisite for ──→ Phase 5 (Policy Engine)
   ├── 4.1 Storage ───────── prerequisite for ──→ 4.5 Triggers (state), 3.6 Quarantine (state)
-  └── 4.2 HTTP Client ───── prerequisite for ──→ 4.3 Content Staging
+  ├── 4.2 HTTP Client ───── prerequisite for ──→ 4.3 Content Staging
+  └── 4.8 set_start_mode ── independent (services plugin extension)
 
 Phase 5 (Policy Engine)
   ├── Requires: Phase 3 (Mgmt Groups), Phase 4 (Triggers, Storage)
-  └── 5.1 Rules ─────────── prerequisite for ──→ 5.2 Assignment, 5.3 Dashboard
+  ├── 5.1 Rules ─────────── prerequisite for ──→ 5.2 Assignment, 5.3 Dashboard, 5.5 CEL
+  └── 5.5 CEL ─────────────  requires 5.1 Rules + 2.12 Result Envelope
 
 Phase 6 (Windows Depth)
   ├── Can start any time after Phase 0
@@ -798,7 +943,11 @@ Phase 6 (Windows Depth)
 
 Phase 7 (Scale & Integration)
   ├── Most items can start after Phase 3
-  └── 7.9 Product Packs ── requires Phase 2.1 (Instruction Definitions)
+  ├── 7.1.1 Gateway Adjacency ── requires 7.1 Gateway
+  ├── 7.9 Product Packs ── requires Phase 2.1 (Instruction Definitions)
+  ├── 7.13 Pack Trust Chain ── requires 7.9 Product Packs
+  ├── 7.14 Workflows ────── requires 2.5 Hierarchies + 2.12 Result Envelope
+  └── 7.18 Device Discovery ── complements 7.7 Agent Deployment Jobs
 ```
 
 ---

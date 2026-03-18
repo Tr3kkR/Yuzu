@@ -127,13 +127,13 @@ Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by v
 agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
 agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
 server/core/              Server daemon (sessions, auth, dashboard, REST API, policy engine)
-server/gateway/           gRPC gateway / TLS termination (proto defined, not yet implemented)
+gateway/                  Erlang/OTP gateway node (standalone rebar3 project, see docs/erlang-gateway-blueprint.md)
 sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
 proto/                    Protobuf definitions (source of truth for wire protocol)
   yuzu/agent/v1/          AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
   yuzu/common/v1/         Shared types: Platform, Timestamp, ErrorDetail
   yuzu/server/v1/         ManagementService API
-  yuzu/gateway/v1/        GatewayUpstream: ProxyRegister, BatchHeartbeat
+  yuzu/gateway/v1/        GatewayUpstream — server-side RPCs the Erlang gateway calls into
   gen_proto.py            Codegen script (invoked by meson.build)
 docs/                     Architecture docs, roadmap, capability map
 meson/cross/              Cross-compilation files (aarch64, armv7)

@@ -371,6 +371,7 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     s.username = username;
     s.role = it->second.role;
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source = "local";
     sessions_[token] = std::move(s);
 
     spdlog::info("User '{}' authenticated (role={})", username, role_to_string(it->second.role));
@@ -431,6 +432,37 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
 bool AuthManager::remove_user(const std::string& username) {
     std::lock_guard lock(mu_);
     return users_.erase(username) > 0;
+}
+
+// ── OIDC session creation ───────────────────────────────────────────────────
+
+std::string AuthManager::create_oidc_session(const std::string& display_name,
+                                              const std::string& email,
+                                              const std::string& oidc_sub) {
+    std::lock_guard lock(mu_);
+
+    // Determine role: admin if email or display_name matches a local admin account
+    Role role = Role::user;
+    for (const auto& [name, entry] : users_) {
+        if (entry.role == Role::admin && (name == email || name == display_name)) {
+            role = Role::admin;
+            break;
+        }
+    }
+
+    auto token = generate_session_token();
+    Session s;
+    s.username    = display_name.empty() ? email : display_name;
+    s.role        = role;
+    s.expires_at  = std::chrono::steady_clock::now() + kSessionDuration;
+    s.auth_source = "oidc";
+    s.oidc_sub    = oidc_sub;
+    sessions_[token] = std::move(s);
+
+    spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",
+                 display_name.empty() ? email : display_name, email, oidc_sub,
+                 role_to_string(role));
+    return token;
 }
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────

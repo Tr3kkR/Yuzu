@@ -352,6 +352,119 @@ consistent hashing on `agent_id`. This determines which gateway node an agent
 %% NOT used for command routing — pg handles that transparently.
 ```
 
+### Gateway Adjacency and Latency-Based Agent Redistribution
+
+Each gateway node must maintain an awareness of its **peers** (adjacent gateway
+nodes in the cluster) and be able to dynamically redistribute agents across the
+cluster based on measured latency and load. The consistent hash ring determines
+an agent's *preferred* node, but the actual placement must adapt at runtime.
+
+#### Adjacency Table
+
+Every gateway node maintains a live adjacency table of all peer nodes:
+
+| Field | Source | Update frequency |
+|-------|--------|-----------------|
+| Node name | Erlang distribution (`net_kernel`) | On connect/disconnect |
+| Agent count | Periodic exchange (or pg group size) | Every 10s |
+| CPU / scheduler utilisation | `scheduler:utilization/1` shared via `gen_server:call` or gossip | Every 10s |
+| Memory pressure | `erlang:memory/0` | Every 10s |
+| RTT to this node | `net_adm:ping` latency or distribution heartbeat | Every 30s |
+| Agent→node latency histogram | Aggregated from heartbeat RTTs per agent | Rolling 5 min window |
+| Drain state | Explicit flag (set via admin API or SIGTERM handler) | Event-driven |
+
+The adjacency table is held in an ETS table owned by a new `yuzu_gw_cluster`
+gen_server, which publishes changes as telemetry events.
+
+#### Load Shedding (Outbound)
+
+A gateway node sheds agents when it is overloaded or draining. Shedding is
+cooperative — the node sends a gRPC `GOAWAY` frame to selected agents, which
+triggers agent reconnection. The reconnecting agent is steered to a less-loaded
+peer via one of:
+
+1. **DNS steering** — the gateway updates a DNS record (or health-check weight)
+   so the agent's next resolution returns a different node.
+2. **Redirect hint** — a new field in the `RegisterResponse` or a custom gRPC
+   trailing metadata entry tells the agent which address to connect to next.
+
+Shedding triggers:
+
+| Trigger | Threshold (configurable) | Action |
+|---------|-------------------------|--------|
+| Scheduler utilisation | > 85% sustained 60s | Shed 10% of agents to least-loaded peer |
+| Memory | > 80% of configured ceiling | Shed agents with largest pending maps first |
+| Admin drain | Explicit API call or SIGTERM | Shed all agents over a configurable ramp-down window (default 5 min) |
+| Node joining | New node enters cluster with 0 agents | Existing nodes shed proportionally to rebalance |
+
+Shedding must be **rate-limited** (e.g., max 1000 GOAWAYs/sec) to prevent a
+reconnection storm that overwhelms the receiving nodes.
+
+#### Agent Absorption (Inbound)
+
+When a gateway node has capacity and peers are shedding, it absorbs agents by
+accepting their reconnections. Absorption is passive — the node simply accepts
+`Register` + `Subscribe` calls as normal — but the node advertises its
+willingness to absorb by broadcasting its load state via the adjacency table.
+
+A node may also **proactively pull** agents by requesting a peer to shed specific
+agents toward it. This is useful when a new node joins and wants to ramp up
+quickly rather than waiting for organic reconnections.
+
+#### Latency-Based Redistribution
+
+Static hash-based placement ignores network topology. An agent in a Sydney
+branch office routed by hash to a Frankfurt gateway incurs unnecessary latency.
+Latency-aware redistribution addresses this:
+
+1. **Measurement:** Each gateway node measures RTT to its connected agents via
+   heartbeat round-trip times (already available — heartbeat response latency).
+   These are bucketed per agent into a rolling P50/P99 window.
+
+2. **Peer latency:** Gateways exchange inter-node RTT measurements via the
+   adjacency table, so each node knows latency to every other node.
+
+3. **Affinity score:** For each agent, the system computes an affinity score
+   combining:
+   - Agent→current node RTT (measured)
+   - Agent→alternative node RTT (estimated: agent→current + current→peer,
+     refined by actual measurement after migration)
+   - Current node load (from adjacency table)
+   - Peer node load (from adjacency table)
+
+4. **Migration decision:** If an agent's estimated RTT to a peer is
+   significantly lower (configurable threshold, e.g., > 30% improvement) *and*
+   the peer has capacity, the current node sheds that agent toward the peer.
+   The agent reconnects and the peer measures actual RTT to confirm improvement.
+
+5. **Stability:** To prevent oscillation, an agent that was recently migrated
+   (configurable cooldown, e.g., 10 min) is exempt from further redistribution.
+   Decisions use hysteresis — migrate only when the improvement exceeds a
+   threshold, not on marginal differences.
+
+#### Telemetry Events
+
+```erlang
+%% ── Adjacency / redistribution ──
+[yuzu, gw, cluster, adjacency_update]   % meta: #{peer, agent_count, cpu, memory, rtt_ms}
+[yuzu, gw, cluster, shed_started]       % #{count, reason} meta: #{target_peer}
+[yuzu, gw, cluster, shed_completed]     % #{count, duration_ms}
+[yuzu, gw, cluster, absorbed]           % #{count} meta: #{from_peer}
+[yuzu, gw, cluster, latency_migration]  % #{agent_id, old_rtt_ms, estimated_new_rtt_ms, target_peer}
+```
+
+#### Prometheus Metrics
+
+```
+yuzu_gw_cluster_peer_rtt_ms{peer="gw2@10.0.1.2"}              12
+yuzu_gw_cluster_peer_agent_count{peer="gw2@10.0.1.2"}         342819
+yuzu_gw_cluster_shed_total{reason="overload"}                  1500
+yuzu_gw_cluster_absorbed_total{from_peer="gw3@10.0.1.3"}      1200
+yuzu_gw_agent_rtt_ms{quantile="0.99"}                          45
+yuzu_gw_redistribution_decisions_total{action="migrate"}       320
+yuzu_gw_redistribution_decisions_total{action="keep"}          980000
+```
+
 ---
 
 ## Wire Protocol Integration
