@@ -273,7 +273,7 @@ gateway_restart_resilience(_Config) ->
     %% Register a test agent.
     AgentId = <<"resilience-agent">>,
     Pid1 = spawn_link(fun agent_loop/0),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid1, <<"sess1">>, [<<"p1">>]),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid1, <<"sess1">>, [<<"p1">>], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(AgentId)),
     ct:pal("Agent registered pre-restart"),
 
@@ -293,7 +293,7 @@ gateway_restart_resilience(_Config) ->
 
     %% Re-register agent.
     Pid2 = spawn_link(fun agent_loop/0),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid2, <<"sess2">>, [<<"p1">>]),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid2, <<"sess2">>, [<<"p1">>], <<>>),
     ?assertMatch({ok, Pid2}, yuzu_gw_registry:lookup(AgentId)),
 
     %% Verify upstream proxy still works.

@@ -207,7 +207,7 @@ registration_latency_distribution(_Config) ->
     %% Time each registration individually.
     Timings = [begin
         T0 = erlang:monotonic_time(microsecond),
-        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>]),
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>], <<>>),
         T1 = erlang:monotonic_time(microsecond),
         T1 - T0
     end || {Pid, Id} <- Agents],
@@ -426,7 +426,7 @@ reconnection_storm(_Config) ->
         {CycleMs, NewPids} = yuzu_gw_perf_helpers:measure_wall_clock(fun() ->
             lists:map(fun(Id) ->
                 Pid = spawn(fun agent_loop/0),
-                ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>]),
+                ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>], <<>>),
                 Pid
             end, Ids)
         end),
@@ -560,7 +560,7 @@ register_silent_agents(N, Prefix) ->
     lists:unzip([begin
         Id = iolist_to_binary(io_lib:format("~s-~6..0B", [Prefix, I])),
         Pid = spawn_link(fun silent_loop/0),
-        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [<<"system">>]),
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [<<"system">>], <<>>),
         {Pid, Id}
     end || I <- lists:seq(1, N)]).
 
@@ -609,7 +609,7 @@ do_sustained_load(N, DurationSecs) ->
     %% Register initial agents.
     InitPids = lists:map(fun(Id) ->
         Pid = spawn(fun agent_loop/0),
-        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>]),
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess">>, [<<"p1">>], <<>>),
         Pid
     end, Ids),
 
@@ -675,7 +675,7 @@ churn_agents(Ids, Pct) ->
     %% Re-register with new PIDs.
     lists:foreach(fun(Id) ->
         Pid = spawn(fun agent_loop/0),
-        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess-new">>, [<<"p1">>])
+        ok = yuzu_gw_registry:register_agent(Id, Pid, <<"sess-new">>, [<<"p1">>], <<>>)
     end, ChurnIds).
 
 analyze_endurance(Samples, ExpectedN) when length(Samples) >= 2 ->

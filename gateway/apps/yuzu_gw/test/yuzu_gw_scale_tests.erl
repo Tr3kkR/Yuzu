@@ -171,7 +171,7 @@ concurrent_registration() ->
     Workers = [spawn_link(fun() ->
         Id = iolist_to_binary(io_lib:format("conc-~b", [I])),
         Dummy = spawn(fun() -> receive stop -> ok end end),
-        ok = yuzu_gw_registry:register_agent(Id, Dummy, <<"s">>, []),
+        ok = yuzu_gw_registry:register_agent(Id, Dummy, <<"s">>, [], <<>>),
         Self ! {registered, I, Dummy}
     end) || I <- lists:seq(1, N)],
 
@@ -201,13 +201,13 @@ reconnection_churn() ->
     %% First wave.
     Pids1 = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s1">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s1">>, [], <<>>)
     end, lists:zip(Ids, Pids1)),
 
     %% Second wave — same IDs, different processes.
     Pids2 = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s2">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s2">>, [], <<>>)
     end, lists:zip(Ids, Pids2)),
 
     %% All lookups should return the second-wave pids.
@@ -327,7 +327,7 @@ spawn_and_register_prefixed(N, Prefix) ->
     Ids = [iolist_to_binary([Prefix, integer_to_binary(I)]) || I <- lists:seq(1, N)],
     Pids = [spawn(fun() -> receive stop -> ok end end) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
     end, lists:zip(Ids, Pids)),
     {Pids, Ids}.
 
@@ -335,7 +335,7 @@ register_silent_agents(N) ->
     Ids = [iolist_to_binary(io_lib:format("silent-~b", [I])) || I <- lists:seq(1, N)],
     Pids = [spawn(fun silent_loop/0) || _ <- lists:seq(1, N)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [<<"svc">>])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [<<"svc">>], <<>>)
     end, lists:zip(Ids, Pids)),
     {Pids, Ids}.
 

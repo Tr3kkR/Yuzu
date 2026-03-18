@@ -71,7 +71,7 @@ end_per_testcase(_TC, Config) ->
 %%% Tests
 %%%===================================================================
 
-heartbeat_tags_flow_through_batch(Config) ->
+heartbeat_tags_flow_through_batch(_Config) ->
     %% Queue a heartbeat with full status_tags.
     HB = make_heartbeat(<<"agent-1">>, <<"sess-1">>, #{
         <<"yuzu.os">> => <<"linux">>,

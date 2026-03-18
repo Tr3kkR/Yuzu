@@ -583,7 +583,7 @@ registry_concurrent_registration(_Config) ->
     Workers = [spawn_link(fun() ->
         Id = iolist_to_binary(io_lib:format("conc-reg-~b", [I])),
         Dummy = spawn(fun() -> receive stop -> ok end end),
-        ok = yuzu_gw_registry:register_agent(Id, Dummy, <<"s">>, []),
+        ok = yuzu_gw_registry:register_agent(Id, Dummy, <<"s">>, [], <<>>),
         Self ! {registered, I, Dummy}
     end) || I <- lists:seq(1, N)],
 
@@ -608,12 +608,12 @@ registry_reconnection_handling(_Config) ->
 
     %% First registration.
     Pid1 = spawn(fun() -> receive stop -> ok end end),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid1, <<"s1">>, []),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid1, <<"s1">>, [], <<>>),
     ?assertMatch({ok, Pid1}, yuzu_gw_registry:lookup(AgentId)),
 
     %% Re-register with new process.
     Pid2 = spawn(fun() -> receive stop -> ok end end),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid2, <<"s2">>, []),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid2, <<"s2">>, [], <<>>),
     ?assertMatch({ok, Pid2}, yuzu_gw_registry:lookup(AgentId)),
 
     %% Cleanup.
@@ -708,7 +708,7 @@ upstream_disconnect_recovery(_Config) ->
 start_responding_agent(AgentId) ->
     TestPid = self(),
     Pid = spawn(fun() -> responding_agent_loop(TestPid) end),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid, <<"s">>, [<<"svc">>]),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid, <<"s">>, [<<"svc">>], <<>>),
     {Pid, AgentId}.
 
 responding_agent_loop(TestPid) ->

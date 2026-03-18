@@ -62,7 +62,7 @@ cleanup(_Pid) ->
 
 register_and_lookup() ->
     Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"agent-1">>, Pid, <<"sess-1">>, [<<"svc">>]),
+    ok = yuzu_gw_registry:register_agent(<<"agent-1">>, Pid, <<"sess-1">>, [<<"svc">>], <<>>),
     ?assertMatch({ok, Pid}, yuzu_gw_registry:lookup(<<"agent-1">>)),
     kill_dummy(Pid).
 
@@ -71,7 +71,7 @@ lookup_missing() ->
 
 deregister_removes() ->
     Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"agent-2">>, Pid, <<"s">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"agent-2">>, Pid, <<"s">>, [], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-2">>)),
     yuzu_gw_registry:deregister_agent(<<"agent-2">>),
     timer:sleep(20),  %% cast is async
@@ -80,7 +80,7 @@ deregister_removes() ->
 
 monitor_cleanup() ->
     Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"agent-3">>, Pid, <<"s">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"agent-3">>, Pid, <<"s">>, [], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(<<"agent-3">>)),
     %% Kill the process — registry should auto-clean via DOWN monitor.
     kill_dummy(Pid),
@@ -90,8 +90,8 @@ monitor_cleanup() ->
 reregister_replaces() ->
     Pid1 = spawn_dummy(),
     Pid2 = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"agent-4">>, Pid1, <<"s1">>, []),
-    ok = yuzu_gw_registry:register_agent(<<"agent-4">>, Pid2, <<"s2">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"agent-4">>, Pid1, <<"s1">>, [], <<>>),
+    ok = yuzu_gw_registry:register_agent(<<"agent-4">>, Pid2, <<"s2">>, [], <<>>),
     ?assertMatch({ok, Pid2}, yuzu_gw_registry:lookup(<<"agent-4">>)),
     kill_dummy(Pid1),
     kill_dummy(Pid2).
@@ -100,7 +100,7 @@ all_agents_list() ->
     Pids = [spawn_dummy() || _ <- lists:seq(1, 5)],
     Ids = [iolist_to_binary(io_lib:format("all-~b", [I])) || I <- lists:seq(1, 5)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
     end, lists:zip(Ids, Pids)),
     All = yuzu_gw_registry:all_agents(),
     lists:foreach(fun(Id) ->
@@ -113,7 +113,7 @@ agent_count_accurate() ->
     Pids = [spawn_dummy() || _ <- lists:seq(1, 10)],
     Ids = [iolist_to_binary(io_lib:format("count-~b", [I])) || I <- lists:seq(1, 10)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
     end, lists:zip(Ids, Pids)),
     ?assertEqual(InitialCount + 10, yuzu_gw_registry:agent_count()),
     %% Cleanup
@@ -123,7 +123,7 @@ agent_count_accurate() ->
 
 pg_plugin_groups() ->
     Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"pg-agent">>, Pid, <<"s">>, [<<"svc">>, <<"fs">>]),
+    ok = yuzu_gw_registry:register_agent(<<"pg-agent">>, Pid, <<"s">>, [<<"svc">>, <<"fs">>], <<>>),
     %% Agent should be in the plugin groups.
     SvcMembers = pg:get_members(yuzu_gw, {plugin, <<"svc">>}),
     FsMembers = pg:get_members(yuzu_gw, {plugin, <<"fs">>}),
@@ -135,7 +135,7 @@ pagination_basic() ->
     Pids = [spawn_dummy() || _ <- lists:seq(1, 5)],
     Ids = [iolist_to_binary(io_lib:format("page-~2..0b", [I])) || I <- lists:seq(1, 5)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
     end, lists:zip(Ids, Pids)),
     %% Page size 3 should give 3 agents + a cursor.
     {Page1, Cursor1} = yuzu_gw_registry:list_agents(3, undefined),
@@ -152,7 +152,7 @@ pagination_cursor() ->
     Pids = [spawn_dummy() || _ <- lists:seq(1, 20)],
     Ids = [iolist_to_binary(io_lib:format("cur-~3..0b", [I])) || I <- lists:seq(1, 20)],
     lists:foreach(fun({Id, Pid}) ->
-        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [])
+        yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [], <<>>)
     end, lists:zip(Ids, Pids)),
     %% Walk all pages and collect agent IDs — every ID should appear exactly once.
     AllFound = collect_all_pages(7, undefined, []),
@@ -170,7 +170,7 @@ deregister_nonexistent() ->
 
 lookup_dead_process() ->
     Pid = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"dead-lookup">>, Pid, <<"s">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"dead-lookup">>, Pid, <<"s">>, [], <<>>),
     MonRef = monitor(process, Pid),
     kill_dummy(Pid),
     receive {'DOWN', MonRef, process, Pid, _} -> ok after 1000 -> error(timeout) end,
@@ -240,8 +240,8 @@ reregister_no_monitor_leak() ->
     %% The old monitor ref should be removed from the map.
     Pid1 = spawn_dummy(),
     Pid2 = spawn_dummy(),
-    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid1, <<"s1">>, []),
-    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid2, <<"s2">>, []),
+    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid1, <<"s1">>, [], <<>>),
+    ok = yuzu_gw_registry:register_agent(<<"leak-test">>, Pid2, <<"s2">>, [], <<>>),
 
     %% Inspect the gen_server state via sys:get_state.
     {state, MonRefs, _SweepTimer} = sys:get_state(yuzu_gw_registry),

@@ -93,7 +93,7 @@ spawn_and_register(N, Opts) ->
         Id = iolist_to_binary(io_lib:format("~s-~6..0B", [Prefix, I])),
         Pid = spawn(fun agent_loop/0),
         SessionId = <<"sess-", Id/binary>>,
-        ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, Plugins),
+        ok = yuzu_gw_registry:register_agent(Id, Pid, SessionId, Plugins, <<>>),
         {Pid, Id}
     end || I <- lists:seq(1, N)]).
 

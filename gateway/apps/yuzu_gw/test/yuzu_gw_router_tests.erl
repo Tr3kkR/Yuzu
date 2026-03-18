@@ -158,7 +158,7 @@ fanout_all_respond() ->
 register_fake_agent(AgentId) ->
     TestPid = self(),
     Pid = spawn_link(fun() -> fake_agent_loop(TestPid) end),
-    ok = yuzu_gw_registry:register_agent(AgentId, Pid, <<"s">>, [<<"svc">>]),
+    ok = yuzu_gw_registry:register_agent(AgentId, Pid, <<"s">>, [<<"svc">>], <<>>),
     {Pid, AgentId}.
 
 fake_agent_loop(TestPid) ->
