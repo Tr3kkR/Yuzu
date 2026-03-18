@@ -3,8 +3,8 @@
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kDashboardIndexHtml =
-// Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
-R"HTM(<!DOCTYPE html>
+    // Part 1: CSS + HTML markup (split to stay under MSVC's 16380-byte string limit)
+    R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -352,8 +352,8 @@ R"HTM(<!DOCTYPE html>
   </div>
 
 )HTM"
-// Part 2: HTML body continued
-R"HTM(
+    // Part 2: HTML body continued
+    R"HTM(
   <!-- ── History Panel ──────────────────────────────────────── -->
   <div class="history">
     <div class="history-header">
@@ -398,8 +398,8 @@ R"HTM(
 
   <footer>Yuzu Server &mdash; Dashboard</footer>
 )HTM"
-// Part 2: JavaScript
-R"HTM(
+    // Part 2: JavaScript
+    R"HTM(
   <script>
     /* ── State ─────────────────────────────────────────────── */
     var selectedScope = '__all__';
@@ -470,8 +470,8 @@ R"HTM(
       'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
     };
 )HTM"
-// Part 3: Helpers and table management
-R"HTM(
+    // Part 3: Helpers and table management
+    R"HTM(
     /* ── Helpers ──────────────────────────────────────────── */
     function escapeHtml(s) {
       var d = document.createElement('div');
@@ -833,8 +833,8 @@ R"HTM(
       }
     });
 )HTM"
-// Part 4: SSE + menu JavaScript
-R"HTM(
+    // Part 4: SSE + menu JavaScript
+    R"HTM(
     /* ── SSE ──────────────────────────────────────────────── */
     function connectSSE() {
       if (evtSource) evtSource.close();

@@ -66,7 +66,8 @@ TEST_CASE("sanitize_utf8: valid 2-byte UTF-8 (e.g. e with accent)", "[string_uti
 
 TEST_CASE("sanitize_utf8: valid 3-byte UTF-8 (e.g. euro sign)", "[string_utils][utf8]") {
     // U+20AC (euro sign) = 0xE2 0x82 0xAC
-    std::string valid_3byte = "price: \xE2\x82\xAC" "10";
+    std::string valid_3byte = "price: \xE2\x82\xAC"
+                              "10";
     REQUIRE(sanitize_utf8(valid_3byte) == valid_3byte);
 }
 
@@ -96,7 +97,8 @@ TEST_CASE("sanitize_utf8: truncated 3-byte sequence replaced", "[string_utils][u
 
 TEST_CASE("sanitize_utf8: Latin-1 byte replaced", "[string_utils][utf8]") {
     // 0xFC is not a valid UTF-8 start byte
-    std::string latin1 = "test\xFC" "data";
+    std::string latin1 = "test\xFC"
+                         "data";
     REQUIRE(sanitize_utf8(latin1) == "test?data");
 }
 
@@ -295,8 +297,8 @@ TEST_CASE("chargen_line: all chars are printable ASCII", "[string_utils][chargen
 TEST_CASE("chargen_line: offset 1 starts one position later", "[string_utils][chargen]") {
     auto line0 = chargen_line(0);
     auto line1 = chargen_line(1);
-    REQUIRE(line0[0] == ' ');      // ASCII 32
-    REQUIRE(line1[0] == '!');      // ASCII 33
+    REQUIRE(line0[0] == ' '); // ASCII 32
+    REQUIRE(line1[0] == '!'); // ASCII 33
 }
 
 TEST_CASE("chargen_line: wraps around the character set", "[string_utils][chargen]") {
@@ -313,7 +315,8 @@ TEST_CASE("chargen_line: offset 95 wraps back to offset 0", "[string_utils][char
     REQUIRE(line0 == line95);
 }
 
-TEST_CASE("chargen_line: successive lines differ by one character shift", "[string_utils][chargen]") {
+TEST_CASE("chargen_line: successive lines differ by one character shift",
+          "[string_utils][chargen]") {
     auto line0 = chargen_line(0);
     auto line1 = chargen_line(1);
     // line1 should be line0 shifted left by 1, with a new char appended

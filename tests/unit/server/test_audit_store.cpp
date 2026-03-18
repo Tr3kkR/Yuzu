@@ -60,13 +60,17 @@ TEST_CASE("AuditStore: filter by action", "[audit_store]") {
     AuditStore store(":memory:");
 
     AuditEvent e1;
-    e1.principal = "admin"; e1.principal_role = "admin";
-    e1.action = "auth.login"; e1.result = "success";
+    e1.principal = "admin";
+    e1.principal_role = "admin";
+    e1.action = "auth.login";
+    e1.result = "success";
     store.log(e1);
 
     AuditEvent e2;
-    e2.principal = "admin"; e2.principal_role = "admin";
-    e2.action = "command.dispatch"; e2.result = "success";
+    e2.principal = "admin";
+    e2.principal_role = "admin";
+    e2.action = "command.dispatch";
+    e2.result = "success";
     store.log(e2);
 
     AuditQuery q;
@@ -80,15 +84,21 @@ TEST_CASE("AuditStore: filter by target", "[audit_store]") {
     AuditStore store(":memory:");
 
     AuditEvent e1;
-    e1.principal = "admin"; e1.principal_role = "admin";
-    e1.action = "agent.approve"; e1.result = "success";
-    e1.target_type = "agent"; e1.target_id = "agent-001";
+    e1.principal = "admin";
+    e1.principal_role = "admin";
+    e1.action = "agent.approve";
+    e1.result = "success";
+    e1.target_type = "agent";
+    e1.target_id = "agent-001";
     store.log(e1);
 
     AuditEvent e2;
-    e2.principal = "admin"; e2.principal_role = "admin";
-    e2.action = "agent.approve"; e2.result = "success";
-    e2.target_type = "agent"; e2.target_id = "agent-002";
+    e2.principal = "admin";
+    e2.principal_role = "admin";
+    e2.action = "agent.approve";
+    e2.result = "success";
+    e2.target_type = "agent";
+    e2.target_id = "agent-002";
     store.log(e2);
 
     AuditQuery q;
@@ -104,8 +114,10 @@ TEST_CASE("AuditStore: timestamp ordering", "[audit_store]") {
     for (int64_t ts : {100, 300, 200}) {
         AuditEvent event;
         event.timestamp = ts;
-        event.principal = "admin"; event.principal_role = "admin";
-        event.action = "test"; event.result = "success";
+        event.principal = "admin";
+        event.principal_role = "admin";
+        event.action = "test";
+        event.result = "success";
         store.log(event);
     }
 
@@ -119,8 +131,10 @@ TEST_CASE("AuditStore: limit and offset", "[audit_store]") {
 
     for (int i = 0; i < 10; ++i) {
         AuditEvent event;
-        event.principal = "admin"; event.principal_role = "admin";
-        event.action = "test"; event.result = "success";
+        event.principal = "admin";
+        event.principal_role = "admin";
+        event.action = "test";
+        event.result = "success";
         event.detail = "item-" + std::to_string(i);
         store.log(event);
     }
@@ -140,8 +154,10 @@ TEST_CASE("AuditStore: total_count", "[audit_store]") {
     REQUIRE(store.total_count() == 0);
 
     AuditEvent event;
-    event.principal = "admin"; event.principal_role = "admin";
-    event.action = "test"; event.result = "success";
+    event.principal = "admin";
+    event.principal_role = "admin";
+    event.action = "test";
+    event.result = "success";
     store.log(event);
 
     REQUIRE(store.total_count() == 1);
@@ -178,8 +194,10 @@ TEST_CASE("AuditStore: time range filter", "[audit_store]") {
     for (int64_t ts : {100, 200, 300, 400, 500}) {
         AuditEvent event;
         event.timestamp = ts;
-        event.principal = "admin"; event.principal_role = "admin";
-        event.action = "test"; event.result = "success";
+        event.principal = "admin";
+        event.principal_role = "admin";
+        event.action = "test";
+        event.result = "success";
         store.log(event);
     }
 

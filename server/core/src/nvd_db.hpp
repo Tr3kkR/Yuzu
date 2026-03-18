@@ -1,25 +1,25 @@
 #pragma once
 
+#include <sqlite3.h>
+
 #include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct CveRecord {
     std::string cve_id;
-    std::string product;        // normalized lowercase product name
+    std::string product; // normalized lowercase product name
     std::string vendor;
     std::string affected_below; // versions below this are vulnerable
     std::string fixed_in;
-    std::string severity;       // CRITICAL, HIGH, MEDIUM, LOW
+    std::string severity; // CRITICAL, HIGH, MEDIUM, LOW
     std::string description;
-    std::string published;      // ISO 8601
-    std::string last_modified;  // ISO 8601
-    std::string source;         // "nvd" or "builtin"
+    std::string published;     // ISO 8601
+    std::string last_modified; // ISO 8601
+    std::string source;        // "nvd" or "builtin"
 };
 
 struct SoftwareItem {
@@ -34,7 +34,7 @@ struct CveMatch {
     std::string product;
     std::string installed_version;
     std::string fixed_in;
-    std::string source;         // "nvd" or "builtin"
+    std::string source; // "nvd" or "builtin"
 };
 
 class NvdDatabase {
@@ -68,4 +68,4 @@ private:
 /// Returns <0 if a < b, 0 if equal, >0 if a > b.
 int compare_versions(std::string_view a, std::string_view b);
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

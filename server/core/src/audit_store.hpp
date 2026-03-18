@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sqlite3.h>
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,13 +10,11 @@
 #include <thread>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct AuditEvent {
-    int64_t     id{0};
-    int64_t     timestamp{0};     // epoch seconds
+    int64_t id{0};
+    int64_t timestamp{0}; // epoch seconds
     std::string principal;
     std::string principal_role;
     std::string action;
@@ -24,7 +24,7 @@ struct AuditEvent {
     std::string source_ip;
     std::string user_agent;
     std::string session_id;
-    std::string result;           // "success", "failure", "denied"
+    std::string result; // "success", "failure", "denied"
 };
 
 struct AuditQuery {
@@ -32,16 +32,15 @@ struct AuditQuery {
     std::string action;
     std::string target_type;
     std::string target_id;
-    int64_t     since{0};
-    int64_t     until{0};
-    int         limit{100};
-    int         offset{0};
+    int64_t since{0};
+    int64_t until{0};
+    int limit{100};
+    int offset{0};
 };
 
 class AuditStore {
 public:
-    explicit AuditStore(const std::filesystem::path& db_path,
-                        int retention_days = 365,
+    explicit AuditStore(const std::filesystem::path& db_path, int retention_days = 365,
                         int cleanup_interval_min = 60);
     ~AuditStore();
 
@@ -76,4 +75,4 @@ private:
 #endif
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

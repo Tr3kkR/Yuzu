@@ -153,7 +153,7 @@ TEST_CASE("Severity: serialization round-trip", "[analytics_event][severity]") {
     CHECK(severity_from_string("warn") == Severity::kWarn);
     CHECK(severity_from_string("error") == Severity::kError);
     CHECK(severity_from_string("critical") == Severity::kCritical);
-    CHECK(severity_from_string("unknown") == Severity::kInfo);  // default
+    CHECK(severity_from_string("unknown") == Severity::kInfo); // default
 }
 
 // ── Store Lifecycle ────────────────────────────────────────────────────────
@@ -268,7 +268,8 @@ TEST_CASE("AnalyticsEventStore: sink failure keeps events pending", "[analytics_
     CHECK(store.pending_count() == 1);
 }
 
-TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads", "[analytics_store][threads]") {
+TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads",
+          "[analytics_store][threads]") {
     AnalyticsEventStore store(":memory:");
 
     constexpr int kThreads = 4;
@@ -285,7 +286,8 @@ TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads", "[analyt
             }
         });
     }
-    for (auto& th : threads) th.join();
+    for (auto& th : threads)
+        th.join();
 
     CHECK(store.total_emitted() == kThreads * kPerThread);
 }

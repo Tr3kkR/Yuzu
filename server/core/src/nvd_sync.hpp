@@ -1,5 +1,8 @@
 #pragma once
 
+#include "nvd_client.hpp"
+#include "nvd_db.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -8,24 +11,19 @@
 #include <string>
 #include <thread>
 
-#include "nvd_client.hpp"
-#include "nvd_db.hpp"
-
 namespace yuzu::server {
 
 class NvdSyncManager {
 public:
-    NvdSyncManager(std::shared_ptr<NvdDatabase> db,
-                   std::string api_key,
-                   std::string proxy_url,
+    NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key, std::string proxy_url,
                    std::chrono::seconds sync_interval);
     ~NvdSyncManager();
 
     NvdSyncManager(const NvdSyncManager&) = delete;
     NvdSyncManager& operator=(const NvdSyncManager&) = delete;
 
-    void start();  // Start background sync thread
-    void stop();   // Signal stop and join thread
+    void start(); // Start background sync thread
+    void stop();  // Signal stop and join thread
 
     // Manual sync (blocks until complete)
     void sync_now();
@@ -33,7 +31,7 @@ public:
     // Status info for UI
     struct SyncStatus {
         bool syncing = false;
-        std::string last_sync_time;  // ISO 8601 or empty
+        std::string last_sync_time; // ISO 8601 or empty
         std::size_t total_cves = 0;
         std::string last_error;
     };
@@ -64,4 +62,4 @@ private:
     void do_incremental_sync();
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

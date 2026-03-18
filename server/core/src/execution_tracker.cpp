@@ -7,7 +7,8 @@ namespace yuzu::server {
 ExecutionTracker::ExecutionTracker(sqlite3* db) : db_(db) {}
 
 void ExecutionTracker::create_tables() {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* ddl = R"(
         CREATE TABLE IF NOT EXISTS executions (
@@ -55,7 +56,8 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
     return s;
 }
 
-std::vector<AgentExecStatus> ExecutionTracker::get_agent_statuses(const std::string& /*execution_id*/) const {
+std::vector<AgentExecStatus>
+ExecutionTracker::get_agent_statuses(const std::string& /*execution_id*/) const {
     return {};
 }
 
@@ -63,11 +65,9 @@ std::vector<Execution> ExecutionTracker::get_children(const std::string& /*paren
     return {};
 }
 
-std::expected<std::string, std::string> ExecutionTracker::create_rerun(
-    const std::string& /*original_id*/,
-    const std::string& /*user*/,
-    bool /*failed_only*/)
-{
+std::expected<std::string, std::string>
+ExecutionTracker::create_rerun(const std::string& /*original_id*/, const std::string& /*user*/,
+                               bool /*failed_only*/) {
     return std::unexpected("execution tracker not yet implemented");
 }
 
@@ -75,4 +75,4 @@ void ExecutionTracker::mark_cancelled(const std::string& /*id*/, const std::stri
     // stub
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

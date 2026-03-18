@@ -34,14 +34,12 @@ public:
         snapshots_.erase(agent_id);
     }
 
-    void recompute_metrics(yuzu::MetricsRegistry& metrics,
-                           std::chrono::seconds staleness) {
+    void recompute_metrics(yuzu::MetricsRegistry& metrics, std::chrono::seconds staleness) {
         std::lock_guard lock(mu_);
         auto now = std::chrono::steady_clock::now();
 
-        std::erase_if(snapshots_, [&](const auto& pair) {
-            return (now - pair.second.last_seen) > staleness;
-        });
+        std::erase_if(snapshots_,
+                      [&](const auto& pair) { return (now - pair.second.last_seen) > staleness; });
 
         metrics.clear_gauge_family("yuzu_fleet_agents_by_os");
         metrics.clear_gauge_family("yuzu_fleet_agents_by_arch");
@@ -60,26 +58,29 @@ public:
             };
 
             auto os_val = get("yuzu.os");
-            if (!os_val.empty()) os_counts[os_val]++;
+            if (!os_val.empty())
+                os_counts[os_val]++;
 
             auto arch_val = get("yuzu.arch");
-            if (!arch_val.empty()) arch_counts[arch_val]++;
+            if (!arch_val.empty())
+                arch_counts[arch_val]++;
 
             auto ver_val = get("yuzu.agent_version");
-            if (!ver_val.empty()) version_counts[ver_val]++;
+            if (!ver_val.empty())
+                version_counts[ver_val]++;
 
             auto cmd_val = get("yuzu.commands_executed");
             if (!cmd_val.empty()) {
-                try { total_commands += std::stod(cmd_val); } catch (...) {}
+                try {
+                    total_commands += std::stod(cmd_val);
+                } catch (...) {}
             }
         }
 
-        metrics.gauge("yuzu_fleet_agents_healthy").set(
-            static_cast<double>(healthy_count));
+        metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
 
         for (const auto& [os, count] : os_counts)
-            metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}})
-                .set(static_cast<double>(count));
+            metrics.gauge("yuzu_fleet_agents_by_os", {{"os", os}}).set(static_cast<double>(count));
 
         for (const auto& [arch, count] : arch_counts)
             metrics.gauge("yuzu_fleet_agents_by_arch", {{"arch", arch}})

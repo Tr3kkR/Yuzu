@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sqlite3.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,16 +9,14 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct DeviceTag {
     std::string agent_id;
     std::string key;
     std::string value;
-    std::string source;       // "agent", "server", "api"
-    int64_t     updated_at{0}; // epoch seconds
+    std::string source;    // "agent", "server", "api"
+    int64_t updated_at{0}; // epoch seconds
 };
 
 class TagStore {
@@ -29,8 +29,8 @@ public:
 
     bool is_open() const;
 
-    void set_tag(const std::string& agent_id, const std::string& key,
-                 const std::string& value, const std::string& source = "server");
+    void set_tag(const std::string& agent_id, const std::string& key, const std::string& value,
+                 const std::string& source = "server");
     std::string get_tag(const std::string& agent_id, const std::string& key) const;
     bool delete_tag(const std::string& agent_id, const std::string& key);
     std::vector<DeviceTag> get_all_tags(const std::string& agent_id) const;
@@ -53,4 +53,4 @@ private:
     void create_tables();
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

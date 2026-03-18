@@ -56,7 +56,8 @@ TEST_CASE("Perf: counter increment throughput (4 threads)", "[metrics][perf]") {
             }
         });
     }
-    for (auto& t : threads) t.join();
+    for (auto& t : threads)
+        t.join();
     auto ms = elapsed_ms(start);
 
     REQUIRE(registry.counter("yuzu_perf_mt_counter").value() == kPerThread * kThreads);
@@ -71,8 +72,8 @@ TEST_CASE("Perf: labeled gauge set with many labels", "[metrics][perf]") {
 
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < kLabels; ++i) {
-        registry.gauge("yuzu_perf_gauge", {{"agent", std::to_string(i)}}).set(
-            static_cast<double>(i));
+        registry.gauge("yuzu_perf_gauge", {{"agent", std::to_string(i)}})
+            .set(static_cast<double>(i));
     }
     auto ms = elapsed_ms(start);
 
@@ -162,8 +163,8 @@ TEST_CASE("Perf: concurrent gauge updates and serialize", "[metrics][perf]") {
         writers.emplace_back([&registry, &stop, w]() {
             int i = 0;
             while (!stop.load(std::memory_order_acquire)) {
-                registry.gauge("yuzu_fleet_agents_by_os",
-                    {{"os", w == 0 ? "linux" : "windows"}}).set(static_cast<double>(++i));
+                registry.gauge("yuzu_fleet_agents_by_os", {{"os", w == 0 ? "linux" : "windows"}})
+                    .set(static_cast<double>(++i));
             }
         });
     }
@@ -178,7 +179,8 @@ TEST_CASE("Perf: concurrent gauge updates and serialize", "[metrics][perf]") {
     }
 
     stop.store(true, std::memory_order_release);
-    for (auto& t : writers) t.join();
+    for (auto& t : writers)
+        t.join();
 
     CHECK(serialize_count > 10);
 }

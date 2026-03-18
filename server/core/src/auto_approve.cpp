@@ -10,10 +10,10 @@
 #include <string>
 
 #ifdef _WIN32
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
-#  include <arpa/inet.h>
+#include <arpa/inet.h>
 #endif
 
 namespace yuzu::server::auth {
@@ -22,20 +22,28 @@ namespace {
 
 std::string rule_type_to_string(AutoApproveRuleType t) {
     switch (t) {
-        case AutoApproveRuleType::trusted_ca:     return "trusted_ca";
-        case AutoApproveRuleType::hostname_glob:  return "hostname_glob";
-        case AutoApproveRuleType::ip_subnet:      return "ip_subnet";
-        case AutoApproveRuleType::cloud_provider: return "cloud_provider";
+    case AutoApproveRuleType::trusted_ca:
+        return "trusted_ca";
+    case AutoApproveRuleType::hostname_glob:
+        return "hostname_glob";
+    case AutoApproveRuleType::ip_subnet:
+        return "ip_subnet";
+    case AutoApproveRuleType::cloud_provider:
+        return "cloud_provider";
     }
     return "unknown";
 }
 
 AutoApproveRuleType string_to_rule_type(const std::string& s) {
-    if (s == "trusted_ca")     return AutoApproveRuleType::trusted_ca;
-    if (s == "hostname_glob")  return AutoApproveRuleType::hostname_glob;
-    if (s == "ip_subnet")      return AutoApproveRuleType::ip_subnet;
-    if (s == "cloud_provider") return AutoApproveRuleType::cloud_provider;
-    return AutoApproveRuleType::hostname_glob;  // safe default
+    if (s == "trusted_ca")
+        return AutoApproveRuleType::trusted_ca;
+    if (s == "hostname_glob")
+        return AutoApproveRuleType::hostname_glob;
+    if (s == "ip_subnet")
+        return AutoApproveRuleType::ip_subnet;
+    if (s == "cloud_provider")
+        return AutoApproveRuleType::cloud_provider;
+    return AutoApproveRuleType::hostname_glob; // safe default
 }
 
 std::string to_lower(std::string s) {
@@ -44,7 +52,7 @@ std::string to_lower(std::string s) {
     return s;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
@@ -52,7 +60,8 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
     config_path_ = path;
 
     std::ifstream f(path);
-    if (!f.is_open()) return false;
+    if (!f.is_open())
+        return false;
 
     std::lock_guard lock(mu_);
     rules_.clear();
@@ -60,7 +69,8 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
 
     std::string line;
     while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty() || line[0] == '#')
+            continue;
 
         // mode:any or mode:all
         if (line.starts_with("mode:")) {
@@ -71,8 +81,10 @@ bool AutoApproveEngine::load(const std::filesystem::path& path) {
         // type:value:label:enabled
         std::istringstream ss(line);
         std::string type_s, value, label, enabled_s;
-        if (!std::getline(ss, type_s, ':')) continue;
-        if (!std::getline(ss, value, ':')) continue;
+        if (!std::getline(ss, type_s, ':'))
+            continue;
+        if (!std::getline(ss, value, ':'))
+            continue;
         std::getline(ss, label, ':');
         std::getline(ss, enabled_s, ':');
 
@@ -95,7 +107,8 @@ void AutoApproveEngine::save() const {
 
 // Must be called with mu_ held.
 void AutoApproveEngine::save_locked() const {
-    if (config_path_.empty()) return;
+    if (config_path_.empty())
+        return;
 
     std::ofstream f(config_path_, std::ios::trunc);
     if (!f.is_open()) {
@@ -108,9 +121,7 @@ void AutoApproveEngine::save_locked() const {
     f << "mode:" << (require_all_ ? "all" : "any") << "\n";
 
     for (const auto& rule : rules_) {
-        f << rule_type_to_string(rule.type) << ":"
-          << rule.value << ":"
-          << rule.label << ":"
+        f << rule_type_to_string(rule.type) << ":" << rule.value << ":" << rule.label << ":"
           << (rule.enabled ? "1" : "0") << "\n";
     }
 }
@@ -120,28 +131,32 @@ void AutoApproveEngine::save_locked() const {
 std::string AutoApproveEngine::evaluate(const ApprovalContext& ctx) const {
     std::lock_guard lock(mu_);
 
-    if (rules_.empty()) return {};
+    if (rules_.empty())
+        return {};
 
     if (require_all_) {
         // All enabled rules must match
         for (const auto& rule : rules_) {
-            if (!rule.enabled) continue;
-            if (!match_rule(rule, ctx)) return {};
+            if (!rule.enabled)
+                continue;
+            if (!match_rule(rule, ctx))
+                return {};
         }
         // All matched — return first rule's label as reference
         for (const auto& rule : rules_) {
-            if (rule.enabled) return rule.label.empty() ? "(all rules)" : rule.label;
+            if (rule.enabled)
+                return rule.label.empty() ? "(all rules)" : rule.label;
         }
         return {};
     }
 
     // Any mode — first match wins
     for (const auto& rule : rules_) {
-        if (!rule.enabled) continue;
+        if (!rule.enabled)
+            continue;
         if (match_rule(rule, ctx)) {
-            return rule.label.empty()
-                ? rule_type_to_string(rule.type) + ":" + rule.value
-                : rule.label;
+            return rule.label.empty() ? rule_type_to_string(rule.type) + ":" + rule.value
+                                      : rule.label;
         }
     }
     return {};
@@ -149,19 +164,19 @@ std::string AutoApproveEngine::evaluate(const ApprovalContext& ctx) const {
 
 bool AutoApproveEngine::match_rule(const AutoApproveRule& rule, const ApprovalContext& ctx) const {
     switch (rule.type) {
-        case AutoApproveRuleType::trusted_ca:
-            return !ctx.ca_fingerprint_sha256.empty() &&
-                   to_lower(ctx.ca_fingerprint_sha256) == to_lower(rule.value);
+    case AutoApproveRuleType::trusted_ca:
+        return !ctx.ca_fingerprint_sha256.empty() &&
+               to_lower(ctx.ca_fingerprint_sha256) == to_lower(rule.value);
 
-        case AutoApproveRuleType::hostname_glob:
-            return match_hostname_glob(rule.value, ctx.hostname);
+    case AutoApproveRuleType::hostname_glob:
+        return match_hostname_glob(rule.value, ctx.hostname);
 
-        case AutoApproveRuleType::ip_subnet:
-            return match_ip_subnet(rule.value, ctx.peer_ip);
+    case AutoApproveRuleType::ip_subnet:
+        return match_ip_subnet(rule.value, ctx.peer_ip);
 
-        case AutoApproveRuleType::cloud_provider:
-            return !ctx.attestation_provider.empty() &&
-                   to_lower(ctx.attestation_provider) == to_lower(rule.value);
+    case AutoApproveRuleType::cloud_provider:
+        return !ctx.attestation_provider.empty() &&
+               to_lower(ctx.attestation_provider) == to_lower(rule.value);
     }
     return false;
 }
@@ -169,7 +184,7 @@ bool AutoApproveEngine::match_rule(const AutoApproveRule& rule, const ApprovalCo
 // ── Glob matching ────────────────────────────────────────────────────────────
 
 bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
-                                             const std::string& hostname) const {
+                                            const std::string& hostname) const {
     auto p = to_lower(pattern);
     auto h = to_lower(hostname);
 
@@ -179,7 +194,8 @@ bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
 
     while (hi < h.size()) {
         if (pi < p.size() && (p[pi] == h[hi] || p[pi] == '?')) {
-            ++pi; ++hi;
+            ++pi;
+            ++hi;
         } else if (pi < p.size() && p[pi] == '*') {
             star_p = pi++;
             star_h = hi;
@@ -191,14 +207,14 @@ bool AutoApproveEngine::match_hostname_glob(const std::string& pattern,
         }
     }
 
-    while (pi < p.size() && p[pi] == '*') ++pi;
+    while (pi < p.size() && p[pi] == '*')
+        ++pi;
     return pi == p.size();
 }
 
 // ── CIDR subnet matching ─────────────────────────────────────────────────────
 
-bool AutoApproveEngine::match_ip_subnet(const std::string& cidr,
-                                         const std::string& ip) const {
+bool AutoApproveEngine::match_ip_subnet(const std::string& cidr, const std::string& ip) const {
     // Parse CIDR: "10.0.0.0/8"
     auto slash = cidr.find('/');
     if (slash == std::string::npos) {
@@ -211,8 +227,10 @@ bool AutoApproveEngine::match_ip_subnet(const std::string& cidr,
 
     // Parse both IPs as IPv4
     struct in_addr net_addr{}, ip_addr{};
-    if (inet_pton(AF_INET, net_str.c_str(), &net_addr) != 1) return false;
-    if (inet_pton(AF_INET, ip.c_str(), &ip_addr) != 1) return false;
+    if (inet_pton(AF_INET, net_str.c_str(), &net_addr) != 1)
+        return false;
+    if (inet_pton(AF_INET, ip.c_str(), &ip_addr) != 1)
+        return false;
 
     // Apply prefix mask
     uint32_t net = ntohl(net_addr.s_addr);
@@ -251,4 +269,4 @@ std::vector<AutoApproveRule> AutoApproveEngine::list_rules() const {
     return rules_;
 }
 
-}  // namespace yuzu::server::auth
+} // namespace yuzu::server::auth

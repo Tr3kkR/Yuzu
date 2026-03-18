@@ -1,25 +1,25 @@
 #pragma once
 
+#include <sqlite3.h>
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct UpdatePackage {
-    std::string platform;           // "windows", "linux", "darwin"
-    std::string arch;               // "x86_64", "aarch64"
-    std::string version;            // "0.2.0+87"
-    std::string sha256;             // hex-encoded SHA-256
-    std::string filename;           // "yuzu-agent-0.2.0-x64-windows.exe"
-    bool        mandatory{false};
-    int         rollout_pct{100};   // 0-100
-    std::string uploaded_at;        // ISO 8601
-    int64_t     file_size{0};
+    std::string platform; // "windows", "linux", "darwin"
+    std::string arch;     // "x86_64", "aarch64"
+    std::string version;  // "0.2.0+87"
+    std::string sha256;   // hex-encoded SHA-256
+    std::string filename; // "yuzu-agent-0.2.0-x64-windows.exe"
+    bool mandatory{false};
+    int rollout_pct{100};    // 0-100
+    std::string uploaded_at; // ISO 8601
+    int64_t file_size{0};
 };
 
 class UpdateRegistry {
@@ -51,4 +51,4 @@ private:
     void create_tables();
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -81,10 +81,8 @@ TEST_CASE("TagStore: sync_agent_tags", "[tag_store]") {
     store.set_tag("agent-1", "criticality", "high", "server");
 
     // Sync agent tags
-    std::unordered_map<std::string, std::string> agent_tags = {
-        {"os.version", "10.0.19045"},
-        {"hostname", "WORKSTATION-01"}
-    };
+    std::unordered_map<std::string, std::string> agent_tags = {{"os.version", "10.0.19045"},
+                                                               {"hostname", "WORKSTATION-01"}};
     store.sync_agent_tags("agent-1", agent_tags);
 
     // Server tag should remain

@@ -20,16 +20,17 @@ using namespace yuzu::server;
 struct TestDb {
     sqlite3* db = nullptr;
     TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() { if (db) sqlite3_close(db); }
+    ~TestDb() {
+        if (db)
+            sqlite3_close(db);
+    }
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-static ExecutionRecord make_execution(
-    const std::string& definition_id = "def-001",
-    const std::string& scope = "ostype = 'windows'",
-    const std::string& dispatched_by = "admin")
-{
+static ExecutionRecord make_execution(const std::string& definition_id = "def-001",
+                                      const std::string& scope = "ostype = 'windows'",
+                                      const std::string& dispatched_by = "admin") {
     ExecutionRecord rec;
     rec.definition_id = definition_id;
     rec.scope_expression = scope;
@@ -43,7 +44,7 @@ static ExecutionRecord make_execution(
 TEST_CASE("ExecutionTracker: create_tables succeeds", "[execution_tracker][db]") {
     TestDb tdb;
     ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();  // should not crash
+    tracker.create_tables(); // should not crash
     REQUIRE(true);
 }
 
@@ -66,7 +67,8 @@ TEST_CASE("ExecutionTracker: get execution", "[execution_tracker]") {
     ExecutionTracker tracker(tdb.db);
     tracker.create_tables();
 
-    auto result = tracker.create_execution(make_execution("def-hostname", "ostype = 'windows'", "operator1"));
+    auto result =
+        tracker.create_execution(make_execution("def-hostname", "ostype = 'windows'", "operator1"));
     REQUIRE(result.has_value());
 
     auto exec = tracker.get_execution(*result);
@@ -105,7 +107,8 @@ TEST_CASE("ExecutionTracker: register agents", "[execution_tracker]") {
 
 // ── Agent Status Transitions ───────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: agent status dispatched -> running -> success", "[execution_tracker]") {
+TEST_CASE("ExecutionTracker: agent status dispatched -> running -> success",
+          "[execution_tracker]") {
     TestDb tdb;
     ExecutionTracker tracker(tdb.db);
     tracker.create_tables();
@@ -295,7 +298,7 @@ TEST_CASE("ExecutionTracker: rerun failed_only", "[execution_tracker]") {
 
     auto rerun = tracker.get_execution(*rerun_result);
     REQUIRE(rerun.has_value());
-    CHECK(rerun->agents_targeted == 2);  // only the two failed/timeout agents
+    CHECK(rerun->agents_targeted == 2); // only the two failed/timeout agents
 }
 
 // ── Query with Filters ─────────────────────────────────────────────────────

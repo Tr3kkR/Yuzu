@@ -68,7 +68,7 @@ TEST_CASE("Gauge: labeled gauges are independent", "[metrics][gauge]") {
     MetricFamily<Gauge> family;
 
     auto& temp = family.labels({{"sensor", "cpu"}});
-    auto& fan  = family.labels({{"sensor", "fan"}});
+    auto& fan = family.labels({{"sensor", "fan"}});
 
     temp.set(72.5);
     fan.set(3200.0);
@@ -98,10 +98,10 @@ TEST_CASE("Histogram: observe and snapshot", "[metrics][histogram]") {
     // observe(15.0): hits none+inf      →  raw = [1,2,3,4]
     // cumulative: [1, 1+2=3, 3+3=6, count=4]
     REQUIRE(snap.cumulative_counts.size() == 4);
-    CHECK(snap.cumulative_counts[0] == 1);  // le=1.0
-    CHECK(snap.cumulative_counts[1] == 3);  // le=5.0 (cumulative)
-    CHECK(snap.cumulative_counts[2] == 6);  // le=10.0 (cumulative)
-    CHECK(snap.cumulative_counts[3] == 4);  // +Inf = count
+    CHECK(snap.cumulative_counts[0] == 1); // le=1.0
+    CHECK(snap.cumulative_counts[1] == 3); // le=5.0 (cumulative)
+    CHECK(snap.cumulative_counts[2] == 6); // le=10.0 (cumulative)
+    CHECK(snap.cumulative_counts[3] == 4); // +Inf = count
 }
 
 TEST_CASE("Histogram: bucket boundaries", "[metrics][histogram]") {

@@ -19,19 +19,23 @@ namespace {
 
 // Replicate the validate_path logic from the plugin for testing
 std::string validate_path(std::string_view raw_path, std::string_view base_dir) {
-    if (raw_path.empty()) return {};
+    if (raw_path.empty())
+        return {};
 
     std::error_code ec;
     std::string path_str{raw_path};
 
-    if (!fs::exists(path_str, ec)) return {};
+    if (!fs::exists(path_str, ec))
+        return {};
 
     auto canonical = fs::canonical(path_str, ec);
-    if (ec) return {};
+    if (ec)
+        return {};
 
     if (!base_dir.empty()) {
         auto canonical_base = fs::canonical(std::string{base_dir}, ec);
-        if (ec) return {};
+        if (ec)
+            return {};
 
         auto canon_str = canonical.string();
         auto base_str = canonical_base.string();
@@ -40,8 +44,7 @@ std::string validate_path(std::string_view raw_path, std::string_view base_dir) 
             canon_str.compare(0, base_str.size(), base_str) != 0) {
             return {};
         }
-        if (canon_str.size() > base_str.size() &&
-            canon_str[base_str.size()] != '/' &&
+        if (canon_str.size() > base_str.size() && canon_str[base_str.size()] != '/' &&
             canon_str[base_str.size()] != '\\') {
             return {};
         }
@@ -81,7 +84,7 @@ struct TempDir {
     }
 };
 
-}  // namespace
+} // namespace
 
 // ── Path validation ────────────────────────────────────────────────────────
 
@@ -102,7 +105,10 @@ TEST_CASE("FilesystemRead: validate_path existing file", "[filesystem][read]") {
 TEST_CASE("FilesystemRead: validate_path within base_dir", "[filesystem][read]") {
     TempDir td;
     fs::path file = td.path / "test.txt";
-    { std::ofstream f(file); f << "test"; }
+    {
+        std::ofstream f(file);
+        f << "test";
+    }
 
     auto result = validate_path(file.string(), td.path.string());
     CHECK(!result.empty());
@@ -181,7 +187,8 @@ TEST_CASE("FilesystemRead: empty file", "[filesystem][read]") {
     std::ifstream f(tf.path);
     std::string line;
     int count = 0;
-    while (std::getline(f, line)) ++count;
+    while (std::getline(f, line))
+        ++count;
     CHECK(count == 0);
 }
 
@@ -195,7 +202,8 @@ TEST_CASE("FilesystemRead: line counting", "[filesystem][read]") {
     std::ifstream f(tf.path);
     std::string line;
     int count = 0;
-    while (std::getline(f, line)) ++count;
+    while (std::getline(f, line))
+        ++count;
     CHECK(count == 50);
 }
 
@@ -217,8 +225,10 @@ TEST_CASE("FilesystemRead: offset and limit simulation", "[filesystem][read]") {
 
     while (std::getline(f, line)) {
         ++line_num;
-        if (line_num < offset) continue;
-        if (collected >= limit) break;
+        if (line_num < offset)
+            continue;
+        if (collected >= limit)
+            break;
         output.push_back(line);
         ++collected;
     }

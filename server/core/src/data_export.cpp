@@ -17,23 +17,27 @@ std::string json_array_to_csv(const std::string& json_str) {
             columns.push_back(it.key());
         }
     }
-    if (columns.empty()) return {};
+    if (columns.empty())
+        return {};
 
     std::string csv;
     csv.reserve(json_str.size());
 
     // Header row
     for (size_t i = 0; i < columns.size(); ++i) {
-        if (i > 0) csv += ',';
+        if (i > 0)
+            csv += ',';
         csv += csv_escape(columns[i]);
     }
     csv += "\r\n";
 
     // Data rows
     for (const auto& row : parsed) {
-        if (!row.is_object()) continue;
+        if (!row.is_object())
+            continue;
         for (size_t i = 0; i < columns.size(); ++i) {
-            if (i > 0) csv += ',';
+            if (i > 0)
+                csv += ',';
             auto it = row.find(columns[i]);
             if (it == row.end() || it->is_null()) {
                 // empty field
@@ -49,4 +53,4 @@ std::string json_array_to_csv(const std::string& json_str) {
     return csv;
 }
 
-}  // namespace yuzu::server::data_export
+} // namespace yuzu::server::data_export

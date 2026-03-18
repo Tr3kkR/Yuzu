@@ -16,11 +16,9 @@ using namespace yuzu::server;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-static InstructionDefinition make_question(
-    const std::string& name,
-    const std::string& version = "1.0",
-    const std::string& plugin = "system_info")
-{
+static InstructionDefinition make_question(const std::string& name,
+                                           const std::string& version = "1.0",
+                                           const std::string& plugin = "system_info") {
     InstructionDefinition def;
     def.name = name;
     def.version = version;
@@ -32,11 +30,9 @@ static InstructionDefinition make_question(
     return def;
 }
 
-static InstructionDefinition make_action(
-    const std::string& name,
-    const std::string& version = "1.0",
-    const std::string& plugin = "remediation")
-{
+static InstructionDefinition make_action(const std::string& name,
+                                         const std::string& version = "1.0",
+                                         const std::string& plugin = "remediation") {
     InstructionDefinition def;
     def.name = name;
     def.version = version;
@@ -351,9 +347,11 @@ TEST_CASE("InstructionStore: create instruction set", "[instruction_store][sets]
 TEST_CASE("InstructionStore: list instruction sets", "[instruction_store][sets]") {
     InstructionStore store(":memory:");
 
-    InstructionSet s1; s1.name = "Baseline Audit";
+    InstructionSet s1;
+    s1.name = "Baseline Audit";
     store.create_set(s1);
-    InstructionSet s2; s2.name = "Incident Response";
+    InstructionSet s2;
+    s2.name = "Incident Response";
     store.create_set(s2);
 
     auto sets = store.list_sets();
@@ -401,11 +399,13 @@ TEST_CASE("InstructionStore: definitions_in_set", "[instruction_store][sets]") {
 TEST_CASE("InstructionStore: set name uniqueness", "[instruction_store][sets]") {
     InstructionStore store(":memory:");
 
-    InstructionSet s1; s1.name = "Same Name";
+    InstructionSet s1;
+    s1.name = "Same Name";
     auto r1 = store.create_set(s1);
     REQUIRE(r1.has_value());
 
-    InstructionSet s2; s2.name = "Same Name";
+    InstructionSet s2;
+    s2.name = "Same Name";
     auto r2 = store.create_set(s2);
     CHECK(!r2.has_value());
 }

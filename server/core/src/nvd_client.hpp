@@ -1,19 +1,21 @@
 #pragma once
 
+#include "nvd_db.hpp"
+
 #include <chrono>
 #include <string>
 #include <vector>
 
-#include "nvd_db.hpp"
-
-namespace httplib { class Client; }
+namespace httplib {
+class Client;
+}
 
 namespace yuzu::server {
 
 struct NvdFetchResult {
     std::vector<CveRecord> records;
     int total_results = 0;
-    std::string last_modified_timestamp;  // latest lastModified in results
+    std::string last_modified_timestamp; // latest lastModified in results
 };
 
 class NvdClient {
@@ -40,4 +42,4 @@ private:
     void apply_proxy(httplib::Client& client) const;
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

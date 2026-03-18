@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sqlite3.h>
+
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -7,25 +9,33 @@
 #include <string>
 #include <vector>
 
-#include <sqlite3.h>
-
 namespace yuzu::server {
 
 struct InstructionDefinition {
     std::string id;
     std::string name;
     std::string version;
-    std::string type;
+    std::string type; // "question" or "action"
     std::string plugin;
     std::string action;
     std::string description;
-    bool        enabled{true};
+    bool enabled{true};
     std::string instruction_set_id;
-    int         gather_ttl_seconds{300};
-    int         response_ttl_days{90};
+    int gather_ttl_seconds{300};
+    int response_ttl_days{90};
     std::string created_by;
-    int64_t     created_at{0};
-    int64_t     updated_at{0};
+    int64_t created_at{0};
+    int64_t updated_at{0};
+    // Extended fields (Phase 2)
+    std::string yaml_source;      // verbatim YAML (source of truth)
+    std::string parameter_schema; // JSON Schema for parameters
+    std::string result_schema;    // result column definitions JSON
+    std::string approval_mode;    // "auto", "role-gated", "always"
+    std::string concurrency_mode; // "per-device", "per-definition", etc.
+    std::string platforms;        // comma-separated: "windows,linux,darwin"
+    std::string min_agent_version;
+    std::string required_plugins; // comma-separated
+    std::string readable_payload; // e.g. "Inspect service '${serviceName}'"
 };
 
 struct InstructionQuery {
@@ -33,8 +43,8 @@ struct InstructionQuery {
     std::string plugin_filter;
     std::string type_filter;
     std::string set_id_filter;
-    bool        enabled_only{false};
-    int         limit{100};
+    bool enabled_only{false};
+    int limit{100};
 };
 
 struct InstructionSet {
@@ -42,7 +52,7 @@ struct InstructionSet {
     std::string name;
     std::string description;
     std::string created_by;
-    int64_t     created_at{0};
+    int64_t created_at{0};
 };
 
 class InstructionStore {
@@ -75,4 +85,4 @@ private:
     sqlite3* db_{nullptr};
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

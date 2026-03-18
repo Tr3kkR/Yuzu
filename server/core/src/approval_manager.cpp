@@ -7,7 +7,8 @@ namespace yuzu::server {
 ApprovalManager::ApprovalManager(sqlite3* db) : db_(db) {}
 
 void ApprovalManager::create_tables() {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* ddl = R"(
         CREATE TABLE IF NOT EXISTS approvals (
@@ -33,20 +34,16 @@ int ApprovalManager::pending_count() const {
     return 0;
 }
 
-std::expected<void, std::string> ApprovalManager::approve(
-    const std::string& /*id*/,
-    const std::string& /*reviewer*/,
-    const std::string& /*comment*/)
-{
+std::expected<void, std::string> ApprovalManager::approve(const std::string& /*id*/,
+                                                          const std::string& /*reviewer*/,
+                                                          const std::string& /*comment*/) {
     return std::unexpected("approval manager not yet implemented");
 }
 
-std::expected<void, std::string> ApprovalManager::reject(
-    const std::string& /*id*/,
-    const std::string& /*reviewer*/,
-    const std::string& /*comment*/)
-{
+std::expected<void, std::string> ApprovalManager::reject(const std::string& /*id*/,
+                                                         const std::string& /*reviewer*/,
+                                                         const std::string& /*comment*/) {
     return std::unexpected("approval manager not yet implemented");
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

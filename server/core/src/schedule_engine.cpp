@@ -7,7 +7,8 @@ namespace yuzu::server {
 ScheduleEngine::ScheduleEngine(sqlite3* db) : db_(db) {}
 
 void ScheduleEngine::create_tables() {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     const char* ddl = R"(
         CREATE TABLE IF NOT EXISTS schedules (
@@ -40,7 +41,8 @@ std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQ
     return {};
 }
 
-std::expected<std::string, std::string> ScheduleEngine::create_schedule(const InstructionSchedule& /*sched*/) {
+std::expected<std::string, std::string>
+ScheduleEngine::create_schedule(const InstructionSchedule& /*sched*/) {
     return std::unexpected("schedule engine not yet implemented");
 }
 
@@ -52,4 +54,4 @@ void ScheduleEngine::set_enabled(const std::string& /*id*/, bool /*enabled*/) {
     // stub
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

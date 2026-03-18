@@ -21,21 +21,23 @@ using namespace yuzu::server;
 struct TestDb {
     sqlite3* db = nullptr;
     TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() { if (db) sqlite3_close(db); }
+    ~TestDb() {
+        if (db)
+            sqlite3_close(db);
+    }
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 static int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
-static ApprovalRequest make_request(
-    const std::string& definition_id = "def-001",
-    const std::string& submitted_by = "operator1",
-    const std::string& scope = "ostype = 'windows'")
-{
+static ApprovalRequest make_request(const std::string& definition_id = "def-001",
+                                    const std::string& submitted_by = "operator1",
+                                    const std::string& scope = "ostype = 'windows'") {
     ApprovalRequest req;
     req.definition_id = definition_id;
     req.submitted_by = submitted_by;
@@ -105,9 +107,7 @@ TEST_CASE("ApprovalManager: approve triggers callback", "[approval_manager]") {
     mgr.create_tables();
 
     std::string callback_id;
-    mgr.set_dispatch_callback([&](const ApprovalRequest& req) {
-        callback_id = req.id;
-    });
+    mgr.set_dispatch_callback([&](const ApprovalRequest& req) { callback_id = req.id; });
 
     auto result = mgr.submit(make_request());
     REQUIRE(result.has_value());
@@ -288,7 +288,7 @@ TEST_CASE("ApprovalManager: expire_stale transitions pending to expired", "[appr
     mgr.create_tables();
 
     ApprovalRequest req = make_request();
-    req.expires_at = now_epoch() - 60;  // expired 1 minute ago
+    req.expires_at = now_epoch() - 60; // expired 1 minute ago
     auto result = mgr.submit(req);
     REQUIRE(result.has_value());
 
@@ -322,7 +322,7 @@ TEST_CASE("ApprovalManager: expire_stale respects expiry time", "[approval_manag
     mgr.create_tables();
 
     ApprovalRequest req = make_request();
-    req.expires_at = now_epoch() + 3600;  // expires in 1 hour
+    req.expires_at = now_epoch() + 3600; // expires in 1 hour
     mgr.submit(req);
 
     mgr.expire_stale(now_epoch());

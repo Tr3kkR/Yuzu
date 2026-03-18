@@ -1,10 +1,10 @@
 #include "nvd_sync.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <array>
 #include <chrono>
 #include <format>
-
-#include <spdlog/spdlog.h>
 
 namespace yuzu::server {
 
@@ -12,26 +12,20 @@ namespace {
 
 std::string current_iso_timestamp() {
     const auto now = std::chrono::system_clock::now();
-    return std::format("{:%FT%TZ}",
-                       std::chrono::floor<std::chrono::seconds>(now));
+    return std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(now));
 }
 
 constexpr std::array kInitialSyncKeywords = {
-    "openssl",    "curl",       "sudo",       "openssh",
-    "apache",     "nginx",      "postgresql",  "python",
-    "node.js",    "chrome",     "firefox",     "dotnet",
-    "openjdk",    "log4j",      "git",         "php",
-    "putty",      "7-zip",      "winrar",      "windows",
+    "openssl", "curl",    "sudo",   "openssh", "apache", "nginx",   "postgresql",
+    "python",  "node.js", "chrome", "firefox", "dotnet", "openjdk", "log4j",
+    "git",     "php",     "putty",  "7-zip",   "winrar", "windows",
 };
 
-}  // namespace
+} // namespace
 
-NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db,
-                               std::string api_key,
-                               std::string proxy_url,
-                               std::chrono::seconds sync_interval)
-    : db_{std::move(db)},
-      client_{std::move(api_key), std::move(proxy_url)},
+NvdSyncManager::NvdSyncManager(std::shared_ptr<NvdDatabase> db, std::string api_key,
+                               std::string proxy_url, std::chrono::seconds sync_interval)
+    : db_{std::move(db)}, client_{std::move(api_key), std::move(proxy_url)},
       interval_{sync_interval} {}
 
 NvdSyncManager::~NvdSyncManager() {
@@ -40,7 +34,7 @@ NvdSyncManager::~NvdSyncManager() {
 
 void NvdSyncManager::start() {
     if (sync_thread_.joinable()) {
-        return;  // already running
+        return; // already running
     }
 #ifdef __cpp_lib_jthread
     sync_thread_ = std::jthread([this](std::stop_token stop) { sync_loop(stop); });
@@ -103,12 +97,14 @@ void NvdSyncManager::sync_loop() {
     while (!stop.stop_requested()) {
         std::unique_lock<std::mutex> lock{mu_};
         cv_.wait_for(lock, interval_, [&stop] { return stop.stop_requested(); });
-        if (stop.stop_requested()) break;
+        if (stop.stop_requested())
+            break;
 #else
     while (!stop_requested_.load()) {
         std::unique_lock<std::mutex> lock{mu_};
         cv_.wait_for(lock, interval_, [this] { return stop_requested_.load(); });
-        if (stop_requested_.load()) break;
+        if (stop_requested_.load())
+            break;
 #endif
         lock.unlock();
         do_sync();
@@ -171,8 +167,7 @@ void NvdSyncManager::do_initial_sync() {
             }
         }
 
-        spdlog::info("Initial sync: '{}' — {} CVEs fetched",
-                      keyword, fetched_this_keyword);
+        spdlog::info("Initial sync: '{}' — {} CVEs fetched", keyword, fetched_this_keyword);
     }
 
     db_->set_meta("last_sync_time", current_iso_timestamp());
@@ -194,13 +189,11 @@ void NvdSyncManager::do_incremental_sync() {
 
     // Update sync timestamp to the latest lastModified from results,
     // or current time if there were no results
-    auto new_sync_time = latest_modified.empty()
-                             ? current_iso_timestamp()
-                             : latest_modified;
+    auto new_sync_time = latest_modified.empty() ? current_iso_timestamp() : latest_modified;
     db_->set_meta("last_sync_time", new_sync_time);
 
-    spdlog::info("Incremental sync complete: {} CVEs updated, new sync time: {}",
-                  total_upserted, new_sync_time);
+    spdlog::info("Incremental sync complete: {} CVEs updated, new sync time: {}", total_upserted,
+                 new_sync_time);
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -60,8 +60,8 @@ TEST_CASE("base64_decode: ignores whitespace", "[web_utils][base64]") {
 
 TEST_CASE("base64_decode: longer string", "[web_utils][base64]") {
     // "The quick brown fox jumps over the lazy dog"
-    REQUIRE(base64_decode("VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw==")
-            == "The quick brown fox jumps over the lazy dog");
+    REQUIRE(base64_decode("VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw==") ==
+            "The quick brown fox jumps over the lazy dog");
 }
 
 TEST_CASE("base64_decode: without padding still works", "[web_utils][base64]") {
@@ -100,8 +100,8 @@ TEST_CASE("html_escape: single quote", "[web_utils][html]") {
 }
 
 TEST_CASE("html_escape: all special chars in one string", "[web_utils][html]") {
-    REQUIRE(html_escape("<script>alert('xss' & \"test\")</script>")
-            == "&lt;script&gt;alert(&#39;xss&#39; &amp; &quot;test&quot;)&lt;/script&gt;");
+    REQUIRE(html_escape("<script>alert('xss' & \"test\")</script>") ==
+            "&lt;script&gt;alert(&#39;xss&#39; &amp; &quot;test&quot;)&lt;/script&gt;");
 }
 
 TEST_CASE("html_escape: already-escaped text gets double-escaped", "[web_utils][html]") {

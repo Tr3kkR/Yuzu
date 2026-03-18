@@ -120,7 +120,7 @@ TEST_CASE("role_to_string", "[auth][role]") {
 TEST_CASE("string_to_role", "[auth][role]") {
     REQUIRE(string_to_role("admin") == Role::admin);
     REQUIRE(string_to_role("user") == Role::user);
-    REQUIRE(string_to_role("unknown") == Role::user);  // default
+    REQUIRE(string_to_role("unknown") == Role::user); // default
 }
 
 TEST_CASE("pending_status_to_string", "[auth][role]") {
@@ -243,7 +243,7 @@ TEST_CASE("max_uses enforcement", "[auth][enrollment]") {
     auto raw = mgr->create_enrollment_token("once", 1, std::chrono::hours(1));
 
     REQUIRE(mgr->validate_enrollment_token(raw));       // first use
-    REQUIRE_FALSE(mgr->validate_enrollment_token(raw));  // exhausted
+    REQUIRE_FALSE(mgr->validate_enrollment_token(raw)); // exhausted
 }
 
 TEST_CASE("batch token creation", "[auth][enrollment]") {

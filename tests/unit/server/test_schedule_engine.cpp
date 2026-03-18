@@ -21,21 +21,23 @@ using namespace yuzu::server;
 struct TestDb {
     sqlite3* db = nullptr;
     TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() { if (db) sqlite3_close(db); }
+    ~TestDb() {
+        if (db)
+            sqlite3_close(db);
+    }
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 static int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
 }
 
-static InstructionSchedule make_schedule(
-    const std::string& definition_id,
-    const std::string& frequency_type,
-    const std::string& name = "test-schedule")
-{
+static InstructionSchedule make_schedule(const std::string& definition_id,
+                                         const std::string& frequency_type,
+                                         const std::string& name = "test-schedule") {
     InstructionSchedule sched;
     sched.name = name;
     sched.definition_id = definition_id;
@@ -66,7 +68,8 @@ TEST_CASE("ScheduleEngine: compute_next — once", "[schedule_engine][next]") {
     CHECK(next == sched.active_from);
 }
 
-TEST_CASE("ScheduleEngine: compute_next — once no active_from uses now", "[schedule_engine][next]") {
+TEST_CASE("ScheduleEngine: compute_next — once no active_from uses now",
+          "[schedule_engine][next]") {
     auto sched = make_schedule("def-1", "once");
     auto now = now_epoch();
 
@@ -100,13 +103,13 @@ TEST_CASE("ScheduleEngine: compute_next — daily", "[schedule_engine][next]") {
 
     auto next = ScheduleEngine::compute_next_execution(sched, now);
     CHECK(next > 0);
-    CHECK(next > now - 86400);  // should be within next 24h
+    CHECK(next > now - 86400); // should be within next 24h
 }
 
 TEST_CASE("ScheduleEngine: compute_next — weekly", "[schedule_engine][next]") {
     auto sched = make_schedule("def-1", "weekly");
     sched.time_of_day = "09:00";
-    sched.day_of_week = 1;  // Monday
+    sched.day_of_week = 1; // Monday
     auto now = now_epoch();
 
     auto next = ScheduleEngine::compute_next_execution(sched, now);
@@ -247,9 +250,7 @@ TEST_CASE("ScheduleEngine: evaluate_due fires for overdue schedule", "[schedule_
     sqlite3_finalize(stmt);
 
     std::vector<std::string> fired_ids;
-    engine.set_dispatch_callback([&](const InstructionSchedule& s) {
-        fired_ids.push_back(s.id);
-    });
+    engine.set_dispatch_callback([&](const InstructionSchedule& s) { fired_ids.push_back(s.id); });
     engine.evaluate_due(now);
 
     REQUIRE(fired_ids.size() == 1);
@@ -268,9 +269,7 @@ TEST_CASE("ScheduleEngine: evaluate_due does not fire for disabled schedule", "[
     engine.set_enabled(*result, false);
 
     std::vector<std::string> fired_ids;
-    engine.set_dispatch_callback([&](const InstructionSchedule& s) {
-        fired_ids.push_back(s.id);
-    });
+    engine.set_dispatch_callback([&](const InstructionSchedule& s) { fired_ids.push_back(s.id); });
     engine.evaluate_due(now_epoch() + 3600);
 
     CHECK(fired_ids.empty());
@@ -282,13 +281,11 @@ TEST_CASE("ScheduleEngine: evaluate_due does not fire for future schedule", "[sc
     engine.create_tables();
 
     auto sched = make_schedule("def-future", "once", "Future");
-    sched.active_from = now_epoch() + 7200;  // 2 hours from now
+    sched.active_from = now_epoch() + 7200; // 2 hours from now
     engine.create_schedule(sched);
 
     std::vector<std::string> fired_ids;
-    engine.set_dispatch_callback([&](const InstructionSchedule& s) {
-        fired_ids.push_back(s.id);
-    });
+    engine.set_dispatch_callback([&](const InstructionSchedule& s) { fired_ids.push_back(s.id); });
     engine.evaluate_due(now_epoch());
 
     CHECK(fired_ids.empty());

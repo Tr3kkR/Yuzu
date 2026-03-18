@@ -15,13 +15,15 @@ inline std::string csv_escape(const std::string& field) {
             break;
         }
     }
-    if (!needs_quoting) return field;
+    if (!needs_quoting)
+        return field;
 
     std::string result;
     result.reserve(field.size() + 8);
     result += '"';
     for (char c : field) {
-        if (c == '"') result += '"';
+        if (c == '"')
+            result += '"';
         result += c;
     }
     result += '"';
@@ -32,4 +34,4 @@ inline std::string csv_escape(const std::string& field) {
 // with uniform keys.  Returns CSV with header row.
 std::string json_array_to_csv(const std::string& json_str);
 
-}  // namespace yuzu::server::data_export
+} // namespace yuzu::server::data_export

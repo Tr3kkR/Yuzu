@@ -32,24 +32,23 @@ void cleanup_temp_dir(const fs::path& dir) {
 }
 
 /// Helper: build an UpdatePackage with sensible defaults.
-UpdatePackage make_pkg(const std::string& platform = "windows",
-                       const std::string& arch = "x86_64",
+UpdatePackage make_pkg(const std::string& platform = "windows", const std::string& arch = "x86_64",
                        const std::string& version = "0.1.0",
                        const std::string& filename = "yuzu-agent-0.1.0-x64-windows.exe") {
     UpdatePackage pkg;
-    pkg.platform    = platform;
-    pkg.arch        = arch;
-    pkg.version     = version;
-    pkg.sha256      = "aabbccdd";
-    pkg.filename    = filename;
-    pkg.mandatory   = false;
+    pkg.platform = platform;
+    pkg.arch = arch;
+    pkg.version = version;
+    pkg.sha256 = "aabbccdd";
+    pkg.filename = filename;
+    pkg.mandatory = false;
     pkg.rollout_pct = 100;
     pkg.uploaded_at = "2025-01-01T00:00:00Z";
-    pkg.file_size   = 1024;
+    pkg.file_size = 1024;
     return pkg;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // ── Database Lifecycle ──────────────────────────────────────────────────────
 
@@ -172,22 +171,19 @@ TEST_CASE("UpdateRegistry: remove_package for nonexistent does not crash",
 
 // ── Rollout Eligibility ─────────────────────────────────────────────────────
 
-TEST_CASE("UpdateRegistry: is_eligible at 100% always returns true",
-          "[update_registry][rollout]") {
+TEST_CASE("UpdateRegistry: is_eligible at 100% always returns true", "[update_registry][rollout]") {
     for (int i = 0; i < 50; ++i) {
         REQUIRE(UpdateRegistry::is_eligible("agent-" + std::to_string(i), 100));
     }
 }
 
-TEST_CASE("UpdateRegistry: is_eligible at 0% always returns false",
-          "[update_registry][rollout]") {
+TEST_CASE("UpdateRegistry: is_eligible at 0% always returns false", "[update_registry][rollout]") {
     for (int i = 0; i < 50; ++i) {
         REQUIRE_FALSE(UpdateRegistry::is_eligible("agent-" + std::to_string(i), 0));
     }
 }
 
-TEST_CASE("UpdateRegistry: is_eligible is deterministic",
-          "[update_registry][rollout]") {
+TEST_CASE("UpdateRegistry: is_eligible is deterministic", "[update_registry][rollout]") {
     const std::string agent_id = "test-agent-42";
     bool first_result = UpdateRegistry::is_eligible(agent_id, 50);
 
@@ -215,8 +211,7 @@ TEST_CASE("UpdateRegistry: is_eligible distributes roughly 50% at rollout_pct=50
 
 // ── binary_path ─────────────────────────────────────────────────────────────
 
-TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename",
-          "[update_registry][path]") {
+TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_registry][path]") {
     auto dir = make_temp_update_dir();
     UpdateRegistry reg(":memory:", dir);
 
