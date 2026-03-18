@@ -1,69 +1,85 @@
 # Yuzu Development Roadmap
 
-**Version:** 1.0 | **Date:** 2026-03-15
+**Version:** 1.1 | **Date:** 2026-03-18
 
 This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.
 
 ## GitHub Issue Index
 
-| Phase | Issue | # | Title |
-|-------|-------|---|-------|
-| **0** | 0.1 | [#146](https://github.com/Tr3kkR/Yuzu/issues/146) | HTTPS for Web Dashboard |
-| | 0.2 | [#147](https://github.com/Tr3kkR/Yuzu/issues/147) | Agent OTA Update Management |
-| | 0.3 | [#148](https://github.com/Tr3kkR/Yuzu/issues/148) | Secure Temp File Creation in Filesystem Plugin |
-| | 0.4 | [#150](https://github.com/Tr3kkR/Yuzu/issues/150) | SDK Utility Functions (JSON/Table Conversion) |
-| | 0.5 | [#152](https://github.com/Tr3kkR/Yuzu/issues/152) | Complete Foundation Partial Items |
-| **1** | 1.1 | [#166](https://github.com/Tr3kkR/Yuzu/issues/166) | Server-Side Response Persistence (SQLite) |
-| | 1.2 | [#167](https://github.com/Tr3kkR/Yuzu/issues/167) | Response Filtering, Pagination, and Sorting |
-| | 1.3 | [#168](https://github.com/Tr3kkR/Yuzu/issues/168) | Response Aggregation Engine |
-| | 1.4 | [#169](https://github.com/Tr3kkR/Yuzu/issues/169) | Audit Trail System |
-| | 1.5 | [#170](https://github.com/Tr3kkR/Yuzu/issues/170) | Device Tagging System |
-| | 1.6 | [#171](https://github.com/Tr3kkR/Yuzu/issues/171) | Scope Expression Engine and Device Filtering |
-| | 1.7 | [#172](https://github.com/Tr3kkR/Yuzu/issues/172) | CSV and JSON Data Export |
-| **2** | 2.1 | [#149](https://github.com/Tr3kkR/Yuzu/issues/149) | Instruction Definitions |
-| | 2.2 | [#151](https://github.com/Tr3kkR/Yuzu/issues/151) | Instruction Sets (Grouping and Organization) |
-| | 2.3 | [#153](https://github.com/Tr3kkR/Yuzu/issues/153) | Instruction Scheduling |
-| | 2.4 | [#155](https://github.com/Tr3kkR/Yuzu/issues/155) | Instruction Approval Workflows |
-| | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows |
-| | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics |
-| | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation |
-| **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System |
-| | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups |
-| | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication |
-| | 3.4 | [#159](https://github.com/Tr3kkR/Yuzu/issues/159) | OIDC / SSO Integration |
-| | 3.5 | [#161](https://github.com/Tr3kkR/Yuzu/issues/161) | REST / HTTP Management API (v1) |
-| | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) |
-| | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking |
-| | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management |
-| **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage |
-| | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) |
-| | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution |
-| | 4.4 | [#181](https://github.com/Tr3kkR/Yuzu/issues/181) | Agent Sleep and Stagger Control |
-| | 4.5 | [#184](https://github.com/Tr3kkR/Yuzu/issues/184) | Trigger Framework (Agent-Side) |
-| | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) |
-| | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval |
-| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments |
-| | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment |
-| | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics |
-| | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation |
-| **6** | 6.1 | [#180](https://github.com/Tr3kkR/Yuzu/issues/180) | Registry Plugin (Read/Write/Enumerate) |
-| | 6.2 | [#182](https://github.com/Tr3kkR/Yuzu/issues/182) | Per-User Registry Operations |
-| | 6.3 | [#183](https://github.com/Tr3kkR/Yuzu/issues/183) | WMI Query and Method Invocation |
-| | 6.4 | [#186](https://github.com/Tr3kkR/Yuzu/issues/186) | Per-User Application Inventory |
-| | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations |
-| | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger |
-| **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation |
-| | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics |
-| | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API |
-| | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications |
-| | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration |
-| | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices |
-| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs |
-| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow |
-| | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) |
-| | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins |
-| | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) |
-| | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) |
+| Phase | Issue | # | Title | Status |
+|-------|-------|---|-------|--------|
+| **0** | 0.1 | [#146](https://github.com/Tr3kkR/Yuzu/issues/146) | HTTPS for Web Dashboard | Done |
+| | 0.2 | [#147](https://github.com/Tr3kkR/Yuzu/issues/147) | Agent OTA Update Management | Done |
+| | 0.3 | [#148](https://github.com/Tr3kkR/Yuzu/issues/148) | Secure Temp File Creation in Filesystem Plugin | Done |
+| | 0.4 | [#150](https://github.com/Tr3kkR/Yuzu/issues/150) | SDK Utility Functions (JSON/Table Conversion) | Done |
+| | 0.5 | [#152](https://github.com/Tr3kkR/Yuzu/issues/152) | Complete Foundation Partial Items | Done |
+| **1** | 1.1 | [#166](https://github.com/Tr3kkR/Yuzu/issues/166) | Server-Side Response Persistence (SQLite) | Done |
+| | 1.2 | [#167](https://github.com/Tr3kkR/Yuzu/issues/167) | Response Filtering, Pagination, and Sorting | Done |
+| | 1.3 | [#168](https://github.com/Tr3kkR/Yuzu/issues/168) | Response Aggregation Engine | Open |
+| | 1.4 | [#169](https://github.com/Tr3kkR/Yuzu/issues/169) | Audit Trail System | Done |
+| | 1.5 | [#170](https://github.com/Tr3kkR/Yuzu/issues/170) | Device Tagging System | Done |
+| | 1.6 | [#171](https://github.com/Tr3kkR/Yuzu/issues/171) | Scope Expression Engine and Device Filtering | Done |
+| | 1.7 | [#172](https://github.com/Tr3kkR/Yuzu/issues/172) | CSV and JSON Data Export | Open |
+| **2** | 2.1 | [#149](https://github.com/Tr3kkR/Yuzu/issues/149) | Instruction Definitions | Scaffolded |
+| | 2.2 | [#151](https://github.com/Tr3kkR/Yuzu/issues/151) | Instruction Sets (Grouping and Organization) | Scaffolded |
+| | 2.3 | [#153](https://github.com/Tr3kkR/Yuzu/issues/153) | Instruction Scheduling | Scaffolded |
+| | 2.4 | [#155](https://github.com/Tr3kkR/Yuzu/issues/155) | Instruction Approval Workflows | Scaffolded |
+| | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows | Open |
+| | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Scaffolded |
+| | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Open |
+| **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Open |
+| | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Open |
+| | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Open |
+| | 3.4 | [#159](https://github.com/Tr3kkR/Yuzu/issues/159) | OIDC / SSO Integration | Open |
+| | 3.5 | [#161](https://github.com/Tr3kkR/Yuzu/issues/161) | REST / HTTP Management API (v1) | Open |
+| | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) | Open |
+| | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Open |
+| | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management | Open |
+| **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage | Open |
+| | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) | Open |
+| | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution | Open |
+| | 4.4 | [#181](https://github.com/Tr3kkR/Yuzu/issues/181) | Agent Sleep and Stagger Control | Open |
+| | 4.5 | [#184](https://github.com/Tr3kkR/Yuzu/issues/184) | Trigger Framework (Agent-Side) | Open |
+| | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) | Open |
+| | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval | Open |
+| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Open |
+| | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment | Open |
+| | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics | Open |
+| | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation | Open |
+| **6** | 6.1 | [#180](https://github.com/Tr3kkR/Yuzu/issues/180) | Registry Plugin (Read/Write/Enumerate) | Open |
+| | 6.2 | [#182](https://github.com/Tr3kkR/Yuzu/issues/182) | Per-User Registry Operations | Open |
+| | 6.3 | [#183](https://github.com/Tr3kkR/Yuzu/issues/183) | WMI Query and Method Invocation | Open |
+| | 6.4 | [#186](https://github.com/Tr3kkR/Yuzu/issues/186) | Per-User Application Inventory | Open |
+| | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations | Open |
+| | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger | Open |
+| **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation | Open |
+| | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Open |
+| | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Open |
+| | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Open |
+| | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Open |
+| | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Open |
+| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Open |
+| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | Open |
+| | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Open |
+| | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Open |
+| | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Open |
+| | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) | Open |
+
+## Current Status
+
+| Phase | Done | Open | Scaffolded | Total | Progress |
+|-------|:----:|:----:|:----------:|:-----:|----------|
+| 0: Foundation | 5 | 0 | 0 | 5 | 100% |
+| 1: Data Infrastructure | 5 | 2 | 0 | 7 | 71% |
+| 2: Instruction System | 0 | 2 | 5 | 7 | Scaffolded |
+| 3: Security & RBAC | 0 | 8 | 0 | 8 | 0% |
+| 4: Agent Infrastructure | 0 | 7 | 0 | 7 | 0% |
+| 5: Policy Engine | 0 | 4 | 0 | 4 | 0% |
+| 6: Windows Depth | 0 | 6 | 0 | 6 | 0% |
+| 7: Scale & Integration | 0 | 12 | 0 | 12 | 0% |
+| **Total** | **10** | **41** | **5** | **56** | |
+
+**Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
 ---
 
@@ -71,43 +87,42 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
 *Close the remaining Foundation-tier gaps. These are prerequisites for production use.*
 
-### Issue 0.1: HTTPS for Web Dashboard
-**Capability:** 18.9 | **Scope:** Server
+### Issue 0.1: HTTPS for Web Dashboard :white_check_mark:
+**Capability:** 18.9 | **Scope:** Server | **Status:** Done
 
-Add TLS termination to the cpp-httplib web server. Support configurable cert/key paths in `yuzu-server.cfg`. Redirect HTTP to HTTPS when TLS is enabled. Reuse the existing TLS cert infrastructure from the mTLS agent connection or allow separate web certs.
+`httplib::SSLServer` with OpenSSL support (`-DCPPHTTPLIB_OPENSSL_SUPPORT`). CLI flags: `--https`, `--https-port` (default 8443), `--https-cert`, `--https-key`, `--no-https-redirect`. HTTP-to-HTTPS 301 redirect server. Secure cookie flag when HTTPS enabled. Settings UI has TLS configuration section.
 
-**Files:** `server/core/src/server.cpp`, `server/core/src/server.hpp`
+**Files:** `server/core/src/server.cpp` (lines 2531-2560, 4412-4462), `server/core/meson.build` (OpenSSL dep)
 
-### Issue 0.2: Agent OTA Update Management
-**Capability:** 1.4 | **Scope:** Agent + Server
+### Issue 0.2: Agent OTA Update Management :white_check_mark:
+**Capability:** 1.4 | **Scope:** Agent + Server | **Status:** Done
 
-Agent checks server for available updates on heartbeat. Server tracks latest agent version per platform/arch and serves installer binaries. Agent downloads, verifies hash, and self-updates (exec replacement on Linux/macOS, scheduled task on Windows). Staged rollouts via percentage-based targeting.
+`CheckForUpdate`/`DownloadUpdate` RPCs in agent.proto. Full updater implementation with hash verification and platform-specific self-update.
 
-**Files:** `agents/core/src/agent.cpp`, `server/core/src/server.cpp`, `proto/yuzu/agent/v1/agent.proto` (new `CheckForUpdate`/`DownloadUpdate` RPCs)
+**Files:** `agents/core/src/updater.cpp`, `proto/yuzu/agent/v1/agent.proto` (lines 29-33, 130-157)
 
-### Issue 0.3: Secure Temp File Creation in Filesystem Plugin
-**Capability:** 10.12 | **Scope:** Plugin
+### Issue 0.3: Secure Temp File Creation in Filesystem Plugin :white_check_mark:
+**Capability:** 10.12 | **Scope:** Plugin | **Status:** Done
 
-Add `create_temp` action to the `filesystem` plugin. Creates a secure temporary file with a unique name in the OS temp directory, returns the path. Cross-platform.
+`yuzu_create_temp_file()` and `yuzu_create_temp_dir()` in SDK with secure permissions (POSIX 0600/0700, Windows owner-only DACL). Filesystem plugin exposes `create_temp` and `create_temp_dir` actions.
 
-**Files:** `agents/plugins/filesystem/src/filesystem_plugin.cpp`
+**Files:** `sdk/include/yuzu/plugin.h` (lines 207-244), `agents/plugins/filesystem/src/filesystem_plugin.cpp`
 
-### Issue 0.4: SDK Utility Functions (JSON/Table Conversion)
-**Capability:** 24.6 | **Scope:** SDK
+### Issue 0.4: SDK Utility Functions (JSON/Table Conversion) :white_check_mark:
+**Capability:** 24.6 | **Scope:** SDK | **Status:** Done
 
-Add utility functions to the plugin SDK: `json_to_table` (parse JSON array into pipe-delimited output), `table_to_json` (convert pipe-delimited output to JSON array), `split_lines`, `generate_sequence`. Expose via `plugin.h` C ABI and `plugin.hpp` wrapper.
+`yuzu_table_to_json()`, `yuzu_json_to_table()`, `yuzu_split_lines()`, `yuzu_generate_sequence()`, `yuzu_free_string()` implemented in plugin.h C ABI.
 
-**Files:** `sdk/include/yuzu/plugin.h`, `sdk/include/yuzu/plugin.hpp`, new `sdk/src/utilities.cpp`
+**Files:** `sdk/include/yuzu/plugin.h` (lines 153-206)
 
-### Issue 0.5: Complete Foundation Partial Items
-**Capabilities:** 1.8, 4.5, 10.3 | **Scope:** Agent + Plugins
+### Issue 0.5: Complete Foundation Partial Items :white_check_mark:
+**Capabilities:** 1.8, 4.5, 10.3 | **Scope:** Agent + Plugins | **Status:** Done
 
-Three small items:
-- **1.8 Connection diagnostics:** Add `connection_info` action to `diagnostics` plugin returning latency, reconnect count, TLS cipher, server cert thumbprint.
-- **4.5 DNS cache dump:** Add `dns_cache` action to `network_config` plugin (Windows: `GetDnsCache` API, Linux: parse systemd-resolved, macOS: `mdns` query).
-- **10.3 File read by line range:** Add `offset` and `limit` parameters to `filesystem` plugin's `read` action.
+- **1.8** `connection_info` action: server address, TLS status, session ID, gRPC channel state, reconnect count, latency, uptime.
+- **4.5** `dns_cache` action: Windows `DnsGetCacheDataTable`, Linux systemd-resolved query.
+- **10.3** `offset`/`limit` parameters on filesystem `read` action (1-based line offset, configurable max).
 
-**Files:** Plugin source files for `diagnostics`, `network_config`, `filesystem`
+**Files:** `agents/plugins/diagnostics/src/diagnostics_plugin.cpp`, `agents/plugins/network_config/src/network_config_plugin.cpp`, `agents/plugins/filesystem/src/filesystem_plugin.cpp`
 
 ---
 
@@ -115,23 +130,19 @@ Three small items:
 
 *Build the server-side systems that all advanced features depend on: persistent response storage, device metadata, audit logging, and a query language.*
 
-### Issue 1.1: Server-Side Response Persistence (SQLite)
-**Capabilities:** 20.2, 20.4 | **Scope:** Server
+### Issue 1.1: Server-Side Response Persistence (SQLite) :white_check_mark:
+**Capabilities:** 20.2, 20.4 | **Scope:** Server | **Status:** Done
 
-Store all command responses in a SQLite database (sharded by instruction ID). Each response row: `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`. Support retention with configurable TTL. This replaces the current in-memory-only streaming approach with durable storage.
+SQLite with WAL mode, `StoredResponse` struct, configurable TTL retention (default 90 days), background cleanup thread.
 
-**Files:** `server/core/src/server.cpp`, new `server/core/src/response_store.cpp`
+**Files:** `server/core/src/response_store.hpp`, `server/core/src/response_store.cpp`
 
-### Issue 1.2: Response Filtering, Pagination, and Sorting
-**Capability:** 20.2 | **Scope:** Server
+### Issue 1.2: Response Filtering, Pagination, and Sorting :white_check_mark:
+**Capability:** 20.2 | **Scope:** Server | **Status:** Done
 
-Build a query engine on top of the response store. Support:
-- Expression-tree filters (attribute/operator/value with AND/OR/NOT)
-- Pagination (offset + page size)
-- Multi-column sort (column + ASC/DESC)
-- Expose via new `SearchResponses` RPC in ManagementService and `/api/responses/search` HTTP endpoint
+`ResponseQuery` struct with agent_id, status, time range (since/until), limit/offset pagination. Exposed via `GET /api/responses/{instruction_id}` with query parameters.
 
-**Files:** `server/core/src/response_store.cpp`, `proto/yuzu/server/v1/management.proto`, `server/core/src/server.cpp`
+**Files:** `server/core/src/response_store.hpp`, `server/core/src/response_store.cpp`, `server/core/src/server.cpp`
 
 ### Issue 1.3: Response Aggregation Engine
 **Capability:** 20.3 | **Scope:** Server
@@ -140,35 +151,26 @@ Server-side aggregation of response data. Support group-by columns with `count`,
 
 **Files:** `server/core/src/response_store.cpp`, `proto/yuzu/server/v1/management.proto`
 
-### Issue 1.4: Audit Trail System
-**Capability:** 21.2 | **Scope:** Server
+### Issue 1.4: Audit Trail System :white_check_mark:
+**Capability:** 21.2 | **Scope:** Server | **Status:** Done
 
-Log all user actions to a persistent audit table: who, what, when, which devices. Events: login/logout, command dispatch, agent approve/deny, token create/revoke, setting changes, user CRUD. Expose via `/api/audit` HTTP endpoint with filter/sort/pagination. Retention configurable.
+`AuditStore` with SQLite WAL backend. `AuditEvent` struct: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering and pagination. Default 365-day retention.
 
-**Files:** New `server/core/src/audit.cpp`, `server/core/src/server.cpp`, `server/core/src/auth.cpp`, `server/core/src/settings_ui.cpp`
+**Files:** `server/core/src/audit_store.hpp`, `server/core/src/audit_store.cpp`, `server/core/src/server.cpp`
 
-### Issue 1.5: Device Tagging System
-**Capabilities:** 3.10, 3.6, 3.7 | **Scope:** Server + Agent
+### Issue 1.5: Device Tagging System :white_check_mark:
+**Capabilities:** 3.10, 3.6, 3.7 | **Scope:** Server + Agent | **Status:** Done
 
-Key-value tags on devices. Two types:
-- **Scopable tags:** Reported to server, usable in targeting expressions. Limited total size (512 bytes).
-- **Freeform tags:** Agent-local only, no size limit.
+`TagStore` with SQLite backend. `DeviceTag` struct: agent_id, key, value, source (agent/server/api), updated_at. Validation: key max 64 chars `[a-zA-Z0-9_.:-]`, value max 448 bytes. Agent tag sync from heartbeat. `agents_with_tag()` for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.
 
-Support: set, get, get_all, delete, check, clear, count. Implement as a new `tagging` plugin on the agent side, with server-side storage for scopable tags. Device criticality (3.6) and location (3.7) are special-purpose tags.
+**Files:** `server/core/src/tag_store.hpp`, `server/core/src/tag_store.cpp`, `agents/plugins/tags/src/tags_plugin.cpp`
 
-**Files:** New `agents/plugins/tagging/`, `server/core/src/server.cpp`, `proto/yuzu/server/v1/management.proto`
+### Issue 1.6: Scope Expression Engine and Device Filtering :white_check_mark:
+**Capabilities:** 19.3, 2.2, 2.11 | **Scope:** Server | **Status:** Done
 
-### Issue 1.6: Scope Expression Engine and Device Filtering
-**Capabilities:** 19.3, 2.2, 2.11 | **Scope:** Server
+494-line recursive-descent parser. 9 operators: `==`, `!=`, `LIKE`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`. AND/OR/NOT combinators, wildcard LIKE matching, case-insensitive comparison, max nesting depth 10. `AttributeResolver` callback for evaluation. Target estimation via `GET /api/target/estimate`.
 
-Implement a scope expression evaluator for device targeting. Predefined attributes: `ostype`, `osver`, `hostname`, `arch`, `fqdn`, `tag:*`, `criticality`, `managementgroup`. Expression tree syntax with AND/OR/NOT and operators (==, !=, Like, <, >, <=, >=).
-
-Use for:
-- `SendCommand` targeting (replace empty-list-means-all with explicit scope)
-- `ListAgents` filtering
-- Target estimation (`/api/target/estimate` returns approximate device count)
-
-**Files:** New `server/core/src/scope_engine.cpp`, `server/core/src/server.cpp`, `proto/yuzu/server/v1/management.proto`
+**Files:** `server/core/src/scope_engine.hpp`, `server/core/src/scope_engine.cpp`, `server/core/src/server.cpp`
 
 ### Issue 1.7: CSV and JSON Data Export
 **Capabilities:** 20.5, 24.5 | **Scope:** Server

@@ -61,6 +61,7 @@ yuzu_server_core_lib = static_library(
     'src/scope_engine.cpp',
     'src/analytics_event_store.cpp',
     'src/analytics_sinks.cpp',
+    'src/data_export.cpp',
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
     'src/approval_manager.cpp',

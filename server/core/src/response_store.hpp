@@ -32,6 +32,20 @@ struct ResponseQuery {
     int         offset{0};
 };
 
+enum class AggregateOp { Count, Sum, Avg, Min, Max };
+
+struct AggregationQuery {
+    std::string group_by;                   // "status" or "agent_id"
+    AggregateOp op{AggregateOp::Count};
+    std::string op_column;                  // column for sum/avg/min/max
+};
+
+struct AggregationResult {
+    std::string group_value;
+    int64_t     count{0};
+    double      aggregate_value{0.0};
+};
+
 class ResponseStore {
 public:
     explicit ResponseStore(const std::filesystem::path& db_path,
@@ -48,6 +62,9 @@ public:
     std::vector<StoredResponse> query(const std::string& instruction_id,
                                       const ResponseQuery& q = {}) const;
     std::vector<StoredResponse> get_by_instruction(const std::string& instruction_id) const;
+    std::vector<AggregationResult> aggregate(const std::string& instruction_id,
+                                             const AggregationQuery& aq,
+                                             const ResponseQuery& filter = {}) const;
     std::size_t total_count() const;
     std::uintmax_t db_size_bytes() const;
 

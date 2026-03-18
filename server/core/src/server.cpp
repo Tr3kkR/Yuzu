@@ -16,6 +16,7 @@
 #include "schedule_engine.hpp"
 #include "analytics_event.hpp"
 #include "analytics_event_store.hpp"
+#include "data_export.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -3412,6 +3413,134 @@ private:
             });
 
         // -- Response API ---------------------------------------------------------
+
+        // Aggregate endpoint — must be registered before the catch-all responses route
+        web_server_->Get(R"(/api/responses/([^/]+)/aggregate)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto instruction_id = req.matches[1].str();
+                if (!response_store_ || !response_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"response store not available"})", "application/json");
+                    return;
+                }
+
+                auto group_by = req.get_param_value("group_by");
+                if (group_by.empty()) group_by = "status";
+
+                AggregateOp op = AggregateOp::Count;
+                auto op_str = req.get_param_value("op");
+                if (op_str == "sum")       op = AggregateOp::Sum;
+                else if (op_str == "avg")  op = AggregateOp::Avg;
+                else if (op_str == "min")  op = AggregateOp::Min;
+                else if (op_str == "max")  op = AggregateOp::Max;
+
+                AggregationQuery aq;
+                aq.group_by  = group_by;
+                aq.op        = op;
+                aq.op_column = req.get_param_value("op_column");
+
+                ResponseQuery filter;
+                if (req.has_param("agent_id"))
+                    filter.agent_id = req.get_param_value("agent_id");
+                if (req.has_param("status"))
+                    filter.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    filter.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    filter.until = std::stoll(req.get_param_value("until"));
+
+                auto results = response_store_->aggregate(instruction_id, aq, filter);
+
+                int64_t total_rows = 0;
+                nlohmann::json groups = nlohmann::json::array();
+                for (const auto& r : results) {
+                    total_rows += r.count;
+                    groups.push_back({
+                        {"group_value", r.group_value},
+                        {"count", r.count},
+                        {"aggregate_value", r.aggregate_value}
+                    });
+                }
+
+                res.set_content(nlohmann::json({
+                    {"instruction_id", instruction_id},
+                    {"groups", groups},
+                    {"total_groups", results.size()},
+                    {"total_rows", total_rows}
+                }).dump(), "application/json");
+            });
+
+        // Export endpoint — must be registered before the catch-all responses route
+        web_server_->Get(R"(/api/responses/([^/]+)/export)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto instruction_id = req.matches[1].str();
+                if (!response_store_ || !response_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"response store not available"})", "application/json");
+                    return;
+                }
+
+                ResponseQuery q;
+                if (req.has_param("agent_id"))
+                    q.agent_id = req.get_param_value("agent_id");
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                else
+                    q.limit = 10000;  // higher default for exports
+
+                auto results = response_store_->query(instruction_id, q);
+                auto format = req.get_param_value("format");
+
+                if (format == "csv") {
+                    std::string csv = "id,instruction_id,agent_id,timestamp,status,output,error_detail\r\n";
+                    for (const auto& r : results) {
+                        csv += std::to_string(r.id) + ",";
+                        csv += data_export::csv_escape(r.instruction_id) + ",";
+                        csv += data_export::csv_escape(r.agent_id) + ",";
+                        csv += std::to_string(r.timestamp) + ",";
+                        csv += std::to_string(r.status) + ",";
+                        csv += data_export::csv_escape(r.output) + ",";
+                        csv += data_export::csv_escape(r.error_detail) + "\r\n";
+                    }
+                    res.set_header("Content-Disposition",
+                        "attachment; filename=\"responses-" + instruction_id + ".csv\"");
+                    res.set_content(csv, "text/csv; charset=utf-8");
+                } else {
+                    nlohmann::json arr = nlohmann::json::array();
+                    for (const auto& r : results) {
+                        arr.push_back({
+                            {"id", r.id},
+                            {"instruction_id", r.instruction_id},
+                            {"agent_id", r.agent_id},
+                            {"timestamp", r.timestamp},
+                            {"status", r.status},
+                            {"output", r.output},
+                            {"error_detail", r.error_detail}
+                        });
+                    }
+                    nlohmann::json envelope = {
+                        {"instruction_id", instruction_id},
+                        {"count", results.size()},
+                        {"responses", arr}
+                    };
+                    res.set_header("Content-Disposition",
+                        "attachment; filename=\"responses-" + instruction_id + ".json\"");
+                    res.set_content(envelope.dump(2), "application/json; charset=utf-8");
+                }
+            });
+
         web_server_->Get(R"(/api/responses/(.+))",
             [this](const httplib::Request& req, httplib::Response& res) {
                 auto session = require_auth(req, res);
@@ -3646,6 +3775,22 @@ private:
                 auto session = require_auth(req, res);
                 if (!session) { res.set_redirect("/login"); return; }
                 res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
+            });
+
+        // -- Generic JSON-to-CSV export -----------------------------------------
+        web_server_->Post("/api/export/json-to-csv",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto csv = data_export::json_array_to_csv(req.body);
+                if (csv.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid JSON array"})", "application/json");
+                    return;
+                }
+                res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
+                res.set_content(csv, "text/csv; charset=utf-8");
             });
 
         // -- Instruction Definitions API --------------------------------------

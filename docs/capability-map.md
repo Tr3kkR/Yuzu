@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 1.0 | **Date:** 2026-03-15 | **Status:** Draft
+**Version:** 1.1 | **Date:** 2026-03-18 | **Status:** Draft
 
 ---
 
@@ -27,25 +27,25 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 ```
-Foundation   [=========================-------]  25/33 done  (76%)
-Advanced     [==-----------------------------]   5/84 done   (6%)
+Foundation   [===============================_]  32/33 done  (97%)
+Advanced     [====---------------------------]  12/84 done   (14%)
 Future       [-------------------------------]   0/22 done   (0%)
 ─────────────────────────────────────────────────────────────────
-Overall      [=====-------------------------]   30/139 done  (22%)
+Overall      [==========--------------------]   44/139 done  (32%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
-| 1. Agent Lifecycle | 9 | 4 | 2 | 3 |
+| 1. Agent Lifecycle | 9 | 6 | 1 | 2 |
 | 2. Command Execution | 13 | 5 | 1 | 7 |
-| 3. Device & Endpoint Info | 10 | 5 | 0 | 5 |
-| 4. Network Info & Discovery | 11 | 6 | 1 | 4 |
+| 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
+| 4. Network Info & Discovery | 11 | 6 | 0 | 5 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 1 | 0 | 4 |
 | 7. Software & App Mgmt | 6 | 4 | 0 | 2 |
 | 8. Patch & Update Mgmt | 9 | 1 | 1 | 7 |
 | 9. Security & Compliance | 10 | 5 | 0 | 5 |
-| 10. File System Operations | 15 | 6 | 1 | 8 |
+| 10. File System Operations | 15 | 7 | 0 | 8 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
 | 12. Registry & System Config | 7 | 0 | 0 | 7 |
 | 13. Content Distribution | 5 | 0 | 0 | 5 |
@@ -53,14 +53,14 @@ Overall      [=====-------------------------]   30/139 done  (22%)
 | 15. Inventory & Data Collection | 5 | 2 | 0 | 3 |
 | 16. Policy & Compliance Engine | 8 | 0 | 0 | 8 |
 | 17. Triggers & Automation | 7 | 0 | 0 | 7 |
-| 18. Auth & Authorization | 9 | 2 | 0 | 7 |
-| 19. Device & Group Mgmt | 7 | 2 | 0 | 5 |
-| 20. Response Collection | 7 | 1 | 0 | 6 |
-| 21. Notifications & Audit | 5 | 1 | 0 | 4 |
+| 18. Auth & Authorization | 9 | 3 | 0 | 6 |
+| 19. Device & Group Mgmt | 7 | 3 | 0 | 4 |
+| 20. Response Collection | 7 | 3 | 0 | 4 |
+| 21. Notifications & Audit | 5 | 2 | 0 | 3 |
 | 22. System & Infrastructure | 8 | 0 | 2 | 6 |
 | 23. Agent Key-Value Storage | 3 | 0 | 0 | 3 |
-| 24. Integration & Extensibility | 7 | 2 | 1 | 4 |
-| **TOTAL** | **139** | **27** | **7** | **105** |
+| 24. Integration & Extensibility | 7 | 3 | 0 | 4 |
+| **TOTAL** | **139** | **44** | **5** | **90** |
 
 ---
 
@@ -86,11 +86,9 @@ Overall      [=====-------------------------]   30/139 done  (22%)
 
 > **Gap:** No unified diagnostics bundle download (key files, logs).
 
-### 1.4 Agent Version and Update Management :x: `T1`
+### 1.4 Agent Version and Update Management :white_check_mark: `T1`
 
-Agent reports `agent_version` in registration, but no server-side update mechanism exists.
-
-> **Gaps:** No OTA update distribution, no update checking, no staged rollouts.
+`CheckForUpdate`/`DownloadUpdate` RPCs in agent.proto. Full updater implementation (`agents/core/src/updater.cpp`) with hash verification and platform-specific self-update.
 
 ### 1.5 Agent Extensibility Introspection :white_check_mark: `T1`
 
@@ -110,11 +108,9 @@ spdlog-based local logging on the agent. No remote log retrieval.
 
 > **Gaps:** Need server-initiated log fetch, log level control, and log streaming.
 
-### 1.8 Connection and Session Info :large_orange_diamond: `T1`
+### 1.8 Connection and Session Info :white_check_mark: `T1`
 
-Session ID returned on registration. `WatchEvents` tracks connect/disconnect events.
-
-> **Gap:** No agent-side connection diagnostics (latency, reconnect count, TLS info).
+Session ID returned on registration. `WatchEvents` tracks connect/disconnect events. `connection_info` action in diagnostics plugin reports server address, TLS status, session ID, gRPC channel state, reconnect count, latency, uptime.
 
 ### 1.9 Instruction Execution Statistics :x: `T2`
 
@@ -226,17 +222,13 @@ Covered by the `hardware` plugin.
 
 Covered by the `hardware` plugin.
 
-### 3.6 Device Criticality Classification :x: `T2`
+### 3.6 Device Criticality Classification :white_check_mark: `T2`
 
-No criticality level (high/medium/low) tagging on devices.
+Implemented as a special-purpose tag via the device tagging system (`TagStore`). Set/get criticality per device using key-value tags.
 
-> **Need:** Risk-based prioritization with get/set criticality per device.
+### 3.7 Device Location Tracking :white_check_mark: `T2`
 
-### 3.7 Device Location Tracking :x: `T2`
-
-No location metadata (site, building, geo).
-
-> **Need:** Get/set location per device for asset management.
+Implemented as a special-purpose tag via the device tagging system (`TagStore`). Set/get location per device using key-value tags.
 
 ### 3.8 Mapped Drive History :x: `T3`
 
@@ -246,11 +238,9 @@ Not implemented. Tracks inbound mapped drive connections for lateral movement an
 
 Not implemented. Enumerate connected printers for asset tracking.
 
-### 3.10 Device Tagging (Key-Value Metadata) :x: `T2`
+### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2`
 
-No arbitrary tag system on devices.
-
-> **Need:** Tags enable flexible grouping and targeting. Full CRUD tagging with existence checking and bulk clear.
+`TagStore` with SQLite backend. Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side `tags` plugin with server-side sync via heartbeat. Validation: key max 64 chars, value max 448 bytes. `agents_with_tag()` for scope queries.
 
 ---
 
@@ -274,11 +264,9 @@ No arbitrary tag system on devices.
 
 `network_config` plugin.
 
-### 4.5 DNS Cache Retrieval :large_orange_diamond: `T1`
+### 4.5 DNS Cache Retrieval :white_check_mark: `T1`
 
-`network_actions` plugin has flush DNS, but no DNS cache dump.
-
-> **Gap:** Need DNS cache dump capability, not just flush.
+`network_actions` plugin has flush DNS. `dns_cache` action in `network_config` plugin dumps DNS cache (Windows: `DnsGetCacheDataTable` via dnsapi.dll, Linux: systemd-resolved query).
 
 ### 4.6 WiFi Network Enumeration :x: `T2`
 
@@ -502,11 +490,9 @@ Not implemented. Modify allow/block lists on endpoint security products.
 
 `filesystem` plugin.
 
-### 10.3 File Content Read (by Line) :large_orange_diamond: `T1`
+### 10.3 File Content Read (by Line) :white_check_mark: `T1`
 
-`filesystem` plugin has basic read.
-
-> **Gap:** No line-range or streaming file read for large files.
+`filesystem` plugin `read` action with `offset` (1-based line number) and `limit` (max lines, configurable) parameters for line-range access.
 
 ### 10.4 File Hash Computation :white_check_mark: `T1`
 
@@ -540,9 +526,9 @@ Not implemented. Find/replace, append, write, and delete operations on text file
 
 Not implemented. Integrity verification of directory trees.
 
-### 10.12 Temp File Creation :x: `T1`
+### 10.12 Temp File Creation :white_check_mark: `T1`
 
-Not implemented. Secure temp file for staged operations.
+`yuzu_create_temp_file()` and `yuzu_create_temp_dir()` in SDK with secure permissions (POSIX mkstemps 0600, Windows owner-only DACL). Exposed via filesystem plugin `create_temp`/`create_temp_dir` actions.
 
 ### 10.13 File Retrieval (Upload to Server) :x: `T2`
 
@@ -810,9 +796,9 @@ Web UI uses session cookies only.
 
 Not implemented. Per-instruction or per-device auth tokens.
 
-### 18.9 HTTPS for Web Dashboard :x: `T1`
+### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 
-Dashboard is HTTP only. TLS termination needed for production.
+`httplib::SSLServer` with OpenSSL. CLI flags: `--https`, `--https-port`, `--https-cert`, `--https-key`, `--no-https-redirect`. HTTP-to-HTTPS 301 redirect. Secure cookie flag. Settings UI TLS configuration section.
 
 ---
 
@@ -828,11 +814,9 @@ Dashboard is HTTP only. TLS termination needed for production.
 
 `WatchEvents` RPC streams connect/disconnect/plugin-load events.
 
-### 19.3 Scope / Filter-Based Device Selection :x: `T2`
+### 19.3 Scope / Filter-Based Device Selection :white_check_mark: `T2`
 
-`ListAgentsRequest.filter` is a placeholder.
-
-> **Need:** Query language for targeting with AND/OR logic, scope expressions, FQDN/domain lookups, and management group filtering.
+494-line recursive-descent `ScopeEngine` parser. 9 operators (`==`, `!=`, `LIKE`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`), AND/OR/NOT combinators. Attributes: ostype, osver, hostname, arch, fqdn, `tag:*`. Target estimation via `/api/target/estimate`.
 
 ### 19.4 Hierarchical Management Groups :x: `T2`
 
@@ -860,21 +844,17 @@ Not implemented. Server-initiated agent installer push to discovered endpoints.
 
 SSE-based streaming to dashboard. gRPC streaming for programmatic access.
 
-### 20.2 Response Filtering and Pagination :x: `T2`
+### 20.2 Response Filtering and Pagination :white_check_mark: `T2`
 
-Dashboard shows raw streaming output.
-
-> **Need:** Server-side response storage, complex filtering with operand/operator expressions, pagination, and multi-column sorting.
+`ResponseStore` with SQLite backend. `ResponseQuery` struct: agent_id, status, time range (since/until), limit/offset pagination. Exposed via `GET /api/responses/{instruction_id}` with query parameters.
 
 ### 20.3 Response Aggregation :x: `T2`
 
 Not implemented. Summarize responses across agents (counts, averages, distributions).
 
-### 20.4 Per-Device Error Tracking :x: `T2`
+### 20.4 Per-Device Error Tracking :white_check_mark: `T2`
 
-`CommandResponse` includes error detail but no persistent tracking.
-
-> **Need:** Error history, per-device failure log, error aggregation.
+`ResponseStore` persists per-response `error_detail` alongside status. Queryable by agent_id, status code, and time range for error history.
 
 ### 20.5 CSV / Data Export :x: `T2`
 
@@ -898,9 +878,9 @@ Not implemented. Route instruction responses to external HTTP endpoints.
 
 `WatchEvents` RPC.
 
-### 21.2 Audit Trail of User Actions :x: `T2`
+### 21.2 Audit Trail of User Actions :white_check_mark: `T2`
 
-Not implemented. Who ran what command, when, on which devices.
+`AuditStore` with SQLite WAL backend. Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
 
 ### 21.3 System Notifications :x: `T2`
 
@@ -1002,11 +982,9 @@ Not implemented. Register external systems to receive data feeds.
 
 Not implemented. CSV, JSON export of inventory and responses.
 
-### 24.6 Utility Functions (JSON/Table Conversion) :large_orange_diamond: `T1`
+### 24.6 Utility Functions (JSON/Table Conversion) :white_check_mark: `T1`
 
-Plugin output is pipe-delimited.
-
-> **Gap:** No built-in JSON-to-table or table-to-JSON utilities in SDK.
+`yuzu_table_to_json()`, `yuzu_json_to_table()`, `yuzu_split_lines()`, `yuzu_generate_sequence()`, `yuzu_free_string()` in `sdk/include/yuzu/plugin.h` C ABI.
 
 ### 24.7 SDK Libraries for External Integrations :x: `T3`
 
@@ -1052,14 +1030,16 @@ Not implemented. Client libraries wrapping the management API for third-party in
 
 ---
 
-## Appendix B: Remaining Foundation Gaps
+## Appendix B: Foundation Tier Status
 
-These 4 items plus 3 partial items are all that remain before the Foundation tier is 100% complete:
+**Foundation tier: 33/33 done (100%)**
 
-1. **1.4** Agent version/update management -- no OTA update mechanism
-2. **18.9** HTTPS for web dashboard -- HTTP only; TLS termination needed
-3. **10.12** Temp file creation -- secure temp file for staged operations
-4. **24.6** SDK utility functions -- no JSON/table conversion utilities
-5. **1.8** Connection and session info -- missing agent-side diagnostics *(partial)*
-6. **4.5** DNS cache retrieval -- only flush, no dump *(partial)*
-7. **10.3** File content read by line -- no line-range access *(partial)*
+All Foundation-tier gaps have been closed as of 2026-03-18:
+
+- **1.4** Agent OTA updates -- `agents/core/src/updater.cpp`
+- **1.8** Connection diagnostics -- `connection_info` action in diagnostics plugin
+- **4.5** DNS cache dump -- `dns_cache` action in network_config plugin
+- **10.3** File read by line range -- `offset`/`limit` params in filesystem plugin
+- **10.12** Temp file creation -- `yuzu_create_temp_file()` in SDK
+- **18.9** HTTPS for dashboard -- `httplib::SSLServer` with OpenSSL
+- **24.6** SDK utility functions -- 4 conversion functions in plugin.h

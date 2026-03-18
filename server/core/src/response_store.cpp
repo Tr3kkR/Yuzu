@@ -1,5 +1,6 @@
 #include "response_store.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include <spdlog/spdlog.h>
@@ -146,6 +147,74 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
 
 std::vector<StoredResponse> ResponseStore::get_by_instruction(const std::string& instruction_id) const {
     return query(instruction_id);
+}
+
+std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instruction_id,
+                                                        const AggregationQuery& aq,
+                                                        const ResponseQuery& filter) const {
+    std::vector<AggregationResult> results;
+    if (!db_) return results;
+
+    // Whitelist group_by columns to prevent SQL injection
+    static const std::vector<std::string> allowed_group = {"status", "agent_id"};
+    if (std::find(allowed_group.begin(), allowed_group.end(), aq.group_by) == allowed_group.end()) {
+        spdlog::warn("ResponseStore::aggregate: invalid group_by '{}'", aq.group_by);
+        return results;
+    }
+
+    // Whitelist op columns
+    static const std::vector<std::string> allowed_op_col = {"timestamp", "status", "id"};
+    auto effective_op_col = aq.op_column.empty() ? "id" : aq.op_column;
+    if (std::find(allowed_op_col.begin(), allowed_op_col.end(), effective_op_col) == allowed_op_col.end()) {
+        spdlog::warn("ResponseStore::aggregate: invalid op_column '{}'", effective_op_col);
+        return results;
+    }
+
+    // Build aggregate function
+    std::string agg_func;
+    switch (aq.op) {
+        case AggregateOp::Count: agg_func = "COUNT(*)"; break;
+        case AggregateOp::Sum:   agg_func = "SUM(" + effective_op_col + ")"; break;
+        case AggregateOp::Avg:   agg_func = "AVG(" + effective_op_col + ")"; break;
+        case AggregateOp::Min:   agg_func = "MIN(" + effective_op_col + ")"; break;
+        case AggregateOp::Max:   agg_func = "MAX(" + effective_op_col + ")"; break;
+    }
+
+    std::string sql = "SELECT " + aq.group_by + ", COUNT(*), " + agg_func +
+                      " FROM responses WHERE instruction_id = ?";
+    std::vector<std::string> bind_texts;
+    bind_texts.push_back(instruction_id);
+
+    if (!filter.agent_id.empty()) {
+        sql += " AND agent_id = ?";
+        bind_texts.push_back(filter.agent_id);
+    }
+    if (filter.status >= 0)
+        sql += " AND status = " + std::to_string(filter.status);
+    if (filter.since > 0)
+        sql += " AND timestamp >= " + std::to_string(filter.since);
+    if (filter.until > 0)
+        sql += " AND timestamp <= " + std::to_string(filter.until);
+
+    sql += " GROUP BY " + aq.group_by + " ORDER BY COUNT(*) DESC";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
+
+    for (int i = 0; i < static_cast<int>(bind_texts.size()); ++i) {
+        sqlite3_bind_text(stmt, i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        AggregationResult r;
+        auto gv = sqlite3_column_text(stmt, 0);
+        if (gv) r.group_value = reinterpret_cast<const char*>(gv);
+        r.count           = sqlite3_column_int64(stmt, 1);
+        r.aggregate_value = sqlite3_column_double(stmt, 2);
+        results.push_back(std::move(r));
+    }
+    sqlite3_finalize(stmt);
+    return results;
 }
 
 std::size_t ResponseStore::total_count() const {
