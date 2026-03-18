@@ -2672,8 +2672,9 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page, metrics, and OIDC flow
+                // Allow unauthenticated access to login page, metrics, health, and OIDC flow
                 if (req.path == "/login" || req.path == "/metrics" ||
+                    req.path == "/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }

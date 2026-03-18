@@ -54,10 +54,10 @@ TEST_CASE("create_temp_file respects custom directory", "[temp_file]") {
 
     fs::path p(path);
     REQUIRE(fs::exists(p));
-    REQUIRE(p.parent_path() == fs::canonical(custom_dir));
+    REQUIRE(fs::canonical(p.parent_path()) == fs::canonical(custom_dir));
 
     fs::remove(p);
-    fs::remove(custom_dir);
+    fs::remove_all(custom_dir);
 }
 
 TEST_CASE("create_temp_file creates unique files", "[temp_file]") {

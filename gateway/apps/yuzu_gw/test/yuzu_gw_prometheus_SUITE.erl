@@ -48,21 +48,27 @@ init_per_suite(Config) ->
     application:ensure_all_started(inets),
     application:ensure_all_started(prometheus),
     application:ensure_all_started(telemetry),
+    %% Starting prometheus_httpd app calls prometheus_http_impl:setup/0,
+    %% which declares the internal telemetry_scrape_* metrics required
+    %% for the /metrics endpoint handler to work.
+    application:ensure_all_started(prometheus_httpd),
 
     %% Set up prometheus metrics (same as app startup).
     yuzu_gw_telemetry:setup(),
 
     %% Start prometheus_httpd on a test port.
-    {ok, _} = prometheus_httpd:start([{port, ?PROM_PORT}, {path, "/metrics"}]),
+    application:set_env(prometheus, prometheus_http, [{port, ?PROM_PORT}, {path, "/metrics"}]),
+    {ok, HttpdPid} = prometheus_httpd:start(),
 
     %% Increment some counters so they appear in output.
     prometheus_counter:inc(yuzu_gw_agents_connected_total, [<<"test-node">>]),
     prometheus_counter:inc(yuzu_gw_commands_dispatched_total, [<<"test-plugin">>]),
 
-    [{prom_port, ?PROM_PORT} | Config].
+    [{prom_port, ?PROM_PORT}, {httpd_pid, HttpdPid} | Config].
 
-end_per_suite(_Config) ->
-    prometheus_httpd:stop(),
+end_per_suite(Config) ->
+    HttpdPid = proplists:get_value(httpd_pid, Config),
+    inets:stop(httpd, HttpdPid),
     ok.
 
 %%%===================================================================

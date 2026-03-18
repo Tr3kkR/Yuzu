@@ -20,7 +20,8 @@ start(_StartType, _StartArgs) ->
 
     %% Start Prometheus HTTP exporter for /metrics endpoint.
     Port = application:get_env(yuzu_gw, prometheus_port, 9568),
-    {ok, _} = prometheus_httpd:start([{port, Port}, {path, "/metrics"}]),
+    application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
+    {ok, _} = prometheus_httpd:start(),
     logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
 
     %% Start the supervision tree.

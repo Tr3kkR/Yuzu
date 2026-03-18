@@ -523,7 +523,7 @@ fi
 
 # ── Test 10: Server health endpoint ───────────────────────────────────
 log "Test: Server health endpoint"
-HEALTH_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/health" 2>/dev/null || echo "000")
+HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$SERVER_WEB_PORT/health" 2>/dev/null)
 TESTS=$((TESTS + 1))
 if [[ "$HEALTH_CODE" == "200" ]] || [[ "$HEALTH_CODE" == "404" ]]; then
     pass "Server health check endpoint accessible ($HEALTH_CODE)"
