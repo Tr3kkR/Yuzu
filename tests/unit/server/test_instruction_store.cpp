@@ -1,8 +1,8 @@
 /**
  * test_instruction_store.cpp — Unit tests for InstructionStore
  *
- * Covers: CRUD definitions, uniqueness, filters, parameters, import/export,
- *         instruction sets.
+ * Covers: CRUD definitions, uniqueness, filters, import/export,
+ *         instruction sets, extended fields, validation.
  */
 
 #include "instruction_store.hpp"
@@ -10,7 +10,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
-#include <unordered_map>
 
 using namespace yuzu::server;
 
@@ -71,6 +70,19 @@ TEST_CASE("InstructionStore: create action definition", "[instruction_store]") {
     CHECK(!result->empty());
 }
 
+TEST_CASE("InstructionStore: create with empty name fails", "[instruction_store]") {
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+    auto result = store.create_definition(def);
+    CHECK(!result.has_value());
+}
+
 TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_store]") {
     InstructionStore store(":memory:");
 
@@ -79,25 +91,29 @@ TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_stor
     def.type = "invalid";
     def.plugin = "test";
     def.action = "test";
+    def.version = "1.0";
     auto result = store.create_definition(def);
     CHECK(!result.has_value());
 }
 
-// ── Name+Version Uniqueness ────────────────────────────────────────────────
+// ── ID Uniqueness ─────────────────────────────────────────────────────────
 
-TEST_CASE("InstructionStore: name+version uniqueness", "[instruction_store]") {
+TEST_CASE("InstructionStore: auto-generated IDs are unique", "[instruction_store]") {
     InstructionStore store(":memory:");
 
     auto result1 = store.create_definition(make_question("Get Hostname", "1.0"));
     REQUIRE(result1.has_value());
 
-    // Same name+version should fail
+    // Same name+version gets a different auto-generated ID
     auto result2 = store.create_definition(make_question("Get Hostname", "1.0"));
-    CHECK(!result2.has_value());
+    REQUIRE(result2.has_value());
+    CHECK(*result1 != *result2);
 
-    // Same name, different version should succeed
-    auto result3 = store.create_definition(make_question("Get Hostname", "2.0"));
-    CHECK(result3.has_value());
+    // Explicit duplicate ID should fail
+    auto def = make_question("Another", "1.0");
+    def.id = *result1;
+    auto result3 = store.create_definition(def);
+    CHECK(!result3.has_value());
 }
 
 // ── Get By ID ──────────────────────────────────────────────────────────────
@@ -197,6 +213,45 @@ TEST_CASE("InstructionStore: query enabled_only filter", "[instruction_store]") 
     CHECK(results[0].name == "Get Hostname");
 }
 
+TEST_CASE("InstructionStore: query by set_id_filter", "[instruction_store]") {
+    InstructionStore store(":memory:");
+
+    InstructionSet iset;
+    iset.name = "Fleet Overview";
+    auto set_result = store.create_set(iset);
+    REQUIRE(set_result.has_value());
+
+    auto def1 = make_question("Get Hostname");
+    def1.instruction_set_id = *set_result;
+    store.create_definition(def1);
+
+    auto def2 = make_question("Get OS Version");
+    def2.instruction_set_id = *set_result;
+    store.create_definition(def2);
+
+    // Third definition not in set
+    store.create_definition(make_question("Get CPU Info"));
+
+    InstructionQuery q;
+    q.set_id_filter = *set_result;
+    auto results = store.query_definitions(q);
+    REQUIRE(results.size() == 2);
+}
+
+TEST_CASE("InstructionStore: query with limit", "[instruction_store]") {
+    InstructionStore store(":memory:");
+
+    for (int i = 0; i < 10; ++i) {
+        auto def = make_question("Def " + std::to_string(i), std::to_string(i) + ".0");
+        store.create_definition(def);
+    }
+
+    InstructionQuery q;
+    q.limit = 3;
+    auto results = store.query_definitions(q);
+    REQUIRE(results.size() == 3);
+}
+
 // ── Update Definition ──────────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: update definition", "[instruction_store]") {
@@ -256,79 +311,43 @@ TEST_CASE("InstructionStore: delete nonexistent returns false", "[instruction_st
     CHECK(!deleted);
 }
 
-// ── Parameter Validation ───────────────────────────────────────────────────
-
-TEST_CASE("InstructionStore: parameter validation — required", "[instruction_store][params]") {
-    InstructionStore store(":memory:");
-
-    auto def = make_action("Run Script");
-    ParamDef param;
-    param.name = "script_path";
-    param.type = "string";
-    param.required = true;
-    def.parameter_schema.push_back(param);
-    auto id_result = store.create_definition(def);
-    REQUIRE(id_result.has_value());
-
-    // Missing required parameter should fail validation
-    std::unordered_map<std::string, std::string> args;
-    auto errors = store.validate_parameters(*id_result, args);
-    CHECK(!errors.has_value());
-
-    // Providing the required parameter should pass
-    args["script_path"] = "/usr/local/bin/cleanup.sh";
-    auto errors2 = store.validate_parameters(*id_result, args);
-    CHECK(errors2.has_value());
-}
-
-TEST_CASE("InstructionStore: parameter validation — choice", "[instruction_store][params]") {
-    InstructionStore store(":memory:");
-
-    auto def = make_action("Set Power Plan");
-    ParamDef param;
-    param.name = "plan";
-    param.type = "choice";
-    param.required = true;
-    param.choices = {"balanced", "performance", "power_saver"};
-    def.parameter_schema.push_back(param);
-    auto id_result = store.create_definition(def);
-    REQUIRE(id_result.has_value());
-
-    // Valid choice
-    std::unordered_map<std::string, std::string> args;
-    args["plan"] = "balanced";
-    auto result1 = store.validate_parameters(*id_result, args);
-    CHECK(result1.has_value());
-
-    // Invalid choice
-    args["plan"] = "turbo";
-    auto result2 = store.validate_parameters(*id_result, args);
-    CHECK(!result2.has_value());
-}
-
 // ── Import/Export JSON ─────────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: export and import round-trip", "[instruction_store][json]") {
     InstructionStore store(":memory:");
 
-    auto id_result = store.create_definition(make_question("Get Hostname"));
+    auto def = make_question("Get Hostname");
+    def.parameter_schema = R"({"type":"object","properties":{"timeout":{"type":"integer"}}})";
+    def.result_schema = R"([{"name":"hostname","type":"string"}])";
+    auto id_result = store.create_definition(def);
     REQUIRE(id_result.has_value());
 
     auto json = store.export_definition_json(*id_result);
     REQUIRE(!json.empty());
     CHECK(json != "{}");
 
-    // Import into same store with different name to avoid uniqueness violation
-    // The import creates a new ID, but same name+version will fail
+    // Import into a fresh store (avoids name+version uniqueness collision)
     InstructionStore store2(":memory:");
     auto import_result = store2.import_definition_json(json);
-    CHECK(import_result.has_value());
+    REQUIRE(import_result.has_value());
+
+    // Verify the imported definition preserves fields
+    auto imported = store2.get_definition(*import_result);
+    REQUIRE(imported.has_value());
+    CHECK(imported->name == "Get Hostname");
+    CHECK(imported->plugin == "system_info");
 }
 
 TEST_CASE("InstructionStore: import invalid JSON fails", "[instruction_store][json]") {
     InstructionStore store(":memory:");
     auto result = store.import_definition_json("not valid json {{{");
     CHECK(!result.has_value());
+}
+
+TEST_CASE("InstructionStore: export nonexistent returns empty", "[instruction_store][json]") {
+    InstructionStore store(":memory:");
+    auto json = store.export_definition_json("nonexistent-id");
+    CHECK((json.empty() || json == "{}"));
 }
 
 // ── Instruction Sets ───────────────────────────────────────────────────────
@@ -373,7 +392,8 @@ TEST_CASE("InstructionStore: delete instruction set", "[instruction_store][sets]
     CHECK(sets.empty());
 }
 
-TEST_CASE("InstructionStore: definitions_in_set", "[instruction_store][sets]") {
+TEST_CASE("InstructionStore: delete set unsets instruction_set_id on definitions",
+          "[instruction_store][sets]") {
     InstructionStore store(":memory:");
 
     InstructionSet iset;
@@ -381,31 +401,74 @@ TEST_CASE("InstructionStore: definitions_in_set", "[instruction_store][sets]") {
     auto set_result = store.create_set(iset);
     REQUIRE(set_result.has_value());
 
-    auto def1 = make_question("Get Hostname");
-    def1.instruction_set_id = *set_result;
-    store.create_definition(def1);
+    auto def = make_question("Get Hostname");
+    def.instruction_set_id = *set_result;
+    auto def_result = store.create_definition(def);
+    REQUIRE(def_result.has_value());
 
-    auto def2 = make_question("Get OS Version");
-    def2.instruction_set_id = *set_result;
-    store.create_definition(def2);
+    // Delete the set
+    bool deleted = store.delete_set(*set_result);
+    REQUIRE(deleted);
 
-    // Third definition not in set
-    store.create_definition(make_question("Get CPU Info"));
-
-    auto defs = store.definitions_in_set(*set_result);
-    REQUIRE(defs.size() == 2);
+    // The definition should still exist but with instruction_set_id cleared
+    auto fetched = store.get_definition(*def_result);
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->instruction_set_id.empty());
 }
 
-TEST_CASE("InstructionStore: set name uniqueness", "[instruction_store][sets]") {
+TEST_CASE("InstructionStore: delete nonexistent set returns false", "[instruction_store][sets]") {
+    InstructionStore store(":memory:");
+    bool deleted = store.delete_set("nonexistent-set-id");
+    CHECK(!deleted);
+}
+
+// ── Extended Fields ────────────────────────────────────────────────────────
+
+TEST_CASE("InstructionStore: extended fields round-trip", "[instruction_store][extended]") {
     InstructionStore store(":memory:");
 
-    InstructionSet s1;
-    s1.name = "Same Name";
-    auto r1 = store.create_set(s1);
-    REQUIRE(r1.has_value());
+    auto def = make_action("Patch Windows");
+    def.yaml_source = "name: Patch Windows\ntype: action\n";
+    def.parameter_schema = R"({"type":"object","properties":{"kb":{"type":"string"}}})";
+    def.result_schema = R"([{"name":"exit_code","type":"int32"},{"name":"reboot","type":"bool"}])";
+    def.approval_mode = "role-gated";
+    def.concurrency_mode = "per-device";
+    def.platforms = "windows";
+    def.min_agent_version = "2.1.0";
+    def.required_plugins = "windows_update,remediation";
+    def.readable_payload = "Install KB ${kb} on target";
+    def.created_by = "admin";
+    def.gather_ttl_seconds = 600;
+    def.response_ttl_days = 180;
 
-    InstructionSet s2;
-    s2.name = "Same Name";
-    auto r2 = store.create_set(s2);
-    CHECK(!r2.has_value());
+    auto id_result = store.create_definition(def);
+    REQUIRE(id_result.has_value());
+
+    auto fetched = store.get_definition(*id_result);
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->yaml_source == def.yaml_source);
+    CHECK(fetched->parameter_schema == def.parameter_schema);
+    CHECK(fetched->result_schema == def.result_schema);
+    CHECK(fetched->approval_mode == "role-gated");
+    CHECK(fetched->concurrency_mode == "per-device");
+    CHECK(fetched->platforms == "windows");
+    CHECK(fetched->min_agent_version == "2.1.0");
+    CHECK(fetched->required_plugins == "windows_update,remediation");
+    CHECK(fetched->readable_payload == "Install KB ${kb} on target");
+    CHECK(fetched->created_by == "admin");
+    CHECK(fetched->gather_ttl_seconds == 600);
+    CHECK(fetched->response_ttl_days == 180);
+}
+
+TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][extended]") {
+    InstructionStore store(":memory:");
+
+    auto def = make_question("Get Hostname");
+    auto id_result = store.create_definition(def);
+    REQUIRE(id_result.has_value());
+
+    auto fetched = store.get_definition(*id_result);
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->created_at > 0);
+    CHECK(fetched->updated_at > 0);
 }

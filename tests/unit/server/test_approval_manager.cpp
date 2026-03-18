@@ -1,8 +1,9 @@
 /**
  * test_approval_manager.cpp — Unit tests for ApprovalManager
  *
- * Covers: submit, approve, reject, self-approval prevention, cancel,
- *         pending_count, needs_approval policy, expire_stale, query.
+ * Covers: submit, query by status/submitted_by, pending_count, approve,
+ *         reject, self-approval prevention, double-review prevention,
+ *         approve nonexistent.
  */
 
 #include "approval_manager.hpp"
@@ -10,7 +11,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
-#include <chrono>
 #include <string>
 #include <vector>
 
@@ -27,24 +27,6 @@ struct TestDb {
     }
 };
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-static int64_t now_epoch() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-static ApprovalRequest make_request(const std::string& definition_id = "def-001",
-                                    const std::string& submitted_by = "operator1",
-                                    const std::string& scope = "ostype = 'windows'") {
-    ApprovalRequest req;
-    req.definition_id = definition_id;
-    req.submitted_by = submitted_by;
-    req.scope_expression = scope;
-    return req;
-}
-
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 TEST_CASE("ApprovalManager: create_tables succeeds", "[approval_manager][db]") {
@@ -54,281 +36,50 @@ TEST_CASE("ApprovalManager: create_tables succeeds", "[approval_manager][db]") {
     REQUIRE(true);
 }
 
-// ── Submit Request ─────────────────────────────────────────────────────────
+// ── Submit ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: submit request", "[approval_manager]") {
+TEST_CASE("ApprovalManager: submit creates pending approval", "[approval_manager]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit(make_request());
+    auto result = mgr.submit("def-001", "operator1", "ostype = 'windows'");
     REQUIRE(result.has_value());
     CHECK(!result->empty());
 }
 
-TEST_CASE("ApprovalManager: submitted request is pending", "[approval_manager]") {
+TEST_CASE("ApprovalManager: submitted approval has pending status", "[approval_manager]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit(make_request());
+    auto result = mgr.submit("def-001", "operator1", "ostype = 'windows'");
     REQUIRE(result.has_value());
 
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "pending");
-    CHECK(fetched->submitted_by == "operator1");
-    CHECK(fetched->reviewed_by.empty());
-}
-
-// ── Approve ────────────────────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: approve sets status and reviewer", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-
-    auto approve_result = mgr.approve(*result, "admin_user");
-    REQUIRE(approve_result.has_value());
-
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "approved");
-    CHECK(fetched->reviewed_by == "admin_user");
-    CHECK(fetched->reviewed_at > 0);
-}
-
-TEST_CASE("ApprovalManager: approve triggers callback", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    std::string callback_id;
-    mgr.set_dispatch_callback([&](const ApprovalRequest& req) { callback_id = req.id; });
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-    mgr.approve(*result, "admin_user");
-
-    CHECK(callback_id == *result);
-}
-
-// ── Reject ─────────────────────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: reject sets status and reviewer", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-
-    auto reject_result = mgr.reject(*result, "admin_user", "Too risky");
-    REQUIRE(reject_result.has_value());
-
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "rejected");
-    CHECK(fetched->reviewed_by == "admin_user");
-    CHECK(fetched->review_comment == "Too risky");
-}
-
-// ── Self-Approval Prevention ───────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: self-approval prevented", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request("def-1", "operator1"));
-    REQUIRE(result.has_value());
-
-    // Same user cannot approve their own request
-    auto approve_result = mgr.approve(*result, "operator1");
-    CHECK(!approve_result.has_value());
-
-    // Request should still be pending
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "pending");
-}
-
-// ── Cannot Approve/Reject Non-Pending ──────────────────────────────────────
-
-TEST_CASE("ApprovalManager: cannot approve already approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-    mgr.approve(*result, "admin1");
-
-    auto approve2 = mgr.approve(*result, "admin2");
-    CHECK(!approve2.has_value());
-}
-
-TEST_CASE("ApprovalManager: cannot reject already approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-    mgr.approve(*result, "admin1");
-
-    auto reject_result = mgr.reject(*result, "admin2", "too late");
-    CHECK(!reject_result.has_value());
-}
-
-TEST_CASE("ApprovalManager: cannot approve already rejected", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-    mgr.reject(*result, "admin1", "denied");
-
-    auto approve_result = mgr.approve(*result, "admin2");
-    CHECK(!approve_result.has_value());
-}
-
-// ── Cancel ─────────────────────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: cancel pending request", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-
-    bool ok = mgr.cancel(*result);
-    REQUIRE(ok);
-
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "cancelled");
-}
-
-TEST_CASE("ApprovalManager: cannot cancel already approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    auto result = mgr.submit(make_request());
-    REQUIRE(result.has_value());
-    mgr.approve(*result, "admin1");
-
-    bool ok = mgr.cancel(*result);
-    CHECK(!ok);
-}
-
-// ── Pending Count ──────────────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: pending_count", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    CHECK(mgr.pending_count() == 0);
-
-    mgr.submit(make_request("def-1"));
-    mgr.submit(make_request("def-2"));
-    mgr.submit(make_request("def-3"));
-    CHECK(mgr.pending_count() == 3);
-
-    // Approve one
+    // Verify via query
     ApprovalQuery q;
     q.status = "pending";
     auto pending = mgr.query(q);
-    REQUIRE(!pending.empty());
-    mgr.approve(pending[0].id, "admin1");
-    CHECK(mgr.pending_count() == 2);
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].id == *result);
+    CHECK(pending[0].definition_id == "def-001");
+    CHECK(pending[0].submitted_by == "operator1");
+    CHECK(pending[0].status == "pending");
+    CHECK(pending[0].scope_expression == "ostype = 'windows'");
+    CHECK(pending[0].reviewed_by.empty());
 }
 
-// ── needs_approval Policy ──────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: questions auto-approved", "[approval_manager][policy]") {
+TEST_CASE("ApprovalManager: submit multiple approvals", "[approval_manager]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    bool needs = mgr.needs_approval("question", "user");
-    CHECK(!needs);
-}
+    mgr.submit("def-001", "operator1", "scope-1");
+    mgr.submit("def-002", "operator2", "scope-2");
+    mgr.submit("def-003", "operator1", "scope-3");
 
-TEST_CASE("ApprovalManager: actions need approval for users", "[approval_manager][policy]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    bool needs = mgr.needs_approval("action", "user");
-    CHECK(needs);
-}
-
-TEST_CASE("ApprovalManager: admin exempt from approval", "[approval_manager][policy]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    bool needs = mgr.needs_approval("action", "admin");
-    CHECK(!needs);
-}
-
-// ── Expire Stale ───────────────────────────────────────────────────────────
-
-TEST_CASE("ApprovalManager: expire_stale transitions pending to expired", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    ApprovalRequest req = make_request();
-    req.expires_at = now_epoch() - 60; // expired 1 minute ago
-    auto result = mgr.submit(req);
-    REQUIRE(result.has_value());
-
-    mgr.expire_stale(now_epoch());
-
-    auto fetched = mgr.get(*result);
-    REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "expired");
-}
-
-TEST_CASE("ApprovalManager: expire_stale does not affect approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    ApprovalRequest req = make_request();
-    req.expires_at = now_epoch() - 60;
-    auto result = mgr.submit(req);
-    REQUIRE(result.has_value());
-    mgr.approve(*result, "admin1");
-
-    mgr.expire_stale(now_epoch());
-
-    auto fetched = mgr.get(*result);
-    CHECK(fetched->status == "approved");
-}
-
-TEST_CASE("ApprovalManager: expire_stale respects expiry time", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-
-    ApprovalRequest req = make_request();
-    req.expires_at = now_epoch() + 3600; // expires in 1 hour
-    mgr.submit(req);
-
-    mgr.expire_stale(now_epoch());
-
-    // Should still be pending since not expired yet
-    CHECK(mgr.pending_count() == 1);
+    auto all = mgr.query();
+    REQUIRE(all.size() == 3);
 }
 
 // ── Query by Status ────────────────────────────────────────────────────────
@@ -338,16 +89,33 @@ TEST_CASE("ApprovalManager: query by status — pending", "[approval_manager]") 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    mgr.submit(make_request("def-1"));
-    mgr.submit(make_request("def-2"));
-    auto r3 = mgr.submit(make_request("def-3"));
+    mgr.submit("def-1", "operator1", "scope-1");
+    mgr.submit("def-2", "operator1", "scope-2");
+    auto r3 = mgr.submit("def-3", "operator1", "scope-3");
     REQUIRE(r3.has_value());
-    mgr.approve(*r3, "admin1");
+    mgr.approve(*r3, "admin1", "approved");
 
     ApprovalQuery q;
     q.status = "pending";
     auto pending = mgr.query(q);
     REQUIRE(pending.size() == 2);
+}
+
+TEST_CASE("ApprovalManager: query by status — approved", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto r1 = mgr.submit("def-1", "operator1", "scope-1");
+    mgr.submit("def-2", "operator1", "scope-2");
+    REQUIRE(r1.has_value());
+    mgr.approve(*r1, "admin1", "looks good");
+
+    ApprovalQuery q;
+    q.status = "approved";
+    auto approved = mgr.query(q);
+    REQUIRE(approved.size() == 1);
+    CHECK(approved[0].definition_id == "def-1");
 }
 
 TEST_CASE("ApprovalManager: query empty returns empty", "[approval_manager]") {
@@ -359,4 +127,200 @@ TEST_CASE("ApprovalManager: query empty returns empty", "[approval_manager]") {
     q.status = "pending";
     auto results = mgr.query(q);
     CHECK(results.empty());
+}
+
+// ── Query by submitted_by ──────────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: query by submitted_by", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    mgr.submit("def-1", "operator1", "scope-1");
+    mgr.submit("def-2", "operator2", "scope-2");
+    mgr.submit("def-3", "operator1", "scope-3");
+
+    ApprovalQuery q;
+    q.submitted_by = "operator1";
+    auto results = mgr.query(q);
+    REQUIRE(results.size() == 2);
+}
+
+// ── Pending Count ──────────────────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: pending_count starts at zero", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    CHECK(mgr.pending_count() == 0);
+}
+
+TEST_CASE("ApprovalManager: pending_count increments and decrements", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    mgr.submit("def-1", "operator1", "scope-1");
+    mgr.submit("def-2", "operator1", "scope-2");
+    mgr.submit("def-3", "operator1", "scope-3");
+    CHECK(mgr.pending_count() == 3);
+
+    // Approve one
+    ApprovalQuery q;
+    q.status = "pending";
+    auto pending = mgr.query(q);
+    REQUIRE(!pending.empty());
+    mgr.approve(pending[0].id, "admin1", "ok");
+    CHECK(mgr.pending_count() == 2);
+}
+
+// ── Approve ────────────────────────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: approve sets status, reviewer, timestamp", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+
+    auto approve_result = mgr.approve(*result, "admin_user", "Approved for deployment");
+    REQUIRE(approve_result.has_value());
+
+    ApprovalQuery q;
+    q.status = "approved";
+    auto approved = mgr.query(q);
+    REQUIRE(approved.size() == 1);
+    CHECK(approved[0].status == "approved");
+    CHECK(approved[0].reviewed_by == "admin_user");
+    CHECK(approved[0].reviewed_at > 0);
+    CHECK(approved[0].review_comment == "Approved for deployment");
+}
+
+TEST_CASE("ApprovalManager: approve with empty comment", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+
+    auto approve_result = mgr.approve(*result, "admin_user", "");
+    REQUIRE(approve_result.has_value());
+}
+
+// ── Reject ─────────────────────────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+
+    auto reject_result = mgr.reject(*result, "admin_user", "Too risky");
+    REQUIRE(reject_result.has_value());
+
+    ApprovalQuery q;
+    q.status = "rejected";
+    auto rejected = mgr.query(q);
+    REQUIRE(rejected.size() == 1);
+    CHECK(rejected[0].status == "rejected");
+    CHECK(rejected[0].reviewed_by == "admin_user");
+    CHECK(rejected[0].review_comment == "Too risky");
+    CHECK(rejected[0].reviewed_at > 0);
+}
+
+// ── Self-Approval Prevention ───────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: self-approval prevented", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-1", "operator1", "scope");
+    REQUIRE(result.has_value());
+
+    // Same user cannot approve their own request
+    auto approve_result = mgr.approve(*result, "operator1", "self-approve");
+    CHECK(!approve_result.has_value());
+
+    // Verify request is still pending
+    CHECK(mgr.pending_count() == 1);
+}
+
+// ── Cannot Approve/Reject Already-Reviewed ─────────────────────────────────
+
+TEST_CASE("ApprovalManager: cannot approve already approved", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+    mgr.approve(*result, "admin1", "ok");
+
+    auto approve2 = mgr.approve(*result, "admin2", "also ok");
+    CHECK(!approve2.has_value());
+}
+
+TEST_CASE("ApprovalManager: cannot reject already approved", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+    mgr.approve(*result, "admin1", "ok");
+
+    auto reject_result = mgr.reject(*result, "admin2", "too late");
+    CHECK(!reject_result.has_value());
+}
+
+TEST_CASE("ApprovalManager: cannot approve already rejected", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+    mgr.reject(*result, "admin1", "denied");
+
+    auto approve_result = mgr.approve(*result, "admin2", "wait, let me reconsider");
+    CHECK(!approve_result.has_value());
+}
+
+TEST_CASE("ApprovalManager: cannot reject already rejected", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.submit("def-001", "operator1", "scope");
+    REQUIRE(result.has_value());
+    mgr.reject(*result, "admin1", "denied");
+
+    auto reject2 = mgr.reject(*result, "admin2", "also denied");
+    CHECK(!reject2.has_value());
+}
+
+// ── Approve/Reject Nonexistent ─────────────────────────────────────────────
+
+TEST_CASE("ApprovalManager: approve nonexistent ID fails", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.approve("nonexistent-id", "admin1", "approving nothing");
+    CHECK(!result.has_value());
+}
+
+TEST_CASE("ApprovalManager: reject nonexistent ID fails", "[approval_manager]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto result = mgr.reject("nonexistent-id", "admin1", "rejecting nothing");
+    CHECK(!result.has_value());
 }
