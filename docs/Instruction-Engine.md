@@ -12,7 +12,7 @@
 
 - **Phase 0** complete — HTTPS, OTA updates (`agents/core/src/updater.cpp`), secure temp files (`sdk/include/yuzu/plugin.h`), SDK utilities (`yuzu_table_to_json`, `yuzu_json_to_table`, `yuzu_split_lines`, `yuzu_generate_sequence`).
 - **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
-- **Phase 2** scaffolded — `InstructionStore` (DDL, CRUD, import/export JSON), `ExecutionTracker` (Execution/AgentExecStatus structs, rerun, cancel), `ApprovalManager` (submit/approve/reject, pending count), `ScheduleEngine` (frequency types, scope expression, approval gating). All stubs with table creation and struct definitions; business logic not yet wired.
+- **Phase 2** implemented — `InstructionStore` (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), `ExecutionTracker` (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), `ApprovalManager` (submit/approve/reject with ownership validation — reviewer != submitter, pending count), `ScheduleEngine` (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by SQLite with WAL mode.
 - **30 plugins** across `agents/plugins/`: 24 cross-platform, 4 Windows-only (`bitlocker`, `msi_packages`, `sccm`, `windows_updates`), 2 test/debug (`chargen`, `example`).
 - **Plugin ABI** v1 stable: `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`.
 - **Wire protocol**: gRPC/Protobuf — `CommandRequest` (plugin + action + parameters + expires_at), `CommandResponse` (status enum: RUNNING/SUCCESS/FAILURE/TIMEOUT/REJECTED, streaming output).
@@ -59,7 +59,7 @@ This document is the architectural blueprint for that work.
 | **TagStore** | `tag_store.hpp` | **Real** | SQLite-backed. `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
-**Overall progress:** 44/139 capabilities done (32%). Phase 0 and 1 complete. Phase 2 scaffolded (DDL + struct definitions; business logic in progress).
+**Overall progress:** 44/139 capabilities done (32%). Phases 0, 1, and 2 complete. Phase 2 business logic fully implemented.
 
 ---
 

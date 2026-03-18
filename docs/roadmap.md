@@ -15,18 +15,18 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 0.5 | [#152](https://github.com/Tr3kkR/Yuzu/issues/152) | Complete Foundation Partial Items | Done |
 | **1** | 1.1 | [#166](https://github.com/Tr3kkR/Yuzu/issues/166) | Server-Side Response Persistence (SQLite) | Done |
 | | 1.2 | [#167](https://github.com/Tr3kkR/Yuzu/issues/167) | Response Filtering, Pagination, and Sorting | Done |
-| | 1.3 | [#168](https://github.com/Tr3kkR/Yuzu/issues/168) | Response Aggregation Engine | Open |
+| | 1.3 | [#168](https://github.com/Tr3kkR/Yuzu/issues/168) | Response Aggregation Engine | Done |
 | | 1.4 | [#169](https://github.com/Tr3kkR/Yuzu/issues/169) | Audit Trail System | Done |
 | | 1.5 | [#170](https://github.com/Tr3kkR/Yuzu/issues/170) | Device Tagging System | Done |
 | | 1.6 | [#171](https://github.com/Tr3kkR/Yuzu/issues/171) | Scope Expression Engine and Device Filtering | Done |
-| | 1.7 | [#172](https://github.com/Tr3kkR/Yuzu/issues/172) | CSV and JSON Data Export | Open |
-| **2** | 2.1 | [#149](https://github.com/Tr3kkR/Yuzu/issues/149) | Instruction Definitions | Scaffolded |
-| | 2.2 | [#151](https://github.com/Tr3kkR/Yuzu/issues/151) | Instruction Sets (Grouping and Organization) | Scaffolded |
-| | 2.3 | [#153](https://github.com/Tr3kkR/Yuzu/issues/153) | Instruction Scheduling | Scaffolded |
-| | 2.4 | [#155](https://github.com/Tr3kkR/Yuzu/issues/155) | Instruction Approval Workflows | Scaffolded |
-| | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows | Open |
-| | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Scaffolded |
-| | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Open |
+| | 1.7 | [#172](https://github.com/Tr3kkR/Yuzu/issues/172) | CSV and JSON Data Export | Done |
+| **2** | 2.1 | [#149](https://github.com/Tr3kkR/Yuzu/issues/149) | Instruction Definitions | Done |
+| | 2.2 | [#151](https://github.com/Tr3kkR/Yuzu/issues/151) | Instruction Sets (Grouping and Organization) | Done |
+| | 2.3 | [#153](https://github.com/Tr3kkR/Yuzu/issues/153) | Instruction Scheduling | Done |
+| | 2.4 | [#155](https://github.com/Tr3kkR/Yuzu/issues/155) | Instruction Approval Workflows | Done |
+| | 2.5 | [#158](https://github.com/Tr3kkR/Yuzu/issues/158) | Instruction Hierarchies and Follow-Up Workflows | Done |
+| | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Done |
+| | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Done |
 | **3** | 3.1 | [#154](https://github.com/Tr3kkR/Yuzu/issues/154) | Granular RBAC System | Open |
 | | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Open |
 | | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Open |
@@ -67,17 +67,17 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 
 ## Current Status
 
-| Phase | Done | Open | Scaffolded | Total | Progress |
-|-------|:----:|:----:|:----------:|:-----:|----------|
-| 0: Foundation | 5 | 0 | 0 | 5 | 100% |
-| 1: Data Infrastructure | 5 | 2 | 0 | 7 | 71% |
-| 2: Instruction System | 0 | 2 | 5 | 7 | Scaffolded |
-| 3: Security & RBAC | 0 | 8 | 0 | 8 | 0% |
-| 4: Agent Infrastructure | 0 | 7 | 0 | 7 | 0% |
-| 5: Policy Engine | 0 | 4 | 0 | 4 | 0% |
-| 6: Windows Depth | 0 | 6 | 0 | 6 | 0% |
-| 7: Scale & Integration | 0 | 12 | 0 | 12 | 0% |
-| **Total** | **10** | **41** | **5** | **56** | |
+| Phase | Done | Open | Total | Progress |
+|-------|:----:|:----:|:-----:|----------|
+| 0: Foundation | 5 | 0 | 5 | 100% |
+| 1: Data Infrastructure | 7 | 0 | 7 | 100% |
+| 2: Instruction System | 7 | 0 | 7 | 100% |
+| 3: Security & RBAC | 0 | 8 | 8 | 0% |
+| 4: Agent Infrastructure | 0 | 7 | 7 | 0% |
+| 5: Policy Engine | 0 | 4 | 4 | 0% |
+| 6: Windows Depth | 0 | 6 | 6 | 0% |
+| 7: Scale & Integration | 0 | 12 | 12 | 0% |
+| **Total** | **19** | **37** | **56** | |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
