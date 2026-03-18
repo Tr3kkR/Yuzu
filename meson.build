@@ -145,6 +145,21 @@ if _rebar3.found()
     build_always_stale: true,
     build_by_default: true,
   )
+  # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
+  _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
+  _python3 = find_program('python3')
+  test('gateway eunit',
+    _python3,
+    args: [_gw_test_script, _gw_src, 'eunit'],
+    suite: 'gateway',
+    timeout: 120,
+  )
+  test('gateway ct',
+    _python3,
+    args: [_gw_test_script, _gw_src, 'ct'],
+    suite: 'gateway',
+    timeout: 300,
+  )
   message('Erlang gateway: enabled (rebar3 found)')
 else
   message('Erlang gateway: skipped (rebar3 not found)')
