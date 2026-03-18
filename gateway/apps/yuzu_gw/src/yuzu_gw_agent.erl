@@ -41,7 +41,7 @@
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
     agent_info  :: map(),
     plugins     :: [binary()],
-    pending     :: #{binary() => {pid(), reference()}},  %% command_id => {reply_to, mon_ref}
+    pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
     peer_addr   :: binary()
 }).
@@ -99,7 +99,9 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     },
 
     %% Register in routing table and join pg groups.
-    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins),
+    Hostname = maps:get(<<"hostname">>, AgentInfo,
+                        maps:get(hostname, AgentInfo, <<>>)),
+    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins, Hostname),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
@@ -174,7 +176,7 @@ streaming(cast, {dispatch, CommandReq, {ReplyTo, FanoutRef}}, Data) ->
                       #{agent_id => AgentId, plugin => Plugin,
                         command_id => CmdId}),
 
-    Pending2 = Pending#{CmdId => {ReplyTo, FanoutRef}},
+    Pending2 = Pending#{CmdId => {ReplyTo, FanoutRef, erlang:monotonic_time(millisecond)}},
     {keep_state, Data#data{pending = Pending2}};
 
 streaming(info, {stream_data, ResponseFrame}, Data) ->
@@ -185,7 +187,7 @@ streaming(info, {stream_data, ResponseFrame}, Data) ->
                       maps:get(status, ResponseFrame, undefined)),
 
     case maps:find(CmdId, Pending) of
-        {ok, {ReplyTo, FanoutRef}} ->
+        {ok, {ReplyTo, FanoutRef, DispatchedAt}} ->
             ReplyTo ! {command_response, FanoutRef, AgentId, ResponseFrame},
 
             Pending2 = case Status of
@@ -193,8 +195,9 @@ streaming(info, {stream_data, ResponseFrame}, Data) ->
                 <<"RUNNING">>      -> Pending;
                 0                  -> Pending;  %% proto enum value
                 _FinalStatus       ->
+                    Duration = erlang:monotonic_time(millisecond) - DispatchedAt,
                     telemetry:execute([yuzu, gw, command, completed],
-                                      #{duration_ms => 0},
+                                      #{duration_ms => Duration},
                                       #{agent_id => AgentId, status => Status}),
                     %% Notify router so it can complete the fanout.
                     case whereis(yuzu_gw_router) of
@@ -266,9 +269,14 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
     %% Deregister from routing table and pg groups.
     yuzu_gw_registry:deregister_agent(AgentId),
 
-    %% Notify pending command waiters that the agent disconnected.
-    maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef}) ->
-        ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected}
+    %% Notify pending command waiters that the agent disconnected,
+    %% and notify router so it can complete fanout tracking.
+    maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
+        ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
+        case whereis(yuzu_gw_router) of
+            undefined -> ok;
+            RouterPid -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
+        end
     end, Pending),
 
     Duration = case ConnectedAt of
@@ -310,10 +318,13 @@ format_info(#data{agent_id = AgentId, session_id = SessionId,
                    plugins = Plugins, connected_at = ConnectedAt,
                    agent_info = AgentInfo, peer_addr = PeerAddr,
                    pending = Pending}, State) ->
+    Hostname = maps:get(<<"hostname">>, AgentInfo,
+                        maps:get(hostname, AgentInfo, <<>>)),
     #{agent_id     => AgentId,
       session_id   => SessionId,
       state        => State,
       plugins      => Plugins,
+      hostname     => Hostname,
       connected_at => ConnectedAt,
       peer_addr    => PeerAddr,
       agent_info   => AgentInfo,

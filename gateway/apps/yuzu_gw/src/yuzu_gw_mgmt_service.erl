@@ -90,8 +90,7 @@ get_agent(Request, Ctx) ->
                     Plugins = [#{name => P} || P <- maps:get(plugins, Info, [])],
                     Response = #{
                         summary => #{agent_id     => AgentId,
-                                     hostname     => maps:get(hostname,
-                                                              maps:get(agent_info, Info, #{}), <<>>),
+                                     hostname     => maps:get(hostname, Info, <<>>),
                                      online       => true,
                                      last_seen    => #{millis_epoch =>
                                                        maps:get(connected_at, Info, 0)}},

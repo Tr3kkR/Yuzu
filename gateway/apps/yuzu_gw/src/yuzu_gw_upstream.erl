@@ -32,12 +32,14 @@
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
+-define(MAX_NOTIFY_INFLIGHT, 10).
 
 -record(state, {
     hb_buffer     :: [map()],           %% buffered heartbeat requests
     hb_timer      :: reference() | undefined,
     hb_interval   :: non_neg_integer(), %% ms
-    max_hb_buffer :: non_neg_integer()  %% cap for retained buffer on failure
+    max_hb_buffer :: non_neg_integer(), %% cap for retained buffer on failure
+    notify_pids   :: #{pid() => true}   %% in-flight notification processes
 }).
 
 %%%===================================================================
@@ -84,7 +86,8 @@ init([]) ->
         hb_buffer     = [],
         hb_timer      = TRef,
         hb_interval   = Interval,
-        max_hb_buffer = MaxBuf
+        max_hb_buffer = MaxBuf,
+        notify_pids   = #{}
     }}.
 
 handle_call({proxy_register, RegisterReq}, _From, State) ->
@@ -102,24 +105,30 @@ handle_cast({queue_heartbeat, HbReq}, #state{hb_buffer = Buf} = State) ->
     {noreply, State#state{hb_buffer = [HbReq | Buf]}};
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
-            State) ->
-    Notification = #{
-        agent_id     => AgentId,
-        session_id   => ensure_binary(SessionId),
-        event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
-        peer_addr    => PeerAddr,
-        gateway_node => atom_to_binary(node(), utf8)
-    },
-    %% Fire-and-forget: stream status is best-effort.
-    spawn(fun() ->
-        case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
-            {ok, _} -> ok;
-            {error, Reason} ->
-                logger:warning("Failed to notify stream status for ~s: ~p",
-                               [AgentId, Reason])
-        end
-    end),
-    {noreply, State};
+            #state{notify_pids = Pids} = State) ->
+    case map_size(Pids) >= ?MAX_NOTIFY_INFLIGHT of
+        true ->
+            %% At capacity — drop this notification (best-effort).
+            logger:debug("Dropping stream status notification for ~s (at capacity)", [AgentId]),
+            {noreply, State};
+        false ->
+            Notification = #{
+                agent_id     => AgentId,
+                session_id   => ensure_binary(SessionId),
+                event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
+                peer_addr    => PeerAddr,
+                gateway_node => atom_to_binary(node(), utf8)
+            },
+            {Pid, _MonRef} = spawn_monitor(fun() ->
+                case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
+                    {ok, _} -> ok;
+                    {error, Reason} ->
+                        logger:warning("Failed to notify stream status for ~s: ~p",
+                                       [AgentId, Reason])
+                end
+            end),
+            {noreply, State#state{notify_pids = Pids#{Pid => true}}}
+    end;
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -153,6 +162,10 @@ handle_info(flush_heartbeats, #state{hb_buffer = Buf, hb_interval = Interval,
 
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
     {noreply, State#state{hb_buffer = NewBuf, hb_timer = TRef}};
+
+handle_info({'DOWN', _MonRef, process, Pid, _Reason},
+            #state{notify_pids = Pids} = State) ->
+    {noreply, State#state{notify_pids = maps:remove(Pid, Pids)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -205,7 +218,7 @@ do_rpc(Method, Request, Tag) ->
                               #{count => 1},
                               #{rpc_name => atom_to_binary(Tag, utf8),
                                 code => Reason}),
-            {error, Reason}
+            {error, {internal, iolist_to_binary(io_lib:format("~p", [Reason]))}}
     end.
 
 ensure_binary(undefined) -> <<>>;

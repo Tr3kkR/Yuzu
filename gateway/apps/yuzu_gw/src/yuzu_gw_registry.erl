@@ -15,7 +15,7 @@
 
 %% API
 -export([start_link/0,
-         register_agent/4,
+         register_agent/5,
          deregister_agent/1,
          lookup/1,
          all_agents/0,
@@ -50,9 +50,9 @@ start_link() ->
 
 %% @doc Register an agent process in the routing table.
 %% Called by yuzu_gw_agent:init/1 from the agent process itself.
--spec register_agent(binary(), pid(), binary() | undefined, [binary()]) -> ok.
-register_agent(AgentId, Pid, SessionId, Plugins) ->
-    gen_server:call(?SERVER, {register, AgentId, Pid, SessionId, Plugins}).
+-spec register_agent(binary(), pid(), binary() | undefined, [binary()], binary()) -> ok.
+register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
+    gen_server:call(?SERVER, {register, AgentId, Pid, SessionId, Plugins, Hostname}).
 
 %% @doc Remove an agent from the routing table.
 -spec deregister_agent(binary()) -> ok.
@@ -63,7 +63,7 @@ deregister_agent(AgentId) ->
 -spec lookup(binary()) -> {ok, pid()} | error.
 lookup(AgentId) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, _, _}] ->
+        [{_, Pid, _, _, _, _, _}] ->
             case is_process_alive(Pid) of
                 true  -> {ok, Pid};
                 false -> error
@@ -75,7 +75,7 @@ lookup(AgentId) ->
 %% @doc Return all agent IDs.
 -spec all_agents() -> [binary()].
 all_agents() ->
-    [AgentId || {AgentId, _, _, _, _, _} <- ets:tab2list(?TABLE)].
+    [AgentId || {AgentId, _, _, _, _, _, _} <- ets:tab2list(?TABLE)].
 
 %% @doc Return all agent pids (for broadcast via pg fallback).
 -spec all_agent_pids() -> [pid()].
@@ -102,7 +102,7 @@ list_agents(Limit, Cursor) ->
     Filtered = case Cursor of
         undefined -> All;
         <<>>      -> All;
-        _         -> lists:dropwhile(fun({Id, _, _, _, _, _}) -> Id =< Cursor end, All)
+        _         -> lists:dropwhile(fun({Id, _, _, _, _, _, _}) -> Id =< Cursor end, All)
     end,
     Page = lists:sublist(Filtered, Limit),
     Agents = [#{agent_id     => Id,
@@ -110,8 +110,9 @@ list_agents(Limit, Cursor) ->
                 node         => Node,
                 session_id   => Sid,
                 plugins      => Plugins,
-                connected_at => T}
-              || {Id, Pid, Node, Sid, Plugins, T} <- Page],
+                connected_at => T,
+                hostname     => Hn}
+              || {Id, Pid, Node, Sid, Plugins, T, Hn} <- Page],
     NextCursor = case length(Page) =:= Limit andalso length(Filtered) > Limit of
         true  -> element(1, lists:last(Page));
         false -> undefined
@@ -147,14 +148,14 @@ init([]) ->
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
     {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
 
-handle_call({register, AgentId, Pid, SessionId, Plugins}, _From,
+handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname}, _From,
             #state{monitor_refs = Mons} = State) ->
     %% Remove any stale entry for this agent_id (returns cleaned Mons).
     Mons1 = maybe_cleanup(AgentId, Mons),
 
     %% Insert into ETS.
     Now = erlang:system_time(millisecond),
-    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now}),
+    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now, Hostname}),
 
     %% Join pg groups.
     pg:join(?PG_SCOPE, all_agents, Pid),
@@ -216,7 +217,7 @@ terminate(_Reason, _State) ->
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, Plugins, _}] ->
+        [{_, Pid, _, _, Plugins, _, _}] ->
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes on process exit, but leave explicitly for clarity.
             catch pg:leave(?PG_SCOPE, all_agents, Pid),
@@ -233,7 +234,7 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
 %% @doc Clean up a stale agent entry and return the updated monitor map.
 maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, OldPid, _, _, OldPlugins, _}] ->
+        [{_, OldPid, _, _, OldPlugins, _, _}] ->
             catch pg:leave(?PG_SCOPE, all_agents, OldPid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)
