@@ -147,9 +147,10 @@ void RbacStore::seed_defaults() {
     // Built-in roles
     struct RoleSeed { const char* name; const char* desc; };
     RoleSeed roles[] = {
-        {"Administrator", "Full access to all operations"},
-        {"Operator",      "Execute and manage instructions, schedules, and tags"},
-        {"Viewer",        "Read-only access to operational data"},
+        {"Administrator",    "Full access to all operations"},
+        {"PlatformEngineer", "Author and manage YAML instruction definitions, sets, and schemas"},
+        {"Operator",         "Execute and manage instructions, schedules, and tags"},
+        {"Viewer",           "Read-only access to operational data"},
     };
     for (auto& [name, desc] : roles) {
         sqlite3_stmt* s = nullptr;
@@ -175,6 +176,34 @@ void RbacStore::seed_defaults() {
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
+    }
+
+    // PlatformEngineer: full CRUD on definitions, sets, and read on related types
+    const char* pe_full_types[] = {"InstructionDefinition", "InstructionSet"};
+    const char* pe_full_ops[]   = {"Read", "Write", "Execute", "Delete"};
+    for (auto* t : pe_full_types) {
+        for (auto* o : pe_full_ops) {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(db_,
+                "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', ?, ?, 'allow');",
+                -1, &s, nullptr);
+            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+    // PlatformEngineer: read on operational types for context
+    const char* pe_read_types[] = {
+        "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response"};
+    for (auto* t : pe_read_types) {
+        sqlite3_stmt* s = nullptr;
+        sqlite3_prepare_v2(db_,
+            "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', ?, 'Read', 'allow');",
+            -1, &s, nullptr);
+        sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
     }
 
     // Operator: read/write/execute on operational types, read on audit/response

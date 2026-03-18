@@ -64,6 +64,8 @@ extern const char* const kSettingsHtml;
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kInstructionEditorHtml;
+extern const char* const kInstructionEditorDeniedHtml;
 
 namespace yuzu::server {
 
@@ -4774,17 +4776,39 @@ private:
                 }
 
                 auto defs = instruction_store_->query_definitions();
+
+                // Check if user has PlatformEngineer or Administrator role
+                // PlatformEngineer or Administrator can author definitions.
+                // When RBAC enforcement is fully wired, this will check the
+                // PlatformEngineer role via RbacStore::check_permission().
+                bool can_author = (session->role == auth::Role::admin);
+
                 std::string html;
+                // Toolbar with New button for Platform Engineers
+                html += "<div class=\"toolbar\"><div>";
+                html += "<strong>" + std::to_string(defs.size()) + "</strong> definitions";
+                html += "</div><div>";
+                if (can_author) {
+                    html += "<button class=\"btn btn-primary\" onclick=\"openEditor()\">"
+                            "New Definition</button>";
+                }
+                html += "</div></div>";
+
                 if (defs.empty()) {
-                    html = "<div class=\"empty-state\">No instruction definitions yet. Use the API "
-                           "to create one.</div>";
+                    html += "<div class=\"empty-state\">No instruction definitions yet.";
+                    if (can_author)
+                        html += " Click <strong>New Definition</strong> to create one.";
+                    html += "</div>";
                 } else {
-                    html = "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</"
+                    html += "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</"
                            "th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
                     for (const auto& d : defs) {
                         auto type_cls = d.type == "question" ? "status-running" : "status-pending";
+                        bool is_legacy = d.id.starts_with("legacy.");
                         html += "<tr><td><strong>" + html_escape(d.name) +
-                                "</strong><br><span style=\"font-size:0.65rem;color:#8b949e\">" +
+                                "</strong>";
+                        if (is_legacy) html += " <span class=\"legacy-badge\">legacy</span>";
+                        html += "<br><span style=\"font-size:0.65rem;color:#8b949e\">" +
                                 html_escape(d.id.substr(0, 12)) +
                                 "</span></td>"
                                 "<td><code>" +
@@ -4801,8 +4825,12 @@ private:
                                                 ? "-"
                                                 : d.instruction_set_id.substr(0, 8)) +
                                 "</td>"
-                                "<td><button class=\"btn btn-danger\" "
-                                "style=\"font-size:0.65rem;padding:0.15rem 0.5rem\" "
+                                "<td>";
+                        if (can_author) {
+                            html += "<button class=\"btn btn-secondary btn-sm\" "
+                                    "onclick=\"openEditor('" + d.id + "')\">Edit</button> ";
+                        }
+                        html += "<button class=\"btn btn-danger btn-sm\" "
                                 "hx-delete=\"/api/instructions/" +
                                 d.id +
                                 "\" hx-target=\"#tab-definitions\" hx-swap=\"innerHTML\" "
@@ -4812,6 +4840,205 @@ private:
                     html += "</tbody></table>";
                 }
                 res.set_content(html, "text/html; charset=utf-8");
+            });
+
+        // -- Editor fragment: RBAC-gated to PlatformEngineer / Administrator --
+        web_server_->Get(
+            "/fragments/instructions/editor",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+
+                // PlatformEngineer or Administrator can author definitions.
+                // When RBAC enforcement is fully wired, this will check the
+                // PlatformEngineer role via RbacStore::check_permission().
+                bool can_author = (session->role == auth::Role::admin);
+                if (!can_author) {
+                    res.set_content(kInstructionEditorDeniedHtml, "text/html; charset=utf-8");
+                    return;
+                }
+
+                std::string tmpl(kInstructionEditorHtml);
+                auto def_id = req.get_param_value("id");
+                if (!def_id.empty() && instruction_store_) {
+                    auto def = instruction_store_->get_definition(def_id);
+                    if (def) {
+                        auto replace = [&](const std::string& key, const std::string& val) {
+                            for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
+                                tmpl.replace(pos, key.size(), html_escape(val));
+                        };
+                        replace("{{TITLE}}", "Edit Definition");
+                        replace("{{DEF_ID}}", def->id);
+                        replace("{{DEF_NAME}}", def->name);
+                        replace("{{DEF_VERSION}}", def->version);
+                        replace("{{DEF_PLUGIN}}", def->plugin);
+                        replace("{{DEF_ACTION}}", def->action);
+                        replace("{{DEF_DESCRIPTION}}", def->description);
+                        replace("{{DEF_PLATFORMS}}", def->platforms);
+                        replace("{{YAML_SOURCE}}", def->yaml_source);
+                        // Set dropdowns
+                        replace("{{SEL_QUESTION}}", def->type == "question" ? "selected" : "");
+                        replace("{{SEL_ACTION}}", def->type == "action" ? "selected" : "");
+                        replace("{{SEL_APPR_AUTO}}", def->approval_mode == "auto" ? "selected" : "");
+                        replace("{{SEL_APPR_ROLE}}", def->approval_mode == "role-gated" ? "selected" : "");
+                        replace("{{SEL_APPR_ALWAYS}}", def->approval_mode == "always" ? "selected" : "");
+                        replace("{{SEL_CC_UNLIM}}", def->concurrency_mode == "unlimited" ? "selected" : "");
+                        replace("{{SEL_CC_DEV}}", def->concurrency_mode == "per-device" ? "selected" : "");
+                        replace("{{SEL_CC_DEF}}", def->concurrency_mode == "per-definition" ? "selected" : "");
+                        replace("{{SEL_CC_SET}}", def->concurrency_mode == "per-set" ? "selected" : "");
+                    }
+                } else {
+                    // New definition — clear all placeholders
+                    auto clear = [&](const std::string& key) {
+                        for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
+                            tmpl.replace(pos, key.size(), "");
+                    };
+                    auto replace = [&](const std::string& key, const std::string& val) {
+                        for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
+                            tmpl.replace(pos, key.size(), val);
+                    };
+                    replace("{{TITLE}}", "New Definition");
+                    clear("{{DEF_ID}}"); clear("{{DEF_NAME}}"); clear("{{DEF_VERSION}}");
+                    clear("{{DEF_PLUGIN}}"); clear("{{DEF_ACTION}}"); clear("{{DEF_DESCRIPTION}}");
+                    clear("{{DEF_PLATFORMS}}");
+                    replace("{{YAML_SOURCE}}",
+                        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+                        "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
+                        "  plugin: \"\"\n  action: \"\"\n  type: question\n"
+                        "  description: \"\"\n  concurrency: unlimited\n"
+                        "  approval: auto\n  parameters:\n    type: object\n"
+                        "    additionalProperties:\n      type: string\n"
+                        "  results:\n    - name: output\n      type: string\n");
+                    replace("{{SEL_QUESTION}}", "selected");
+                    clear("{{SEL_ACTION}}");
+                    replace("{{SEL_APPR_AUTO}}", "selected");
+                    clear("{{SEL_APPR_ROLE}}"); clear("{{SEL_APPR_ALWAYS}}");
+                    replace("{{SEL_CC_UNLIM}}", "selected");
+                    clear("{{SEL_CC_DEV}}"); clear("{{SEL_CC_DEF}}"); clear("{{SEL_CC_SET}}");
+                }
+                res.set_content(tmpl, "text/html; charset=utf-8");
+            });
+
+        // -- YAML save endpoint (HTMX form POST from editor) --
+        web_server_->Post(
+            "/api/instructions/yaml",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+
+                // PlatformEngineer or Administrator can author definitions.
+                // When RBAC enforcement is fully wired, this will check the
+                // PlatformEngineer role via RbacStore::check_permission().
+                bool can_author = (session->role == auth::Role::admin);
+                if (!can_author) {
+                    res.set_content(
+                        "<div class=\"alert alert-error\">Permission denied: PlatformEngineer role required</div>",
+                        "text/html");
+                    return;
+                }
+                if (!instruction_store_) {
+                    res.set_content(
+                        "<div class=\"alert alert-error\">Instruction store not available</div>",
+                        "text/html");
+                    return;
+                }
+
+                auto yaml_source = req.get_param_value("yaml_source");
+                auto def_id = req.get_param_value("id");
+
+                if (yaml_source.empty()) {
+                    res.set_content(
+                        "<div class=\"alert alert-error\">YAML source cannot be empty</div>",
+                        "text/html");
+                    return;
+                }
+
+                // Minimal YAML field extraction (name, plugin, action from the YAML text).
+                // Full yaml-cpp parsing is deferred; for now we extract fields via simple
+                // line scanning — the YAML source is stored verbatim as source of truth.
+                auto extract = [&](const std::string& key) -> std::string {
+                    auto needle = key + ": ";
+                    auto pos = yaml_source.find(needle);
+                    if (pos == std::string::npos) return {};
+                    auto start = pos + needle.size();
+                    auto end = yaml_source.find('\n', start);
+                    auto val = yaml_source.substr(start, end - start);
+                    // Strip quotes
+                    if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
+                        val = val.substr(1, val.size() - 2);
+                    return val;
+                };
+
+                InstructionDefinition def;
+                def.name = extract("name");
+                def.version = extract("version");
+                def.plugin = extract("plugin");
+                def.action = extract("action");
+                def.type = extract("type");
+                def.description = extract("description");
+                def.concurrency_mode = extract("concurrency");
+                def.approval_mode = extract("approval");
+                def.yaml_source = yaml_source;
+                def.created_by = session->username;
+                def.enabled = true;
+
+                if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
+                    res.set_content(
+                        "<div class=\"alert alert-error\">Missing required fields: name, plugin, action</div>",
+                        "text/html");
+                    return;
+                }
+
+                std::string msg;
+                if (!def_id.empty()) {
+                    def.id = def_id;
+                    auto result = instruction_store_->update_definition(def);
+                    msg = result ? "Definition updated" : "Update failed: " + result.error();
+                } else {
+                    auto result = instruction_store_->create_definition(def);
+                    msg = result ? "Definition created" : "Create failed: " + result.error();
+                }
+
+                std::string cls = msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
+                res.set_content(
+                    "<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
+                    "text/html");
+            });
+
+        // -- YAML validate endpoint --
+        web_server_->Post(
+            "/api/instructions/validate-yaml",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) return;
+
+                auto yaml_source = req.get_param_value("yaml_source");
+                std::vector<std::string> errors;
+
+                if (yaml_source.empty())
+                    errors.push_back("YAML source is empty");
+                if (yaml_source.find("apiVersion:") == std::string::npos)
+                    errors.push_back("Missing apiVersion field");
+                if (yaml_source.find("kind:") == std::string::npos)
+                    errors.push_back("Missing kind field");
+                if (yaml_source.find("plugin:") == std::string::npos)
+                    errors.push_back("Missing spec.plugin field");
+                if (yaml_source.find("action:") == std::string::npos)
+                    errors.push_back("Missing spec.action field");
+
+                if (errors.empty()) {
+                    res.set_content(
+                        "<div class=\"alert alert-success\">YAML validation passed</div>",
+                        "text/html");
+                } else {
+                    std::string html = "<div class=\"alert alert-error\"><strong>Validation errors:</strong><ul>";
+                    for (const auto& e : errors)
+                        html += "<li>" + html_escape(e) + "</li>";
+                    html += "</ul></div>";
+                    res.set_content(html, "text/html");
+                }
             });
 
         web_server_->Get("/fragments/executions", [this](const httplib::Request& req,
