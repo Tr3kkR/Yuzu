@@ -87,7 +87,8 @@ TEST_CASE("ConcurrencyManager: per-definition allows after release", "[concurren
     CHECK(mgr.try_acquire("def-1", "exec-3", "per-definition") == true);
 }
 
-TEST_CASE("ConcurrencyManager: per-definition allows different definitions", "[concurrency_manager]") {
+TEST_CASE("ConcurrencyManager: per-definition allows different definitions",
+          "[concurrency_manager]") {
     TestDb tdb;
     ConcurrencyManager mgr(tdb.db);
     mgr.create_tables();

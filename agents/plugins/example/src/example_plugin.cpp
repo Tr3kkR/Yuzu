@@ -12,14 +12,14 @@
 
 class ExamplePlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "example"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "example"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Reference example plugin — responds to 'ping'";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "ping", "echo", nullptr };
+        static const char* acts[] = {"ping", "echo", nullptr};
         return acts;
     }
 
@@ -30,9 +30,7 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "ping") {
             ctx.write_output("pong");
             return 0;

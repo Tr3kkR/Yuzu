@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <format>
+#include <regex>
 #include <sstream>
 #include <string>
 
@@ -28,6 +29,10 @@ enum class TokenType {
     OpGe,
     OpIn,
     OpContains,
+    OpMatches,
+    OpExists,
+    KwLen,
+    KwStartswith,
     KwAnd,
     KwOr,
     KwNot,
@@ -134,7 +139,10 @@ private:
         std::string val;
         while (pos_ < input_.size() && input_[pos_] != quote) {
             if (input_[pos_] == '\\' && pos_ + 1 < input_.size()) {
-                ++pos_;
+                char ch = input_[pos_ + 1];
+                if (ch == quote || ch == '\\') {
+                    ++pos_; // only consume backslash for quote or backslash
+                }
             }
             val += input_[pos_++];
         }
@@ -174,6 +182,14 @@ private:
             return {TokenType::OpIn, val, start};
         if (upper == "CONTAINS")
             return {TokenType::OpContains, val, start};
+        if (upper == "MATCHES")
+            return {TokenType::OpMatches, val, start};
+        if (upper == "EXISTS")
+            return {TokenType::OpExists, val, start};
+        if (upper == "LEN")
+            return {TokenType::KwLen, val, start};
+        if (upper == "STARTSWITH")
+            return {TokenType::KwStartswith, val, start};
 
         return {TokenType::Ident, val, start};
     }
@@ -290,6 +306,101 @@ private:
             return result;
         }
 
+        // EXISTS <attribute> — unary operator (checks non-empty)
+        if (tok.type == TokenType::OpExists) {
+            tokenizer_.next(); // consume EXISTS
+            auto attr_tok = tokenizer_.next();
+            if (attr_tok.type != TokenType::Ident) {
+                return std::unexpected(std::format(
+                    "expected attribute after EXISTS at position {}", attr_tok.pos));
+            }
+            Condition cond;
+            cond.attribute = attr_tok.value;
+            cond.op = CompOp::Exists;
+            return Expression{std::move(cond)};
+        }
+
+        // LEN(<attribute>) <op> <value> — string length comparison
+        if (tok.type == TokenType::KwLen) {
+            tokenizer_.next(); // consume LEN
+            auto lp = tokenizer_.next();
+            if (lp.type != TokenType::LParen) {
+                return std::unexpected(std::format(
+                    "expected '(' after LEN at position {}", lp.pos));
+            }
+            auto attr_tok = tokenizer_.next();
+            if (attr_tok.type != TokenType::Ident) {
+                return std::unexpected(std::format(
+                    "expected attribute inside LEN() at position {}", attr_tok.pos));
+            }
+            auto rp = tokenizer_.next();
+            if (rp.type != TokenType::RParen) {
+                return std::unexpected(std::format(
+                    "expected ')' after LEN attribute at position {}", rp.pos));
+            }
+            // Now read comparison operator and value
+            auto op_tok = tokenizer_.next();
+            CompOp op;
+            switch (op_tok.type) {
+            case TokenType::OpEq:  op = CompOp::Eq;  break;
+            case TokenType::OpNeq: op = CompOp::Neq; break;
+            case TokenType::OpLt:  op = CompOp::Lt;  break;
+            case TokenType::OpGt:  op = CompOp::Gt;  break;
+            case TokenType::OpLe:  op = CompOp::Le;  break;
+            case TokenType::OpGe:  op = CompOp::Ge;  break;
+            default:
+                return std::unexpected(std::format(
+                    "expected comparison operator after LEN() at position {}", op_tok.pos));
+            }
+            auto val_tok = tokenizer_.next();
+            if (val_tok.type != TokenType::Ident && val_tok.type != TokenType::String) {
+                return std::unexpected(std::format(
+                    "expected value after LEN() operator at position {}", val_tok.pos));
+            }
+            // Encode as synthetic attribute __len:<attr>
+            Condition cond;
+            cond.attribute = "__len:" + attr_tok.value;
+            cond.op = op;
+            cond.value = val_tok.value;
+            return Expression{std::move(cond)};
+        }
+
+        // STARTSWITH(<attribute>, <prefix>) — prefix check
+        if (tok.type == TokenType::KwStartswith) {
+            tokenizer_.next(); // consume STARTSWITH
+            auto lp = tokenizer_.next();
+            if (lp.type != TokenType::LParen) {
+                return std::unexpected(std::format(
+                    "expected '(' after STARTSWITH at position {}", lp.pos));
+            }
+            auto attr_tok = tokenizer_.next();
+            if (attr_tok.type != TokenType::Ident) {
+                return std::unexpected(std::format(
+                    "expected attribute inside STARTSWITH() at position {}", attr_tok.pos));
+            }
+            auto comma = tokenizer_.next();
+            if (comma.type != TokenType::Comma) {
+                return std::unexpected(std::format(
+                    "expected ',' in STARTSWITH() at position {}", comma.pos));
+            }
+            auto val_tok = tokenizer_.next();
+            if (val_tok.type != TokenType::Ident && val_tok.type != TokenType::String) {
+                return std::unexpected(std::format(
+                    "expected prefix value in STARTSWITH() at position {}", val_tok.pos));
+            }
+            auto rp = tokenizer_.next();
+            if (rp.type != TokenType::RParen) {
+                return std::unexpected(std::format(
+                    "expected ')' after STARTSWITH() at position {}", rp.pos));
+            }
+            // Encode as synthetic attribute __startswith:<attr>
+            Condition cond;
+            cond.attribute = "__startswith:" + attr_tok.value;
+            cond.op = CompOp::Eq;
+            cond.value = val_tok.value;
+            return Expression{std::move(cond)};
+        }
+
         return parse_condition();
     }
 
@@ -329,6 +440,9 @@ private:
             break;
         case TokenType::OpContains:
             op = CompOp::Contains;
+            break;
+        case TokenType::OpMatches:
+            op = CompOp::Matches;
             break;
         default:
             return std::unexpected(std::format("expected operator at position {}, got '{}'",
@@ -500,7 +614,39 @@ bool ci_contains(std::string_view haystack, std::string_view needle) {
 
 // -- Evaluate a single condition ---------------------------------------------
 
+// -- Helper: case-insensitive startswith ------------------------------------
+
+bool ci_starts_with(std::string_view text, std::string_view prefix) {
+    if (prefix.size() > text.size())
+        return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(text[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
+    // Synthetic __startswith:<attr> — resolve real attribute then prefix-check
+    if (cond.attribute.starts_with("__startswith:")) {
+        auto real_attr = cond.attribute.substr(13);
+        auto resolved = resolver(real_attr);
+        return ci_starts_with(resolved, cond.value);
+    }
+
+    // Synthetic __len:<attr> — resolve real attribute then compare length
+    if (cond.attribute.starts_with("__len:")) {
+        auto real_attr = cond.attribute.substr(6);
+        auto resolved = resolver(real_attr);
+        auto len_str = std::to_string(resolved.size());
+        // Eq/Neq: direct string compare (both are numeric strings)
+        if (cond.op == CompOp::Eq) return len_str == cond.value;
+        if (cond.op == CompOp::Neq) return len_str != cond.value;
+        return try_numeric_compare(len_str, cond.value, cond.op);
+    }
+
     auto resolved = resolver(cond.attribute);
 
     switch (cond.op) {
@@ -510,6 +656,16 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
         return !ci_equal(resolved, cond.value);
     case CompOp::Like:
         return wildcard_match(cond.value, resolved);
+    case CompOp::Matches: {
+        try {
+            std::regex re(cond.value, std::regex::ECMAScript | std::regex::icase);
+            return std::regex_search(std::string(resolved), re);
+        } catch (const std::regex_error&) {
+            return false;
+        }
+    }
+    case CompOp::Exists:
+        return !resolved.empty();
     case CompOp::Lt:
     case CompOp::Gt:
     case CompOp::Le:

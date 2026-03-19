@@ -437,10 +437,9 @@ bool AuthManager::remove_user(const std::string& username) {
 // ── OIDC session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
-                                              const std::string& email,
-                                              const std::string& oidc_sub,
-                                              const std::vector<std::string>& groups,
-                                              const std::string& admin_group_id) {
+                                             const std::string& email, const std::string& oidc_sub,
+                                             const std::vector<std::string>& groups,
+                                             const std::string& admin_group_id) {
     std::lock_guard lock(mu_);
 
     // Determine role: admin if user is in the configured admin group,
@@ -465,11 +464,11 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
 
     auto token = generate_session_token();
     Session s;
-    s.username    = display_name.empty() ? email : display_name;
-    s.role        = role;
-    s.expires_at  = std::chrono::steady_clock::now() + kSessionDuration;
+    s.username = display_name.empty() ? email : display_name;
+    s.role = role;
+    s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
-    s.oidc_sub    = oidc_sub;
+    s.oidc_sub = oidc_sub;
     sessions_[token] = std::move(s);
 
     spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",

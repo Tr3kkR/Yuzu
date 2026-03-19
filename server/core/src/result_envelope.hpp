@@ -31,8 +31,8 @@ struct InstructionResult {
     std::string execution_id;
     std::string definition_id;
     std::string agent_id;
-    int64_t timestamp{0};   // epoch milliseconds
-    std::string status;     // e.g. "success", "failure", "timeout"
+    int64_t timestamp{0}; // epoch milliseconds
+    std::string status;   // e.g. "success", "failure", "timeout"
     int error_code{0};
     int64_t duration_ms{0};
 
@@ -54,8 +54,7 @@ struct InstructionResult {
 //
 // `result_schema_json` is the JSON result-schema from the InstructionDefinition
 // (may be empty, in which case column types fall back to String).
-InstructionResult parse_result(const std::string& output,
-                               const std::string& result_schema_json);
+InstructionResult parse_result(const std::string& output, const std::string& result_schema_json);
 
 // Serialize an InstructionResult to a nlohmann::json object suitable for the
 // REST API or persistent storage.

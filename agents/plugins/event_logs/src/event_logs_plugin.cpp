@@ -47,7 +47,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -69,12 +70,14 @@ std::vector<std::string> run_command_lines(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return lines;
+    if (!pipe)
+        return lines;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         std::string line(buf.data());
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
             line.pop_back();
-        if (!line.empty()) lines.push_back(std::move(line));
+        if (!line.empty())
+            lines.push_back(std::move(line));
     }
 #ifdef _WIN32
     _pclose(pipe);
@@ -92,8 +95,8 @@ std::string sanitize_input(std::string_view input) {
     std::string out;
     out.reserve(input.size());
     for (char ch : input) {
-        if (std::isalnum(static_cast<unsigned char>(ch)) ||
-            ch == ' ' || ch == '.' || ch == '-' || ch == '_' || ch == '/') {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == ' ' || ch == '.' || ch == '-' ||
+            ch == '_' || ch == '/') {
             out += ch;
         }
     }
@@ -104,27 +107,34 @@ std::string sanitize_input(std::string_view input) {
 
 int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto log_name = sanitize_input(params.get("log"));
-    if (log_name.empty()) log_name = "System";
+    if (log_name.empty())
+        log_name = "System";
 
     auto hours_str = std::string(params.get("hours"));
-    if (hours_str.empty()) hours_str = "24";
+    if (hours_str.empty())
+        hours_str = "24";
     // Validate hours is numeric
     int hours = 24;
-    try { hours = std::stoi(hours_str); } catch (...) { hours = 24; }
-    if (hours < 1) hours = 1;
-    if (hours > 720) hours = 720;
+    try {
+        hours = std::stoi(hours_str);
+    } catch (...) {
+        hours = 24;
+    }
+    if (hours < 1)
+        hours = 1;
+    if (hours > 720)
+        hours = 720;
 
 #ifdef _WIN32
-    auto cmd = std::format(
-        "powershell -NoProfile -Command \""
-        "Get-WinEvent -FilterHashtable @{{LogName='{}';Level=2;"
-        "StartTime=(Get-Date).AddHours(-{})}} -MaxEvents 100 "
-        "-ErrorAction SilentlyContinue | ForEach-Object {{ "
-        "$_.TimeCreated.ToString('o') + '|' + $_.Id + '|' + "
-        "$_.ProviderName + '|' + "
-        "($_.Message -replace '[\\r\\n]+',' ').Substring(0,"
-        "[Math]::Min(200,$_.Message.Length)) }}\"",
-        log_name, hours);
+    auto cmd = std::format("powershell -NoProfile -Command \""
+                           "Get-WinEvent -FilterHashtable @{{LogName='{}';Level=2;"
+                           "StartTime=(Get-Date).AddHours(-{})}} -MaxEvents 100 "
+                           "-ErrorAction SilentlyContinue | ForEach-Object {{ "
+                           "$_.TimeCreated.ToString('o') + '|' + $_.Id + '|' + "
+                           "$_.ProviderName + '|' + "
+                           "($_.Message -replace '[\\r\\n]+',' ').Substring(0,"
+                           "[Math]::Min(200,$_.Message.Length)) }}\"",
+                           log_name, hours);
     auto lines = run_command_lines(cmd.c_str());
     if (lines.empty()) {
         ctx.write_output("error|none|No error events found|-|-");
@@ -162,7 +172,8 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (colon != std::string::npos) {
             auto unit = rest.substr(0, colon);
             auto message = rest.substr(colon + 2);
-            if (message.size() > 200) message = message.substr(0, 200);
+            if (message.size() > 200)
+                message = message.substr(0, 200);
             ctx.write_output(std::format("error|{}|{}|{}", timestamp, unit, message));
         } else {
             ctx.write_output(std::format("error|{}|-|{}", timestamp, rest));
@@ -170,10 +181,9 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format(
-        "log show --predicate 'messageType == error' --last {}h "
-        "--style compact 2>/dev/null | head -100",
-        hours);
+    auto cmd = std::format("log show --predicate 'messageType == error' --last {}h "
+                           "--style compact 2>/dev/null | head -100",
+                           hours);
     auto lines = run_command_lines(cmd.c_str());
     if (lines.empty()) {
         ctx.write_output("error|none|-|No error events found");
@@ -195,7 +205,8 @@ int do_errors(yuzu::CommandContext& ctx, yuzu::Params params) {
             process = rest.substr(0, second_space);
             message = rest.substr(second_space + 2);
         }
-        if (message.size() > 200) message = message.substr(0, 200);
+        if (message.size() > 200)
+            message = message.substr(0, 200);
         ctx.write_output(std::format("error|{}|{}|{}", timestamp, process, message));
     }
 
@@ -221,23 +232,30 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
     auto count_str = std::string(params.get("count"));
-    if (count_str.empty()) count_str = "50";
+    if (count_str.empty())
+        count_str = "50";
     int count = 50;
-    try { count = std::stoi(count_str); } catch (...) { count = 50; }
-    if (count < 1) count = 1;
-    if (count > 500) count = 500;
+    try {
+        count = std::stoi(count_str);
+    } catch (...) {
+        count = 50;
+    }
+    if (count < 1)
+        count = 1;
+    if (count > 500)
+        count = 500;
 
 #ifdef _WIN32
-    auto cmd = std::format(
-        "powershell -NoProfile -Command \""
-        "Get-WinEvent -LogName '{}' -MaxEvents {} "
-        "-ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*{}*' }} "
-        "| ForEach-Object {{ "
-        "$_.TimeCreated.ToString('o') + '|' + $_.LevelDisplayName + '|' + "
-        "$_.Id + '|' + $_.ProviderName + '|' + "
-        "($_.Message -replace '[\\r\\n]+',' ').Substring(0,"
-        "[Math]::Min(200,$_.Message.Length)) }}\"",
-        log_name, count, filter);
+    auto cmd =
+        std::format("powershell -NoProfile -Command \""
+                    "Get-WinEvent -LogName '{}' -MaxEvents {} "
+                    "-ErrorAction SilentlyContinue | Where-Object {{ $_.Message -like '*{}*' }} "
+                    "| ForEach-Object {{ "
+                    "$_.TimeCreated.ToString('o') + '|' + $_.LevelDisplayName + '|' + "
+                    "$_.Id + '|' + $_.ProviderName + '|' + "
+                    "($_.Message -replace '[\\r\\n]+',' ').Substring(0,"
+                    "[Math]::Min(200,$_.Message.Length)) }}\"",
+                    log_name, count, filter);
     auto lines = run_command_lines(cmd.c_str());
     if (lines.empty()) {
         ctx.write_output("event|none|-|-|-|No matching events found");
@@ -248,9 +266,8 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__linux__)
-    auto cmd = std::format(
-        "journalctl --grep=\"{}\" -n {} --no-pager -o short-iso 2>/dev/null",
-        filter, count);
+    auto cmd = std::format("journalctl --grep=\"{}\" -n {} --no-pager -o short-iso 2>/dev/null",
+                           filter, count);
     auto lines = run_command_lines(cmd.c_str());
     if (lines.empty()) {
         ctx.write_output("event|none|-|No matching events found");
@@ -272,7 +289,8 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
         if (colon != std::string::npos) {
             auto unit = rest.substr(0, colon);
             auto message = rest.substr(colon + 2);
-            if (message.size() > 200) message = message.substr(0, 200);
+            if (message.size() > 200)
+                message = message.substr(0, 200);
             ctx.write_output(std::format("event|{}|{}|{}", timestamp, unit, message));
         } else {
             ctx.write_output(std::format("event|{}|-|{}", timestamp, rest));
@@ -280,10 +298,9 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto cmd = std::format(
-        "log show --predicate 'eventMessage contains \"{}\"' --last 24h "
-        "--style compact 2>/dev/null | head -{}",
-        filter, count);
+    auto cmd = std::format("log show --predicate 'eventMessage contains \"{}\"' --last 24h "
+                           "--style compact 2>/dev/null | head -{}",
+                           filter, count);
     auto lines = run_command_lines(cmd.c_str());
     if (lines.empty()) {
         ctx.write_output("event|none|-|No matching events found");
@@ -304,7 +321,8 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
             process = rest.substr(0, second_space);
             message = rest.substr(second_space + 2);
         }
-        if (message.size() > 200) message = message.substr(0, 200);
+        if (message.size() > 200)
+            message = message.substr(0, 200);
         ctx.write_output(std::format("event|{}|{}|{}", timestamp, process, message));
     }
 
@@ -314,34 +332,30 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class EventLogsPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "event_logs"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "event_logs"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Queries system event logs for errors and filtered events";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "errors", "query", nullptr
-        };
+        static const char* acts[] = {"errors", "query", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
-        if (action == "errors") return do_errors(ctx, params);
-        if (action == "query")  return do_query(ctx, params);
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
+        if (action == "errors")
+            return do_errors(ctx, params);
+        if (action == "query")
+            return do_query(ctx, params);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

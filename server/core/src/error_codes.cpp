@@ -40,16 +40,21 @@ const ErrorCodeInfo* find_entry(int code) {
 } // namespace
 
 ErrorCategory categorize(int code) {
-    if (code >= 1000 && code < 2000) return ErrorCategory::Plugin;
-    if (code >= 2000 && code < 3000) return ErrorCategory::Transport;
-    if (code >= 3000 && code < 4000) return ErrorCategory::Orchestration;
-    if (code >= 4000 && code < 5000) return ErrorCategory::Agent;
+    if (code >= 1000 && code < 2000)
+        return ErrorCategory::Plugin;
+    if (code >= 2000 && code < 3000)
+        return ErrorCategory::Transport;
+    if (code >= 3000 && code < 4000)
+        return ErrorCategory::Orchestration;
+    if (code >= 4000 && code < 5000)
+        return ErrorCategory::Agent;
     return ErrorCategory::Unknown;
 }
 
 std::optional<ErrorCodeInfo> lookup(int code) {
     const auto* entry = find_entry(code);
-    if (!entry) return std::nullopt;
+    if (!entry)
+        return std::nullopt;
     return *entry;
 }
 
@@ -65,11 +70,16 @@ int max_retry_attempts(int code) {
 
 std::string_view category_name(ErrorCategory cat) {
     switch (cat) {
-    case ErrorCategory::Plugin: return "Plugin";
-    case ErrorCategory::Transport: return "Transport";
-    case ErrorCategory::Orchestration: return "Orchestration";
-    case ErrorCategory::Agent: return "Agent";
-    case ErrorCategory::Unknown: return "Unknown";
+    case ErrorCategory::Plugin:
+        return "Plugin";
+    case ErrorCategory::Transport:
+        return "Transport";
+    case ErrorCategory::Orchestration:
+        return "Orchestration";
+    case ErrorCategory::Agent:
+        return "Agent";
+    case ErrorCategory::Unknown:
+        return "Unknown";
     }
     return "Unknown";
 }

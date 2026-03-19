@@ -68,6 +68,7 @@ void AnalyticsEventStore::emit(AnalyticsEvent event) {
     nlohmann::json j = event;
     auto json_str = j.dump();
 
+    std::lock_guard lock(mu_);
     const char* sql = "INSERT INTO analytics_buffer (event_json, created_at) VALUES (?, ?)";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)

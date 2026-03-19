@@ -36,7 +36,7 @@ std::vector<std::string_view> to_sv_vec(const char* const* names, size_t count) 
     return v;
 }
 
-}  // namespace
+} // namespace
 
 extern "C" {
 
@@ -44,47 +44,48 @@ YUZU_EXPORT void yuzu_free_string(char* str) {
     std::free(str);
 }
 
-YUZU_EXPORT char* yuzu_table_to_json(
-        const char*        input,
-        const char* const* column_names,
-        size_t             column_count)
-{
-    if (!input || !column_names || column_count == 0) return nullptr;
+YUZU_EXPORT char* yuzu_table_to_json(const char* input, const char* const* column_names,
+                                     size_t column_count) {
+    if (!input || !column_names || column_count == 0)
+        return nullptr;
 
     auto cols = to_sv_vec(column_names, column_count);
     auto result = yuzu::sdk::table_to_json(input, cols);
-    if (!result) return nullptr;
+    if (!result)
+        return nullptr;
     return to_c_string(*result);
 }
 
-YUZU_EXPORT char* yuzu_json_to_table(
-        const char*        json_input,
-        const char* const* column_names,
-        size_t             column_count)
-{
-    if (!json_input || !column_names || column_count == 0) return nullptr;
+YUZU_EXPORT char* yuzu_json_to_table(const char* json_input, const char* const* column_names,
+                                     size_t column_count) {
+    if (!json_input || !column_names || column_count == 0)
+        return nullptr;
 
     auto cols = to_sv_vec(column_names, column_count);
     auto result = yuzu::sdk::json_to_table(json_input, cols);
-    if (!result) return nullptr;
+    if (!result)
+        return nullptr;
     return to_c_string(*result);
 }
 
 YUZU_EXPORT char* yuzu_split_lines(const char* input) {
-    if (!input) return nullptr;
+    if (!input)
+        return nullptr;
 
     auto lines = yuzu::sdk::split_lines(input);
     std::string normalized;
     for (size_t i = 0; i < lines.size(); ++i) {
-        if (i > 0) normalized += '\n';
+        if (i > 0)
+            normalized += '\n';
         normalized += lines[i];
     }
     return to_c_string(normalized);
 }
 
 YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefix) {
-    if (count <= 0) return nullptr;
+    if (count <= 0)
+        return nullptr;
     return to_c_string(yuzu::sdk::generate_sequence(start, count, prefix ? prefix : ""));
 }
 
-}  // extern "C"
+} // extern "C"

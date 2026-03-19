@@ -27,8 +27,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
 #include <tlhelp32.h>
+#include <windows.h>
 #endif
 
 #ifdef __linux__
@@ -40,7 +40,7 @@ namespace {
 
 struct ProcessInfo {
     unsigned long pid;
-    std::string   name;
+    std::string name;
 };
 
 std::string to_lower(std::string_view sv) {
@@ -54,7 +54,8 @@ std::string to_lower(std::string_view sv) {
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return procs;
+    if (snap == INVALID_HANDLE_VALUE)
+        return procs;
 
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
@@ -63,12 +64,12 @@ std::vector<ProcessInfo> enumerate_processes() {
             ProcessInfo pi;
             pi.pid = pe.th32ProcessID;
             // Wide to narrow (ASCII process names)
-            int len = WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
-                                          nullptr, 0, nullptr, nullptr);
+            int len =
+                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, nullptr, 0, nullptr, nullptr);
             if (len > 0) {
                 pi.name.resize(static_cast<size_t>(len - 1));
-                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
-                                    pi.name.data(), len, nullptr, nullptr);
+                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, pi.name.data(), len, nullptr,
+                                    nullptr);
             }
             procs.push_back(std::move(pi));
         } while (Process32NextW(snap, &pe));
@@ -80,12 +81,14 @@ std::vector<ProcessInfo> enumerate_processes() {
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
     DIR* proc_dir = opendir("/proc");
-    if (!proc_dir) return procs;
+    if (!proc_dir)
+        return procs;
 
     struct dirent* entry = nullptr;
     while ((entry = readdir(proc_dir)) != nullptr) {
         // Only numeric directories
-        if (entry->d_type != DT_DIR) continue;
+        if (entry->d_type != DT_DIR)
+            continue;
         bool is_pid = true;
         for (const char* p = entry->d_name; *p; ++p) {
             if (!std::isdigit(static_cast<unsigned char>(*p))) {
@@ -93,11 +96,13 @@ std::vector<ProcessInfo> enumerate_processes() {
                 break;
             }
         }
-        if (!is_pid) continue;
+        if (!is_pid)
+            continue;
 
         std::string status_path = std::string("/proc/") + entry->d_name + "/status";
         std::ifstream ifs(status_path);
-        if (!ifs.is_open()) continue;
+        if (!ifs.is_open())
+            continue;
 
         ProcessInfo pi;
         pi.pid = std::stoul(entry->d_name);
@@ -120,7 +125,8 @@ std::vector<ProcessInfo> enumerate_processes() {
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
     FILE* pipe = popen("ps -axo pid,comm", "r");
-    if (!pipe) return procs;
+    if (!pipe)
+        return procs;
 
     std::array<char, 512> buf{};
     // Skip header line
@@ -135,13 +141,16 @@ std::vector<ProcessInfo> enumerate_processes() {
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
             line.pop_back();
         }
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
 
         // Parse: "  PID COMMAND"
         auto pos = line.find_first_not_of(' ');
-        if (pos == std::string::npos) continue;
+        if (pos == std::string::npos)
+            continue;
         auto space = line.find(' ', pos);
-        if (space == std::string::npos) continue;
+        if (space == std::string::npos)
+            continue;
 
         ProcessInfo pi;
         try {
@@ -168,26 +177,22 @@ std::vector<ProcessInfo> enumerate_processes() {
 
 class ProcessesPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "processes"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "processes"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Process listing — enumerate and query running processes";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "list", "query", nullptr };
+        static const char* acts[] = {"list", "query", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "list") {
             return do_list(ctx);
         }

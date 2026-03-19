@@ -28,7 +28,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -48,7 +49,8 @@ int run_command_with_exit(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return -1;
+    if (!pipe)
+        return -1;
     std::array<char, 256> buf{};
     // drain output
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {}
@@ -60,10 +62,10 @@ int run_command_with_exit(const char* cmd) {
 }
 
 bool is_safe_host(std::string_view host) {
-    if (host.empty() || host.size() > 253) return false;
+    if (host.empty() || host.size() > 253)
+        return false;
     for (char c : host) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) &&
-            c != '.' && c != '-' && c != ':') {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-' && c != ':') {
             return false;
         }
     }
@@ -74,31 +76,28 @@ bool is_safe_host(std::string_view host) {
 
 class NetworkActionsPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "network_actions"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "network_actions"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Network actions — DNS flush and ping";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "flush_dns", "ping", nullptr };
+        static const char* acts[] = {"flush_dns", "ping", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 
         if (action == "flush_dns") {
 #ifdef _WIN32
             auto output = run_command("ipconfig /flushdns");
 #elif defined(__linux__)
-            auto output = run_command(
-                "resolvectl flush-caches 2>/dev/null || "
-                "systemd-resolve --flush-caches 2>/dev/null || true");
+            auto output = run_command("resolvectl flush-caches 2>/dev/null || "
+                                      "systemd-resolve --flush-caches 2>/dev/null || true");
 #elif defined(__APPLE__)
             auto output = run_command("dscacheutil -flushcache");
 #else

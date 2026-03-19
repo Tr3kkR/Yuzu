@@ -92,9 +92,11 @@ run_erlang_ct() {
 
     cd "$GATEWAY_DIR"
 
+    CT_DIR="apps/yuzu_gw/test"
+
     # E2E suite
     echo "  Running e2e suite..."
-    if rebar3 ct --suite=yuzu_gw_e2e_SUITE 2>&1 | tail -10; then
+    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_e2e_SUITE 2>&1 | tail -10; then
         pass "Gateway E2E suite"
     else
         fail "Gateway E2E suite"
@@ -103,7 +105,7 @@ run_erlang_ct() {
     # Integration suite
     echo ""
     echo "  Running integration suite..."
-    if rebar3 ct --suite=yuzu_gw_integration_SUITE 2>&1 | tail -10; then
+    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_integration_SUITE 2>&1 | tail -10; then
         pass "Gateway integration suite"
     else
         fail "Gateway integration suite"
@@ -112,7 +114,7 @@ run_erlang_ct() {
     # Metrics E2E suite
     echo ""
     echo "  Running metrics E2E suite..."
-    if rebar3 ct --suite=yuzu_gw_metrics_e2e_SUITE 2>&1 | tail -10; then
+    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_metrics_e2e_SUITE 2>&1 | tail -10; then
         pass "Gateway metrics E2E suite"
     else
         fail "Gateway metrics E2E suite"
@@ -121,7 +123,7 @@ run_erlang_ct() {
     # Prometheus endpoint suite
     echo ""
     echo "  Running Prometheus endpoint suite..."
-    if rebar3 ct --suite=yuzu_gw_prometheus_SUITE 2>&1 | tail -10; then
+    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_prometheus_SUITE 2>&1 | tail -10; then
         pass "Gateway Prometheus endpoint suite"
     else
         fail "Gateway Prometheus endpoint suite"

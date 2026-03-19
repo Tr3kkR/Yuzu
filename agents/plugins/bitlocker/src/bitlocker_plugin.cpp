@@ -26,7 +26,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -49,8 +50,8 @@ void parse_bitlocker_status(yuzu::CommandContext& ctx, const std::string& output
 
     auto emit_volume = [&]() {
         if (!drive.empty()) {
-            ctx.write_output(std::format("volume|{}|{}|{}|{}|{}",
-                                         drive, conversion, pct_encrypted, method, protection));
+            ctx.write_output(std::format("volume|{}|{}|{}|{}|{}", drive, conversion, pct_encrypted,
+                                         method, protection));
         }
         drive.clear();
         conversion.clear();
@@ -62,7 +63,8 @@ void parse_bitlocker_status(yuzu::CommandContext& ctx, const std::string& output
     while (std::getline(iss, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
             line.pop_back();
-        if (line.empty()) continue;
+        if (line.empty())
+            continue;
 
         // Volume lines look like: "Volume C: [OS]"
         if (line.find("Volume") == 0 && line.find(':') != std::string::npos) {
@@ -76,16 +78,20 @@ void parse_bitlocker_status(yuzu::CommandContext& ctx, const std::string& output
         }
 
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
 
         auto key = line.substr(0, colon);
         auto val = line.substr(colon + 1);
         // Trim
         while (!key.empty() && (key.front() == ' ' || key.front() == '\t'))
             key.erase(key.begin());
-        while (!key.empty() && key.back() == ' ') key.pop_back();
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
-        while (!val.empty() && val.back() == ' ') val.pop_back();
+        while (!key.empty() && key.back() == ' ')
+            key.pop_back();
+        while (!val.empty() && val.front() == ' ')
+            val.erase(val.begin());
+        while (!val.empty() && val.back() == ' ')
+            val.pop_back();
 
         if (key == "Conversion Status") {
             conversion = val;
@@ -145,22 +151,21 @@ void list_luks_volumes(yuzu::CommandContext& ctx) {
 
 class BitlockerPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "bitlocker"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "bitlocker"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Disk encryption status — BitLocker, LUKS, FileVault";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "state", nullptr };
+        static const char* acts[] = {"state", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
 
         if (action == "state") {

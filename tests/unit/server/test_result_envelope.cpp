@@ -83,11 +83,11 @@ TEST_CASE("ResultEnvelope: parse_result wraps non-JSON text", "[result_envelope]
 
 TEST_CASE("ResultEnvelope: parse_result with JSON columns/rows", "[result_envelope]") {
     nlohmann::json input = {
-        {"columns", {{{"name", "hostname"}, {"type", "string"}},
-                      {{"name", "cpu_count"}, {"type", "int32"}}}},
-        {"rows", {{{"hostname", "srv-01"}, {"cpu_count", "8"}},
-                   {{"hostname", "srv-02"}, {"cpu_count", "16"}}}}
-    };
+        {"columns",
+         {{{"name", "hostname"}, {"type", "string"}}, {{"name", "cpu_count"}, {"type", "int32"}}}},
+        {"rows",
+         {{{"hostname", "srv-01"}, {"cpu_count", "8"}},
+          {{"hostname", "srv-02"}, {"cpu_count", "16"}}}}};
 
     auto result = parse_result(input.dump(), "");
 
@@ -105,20 +105,18 @@ TEST_CASE("ResultEnvelope: parse_result with JSON columns/rows", "[result_envelo
 }
 
 TEST_CASE("ResultEnvelope: parse_result extracts metadata from JSON", "[result_envelope]") {
-    nlohmann::json input = {
-        {"columns", {{{"name", "output"}, {"type", "string"}}}},
-        {"rows", {{{"output", "ok"}}}},
-        {"execution_id", "exec-001"},
-        {"definition_id", "def-001"},
-        {"agent_id", "agent-001"},
-        {"timestamp", 1700000000000},
-        {"status", "success"},
-        {"error_code", 0},
-        {"duration_ms", 150},
-        {"stdout", "some stdout"},
-        {"stderr", "some stderr"},
-        {"warnings", {"warn1", "warn2"}}
-    };
+    nlohmann::json input = {{"columns", {{{"name", "output"}, {"type", "string"}}}},
+                            {"rows", {{{"output", "ok"}}}},
+                            {"execution_id", "exec-001"},
+                            {"definition_id", "def-001"},
+                            {"agent_id", "agent-001"},
+                            {"timestamp", 1700000000000},
+                            {"status", "success"},
+                            {"error_code", 0},
+                            {"duration_ms", 150},
+                            {"stdout", "some stdout"},
+                            {"stderr", "some stderr"},
+                            {"warnings", {"warn1", "warn2"}}};
 
     auto result = parse_result(input.dump(), "");
 
@@ -138,18 +136,16 @@ TEST_CASE("ResultEnvelope: parse_result extracts metadata from JSON", "[result_e
 
 // ── parse_result: schema override ───────────────────────────────────────────
 
-TEST_CASE("ResultEnvelope: parse_result with schema override applies schema types", "[result_envelope]") {
+TEST_CASE("ResultEnvelope: parse_result with schema override applies schema types",
+          "[result_envelope]") {
     nlohmann::json input = {
-        {"columns", {{{"name", "uptime_s"}, {"type", "string"}},
-                      {{"name", "healthy"}, {"type", "string"}}}},
-        {"rows", {{{"uptime_s", "86400"}, {"healthy", "true"}}}}
-    };
+        {"columns",
+         {{{"name", "uptime_s"}, {"type", "string"}}, {{"name", "healthy"}, {"type", "string"}}}},
+        {"rows", {{{"uptime_s", "86400"}, {"healthy", "true"}}}}};
 
     // Schema overrides: uptime_s is int64, healthy is bool
-    nlohmann::json schema = {
-        {{"name", "uptime_s"}, {"type", "int64"}},
-        {{"name", "healthy"}, {"type", "bool"}}
-    };
+    nlohmann::json schema = {{{"name", "uptime_s"}, {"type", "int64"}},
+                             {{"name", "healthy"}, {"type", "bool"}}};
 
     auto result = parse_result(input.dump(), schema.dump());
 

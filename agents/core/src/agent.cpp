@@ -1,11 +1,11 @@
 #ifdef _WIN32
-#  include <io.h>
-#  pragma section(".CRT$XCB", read)
+#include <io.h>
+#pragma section(".CRT$XCB", read)
 static void __cdecl diag_dll_static_init() {
     const char msg[] = "[DIAG] DLL static-init starting (before proto registration)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_static_init;
+__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
@@ -25,16 +25,16 @@ __declspec(allocate(".CRT$XCB")) static void (__cdecl *p_dll_diag)() = diag_dll_
 #include "agent.grpc.pb.h"
 
 #ifdef _WIN32
-#  include <winsock2.h>   // gethostname
+#include <winsock2.h> // gethostname
 #else
-#  include <unistd.h>     // gethostname
+#include <unistd.h> // gethostname
 #endif
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <format>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -50,29 +50,29 @@ namespace pb = ::yuzu::agent::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 #if defined(_WIN32)
-constexpr const char* kAgentOs   = "windows";
+constexpr const char* kAgentOs = "windows";
 constexpr const char* kAgentArch = "x86_64";
 #elif defined(__APPLE__)
-#  if defined(__aarch64__)
-constexpr const char* kAgentOs   = "darwin";
-constexpr const char* kAgentArch = "aarch64";
-#  else
-constexpr const char* kAgentOs   = "darwin";
-constexpr const char* kAgentArch = "x86_64";
-#  endif
-#elif defined(__aarch64__)
-constexpr const char* kAgentOs   = "linux";
+#if defined(__aarch64__)
+constexpr const char* kAgentOs = "darwin";
 constexpr const char* kAgentArch = "aarch64";
 #else
-constexpr const char* kAgentOs   = "linux";
+constexpr const char* kAgentOs = "darwin";
+constexpr const char* kAgentArch = "x86_64";
+#endif
+#elif defined(__aarch64__)
+constexpr const char* kAgentOs = "linux";
+constexpr const char* kAgentArch = "aarch64";
+#else
+constexpr const char* kAgentOs = "linux";
 constexpr const char* kAgentArch = "x86_64";
 #endif
 
 std::string read_file_contents(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
-    if (!f) return {};
-    return std::string(std::istreambuf_iterator<char>(f),
-                       std::istreambuf_iterator<char>());
+    if (!f)
+        return {};
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
@@ -88,26 +88,26 @@ struct PluginContextImpl {
 
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
-    std::mutex*      write_mu;   // protects concurrent stream->Write()
-    std::string      command_id;
+    std::mutex* write_mu; // protects concurrent stream->Write()
+    std::string command_id;
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
 };
 
-template <typename F>
-struct ScopeExit {
+template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
 };
 
-}  // anonymous namespace
+} // anonymous namespace
 
 // C ABI context function implementations
 
 extern "C" {
 
 YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text) {
-    if (!ctx || !text) return;
+    if (!ctx || !text)
+        return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
 
     pb::CommandResponse resp;
@@ -125,31 +125,32 @@ YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) 
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* key) {
-    if (!ctx || !key) return nullptr;
+    if (!ctx || !key)
+        return nullptr;
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     auto it = impl->config.find(key);
-    if (it == impl->config.end()) return nullptr;
+    if (it == impl->config.end())
+        return nullptr;
     return it->second.c_str();
 }
 
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key) {
-    (void)ctx; (void)key;
+    (void)ctx;
+    (void)key;
     return nullptr;
 }
 
-}  // extern "C"
+} // extern "C"
 
 // AgentImpl
 
 class AgentImpl final : public Agent {
 public:
     explicit AgentImpl(Config cfg) : cfg_{std::move(cfg)} {
-        metrics_.describe("yuzu_agent_uptime_seconds",
-            "Agent uptime in seconds", "gauge");
-        metrics_.describe("yuzu_agent_commands_executed_total",
-            "Total commands executed by plugin", "counter");
-        metrics_.describe("yuzu_agent_plugins_loaded",
-            "Number of loaded plugins", "gauge");
+        metrics_.describe("yuzu_agent_uptime_seconds", "Agent uptime in seconds", "gauge");
+        metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
+                          "counter");
+        metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
     }
 
     void run() override {
@@ -165,31 +166,31 @@ public:
         }
 
         // Build the plugin context config map with agent state
-        plugin_ctx_.config["agent.id"]                 = cfg_.agent_id;
-        plugin_ctx_.config["agent.version"]            = std::string{yuzu::kFullVersionString};
-        plugin_ctx_.config["agent.build_number"]       = std::to_string(yuzu::kBuildNumber);
-        plugin_ctx_.config["agent.git_commit"]         = std::string{yuzu::kGitCommitHash};
-        plugin_ctx_.config["agent.server_address"]     = cfg_.server_address;
-        plugin_ctx_.config["agent.tls_enabled"]        = cfg_.tls_enabled ? "true" : "false";
-        plugin_ctx_.config["agent.heartbeat_interval"] = std::to_string(cfg_.heartbeat_interval.count());
-        plugin_ctx_.config["agent.plugin_dir"]         = cfg_.plugin_dir.string();
-        plugin_ctx_.config["agent.data_dir"]           = cfg_.data_dir.string();
-        plugin_ctx_.config["agent.log_level"]          = cfg_.log_level;
-        plugin_ctx_.config["agent.debug_mode"]         = cfg_.debug_mode ? "true" : "false";
-        plugin_ctx_.config["agent.verbose_logging"]    = cfg_.verbose_logging ? "true" : "false";
-        plugin_ctx_.config["agent.reconnect_count"]    = "0";
+        plugin_ctx_.config["agent.id"] = cfg_.agent_id;
+        plugin_ctx_.config["agent.version"] = std::string{yuzu::kFullVersionString};
+        plugin_ctx_.config["agent.build_number"] = std::to_string(yuzu::kBuildNumber);
+        plugin_ctx_.config["agent.git_commit"] = std::string{yuzu::kGitCommitHash};
+        plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
+        plugin_ctx_.config["agent.tls_enabled"] = cfg_.tls_enabled ? "true" : "false";
+        plugin_ctx_.config["agent.heartbeat_interval"] =
+            std::to_string(cfg_.heartbeat_interval.count());
+        plugin_ctx_.config["agent.plugin_dir"] = cfg_.plugin_dir.string();
+        plugin_ctx_.config["agent.data_dir"] = cfg_.data_dir.string();
+        plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
+        plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
+        plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
+        plugin_ctx_.config["agent.reconnect_count"] = "0";
 
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
         plugin_ctx_.config["agent.start_time_epoch"] = std::to_string(start_epoch);
 
         size_t module_index = 0;
-        auto record_module = [this, &module_index](
-                                 std::string_view name,
-                                 std::string_view version,
-                                 std::string_view description,
-                                 std::string_view status) {
+        auto record_module = [this, &module_index](std::string_view name, std::string_view version,
+                                                   std::string_view description,
+                                                   std::string_view status) {
             auto prefix = std::format("agent.modules.{}", module_index++);
             plugin_ctx_.config[prefix + ".name"] = std::string{name};
             plugin_ctx_.config[prefix + ".version"] = std::string{version};
@@ -209,21 +210,15 @@ public:
             if (handle.descriptor()->init) {
                 int rc = handle.descriptor()->init(raw_plugin_ctx);
                 if (rc != 0) {
-                    spdlog::warn("Plugin {} init returned {}, skipping",
-                        handle.descriptor()->name, rc);
-                    record_module(
-                        descriptor->name,
-                        descriptor->version,
-                        std::format("{} (init rc={})", descriptor->description, rc),
-                        "init_failed");
+                    spdlog::warn("Plugin {} init returned {}, skipping", handle.descriptor()->name,
+                                 rc);
+                    record_module(descriptor->name, descriptor->version,
+                                  std::format("{} (init rc={})", descriptor->description, rc),
+                                  "init_failed");
                     continue;
                 }
             }
-            record_module(
-                descriptor->name,
-                descriptor->version,
-                descriptor->description,
-                "loaded");
+            record_module(descriptor->name, descriptor->version, descriptor->description, "loaded");
             plugin_names_.emplace_back(handle.descriptor()->name);
             plugins_.push_back(std::move(handle));
         }
@@ -233,13 +228,12 @@ public:
         plugin_ctx_.config["agent.modules.count"] = std::to_string(module_index);
         for (size_t i = 0; i < plugins_.size(); ++i) {
             auto prefix = std::format("agent.plugins.{}", i);
-            plugin_ctx_.config[prefix + ".name"]        = plugins_[i].descriptor()->name;
-            plugin_ctx_.config[prefix + ".version"]     = plugins_[i].descriptor()->version;
+            plugin_ctx_.config[prefix + ".name"] = plugins_[i].descriptor()->name;
+            plugin_ctx_.config[prefix + ".version"] = plugins_[i].descriptor()->version;
             plugin_ctx_.config[prefix + ".description"] = plugins_[i].descriptor()->description;
         }
 
-        metrics_.gauge("yuzu_agent_plugins_loaded").set(
-            static_cast<double>(plugins_.size()));
+        metrics_.gauge("yuzu_agent_plugins_loaded").set(static_cast<double>(plugins_.size()));
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
@@ -254,7 +248,8 @@ public:
             {
                 std::lock_guard lock(exec_mu_);
                 for (auto& t : exec_threads_) {
-                    if (t.joinable()) t.join();
+                    if (t.joinable())
+                        t.join();
                 }
                 exec_threads_.clear();
             }
@@ -269,19 +264,17 @@ public:
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
         // Auto-discover client certificate if none explicitly configured
-        if (cfg_.cert_auto_discovery
-            && cfg_.tls_client_cert.empty()
-            && cfg_.cert_store.empty()) {
+        if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
             auto discovered = discover_client_cert();
             if (discovered) {
                 cfg_.tls_client_cert = discovered->cert_path;
-                cfg_.tls_client_key  = discovered->key_path;
+                cfg_.tls_client_key = discovered->key_path;
                 spdlog::info("Using auto-discovered cert from {} (source: {})",
                              discovered->cert_path.string(), discovered->source);
             }
         }
 
-        CloudIdentity cloud_id;  // Populated before registration (step 2b)
+        CloudIdentity cloud_id; // Populated before registration (step 2b)
         std::shared_ptr<grpc::ChannelCredentials> creds;
         std::shared_ptr<grpc::Channel> channel;
         std::unique_ptr<pb::AgentService::Stub> stub;
@@ -299,8 +292,8 @@ public:
             if (!cfg_.cert_store.empty()) {
                 // Read client cert + key from OS certificate store
                 spdlog::info("Reading client certificate from {} store...", cfg_.cert_store);
-                auto store_result = read_cert_from_store(
-                    cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
+                auto store_result =
+                    read_cert_from_store(cfg_.cert_store, cfg_.cert_subject, cfg_.cert_thumbprint);
 
                 if (!store_result.ok()) {
                     spdlog::error("Certificate store error: {}", store_result.error);
@@ -335,8 +328,7 @@ public:
             creds = grpc::InsecureChannelCredentials();
         }
 
-        channel = grpc::CreateCustomChannel(
-            cfg_.server_address, creds, ch_args);
+        channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
 
         stub = pb::AgentService::NewStub(channel);
 
@@ -380,17 +372,23 @@ public:
                             while ((pos = tags_content.find('"', pos)) != std::string::npos) {
                                 size_t key_start = pos + 1;
                                 size_t key_end = tags_content.find('"', key_start);
-                                if (key_end == std::string::npos) break;
-                                std::string key = tags_content.substr(key_start, key_end - key_start);
+                                if (key_end == std::string::npos)
+                                    break;
+                                std::string key =
+                                    tags_content.substr(key_start, key_end - key_start);
                                 pos = key_end + 1;
                                 pos = tags_content.find(':', pos);
-                                if (pos == std::string::npos) break;
+                                if (pos == std::string::npos)
+                                    break;
                                 pos = tags_content.find('"', pos);
-                                if (pos == std::string::npos) break;
+                                if (pos == std::string::npos)
+                                    break;
                                 size_t val_start = pos + 1;
                                 size_t val_end = tags_content.find('"', val_start);
-                                if (val_end == std::string::npos) break;
-                                std::string val = tags_content.substr(val_start, val_end - val_start);
+                                if (val_end == std::string::npos)
+                                    break;
+                                std::string val =
+                                    tags_content.substr(val_start, val_end - val_start);
                                 (*tags_map)[key] = val;
                                 pos = val_end + 1;
                             }
@@ -426,43 +424,43 @@ public:
             // Tier 3: Include cloud identity attestation if available
             if (cloud_id.valid()) {
                 req.set_attestation_provider(cloud_id.provider);
-                req.set_machine_certificate(
-                    cloud_id.identity_document.data(),
-                    cloud_id.identity_document.size());
-                spdlog::info("Including {} cloud attestation in registration",
-                             cloud_id.provider);
+                req.set_machine_certificate(cloud_id.identity_document.data(),
+                                            cloud_id.identity_document.size());
+                spdlog::info("Including {} cloud attestation in registration", cloud_id.provider);
             }
 
             pb::RegisterResponse resp;
             auto register_start = std::chrono::steady_clock::now();
             auto status = stub->Register(&ctx, req, &resp);
             if (!status.ok()) {
-                spdlog::error("Failed to register with server: {}",
-                    status.error_message());
+                spdlog::error("Failed to register with server: {}", status.error_message());
                 return;
             }
             if (!resp.accepted()) {
-                spdlog::error("Server rejected registration: {}",
-                    resp.reject_reason());
+                spdlog::error("Server rejected registration: {}", resp.reject_reason());
                 return;
             }
 
             auto enrollment_status = resp.enrollment_status();
             if (enrollment_status == "pending") {
-                spdlog::warn("Registration pending admin approval - agent will not receive commands until approved");
-                spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard", cfg_.agent_id);
+                spdlog::warn("Registration pending admin approval - agent will not receive "
+                             "commands until approved");
+                spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard",
+                             cfg_.agent_id);
                 return;
             }
 
             session_id_ = resp.session_id();
             auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
             plugin_ctx_.config["agent.session_id"] = session_id_;
             plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
 
             // Measure Register RPC latency
             auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - register_start).count();
+                                        std::chrono::steady_clock::now() - register_start)
+                                        .count();
             plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
 
             // Query gRPC channel state
@@ -470,25 +468,33 @@ public:
                 auto state = channel->GetState(false);
                 const char* state_str = "UNKNOWN";
                 switch (state) {
-                    case GRPC_CHANNEL_IDLE: state_str = "IDLE"; break;
-                    case GRPC_CHANNEL_CONNECTING: state_str = "CONNECTING"; break;
-                    case GRPC_CHANNEL_READY: state_str = "READY"; break;
-                    case GRPC_CHANNEL_TRANSIENT_FAILURE: state_str = "TRANSIENT_FAILURE"; break;
-                    case GRPC_CHANNEL_SHUTDOWN: state_str = "SHUTDOWN"; break;
+                case GRPC_CHANNEL_IDLE:
+                    state_str = "IDLE";
+                    break;
+                case GRPC_CHANNEL_CONNECTING:
+                    state_str = "CONNECTING";
+                    break;
+                case GRPC_CHANNEL_READY:
+                    state_str = "READY";
+                    break;
+                case GRPC_CHANNEL_TRANSIENT_FAILURE:
+                    state_str = "TRANSIENT_FAILURE";
+                    break;
+                case GRPC_CHANNEL_SHUTDOWN:
+                    state_str = "SHUTDOWN";
+                    break;
                 }
                 plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
             }
-            spdlog::info("Registered with server (session={}, enrollment={})",
-                session_id_, enrollment_status.empty() ? "enrolled" : enrollment_status);
+            spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
+                         enrollment_status.empty() ? "enrolled" : enrollment_status);
         }
 
         // 3b. OTA updater: rollback check and old binary cleanup
         {
             updater_ = std::make_unique<Updater>(
-                UpdateConfig{cfg_.auto_update, cfg_.update_check_interval},
-                cfg_.agent_id,
-                std::string{yuzu::kFullVersionString},
-                kAgentOs, kAgentArch,
+                UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
+                std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                 current_executable_path());
 
             if (updater_->rollback_if_needed()) {
@@ -518,7 +524,7 @@ public:
                 auto* raw_stub = static_cast<void*>(stub.get());
                 update_thread_ = std::thread([this, raw_stub]() {
                     spdlog::info("OTA update checker started (interval={}s)",
-                        cfg_.update_check_interval.count());
+                                 cfg_.update_check_interval.count());
                     while (!stop_requested_.load(std::memory_order_acquire)) {
                         auto result = updater_->check_and_apply(raw_stub);
                         if (result.has_value() && result.value()) {
@@ -527,13 +533,12 @@ public:
                             return;
                         }
                         if (!result.has_value()) {
-                            spdlog::warn("OTA update check failed: {}",
-                                result.error().message);
+                            spdlog::warn("OTA update check failed: {}", result.error().message);
                         }
                         // Sleep in small increments so we can respond to stop quickly
                         auto remaining = cfg_.update_check_interval;
-                        while (remaining.count() > 0
-                               && !stop_requested_.load(std::memory_order_acquire)) {
+                        while (remaining.count() > 0 &&
+                               !stop_requested_.load(std::memory_order_acquire)) {
                             auto sleep_time = std::min(remaining, std::chrono::seconds{5});
                             std::this_thread::sleep_for(sleep_time);
                             remaining -= sleep_time;
@@ -547,33 +552,35 @@ public:
                 auto hb_stub = pb::AgentService::NewStub(channel);
                 heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
                     spdlog::info("Heartbeat thread started (interval={}s)",
-                        cfg_.heartbeat_interval.count());
+                                 cfg_.heartbeat_interval.count());
                     while (!stop_requested_.load(std::memory_order_acquire)) {
                         // Sleep in small increments for responsive shutdown
                         auto remaining = cfg_.heartbeat_interval;
-                        while (remaining.count() > 0
-                               && !stop_requested_.load(std::memory_order_acquire)) {
+                        while (remaining.count() > 0 &&
+                               !stop_requested_.load(std::memory_order_acquire)) {
                             auto sleep_time = std::min(remaining, std::chrono::seconds{5});
                             std::this_thread::sleep_for(sleep_time);
                             remaining -= sleep_time;
                         }
-                        if (stop_requested_.load(std::memory_order_acquire)) break;
+                        if (stop_requested_.load(std::memory_order_acquire))
+                            break;
 
                         // Build heartbeat with piggybacked metrics
                         grpc::ClientContext ctx;
                         pb::HeartbeatRequest req;
                         req.set_session_id(session_id_);
                         auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
+                                          std::chrono::system_clock::now().time_since_epoch())
+                                          .count();
                         req.mutable_sent_at()->set_millis_epoch(now_ms);
 
                         auto& tags = *req.mutable_status_tags();
                         auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-                            std::chrono::steady_clock::now() - start_time_).count();
+                                          std::chrono::steady_clock::now() - start_time_)
+                                          .count();
                         tags["yuzu.uptime_s"] = std::to_string(uptime);
-                        tags["yuzu.commands_executed"] = std::to_string(
-                            static_cast<int64_t>(metrics_.counter(
-                                "yuzu_agent_commands_executed_total").value()));
+                        tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
+                            metrics_.counter("yuzu_agent_commands_executed_total").value()));
                         tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
                         tags["yuzu.os"] = kAgentOs;
                         tags["yuzu.arch"] = kAgentArch;
@@ -596,19 +603,19 @@ public:
             bool update_verified = false;
             pb::CommandRequest cmd;
             while (stream->Read(&cmd)) {
-                if (stop_requested_.load(std::memory_order_acquire)) break;
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
 
                 // Write health marker after first successful read (OTA rollback guard)
                 if (!update_verified) {
                     update_verified = true;
-                    auto marker = current_executable_path().parent_path()
-                                  / ".yuzu-update-verified";
+                    auto marker = current_executable_path().parent_path() / ".yuzu-update-verified";
                     std::ofstream{marker} << "ok";
                     spdlog::debug("Wrote update verification marker: {}", marker.string());
                 }
 
-                spdlog::info("Received command: plugin={}, action={}, id={}",
-                    cmd.plugin(), cmd.action(), cmd.command_id());
+                spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),
+                             cmd.action(), cmd.command_id());
 
                 // Find the matching plugin
                 const YuzuPluginDescriptor* target = nullptr;
@@ -636,11 +643,12 @@ public:
                 // Each thread captures the shared_ptr to guarantee the stream
                 // outlives all writers (fixes use-after-free risk from #66).
                 std::thread exec_thread([this, target, cmd, stream]() {
-                    metrics_.counter("yuzu_agent_commands_executed_total",
-                        {{"plugin", cmd.plugin()}}).increment();
+                    metrics_
+                        .counter("yuzu_agent_commands_executed_total", {{"plugin", cmd.plugin()}})
+                        .increment();
                     CommandContextImpl ctx_impl{
-                        .stream     = stream,
-                        .write_mu   = &stream_write_mu_,
+                        .stream = stream,
+                        .write_mu = &stream_write_mu_,
                         .command_id = cmd.command_id(),
                         .start_time = std::chrono::steady_clock::now(),
                     };
@@ -654,20 +662,16 @@ public:
                     }
                     std::vector<YuzuParam> params;
                     for (size_t i = 0; i < keys.size(); ++i) {
-                        params.push_back(YuzuParam{
-                            keys[i].c_str(), values[i].c_str()});
+                        params.push_back(YuzuParam{keys[i].c_str(), values[i].c_str()});
                     }
 
-                    int rc = target->execute(
-                        raw_ctx,
-                        cmd.action().c_str(),
-                        params.data(),
-                        params.size()
-                    );
+                    int rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
+                                             params.size());
 
                     auto end_time = std::chrono::steady_clock::now();
                     auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        end_time - ctx_impl.start_time).count();
+                                       end_time - ctx_impl.start_time)
+                                       .count();
 
                     // Send timing metadata before the final status
                     {
@@ -684,21 +688,21 @@ public:
                     {
                         pb::CommandResponse final_resp;
                         final_resp.set_command_id(cmd.command_id());
-                        final_resp.set_status(rc == 0
-                            ? pb::CommandResponse::SUCCESS
-                            : pb::CommandResponse::FAILURE);
+                        final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
+                                                      : pb::CommandResponse::FAILURE);
                         final_resp.set_exit_code(rc);
 
                         auto now_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
                         final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(final_resp, grpc::WriteOptions());
                     }
 
-                    spdlog::info("Command {} finished (rc={}, exec={}ms)",
-                        cmd.command_id(), rc, exec_ms);
+                    spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
+                                 exec_ms);
                 });
 
                 {
@@ -723,7 +727,8 @@ public:
             {
                 std::lock_guard lock(exec_mu_);
                 for (auto& t : exec_threads_) {
-                    if (t.joinable()) t.join();
+                    if (t.joinable())
+                        t.join();
                 }
                 exec_threads_.clear();
             }
@@ -743,12 +748,12 @@ public:
 
             spdlog::info("Subscribe stream ended");
         }
-
     }
 
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
-        if (updater_) updater_->stop();
+        if (updater_)
+            updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
@@ -757,26 +762,24 @@ public:
 
     std::string_view agent_id() const noexcept override { return cfg_.agent_id; }
 
-    std::vector<std::string> loaded_plugins() const override {
-        return plugin_names_;
-    }
+    std::vector<std::string> loaded_plugins() const override { return plugin_names_; }
 
 private:
-    Config                              cfg_;
-    PluginContextImpl                   plugin_ctx_;
-    yuzu::MetricsRegistry               metrics_;
+    Config cfg_;
+    PluginContextImpl plugin_ctx_;
+    yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
-    std::string                         session_id_;
-    std::atomic<bool>                   stop_requested_{false};
-    std::atomic<grpc::ClientContext*>   subscribe_ctx_{nullptr};
-    std::vector<PluginHandle>           plugins_;
-    std::vector<std::string>            plugin_names_;
-    std::mutex                          stream_write_mu_;
-    std::mutex                          exec_mu_;
-    std::vector<std::thread>            exec_threads_;
-    std::unique_ptr<Updater>            updater_;
-    std::thread                         update_thread_;
-    std::thread                         heartbeat_thread_;
+    std::string session_id_;
+    std::atomic<bool> stop_requested_{false};
+    std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
+    std::vector<PluginHandle> plugins_;
+    std::vector<std::string> plugin_names_;
+    std::mutex stream_write_mu_;
+    std::mutex exec_mu_;
+    std::vector<std::thread> exec_threads_;
+    std::unique_ptr<Updater> updater_;
+    std::thread update_thread_;
+    std::thread heartbeat_thread_;
 };
 
 // Factory
@@ -785,4 +788,4 @@ std::unique_ptr<Agent> Agent::create(Config config) {
     return std::make_unique<AgentImpl>(std::move(config));
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

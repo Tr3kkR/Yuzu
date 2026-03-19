@@ -142,8 +142,7 @@ int main(int argc, char* argv[]) {
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
                    "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)");
-    app.add_option("--oidc-client-id", cfg.oidc_client_id,
-                   "OIDC client ID (app registration)");
+    app.add_option("--oidc-client-id", cfg.oidc_client_id, "OIDC client ID (app registration)");
     app.add_option("--oidc-client-secret", cfg.oidc_client_secret,
                    "OIDC client secret (required for Entra/Azure AD web apps)");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,

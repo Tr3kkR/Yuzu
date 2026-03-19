@@ -19,8 +19,8 @@
 #include <string_view>
 
 #if defined(__linux__) || defined(__APPLE__)
-#include <unistd.h>
 #include <fstream>
+#include <unistd.h>
 #endif
 
 #ifdef _WIN32
@@ -31,9 +31,9 @@
 #define NOMINMAX
 #endif
 #define SECURITY_WIN32
-#include <windows.h>
-#include <lm.h>      // NetGetJoinInformation, NetApiBufferFree
+#include <lm.h>       // NetGetJoinInformation, NetApiBufferFree
 #include <security.h> // GetComputerObjectNameA
+#include <windows.h>
 #endif
 
 namespace {
@@ -45,7 +45,8 @@ std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
     FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -108,11 +109,13 @@ int do_domain(yuzu::CommandContext& ctx) {
                     if (val_start != std::string::npos) {
                         // For "search", take the first entry
                         auto val_end = line.find_first_of(" \t", val_start);
-                        domain = line.substr(val_start,
-                            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+                        domain = line.substr(val_start, val_end == std::string::npos
+                                                            ? std::string::npos
+                                                            : val_end - val_start);
                     }
                 }
-                if (line.starts_with("domain ")) break; // prefer "domain" over "search"
+                if (line.starts_with("domain "))
+                    break; // prefer "domain" over "search"
             }
         }
     }
@@ -156,8 +159,9 @@ int do_domain(yuzu::CommandContext& ctx) {
             if (eq != std::string::npos) {
                 auto val_start = ad_out.find_first_not_of(" \t", eq + 1);
                 auto val_end = ad_out.find_first_of("\r\n", val_start);
-                auto domain = ad_out.substr(val_start,
-                    val_end == std::string::npos ? std::string::npos : val_end - val_start);
+                auto domain =
+                    ad_out.substr(val_start, val_end == std::string::npos ? std::string::npos
+                                                                          : val_end - val_start);
                 ctx.write_output(std::format("domain|{}", domain));
                 ctx.write_output("joined|true");
                 return 0;
@@ -186,18 +190,16 @@ int do_domain(yuzu::CommandContext& ctx) {
     auto status = NetGetJoinInformation(nullptr, &name_buf, &join_status);
     if (status == NERR_Success && name_buf) {
         // Convert wide string to narrow
-        int len = WideCharToMultiByte(CP_UTF8, 0, name_buf, -1,
-                                      nullptr, 0, nullptr, nullptr);
+        int len = WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, nullptr, 0, nullptr, nullptr);
         std::string domain(len > 0 ? len - 1 : 0, '\0');
         if (len > 0) {
-            WideCharToMultiByte(CP_UTF8, 0, name_buf, -1,
-                                domain.data(), len, nullptr, nullptr);
+            WideCharToMultiByte(CP_UTF8, 0, name_buf, -1, domain.data(), len, nullptr, nullptr);
         }
         NetApiBufferFree(name_buf);
 
         ctx.write_output(std::format("domain|{}", domain.empty() ? "N/A" : domain));
-        ctx.write_output(std::format("joined|{}",
-            join_status == NetSetupDomainName ? "true" : "false"));
+        ctx.write_output(
+            std::format("joined|{}", join_status == NetSetupDomainName ? "true" : "false"));
     } else {
         ctx.write_output("domain|N/A");
         ctx.write_output("joined|false");
@@ -219,8 +221,9 @@ int do_ou(yuzu::CommandContext& ctx) {
             auto val_start = realm_out.find_first_not_of(" \t:", pos + 12);
             if (val_start != std::string::npos) {
                 auto val_end = realm_out.find_first_of("\r\n", val_start);
-                auto ou = realm_out.substr(val_start,
-                    val_end == std::string::npos ? std::string::npos : val_end - val_start);
+                auto ou =
+                    realm_out.substr(val_start, val_end == std::string::npos ? std::string::npos
+                                                                             : val_end - val_start);
                 ctx.write_output(std::format("ou|{}", ou));
                 return 0;
             }
@@ -238,7 +241,8 @@ int do_ou(yuzu::CommandContext& ctx) {
                     auto val = line.substr(eq + 1);
                     // Trim leading whitespace
                     auto start = val.find_first_not_of(" \t");
-                    if (start != std::string::npos) val = val.substr(start);
+                    if (start != std::string::npos)
+                        val = val.substr(start);
                     ctx.write_output(std::format("ou|{}", val));
                     return 0;
                 }
@@ -262,8 +266,9 @@ int do_ou(yuzu::CommandContext& ctx) {
             if (eq != std::string::npos) {
                 auto val_start = ad_out.find_first_not_of(" \t", eq + 1);
                 auto val_end = ad_out.find_first_of("\r\n", val_start);
-                auto ou = ad_out.substr(val_start,
-                    val_end == std::string::npos ? std::string::npos : val_end - val_start);
+                auto ou =
+                    ad_out.substr(val_start, val_end == std::string::npos ? std::string::npos
+                                                                          : val_end - val_start);
                 ctx.write_output(std::format("ou|{}", ou));
                 return 0;
             }
@@ -299,35 +304,33 @@ int do_ou(yuzu::CommandContext& ctx) {
 }
 #endif
 
-}  // namespace
+} // namespace
 
 class DeviceIdentityPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "device_identity"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "device_identity"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Reports device hostname, domain membership, and AD organizational unit";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "device_name", "domain", "ou", nullptr
-        };
+        static const char* acts[] = {"device_name", "domain", "ou", nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "device_name") return do_device_name(ctx);
-        if (action == "domain")      return do_domain(ctx);
-        if (action == "ou")          return do_ou(ctx);
+        if (action == "device_name")
+            return do_device_name(ctx);
+        if (action == "domain")
+            return do_domain(ctx);
+        if (action == "ou")
+            return do_ou(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

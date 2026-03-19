@@ -75,8 +75,8 @@ TEST_CASE("OIDC: code_challenge against RFC 7636 Appendix B", "[oidc]") {
     // RFC 7636 test vector:
     //   code_verifier  = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
     //   code_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-    auto challenge = OidcProvider::compute_code_challenge(
-        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+    auto challenge =
+        OidcProvider::compute_code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
     CHECK(challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
 }
 
@@ -158,11 +158,13 @@ TEST_CASE("OIDC: validate_claims — valid", "[oidc]") {
     OidcProvider provider(std::move(cfg));
 
     IdTokenClaims claims;
-    claims.iss   = "https://issuer";
-    claims.aud   = "my-client";
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
     claims.nonce = "test-nonce";
-    claims.exp   = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch()).count() + 3600;
+    claims.exp = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count() +
+                 3600;
 
     auto result = provider.validate_claims(claims, "test-nonce");
     CHECK(result.has_value());
@@ -212,7 +214,7 @@ TEST_CASE("OIDC: validate_claims — expired token", "[oidc]") {
     claims.iss = "https://iss";
     claims.aud = "c";
     claims.nonce = "n";
-    claims.exp = 1000000000;  // long expired
+    claims.exp = 1000000000; // long expired
 
     auto result = provider.validate_claims(claims, "n");
     CHECK_FALSE(result.has_value());

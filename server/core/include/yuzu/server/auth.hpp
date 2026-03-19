@@ -15,30 +15,30 @@ enum class Role { user, admin };
 
 struct UserEntry {
     std::string username;
-    Role        role;
+    Role role;
     std::string salt_hex;
     std::string hash_hex;
 };
 
 struct Session {
     std::string username;
-    Role        role;
+    Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"};  // "local" or "oidc"
-    std::string oidc_sub;              // OIDC subject claim (empty for local auth)
+    std::string auth_source{"local"}; // "local" or "oidc"
+    std::string oidc_sub;             // OIDC subject claim (empty for local auth)
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
 struct EnrollmentToken {
-    std::string token_id;      // Short display ID (first 8 hex chars)
-    std::string token_hash;    // SHA-256 hash of the actual token (stored, never raw)
-    std::string label;         // Admin-assigned label (e.g. "NYC office rollout")
-    int         max_uses;      // 0 = unlimited
-    int         use_count;     // How many times this token has been used
+    std::string token_id;   // Short display ID (first 8 hex chars)
+    std::string token_hash; // SHA-256 hash of the actual token (stored, never raw)
+    std::string label;      // Admin-assigned label (e.g. "NYC office rollout")
+    int max_uses;           // 0 = unlimited
+    int use_count;          // How many times this token has been used
     std::chrono::system_clock::time_point created_at;
-    std::chrono::system_clock::time_point expires_at;  // time_point::max() = never
-    bool        revoked;
+    std::chrono::system_clock::time_point expires_at; // time_point::max() = never
+    bool revoked;
 };
 
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
@@ -58,7 +58,7 @@ struct PendingAgent {
 class AuthManager {
 public:
     static constexpr auto kSessionDuration = std::chrono::hours(8);
-    static constexpr int  kPbkdf2Iterations = 100'000;
+    static constexpr int kPbkdf2Iterations = 100'000;
 
     /// Load users from config file. Returns false if file missing/corrupt.
     bool load_config(const std::filesystem::path& cfg_path);
@@ -83,8 +83,7 @@ public:
     std::vector<UserEntry> list_users() const;
 
     /// Add or overwrite a user.
-    bool upsert_user(const std::string& username,
-                     const std::string& password, Role role);
+    bool upsert_user(const std::string& username, const std::string& password, Role role);
 
     /// Remove a user by name.
     bool remove_user(const std::string& username);
@@ -94,8 +93,7 @@ public:
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
-    std::string create_oidc_session(const std::string& display_name,
-                                    const std::string& email,
+    std::string create_oidc_session(const std::string& display_name, const std::string& email,
                                     const std::string& oidc_sub,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {});
@@ -105,17 +103,14 @@ public:
     // -- Enrollment tokens (Tier 2) ---------------------------------------
 
     /// Create a new enrollment token. Returns the raw token string (show once).
-    std::string create_enrollment_token(const std::string& label,
-                                        int max_uses,
+    std::string create_enrollment_token(const std::string& label, int max_uses,
                                         std::chrono::seconds ttl);
 
     /// Create multiple enrollment tokens at once for batch deployment.
     /// Returns a vector of raw token strings (each shown once).
-    std::vector<std::string> create_enrollment_tokens_batch(
-        const std::string& label_prefix,
-        int count,
-        int max_uses_each,
-        std::chrono::seconds ttl);
+    std::vector<std::string> create_enrollment_tokens_batch(const std::string& label_prefix,
+                                                            int count, int max_uses_each,
+                                                            std::chrono::seconds ttl);
 
     /// Validate a raw enrollment token. Returns true and increments use_count
     /// if valid. Returns false if expired, revoked, or exhausted.
@@ -130,10 +125,8 @@ public:
     // -- Pending agents (Tier 1) ------------------------------------------
 
     /// Add an agent to the pending approval queue.
-    void add_pending_agent(const std::string& agent_id,
-                           const std::string& hostname,
-                           const std::string& os,
-                           const std::string& arch,
+    void add_pending_agent(const std::string& agent_id, const std::string& hostname,
+                           const std::string& os, const std::string& arch,
                            const std::string& agent_version);
 
     /// Check if an agent_id is pending, approved, or denied.
@@ -154,12 +147,11 @@ public:
     // -- Crypto primitives (platform-abstracted) --------------------------
 
     static std::vector<uint8_t> random_bytes(std::size_t n);
-    static std::string          bytes_to_hex(const std::vector<uint8_t>& v);
+    static std::string bytes_to_hex(const std::vector<uint8_t>& v);
     static std::vector<uint8_t> hex_to_bytes(const std::string& hex);
-    static std::string          pbkdf2_sha256(const std::string& password,
-                                              const std::vector<uint8_t>& salt,
-                                              int iterations);
-    static std::string          sha256_hex(const std::string& input);
+    static std::string pbkdf2_sha256(const std::string& password, const std::vector<uint8_t>& salt,
+                                     int iterations);
+    static std::string sha256_hex(const std::string& input);
 
     /// Constant-time comparison of two hex strings (timing-attack safe).
     static bool constant_time_compare(const std::string& a, const std::string& b);
@@ -194,8 +186,8 @@ std::filesystem::path default_config_path();
 std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
-Role        string_to_role(const std::string& s);
+Role string_to_role(const std::string& s);
 
 std::string pending_status_to_string(PendingStatus s);
 
-}  // namespace yuzu::server::auth
+} // namespace yuzu::server::auth

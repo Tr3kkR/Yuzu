@@ -12,7 +12,7 @@ namespace yuzu::scope {
 
 // -- Comparison operators ----------------------------------------------------
 
-enum class CompOp { Eq, Neq, Like, Lt, Gt, Le, Ge, In, Contains };
+enum class CompOp { Eq, Neq, Like, Lt, Gt, Le, Ge, In, Contains, Matches, Exists };
 
 // -- Expression AST ----------------------------------------------------------
 
@@ -44,9 +44,14 @@ struct Combinator {
 ///   not_expr ::= 'NOT' not_expr | primary
 ///   primary  ::= '(' expr ')' | condition
 ///   condition::= IDENT op value
-///   op       ::= '==' | '!=' | 'LIKE' | '<' | '>' | '<=' | '>=' | 'IN' | 'CONTAINS'
+///   op       ::= '==' | '!=' | 'LIKE' | 'MATCHES' | '<' | '>' | '<=' | '>=' | 'IN' | 'CONTAINS'
 ///   value    ::= QUOTED_STRING | '(' value_list ')' | IDENT
 ///   value_list ::= value (',' value)*
+///
+/// Extended operators:
+///   condition::= 'EXISTS' IDENT                        (unary — checks non-empty)
+///              | 'LEN' '(' IDENT ')' op value           (string length comparison)
+///              | 'STARTSWITH' '(' IDENT ',' value ')'   (prefix check)
 std::expected<Expression, std::string> parse(std::string_view input);
 
 // -- Evaluator ---------------------------------------------------------------

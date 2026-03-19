@@ -21,12 +21,12 @@
 #include <string_view>
 
 #if defined(__linux__)
-#include <fstream>
-#include <utmp.h>
 #include <ctime>
-#include <pwd.h>
+#include <fstream>
 #include <grp.h>
+#include <pwd.h>
 #include <shadow.h>
+#include <utmp.h>
 #endif
 
 #if defined(__APPLE__)
@@ -40,9 +40,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <lm.h>
 #include <windows.h>
 #include <wtsapi32.h>
-#include <lm.h>
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "netapi32.lib")
 #endif
@@ -56,7 +56,8 @@ std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
     FILE* pipe = popen(cmd, "r");
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -71,7 +72,8 @@ std::string run_command(const char* cmd) {
 #ifdef _WIN32
 // Convert a wide string to UTF-8
 std::string wide_to_utf8(const wchar_t* ws) {
-    if (!ws || !*ws) return {};
+    if (!ws || !*ws)
+        return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
     std::string result(len > 0 ? len - 1 : 0, '\0');
     if (len > 0) {
@@ -82,14 +84,15 @@ std::string wide_to_utf8(const wchar_t* ws) {
 
 // Format a Windows FILETIME as "YYYY-MM-DD HH:MM:SS" or "Never" if zero
 std::string format_filetime(DWORD low, DWORD high) {
-    if (low == 0 && high == 0) return "Never";
+    if (low == 0 && high == 0)
+        return "Never";
     FILETIME ft;
     ft.dwLowDateTime = low;
     ft.dwHighDateTime = high;
     SYSTEMTIME st;
     FileTimeToSystemTime(&ft, &st);
-    return std::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", st.wYear, st.wMonth, st.wDay,
+                       st.wHour, st.wMinute, st.wSecond);
 }
 #endif
 
@@ -107,10 +110,11 @@ int do_logged_on(yuzu::CommandContext& ctx) {
             std::string line(entry->ut_line);
             // Determine logon type from tty name
             std::string logon_type = "console";
-            if (line.starts_with("pts/")) logon_type = "remote";
+            if (line.starts_with("pts/"))
+                logon_type = "remote";
             std::string session_id = line;
-            ctx.write_output(std::format("user|{}|{}|{}|{}",
-                user, host.empty() ? "local" : host, logon_type, session_id));
+            ctx.write_output(std::format("user|{}|{}|{}|{}", user, host.empty() ? "local" : host,
+                                         logon_type, session_id));
         }
     }
     endutent();
@@ -126,7 +130,8 @@ int do_logged_on(yuzu::CommandContext& ctx) {
             std::string user, tty;
             ls >> user >> tty;
             std::string logon_type = "console";
-            if (tty.starts_with("ttys")) logon_type = "remote";
+            if (tty.starts_with("ttys"))
+                logon_type = "remote";
             // Extract host if present (in parentheses at end)
             std::string domain = "local";
             auto paren = line.rfind('(');
@@ -136,8 +141,7 @@ int do_logged_on(yuzu::CommandContext& ctx) {
                     domain = line.substr(paren + 1, end - paren - 1);
                 }
             }
-            ctx.write_output(std::format("user|{}|{}|{}|{}",
-                user, domain, logon_type, tty));
+            ctx.write_output(std::format("user|{}|{}|{}|{}", user, domain, logon_type, tty));
         }
     }
 
@@ -155,17 +159,20 @@ int do_logged_on(yuzu::CommandContext& ctx) {
             DWORD domain_len = 0;
 
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                WTSUserName, &user_buf, &user_len);
+                                        WTSUserName, &user_buf, &user_len);
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                WTSDomainName, &domain_buf, &domain_len);
+                                        WTSDomainName, &domain_buf, &domain_len);
 
             auto user = wide_to_utf8(user_buf);
             auto domain = wide_to_utf8(domain_buf);
 
-            if (user_buf) WTSFreeMemory(user_buf);
-            if (domain_buf) WTSFreeMemory(domain_buf);
+            if (user_buf)
+                WTSFreeMemory(user_buf);
+            if (domain_buf)
+                WTSFreeMemory(domain_buf);
 
-            if (user.empty()) continue;
+            if (user.empty())
+                continue;
 
             std::string logon_type = "console";
             auto session_name = wide_to_utf8(sessions[i].pWinStationName);
@@ -174,9 +181,9 @@ int do_logged_on(yuzu::CommandContext& ctx) {
                 logon_type = "RDP";
             }
 
-            ctx.write_output(std::format("user|{}|{}|{}|{}",
-                user, domain.empty() ? "local" : domain,
-                logon_type, sessions[i].SessionId));
+            ctx.write_output(std::format("user|{}|{}|{}|{}", user,
+                                         domain.empty() ? "local" : domain, logon_type,
+                                         sessions[i].SessionId));
         }
         WTSFreeMemory(sessions);
     }
@@ -201,8 +208,8 @@ int do_sessions(yuzu::CommandContext& ctx) {
             std::string state = "Active";
             // Parse idle time to seconds (format: "1:23" or "1.00s" or "1days")
             std::string idle_seconds = idle;
-            ctx.write_output(std::format("session|{}|{}|{}|{}|{}",
-                tty, user, state, from.empty() ? "-" : from, idle));
+            ctx.write_output(std::format("session|{}|{}|{}|{}|{}", tty, user, state,
+                                         from.empty() ? "-" : from, idle));
         }
     }
 
@@ -215,8 +222,8 @@ int do_sessions(yuzu::CommandContext& ctx) {
             std::istringstream ls(line);
             std::string user, tty, from, login, idle;
             ls >> user >> tty >> from >> login >> idle;
-            ctx.write_output(std::format("session|{}|{}|Active|{}|{}",
-                tty, user, from.empty() ? "-" : from, idle));
+            ctx.write_output(std::format("session|{}|{}|Active|{}|{}", tty, user,
+                                         from.empty() ? "-" : from, idle));
         }
     }
 
@@ -228,45 +235,61 @@ int do_sessions(yuzu::CommandContext& ctx) {
             LPWSTR user_buf = nullptr;
             DWORD user_len = 0;
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                WTSUserName, &user_buf, &user_len);
+                                        WTSUserName, &user_buf, &user_len);
             auto user = wide_to_utf8(user_buf);
-            if (user_buf) WTSFreeMemory(user_buf);
+            if (user_buf)
+                WTSFreeMemory(user_buf);
 
-            if (user.empty()) continue;
+            if (user.empty())
+                continue;
 
             const char* state = "unknown";
             switch (sessions[i].State) {
-                case WTSActive:       state = "Active"; break;
-                case WTSConnected:    state = "Connected"; break;
-                case WTSDisconnected: state = "Disconnected"; break;
-                case WTSIdle:         state = "Idle"; break;
-                case WTSListen:       state = "Listen"; break;
-                default:              state = "Other"; break;
+            case WTSActive:
+                state = "Active";
+                break;
+            case WTSConnected:
+                state = "Connected";
+                break;
+            case WTSDisconnected:
+                state = "Disconnected";
+                break;
+            case WTSIdle:
+                state = "Idle";
+                break;
+            case WTSListen:
+                state = "Listen";
+                break;
+            default:
+                state = "Other";
+                break;
             }
 
             // Get client name for RDP sessions
             LPWSTR client_buf = nullptr;
             DWORD client_len = 0;
             WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                WTSClientName, &client_buf, &client_len);
+                                        WTSClientName, &client_buf, &client_len);
             auto client = wide_to_utf8(client_buf);
-            if (client_buf) WTSFreeMemory(client_buf);
+            if (client_buf)
+                WTSFreeMemory(client_buf);
 
             // Get idle time
             WTSINFOEXW* info_buf = nullptr;
             DWORD info_len = 0;
             long long idle_secs = 0;
             if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId,
-                    WTSSessionInfo, reinterpret_cast<LPWSTR*>(&info_buf), &info_len) && info_buf) {
+                                            WTSSessionInfo, reinterpret_cast<LPWSTR*>(&info_buf),
+                                            &info_len) &&
+                info_buf) {
                 // IdleTime is a LARGE_INTEGER representing 100-nanosecond intervals
                 // But WTSINFOEXA has different layout; use CurrentTime - LastInputTime
                 // For simplicity, report 0 for active sessions
                 WTSFreeMemory(info_buf);
             }
 
-            ctx.write_output(std::format("session|{}|{}|{}|{}|{}",
-                sessions[i].SessionId, user, state,
-                client.empty() ? "-" : client, idle_secs));
+            ctx.write_output(std::format("session|{}|{}|{}|{}|{}", sessions[i].SessionId, user,
+                                         state, client.empty() ? "-" : client, idle_secs));
         }
         WTSFreeMemory(sessions);
     }
@@ -297,10 +320,13 @@ int do_local_users(yuzu::CommandContext& ctx) {
         std::getline(ls, shell, ':');
 
         int uid = 0;
-        try { uid = std::stoi(uid_s); } catch (...) {}
+        try {
+            uid = std::stoi(uid_s);
+        } catch (...) {}
 
         // Skip system accounts (uid < 1000, except root)
-        if (uid != 0 && uid < 1000) continue;
+        if (uid != 0 && uid < 1000)
+            continue;
         // Skip nologin/false shell accounts
         bool enabled = true;
         if (shell.find("nologin") != std::string::npos ||
@@ -310,8 +336,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
 
         // Try to get last login from lastlog
         std::string last_logon = "unknown";
-        auto lastlog_out = run_command(
-            std::format("lastlog -u {} 2>/dev/null | tail -1", user).c_str());
+        auto lastlog_out =
+            run_command(std::format("lastlog -u {} 2>/dev/null | tail -1", user).c_str());
         if (!lastlog_out.empty() && lastlog_out.find("Never") != std::string::npos) {
             last_logon = "Never";
         } else if (!lastlog_out.empty()) {
@@ -323,9 +349,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
             }
         }
 
-        ctx.write_output(std::format("local_user|{}|{}|{}|{}",
-            user, enabled ? "true" : "false", last_logon,
-            desc.empty() ? "-" : desc));
+        ctx.write_output(std::format("local_user|{}|{}|{}|{}", user, enabled ? "true" : "false",
+                                     last_logon, desc.empty() ? "-" : desc));
     }
 
 #elif defined(__APPLE__)
@@ -338,23 +363,30 @@ int do_local_users(yuzu::CommandContext& ctx) {
             std::string user, uid_s;
             ls >> user >> uid_s;
             int uid = 0;
-            try { uid = std::stoi(uid_s); } catch (...) {}
+            try {
+                uid = std::stoi(uid_s);
+            } catch (...) {}
             // Skip system accounts
-            if (uid < 500 && user != "root") continue;
-            if (user.starts_with("_")) continue;
+            if (uid < 500 && user != "root")
+                continue;
+            if (user.starts_with("_"))
+                continue;
 
             // Check if account is enabled
             auto shell = run_command(
-                std::format("dscl . -read /Users/{} UserShell 2>/dev/null | awk '{{print $2}}'", user).c_str());
+                std::format("dscl . -read /Users/{} UserShell 2>/dev/null | awk '{{print $2}}'",
+                            user)
+                    .c_str());
             bool enabled = shell.find("false") == std::string::npos &&
                            shell.find("nologin") == std::string::npos;
 
             auto desc = run_command(
-                std::format("dscl . -read /Users/{} RealName 2>/dev/null | tail -1 | sed 's/^ //'", user).c_str());
+                std::format("dscl . -read /Users/{} RealName 2>/dev/null | tail -1 | sed 's/^ //'",
+                            user)
+                    .c_str());
 
-            ctx.write_output(std::format("local_user|{}|{}|unknown|{}",
-                user, enabled ? "true" : "false",
-                desc.empty() ? "-" : desc));
+            ctx.write_output(std::format("local_user|{}|{}|unknown|{}", user,
+                                         enabled ? "true" : "false", desc.empty() ? "-" : desc));
         }
     }
 
@@ -366,9 +398,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
     NET_API_STATUS status;
 
     do {
-        status = NetUserEnum(nullptr, 2, FILTER_NORMAL_ACCOUNT,
-            reinterpret_cast<LPBYTE*>(&buf), MAX_PREFERRED_LENGTH,
-            &entries_read, &total_entries, &resume);
+        status = NetUserEnum(nullptr, 2, FILTER_NORMAL_ACCOUNT, reinterpret_cast<LPBYTE*>(&buf),
+                             MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
 
         if (status == NERR_Success || status == ERROR_MORE_DATA) {
             for (DWORD i = 0; i < entries_read; ++i) {
@@ -388,9 +419,9 @@ int do_local_users(yuzu::CommandContext& ctx) {
                     last_logon = time_str;
                 }
 
-                ctx.write_output(std::format("local_user|{}|{}|{}|{}",
-                    name, enabled ? "true" : "false", last_logon,
-                    comment.empty() ? "-" : comment));
+                ctx.write_output(std::format("local_user|{}|{}|{}|{}", name,
+                                             enabled ? "true" : "false", last_logon,
+                                             comment.empty() ? "-" : comment));
             }
             NetApiBufferFree(buf);
             buf = nullptr;
@@ -407,10 +438,10 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     // Check sudo and wheel groups
     for (const char* group_name : {"sudo", "wheel"}) {
         struct group* grp = getgrnam(group_name);
-        if (!grp) continue;
+        if (!grp)
+            continue;
         for (char** member = grp->gr_mem; *member; ++member) {
-            ctx.write_output(std::format("admin|{}|user|{}",
-                *member, group_name));
+            ctx.write_output(std::format("admin|{}|user|{}", *member, group_name));
         }
     }
     // Also check root (uid 0) in /etc/passwd
@@ -440,10 +471,9 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     DWORD total_entries = 0;
     DWORD_PTR resume = 0;
 
-    NET_API_STATUS status = NetLocalGroupGetMembers(
-        nullptr, L"Administrators", 2,
-        reinterpret_cast<LPBYTE*>(&buf), MAX_PREFERRED_LENGTH,
-        &entries_read, &total_entries, &resume);
+    NET_API_STATUS status =
+        NetLocalGroupGetMembers(nullptr, L"Administrators", 2, reinterpret_cast<LPBYTE*>(&buf),
+                                MAX_PREFERRED_LENGTH, &entries_read, &total_entries, &resume);
 
     if (status == NERR_Success) {
         for (DWORD i = 0; i < entries_read; ++i) {
@@ -452,11 +482,20 @@ int do_local_admins(yuzu::CommandContext& ctx) {
 
             const char* type_str = "unknown";
             switch (m.lgrmi2_sidusage) {
-                case SidTypeUser:           type_str = "user"; break;
-                case SidTypeGroup:          type_str = "group"; break;
-                case SidTypeWellKnownGroup: type_str = "well_known_group"; break;
-                case SidTypeAlias:          type_str = "alias"; break;
-                default: break;
+            case SidTypeUser:
+                type_str = "user";
+                break;
+            case SidTypeGroup:
+                type_str = "group";
+                break;
+            case SidTypeWellKnownGroup:
+                type_str = "well_known_group";
+                break;
+            case SidTypeAlias:
+                type_str = "alias";
+                break;
+            default:
+                break;
             }
 
             // Split domain\name
@@ -468,8 +507,7 @@ int do_local_admins(yuzu::CommandContext& ctx) {
                 member_name = name.substr(backslash + 1);
             }
 
-            ctx.write_output(std::format("admin|{}|{}|{}",
-                member_name, type_str, domain));
+            ctx.write_output(std::format("admin|{}|{}|{}", member_name, type_str, domain));
         }
         NetApiBufferFree(buf);
     }
@@ -477,36 +515,36 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-}  // namespace
+} // namespace
 
 class UsersPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "users"; }
-    std::string_view version()     const noexcept override { return "1.0.0"; }
+    std::string_view name() const noexcept override { return "users"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
         return "Reports logged-on users, sessions, local accounts, and admin group members";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "logged_on", "sessions", "local_users", "local_admins", nullptr
-        };
+        static const char* acts[] = {"logged_on", "sessions", "local_users", "local_admins",
+                                     nullptr};
         return acts;
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
-        return {};
-    }
+    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
-        if (action == "logged_on")    return do_logged_on(ctx);
-        if (action == "sessions")     return do_sessions(ctx);
-        if (action == "local_users")  return do_local_users(ctx);
-        if (action == "local_admins") return do_local_admins(ctx);
+        if (action == "logged_on")
+            return do_logged_on(ctx);
+        if (action == "sessions")
+            return do_sessions(ctx);
+        if (action == "local_users")
+            return do_local_users(ctx);
+        if (action == "local_admins")
+            return do_local_admins(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

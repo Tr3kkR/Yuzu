@@ -36,6 +36,31 @@ Yuzu Server
     └── Metrics — Prometheus-compatible, per-plugin counters
 ```
 
+## Darwin Compatibility
+
+This Claude instance is the designated **macOS/Darwin compatibility guardian** for Yuzu. When Windows-originated changes land on `origin/dev`, the standing workflow is:
+
+1. `git fetch origin && git status` — confirm branch state.
+2. `git pull` — fast-forward to latest dev.
+3. `git diff HEAD~N..HEAD --stat` — review what changed.
+4. Identify which previous Darwin fixes are still present in the new tree.
+5. `meson setup builddir --reconfigure ...` if `meson.build` changed.
+6. `meson compile -C builddir` — fix any new compile errors.
+7. `bash scripts/run-tests.sh all` — fix any new test failures.
+8. Commit clean with a Darwin-fix commit message.
+
+### Standing Darwin pitfalls
+
+| Area | Issue |
+|---|---|
+| Path comparisons | macOS `/var` → `/private/var` symlink: always call `fs::canonical()` on both sides before comparing paths in tests. |
+| SQLite concurrency | Any new store that emits from multiple threads needs a mutex protecting the `db_` handle. |
+| Erlang rebar3 ct | Always pass `--dir apps/yuzu_gw/test` together with `--suite` flags. |
+| `curl -f` in tests | Do **not** use `-f` where 4xx is an acceptable response — it causes `|| echo "000"` fallbacks to contaminate the status code variable. |
+| `prometheus_httpd` | Use `start/0` with `application:set_env(prometheus, prometheus_http, [{port, P}, {path, "/metrics"}])` — `start/1` does not exist. Call `application:ensure_all_started(prometheus_httpd)` first so `prometheus_http_impl:setup/0` runs before the first scrape. |
+
+After any cross-platform change, always run `bash scripts/run-tests.sh all` on Darwin before committing.
+
 ## Instruction Engine
 
 The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:

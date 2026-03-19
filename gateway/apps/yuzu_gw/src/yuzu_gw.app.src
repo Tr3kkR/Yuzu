@@ -16,7 +16,8 @@
         inets,
         grpcbox,
         telemetry,
-        prometheus
+        prometheus,
+        prometheus_httpd
     ]},
     {env, []},
     {modules, []},

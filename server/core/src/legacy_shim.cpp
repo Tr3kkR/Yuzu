@@ -1,11 +1,11 @@
 #include "legacy_shim.hpp"
 
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
 #include <format>
 #include <string>
 #include <vector>
-
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
 namespace yuzu::server {
 
@@ -13,44 +13,41 @@ namespace {
 
 // Build a minimal YAML source string that conforms to the
 // apiVersion: yuzu.io/v1alpha1 InstructionDefinition format.
-std::string build_yaml_source(const std::string& plugin_name,
-                              const std::string& action,
+std::string build_yaml_source(const std::string& plugin_name, const std::string& action,
                               const std::string& def_id) {
-    return std::format(
-        "apiVersion: yuzu.io/v1alpha1\n"
-        "kind: InstructionDefinition\n"
-        "metadata:\n"
-        "  name: \"{}:{}\"\n"
-        "  id: \"{}\"\n"
-        "spec:\n"
-        "  plugin: \"{}\"\n"
-        "  action: \"{}\"\n"
-        "  type: question\n"
-        "  version: \"1.0.0\"\n"
-        "  description: \"Auto-generated from {} plugin descriptor\"\n"
-        "  concurrency: per-device\n"
-        "  approval: auto\n"
-        "  parameters:\n"
-        "    type: object\n"
-        "    additionalProperties:\n"
-        "      type: string\n"
-        "  results:\n"
-        "    - name: output\n"
-        "      type: string\n",
-        plugin_name, action, def_id, plugin_name, action, plugin_name);
+    return std::format("apiVersion: yuzu.io/v1alpha1\n"
+                       "kind: InstructionDefinition\n"
+                       "metadata:\n"
+                       "  name: \"{}:{}\"\n"
+                       "  id: \"{}\"\n"
+                       "spec:\n"
+                       "  plugin: \"{}\"\n"
+                       "  action: \"{}\"\n"
+                       "  type: question\n"
+                       "  version: \"1.0.0\"\n"
+                       "  description: \"Auto-generated from {} plugin descriptor\"\n"
+                       "  concurrency: per-device\n"
+                       "  approval: auto\n"
+                       "  parameters:\n"
+                       "    type: object\n"
+                       "    additionalProperties:\n"
+                       "      type: string\n"
+                       "  results:\n"
+                       "    - name: output\n"
+                       "      type: string\n",
+                       plugin_name, action, def_id, plugin_name, action, plugin_name);
 }
 
 } // namespace
 
-std::vector<InstructionDefinition> generate_legacy_definitions(
-    const std::vector<PluginCapability>& capabilities) {
+std::vector<InstructionDefinition>
+generate_legacy_definitions(const std::vector<PluginCapability>& capabilities) {
 
-    const nlohmann::json parameter_schema = {
-        {"type", "object"},
-        {"additionalProperties", {{"type", "string"}}}};
+    const nlohmann::json parameter_schema = {{"type", "object"},
+                                             {"additionalProperties", {{"type", "string"}}}};
 
-    const nlohmann::json result_schema = nlohmann::json::array(
-        {{{"name", "output"}, {"type", "string"}}});
+    const nlohmann::json result_schema =
+        nlohmann::json::array({{{"name", "output"}, {"type", "string"}}});
 
     std::vector<InstructionDefinition> definitions;
 
@@ -63,15 +60,14 @@ std::vector<InstructionDefinition> generate_legacy_definitions(
             def.type = "question";
             def.plugin = cap.plugin_name;
             def.action = action;
-            def.description = std::format(
-                "Auto-generated from {} plugin descriptor", cap.plugin_name);
+            def.description =
+                std::format("Auto-generated from {} plugin descriptor", cap.plugin_name);
             def.parameter_schema = parameter_schema.dump();
             def.result_schema = result_schema.dump();
             def.concurrency_mode = "per-device";
             def.approval_mode = "auto";
             def.enabled = true;
-            def.yaml_source =
-                build_yaml_source(cap.plugin_name, action, def.id);
+            def.yaml_source = build_yaml_source(cap.plugin_name, action, def.id);
 
             definitions.push_back(std::move(def));
         }
@@ -97,15 +93,13 @@ int sync_legacy_definitions(InstructionStore& store,
             spdlog::info("Legacy shim: created definition '{}'", def.id);
         } else {
             ++skipped_count;
-            spdlog::debug(
-                "Legacy shim: skipped '{}' (already exists or error: {})",
-                def.id, result.error());
+            spdlog::debug("Legacy shim: skipped '{}' (already exists or error: {})", def.id,
+                          result.error());
         }
     }
 
-    spdlog::info(
-        "Legacy shim sync complete: {} created, {} skipped, {} total",
-        created_count, skipped_count, created_count + skipped_count);
+    spdlog::info("Legacy shim sync complete: {} created, {} skipped, {} total", created_count,
+                 skipped_count, created_count + skipped_count);
 
     return created_count;
 }

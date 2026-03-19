@@ -27,7 +27,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -77,8 +78,8 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
 
     auto emit_rule = [&]() {
         if (!rule_name.empty() && count < 100) {
-            ctx.write_output(std::format("rule|{}|{}|{}|{}|{}",
-                                         rule_name, enabled, direction, action_str, profiles));
+            ctx.write_output(std::format("rule|{}|{}|{}|{}|{}", rule_name, enabled, direction,
+                                         action_str, profiles));
             ++count;
         }
         rule_name.clear();
@@ -89,16 +90,20 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
     };
 
     while (std::getline(iss, line) && count < 100) {
-        if (line.empty() || line[0] == '-') continue;
+        if (line.empty() || line[0] == '-')
+            continue;
 
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
 
         auto key = line.substr(0, colon);
         auto val = line.substr(colon + 1);
         // Trim whitespace
-        while (!key.empty() && key.back() == ' ') key.pop_back();
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+        while (!key.empty() && key.back() == ' ')
+            key.pop_back();
+        while (!val.empty() && val.front() == ' ')
+            val.erase(val.begin());
 
         if (key == "Rule Name") {
             emit_rule();
@@ -122,22 +127,21 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
 
 class FirewallPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "firewall"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "firewall"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Firewall status and rule listing";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = { "state", "rules", nullptr };
+        static const char* acts[] = {"state", "rules", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
+    int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
 
         if (action == "state") {
@@ -155,9 +159,10 @@ public:
                 auto ufw_out = run_command("ufw status 2>/dev/null");
                 if (ufw_out.find("active") != std::string::npos) {
                     ctx.write_output("backend|ufw");
-                    ctx.write_output(std::format("state|{}",
-                        ufw_out.find("Status: active") != std::string::npos
-                            ? "active" : "inactive"));
+                    ctx.write_output(
+                        std::format("state|{}", ufw_out.find("Status: active") != std::string::npos
+                                                    ? "active"
+                                                    : "inactive"));
                 } else {
                     // Try iptables
                     auto ipt = run_command("iptables -L -n 2>/dev/null");
@@ -173,8 +178,8 @@ public:
                                 ++rule_count;
                             }
                         }
-                        ctx.write_output(std::format("state|{}",
-                            rule_count > 0 ? "active" : "inactive"));
+                        ctx.write_output(
+                            std::format("state|{}", rule_count > 0 ? "active" : "inactive"));
                     } else {
                         ctx.write_output("backend|none");
                         ctx.write_output("state|inactive");
@@ -197,14 +202,12 @@ public:
 
         if (action == "rules") {
 #ifdef _WIN32
-            auto output = run_command(
-                "netsh advfirewall firewall show rule name=all dir=in");
+            auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
             parse_firewall_rules(ctx, output);
 #elif defined(__linux__)
-            auto output = run_command(
-                "firewall-cmd --list-all 2>/dev/null || "
-                "ufw status numbered 2>/dev/null || "
-                "iptables -L -n --line-numbers 2>/dev/null");
+            auto output = run_command("firewall-cmd --list-all 2>/dev/null || "
+                                      "ufw status numbered 2>/dev/null || "
+                                      "iptables -L -n --line-numbers 2>/dev/null");
             std::istringstream iss(output);
             std::string line;
             while (std::getline(iss, line)) {

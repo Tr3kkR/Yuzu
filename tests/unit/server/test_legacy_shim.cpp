@@ -20,7 +20,7 @@ using namespace yuzu::server;
 static std::vector<PluginCapability> make_test_capabilities() {
     return {
         {"system_info", "1.0.0", "System information plugin", {"query", "summary"}},
-        {"network",     "2.1.0", "Network diagnostics plugin", {"ping", "traceroute", "dns"}},
+        {"network", "2.1.0", "Network diagnostics plugin", {"ping", "traceroute", "dns"}},
     };
 }
 
@@ -147,17 +147,14 @@ TEST_CASE("LegacyShim: sync with new capability adds only new", "[legacy_shim][d
     InstructionStore store(":memory:");
 
     // First sync with one plugin
-    std::vector<PluginCapability> caps1 = {
-        {"plugin_a", "1.0.0", "Plugin A", {"action1"}}
-    };
+    std::vector<PluginCapability> caps1 = {{"plugin_a", "1.0.0", "Plugin A", {"action1"}}};
     int first = sync_legacy_definitions(store, caps1);
     CHECK(first == 1);
 
     // Second sync adds a new plugin
     std::vector<PluginCapability> caps2 = {
         {"plugin_a", "1.0.0", "Plugin A", {"action1"}},
-        {"plugin_b", "1.0.0", "Plugin B", {"action2", "action3"}}
-    };
+        {"plugin_b", "1.0.0", "Plugin B", {"action2", "action3"}}};
     int second = sync_legacy_definitions(store, caps2);
     CHECK(second == 2);
 

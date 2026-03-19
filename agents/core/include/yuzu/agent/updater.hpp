@@ -1,6 +1,6 @@
 #pragma once
 
-#include <yuzu/plugin.h>  // YUZU_EXPORT
+#include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <atomic>
 #include <chrono>
@@ -10,17 +10,18 @@
 
 namespace yuzu::agent {
 
-struct UpdateError { std::string message; };
+struct UpdateError {
+    std::string message;
+};
 
 struct UpdateConfig {
     bool enabled{true};
-    std::chrono::seconds check_interval{6 * 3600};  // 6 hours
+    std::chrono::seconds check_interval{6 * 3600}; // 6 hours
 };
 
 class YUZU_EXPORT Updater {
 public:
-    Updater(UpdateConfig config, std::string agent_id,
-            std::string current_version, std::string os,
+    Updater(UpdateConfig config, std::string agent_id, std::string current_version, std::string os,
             std::string arch, std::filesystem::path exe_path);
     ~Updater() = default;
 
@@ -59,4 +60,4 @@ private:
 /// Get the path to the currently running executable (cross-platform).
 YUZU_EXPORT std::filesystem::path current_executable_path();
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent

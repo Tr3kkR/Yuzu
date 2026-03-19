@@ -16,14 +16,14 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-
-#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -35,13 +35,16 @@ fs::path g_tags_path;
 
 void load_tags() {
     g_tags.clear();
-    if (g_tags_path.empty()) return;
+    if (g_tags_path.empty())
+        return;
 
     std::error_code ec;
-    if (!fs::exists(g_tags_path, ec)) return;
+    if (!fs::exists(g_tags_path, ec))
+        return;
 
     std::ifstream f(g_tags_path);
-    if (!f) return;
+    if (!f)
+        return;
 
     try {
         auto j = nlohmann::json::parse(f);
@@ -56,7 +59,8 @@ void load_tags() {
 }
 
 void save_tags() {
-    if (g_tags_path.empty()) return;
+    if (g_tags_path.empty())
+        return;
 
     std::error_code ec;
     auto parent = g_tags_path.parent_path();
@@ -71,20 +75,19 @@ void save_tags() {
     }
 }
 
-}  // namespace
+} // namespace
 
 class TagsPlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return "tags"; }
-    std::string_view version()     const noexcept override { return "0.1.0"; }
+    std::string_view name() const noexcept override { return "tags"; }
+    std::string_view version() const noexcept override { return "0.1.0"; }
     std::string_view description() const noexcept override {
         return "Device tagging — set, get, delete, list tags for scope evaluation";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "set", "get", "get_all", "delete", "check", "clear", "count", nullptr
-        };
+        static const char* acts[] = {"set",   "get",   "get_all", "delete",
+                                     "check", "clear", "count",   nullptr};
         return acts;
     }
 
@@ -102,20 +105,23 @@ public:
         return {};
     }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        g_ctx = nullptr;
-    }
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override { g_ctx = nullptr; }
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
-        if (action == "set")     return do_set(ctx, params);
-        if (action == "get")     return do_get(ctx, params);
-        if (action == "get_all") return do_get_all(ctx);
-        if (action == "delete")  return do_delete(ctx, params);
-        if (action == "check")   return do_check(ctx, params);
-        if (action == "clear")   return do_clear(ctx);
-        if (action == "count")   return do_count(ctx);
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
+        if (action == "set")
+            return do_set(ctx, params);
+        if (action == "get")
+            return do_get(ctx, params);
+        if (action == "get_all")
+            return do_get_all(ctx);
+        if (action == "delete")
+            return do_delete(ctx, params);
+        if (action == "check")
+            return do_check(ctx, params);
+        if (action == "clear")
+            return do_clear(ctx);
+        if (action == "count")
+            return do_count(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

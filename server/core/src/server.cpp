@@ -16,8 +16,13 @@
 #include "management.grpc.pb.h"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "api_token_store.hpp"
+#include "management_group_store.hpp"
 #include "oidc_provider.hpp"
+#include "quarantine_store.hpp"
+#include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "rest_api_v1.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -1513,10 +1518,10 @@ public:
         // Initialize OIDC provider if configured
         if (!cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty()) {
             oidc::OidcConfig oidc_cfg;
-            oidc_cfg.issuer        = cfg_.oidc_issuer;
-            oidc_cfg.client_id     = cfg_.oidc_client_id;
+            oidc_cfg.issuer = cfg_.oidc_issuer;
+            oidc_cfg.client_id = cfg_.oidc_client_id;
             oidc_cfg.client_secret = cfg_.oidc_client_secret;
-            oidc_cfg.redirect_uri   = cfg_.oidc_redirect_uri;
+            oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             // Fallback endpoints for Entra ID — OidcProvider constructor will
             // override from the OIDC discovery document if reachable.
@@ -1526,17 +1531,19 @@ public:
             if (v2_pos != std::string::npos) {
                 auto base = issuer.substr(0, v2_pos);
                 oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint         = base + "/oauth2/v2.0/token";
+                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
             } else {
                 oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint         = issuer + "/token";
+                oidc_cfg.token_endpoint = issuer + "/token";
             }
             // Token exchange helper script (Python subprocess workaround for
             // httplib OpenSSL client issues on Windows)
-            auto script_dir = std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path()
-                              / "scripts" / "oidc_token_exchange.py";
+            auto script_dir =
+                std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
+                "scripts" / "oidc_token_exchange.py";
             // Try source tree location first (development), then installed location
-            auto src_script = std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
+            auto src_script =
+                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
             if (std::filesystem::exists(src_script))
                 oidc_cfg.exchange_script = src_script.string();
             else if (std::filesystem::exists(script_dir))
@@ -1667,6 +1674,24 @@ public:
                     schedule_engine_->create_tables();
                 }
             }
+        }
+
+        // Initialize Phase 3: Security & RBAC stores
+        {
+            auto rbac_db = cfg_.auth_config_path.parent_path() / "rbac.db";
+            rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        }
+        {
+            auto mgmt_db = cfg_.auth_config_path.parent_path() / "management-groups.db";
+            mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
+        }
+        {
+            auto token_db = cfg_.auth_config_path.parent_path() / "api-tokens.db";
+            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
+        }
+        {
+            auto quar_db = cfg_.auth_config_path.parent_path() / "quarantine.db";
+            quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
     }
 
@@ -1963,13 +1988,42 @@ private:
     }
 
     std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res) {
+        // 1. Try session cookie (existing browser auth)
         auto token = extract_session_cookie(req);
         auto session = auth_mgr_.validate_session(token);
-        if (!session) {
-            res.status = 401;
-            res.set_content(R"({"error":"unauthorized"})", "application/json");
+        if (session)
+            return session;
+
+        // 2. Try Authorization: Bearer <token> (API token auth)
+        auto auth_header = req.get_header_value("Authorization");
+        if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
+            auto raw = auth_header.substr(7);
+            if (api_token_store_) {
+                auto api_token = api_token_store_->validate_token(raw);
+                if (api_token) {
+                    auth::Session synth;
+                    synth.username = api_token->principal_id;
+                    synth.role = auth::Role::admin; // API tokens are always full-access
+                    return synth;
+                }
+            }
         }
-        return session;
+
+        // 3. Try X-Yuzu-Token header (alternative API token header)
+        auto custom_header = req.get_header_value("X-Yuzu-Token");
+        if (!custom_header.empty() && api_token_store_) {
+            auto api_token = api_token_store_->validate_token(custom_header);
+            if (api_token) {
+                auth::Session synth;
+                synth.username = api_token->principal_id;
+                synth.role = auth::Role::admin;
+                return synth;
+            }
+        }
+
+        res.status = 401;
+        res.set_content(R"({"error":"unauthorized"})", "application/json");
+        return std::nullopt;
     }
 
     bool require_admin(const httplib::Request& req, httplib::Response& res) {
@@ -1977,6 +2031,35 @@ private:
         if (!session)
             return false;
         if (session->role != auth::Role::admin) {
+            res.status = 403;
+            res.set_content(R"({"error":"admin role required"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    /// RBAC-aware permission check. Falls back to legacy admin/user check if RBAC is disabled.
+    bool require_permission(const httplib::Request& req, httplib::Response& res,
+                            const std::string& securable_type, const std::string& operation) {
+        auto session = require_auth(req, res);
+        if (!session)
+            return false;
+
+        if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+            if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"required_permission", securable_type + ":" + operation}})
+                        .dump(),
+                    "application/json");
+                return false;
+            }
+            return true;
+        }
+
+        // Legacy fallback: write/delete/execute/approve require admin
+        if (operation != "Read" && session->role != auth::Role::admin) {
             res.status = 403;
             res.set_content(R"({"error":"admin role required"})", "application/json");
             return false;
@@ -2672,8 +2755,8 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page, metrics, and OIDC flow
-                if (req.path == "/login" || req.path == "/metrics" ||
+                // Allow unauthenticated access to login page, metrics, health, and OIDC flow
+                if (req.path == "/login" || req.path == "/metrics" || req.path == "/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
@@ -2744,8 +2827,8 @@ private:
         });
 
         // -- OIDC SSO endpoints -----------------------------------------------
-        web_server_->Get("/auth/oidc/start",
-            [this](const httplib::Request& req, httplib::Response& res) {
+        web_server_->Get(
+            "/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
                 if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
                     res.status = 404;
                     res.set_content(R"({"error":"OIDC not configured"})", "application/json");
@@ -2763,61 +2846,60 @@ private:
                 res.set_redirect(auth_url);
             });
 
-        web_server_->Get("/auth/callback",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                if (!oidc_provider_) {
-                    res.status = 404;
-                    res.set_content("OIDC not configured", "text/plain");
-                    return;
-                }
+        web_server_->Get("/auth/callback", [this](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            if (!oidc_provider_) {
+                res.status = 404;
+                res.set_content("OIDC not configured", "text/plain");
+                return;
+            }
 
-                // Check for error response from IdP
-                auto error = req.get_param_value("error");
-                if (!error.empty()) {
-                    auto desc = req.get_param_value("error_description");
-                    spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
-                    res.set_redirect("/login?error=sso_denied");
-                    return;
-                }
+            // Check for error response from IdP
+            auto error = req.get_param_value("error");
+            if (!error.empty()) {
+                auto desc = req.get_param_value("error_description");
+                spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+                res.set_redirect("/login?error=sso_denied");
+                return;
+            }
 
-                auto code  = req.get_param_value("code");
-                auto state = req.get_param_value("state");
+            auto code = req.get_param_value("code");
+            auto state = req.get_param_value("state");
 
-                if (code.empty() || state.empty()) {
-                    res.set_redirect("/login?error=sso_invalid");
-                    return;
-                }
+            if (code.empty() || state.empty()) {
+                res.set_redirect("/login?error=sso_invalid");
+                return;
+            }
 
-                auto result = oidc_provider_->handle_callback(code, state);
-                if (!result) {
-                    spdlog::warn("OIDC callback failed: {}", result.error());
-                    audit_log(req, "auth.oidc_login_failed", "failure");
-                    emit_event("auth.oidc_login_failed", req,
-                               {{"source_ip", req.remote_addr}, {"error", result.error()}},
-                               {}, Severity::kWarn);
-                    res.set_redirect("/login?error=sso_failed");
-                    return;
-                }
+            auto result = oidc_provider_->handle_callback(code, state);
+            if (!result) {
+                spdlog::warn("OIDC callback failed: {}", result.error());
+                audit_log(req, "auth.oidc_login_failed", "failure");
+                emit_event("auth.oidc_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", result.error()}}, {},
+                           Severity::kWarn);
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
 
-                auto& claims = result.value();
-                auto email   = claims.email.empty() ? claims.preferred_username : claims.email;
-                auto display = claims.name.empty() ? email : claims.name;
-                auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
-                auto session_token = auth_mgr_.create_oidc_session(
-                    display, email, claims.sub, claims.groups, admin_gid);
+            auto& claims = result.value();
+            auto email = claims.email.empty() ? claims.preferred_username : claims.email;
+            auto display = claims.name.empty() ? email : claims.name;
+            auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+            auto session_token =
+                auth_mgr_.create_oidc_session(display, email, claims.sub, claims.groups, admin_gid);
 
-                res.set_header("Set-Cookie",
-                               "yuzu_session=" + session_token + session_cookie_attrs());
+            res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
-                audit_log(req, "auth.oidc_login", "success", "user", display);
-                emit_event("auth.oidc_login", req,
-                           {{"source_ip", req.remote_addr},
-                            {"oidc_sub", claims.sub},
-                            {"email", email},
-                            {"name", claims.name}});
+            audit_log(req, "auth.oidc_login", "success", "user", display);
+            emit_event("auth.oidc_login", req,
+                       {{"source_ip", req.remote_addr},
+                        {"oidc_sub", claims.sub},
+                        {"email", email},
+                        {"name", claims.name}});
 
-                res.set_redirect("/");
-            });
+            res.set_redirect("/");
+        });
 
         // -- HTTP metrics (post-routing handler) --------------------------------
         web_server_->set_post_routing_handler(
@@ -4801,13 +4883,13 @@ private:
                     html += "</div>";
                 } else {
                     html += "<table><thead><tr><th>Name</th><th>Plugin:Action</th><th>Type</"
-                           "th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
+                            "th><th>Enabled</th><th>Set</th><th></th></tr></thead><tbody>";
                     for (const auto& d : defs) {
                         auto type_cls = d.type == "question" ? "status-running" : "status-pending";
                         bool is_legacy = d.id.starts_with("legacy.");
-                        html += "<tr><td><strong>" + html_escape(d.name) +
-                                "</strong>";
-                        if (is_legacy) html += " <span class=\"legacy-badge\">legacy</span>";
+                        html += "<tr><td><strong>" + html_escape(d.name) + "</strong>";
+                        if (is_legacy)
+                            html += " <span class=\"legacy-badge\">legacy</span>";
                         html += "<br><span style=\"font-size:0.65rem;color:#8b949e\">" +
                                 html_escape(d.id.substr(0, 12)) +
                                 "</span></td>"
@@ -4828,7 +4910,8 @@ private:
                                 "<td>";
                         if (can_author) {
                             html += "<button class=\"btn btn-secondary btn-sm\" "
-                                    "onclick=\"openEditor('" + d.id + "')\">Edit</button> ";
+                                    "onclick=\"openEditor('" +
+                                    d.id + "')\">Edit</button> ";
                         }
                         html += "<button class=\"btn btn-danger btn-sm\" "
                                 "hx-delete=\"/api/instructions/" +
@@ -4843,66 +4926,75 @@ private:
             });
 
         // -- Editor fragment: RBAC-gated to PlatformEngineer / Administrator --
-        web_server_->Get(
-            "/fragments/instructions/editor",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
-                    return;
+        web_server_->Get("/fragments/instructions/editor", [this](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
 
-                // PlatformEngineer or Administrator can author definitions.
-                // When RBAC enforcement is fully wired, this will check the
-                // PlatformEngineer role via RbacStore::check_permission().
-                bool can_author = (session->role == auth::Role::admin);
-                if (!can_author) {
-                    res.set_content(kInstructionEditorDeniedHtml, "text/html; charset=utf-8");
-                    return;
-                }
+            // PlatformEngineer or Administrator can author definitions.
+            // When RBAC enforcement is fully wired, this will check the
+            // PlatformEngineer role via RbacStore::check_permission().
+            bool can_author = (session->role == auth::Role::admin);
+            if (!can_author) {
+                res.set_content(kInstructionEditorDeniedHtml, "text/html; charset=utf-8");
+                return;
+            }
 
-                std::string tmpl(kInstructionEditorHtml);
-                auto def_id = req.get_param_value("id");
-                if (!def_id.empty() && instruction_store_) {
-                    auto def = instruction_store_->get_definition(def_id);
-                    if (def) {
-                        auto replace = [&](const std::string& key, const std::string& val) {
-                            for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                                tmpl.replace(pos, key.size(), html_escape(val));
-                        };
-                        replace("{{TITLE}}", "Edit Definition");
-                        replace("{{DEF_ID}}", def->id);
-                        replace("{{DEF_NAME}}", def->name);
-                        replace("{{DEF_VERSION}}", def->version);
-                        replace("{{DEF_PLUGIN}}", def->plugin);
-                        replace("{{DEF_ACTION}}", def->action);
-                        replace("{{DEF_DESCRIPTION}}", def->description);
-                        replace("{{DEF_PLATFORMS}}", def->platforms);
-                        replace("{{YAML_SOURCE}}", def->yaml_source);
-                        // Set dropdowns
-                        replace("{{SEL_QUESTION}}", def->type == "question" ? "selected" : "");
-                        replace("{{SEL_ACTION}}", def->type == "action" ? "selected" : "");
-                        replace("{{SEL_APPR_AUTO}}", def->approval_mode == "auto" ? "selected" : "");
-                        replace("{{SEL_APPR_ROLE}}", def->approval_mode == "role-gated" ? "selected" : "");
-                        replace("{{SEL_APPR_ALWAYS}}", def->approval_mode == "always" ? "selected" : "");
-                        replace("{{SEL_CC_UNLIM}}", def->concurrency_mode == "unlimited" ? "selected" : "");
-                        replace("{{SEL_CC_DEV}}", def->concurrency_mode == "per-device" ? "selected" : "");
-                        replace("{{SEL_CC_DEF}}", def->concurrency_mode == "per-definition" ? "selected" : "");
-                        replace("{{SEL_CC_SET}}", def->concurrency_mode == "per-set" ? "selected" : "");
-                    }
-                } else {
-                    // New definition — clear all placeholders
-                    auto clear = [&](const std::string& key) {
-                        for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                            tmpl.replace(pos, key.size(), "");
-                    };
+            std::string tmpl(kInstructionEditorHtml);
+            auto def_id = req.get_param_value("id");
+            if (!def_id.empty() && instruction_store_) {
+                auto def = instruction_store_->get_definition(def_id);
+                if (def) {
                     auto replace = [&](const std::string& key, const std::string& val) {
-                        for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                            tmpl.replace(pos, key.size(), val);
+                        for (auto pos = tmpl.find(key); pos != std::string::npos;
+                             pos = tmpl.find(key))
+                            tmpl.replace(pos, key.size(), html_escape(val));
                     };
-                    replace("{{TITLE}}", "New Definition");
-                    clear("{{DEF_ID}}"); clear("{{DEF_NAME}}"); clear("{{DEF_VERSION}}");
-                    clear("{{DEF_PLUGIN}}"); clear("{{DEF_ACTION}}"); clear("{{DEF_DESCRIPTION}}");
-                    clear("{{DEF_PLATFORMS}}");
-                    replace("{{YAML_SOURCE}}",
+                    replace("{{TITLE}}", "Edit Definition");
+                    replace("{{DEF_ID}}", def->id);
+                    replace("{{DEF_NAME}}", def->name);
+                    replace("{{DEF_VERSION}}", def->version);
+                    replace("{{DEF_PLUGIN}}", def->plugin);
+                    replace("{{DEF_ACTION}}", def->action);
+                    replace("{{DEF_DESCRIPTION}}", def->description);
+                    replace("{{DEF_PLATFORMS}}", def->platforms);
+                    replace("{{YAML_SOURCE}}", def->yaml_source);
+                    // Set dropdowns
+                    replace("{{SEL_QUESTION}}", def->type == "question" ? "selected" : "");
+                    replace("{{SEL_ACTION}}", def->type == "action" ? "selected" : "");
+                    replace("{{SEL_APPR_AUTO}}", def->approval_mode == "auto" ? "selected" : "");
+                    replace("{{SEL_APPR_ROLE}}",
+                            def->approval_mode == "role-gated" ? "selected" : "");
+                    replace("{{SEL_APPR_ALWAYS}}",
+                            def->approval_mode == "always" ? "selected" : "");
+                    replace("{{SEL_CC_UNLIM}}",
+                            def->concurrency_mode == "unlimited" ? "selected" : "");
+                    replace("{{SEL_CC_DEV}}",
+                            def->concurrency_mode == "per-device" ? "selected" : "");
+                    replace("{{SEL_CC_DEF}}",
+                            def->concurrency_mode == "per-definition" ? "selected" : "");
+                    replace("{{SEL_CC_SET}}", def->concurrency_mode == "per-set" ? "selected" : "");
+                }
+            } else {
+                // New definition — clear all placeholders
+                auto clear = [&](const std::string& key) {
+                    for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
+                        tmpl.replace(pos, key.size(), "");
+                };
+                auto replace = [&](const std::string& key, const std::string& val) {
+                    for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
+                        tmpl.replace(pos, key.size(), val);
+                };
+                replace("{{TITLE}}", "New Definition");
+                clear("{{DEF_ID}}");
+                clear("{{DEF_NAME}}");
+                clear("{{DEF_VERSION}}");
+                clear("{{DEF_PLUGIN}}");
+                clear("{{DEF_ACTION}}");
+                clear("{{DEF_DESCRIPTION}}");
+                clear("{{DEF_PLATFORMS}}");
+                replace("{{YAML_SOURCE}}",
                         "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
                         "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
                         "  plugin: \"\"\n  action: \"\"\n  type: question\n"
@@ -4910,20 +5002,22 @@ private:
                         "  approval: auto\n  parameters:\n    type: object\n"
                         "    additionalProperties:\n      type: string\n"
                         "  results:\n    - name: output\n      type: string\n");
-                    replace("{{SEL_QUESTION}}", "selected");
-                    clear("{{SEL_ACTION}}");
-                    replace("{{SEL_APPR_AUTO}}", "selected");
-                    clear("{{SEL_APPR_ROLE}}"); clear("{{SEL_APPR_ALWAYS}}");
-                    replace("{{SEL_CC_UNLIM}}", "selected");
-                    clear("{{SEL_CC_DEV}}"); clear("{{SEL_CC_DEF}}"); clear("{{SEL_CC_SET}}");
-                }
-                res.set_content(tmpl, "text/html; charset=utf-8");
-            });
+                replace("{{SEL_QUESTION}}", "selected");
+                clear("{{SEL_ACTION}}");
+                replace("{{SEL_APPR_AUTO}}", "selected");
+                clear("{{SEL_APPR_ROLE}}");
+                clear("{{SEL_APPR_ALWAYS}}");
+                replace("{{SEL_CC_UNLIM}}", "selected");
+                clear("{{SEL_CC_DEV}}");
+                clear("{{SEL_CC_DEF}}");
+                clear("{{SEL_CC_SET}}");
+            }
+            res.set_content(tmpl, "text/html; charset=utf-8");
+        });
 
         // -- YAML save endpoint (HTMX form POST from editor) --
         web_server_->Post(
-            "/api/instructions/yaml",
-            [this](const httplib::Request& req, httplib::Response& res) {
+            "/api/instructions/yaml", [this](const httplib::Request& req, httplib::Response& res) {
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -4933,9 +5027,9 @@ private:
                 // PlatformEngineer role via RbacStore::check_permission().
                 bool can_author = (session->role == auth::Role::admin);
                 if (!can_author) {
-                    res.set_content(
-                        "<div class=\"alert alert-error\">Permission denied: PlatformEngineer role required</div>",
-                        "text/html");
+                    res.set_content("<div class=\"alert alert-error\">Permission denied: "
+                                    "PlatformEngineer role required</div>",
+                                    "text/html");
                     return;
                 }
                 if (!instruction_store_) {
@@ -4961,7 +5055,8 @@ private:
                 auto extract = [&](const std::string& key) -> std::string {
                     auto needle = key + ": ";
                     auto pos = yaml_source.find(needle);
-                    if (pos == std::string::npos) return {};
+                    if (pos == std::string::npos)
+                        return {};
                     auto start = pos + needle.size();
                     auto end = yaml_source.find('\n', start);
                     auto val = yaml_source.substr(start, end - start);
@@ -4985,9 +5080,9 @@ private:
                 def.enabled = true;
 
                 if (def.name.empty() || def.plugin.empty() || def.action.empty()) {
-                    res.set_content(
-                        "<div class=\"alert alert-error\">Missing required fields: name, plugin, action</div>",
-                        "text/html");
+                    res.set_content("<div class=\"alert alert-error\">Missing required fields: "
+                                    "name, plugin, action</div>",
+                                    "text/html");
                     return;
                 }
 
@@ -5001,45 +5096,45 @@ private:
                     msg = result ? "Definition created" : "Create failed: " + result.error();
                 }
 
-                std::string cls = msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
-                res.set_content(
-                    "<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
-                    "text/html");
+                std::string cls =
+                    msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
+                res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
+                                "text/html");
             });
 
         // -- YAML validate endpoint --
-        web_server_->Post(
-            "/api/instructions/validate-yaml",
-            [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session) return;
+        web_server_->Post("/api/instructions/validate-yaml", [this](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
 
-                auto yaml_source = req.get_param_value("yaml_source");
-                std::vector<std::string> errors;
+            auto yaml_source = req.get_param_value("yaml_source");
+            std::vector<std::string> errors;
 
-                if (yaml_source.empty())
-                    errors.push_back("YAML source is empty");
-                if (yaml_source.find("apiVersion:") == std::string::npos)
-                    errors.push_back("Missing apiVersion field");
-                if (yaml_source.find("kind:") == std::string::npos)
-                    errors.push_back("Missing kind field");
-                if (yaml_source.find("plugin:") == std::string::npos)
-                    errors.push_back("Missing spec.plugin field");
-                if (yaml_source.find("action:") == std::string::npos)
-                    errors.push_back("Missing spec.action field");
+            if (yaml_source.empty())
+                errors.push_back("YAML source is empty");
+            if (yaml_source.find("apiVersion:") == std::string::npos)
+                errors.push_back("Missing apiVersion field");
+            if (yaml_source.find("kind:") == std::string::npos)
+                errors.push_back("Missing kind field");
+            if (yaml_source.find("plugin:") == std::string::npos)
+                errors.push_back("Missing spec.plugin field");
+            if (yaml_source.find("action:") == std::string::npos)
+                errors.push_back("Missing spec.action field");
 
-                if (errors.empty()) {
-                    res.set_content(
-                        "<div class=\"alert alert-success\">YAML validation passed</div>",
-                        "text/html");
-                } else {
-                    std::string html = "<div class=\"alert alert-error\"><strong>Validation errors:</strong><ul>";
-                    for (const auto& e : errors)
-                        html += "<li>" + html_escape(e) + "</li>";
-                    html += "</ul></div>";
-                    res.set_content(html, "text/html");
-                }
-            });
+            if (errors.empty()) {
+                res.set_content("<div class=\"alert alert-success\">YAML validation passed</div>",
+                                "text/html");
+            } else {
+                std::string html =
+                    "<div class=\"alert alert-error\"><strong>Validation errors:</strong><ul>";
+                for (const auto& e : errors)
+                    html += "<li>" + html_escape(e) + "</li>";
+                html += "</ul></div>";
+                res.set_content(html, "text/html");
+            }
+        });
 
         web_server_->Get("/fragments/executions", [this](const httplib::Request& req,
                                                          httplib::Response& res) {
@@ -5239,6 +5334,27 @@ private:
                 "application/json");
         });
 
+        // -- Register REST API v1 routes (Phase 3) --------------------------------
+
+        rest_api_v1_ = std::make_unique<RestApiV1>();
+        rest_api_v1_->register_routes(
+            *web_server_,
+            [this](const httplib::Request& req, httplib::Response& res)
+                -> std::optional<auth::Session> { return require_auth(req, res); },
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const std::string& type, const std::string& op) -> bool {
+                return require_permission(req, res, type, op);
+            },
+            [this](const httplib::Request& req, const std::string& action,
+                   const std::string& result, const std::string& target_type,
+                   const std::string& target_id, const std::string& detail) {
+                audit_log(req, action, result, target_type, target_id, detail);
+            },
+            rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
+            quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
+            execution_tracker_.get(), schedule_engine_.get(), approval_manager_.get(),
+            tag_store_.get(), audit_store_.get());
+
         // -- Listen -----------------------------------------------------------
 
         int listen_port = cfg_.web_port;
@@ -5398,6 +5514,13 @@ private:
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
     sqlite3* shared_instr_db_{nullptr};
+
+    // Phase 3: Security & RBAC
+    std::unique_ptr<RbacStore> rbac_store_;
+    std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    std::unique_ptr<ApiTokenStore> api_token_store_;
+    std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<RestApiV1> rest_api_v1_;
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;

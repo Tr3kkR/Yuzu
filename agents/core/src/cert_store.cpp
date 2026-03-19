@@ -6,12 +6,12 @@
 #include <vector>
 
 #ifdef _WIN32
-#  include <winsock2.h>
-#  include <windows.h>
-#  include <wincrypt.h>
-#  include <ncrypt.h>
-#  pragma comment(lib, "crypt32.lib")
-#  pragma comment(lib, "ncrypt.lib")
+#include <ncrypt.h>
+#include <wincrypt.h>
+#include <windows.h>
+#include <winsock2.h>
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "ncrypt.lib")
 
 namespace yuzu::agent {
 
@@ -21,16 +21,23 @@ namespace {
 // Accepts "AB12CD..." or "AB:12:CD:..." (with or without colons/spaces).
 std::vector<unsigned char> parse_thumbprint(const std::string& hex) {
     std::vector<unsigned char> bytes;
-    bytes.reserve(20);  // SHA-1 = 20 bytes
-    for (size_t i = 0; i < hex.size(); ) {
+    bytes.reserve(20); // SHA-1 = 20 bytes
+    for (size_t i = 0; i < hex.size();) {
         char c = hex[i];
-        if (c == ':' || c == ' ') { ++i; continue; }
-        if (i + 1 >= hex.size()) break;
+        if (c == ':' || c == ' ') {
+            ++i;
+            continue;
+        }
+        if (i + 1 >= hex.size())
+            break;
         auto hi = hex[i], lo = hex[i + 1];
         auto nibble = [](char ch) -> unsigned char {
-            if (ch >= '0' && ch <= '9') return static_cast<unsigned char>(ch - '0');
-            if (ch >= 'a' && ch <= 'f') return static_cast<unsigned char>(ch - 'a' + 10);
-            if (ch >= 'A' && ch <= 'F') return static_cast<unsigned char>(ch - 'A' + 10);
+            if (ch >= '0' && ch <= '9')
+                return static_cast<unsigned char>(ch - '0');
+            if (ch >= 'a' && ch <= 'f')
+                return static_cast<unsigned char>(ch - 'a' + 10);
+            if (ch >= 'A' && ch <= 'F')
+                return static_cast<unsigned char>(ch - 'A' + 10);
             return 0;
         };
         bytes.push_back(static_cast<unsigned char>((nibble(hi) << 4) | nibble(lo)));
@@ -43,12 +50,10 @@ std::vector<unsigned char> parse_thumbprint(const std::string& hex) {
 std::string pem_encode(const std::string& label, const unsigned char* data, size_t len) {
     // Base64 encode
     DWORD b64_len = 0;
-    CryptBinaryToStringA(data, static_cast<DWORD>(len),
-                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+    CryptBinaryToStringA(data, static_cast<DWORD>(len), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
                          nullptr, &b64_len);
     std::string b64(b64_len, '\0');
-    CryptBinaryToStringA(data, static_cast<DWORD>(len),
-                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+    CryptBinaryToStringA(data, static_cast<DWORD>(len), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
                          b64.data(), &b64_len);
     b64.resize(b64_len);
 
@@ -61,34 +66,27 @@ std::string pem_encode(const std::string& label, const unsigned char* data, size
     return pem;
 }
 
-}  // anonymous namespace
+} // anonymous namespace
 
-CertStoreResult read_cert_from_store(
-    const std::string& store_name,
-    const std::string& subject,
-    const std::string& thumbprint)
-{
+CertStoreResult read_cert_from_store(const std::string& store_name, const std::string& subject,
+                                     const std::string& thumbprint) {
     CertStoreResult result;
 
     // Open the Local Machine certificate store
-    auto store = CertOpenStore(
-        CERT_STORE_PROV_SYSTEM_A,
-        0, 0,
-        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
-        store_name.c_str());
+    auto store = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+                               CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_READONLY_FLAG,
+                               store_name.c_str());
 
     if (!store) {
         // Fall back to Current User store
-        store = CertOpenStore(
-            CERT_STORE_PROV_SYSTEM_A,
-            0, 0,
-            CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_READONLY_FLAG,
-            store_name.c_str());
+        store = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+                              CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_READONLY_FLAG,
+                              store_name.c_str());
     }
 
     if (!store) {
-        result.error = "Failed to open certificate store '" + store_name +
-                       "' (error " + std::to_string(GetLastError()) + ")";
+        result.error = "Failed to open certificate store '" + store_name + "' (error " +
+                       std::to_string(GetLastError()) + ")";
         return result;
     }
 
@@ -101,9 +99,8 @@ CertStoreResult read_cert_from_store(
         hash_blob.cbData = static_cast<DWORD>(hash_bytes.size());
         hash_blob.pbData = hash_bytes.data();
 
-        cert_ctx = CertFindCertificateInStore(
-            store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            0, CERT_FIND_HASH, &hash_blob, nullptr);
+        cert_ctx = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                              CERT_FIND_HASH, &hash_blob, nullptr);
 
         if (!cert_ctx) {
             result.error = "No certificate found with thumbprint '" + thumbprint + "'";
@@ -114,9 +111,8 @@ CertStoreResult read_cert_from_store(
 
     } else if (!subject.empty()) {
         // Search by subject CN substring
-        cert_ctx = CertFindCertificateInStore(
-            store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-            0, CERT_FIND_SUBJECT_STR_A, subject.c_str(), nullptr);
+        cert_ctx = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                              CERT_FIND_SUBJECT_STR_A, subject.c_str(), nullptr);
 
         if (!cert_ctx) {
             result.error = "No certificate found with subject matching '" + subject + "'";
@@ -126,8 +122,8 @@ CertStoreResult read_cert_from_store(
 
         // Log the matched subject for diagnostics
         char subject_name[256] = {};
-        CertGetNameStringA(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                           0, nullptr, subject_name, sizeof(subject_name));
+        CertGetNameStringA(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, subject_name,
+                           sizeof(subject_name));
         spdlog::info("Found certificate by subject: {}", subject_name);
 
     } else {
@@ -143,15 +139,14 @@ CertStoreResult read_cert_from_store(
     chain_para.cbSize = sizeof(chain_para);
     PCCERT_CHAIN_CONTEXT chain_ctx = nullptr;
 
-    BOOL chain_ok = CertGetCertificateChain(
-        nullptr,       // default chain engine
-        cert_ctx,
-        nullptr,       // current time
-        store,         // additional store to search
-        &chain_para,
-        0,             // flags
-        nullptr,       // reserved
-        &chain_ctx);
+    BOOL chain_ok = CertGetCertificateChain(nullptr, // default chain engine
+                                            cert_ctx,
+                                            nullptr, // current time
+                                            store,   // additional store to search
+                                            &chain_para,
+                                            0,       // flags
+                                            nullptr, // reserved
+                                            &chain_ctx);
 
     std::string cert_pem;
     if (chain_ok && chain_ctx && chain_ctx->cChain > 0) {
@@ -159,18 +154,15 @@ CertStoreResult read_cert_from_store(
         auto* simple_chain = chain_ctx->rgpChain[0];
         for (DWORD i = 0; i < simple_chain->cElement; ++i) {
             auto* elem = simple_chain->rgpElement[i]->pCertContext;
-            cert_pem += pem_encode("CERTIFICATE",
-                                   elem->pbCertEncoded,
-                                   elem->cbCertEncoded);
+            cert_pem += pem_encode("CERTIFICATE", elem->pbCertEncoded, elem->cbCertEncoded);
         }
     } else {
         // Fall back to just the leaf certificate
-        cert_pem = pem_encode("CERTIFICATE",
-                              cert_ctx->pbCertEncoded,
-                              cert_ctx->cbCertEncoded);
+        cert_pem = pem_encode("CERTIFICATE", cert_ctx->pbCertEncoded, cert_ctx->cbCertEncoded);
     }
 
-    if (chain_ctx) CertFreeCertificateChain(chain_ctx);
+    if (chain_ctx)
+        CertFreeCertificateChain(chain_ctx);
 
     result.pem_cert_chain = std::move(cert_pem);
 
@@ -181,27 +173,20 @@ CertStoreResult read_cert_from_store(
     HCRYPTPROV_OR_NCRYPT_KEY_HANDLE key_handle = 0;
 
     BOOL key_ok = CryptAcquireCertificatePrivateKey(
-        cert_ctx,
-        CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG,
-        nullptr,
-        &key_handle,
-        &key_spec,
-        &caller_free);
+        cert_ctx, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG, nullptr,
+        &key_handle, &key_spec, &caller_free);
 
     if (!key_ok || key_handle == 0) {
         // Try legacy CSP path
-        key_ok = CryptAcquireCertificatePrivateKey(
-            cert_ctx,
-            CRYPT_ACQUIRE_SILENT_FLAG,
-            nullptr,
-            &key_handle,
-            &key_spec,
-            &caller_free);
+        key_ok = CryptAcquireCertificatePrivateKey(cert_ctx, CRYPT_ACQUIRE_SILENT_FLAG, nullptr,
+                                                   &key_handle, &key_spec, &caller_free);
     }
 
     if (!key_ok || key_handle == 0) {
         result.error = "Certificate found but private key is not accessible "
-                       "(error " + std::to_string(GetLastError()) + "). "
+                       "(error " +
+                       std::to_string(GetLastError()) +
+                       "). "
                        "Ensure the key is marked as exportable and the agent runs "
                        "with sufficient privileges (Local System or admin).";
         CertFreeCertificateContext(cert_ctx);
@@ -213,27 +198,22 @@ CertStoreResult read_cert_from_store(
     if (key_spec == CERT_NCRYPT_KEY_SPEC) {
         // CNG key — export as PKCS#8 blob, then PEM-encode
         DWORD blob_len = 0;
-        SECURITY_STATUS ss = NCryptExportKey(
-            key_handle, 0,
-            BCRYPT_RSAFULLPRIVATE_BLOB,  // or NCRYPT_PKCS8_PRIVATE_KEY_BLOB
-            nullptr, nullptr, 0, &blob_len, 0);
+        SECURITY_STATUS ss =
+            NCryptExportKey(key_handle, 0,
+                            BCRYPT_RSAFULLPRIVATE_BLOB, // or NCRYPT_PKCS8_PRIVATE_KEY_BLOB
+                            nullptr, nullptr, 0, &blob_len, 0);
 
         // Try PKCS#8 first (more portable)
-        ss = NCryptExportKey(
-            key_handle, 0,
-            NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
-            nullptr, nullptr, 0, &blob_len, 0);
+        ss = NCryptExportKey(key_handle, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, nullptr, nullptr, 0,
+                             &blob_len, 0);
 
         if (ss == ERROR_SUCCESS && blob_len > 0) {
             std::vector<unsigned char> blob(blob_len);
-            ss = NCryptExportKey(
-                key_handle, 0,
-                NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
-                nullptr, blob.data(), blob_len, &blob_len, 0);
+            ss = NCryptExportKey(key_handle, 0, NCRYPT_PKCS8_PRIVATE_KEY_BLOB, nullptr, blob.data(),
+                                 blob_len, &blob_len, 0);
 
             if (ss == ERROR_SUCCESS) {
-                result.pem_private_key = pem_encode("PRIVATE KEY",
-                                                     blob.data(), blob_len);
+                result.pem_private_key = pem_encode("PRIVATE KEY", blob.data(), blob_len);
             } else {
                 result.error = "NCryptExportKey (PKCS8) failed: " + std::to_string(ss) +
                                ". The private key may not be marked as exportable.";
@@ -243,7 +223,8 @@ CertStoreResult read_cert_from_store(
                            ". The private key may not be marked as exportable.";
         }
 
-        if (caller_free) NCryptFreeObject(key_handle);
+        if (caller_free)
+            NCryptFreeObject(key_handle);
     } else {
         // Legacy CAPI key — export as PRIVATEKEYBLOB, convert to PKCS#8
         HCRYPTKEY hkey = 0;
@@ -256,17 +237,16 @@ CertStoreResult read_cert_from_store(
                 if (CryptExportKey(hkey, 0, PRIVATEKEYBLOB, 0, blob.data(), &blob_len)) {
                     // Convert CAPI PRIVATEKEYBLOB to PKCS#8 DER
                     DWORD der_len = 0;
-                    if (CryptEncodeObjectEx(
-                            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                            PKCS_RSA_PRIVATE_KEY,
-                            blob.data(), 0, nullptr, nullptr, &der_len) && der_len > 0) {
+                    if (CryptEncodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                            PKCS_RSA_PRIVATE_KEY, blob.data(), 0, nullptr, nullptr,
+                                            &der_len) &&
+                        der_len > 0) {
                         std::vector<unsigned char> der(der_len);
-                        if (CryptEncodeObjectEx(
-                                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-                                PKCS_RSA_PRIVATE_KEY,
-                                blob.data(), 0, nullptr, der.data(), &der_len)) {
-                            result.pem_private_key = pem_encode("RSA PRIVATE KEY",
-                                                                 der.data(), der_len);
+                        if (CryptEncodeObjectEx(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                                PKCS_RSA_PRIVATE_KEY, blob.data(), 0, nullptr,
+                                                der.data(), &der_len)) {
+                            result.pem_private_key =
+                                pem_encode("RSA PRIVATE KEY", der.data(), der_len);
                         }
                     }
 
@@ -281,11 +261,11 @@ CertStoreResult read_cert_from_store(
             }
             CryptDestroyKey(hkey);
         } else {
-            result.error = "CryptGetUserKey failed (error " +
-                           std::to_string(GetLastError()) + ")";
+            result.error = "CryptGetUserKey failed (error " + std::to_string(GetLastError()) + ")";
         }
 
-        if (caller_free) CryptReleaseContext(key_handle, 0);
+        if (caller_free)
+            CryptReleaseContext(key_handle, 0);
     }
 
     // Cleanup
@@ -295,23 +275,20 @@ CertStoreResult read_cert_from_store(
     return result;
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent
 
-#else  // !_WIN32 — Linux / macOS stub
+#else // !_WIN32 — Linux / macOS stub
 
 namespace yuzu::agent {
 
-CertStoreResult read_cert_from_store(
-    const std::string& /*store_name*/,
-    const std::string& /*subject*/,
-    const std::string& /*thumbprint*/)
-{
-    return CertStoreResult{
-        .error = "OS certificate store integration is only available on Windows. "
-                 "Use --client-cert and --client-key with PEM files instead."
-    };
+CertStoreResult read_cert_from_store(const std::string& /*store_name*/,
+                                     const std::string& /*subject*/,
+                                     const std::string& /*thumbprint*/) {
+    return CertStoreResult{.error =
+                               "OS certificate store integration is only available on Windows. "
+                               "Use --client-cert and --client-key with PEM files instead."};
 }
 
-}  // namespace yuzu::agent
+} // namespace yuzu::agent
 
 #endif
