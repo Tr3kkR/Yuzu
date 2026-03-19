@@ -4,9 +4,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -18,6 +21,17 @@ struct DeviceTag {
     std::string source;    // "agent", "server", "api"
     int64_t updated_at{0}; // epoch seconds
 };
+
+struct TagCategory {
+    std::string_view key;
+    std::string_view display_name;
+    std::vector<std::string_view> allowed_values; // empty = free-form
+};
+
+// Fixed categories — the only structured tag categories that exist
+inline constexpr std::string_view kCategoryKeys[] = {"role", "environment", "location", "service"};
+
+const std::vector<TagCategory>& get_tag_categories();
 
 class TagStore {
 public:
@@ -43,6 +57,19 @@ public:
     void delete_all_tags(const std::string& agent_id);
     std::vector<std::string> agents_with_tag(const std::string& key,
                                              const std::string& value = {}) const;
+
+    /// Set tag with category validation. If key matches a category with
+    /// allowed_values, value must be in the list. Delegates to set_tag().
+    std::expected<void, std::string> set_tag_checked(const std::string& agent_id,
+                                                     const std::string& key,
+                                                     const std::string& value,
+                                                     const std::string& source = "server");
+
+    /// Returns (agent_id, [missing category keys]) for agents missing any category tags.
+    std::vector<std::pair<std::string, std::vector<std::string>>> get_compliance_gaps() const;
+
+    /// Returns distinct values for a given tag key.
+    std::vector<std::string> get_distinct_values(const std::string& key) const;
 
     /// Validation: key max 64 chars [a-zA-Z0-9_.:-], value max 448 bytes
     static bool validate_key(const std::string& key);

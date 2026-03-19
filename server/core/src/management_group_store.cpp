@@ -187,6 +187,36 @@ std::optional<ManagementGroup> ManagementGroupStore::get_group(const std::string
     return result;
 }
 
+std::optional<ManagementGroup>
+ManagementGroupStore::find_group_by_name(const std::string& name) const {
+    if (!db_)
+        return std::nullopt;
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT id, name, description, parent_id, membership_type, scope_expression, "
+            "created_by, created_at, updated_at FROM management_groups WHERE name = ? LIMIT 1;",
+            -1, &s, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    std::optional<ManagementGroup> result;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        ManagementGroup g;
+        g.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        g.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        g.description = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        g.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        g.membership_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        g.scope_expression = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
+        g.created_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        g.created_at = sqlite3_column_int64(s, 7);
+        g.updated_at = sqlite3_column_int64(s, 8);
+        result = std::move(g);
+    }
+    sqlite3_finalize(s);
+    return result;
+}
+
 std::vector<ManagementGroup> ManagementGroupStore::list_groups() const {
     std::vector<ManagementGroup> result;
     if (!db_)

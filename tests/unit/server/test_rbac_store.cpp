@@ -3,14 +3,16 @@
  *
  * Covers: lifecycle, seed data, role CRUD, permission CRUD, principal-role
  * assignments, group membership, check_permission, deny-overrides-allow,
- * RBAC toggle.
+ * RBAC toggle, check_scoped_permission.
  */
 
+#include "management_group_store.hpp"
 #include "rbac_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <string>
 
 using namespace yuzu::server;
@@ -33,9 +35,11 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 
     REQUIRE(find("Administrator") != roles.end());
     REQUIRE(find("Operator") != roles.end());
+    REQUIRE(find("ITServiceOwner") != roles.end());
     REQUIRE(find("Viewer") != roles.end());
     CHECK(find("Administrator")->is_system);
     CHECK(find("Operator")->is_system);
+    CHECK(find("ITServiceOwner")->is_system);
     CHECK(find("Viewer")->is_system);
 }
 
@@ -352,4 +356,96 @@ TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
 
     auto members = store.get_group_members("temp");
     CHECK(members.empty());
+}
+
+// ── ITServiceOwner role ──────────────────────────────────────────────────────
+
+TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rbac_store]") {
+    RbacStore store(":memory:");
+    auto role = store.get_role("ITServiceOwner");
+    REQUIRE(role.has_value());
+    CHECK(role->is_system);
+    CHECK(role->description.find("IT Service") != std::string::npos);
+
+    auto perms = store.get_role_permissions("ITServiceOwner");
+    // 10 types * 5 ops = 50 permissions
+    CHECK(perms.size() == 50);
+    for (auto& p : perms) {
+        CHECK(p.effect == "allow");
+        // Should not include UserManagement, Security, ApiToken
+        CHECK(p.securable_type != "UserManagement");
+        CHECK(p.securable_type != "Security");
+        CHECK(p.securable_type != "ApiToken");
+    }
+}
+
+// ── check_scoped_permission ──────────────────────────────────────────────────
+
+namespace {
+struct ScopedTestDb {
+    std::filesystem::path path;
+    ScopedTestDb() : path(std::filesystem::temp_directory_path() / "test_scoped_rbac.db") {
+        std::filesystem::remove(path);
+    }
+    ~ScopedTestDb() { std::filesystem::remove(path); }
+};
+} // namespace
+
+TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[rbac_store]") {
+    RbacStore rbac(":memory:");
+    ScopedTestDb tmp;
+    ManagementGroupStore mgmt(tmp.path);
+
+    rbac.assign_role({"user", "admin_user", "Administrator"});
+    CHECK(rbac.check_scoped_permission("admin_user", "Tag", "Write", "agent-1", &mgmt));
+}
+
+TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]") {
+    RbacStore rbac(":memory:");
+    ScopedTestDb tmp;
+    ManagementGroupStore mgmt(tmp.path);
+
+    // Create a management group and add agent to it
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    mgmt.add_member(*group_id, "agent-crm-1");
+
+    // Assign ITServiceOwner to alice on this group
+    GroupRoleAssignment a;
+    a.group_id = *group_id;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "ITServiceOwner";
+    mgmt.assign_role(a);
+
+    // alice has NO global role, but should have scoped access
+    CHECK(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
+    CHECK(rbac.check_scoped_permission("alice", "Execution", "Execute", "agent-crm-1", &mgmt));
+}
+
+TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_store]") {
+    RbacStore rbac(":memory:");
+    ScopedTestDb tmp;
+    ManagementGroupStore mgmt(tmp.path);
+
+    // alice has ITServiceOwner on CRM group, but agent-other is not in it
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    mgmt.add_member(*group_id, "agent-crm-1");
+
+    GroupRoleAssignment a;
+    a.group_id = *group_id;
+    a.principal_type = "user";
+    a.principal_id = "alice";
+    a.role_name = "ITServiceOwner";
+    mgmt.assign_role(a);
+
+    // agent-other is NOT in the CRM group
+    CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
 }

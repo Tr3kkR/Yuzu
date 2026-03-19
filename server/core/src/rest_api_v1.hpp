@@ -34,6 +34,9 @@ public:
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    using ServiceGroupFn = std::function<void(const std::string& service_value)>;
+    using TagPushFn =
+        std::function<void(const std::string& agent_id, const std::string& key)>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          RbacStore* rbac_store, ManagementGroupStore* mgmt_store,
@@ -41,7 +44,8 @@ public:
                          ResponseStore* response_store, InstructionStore* instruction_store,
                          ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
                          ApprovalManager* approval_manager, TagStore* tag_store,
-                         AuditStore* audit_store);
+                         AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
+                         TagPushFn tag_push_fn = {});
 
 private:
     // JSON envelope helpers

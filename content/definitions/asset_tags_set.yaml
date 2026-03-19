@@ -1,0 +1,30 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.asset-tags
+  displayName: Structured Asset Tag Management
+  version: 1.0.0
+  description: >
+    Server-to-agent synchronization and local awareness of the 4 structured
+    tag categories (role, environment, location, service). Enables agents to
+    know their own tags, detect changes, and report compliance gaps.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      - device.asset_tags.sync
+      - device.asset_tags.status
+      - device.asset_tags.get
+      - device.asset_tags.changes
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

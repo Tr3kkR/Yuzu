@@ -257,6 +257,25 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── API Tokens ────────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">API Tokens</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Generate tokens for programmatic REST API access.
+          Pass via <code>Authorization: Bearer &lt;token&gt;</code> or
+          <code>X-Yuzu-Token</code> header.
+          The raw token is shown <strong>once</strong> — copy it before closing.
+        </p>
+        <div id="api-token-section"
+             hx-get="/fragments/settings/api-tokens"
+             hx-trigger="load, refreshApiTokens from:body"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Auto-Approve Policies ─────────────────────────── -->
     <div class="section">
       <div class="section-header">Auto-Approve Policies</div>
@@ -302,6 +321,23 @@ extern const char* const kSettingsHtml =
         </p>
         <div id="updates-section"
              hx-get="/fragments/settings/updates"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Tag Compliance ──────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Tag Compliance</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Devices should have all 4 structured tag categories assigned.
+          Devices missing tags are flagged but continue to function normally.
+        </p>
+        <div id="tag-compliance-section"
+             hx-get="/fragments/settings/tag-compliance"
              hx-trigger="load"
              hx-swap="innerHTML">
           <span style="color:#484f58">Loading...</span>

@@ -33,7 +33,8 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 InstructionStore* instruction_store,
                                 ExecutionTracker* execution_tracker,
                                 ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
-                                TagStore* tag_store, AuditStore* audit_store) {
+                                TagStore* tag_store, AuditStore* audit_store,
+                                ServiceGroupFn service_group_fn, TagPushFn tag_push_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -214,6 +215,156 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
                      agent_id);
             res.set_content(ok_response({{"removed", true}}).dump(), "application/json");
+        });
+
+    // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
+
+    svr.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+            [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
+                if (!mgmt_store) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto group_id = req.matches[1].str();
+                auto roles = mgmt_store->get_group_roles(group_id);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : roles) {
+                    arr.push_back({{"group_id", r.group_id},
+                                   {"principal_type", r.principal_type},
+                                   {"principal_id", r.principal_id},
+                                   {"role_name", r.role_name}});
+                }
+                res.set_content(ok_response(arr).dump(), "application/json");
+            });
+
+    svr.Post(
+        R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!mgmt_store || !rbac_store) {
+                res.status = 503;
+                return;
+            }
+
+            auto group_id = req.matches[1].str();
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(error_response("invalid JSON").dump(), "application/json");
+                return;
+            }
+
+            auto principal_type = body.value("principal_type", "user");
+            auto principal_id = body.value("principal_id", "");
+            auto role_name = body.value("role_name", "");
+
+            if (principal_id.empty() || role_name.empty()) {
+                res.status = 400;
+                res.set_content(error_response("principal_id and role_name required").dump(),
+                                "application/json");
+                return;
+            }
+
+            // Delegation guard: only Operator and Viewer can be delegated
+            if (role_name != "Operator" && role_name != "Viewer") {
+                res.status = 403;
+                res.set_content(
+                    error_response("only Operator and Viewer roles can be delegated").dump(),
+                    "application/json");
+                return;
+            }
+
+            // Caller must be global Administrator or have ITServiceOwner on this group
+            bool authorized = rbac_store->check_permission(session->username, "ManagementGroup",
+                                                           "Write");
+            if (!authorized) {
+                // Check if caller has ITServiceOwner on this group
+                auto group_roles = mgmt_store->get_group_roles(group_id);
+                for (const auto& gr : group_roles) {
+                    if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                        gr.role_name == "ITServiceOwner") {
+                        authorized = true;
+                        break;
+                    }
+                }
+            }
+            if (!authorized) {
+                res.status = 403;
+                res.set_content(error_response("forbidden").dump(), "application/json");
+                return;
+            }
+
+            GroupRoleAssignment assignment;
+            assignment.group_id = group_id;
+            assignment.principal_type = principal_type;
+            assignment.principal_id = principal_id;
+            assignment.role_name = role_name;
+
+            auto result = mgmt_store->assign_role(assignment);
+            if (!result) {
+                res.status = 400;
+                res.set_content(error_response(result.error()).dump(), "application/json");
+                return;
+            }
+            audit_fn(req, "management_group.assign_role", "success", "ManagementGroup", group_id,
+                     principal_id + ":" + role_name);
+            res.status = 201;
+            res.set_content(ok_response({{"assigned", true}}).dump(), "application/json");
+        });
+
+    svr.Delete(
+        R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!mgmt_store || !rbac_store) {
+                res.status = 503;
+                return;
+            }
+
+            auto group_id = req.matches[1].str();
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(error_response("invalid JSON").dump(), "application/json");
+                return;
+            }
+
+            auto principal_type = body.value("principal_type", "user");
+            auto principal_id = body.value("principal_id", "");
+            auto role_name = body.value("role_name", "");
+
+            // Caller must be global Administrator or have ITServiceOwner on this group
+            bool authorized = rbac_store->check_permission(session->username, "ManagementGroup",
+                                                           "Write");
+            if (!authorized) {
+                auto group_roles = mgmt_store->get_group_roles(group_id);
+                for (const auto& gr : group_roles) {
+                    if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                        gr.role_name == "ITServiceOwner") {
+                        authorized = true;
+                        break;
+                    }
+                }
+            }
+            if (!authorized) {
+                res.status = 403;
+                res.set_content(error_response("forbidden").dump(), "application/json");
+                return;
+            }
+
+            mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name);
+            audit_fn(req, "management_group.unassign_role", "success", "ManagementGroup", group_id,
+                     principal_id + ":" + role_name);
+            res.set_content(ok_response({{"unassigned", true}}).dump(), "application/json");
         });
 
     // ── API Tokens (/api/v1/tokens) ──────────────────────────────────────
@@ -430,6 +581,48 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_response({{"allowed", allowed}}).dump(), "application/json");
     });
 
+    // ── Tag Categories (/api/v1/tag-categories) ────────────────────────
+
+    svr.Get("/api/v1/tag-categories",
+            [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Tag", "Read"))
+                    return;
+
+                const auto& categories = get_tag_categories();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& cat : categories) {
+                    nlohmann::json c = {{"key", cat.key}, {"display_name", cat.display_name}};
+                    nlohmann::json vals = nlohmann::json::array();
+                    for (auto v : cat.allowed_values)
+                        vals.push_back(std::string(v));
+                    c["allowed_values"] = vals;
+                    arr.push_back(std::move(c));
+                }
+                res.set_content(ok_response(arr).dump(), "application/json");
+            });
+
+    // ── Tag Compliance (/api/v1/tag-compliance) ──────────────────────────
+
+    svr.Get("/api/v1/tag-compliance",
+            [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Tag", "Read"))
+                    return;
+                if (!tag_store) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto gaps = tag_store->get_compliance_gaps();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& [agent_id, missing] : gaps) {
+                    nlohmann::json m = nlohmann::json::array();
+                    for (const auto& k : missing)
+                        m.push_back(k);
+                    arr.push_back({{"agent_id", agent_id}, {"missing_tags", m}});
+                }
+                res.set_content(ok_response(arr).dump(), "application/json");
+            });
+
     // ── Tags (/api/v1/tags) ──────────────────────────────────────────────
 
     svr.Get("/api/v1/tags",
@@ -454,6 +647,69 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     obj[tags[i].key] = tags[i].value;
                 res.set_content(ok_response(obj).dump(), "application/json");
             });
+
+    svr.Put("/api/v1/tags",
+            [perm_fn, audit_fn, tag_store, service_group_fn,
+             tag_push_fn](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Tag", "Write"))
+                    return;
+                if (!tag_store) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded()) {
+                    res.status = 400;
+                    res.set_content(error_response("invalid JSON").dump(), "application/json");
+                    return;
+                }
+                auto agent_id = body.value("agent_id", "");
+                auto key = body.value("key", "");
+                auto value = body.value("value", "");
+
+                if (agent_id.empty() || key.empty()) {
+                    res.status = 400;
+                    res.set_content(error_response("agent_id and key required").dump(),
+                                    "application/json");
+                    return;
+                }
+
+                auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(error_response(result.error()).dump(), "application/json");
+                    return;
+                }
+                if (key == "service" && service_group_fn)
+                    service_group_fn(value);
+                if (tag_push_fn)
+                    tag_push_fn(agent_id, key);
+                audit_fn(req, "tag.set", "success", "Tag", agent_id + ":" + key, value);
+                res.set_content(ok_response({{"set", true}}).dump(), "application/json");
+            });
+
+    svr.Delete(
+        R"(/api/v1/tags/([^/]+)/([^/]+))",
+        [perm_fn, audit_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Tag", "Delete"))
+                return;
+            if (!tag_store) {
+                res.status = 503;
+                return;
+            }
+
+            auto agent_id = req.matches[1].str();
+            auto key = req.matches[2].str();
+            bool deleted = tag_store->delete_tag(agent_id, key);
+            if (!deleted) {
+                res.status = 404;
+                res.set_content(error_response("tag not found").dump(), "application/json");
+                return;
+            }
+            audit_fn(req, "tag.delete", "success", "Tag", agent_id + ":" + key, "");
+            res.set_content(ok_response({{"deleted", true}}).dump(), "application/json");
+        });
 
     // ── Instructions (/api/v1/definitions) ───────────────────────────────
 

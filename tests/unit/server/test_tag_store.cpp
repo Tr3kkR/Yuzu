@@ -163,3 +163,88 @@ TEST_CASE("TagStore: source preserved", "[tag_store]") {
     REQUIRE(tags.size() == 1);
     CHECK(tags[0].source == "api");
 }
+
+// ── Tag categories ──────────────────────────────────────────────────────────
+
+TEST_CASE("TagStore: get_tag_categories returns 4 categories", "[tag_store][categories]") {
+    const auto& cats = get_tag_categories();
+    REQUIRE(cats.size() == 4);
+    CHECK(cats[0].key == "role");
+    CHECK(cats[1].key == "environment");
+    CHECK(cats[2].key == "location");
+    CHECK(cats[3].key == "service");
+}
+
+TEST_CASE("TagStore: set_tag_checked accepts valid environment value", "[tag_store][categories]") {
+    TagStore store(":memory:");
+    auto result = store.set_tag_checked("agent-1", "environment", "Production");
+    REQUIRE(result.has_value());
+    CHECK(store.get_tag("agent-1", "environment") == "Production");
+}
+
+TEST_CASE("TagStore: set_tag_checked rejects invalid environment value",
+          "[tag_store][categories]") {
+    TagStore store(":memory:");
+    auto result = store.set_tag_checked("agent-1", "environment", "Staging");
+    REQUIRE(!result.has_value());
+    CHECK(result.error().find("allowed values") != std::string::npos);
+    CHECK(store.get_tag("agent-1", "environment").empty());
+}
+
+TEST_CASE("TagStore: set_tag_checked allows free-form category", "[tag_store][categories]") {
+    TagStore store(":memory:");
+    auto result = store.set_tag_checked("agent-1", "role", "Web Server");
+    REQUIRE(result.has_value());
+    CHECK(store.get_tag("agent-1", "role") == "Web Server");
+}
+
+TEST_CASE("TagStore: set_tag_checked passes non-category key", "[tag_store][categories]") {
+    TagStore store(":memory:");
+    auto result = store.set_tag_checked("agent-1", "custom-tag", "any value");
+    REQUIRE(result.has_value());
+    CHECK(store.get_tag("agent-1", "custom-tag") == "any value");
+}
+
+TEST_CASE("TagStore: get_compliance_gaps", "[tag_store][categories]") {
+    TagStore store(":memory:");
+
+    // Agent-1 has all 4 categories
+    store.set_tag("agent-1", "role", "Web Server");
+    store.set_tag("agent-1", "environment", "Production");
+    store.set_tag("agent-1", "location", "US-East");
+    store.set_tag("agent-1", "service", "CRM");
+
+    // Agent-2 missing environment and service
+    store.set_tag("agent-2", "role", "Database");
+    store.set_tag("agent-2", "location", "EU-West");
+
+    auto gaps = store.get_compliance_gaps();
+    // Agent-1 should not be in the gaps, agent-2 should
+    REQUIRE(gaps.size() == 1);
+    CHECK(gaps[0].first == "agent-2");
+    REQUIRE(gaps[0].second.size() == 2);
+    // Missing keys should be environment and service
+    bool has_env = false, has_svc = false;
+    for (const auto& k : gaps[0].second) {
+        if (k == "environment")
+            has_env = true;
+        if (k == "service")
+            has_svc = true;
+    }
+    CHECK(has_env);
+    CHECK(has_svc);
+}
+
+TEST_CASE("TagStore: get_distinct_values", "[tag_store][categories]") {
+    TagStore store(":memory:");
+
+    store.set_tag("agent-1", "service", "CRM");
+    store.set_tag("agent-2", "service", "ERP");
+    store.set_tag("agent-3", "service", "CRM");
+
+    auto values = store.get_distinct_values("service");
+    REQUIRE(values.size() == 2);
+    // Sorted alphabetically
+    CHECK(values[0] == "CRM");
+    CHECK(values[1] == "ERP");
+}

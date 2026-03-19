@@ -1,9 +1,12 @@
 #include "rbac_store.hpp"
 
+#include "management_group_store.hpp"
+
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 #include <chrono>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -162,6 +165,8 @@ void RbacStore::seed_defaults() {
         {"Administrator", "Full access to all operations"},
         {"PlatformEngineer", "Author and manage YAML instruction definitions, sets, and schemas"},
         {"Operator", "Execute and manage instructions, schedules, and tags"},
+        {"ApiTokenManager", "Create, revoke, and manage API tokens for programmatic access"},
+        {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
     };
     for (auto& [name, desc] : roles) {
@@ -267,6 +272,46 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Response', 'Read', 'allow');",
         nullptr, nullptr, nullptr);
+
+    // ApiTokenManager: read + write + delete on ApiToken
+    const char* atm_ops[] = {"Read", "Write", "Delete"};
+    for (auto* o : atm_ops) {
+        sqlite3_stmt* s = nullptr;
+        sqlite3_prepare_v2(
+            db_,
+            "INSERT OR IGNORE INTO role_permissions VALUES ('ApiTokenManager', 'ApiToken', ?, "
+            "'allow');",
+            -1, &s, nullptr);
+        sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+
+    // ITServiceOwner: broad access on operational types (excludes UserManagement, Security,
+    // ApiToken)
+    const char* itso_types[] = {"Infrastructure",
+                                "InstructionDefinition",
+                                "InstructionSet",
+                                "Execution",
+                                "Schedule",
+                                "Approval",
+                                "Tag",
+                                "AuditLog",
+                                "Response",
+                                "ManagementGroup"};
+    for (auto* t : itso_types) {
+        for (auto* o : ops) {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(
+                db_,
+                "INSERT OR IGNORE INTO role_permissions VALUES ('ITServiceOwner', ?, ?, 'allow');",
+                -1, &s, nullptr);
+            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
 
     // Viewer: read on all except Infrastructure
     const char* viewer_types[] = {"UserManagement",
@@ -838,6 +883,82 @@ std::vector<std::string> RbacStore::list_operations() const {
         result.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
     sqlite3_finalize(s);
     return result;
+}
+
+// ── Scoped permission check ──────────────────────────────────────────────────
+
+bool RbacStore::check_scoped_permission(const std::string& username,
+                                        const std::string& securable_type,
+                                        const std::string& operation,
+                                        const std::string& agent_id,
+                                        const ManagementGroupStore* mgmt_store) const {
+    // 1. Try global permission first — if passes, return true immediately
+    if (check_permission(username, securable_type, operation))
+        return true;
+
+    // 2. If no mgmt_store or no agent_id, cannot do scoped check
+    if (!mgmt_store || agent_id.empty())
+        return false;
+
+    // 3. Get agent's management groups + ancestors
+    auto groups = mgmt_store->get_agent_groups(agent_id);
+    std::unordered_set<std::string> all_groups;
+    for (const auto& gid : groups) {
+        all_groups.insert(gid);
+        auto ancestors = mgmt_store->get_ancestor_ids(gid);
+        for (const auto& aid : ancestors)
+            all_groups.insert(aid);
+    }
+
+    if (all_groups.empty())
+        return false;
+
+    // 4. Collect user's RBAC group memberships
+    std::unordered_set<std::string> user_rbac_groups;
+    if (db_) {
+        sqlite3_stmt* s = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT group_name FROM group_members WHERE username = ?;", -1,
+                               &s, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                auto* g = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
+                if (g)
+                    user_rbac_groups.insert(g);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+
+    // 5. For each management group, check role assignments
+    bool has_allow = false;
+    for (const auto& gid : all_groups) {
+        auto assignments = mgmt_store->get_group_roles(gid);
+        for (const auto& assignment : assignments) {
+            // Check if this assignment is for our user
+            bool matches = false;
+            if (assignment.principal_type == "user" && assignment.principal_id == username)
+                matches = true;
+            else if (assignment.principal_type == "group" &&
+                     user_rbac_groups.contains(assignment.principal_id))
+                matches = true;
+
+            if (!matches)
+                continue;
+
+            // Check if the assigned role grants the required permission
+            auto perms = get_role_permissions(assignment.role_name);
+            for (const auto& p : perms) {
+                if (p.securable_type == securable_type && p.operation == operation) {
+                    if (p.effect == "deny")
+                        return false; // deny overrides
+                    if (p.effect == "allow")
+                        has_allow = true;
+                }
+            }
+        }
+    }
+
+    return has_allow;
 }
 
 } // namespace yuzu::server

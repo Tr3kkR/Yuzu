@@ -50,6 +50,7 @@ public:
     // ── Group CRUD ───────────────────────────────────────────────────────
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);
     std::optional<ManagementGroup> get_group(const std::string& id) const;
+    std::optional<ManagementGroup> find_group_by_name(const std::string& name) const;
     std::vector<ManagementGroup> list_groups() const;
     std::vector<ManagementGroup> get_children(const std::string& parent_id) const;
     std::expected<void, std::string> update_group(const ManagementGroup& group);

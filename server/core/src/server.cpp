@@ -2067,6 +2067,91 @@ private:
         return true;
     }
 
+    /// Scoped RBAC-aware permission check for device-specific operations.
+    bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
+                                   const std::string& securable_type, const std::string& operation,
+                                   const std::string& agent_id) {
+        auto session = require_auth(req, res);
+        if (!session)
+            return false;
+
+        if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+            if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
+                                                      agent_id, mgmt_group_store_.get())) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"required_permission", securable_type + ":" + operation}})
+                        .dump(),
+                    "application/json");
+                return false;
+            }
+            return true;
+        }
+
+        // Legacy fallback: write/delete/execute/approve require admin
+        if (operation != "Read" && session->role != auth::Role::admin) {
+            res.status = 403;
+            res.set_content(R"({"error":"admin role required"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    /// Auto-create a dynamic management group for a service tag value.
+    void ensure_service_management_group(const std::string& service_value) {
+        if (!mgmt_group_store_ || service_value.empty())
+            return;
+
+        std::string group_name = "Service: " + service_value;
+        auto existing = mgmt_group_store_->find_group_by_name(group_name);
+        if (existing)
+            return;
+
+        ManagementGroup g;
+        g.name = group_name;
+        g.description = "Auto-created for IT service: " + service_value;
+        g.membership_type = "dynamic";
+        g.scope_expression = "tag:service == \"" + service_value + "\"";
+        g.created_by = "system";
+
+        auto result = mgmt_group_store_->create_group(g);
+        if (result) {
+            // Populate with agents that have this service tag
+            if (tag_store_) {
+                auto agents = tag_store_->agents_with_tag("service", service_value);
+                mgmt_group_store_->refresh_dynamic_membership(*result, agents);
+            }
+            spdlog::info("Auto-created management group '{}' for service '{}'", group_name,
+                         service_value);
+        }
+    }
+
+    /// Push structured tag state to an agent via the asset_tags plugin.
+    void push_asset_tags_to_agent(const std::string& agent_id) {
+        if (!tag_store_)
+            return;
+
+        // Build the sync command with all 4 structured category values
+        ::yuzu::agent::v1::CommandRequest cmd;
+        cmd.set_command_id("asset-tag-sync-" + std::to_string(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
+        cmd.set_plugin("asset_tags");
+        cmd.set_action("sync");
+
+        auto* params = cmd.mutable_parameters();
+        for (auto cat_key : kCategoryKeys) {
+            std::string key_str{cat_key};
+            auto val = tag_store_->get_tag(agent_id, key_str);
+            (*params)[key_str] = val;
+        }
+
+        if (registry_.send_to(agent_id, cmd)) {
+            spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
+        }
+    }
+
     // -- HTML fragment renderers for HTMX Settings page -------------------------
 
     std::string render_tls_fragment() {
@@ -2329,6 +2414,131 @@ private:
         return html;
     }
 
+    std::string render_api_tokens_fragment(const std::string& new_raw_token = {}) {
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            return "<span style=\"color:#484f58\">API token store unavailable.</span>";
+        }
+
+        // Format epoch seconds to "YYYY-MM-DD HH:MM" UTC
+        auto fmt_epoch = [](int64_t epoch) -> std::string {
+            if (epoch == 0)
+                return "Never";
+            auto tt = static_cast<std::time_t>(epoch);
+            std::tm tm_buf{};
+#ifdef _WIN32
+            gmtime_s(&tm_buf, &tt);
+#else
+            gmtime_r(&tt, &tm_buf);
+#endif
+            char buf[32]{};
+            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
+            return std::string(buf) + " UTC";
+        };
+
+        auto tokens = api_token_store_->list_tokens();
+        std::string html = "<table class=\"user-table\">"
+                           "  <thead><tr><th>ID</th><th>Name</th><th>Owner</th>"
+                           "  <th>Created</th><th>Expires</th><th>Last Used</th>"
+                           "  <th>Status</th><th></th></tr></thead>"
+                           "  <tbody>";
+
+        if (tokens.empty()) {
+            html += "<tr><td colspan=\"8\" style=\"color:#484f58\">No API tokens created</td></tr>";
+        } else {
+            auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+            for (const auto& t : tokens) {
+                std::string exp =
+                    t.expires_at == 0 ? "Never" : fmt_epoch(t.expires_at);
+
+                bool expired = t.expires_at > 0 && t.expires_at < now;
+
+                std::string status_cls, status_txt;
+                if (t.revoked) {
+                    status_cls = "role-user";
+                    status_txt = "Revoked";
+                } else if (expired) {
+                    status_cls = "role-user";
+                    status_txt = "Expired";
+                } else {
+                    status_cls = "role-admin";
+                    status_txt = "Active";
+                }
+
+                html += "<tr><td><code>" + html_escape(t.token_id) +
+                        "</code></td>"
+                        "<td>" +
+                        html_escape(t.name) +
+                        "</td>"
+                        "<td>" +
+                        html_escape(t.principal_id) +
+                        "</td>"
+                        "<td style=\"font-size:0.75rem\">" +
+                        fmt_epoch(t.created_at) +
+                        "</td>"
+                        "<td style=\"font-size:0.75rem\">" +
+                        exp +
+                        "</td>"
+                        "<td style=\"font-size:0.75rem\">" +
+                        fmt_epoch(t.last_used_at) +
+                        "</td>"
+                        "<td><span class=\"role-badge " +
+                        status_cls + "\">" + status_txt +
+                        "</span></td>"
+                        "<td>";
+                if (!t.revoked) {
+                    html += "<button class=\"btn btn-danger\" "
+                            "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                            "hx-delete=\"/api/settings/api-tokens/" +
+                            html_escape(t.token_id) +
+                            "\" "
+                            "hx-target=\"#api-token-section\" hx-swap=\"innerHTML\" "
+                            "hx-confirm=\"Revoke API token &quot;" +
+                            html_escape(t.token_id) +
+                            "&quot;? Applications using this token will lose access.\""
+                            ">Revoke</button>";
+                }
+                html += "</td></tr>";
+            }
+        }
+
+        html += "  </tbody>"
+                "</table>"
+                "<form class=\"add-user-form\" hx-post=\"/api/settings/api-tokens\" "
+                "      hx-target=\"#api-token-section\" hx-swap=\"innerHTML\">"
+                "  <div class=\"mini-field\">"
+                "    <label>Name</label>"
+                "    <input type=\"text\" name=\"name\" placeholder=\"e.g. CI/CD pipeline\" "
+                "style=\"width:160px\" required>"
+                "  </div>"
+                "  <div class=\"mini-field\">"
+                "    <label>TTL (hours)</label>"
+                "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
+                "style=\"width:80px\">"
+                "  </div>"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Create Token</button>"
+                "</form>"
+                "<div class=\"feedback\" id=\"api-token-feedback\"></div>";
+
+        // Show the one-time token reveal if a new token was just created
+        if (!new_raw_token.empty()) {
+            html += "<div class=\"token-reveal\">"
+                    "  <div class=\"token-reveal-header\">"
+                    "    COPY THIS API TOKEN NOW — it will not be shown again"
+                    "  </div>"
+                    "  <code>" +
+                    html_escape(new_raw_token) +
+                    "</code><br>"
+                    "  <button class=\"btn btn-secondary\" "
+                    "style=\"margin-top:0.5rem;font-size:0.7rem\" "
+                    "          data-copy-token>Copy to Clipboard</button>"
+                    "</div>";
+        }
+
+        return html;
+    }
+
     std::string render_pending_fragment() {
         auto agents = auth_mgr_.list_pending_agents();
         std::string html = "<table class=\"user-table\">"
@@ -2511,6 +2721,92 @@ private:
                 "<button class=\"btn btn-primary\" type=\"submit\">Add Rule</button>"
                 "</form></div>"
                 "<div class=\"feedback\" id=\"auto-approve-feedback\"></div>";
+
+        return html;
+    }
+
+    // -- Tag Compliance fragment renderer -------------------------------------
+
+    std::string render_tag_compliance_fragment() {
+        const auto& categories = get_tag_categories();
+
+        std::string html;
+        html += "<table class=\"user-table\">"
+                "<thead><tr>"
+                "<th>Category</th>"
+                "<th>Display Name</th>"
+                "<th>Agents Tagged</th>"
+                "<th>Agents Missing</th>"
+                "<th>Allowed Values</th>"
+                "</tr></thead><tbody>";
+
+        auto gaps = tag_store_ ? tag_store_->get_compliance_gaps()
+                               : std::vector<std::pair<std::string, std::vector<std::string>>>{};
+
+        // Count how many agents are missing each category
+        std::unordered_map<std::string, int> missing_count;
+        for (const auto& [agent_id, missing] : gaps) {
+            for (const auto& k : missing)
+                missing_count[k]++;
+        }
+
+        // Total known agents (from tags table)
+        size_t total_agents = 0;
+        if (tag_store_) {
+            // Count via a simple query — agents that have any tag
+            auto all_gaps = tag_store_->get_compliance_gaps();
+            // All agents = agents with gaps + agents without gaps
+            // Use distinct values approach: count agents with the first category key
+            auto agents_with_any = tag_store_->get_distinct_values("role"); // rough count
+            // Better: count from gaps + non-gaps
+            std::unordered_set<std::string> seen;
+            for (const auto& [aid, m] : gaps)
+                seen.insert(aid);
+            // Also agents with all tags (not in gaps)
+            for (auto cat_key : kCategoryKeys) {
+                auto agents = tag_store_->agents_with_tag(std::string(cat_key));
+                for (const auto& a : agents)
+                    seen.insert(a);
+            }
+            total_agents = seen.size();
+        }
+
+        for (const auto& cat : categories) {
+            std::string key_str(cat.key);
+            int tagged = 0;
+            if (tag_store_)
+                tagged = static_cast<int>(tag_store_->agents_with_tag(key_str).size());
+            int missing = missing_count.count(key_str) ? missing_count[key_str] : 0;
+
+            std::string vals_str;
+            if (cat.allowed_values.empty()) {
+                vals_str = "<span style=\"color:#8b949e\">Free-form</span>";
+            } else {
+                for (size_t i = 0; i < cat.allowed_values.size(); ++i) {
+                    if (i > 0)
+                        vals_str += ", ";
+                    vals_str += std::string(cat.allowed_values[i]);
+                }
+            }
+
+            std::string missing_style =
+                missing > 0 ? "color:#f85149;font-weight:600" : "color:#3fb950";
+            html += "<tr><td><code>" + key_str + "</code></td>";
+            html += "<td>" + std::string(cat.display_name) + "</td>";
+            html += "<td>" + std::to_string(tagged) + "</td>";
+            html += "<td style=\"" + missing_style + "\">" + std::to_string(missing) + "</td>";
+            html += "<td>" + vals_str + "</td></tr>";
+        }
+
+        html += "</tbody></table>";
+
+        if (total_agents > 0) {
+            size_t compliant = total_agents - gaps.size();
+            html += "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+                    "Compliance: " +
+                    std::to_string(compliant) + "/" + std::to_string(total_agents) +
+                    " agents have all required tags</div>";
+        }
 
         return html;
     }
@@ -2889,6 +3185,19 @@ private:
             auto session_token =
                 auth_mgr_.create_oidc_session(display, email, claims.sub, claims.groups, admin_gid);
 
+            // Sync Entra groups into the RBAC store so that group-scoped role
+            // assignments (e.g. ApiTokenManager on an Entra group) take effect.
+            if (rbac_store_ && !claims.groups.empty()) {
+                auto username = display.empty() ? email : display;
+                for (const auto& gid : claims.groups) {
+                    (void)rbac_store_->create_group({.name = gid,
+                                                     .description = "Entra ID group (auto-synced)",
+                                                     .source = "entra",
+                                                     .external_id = gid});
+                    (void)rbac_store_->add_group_member(gid, username);
+                }
+            }
+
             res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
             audit_log(req, "auth.oidc_login", "success", "user", display);
@@ -2976,6 +3285,14 @@ private:
                 return;
             res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
         });
+
+        web_server_->Get("/fragments/settings/api-tokens",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "ApiToken", "Read"))
+                                 return;
+                             res.set_content(render_api_tokens_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
 
         // -- Settings API: TLS toggle (HTMX POST) ----------------------------
         web_server_->Post("/api/settings/tls",
@@ -3202,6 +3519,95 @@ private:
                             "application/json");
         });
 
+        // -- Settings API: API tokens (admin only, HTMX) -------------------------
+
+        web_server_->Post("/api/settings/api-tokens", [this](const httplib::Request& req,
+                                                             httplib::Response& res) {
+            if (!require_permission(req, res, "ApiToken", "Write"))
+                return;
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
+
+            auto name = extract_form_value(req.body, "name");
+            auto ttl_s = extract_form_value(req.body, "ttl_hours");
+
+            if (name.empty()) {
+                res.set_content(
+                    "<span class=\"feedback-error\">Token name is required.</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            int64_t expires_at = 0;
+            if (!ttl_s.empty()) {
+                try {
+                    int ttl_hours = std::stoi(ttl_s);
+                    if (ttl_hours > 0) {
+                        auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                        expires_at = now + static_cast<int64_t>(ttl_hours) * 3600;
+                    }
+                } catch (const std::exception&) {
+                    res.set_content(
+                        "<span class=\"feedback-error\">Invalid TTL value.</span>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+            }
+
+            auto result = api_token_store_->create_token(name, session->username, expires_at);
+            if (!result) {
+                res.set_content(
+                    "<span class=\"feedback-error\">" + html_escape(result.error()) + "</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            spdlog::info("API token '{}' created by {}", name, session->username);
+
+            if (audit_store_) {
+                audit_store_->log({.principal = session->username,
+                                   .principal_role = "admin",
+                                   .action = "api_token.create",
+                                   .target_type = "ApiToken",
+                                   .target_id = name,
+                                   .source_ip = req.remote_addr,
+                                   .result = "success"});
+            }
+
+            res.set_content(render_api_tokens_fragment(result.value()),
+                            "text/html; charset=utf-8");
+        });
+
+        web_server_->Delete(R"(/api/settings/api-tokens/(.+))",
+                            [this](const httplib::Request& req, httplib::Response& res) {
+                                if (!require_permission(req, res, "ApiToken", "Delete"))
+                                    return;
+                                auto session = require_auth(req, res);
+                                if (!session)
+                                    return;
+                                auto token_id = req.matches[1].str();
+                                api_token_store_->revoke_token(token_id);
+
+                                spdlog::info("API token '{}' revoked by {}", token_id,
+                                             session->username);
+
+                                if (audit_store_) {
+                                    audit_store_->log({.principal = session->username,
+                                                       .principal_role = "admin",
+                                                       .action = "api_token.revoke",
+                                                       .target_type = "ApiToken",
+                                                       .target_id = token_id,
+                                                       .source_ip = req.remote_addr,
+                                                       .result = "success"});
+                                }
+
+                                res.set_content(render_api_tokens_fragment(),
+                                                "text/html; charset=utf-8");
+                            });
+
         // -- Settings API: Pending agents (admin only, HTMX) --------------------
 
         web_server_->Post(R"(/api/settings/pending-agents/(.+)/approve)",
@@ -3299,6 +3705,14 @@ private:
                             });
 
         // -- Settings HTMX fragment: OTA Updates ---------------------------------
+
+        web_server_->Get("/fragments/settings/tag-compliance",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Tag", "Read"))
+                                 return;
+                             res.set_content(render_tag_compliance_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
 
         web_server_->Get("/fragments/settings/updates",
                          [this](const httplib::Request& req, httplib::Response& res) {
@@ -4020,6 +4434,15 @@ private:
                 }
 
                 tag_store_->set_tag(agent_id, key, value, "api");
+                if (key == "service")
+                    ensure_service_management_group(value);
+                // Push updated tags to agent if a structured category changed
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == key) {
+                        push_asset_tags_to_agent(agent_id);
+                        break;
+                    }
+                }
                 audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
                 res.set_content(R"({"status":"ok"})", "application/json");
             });
@@ -5353,7 +5776,19 @@ private:
             rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
             quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
             execution_tracker_.get(), schedule_engine_.get(), approval_manager_.get(),
-            tag_store_.get(), audit_store_.get());
+            tag_store_.get(), audit_store_.get(),
+            [this](const std::string& service_value) {
+                ensure_service_management_group(service_value);
+            },
+            [this](const std::string& agent_id, const std::string& key) {
+                // Push asset tags to agent when a structured category changes
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == key) {
+                        push_asset_tags_to_agent(agent_id);
+                        break;
+                    }
+                }
+            });
 
         // -- Listen -----------------------------------------------------------
 

@@ -1,0 +1,255 @@
+## Structured Asset Tag Definitions
+## Provides server-to-agent tag synchronization, status queries,
+## and change detection for the 4 fixed tag categories:
+## role, environment, location, service.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.asset_tags.sync
+  displayName: Sync Structured Asset Tags
+  version: 1.0.0
+  description: >
+    Push the server-assigned structured tags (role, environment, location,
+    service) to an agent. The agent stores them locally and reports any
+    changes from the previous state. Typically invoked automatically by
+    the server when a tag category value changes.
+  tags: [tags, compliance, identity]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: asset_tags
+    action: sync
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      role:
+        type: string
+        displayName: Role
+        description: The device's operational role (free-form).
+      environment:
+        type: string
+        displayName: Environment
+        description: Deployment stage for this device.
+        validation:
+          enum: ["Dev", "UAT", "Production"]
+      location:
+        type: string
+        displayName: Location
+        description: Physical or logical location of the device (free-form).
+      service:
+        type: string
+        displayName: Service
+        description: IT service this device belongs to (free-form).
+
+  result:
+    columns:
+      - name: event
+        type: string
+      - name: key
+        type: string
+      - name: old_value
+        type: string
+      - name: new_value
+        type: string
+
+  readablePayload: >
+    Sync asset tags: role=${role}, env=${environment},
+    location=${location}, service=${service}
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [asset_tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.asset_tags.status
+  displayName: Asset Tag Status
+  version: 1.0.0
+  description: >
+    Query the agent's locally cached structured tags, last sync time,
+    staleness flag, and change count. No server-side state is modified.
+  tags: [tags, compliance, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: asset_tags
+    action: status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+      - name: last_sync
+        type: int64
+      - name: stale
+        type: bool
+      - name: check_interval
+        type: int32
+      - name: change_count
+        type: int32
+
+  readablePayload: "Query asset tag status"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [asset_tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.asset_tags.get
+  displayName: Get Asset Tag
+  version: 1.0.0
+  description: >
+    Retrieve a single structured tag value by category key.
+    Valid keys: role, environment, location, service.
+  tags: [tags, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: asset_tags
+    action: get
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [key]
+    properties:
+      key:
+        type: string
+        displayName: Category Key
+        description: One of the 4 structured tag categories.
+        validation:
+          enum: ["role", "environment", "location", "service"]
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+
+  readablePayload: "Get asset tag '${key}'"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [asset_tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.asset_tags.changes
+  displayName: Asset Tag Change Log
+  version: 1.0.0
+  description: >
+    Returns the change history for structured asset tags on this device.
+    Each entry records the category key, old value, new value, and
+    timestamp of the change. Useful for compliance auditing and drift
+    detection.
+  tags: [tags, compliance, audit]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: asset_tags
+    action: changes
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: old_value
+        type: string
+      - name: new_value
+        type: string
+      - name: timestamp
+        type: int64
+
+  readablePayload: "Query asset tag change log"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [asset_tags]
+
+status:
+  phase: active

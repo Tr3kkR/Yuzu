@@ -6,8 +6,21 @@
 #include <algorithm>
 #include <chrono>
 #include <regex>
+#include <unordered_set>
 
 namespace yuzu::server {
+
+// ── Tag categories (compile-time fixed) ──────────────────────────────────────
+
+const std::vector<TagCategory>& get_tag_categories() {
+    static const std::vector<TagCategory> categories = {
+        {"role", "Role", {}},
+        {"environment", "Environment", {"Dev", "UAT", "Production"}},
+        {"location", "Location", {}},
+        {"service", "Service", {}},
+    };
+    return categories;
+}
 
 TagStore::TagStore(const std::filesystem::path& db_path) {
     int rc = sqlite3_open(db_path.string().c_str(), &db_);
@@ -252,6 +265,98 @@ std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
         sqlite3_bind_text(stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
     }
 
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto t = sqlite3_column_text(stmt, 0);
+        if (t)
+            result.emplace_back(reinterpret_cast<const char*>(t));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+std::expected<void, std::string>
+TagStore::set_tag_checked(const std::string& agent_id, const std::string& key,
+                          const std::string& value, const std::string& source) {
+    if (!validate_key(key))
+        return std::unexpected("invalid tag key");
+    if (!validate_value(value))
+        return std::unexpected("tag value exceeds maximum length");
+
+    // Check if key matches a category with restricted values
+    for (const auto& cat : get_tag_categories()) {
+        if (cat.key == key && !cat.allowed_values.empty()) {
+            bool found = false;
+            for (auto av : cat.allowed_values) {
+                if (av == value) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::string msg = "invalid value for '" + key + "': allowed values are";
+                for (size_t i = 0; i < cat.allowed_values.size(); ++i) {
+                    if (i > 0)
+                        msg += ",";
+                    msg += " ";
+                    msg += cat.allowed_values[i];
+                }
+                return std::unexpected(msg);
+            }
+            break;
+        }
+    }
+
+    set_tag(agent_id, key, value, source);
+    return {};
+}
+
+std::vector<std::pair<std::string, std::vector<std::string>>>
+TagStore::get_compliance_gaps() const {
+    std::vector<std::pair<std::string, std::vector<std::string>>> result;
+    if (!db_)
+        return result;
+
+    // Get all distinct agent_ids
+    std::vector<std::string> all_agents;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT DISTINCT agent_id FROM tags", -1, &stmt, nullptr) ==
+            SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                auto t = sqlite3_column_text(stmt, 0);
+                if (t)
+                    all_agents.emplace_back(reinterpret_cast<const char*>(t));
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // For each agent, find which category keys are missing
+    for (const auto& agent_id : all_agents) {
+        std::vector<std::string> missing;
+        for (auto cat_key : kCategoryKeys) {
+            std::string tag_val = get_tag(agent_id, std::string(cat_key));
+            if (tag_val.empty())
+                missing.emplace_back(cat_key);
+        }
+        if (!missing.empty())
+            result.emplace_back(agent_id, std::move(missing));
+    }
+
+    return result;
+}
+
+std::vector<std::string> TagStore::get_distinct_values(const std::string& key) const {
+    std::vector<std::string> result;
+    if (!db_)
+        return result;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT DISTINCT value FROM tags WHERE key = ? ORDER BY value", -1,
+                           &stmt, nullptr) != SQLITE_OK)
+        return result;
+
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         auto t = sqlite3_column_text(stmt, 0);
         if (t)

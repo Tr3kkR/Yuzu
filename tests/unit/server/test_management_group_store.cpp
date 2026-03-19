@@ -249,6 +249,27 @@ TEST_CASE("ManagementGroupStore: group role assignments", "[mgmt][roles]") {
     CHECK(roles2.empty());
 }
 
+TEST_CASE("ManagementGroupStore: find_group_by_name", "[mgmt][crud]") {
+    TempDb tmp;
+    ManagementGroupStore store(tmp.path);
+
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "dynamic";
+    g.scope_expression = R"(tag:service == "CRM")";
+    auto id = store.create_group(g);
+    REQUIRE(id.has_value());
+
+    auto found = store.find_group_by_name("Service: CRM");
+    REQUIRE(found.has_value());
+    CHECK(found->id == *id);
+    CHECK(found->name == "Service: CRM");
+    CHECK(found->membership_type == "dynamic");
+
+    auto not_found = store.find_group_by_name("Service: ERP");
+    CHECK(!not_found.has_value());
+}
+
 TEST_CASE("ManagementGroupStore: cascade delete removes members and roles", "[mgmt][cascade]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);

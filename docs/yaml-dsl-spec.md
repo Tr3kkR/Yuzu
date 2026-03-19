@@ -1271,6 +1271,10 @@ This section enumerates the stable builtin primitives that content authors targe
 | `hardware.inventory` | `hardware` | Y | Y | Y | Verified |
 | `device.tags.get` | `tags` | Y | Y | Y | Verified |
 | `device.tags.set` | `tags` | Y | Y | Y | Verified |
+| `device.asset_tags.sync` | `asset_tags` | Y | Y | Y | Verified |
+| `device.asset_tags.status` | `asset_tags` | Y | Y | Y | Verified |
+| `device.asset_tags.get` | `asset_tags` | Y | Y | Y | Verified |
+| `device.asset_tags.changes` | `asset_tags` | Y | Y | Y | Verified |
 | `agent.health` | `diagnostics` | Y | Y | Y | Verified |
 | `agent.restart` | `agent_actions` | Y | Y | Y | Verified |
 | `agent.sleep` | agent core | Y | Y | Y | Planned |

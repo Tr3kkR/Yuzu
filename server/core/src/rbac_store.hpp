@@ -12,6 +12,8 @@
 
 namespace yuzu::server {
 
+class ManagementGroupStore; // forward declaration
+
 struct RbacRole {
     std::string name;
     std::string description;
@@ -91,6 +93,11 @@ public:
     // ── Authorization check ──────────────────────────────────────────────
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
+
+    /// Scoped permission check: first tries global, then checks group-scoped roles.
+    bool check_scoped_permission(const std::string& username, const std::string& securable_type,
+                                 const std::string& operation, const std::string& agent_id,
+                                 const ManagementGroupStore* mgmt_store) const;
 
     /// All effective permissions for a user (for UI display).
     std::vector<Permission> get_effective_permissions(const std::string& username) const;
