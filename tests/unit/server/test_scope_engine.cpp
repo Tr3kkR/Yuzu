@@ -236,6 +236,180 @@ TEST_CASE("ScopeEngine: eval numeric comparison", "[scope][eval]") {
     CHECK(evaluate(*lt, resolver) == false);
 }
 
+// ── Extended operator tests (Phase 3.9) ────────────────────────────────────
+
+TEST_CASE("ScopeEngine: parse MATCHES", "[scope][parser]") {
+    auto result = parse(R"(hostname MATCHES "^web-\d+$")");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: eval MATCHES regex match", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "web-042"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(hostname MATCHES "^web-\d+$")");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: eval MATCHES regex mismatch", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "db-primary"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(hostname MATCHES "^web-\d+$")");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: eval MATCHES invalid regex returns false", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "test"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(hostname MATCHES "[invalid")");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: eval MATCHES case insensitive", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "WEB-PROD-01"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(hostname MATCHES "web-prod-\\d+")");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: parse EXISTS", "[scope][parser]") {
+    auto result = parse(R"(EXISTS tag:env)");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: eval EXISTS present", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"tag:env", "prod"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(EXISTS tag:env)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: eval EXISTS absent", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"tag:team", "infra"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(EXISTS tag:env)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: eval EXISTS empty string is absent", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"tag:env", ""}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(EXISTS tag:env)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: parse LEN()", "[scope][parser]") {
+    auto result = parse(R"(LEN(hostname) > 5)");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: eval LEN() greater than", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "web-prod-01"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(LEN(hostname) > 5)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: eval LEN() equal", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "abc"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(LEN(hostname) == 3)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+
+    auto expr2 = parse(R"(LEN(hostname) == 5)");
+    REQUIRE(expr2.has_value());
+    CHECK(evaluate(*expr2, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: eval LEN() on missing attribute", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(LEN(hostname) == 0)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: parse STARTSWITH()", "[scope][parser]") {
+    auto result = parse(R"(STARTSWITH(hostname, "web-"))");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: eval STARTSWITH() match", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "web-prod-01"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(STARTSWITH(hostname, "web-"))");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: eval STARTSWITH() mismatch", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "db-primary"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(STARTSWITH(hostname, "web-"))");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == false);
+}
+
+TEST_CASE("ScopeEngine: eval STARTSWITH() case insensitive", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "WEB-PROD-01"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(R"(STARTSWITH(hostname, "web-"))");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: combined extended operators", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {
+        {"hostname", "web-prod-01"}, {"tag:env", "production"}, {"ostype", "Linux"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(
+        R"(EXISTS tag:env AND hostname MATCHES "^web-" AND LEN(tag:env) > 3)");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: STARTSWITH and MATCHES in OR", "[scope][eval]") {
+    std::unordered_map<std::string, std::string> attrs = {{"hostname", "db-replica-03"}};
+    auto resolver = make_resolver(attrs);
+
+    auto expr = parse(
+        R"(STARTSWITH(hostname, "web-") OR hostname MATCHES "^db-replica-\d+$")");
+    REQUIRE(expr.has_value());
+    CHECK(evaluate(*expr, resolver) == true);
+}
+
+TEST_CASE("ScopeEngine: parse error on LEN missing paren", "[scope][parser]") {
+    auto result = parse(R"(LEN hostname > 5)");
+    REQUIRE(!result.has_value());
+}
+
+TEST_CASE("ScopeEngine: parse error on STARTSWITH missing comma", "[scope][parser]") {
+    auto result = parse(R"(STARTSWITH(hostname "web-"))");
+    REQUIRE(!result.has_value());
+}
+
 // ── Performance tests ──────────────────────────────────────────────────────
 
 TEST_CASE("ScopeEngine: parse performance", "[scope][perf]") {

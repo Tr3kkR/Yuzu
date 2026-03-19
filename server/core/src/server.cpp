@@ -16,8 +16,13 @@
 #include "management.grpc.pb.h"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
+#include "api_token_store.hpp"
+#include "management_group_store.hpp"
 #include "oidc_provider.hpp"
+#include "quarantine_store.hpp"
+#include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "rest_api_v1.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -1670,6 +1675,24 @@ public:
                 }
             }
         }
+
+        // Initialize Phase 3: Security & RBAC stores
+        {
+            auto rbac_db = cfg_.auth_config_path.parent_path() / "rbac.db";
+            rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        }
+        {
+            auto mgmt_db = cfg_.auth_config_path.parent_path() / "management-groups.db";
+            mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
+        }
+        {
+            auto token_db = cfg_.auth_config_path.parent_path() / "api-tokens.db";
+            api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
+        }
+        {
+            auto quar_db = cfg_.auth_config_path.parent_path() / "quarantine.db";
+            quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
+        }
     }
 
     void run() override {
@@ -1965,13 +1988,42 @@ private:
     }
 
     std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res) {
+        // 1. Try session cookie (existing browser auth)
         auto token = extract_session_cookie(req);
         auto session = auth_mgr_.validate_session(token);
-        if (!session) {
-            res.status = 401;
-            res.set_content(R"({"error":"unauthorized"})", "application/json");
+        if (session)
+            return session;
+
+        // 2. Try Authorization: Bearer <token> (API token auth)
+        auto auth_header = req.get_header_value("Authorization");
+        if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
+            auto raw = auth_header.substr(7);
+            if (api_token_store_) {
+                auto api_token = api_token_store_->validate_token(raw);
+                if (api_token) {
+                    auth::Session synth;
+                    synth.username = api_token->principal_id;
+                    synth.role = auth::Role::admin; // API tokens are always full-access
+                    return synth;
+                }
+            }
         }
-        return session;
+
+        // 3. Try X-Yuzu-Token header (alternative API token header)
+        auto custom_header = req.get_header_value("X-Yuzu-Token");
+        if (!custom_header.empty() && api_token_store_) {
+            auto api_token = api_token_store_->validate_token(custom_header);
+            if (api_token) {
+                auth::Session synth;
+                synth.username = api_token->principal_id;
+                synth.role = auth::Role::admin;
+                return synth;
+            }
+        }
+
+        res.status = 401;
+        res.set_content(R"({"error":"unauthorized"})", "application/json");
+        return std::nullopt;
     }
 
     bool require_admin(const httplib::Request& req, httplib::Response& res) {
@@ -1979,6 +2031,35 @@ private:
         if (!session)
             return false;
         if (session->role != auth::Role::admin) {
+            res.status = 403;
+            res.set_content(R"({"error":"admin role required"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    /// RBAC-aware permission check. Falls back to legacy admin/user check if RBAC is disabled.
+    bool require_permission(const httplib::Request& req, httplib::Response& res,
+                            const std::string& securable_type, const std::string& operation) {
+        auto session = require_auth(req, res);
+        if (!session)
+            return false;
+
+        if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+            if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"required_permission", securable_type + ":" + operation}})
+                        .dump(),
+                    "application/json");
+                return false;
+            }
+            return true;
+        }
+
+        // Legacy fallback: write/delete/execute/approve require admin
+        if (operation != "Read" && session->role != auth::Role::admin) {
             res.status = 403;
             res.set_content(R"({"error":"admin role required"})", "application/json");
             return false;
@@ -5253,6 +5334,27 @@ private:
                 "application/json");
         });
 
+        // -- Register REST API v1 routes (Phase 3) --------------------------------
+
+        rest_api_v1_ = std::make_unique<RestApiV1>();
+        rest_api_v1_->register_routes(
+            *web_server_,
+            [this](const httplib::Request& req, httplib::Response& res)
+                -> std::optional<auth::Session> { return require_auth(req, res); },
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const std::string& type, const std::string& op) -> bool {
+                return require_permission(req, res, type, op);
+            },
+            [this](const httplib::Request& req, const std::string& action,
+                   const std::string& result, const std::string& target_type,
+                   const std::string& target_id, const std::string& detail) {
+                audit_log(req, action, result, target_type, target_id, detail);
+            },
+            rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
+            quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
+            execution_tracker_.get(), schedule_engine_.get(), approval_manager_.get(),
+            tag_store_.get(), audit_store_.get());
+
         // -- Listen -----------------------------------------------------------
 
         int listen_port = cfg_.web_port;
@@ -5412,6 +5514,13 @@ private:
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
     sqlite3* shared_instr_db_{nullptr};
+
+    // Phase 3: Security & RBAC
+    std::unique_ptr<RbacStore> rbac_store_;
+    std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
+    std::unique_ptr<ApiTokenStore> api_token_store_;
+    std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<RestApiV1> rest_api_v1_;
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;

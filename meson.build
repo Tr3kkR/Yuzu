@@ -117,6 +117,9 @@ if build_agent
     subdir('agents/plugins/bitlocker')
     subdir('agents/plugins/vuln_scan')
     subdir('agents/plugins/tags')
+    subdir('agents/plugins/quarantine')
+    subdir('agents/plugins/certificates')
+    subdir('agents/plugins/ioc')
   endif
 endif
 

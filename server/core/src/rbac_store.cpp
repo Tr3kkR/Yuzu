@@ -124,7 +124,10 @@ void RbacStore::seed_defaults() {
                            "Approval",
                            "Tag",
                            "AuditLog",
-                           "Response"};
+                           "Response",
+                           "ManagementGroup",
+                           "ApiToken",
+                           "Security"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -274,7 +277,10 @@ void RbacStore::seed_defaults() {
                                   "Approval",
                                   "Tag",
                                   "AuditLog",
-                                  "Response"};
+                                  "Response",
+                                  "ManagementGroup",
+                                  "ApiToken",
+                                  "Security"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

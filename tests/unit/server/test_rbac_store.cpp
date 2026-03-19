@@ -42,7 +42,7 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 10);
+    REQUIRE(types.size() == 13);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -51,6 +51,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("Execution"));
     CHECK(has("AuditLog"));
     CHECK(has("Response"));
+    CHECK(has("ManagementGroup"));
+    CHECK(has("ApiToken"));
+    CHECK(has("Security"));
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -62,8 +65,8 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 10 types * 5 ops = 50 permissions
-    CHECK(perms.size() == 50);
+    // 13 types * 5 ops = 65 permissions
+    CHECK(perms.size() == 65);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 }
@@ -71,8 +74,8 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 9 types * Read only (not Infrastructure)
-    CHECK(perms.size() == 9);
+    // 12 types * Read only (not Infrastructure)
+    CHECK(perms.size() == 12);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");

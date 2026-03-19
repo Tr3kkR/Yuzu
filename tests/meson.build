@@ -48,6 +48,9 @@ if build_server
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',
       'unit/server/test_legacy_shim.cpp',
+      'unit/server/test_management_group_store.cpp',
+      'unit/server/test_api_token_store.cpp',
+      'unit/server/test_quarantine_store.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
