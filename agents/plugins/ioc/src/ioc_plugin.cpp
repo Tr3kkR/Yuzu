@@ -48,11 +48,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <iphlpapi.h>
-#include <windns.h>
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <windns.h>
 #elif defined(__linux__)
 #include <arpa/inet.h>
 #include <cstring>

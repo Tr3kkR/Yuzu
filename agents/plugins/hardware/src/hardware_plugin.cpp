@@ -39,9 +39,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <windows.h>
 #include <comdef.h>
 #include <wbemidl.h>
-#include <windows.h>
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")

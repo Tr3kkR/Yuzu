@@ -27,8 +27,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <tlhelp32.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 #ifdef __linux__

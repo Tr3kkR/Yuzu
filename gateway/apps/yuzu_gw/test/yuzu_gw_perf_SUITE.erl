@@ -71,15 +71,20 @@ init_per_suite(Config) ->
     %% Trap exits so linked gen_servers (pg, registry) don't kill
     %% the suite process if they crash or are restarted.
     process_flag(trap_exit, true),
-    %% Start pg scope (idempotent).
+    %% Start pg scope (idempotent).  Unlink so the process survives
+    %% CT process transitions between callbacks and test cases.
     case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _         -> ok
+        undefined ->
+            {ok, PgPid} = pg:start_link(yuzu_gw),
+            unlink(PgPid);
+        _ -> ok
     end,
-    %% Start registry.
+    %% Start registry (unlinked for same reason).
     case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _         -> ok
+        undefined ->
+            {ok, RegPid} = yuzu_gw_registry:start_link(),
+            unlink(RegPid);
+        _ -> ok
     end,
     %% Silence telemetry events.
     meck:new(telemetry, [passthrough, no_link]),
@@ -107,13 +112,16 @@ init_per_group(heartbeat, Config) ->
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100000),
     {ok, Pid} = yuzu_gw_upstream:start_link(),
+    unlink(Pid),
     [{upstream_pid, Pid} | Config];
 
 init_per_group(fanout, Config) ->
     ensure_registry(),
     case whereis(yuzu_gw_router) of
-        undefined -> {ok, _} = yuzu_gw_router:start_link();
-        _         -> ok
+        undefined ->
+            {ok, RPid} = yuzu_gw_router:start_link(),
+            unlink(RPid);
+        _ -> ok
     end,
     Config;
 
@@ -124,9 +132,11 @@ init_per_group(_Group, Config) ->
 end_per_group(heartbeat, Config) ->
     catch gen_server:stop(?config(upstream_pid, Config)),
     catch meck:unload(grpcbox_client),
+    drain_registry(),
     ok;
 
 end_per_group(_Group, _Config) ->
+    drain_registry(),
     ok.
 
 init_per_testcase(_TC, Config) ->
@@ -152,7 +162,7 @@ sustained_registration_throughput(_Config) ->
     {WallMs, _} = yuzu_gw_perf_helpers:measure_wall_clock(fun() ->
         lists:foreach(fun({Pid, Id}) ->
             ok = yuzu_gw_registry:register_agent(
-                     Id, Pid, <<"sess-", Id/binary>>, [<<"plugin1">>])
+                     Id, Pid, <<"sess-", Id/binary>>, [<<"plugin1">>], <<>>)
         end, Pairs)
     end),
 
@@ -161,7 +171,8 @@ sustained_registration_throughput(_Config) ->
     ?assert(OpsPerSec > 5000),
 
     yuzu_gw_perf_helpers:cleanup_agents(Pids),
-    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000).
+    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
+    sync_pg().
 
 %% @doc Burst: N concurrent workers each registering one agent.
 burst_registration(_Config) ->
@@ -175,7 +186,7 @@ burst_registration(_Config) ->
     {WallMs, _} = yuzu_gw_perf_helpers:measure_wall_clock(fun() ->
         Workers = [spawn(fun() ->
             ok = yuzu_gw_registry:register_agent(
-                     Id, Pid, <<"sess-", Id/binary>>, [<<"plugin1">>]),
+                     Id, Pid, <<"sess-", Id/binary>>, [<<"plugin1">>], <<>>),
             Parent ! {reg_done, self()}
         end) || {Pid, Id} <- Pairs],
         lists:foreach(fun(W) ->
@@ -189,7 +200,8 @@ burst_registration(_Config) ->
     yuzu_gw_perf_helpers:assert_throughput("Burst registration", N, WallMs),
 
     yuzu_gw_perf_helpers:cleanup_agents(Pids),
-    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000).
+    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
+    sync_pg().
 
 %% @doc Measure per-registration latency distribution.
 %% Assert p99 < 1 ms (1000 µs).
@@ -218,7 +230,8 @@ registration_latency_distribution(_Config) ->
 
     AgentPids = [Pid || {Pid, _} <- Agents],
     yuzu_gw_perf_helpers:cleanup_agents(AgentPids),
-    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000).
+    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
+    sync_pg().
 
 %%%===================================================================
 %%% Heartbeat group
@@ -554,12 +567,13 @@ fanout_benchmark(Label, N, MaxMs) ->
                 "Fanout ~B agents: ~B ms > ~B ms limit", [N, WallMs, MaxMs]))),
 
     yuzu_gw_perf_helpers:cleanup_agents(Pids),
-    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000).
+    ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000),
+    sync_pg().
 
 register_silent_agents(N, Prefix) ->
     lists:unzip([begin
         Id = iolist_to_binary(io_lib:format("~s-~6..0B", [Prefix, I])),
-        Pid = spawn_link(fun silent_loop/0),
+        Pid = spawn(fun silent_loop/0),
         ok = yuzu_gw_registry:register_agent(Id, Pid, <<"s">>, [<<"system">>], <<>>),
         {Pid, Id}
     end || I <- lists:seq(1, N)]).
@@ -598,6 +612,37 @@ collect_errors(FanoutRef, Remaining, Timeout) ->
 flush_mailbox() ->
     receive _ -> flush_mailbox()
     after 0 -> ok
+    end.
+
+%% Deregister all agents left over from a failed test,
+%% then sync with the pg process to drain its DOWN backlog.
+drain_registry() ->
+    try
+        case whereis(yuzu_gw_registry) of
+            undefined -> ok;
+            _ ->
+                Ids = yuzu_gw_registry:all_agents(),
+                lists:foreach(fun(Id) ->
+                    catch yuzu_gw_registry:deregister_agent(Id)
+                end, Ids),
+                yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000)
+        end
+    catch _:_ -> ok
+    end,
+    sync_pg().
+
+%% Synchronize with the pg process to ensure all pending DOWN
+%% messages have been processed before starting new registrations.
+%% pg:join/leave use gen_server:call with infinity timeout, so they
+%% queue behind all pending DOWN messages in pg's mailbox.
+sync_pg() ->
+    Dummy = spawn(fun() -> receive _ -> ok end end),
+    try
+        pg:join(yuzu_gw, '__pg_sync__', Dummy),
+        pg:leave(yuzu_gw, '__pg_sync__', Dummy)
+    catch _:_ -> ok
+    after
+        exit(Dummy, kill)
     end.
 
 %% --- endurance loop --------------------------------------------------
@@ -702,12 +747,12 @@ analyze_endurance(Samples, ExpectedN) when length(Samples) >= 2 ->
 
     ct:pal("=== Endurance Analysis (~B samples) ===~n"
            "  Memory: start=~BKB  end=~BKB  growth=~.1f%~n"
-           "  Processes: avg=~.0f  min=~B  max=~B  variation=~.1f%~n"
-           "  Agent count avg: ~.0f (expected ~B)",
+           "  Processes: avg=~B  min=~B  max=~B  variation=~.1f%~n"
+           "  Agent count avg: ~B (expected ~B)",
            [length(Samples),
             FirstMem div 1024, LastMem div 1024, float(MemGrowthPct),
-            AvgProcs, MinProcs, MaxProcs, float(ProcVar),
-            AvgAgents, ExpectedN]),
+            round(AvgProcs), MinProcs, MaxProcs, float(ProcVar),
+            round(AvgAgents), ExpectedN]),
 
     ?assert(abs(MemGrowthPct) < 50,
             lists:flatten(io_lib:format(
@@ -725,24 +770,28 @@ ensure_registry() ->
     case whereis(yuzu_gw) of
         undefined ->
             ct:pal("[ensure_registry] starting pg scope yuzu_gw"),
-            {ok, _} = pg:start_link(yuzu_gw);
+            {ok, PgPid} = pg:start_link(yuzu_gw),
+            unlink(PgPid);
         Pid ->
             case is_process_alive(Pid) of
                 true  -> ok;
                 false ->
                     ct:pal("[ensure_registry] pg scope yuzu_gw dead (~p), restarting", [Pid]),
-                    {ok, _} = pg:start_link(yuzu_gw)
+                    {ok, PgPid2} = pg:start_link(yuzu_gw),
+                    unlink(PgPid2)
             end
     end,
     case whereis(yuzu_gw_registry) of
         undefined ->
             ct:pal("[ensure_registry] starting yuzu_gw_registry"),
-            {ok, _} = yuzu_gw_registry:start_link(), ok;
+            {ok, RegPid} = yuzu_gw_registry:start_link(),
+            unlink(RegPid);
         RPid ->
             case is_process_alive(RPid) of
                 true  -> ok;
                 false ->
                     ct:pal("[ensure_registry] registry dead (~p), restarting", [RPid]),
-                    {ok, _} = yuzu_gw_registry:start_link(), ok
+                    {ok, RegPid2} = yuzu_gw_registry:start_link(),
+                    unlink(RegPid2)
             end
     end.

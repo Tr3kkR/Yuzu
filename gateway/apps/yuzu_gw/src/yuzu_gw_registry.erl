@@ -52,7 +52,7 @@ start_link() ->
 %% Called by yuzu_gw_agent:init/1 from the agent process itself.
 -spec register_agent(binary(), pid(), binary() | undefined, [binary()], binary()) -> ok.
 register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
-    gen_server:call(?SERVER, {register, AgentId, Pid, SessionId, Plugins, Hostname}).
+    gen_server:call(?SERVER, {register, AgentId, Pid, SessionId, Plugins, Hostname}, 30000).
 
 %% @doc Remove an agent from the routing table.
 -spec deregister_agent(binary()) -> ok.

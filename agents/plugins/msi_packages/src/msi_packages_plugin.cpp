@@ -25,8 +25,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <msi.h>
 #include <windows.h>
+#include <msi.h>
 #pragma comment(lib, "msi.lib")
 
 // String property names for MsiGetProductInfoA

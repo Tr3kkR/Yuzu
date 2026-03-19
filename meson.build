@@ -5,7 +5,7 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++23',
+    'cpp_std=c++20',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -26,6 +26,7 @@ if cxx.get_id() == 'msvc'
   )
 else
   add_project_arguments(
+    '-std=c++23',             # override c++20 default to get C++23 on GCC/Clang
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
     language: 'cpp',

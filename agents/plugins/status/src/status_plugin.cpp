@@ -42,8 +42,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <psapi.h>
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 namespace {

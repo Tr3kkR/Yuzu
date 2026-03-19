@@ -36,6 +36,7 @@
 
 -record(state, {
     hb_buffer     :: [map()],           %% buffered heartbeat requests
+    hb_buf_len    :: non_neg_integer(), %% tracked length of hb_buffer
     hb_timer      :: reference() | undefined,
     hb_interval   :: non_neg_integer(), %% ms
     max_hb_buffer :: non_neg_integer(), %% cap for retained buffer on failure
@@ -84,6 +85,7 @@ init([]) ->
 
     {ok, #state{
         hb_buffer     = [],
+        hb_buf_len    = 0,
         hb_timer      = TRef,
         hb_interval   = Interval,
         max_hb_buffer = MaxBuf,
@@ -101,8 +103,14 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
-handle_cast({queue_heartbeat, HbReq}, #state{hb_buffer = Buf} = State) ->
-    {noreply, State#state{hb_buffer = [HbReq | Buf]}};
+handle_cast({queue_heartbeat, HbReq},
+            #state{hb_buffer = Buf, hb_buf_len = Len,
+                   max_hb_buffer = MaxBuf} = State) ->
+    case Len >= MaxBuf of
+        true  -> {noreply, State};  %% drop — buffer at capacity
+        false -> {noreply, State#state{hb_buffer = [HbReq | Buf],
+                                       hb_buf_len = Len + 1}}
+    end;
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
             #state{notify_pids = Pids} = State) ->
@@ -137,31 +145,32 @@ handle_info(flush_heartbeats, #state{hb_buffer = [], hb_interval = Interval} = S
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
     {noreply, State#state{hb_timer = TRef}};
 
-handle_info(flush_heartbeats, #state{hb_buffer = Buf, hb_interval = Interval,
+handle_info(flush_heartbeats, #state{hb_buffer = Buf, hb_buf_len = BufLen,
+                                       hb_interval = Interval,
                                        max_hb_buffer = MaxBuf} = State) ->
     BatchReq = #{
         heartbeats   => lists:reverse(Buf),
         gateway_node => atom_to_binary(node(), utf8)
     },
 
-    NewBuf = case do_rpc('BatchHeartbeat', BatchReq, batch_heartbeat) of
+    {NewBuf, NewLen} = case do_rpc('BatchHeartbeat', BatchReq, batch_heartbeat) of
         {ok, #{acknowledged_count := Count}} ->
-            logger:debug("Flushed ~b heartbeats (ack=~b)", [length(Buf), Count]),
-            [];
+            logger:debug("Flushed ~b heartbeats (ack=~b)", [BufLen, Count]),
+            {[], 0};
         {ok, _} ->
-            [];
+            {[], 0};
         {error, Reason} ->
             logger:warning("BatchHeartbeat failed (~b buffered): ~p",
-                           [length(Buf), Reason]),
+                           [BufLen, Reason]),
             %% Retain buffer for retry, capped to prevent unbounded growth.
-            case length(Buf) > MaxBuf of
-                true  -> lists:sublist(Buf, MaxBuf);
-                false -> Buf
+            case BufLen > MaxBuf of
+                true  -> {lists:sublist(Buf, MaxBuf), MaxBuf};
+                false -> {Buf, BufLen}
             end
     end,
 
     TRef = erlang:send_after(Interval, self(), flush_heartbeats),
-    {noreply, State#state{hb_buffer = NewBuf, hb_timer = TRef}};
+    {noreply, State#state{hb_buffer = NewBuf, hb_buf_len = NewLen, hb_timer = TRef}};
 
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids} = State) ->

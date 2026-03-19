@@ -17,6 +17,7 @@ _VS_INSTALLER="/c/Program Files (x86)/Microsoft Visual Studio/Installer"
 _VC_TOOLS="${_VS_ROOT}/VC/Tools/MSVC/${_MSVC_VER}"
 _WIN_SDK="/c/Program Files (x86)/Windows Kits/10"
 _VCPKG="/c/vcpkg"
+_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _CMAKE_DIR="/c/Program Files/CMake/bin"
 _PYTHON_DIR="/c/Python314"
 _MESON_DIR="/c/Python314/Scripts"
@@ -29,6 +30,12 @@ export CXX="cl.exe"
 # Without vcvars64.bat this is unset, causing Meson to crash parsing an empty
 # string as a version number. Set it manually from the VS BuildTools version.
 export VSCMD_VER="17.14.27"
+
+# ── Temp directories (Windows-native paths for non-MSYS2 tools like rebar3) ──
+# MSYS2 sets TMP=/tmp which native Windows programs interpret as \\tmp\\ (UNC),
+# causing rebar3 fetches to fail when moving downloaded dependencies.
+export TMP="C:\\Users\\${USER}\\AppData\\Local\\Temp"
+export TEMP="$TMP"
 
 # ── CMake / build config ─────────────────────────────────────────────────────
 export CMAKE_GENERATOR="Ninja"
@@ -69,8 +76,8 @@ _NEW_PATH+="${_VS_ROOT}/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja:"
 _NEW_PATH+="${_PYTHON_DIR}:"
 _NEW_PATH+="${_MESON_DIR}:"
 _NEW_PATH+="${_VCPKG}:"
-_NEW_PATH+="${_VCPKG}/installed/x64-windows/tools/protobuf:"
-_NEW_PATH+="${_VCPKG}/installed/x64-windows/tools/grpc:"
+_NEW_PATH+="${_PROJECT_ROOT}/vcpkg_installed/x64-windows/tools/protobuf:"
+_NEW_PATH+="${_PROJECT_ROOT}/vcpkg_installed/x64-windows/tools/grpc:"
 _NEW_PATH+="${_WIN_SDK}/bin/${_SDK_VER}/x64:"
 
 export PATH="${_NEW_PATH}${PATH}"
@@ -105,5 +112,5 @@ echo "  CC=$CC  CXX=$CXX"
 
 # Clean up temp vars
 unset _MSVC_VER _SDK_VER _VS_ROOT _VS_INSTALLER _VC_TOOLS _WIN_SDK _VCPKG
-unset _CMAKE_DIR _PYTHON_DIR _MESON_DIR _VC_TOOLS_WIN _WIN_SDK_WIN _NEW_PATH
+unset _PROJECT_ROOT _CMAKE_DIR _PYTHON_DIR _MESON_DIR _VC_TOOLS_WIN _WIN_SDK_WIN _NEW_PATH
 unset -f _check

@@ -31,9 +31,9 @@
 #define NOMINMAX
 #endif
 #define SECURITY_WIN32
+#include <windows.h>
 #include <lm.h>       // NetGetJoinInformation, NetApiBufferFree
 #include <security.h> // GetComputerObjectNameA
-#include <windows.h>
 #endif
 
 namespace {

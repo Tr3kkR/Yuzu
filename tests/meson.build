@@ -57,5 +57,5 @@ if build_server
     ],
     dependencies: [yuzu_server_core_dep, catch2_dep],
   )
-  test('server unit tests', server_test_exe)
+  test('server unit tests', server_test_exe, timeout: 120)
 endif

@@ -40,8 +40,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <lm.h>
 #include <windows.h>
+#include <lm.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "netapi32.lib")

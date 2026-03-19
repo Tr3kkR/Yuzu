@@ -38,8 +38,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <wincrypt.h>
 #include <windows.h>
+#include <wincrypt.h>
 #pragma comment(lib, "Crypt32.lib")
 #else
 #include <csignal>
