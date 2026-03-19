@@ -31,8 +31,10 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// clang-format off
+#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+// clang-format on
 #include <bcrypt.h>
-#include <windows.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <openssl/evp.h>

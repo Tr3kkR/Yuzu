@@ -9,7 +9,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>
+// clang-format off
+#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+// clang-format on
 #include <bcrypt.h>
 #else
 #include <openssl/sha.h>
@@ -25,16 +27,21 @@ static int64_t now_epoch() {
         .count();
 }
 
-static const char* safe(const char* p) { return p ? p : ""; }
+static const char* safe(const char* p) {
+    return p ? p : "";
+}
 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
 ApiTokenStore::ApiTokenStore(const std::filesystem::path& db_path) {
     int rc = sqlite3_open(db_path.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
-        spdlog::error("ApiTokenStore: failed to open {}: {}",
-                       db_path.string(), sqlite3_errmsg(db_));
-        if (db_) { sqlite3_close(db_); db_ = nullptr; }
+        spdlog::error("ApiTokenStore: failed to open {}: {}", db_path.string(),
+                      sqlite3_errmsg(db_));
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
         return;
     }
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
@@ -44,10 +51,13 @@ ApiTokenStore::ApiTokenStore(const std::filesystem::path& db_path) {
 }
 
 ApiTokenStore::~ApiTokenStore() {
-    if (db_) sqlite3_close(db_);
+    if (db_)
+        sqlite3_close(db_);
 }
 
-bool ApiTokenStore::is_open() const { return db_ != nullptr; }
+bool ApiTokenStore::is_open() const {
+    return db_ != nullptr;
+}
 
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
@@ -79,7 +89,7 @@ std::string ApiTokenStore::generate_raw_token() const {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     static constexpr char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    std::string token = "yuzu_";  // prefix for easy identification
+    std::string token = "yuzu_"; // prefix for easy identification
     token.reserve(37);
     std::uniform_int_distribution<int> dist(0, 61);
     for (int i = 0; i < 32; ++i)
@@ -120,22 +130,24 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string>
-ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
-                             int64_t expires_at) {
-    if (!db_) return std::unexpected("database not open");
-    if (name.empty()) return std::unexpected("token name cannot be empty");
+std::expected<std::string, std::string> ApiTokenStore::create_token(const std::string& name,
+                                                                    const std::string& principal_id,
+                                                                    int64_t expires_at) {
+    if (!db_)
+        return std::unexpected("database not open");
+    if (name.empty())
+        return std::unexpected("token name cannot be empty");
 
     auto raw = generate_raw_token();
     auto hash = sha256_hex(raw);
-    auto token_id = hash.substr(0, 12);  // Short display ID
+    auto token_id = hash.substr(0, 12); // Short display ID
     auto now = now_epoch();
 
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "INSERT INTO api_tokens (token_id, token_hash, name, principal_id, "
-            "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?);",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "INSERT INTO api_tokens (token_id, token_hash, name, principal_id, "
+                           "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?);",
+                           -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
 
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -149,15 +161,17 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE)
         return std::unexpected(std::string("failed to create token: ") + sqlite3_errmsg(db_));
-    return raw;  // Return the raw token (shown once to user)
+    return raw; // Return the raw token (shown once to user)
 }
 
 std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_token) {
-    if (!db_ || raw_token.empty()) return std::nullopt;
+    if (!db_ || raw_token.empty())
+        return std::nullopt;
 
     auto hash = sha256_hex(raw_token);
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "SELECT token_id, token_hash, name, principal_id, created_at, expires_at, "
             "last_used_at, revoked FROM api_tokens WHERE token_hash = ?;",
             -1, &s, nullptr) != SQLITE_OK)
@@ -167,21 +181,27 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     std::optional<ApiToken> result;
     if (sqlite3_step(s) == SQLITE_ROW) {
         ApiToken t;
-        t.token_id     = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        t.token_hash   = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        t.name         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        t.token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.created_at   = sqlite3_column_int64(s, 4);
-        t.expires_at   = sqlite3_column_int64(s, 5);
+        t.created_at = sqlite3_column_int64(s, 4);
+        t.expires_at = sqlite3_column_int64(s, 5);
         t.last_used_at = sqlite3_column_int64(s, 6);
-        t.revoked      = sqlite3_column_int(s, 7) != 0;
+        t.revoked = sqlite3_column_int(s, 7) != 0;
 
         // Check revocation
-        if (t.revoked) { sqlite3_finalize(s); return std::nullopt; }
+        if (t.revoked) {
+            sqlite3_finalize(s);
+            return std::nullopt;
+        }
 
         // Check expiration
         auto now = now_epoch();
-        if (t.expires_at > 0 && now > t.expires_at) { sqlite3_finalize(s); return std::nullopt; }
+        if (t.expires_at > 0 && now > t.expires_at) {
+            sqlite3_finalize(s);
+            return std::nullopt;
+        }
 
         result = std::move(t);
     }
@@ -190,9 +210,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     // Update last_used_at
     if (result) {
         sqlite3_stmt* upd = nullptr;
-        sqlite3_prepare_v2(db_,
-            "UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?;",
-            -1, &upd, nullptr);
+        sqlite3_prepare_v2(db_, "UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?;", -1,
+                           &upd, nullptr);
         sqlite3_bind_int64(upd, 1, now_epoch());
         sqlite3_bind_text(upd, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(upd);
@@ -204,7 +223,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
 
 std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {
     std::vector<ApiToken> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
 
     std::string sql =
         "SELECT token_id, '', name, principal_id, created_at, expires_at, last_used_at, revoked "
@@ -221,14 +241,14 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
 
     while (sqlite3_step(s) == SQLITE_ROW) {
         ApiToken t;
-        t.token_id     = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        t.token_hash   = "";  // Never expose hash in listing
-        t.name         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        t.token_hash = ""; // Never expose hash in listing
+        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.created_at   = sqlite3_column_int64(s, 4);
-        t.expires_at   = sqlite3_column_int64(s, 5);
+        t.created_at = sqlite3_column_int64(s, 4);
+        t.expires_at = sqlite3_column_int64(s, 5);
         t.last_used_at = sqlite3_column_int64(s, 6);
-        t.revoked      = sqlite3_column_int(s, 7) != 0;
+        t.revoked = sqlite3_column_int(s, 7) != 0;
         result.push_back(std::move(t));
     }
     sqlite3_finalize(s);
@@ -236,11 +256,11 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
 }
 
 bool ApiTokenStore::revoke_token(const std::string& token_id) {
-    if (!db_) return false;
+    if (!db_)
+        return false;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "UPDATE api_tokens SET revoked = 1 WHERE token_id = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "UPDATE api_tokens SET revoked = 1 WHERE token_id = ?;", -1, &s,
+                           nullptr) != SQLITE_OK)
         return false;
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
@@ -249,11 +269,11 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
 }
 
 bool ApiTokenStore::delete_token(const std::string& token_id) {
-    if (!db_) return false;
+    if (!db_)
+        return false;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "DELETE FROM api_tokens WHERE token_id = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "DELETE FROM api_tokens WHERE token_id = ?;", -1, &s, nullptr) !=
+        SQLITE_OK)
         return false;
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
@@ -261,4 +281,4 @@ bool ApiTokenStore::delete_token(const std::string& token_id) {
     return sqlite3_changes(db_) > 0;
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

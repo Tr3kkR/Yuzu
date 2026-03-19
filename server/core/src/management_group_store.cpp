@@ -9,7 +9,9 @@ namespace yuzu::server {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-static const char* safe(const char* p) { return p ? p : ""; }
+static const char* safe(const char* p) {
+    return p ? p : "";
+}
 
 static int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -22,9 +24,12 @@ static int64_t now_epoch() {
 ManagementGroupStore::ManagementGroupStore(const std::filesystem::path& db_path) {
     int rc = sqlite3_open(db_path.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
-        spdlog::error("ManagementGroupStore: failed to open {}: {}",
-                       db_path.string(), sqlite3_errmsg(db_));
-        if (db_) { sqlite3_close(db_); db_ = nullptr; }
+        spdlog::error("ManagementGroupStore: failed to open {}: {}", db_path.string(),
+                      sqlite3_errmsg(db_));
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
         return;
     }
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
@@ -35,10 +40,13 @@ ManagementGroupStore::ManagementGroupStore(const std::filesystem::path& db_path)
 }
 
 ManagementGroupStore::~ManagementGroupStore() {
-    if (db_) sqlite3_close(db_);
+    if (db_)
+        sqlite3_close(db_);
 }
 
-bool ManagementGroupStore::is_open() const { return db_ != nullptr; }
+bool ManagementGroupStore::is_open() const {
+    return db_ != nullptr;
+}
 
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
@@ -99,13 +107,16 @@ std::string ManagementGroupStore::generate_id() const {
 
 std::expected<std::string, std::string>
 ManagementGroupStore::create_group(const ManagementGroup& group) {
-    if (!db_) return std::unexpected("database not open");
-    if (group.name.empty()) return std::unexpected("group name cannot be empty");
+    if (!db_)
+        return std::unexpected("database not open");
+    if (group.name.empty())
+        return std::unexpected("group name cannot be empty");
 
     // Validate no circular parent reference
     if (!group.parent_id.empty()) {
         auto parent = get_group(group.parent_id);
-        if (!parent) return std::unexpected("parent group not found");
+        if (!parent)
+            return std::unexpected("parent group not found");
         // Check depth limit (max 5 levels)
         auto ancestors = get_ancestor_ids(group.parent_id);
         if (ancestors.size() >= 5)
@@ -117,10 +128,11 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
 
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "INSERT INTO management_groups "
-            "(id, name, description, parent_id, membership_type, scope_expression, created_by, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "INSERT INTO management_groups "
+                           "(id, name, description, parent_id, membership_type, scope_expression, "
+                           "created_by, created_at, updated_at) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                           -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
 
     sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
@@ -147,9 +159,11 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
 }
 
 std::optional<ManagementGroup> ManagementGroupStore::get_group(const std::string& id) const {
-    if (!db_) return std::nullopt;
+    if (!db_)
+        return std::nullopt;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "SELECT id, name, description, parent_id, membership_type, scope_expression, "
             "created_by, created_at, updated_at FROM management_groups WHERE id = ?;",
             -1, &s, nullptr) != SQLITE_OK)
@@ -158,15 +172,15 @@ std::optional<ManagementGroup> ManagementGroupStore::get_group(const std::string
     std::optional<ManagementGroup> result;
     if (sqlite3_step(s) == SQLITE_ROW) {
         ManagementGroup g;
-        g.id               = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        g.name             = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        g.description      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        g.parent_id        = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        g.membership_type  = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        g.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        g.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        g.description = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        g.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        g.membership_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
         g.scope_expression = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        g.created_by       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        g.created_at       = sqlite3_column_int64(s, 7);
-        g.updated_at       = sqlite3_column_int64(s, 8);
+        g.created_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        g.created_at = sqlite3_column_int64(s, 7);
+        g.updated_at = sqlite3_column_int64(s, 8);
         result = std::move(g);
     }
     sqlite3_finalize(s);
@@ -175,51 +189,57 @@ std::optional<ManagementGroup> ManagementGroupStore::get_group(const std::string
 
 std::vector<ManagementGroup> ManagementGroupStore::list_groups() const {
     std::vector<ManagementGroup> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "SELECT id, name, description, parent_id, membership_type, scope_expression, "
             "created_by, created_at, updated_at FROM management_groups ORDER BY name;",
             -1, &s, nullptr) != SQLITE_OK)
         return result;
     while (sqlite3_step(s) == SQLITE_ROW) {
         ManagementGroup g;
-        g.id               = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        g.name             = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        g.description      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        g.parent_id        = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        g.membership_type  = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        g.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        g.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        g.description = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        g.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        g.membership_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
         g.scope_expression = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        g.created_by       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        g.created_at       = sqlite3_column_int64(s, 7);
-        g.updated_at       = sqlite3_column_int64(s, 8);
+        g.created_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        g.created_at = sqlite3_column_int64(s, 7);
+        g.updated_at = sqlite3_column_int64(s, 8);
         result.push_back(std::move(g));
     }
     sqlite3_finalize(s);
     return result;
 }
 
-std::vector<ManagementGroup> ManagementGroupStore::get_children(const std::string& parent_id) const {
+std::vector<ManagementGroup>
+ManagementGroupStore::get_children(const std::string& parent_id) const {
     std::vector<ManagementGroup> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "SELECT id, name, description, parent_id, membership_type, scope_expression, "
-            "created_by, created_at, updated_at FROM management_groups WHERE parent_id = ? ORDER BY name;",
+            "created_by, created_at, updated_at FROM management_groups WHERE parent_id = ? ORDER "
+            "BY name;",
             -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, parent_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW) {
         ManagementGroup g;
-        g.id               = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        g.name             = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        g.description      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        g.parent_id        = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        g.membership_type  = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        g.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        g.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        g.description = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        g.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        g.membership_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
         g.scope_expression = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        g.created_by       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-        g.created_at       = sqlite3_column_int64(s, 7);
-        g.updated_at       = sqlite3_column_int64(s, 8);
+        g.created_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        g.created_at = sqlite3_column_int64(s, 7);
+        g.updated_at = sqlite3_column_int64(s, 8);
         result.push_back(std::move(g));
     }
     sqlite3_finalize(s);
@@ -227,9 +247,11 @@ std::vector<ManagementGroup> ManagementGroupStore::get_children(const std::strin
 }
 
 std::expected<void, std::string> ManagementGroupStore::update_group(const ManagementGroup& group) {
-    if (!db_) return std::unexpected("database not open");
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "UPDATE management_groups SET name = ?, description = ?, parent_id = ?, "
             "membership_type = ?, scope_expression = ?, updated_at = ? WHERE id = ?;",
             -1, &s, nullptr) != SQLITE_OK)
@@ -249,30 +271,35 @@ std::expected<void, std::string> ManagementGroupStore::update_group(const Manage
     sqlite3_bind_text(s, 7, group.id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
-    if (sqlite3_changes(db_) == 0) return std::unexpected("group not found");
+    if (sqlite3_changes(db_) == 0)
+        return std::unexpected("group not found");
     return {};
 }
 
 std::expected<void, std::string> ManagementGroupStore::delete_group(const std::string& id) {
-    if (!db_) return std::unexpected("database not open");
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM management_groups WHERE id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "DELETE FROM management_groups WHERE id = ?;", -1, &s, nullptr) !=
+        SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
     sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
-    if (sqlite3_changes(db_) == 0) return std::unexpected("group not found");
+    if (sqlite3_changes(db_) == 0)
+        return std::unexpected("group not found");
     return {};
 }
 
 // ── Membership ───────────────────────────────────────────────────────────────
 
-std::expected<void, std::string>
-ManagementGroupStore::add_member(const std::string& group_id, const std::string& agent_id) {
-    if (!db_) return std::unexpected("database not open");
+std::expected<void, std::string> ManagementGroupStore::add_member(const std::string& group_id,
+                                                                  const std::string& agent_id) {
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "INSERT OR IGNORE INTO management_group_members (group_id, agent_id, source, added_at) "
             "VALUES (?, ?, 'static', ?);",
             -1, &s, nullptr) != SQLITE_OK)
@@ -285,13 +312,15 @@ ManagementGroupStore::add_member(const std::string& group_id, const std::string&
     return {};
 }
 
-std::expected<void, std::string>
-ManagementGroupStore::remove_member(const std::string& group_id, const std::string& agent_id) {
-    if (!db_) return std::unexpected("database not open");
+std::expected<void, std::string> ManagementGroupStore::remove_member(const std::string& group_id,
+                                                                     const std::string& agent_id) {
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "DELETE FROM management_group_members WHERE group_id = ? AND agent_id = ? AND source = 'static';",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "DELETE FROM management_group_members WHERE group_id = ? AND agent_id = "
+                           "? AND source = 'static';",
+                           -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
     sqlite3_bind_text(s, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -303,19 +332,20 @@ ManagementGroupStore::remove_member(const std::string& group_id, const std::stri
 std::vector<ManagementGroupMember>
 ManagementGroupStore::get_members(const std::string& group_id) const {
     std::vector<ManagementGroupMember> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "SELECT group_id, agent_id, source, added_at "
-            "FROM management_group_members WHERE group_id = ? ORDER BY agent_id;",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "SELECT group_id, agent_id, source, added_at "
+                           "FROM management_group_members WHERE group_id = ? ORDER BY agent_id;",
+                           -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW) {
         ManagementGroupMember m;
         m.group_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
         m.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        m.source   = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        m.source = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         m.added_at = sqlite3_column_int64(s, 3);
         result.push_back(std::move(m));
     }
@@ -323,14 +353,13 @@ ManagementGroupStore::get_members(const std::string& group_id) const {
     return result;
 }
 
-std::vector<std::string>
-ManagementGroupStore::get_agent_groups(const std::string& agent_id) const {
+std::vector<std::string> ManagementGroupStore::get_agent_groups(const std::string& agent_id) const {
     std::vector<std::string> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "SELECT group_id FROM management_group_members WHERE agent_id = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "SELECT group_id FROM management_group_members WHERE agent_id = ?;",
+                           -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW)
@@ -341,13 +370,14 @@ ManagementGroupStore::get_agent_groups(const std::string& agent_id) const {
 
 void ManagementGroupStore::refresh_dynamic_membership(
     const std::string& group_id, const std::vector<std::string>& matching_agent_ids) {
-    if (!db_) return;
+    if (!db_)
+        return;
 
     // Remove old dynamic members
     sqlite3_stmt* del = nullptr;
-    sqlite3_prepare_v2(db_,
-        "DELETE FROM management_group_members WHERE group_id = ? AND source = 'dynamic';",
-        -1, &del, nullptr);
+    sqlite3_prepare_v2(
+        db_, "DELETE FROM management_group_members WHERE group_id = ? AND source = 'dynamic';", -1,
+        &del, nullptr);
     sqlite3_bind_text(del, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(del);
     sqlite3_finalize(del);
@@ -356,7 +386,8 @@ void ManagementGroupStore::refresh_dynamic_membership(
     auto now = now_epoch();
     for (const auto& aid : matching_agent_ids) {
         sqlite3_stmt* ins = nullptr;
-        sqlite3_prepare_v2(db_,
+        sqlite3_prepare_v2(
+            db_,
             "INSERT OR IGNORE INTO management_group_members (group_id, agent_id, source, added_at) "
             "VALUES (?, ?, 'dynamic', ?);",
             -1, &ins, nullptr);
@@ -370,17 +401,16 @@ void ManagementGroupStore::refresh_dynamic_membership(
 
 // ── Hierarchy ────────────────────────────────────────────────────────────────
 
-std::vector<std::string>
-ManagementGroupStore::get_ancestor_ids(const std::string& group_id) const {
+std::vector<std::string> ManagementGroupStore::get_ancestor_ids(const std::string& group_id) const {
     std::vector<std::string> ancestors;
-    if (!db_) return ancestors;
+    if (!db_)
+        return ancestors;
 
     auto current = group_id;
-    for (int depth = 0; depth < 10; ++depth) {  // safety limit
+    for (int depth = 0; depth < 10; ++depth) { // safety limit
         sqlite3_stmt* s = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                "SELECT parent_id FROM management_groups WHERE id = ?;",
-                -1, &s, nullptr) != SQLITE_OK)
+        if (sqlite3_prepare_v2(db_, "SELECT parent_id FROM management_groups WHERE id = ?;", -1, &s,
+                               nullptr) != SQLITE_OK)
             break;
         sqlite3_bind_text(s, 1, current.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s) == SQLITE_ROW) {
@@ -401,7 +431,8 @@ ManagementGroupStore::get_ancestor_ids(const std::string& group_id) const {
 std::vector<std::string>
 ManagementGroupStore::get_descendant_ids(const std::string& group_id) const {
     std::vector<std::string> descendants;
-    if (!db_) return descendants;
+    if (!db_)
+        return descendants;
 
     // BFS traversal
     std::vector<std::string> queue = {group_id};
@@ -410,9 +441,8 @@ ManagementGroupStore::get_descendant_ids(const std::string& group_id) const {
         queue.pop_back();
 
         sqlite3_stmt* s = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                "SELECT id FROM management_groups WHERE parent_id = ?;",
-                -1, &s, nullptr) != SQLITE_OK)
+        if (sqlite3_prepare_v2(db_, "SELECT id FROM management_groups WHERE parent_id = ?;", -1, &s,
+                               nullptr) != SQLITE_OK)
             continue;
         sqlite3_bind_text(s, 1, current.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(s) == SQLITE_ROW) {
@@ -431,9 +461,11 @@ ManagementGroupStore::get_descendant_ids(const std::string& group_id) const {
 
 std::expected<void, std::string>
 ManagementGroupStore::assign_role(const GroupRoleAssignment& assignment) {
-    if (!db_) return std::unexpected("database not open");
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "INSERT OR IGNORE INTO management_group_roles "
             "(group_id, principal_type, principal_id, role_name) VALUES (?, ?, ?, ?);",
             -1, &s, nullptr) != SQLITE_OK)
@@ -444,18 +476,19 @@ ManagementGroupStore::assign_role(const GroupRoleAssignment& assignment) {
     sqlite3_bind_text(s, 4, assignment.role_name.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) return std::unexpected(sqlite3_errmsg(db_));
+    if (rc != SQLITE_DONE)
+        return std::unexpected(sqlite3_errmsg(db_));
     return {};
 }
 
 std::expected<void, std::string>
-ManagementGroupStore::unassign_role(const std::string& group_id,
-                                     const std::string& principal_type,
-                                     const std::string& principal_id,
-                                     const std::string& role_name) {
-    if (!db_) return std::unexpected("database not open");
+ManagementGroupStore::unassign_role(const std::string& group_id, const std::string& principal_type,
+                                    const std::string& principal_id, const std::string& role_name) {
+    if (!db_)
+        return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
+    if (sqlite3_prepare_v2(
+            db_,
             "DELETE FROM management_group_roles "
             "WHERE group_id = ? AND principal_type = ? AND principal_id = ? AND role_name = ?;",
             -1, &s, nullptr) != SQLITE_OK)
@@ -472,20 +505,21 @@ ManagementGroupStore::unassign_role(const std::string& group_id,
 std::vector<GroupRoleAssignment>
 ManagementGroupStore::get_group_roles(const std::string& group_id) const {
     std::vector<GroupRoleAssignment> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "SELECT group_id, principal_type, principal_id, role_name "
-            "FROM management_group_roles WHERE group_id = ? ORDER BY role_name;",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "SELECT group_id, principal_type, principal_id, role_name "
+                           "FROM management_group_roles WHERE group_id = ? ORDER BY role_name;",
+                           -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW) {
         GroupRoleAssignment a;
-        a.group_id       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        a.group_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
         a.principal_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        a.principal_id   = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        a.role_name      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        a.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        a.role_name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
         result.push_back(std::move(a));
     }
     sqlite3_finalize(s);
@@ -495,14 +529,15 @@ ManagementGroupStore::get_group_roles(const std::string& group_id) const {
 std::vector<std::string>
 ManagementGroupStore::get_visible_agents(const std::string& username) const {
     std::vector<std::string> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     // Find all groups where the user has any role assignment, then return their members
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "SELECT DISTINCT m.agent_id FROM management_group_members m "
-            "JOIN management_group_roles r ON m.group_id = r.group_id "
-            "WHERE r.principal_type = 'user' AND r.principal_id = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "SELECT DISTINCT m.agent_id FROM management_group_members m "
+                           "JOIN management_group_roles r ON m.group_id = r.group_id "
+                           "WHERE r.principal_type = 'user' AND r.principal_id = ?;",
+                           -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW)
@@ -511,4 +546,4 @@ ManagementGroupStore::get_visible_agents(const std::string& username) const {
     return result;
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -12,14 +12,14 @@
 namespace yuzu::server {
 
 struct ApiToken {
-    std::string token_id;       // Short display ID (prefix of hash)
-    std::string token_hash;     // SHA-256 hash of raw token (stored, never the raw token)
-    std::string name;           // Human-readable label
-    std::string principal_id;   // Username who created it
-    int64_t     created_at{0};
-    int64_t     expires_at{0};  // 0 = never
-    int64_t     last_used_at{0};
-    bool        revoked{false};
+    std::string token_id;     // Short display ID (prefix of hash)
+    std::string token_hash;   // SHA-256 hash of raw token (stored, never the raw token)
+    std::string name;         // Human-readable label
+    std::string principal_id; // Username who created it
+    int64_t created_at{0};
+    int64_t expires_at{0}; // 0 = never
+    int64_t last_used_at{0};
+    bool revoked{false};
 };
 
 class ApiTokenStore {
@@ -27,15 +27,14 @@ public:
     explicit ApiTokenStore(const std::filesystem::path& db_path);
     ~ApiTokenStore();
 
-    ApiTokenStore(const ApiTokenStore&)            = delete;
+    ApiTokenStore(const ApiTokenStore&) = delete;
     ApiTokenStore& operator=(const ApiTokenStore&) = delete;
 
     bool is_open() const;
 
     /// Create a new API token. Returns the raw token string (shown to user once).
-    std::expected<std::string, std::string> create_token(const std::string& name,
-                                                          const std::string& principal_id,
-                                                          int64_t expires_at = 0);
+    std::expected<std::string, std::string>
+    create_token(const std::string& name, const std::string& principal_id, int64_t expires_at = 0);
 
     /// Validate a raw Bearer token. Returns the ApiToken if valid and not expired/revoked.
     std::optional<ApiToken> validate_token(const std::string& raw_token);
@@ -57,4 +56,4 @@ private:
     std::string sha256_hex(const std::string& input) const;
 };
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -12,12 +12,13 @@ nlohmann::json RestApiV1::ok_response(const nlohmann::json& data) {
 
 nlohmann::json RestApiV1::error_response(const std::string& message, int code) {
     nlohmann::json j = {{"error", message}, {"meta", {{"api_version", "v1"}}}};
-    if (code != 0) j["code"] = code;
+    if (code != 0)
+        j["code"] = code;
     return j;
 }
 
-nlohmann::json RestApiV1::list_response(const nlohmann::json& data, int64_t total,
-                                         int64_t start, int64_t page_size) {
+nlohmann::json RestApiV1::list_response(const nlohmann::json& data, int64_t total, int64_t start,
+                                        int64_t page_size) {
     return {{"data", data},
             {"pagination", {{"total", total}, {"start", start}, {"page_size", page_size}}},
             {"meta", {{"api_version", "v1"}}}};
@@ -25,13 +26,14 @@ nlohmann::json RestApiV1::list_response(const nlohmann::json& data, int64_t tota
 
 // ── Route registration ───────────────────────────────────────────────────────
 
-void RestApiV1::register_routes(
-    httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-    RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
-    QuarantineStore* quarantine_store, ResponseStore* response_store,
-    InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
-    ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
-    TagStore* tag_store, AuditStore* audit_store) {
+void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, RbacStore* rbac_store,
+                                ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
+                                QuarantineStore* quarantine_store, ResponseStore* response_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker,
+                                ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
+                                TagStore* tag_store, AuditStore* audit_store) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -39,95 +41,125 @@ void RestApiV1::register_routes(
 
     svr.Get("/api/v1/me", [auth_fn](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn(req, res);
-        if (!session) return;
-        res.set_content(
-            ok_response({{"username", session->username},
-                         {"role", auth::role_to_string(session->role)}}).dump(),
-            "application/json");
+        if (!session)
+            return;
+        res.set_content(ok_response({{"username", session->username},
+                                     {"role", auth::role_to_string(session->role)}})
+                            .dump(),
+                        "application/json");
     });
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
     svr.Get("/api/v1/management-groups",
-        [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Read")) return;
-            if (!mgmt_store) { res.status = 503; return; }
+            [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
+                if (!mgmt_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto groups = mgmt_store->list_groups();
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& g : groups) {
-                arr.push_back({{"id", g.id}, {"name", g.name}, {"description", g.description},
-                               {"parent_id", g.parent_id}, {"membership_type", g.membership_type},
-                               {"scope_expression", g.scope_expression},
-                               {"created_by", g.created_by}, {"created_at", g.created_at},
-                               {"updated_at", g.updated_at}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(groups.size())).dump(),
-                            "application/json");
-        });
+                auto groups = mgmt_store->list_groups();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& g : groups) {
+                    arr.push_back({{"id", g.id},
+                                   {"name", g.name},
+                                   {"description", g.description},
+                                   {"parent_id", g.parent_id},
+                                   {"membership_type", g.membership_type},
+                                   {"scope_expression", g.scope_expression},
+                                   {"created_by", g.created_by},
+                                   {"created_at", g.created_at},
+                                   {"updated_at", g.updated_at}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(groups.size())).dump(),
+                                "application/json");
+            });
 
-    svr.Post("/api/v1/management-groups",
-        [auth_fn, perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Write")) return;
-            if (!mgmt_store) { res.status = 503; return; }
+    svr.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
+                                              const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "ManagementGroup", "Write"))
+            return;
+        if (!mgmt_store) {
+            res.status = 503;
+            return;
+        }
 
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(error_response("invalid JSON").dump(), "application/json");
-                return;
-            }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_content(error_response("invalid JSON").dump(), "application/json");
+            return;
+        }
 
-            ManagementGroup g;
-            g.name = body.value("name", "");
-            g.description = body.value("description", "");
-            g.parent_id = body.value("parent_id", "");
-            g.membership_type = body.value("membership_type", "static");
-            g.scope_expression = body.value("scope_expression", "");
+        ManagementGroup g;
+        g.name = body.value("name", "");
+        g.description = body.value("description", "");
+        g.parent_id = body.value("parent_id", "");
+        g.membership_type = body.value("membership_type", "static");
+        g.scope_expression = body.value("scope_expression", "");
 
-            auto session = auth_fn(req, res);
-            if (session) g.created_by = session->username;
+        auto session = auth_fn(req, res);
+        if (session)
+            g.created_by = session->username;
 
-            auto result = mgmt_store->create_group(g);
-            if (!result) {
-                res.status = 400;
-                res.set_content(error_response(result.error()).dump(), "application/json");
-                return;
-            }
-            audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
-            res.status = 201;
-            res.set_content(ok_response({{"id", *result}}).dump(), "application/json");
-        });
+        auto result = mgmt_store->create_group(g);
+        if (!result) {
+            res.status = 400;
+            res.set_content(error_response(result.error()).dump(), "application/json");
+            return;
+        }
+        audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
+        res.status = 201;
+        res.set_content(ok_response({{"id", *result}}).dump(), "application/json");
+    });
 
     svr.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
-        [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Read")) return;
-            if (!mgmt_store) { res.status = 503; return; }
+            [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
+                if (!mgmt_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto id = req.matches[1].str();
-            auto g = mgmt_store->get_group(id);
-            if (!g) {
-                res.status = 404;
-                res.set_content(error_response("group not found").dump(), "application/json");
+                auto id = req.matches[1].str();
+                auto g = mgmt_store->get_group(id);
+                if (!g) {
+                    res.status = 404;
+                    res.set_content(error_response("group not found").dump(), "application/json");
+                    return;
+                }
+                auto members = mgmt_store->get_members(id);
+                nlohmann::json member_arr = nlohmann::json::array();
+                for (const auto& m : members)
+                    member_arr.push_back(
+                        {{"agent_id", m.agent_id}, {"source", m.source}, {"added_at", m.added_at}});
+
+                res.set_content(ok_response({{"id", g->id},
+                                             {"name", g->name},
+                                             {"description", g->description},
+                                             {"parent_id", g->parent_id},
+                                             {"membership_type", g->membership_type},
+                                             {"scope_expression", g->scope_expression},
+                                             {"created_by", g->created_by},
+                                             {"created_at", g->created_at},
+                                             {"updated_at", g->updated_at},
+                                             {"members", member_arr}})
+                                    .dump(),
+                                "application/json");
+            });
+
+    svr.Delete(
+        R"(/api/v1/management-groups/([a-f0-9]+))",
+        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "ManagementGroup", "Delete"))
+                return;
+            if (!mgmt_store) {
+                res.status = 503;
                 return;
             }
-            auto members = mgmt_store->get_members(id);
-            nlohmann::json member_arr = nlohmann::json::array();
-            for (const auto& m : members)
-                member_arr.push_back({{"agent_id", m.agent_id}, {"source", m.source}, {"added_at", m.added_at}});
-
-            res.set_content(ok_response({
-                {"id", g->id}, {"name", g->name}, {"description", g->description},
-                {"parent_id", g->parent_id}, {"membership_type", g->membership_type},
-                {"scope_expression", g->scope_expression}, {"created_by", g->created_by},
-                {"created_at", g->created_at}, {"updated_at", g->updated_at},
-                {"members", member_arr}}).dump(), "application/json");
-        });
-
-    svr.Delete(R"(/api/v1/management-groups/([a-f0-9]+))",
-        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Delete")) return;
-            if (!mgmt_store) { res.status = 503; return; }
 
             auto id = req.matches[1].str();
             auto result = mgmt_store->delete_group(id);
@@ -142,148 +174,190 @@ void RestApiV1::register_routes(
 
     // Members
     svr.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Write")) return;
-            if (!mgmt_store) { res.status = 503; return; }
+             [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                     return;
+                 if (!mgmt_store) {
+                     res.status = 503;
+                     return;
+                 }
 
-            auto group_id = req.matches[1].str();
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            auto agent_id = body.value("agent_id", "");
-            if (agent_id.empty()) {
-                res.status = 400;
-                res.set_content(error_response("agent_id required").dump(), "application/json");
+                 auto group_id = req.matches[1].str();
+                 auto body = nlohmann::json::parse(req.body, nullptr, false);
+                 auto agent_id = body.value("agent_id", "");
+                 if (agent_id.empty()) {
+                     res.status = 400;
+                     res.set_content(error_response("agent_id required").dump(),
+                                     "application/json");
+                     return;
+                 }
+                 mgmt_store->add_member(group_id, agent_id);
+                 audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
+                          group_id, agent_id);
+                 res.status = 201;
+                 res.set_content(ok_response({{"added", true}}).dump(), "application/json");
+             });
+
+    svr.Delete(
+        R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
+        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                return;
+            if (!mgmt_store) {
+                res.status = 503;
                 return;
             }
-            mgmt_store->add_member(group_id, agent_id);
-            audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                     group_id, agent_id);
-            res.status = 201;
-            res.set_content(ok_response({{"added", true}}).dump(), "application/json");
-        });
-
-    svr.Delete(R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ManagementGroup", "Write")) return;
-            if (!mgmt_store) { res.status = 503; return; }
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
             mgmt_store->remove_member(group_id, agent_id);
-            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup",
-                     group_id, agent_id);
+            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
+                     agent_id);
             res.set_content(ok_response({{"removed", true}}).dump(), "application/json");
         });
 
     // ── API Tokens (/api/v1/tokens) ──────────────────────────────────────
 
     svr.Get("/api/v1/tokens",
-        [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ApiToken", "Read")) return;
-            if (!token_store) { res.status = 503; return; }
+            [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "ApiToken", "Read"))
+                    return;
+                if (!token_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto session = auth_fn(req, res);
-            if (!session) return;
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
 
-            auto tokens = token_store->list_tokens(session->username);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : tokens) {
-                arr.push_back({{"token_id", t.token_id}, {"name", t.name},
-                               {"principal_id", t.principal_id}, {"created_at", t.created_at},
-                               {"expires_at", t.expires_at}, {"last_used_at", t.last_used_at},
-                               {"revoked", t.revoked}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(tokens.size())).dump(),
-                            "application/json");
-        });
+                auto tokens = token_store->list_tokens(session->username);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& t : tokens) {
+                    arr.push_back({{"token_id", t.token_id},
+                                   {"name", t.name},
+                                   {"principal_id", t.principal_id},
+                                   {"created_at", t.created_at},
+                                   {"expires_at", t.expires_at},
+                                   {"last_used_at", t.last_used_at},
+                                   {"revoked", t.revoked}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(tokens.size())).dump(),
+                                "application/json");
+            });
 
-    svr.Post("/api/v1/tokens",
-        [auth_fn, perm_fn, audit_fn, token_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ApiToken", "Write")) return;
-            if (!token_store) { res.status = 503; return; }
+    svr.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn,
+                                token_store](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "ApiToken", "Write"))
+            return;
+        if (!token_store) {
+            res.status = 503;
+            return;
+        }
 
-            auto session = auth_fn(req, res);
-            if (!session) return;
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
 
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            auto name = body.value("name", "");
-            auto expires_at = body.value("expires_at", int64_t{0});
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        auto name = body.value("name", "");
+        auto expires_at = body.value("expires_at", int64_t{0});
 
-            auto result = token_store->create_token(name, session->username, expires_at);
-            if (!result) {
-                res.status = 400;
-                res.set_content(error_response(result.error()).dump(), "application/json");
-                return;
-            }
-            audit_fn(req, "api_token.create", "success", "ApiToken", name, "");
-            res.status = 201;
-            // Return the raw token — shown only once
-            res.set_content(ok_response({{"token", *result}, {"name", name}}).dump(),
-                            "application/json");
-        });
+        auto result = token_store->create_token(name, session->username, expires_at);
+        if (!result) {
+            res.status = 400;
+            res.set_content(error_response(result.error()).dump(), "application/json");
+            return;
+        }
+        audit_fn(req, "api_token.create", "success", "ApiToken", name, "");
+        res.status = 201;
+        // Return the raw token — shown only once
+        res.set_content(ok_response({{"token", *result}, {"name", name}}).dump(),
+                        "application/json");
+    });
 
-    svr.Delete(R"(/api/v1/tokens/(.+))",
-        [perm_fn, audit_fn, token_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "ApiToken", "Delete")) return;
-            if (!token_store) { res.status = 503; return; }
+    svr.Delete(R"(/api/v1/tokens/(.+))", [perm_fn, audit_fn, token_store](
+                                             const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "ApiToken", "Delete"))
+            return;
+        if (!token_store) {
+            res.status = 503;
+            return;
+        }
 
-            auto token_id = req.matches[1].str();
-            bool revoked = token_store->revoke_token(token_id);
-            if (!revoked) {
-                res.status = 404;
-                res.set_content(error_response("token not found").dump(), "application/json");
-                return;
-            }
-            audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id, "");
-            res.set_content(ok_response({{"revoked", true}}).dump(), "application/json");
-        });
+        auto token_id = req.matches[1].str();
+        bool revoked = token_store->revoke_token(token_id);
+        if (!revoked) {
+            res.status = 404;
+            res.set_content(error_response("token not found").dump(), "application/json");
+            return;
+        }
+        audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id, "");
+        res.set_content(ok_response({{"revoked", true}}).dump(), "application/json");
+    });
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
     svr.Get("/api/v1/quarantine",
-        [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Security", "Read")) return;
-            if (!quarantine_store) { res.status = 503; return; }
+            [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!quarantine_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto records = quarantine_store->list_quarantined();
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : records) {
-                arr.push_back({{"agent_id", r.agent_id}, {"status", r.status},
-                               {"quarantined_by", r.quarantined_by},
-                               {"quarantined_at", r.quarantined_at},
-                               {"whitelist", r.whitelist}, {"reason", r.reason}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(records.size())).dump(),
-                            "application/json");
-        });
+                auto records = quarantine_store->list_quarantined();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : records) {
+                    arr.push_back({{"agent_id", r.agent_id},
+                                   {"status", r.status},
+                                   {"quarantined_by", r.quarantined_by},
+                                   {"quarantined_at", r.quarantined_at},
+                                   {"whitelist", r.whitelist},
+                                   {"reason", r.reason}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(records.size())).dump(),
+                                "application/json");
+            });
 
-    svr.Post("/api/v1/quarantine",
-        [auth_fn, perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Security", "Execute")) return;
-            if (!quarantine_store) { res.status = 503; return; }
+    svr.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
+                                       const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Security", "Execute"))
+            return;
+        if (!quarantine_store) {
+            res.status = 503;
+            return;
+        }
 
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            auto agent_id = body.value("agent_id", "");
-            auto reason = body.value("reason", "");
-            auto whitelist = body.value("whitelist", "");
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        auto agent_id = body.value("agent_id", "");
+        auto reason = body.value("reason", "");
+        auto whitelist = body.value("whitelist", "");
 
-            auto session = auth_fn(req, res);
-            std::string by = session ? session->username : "system";
+        auto session = auth_fn(req, res);
+        std::string by = session ? session->username : "system";
 
-            auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
-            if (!result) {
-                res.status = 400;
-                res.set_content(error_response(result.error()).dump(), "application/json");
+        auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
+        if (!result) {
+            res.status = 400;
+            res.set_content(error_response(result.error()).dump(), "application/json");
+            return;
+        }
+        audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
+        res.status = 201;
+        res.set_content(ok_response({{"quarantined", true}}).dump(), "application/json");
+    });
+
+    svr.Delete(
+        R"(/api/v1/quarantine/(.+))",
+        [perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Security", "Execute"))
+                return;
+            if (!quarantine_store) {
+                res.status = 503;
                 return;
             }
-            audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
-            res.status = 201;
-            res.set_content(ok_response({{"quarantined", true}}).dump(), "application/json");
-        });
-
-    svr.Delete(R"(/api/v1/quarantine/(.+))",
-        [perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Security", "Execute")) return;
-            if (!quarantine_store) { res.status = 503; return; }
 
             auto agent_id = req.matches[1].str();
             auto result = quarantine_store->release_device(agent_id);
@@ -299,120 +373,155 @@ void RestApiV1::register_routes(
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
     svr.Get("/api/v1/rbac/roles",
-        [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "UserManagement", "Read")) return;
-            if (!rbac_store) { res.status = 503; return; }
+            [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "UserManagement", "Read"))
+                    return;
+                if (!rbac_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto roles = rbac_store->list_roles();
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : roles) {
-                arr.push_back({{"name", r.name}, {"description", r.description},
-                               {"is_system", r.is_system}, {"created_at", r.created_at}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(roles.size())).dump(),
-                            "application/json");
-        });
+                auto roles = rbac_store->list_roles();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : roles) {
+                    arr.push_back({{"name", r.name},
+                                   {"description", r.description},
+                                   {"is_system", r.is_system},
+                                   {"created_at", r.created_at}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(roles.size())).dump(),
+                                "application/json");
+            });
 
     svr.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
-        [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "UserManagement", "Read")) return;
-            if (!rbac_store) { res.status = 503; return; }
+            [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "UserManagement", "Read"))
+                    return;
+                if (!rbac_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto role_name = req.matches[1].str();
-            auto perms = rbac_store->get_role_permissions(role_name);
-            nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : perms) {
-                arr.push_back({{"securable_type", p.securable_type},
-                               {"operation", p.operation}, {"effect", p.effect}});
-            }
-            res.set_content(ok_response(arr).dump(), "application/json");
-        });
+                auto role_name = req.matches[1].str();
+                auto perms = rbac_store->get_role_permissions(role_name);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& p : perms) {
+                    arr.push_back({{"securable_type", p.securable_type},
+                                   {"operation", p.operation},
+                                   {"effect", p.effect}});
+                }
+                res.set_content(ok_response(arr).dump(), "application/json");
+            });
 
-    svr.Post("/api/v1/rbac/check",
-        [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-            auto session = auth_fn(req, res);
-            if (!session) return;
-            if (!rbac_store) { res.status = 503; return; }
+    svr.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
+                                                         httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (!rbac_store) {
+            res.status = 503;
+            return;
+        }
 
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            auto securable_type = body.value("securable_type", "");
-            auto operation = body.value("operation", "");
-            bool allowed = rbac_store->check_permission(
-                session->username, securable_type, operation);
-            res.set_content(ok_response({{"allowed", allowed}}).dump(), "application/json");
-        });
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        auto securable_type = body.value("securable_type", "");
+        auto operation = body.value("operation", "");
+        bool allowed = rbac_store->check_permission(session->username, securable_type, operation);
+        res.set_content(ok_response({{"allowed", allowed}}).dump(), "application/json");
+    });
 
     // ── Tags (/api/v1/tags) ──────────────────────────────────────────────
 
     svr.Get("/api/v1/tags",
-        [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Tag", "Read")) return;
-            if (!tag_store) { res.status = 503; return; }
+            [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Tag", "Read"))
+                    return;
+                if (!tag_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto agent_id = req.get_param_value("agent_id");
-            if (agent_id.empty()) {
-                res.status = 400;
-                res.set_content(error_response("agent_id parameter required").dump(),
-                                "application/json");
-                return;
-            }
-            auto tags = tag_store->get_all_tags(agent_id);
-            nlohmann::json obj = nlohmann::json::object();
-            for (size_t i = 0; i < tags.size(); ++i)
-                obj[tags[i].key] = tags[i].value;
-            res.set_content(ok_response(obj).dump(), "application/json");
-        });
+                auto agent_id = req.get_param_value("agent_id");
+                if (agent_id.empty()) {
+                    res.status = 400;
+                    res.set_content(error_response("agent_id parameter required").dump(),
+                                    "application/json");
+                    return;
+                }
+                auto tags = tag_store->get_all_tags(agent_id);
+                nlohmann::json obj = nlohmann::json::object();
+                for (size_t i = 0; i < tags.size(); ++i)
+                    obj[tags[i].key] = tags[i].value;
+                res.set_content(ok_response(obj).dump(), "application/json");
+            });
 
     // ── Instructions (/api/v1/definitions) ───────────────────────────────
 
     svr.Get("/api/v1/definitions",
-        [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "InstructionDefinition", "Read")) return;
-            if (!instruction_store) { res.status = 503; return; }
+            [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                if (!instruction_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            auto defs = instruction_store->query_definitions();
-            nlohmann::json arr = nlohmann::json::array();
-            for (size_t i = 0; i < defs.size(); ++i) {
-                const auto& d = defs[i];
-                arr.push_back({{"id", d.id}, {"name", d.name}, {"description", d.description},
-                               {"plugin", d.plugin}, {"action", d.action},
-                               {"version", d.version}, {"created_at", d.created_at}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(defs.size())).dump(),
-                            "application/json");
-        });
+                auto defs = instruction_store->query_definitions();
+                nlohmann::json arr = nlohmann::json::array();
+                for (size_t i = 0; i < defs.size(); ++i) {
+                    const auto& d = defs[i];
+                    arr.push_back({{"id", d.id},
+                                   {"name", d.name},
+                                   {"description", d.description},
+                                   {"plugin", d.plugin},
+                                   {"action", d.action},
+                                   {"version", d.version},
+                                   {"created_at", d.created_at}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(defs.size())).dump(),
+                                "application/json");
+            });
 
     // ── Audit (/api/v1/audit) ────────────────────────────────────────────
 
     svr.Get("/api/v1/audit",
-        [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "AuditLog", "Read")) return;
-            if (!audit_store) { res.status = 503; return; }
+            [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "AuditLog", "Read"))
+                    return;
+                if (!audit_store) {
+                    res.status = 503;
+                    return;
+                }
 
-            AuditQuery q;
-            auto limit_str = req.get_param_value("limit");
-            if (!limit_str.empty()) {
-                try { q.limit = std::stoi(limit_str); }
-                catch (...) {}
-            }
-            if (q.limit > 1000) q.limit = 1000;
-            q.principal = req.get_param_value("principal");
-            q.action = req.get_param_value("action");
+                AuditQuery q;
+                auto limit_str = req.get_param_value("limit");
+                if (!limit_str.empty()) {
+                    try {
+                        q.limit = std::stoi(limit_str);
+                    } catch (...) {}
+                }
+                if (q.limit > 1000)
+                    q.limit = 1000;
+                q.principal = req.get_param_value("principal");
+                q.action = req.get_param_value("action");
 
-            auto events = audit_store->query(q);
-            nlohmann::json arr = nlohmann::json::array();
-            for (size_t i = 0; i < events.size(); ++i) {
-                const auto& e = events[i];
-                arr.push_back({{"timestamp", e.timestamp}, {"principal", e.principal},
-                               {"action", e.action}, {"result", e.result},
-                               {"target_type", e.target_type}, {"target_id", e.target_id},
-                               {"detail", e.detail}});
-            }
-            res.set_content(list_response(arr, static_cast<int64_t>(events.size())).dump(),
-                            "application/json");
-        });
+                auto events = audit_store->query(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (size_t i = 0; i < events.size(); ++i) {
+                    const auto& e = events[i];
+                    arr.push_back({{"timestamp", e.timestamp},
+                                   {"principal", e.principal},
+                                   {"action", e.action},
+                                   {"result", e.result},
+                                   {"target_type", e.target_type},
+                                   {"target_id", e.target_id},
+                                   {"detail", e.detail}});
+                }
+                res.set_content(list_response(arr, static_cast<int64_t>(events.size())).dump(),
+                                "application/json");
+            });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -311,8 +311,8 @@ private:
             tokenizer_.next(); // consume EXISTS
             auto attr_tok = tokenizer_.next();
             if (attr_tok.type != TokenType::Ident) {
-                return std::unexpected(std::format(
-                    "expected attribute after EXISTS at position {}", attr_tok.pos));
+                return std::unexpected(
+                    std::format("expected attribute after EXISTS at position {}", attr_tok.pos));
             }
             Condition cond;
             cond.attribute = attr_tok.value;
@@ -325,37 +325,49 @@ private:
             tokenizer_.next(); // consume LEN
             auto lp = tokenizer_.next();
             if (lp.type != TokenType::LParen) {
-                return std::unexpected(std::format(
-                    "expected '(' after LEN at position {}", lp.pos));
+                return std::unexpected(
+                    std::format("expected '(' after LEN at position {}", lp.pos));
             }
             auto attr_tok = tokenizer_.next();
             if (attr_tok.type != TokenType::Ident) {
-                return std::unexpected(std::format(
-                    "expected attribute inside LEN() at position {}", attr_tok.pos));
+                return std::unexpected(
+                    std::format("expected attribute inside LEN() at position {}", attr_tok.pos));
             }
             auto rp = tokenizer_.next();
             if (rp.type != TokenType::RParen) {
-                return std::unexpected(std::format(
-                    "expected ')' after LEN attribute at position {}", rp.pos));
+                return std::unexpected(
+                    std::format("expected ')' after LEN attribute at position {}", rp.pos));
             }
             // Now read comparison operator and value
             auto op_tok = tokenizer_.next();
             CompOp op;
             switch (op_tok.type) {
-            case TokenType::OpEq:  op = CompOp::Eq;  break;
-            case TokenType::OpNeq: op = CompOp::Neq; break;
-            case TokenType::OpLt:  op = CompOp::Lt;  break;
-            case TokenType::OpGt:  op = CompOp::Gt;  break;
-            case TokenType::OpLe:  op = CompOp::Le;  break;
-            case TokenType::OpGe:  op = CompOp::Ge;  break;
+            case TokenType::OpEq:
+                op = CompOp::Eq;
+                break;
+            case TokenType::OpNeq:
+                op = CompOp::Neq;
+                break;
+            case TokenType::OpLt:
+                op = CompOp::Lt;
+                break;
+            case TokenType::OpGt:
+                op = CompOp::Gt;
+                break;
+            case TokenType::OpLe:
+                op = CompOp::Le;
+                break;
+            case TokenType::OpGe:
+                op = CompOp::Ge;
+                break;
             default:
                 return std::unexpected(std::format(
                     "expected comparison operator after LEN() at position {}", op_tok.pos));
             }
             auto val_tok = tokenizer_.next();
             if (val_tok.type != TokenType::Ident && val_tok.type != TokenType::String) {
-                return std::unexpected(std::format(
-                    "expected value after LEN() operator at position {}", val_tok.pos));
+                return std::unexpected(
+                    std::format("expected value after LEN() operator at position {}", val_tok.pos));
             }
             // Encode as synthetic attribute __len:<attr>
             Condition cond;
@@ -370,8 +382,8 @@ private:
             tokenizer_.next(); // consume STARTSWITH
             auto lp = tokenizer_.next();
             if (lp.type != TokenType::LParen) {
-                return std::unexpected(std::format(
-                    "expected '(' after STARTSWITH at position {}", lp.pos));
+                return std::unexpected(
+                    std::format("expected '(' after STARTSWITH at position {}", lp.pos));
             }
             auto attr_tok = tokenizer_.next();
             if (attr_tok.type != TokenType::Ident) {
@@ -380,8 +392,8 @@ private:
             }
             auto comma = tokenizer_.next();
             if (comma.type != TokenType::Comma) {
-                return std::unexpected(std::format(
-                    "expected ',' in STARTSWITH() at position {}", comma.pos));
+                return std::unexpected(
+                    std::format("expected ',' in STARTSWITH() at position {}", comma.pos));
             }
             auto val_tok = tokenizer_.next();
             if (val_tok.type != TokenType::Ident && val_tok.type != TokenType::String) {
@@ -390,8 +402,8 @@ private:
             }
             auto rp = tokenizer_.next();
             if (rp.type != TokenType::RParen) {
-                return std::unexpected(std::format(
-                    "expected ')' after STARTSWITH() at position {}", rp.pos));
+                return std::unexpected(
+                    std::format("expected ')' after STARTSWITH() at position {}", rp.pos));
             }
             // Encode as synthetic attribute __startswith:<attr>
             Condition cond;
@@ -642,8 +654,10 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
         auto resolved = resolver(real_attr);
         auto len_str = std::to_string(resolved.size());
         // Eq/Neq: direct string compare (both are numeric strings)
-        if (cond.op == CompOp::Eq) return len_str == cond.value;
-        if (cond.op == CompOp::Neq) return len_str != cond.value;
+        if (cond.op == CompOp::Eq)
+            return len_str == cond.value;
+        if (cond.op == CompOp::Neq)
+            return len_str != cond.value;
         return try_numeric_compare(len_str, cond.value, cond.op);
     }
 

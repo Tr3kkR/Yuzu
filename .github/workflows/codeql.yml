@@ -3,8 +3,7 @@ name: "CodeQL"
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
   schedule:
     # Weekly on Sundays at 04:00 UTC
     - cron: '0 4 * * 0'
@@ -15,6 +14,7 @@ concurrency:
 
 env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
   analyze:
@@ -41,11 +41,20 @@ jobs:
             python3-pip
           pip3 install meson==1.9.2
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/vcpkg/installed
+          path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -70,7 +79,7 @@ jobs:
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg/installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=false
 
       - name: Build

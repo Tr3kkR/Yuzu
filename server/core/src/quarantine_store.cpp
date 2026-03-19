@@ -12,16 +12,21 @@ static int64_t now_epoch() {
         .count();
 }
 
-static const char* safe(const char* p) { return p ? p : ""; }
+static const char* safe(const char* p) {
+    return p ? p : "";
+}
 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
 QuarantineStore::QuarantineStore(const std::filesystem::path& db_path) {
     int rc = sqlite3_open(db_path.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
-        spdlog::error("QuarantineStore: failed to open {}: {}",
-                       db_path.string(), sqlite3_errmsg(db_));
-        if (db_) { sqlite3_close(db_); db_ = nullptr; }
+        spdlog::error("QuarantineStore: failed to open {}: {}", db_path.string(),
+                      sqlite3_errmsg(db_));
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
         return;
     }
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
@@ -31,10 +36,13 @@ QuarantineStore::QuarantineStore(const std::filesystem::path& db_path) {
 }
 
 QuarantineStore::~QuarantineStore() {
-    if (db_) sqlite3_close(db_);
+    if (db_)
+        sqlite3_close(db_);
 }
 
-bool QuarantineStore::is_open() const { return db_ != nullptr; }
+bool QuarantineStore::is_open() const {
+    return db_ != nullptr;
+}
 
 void QuarantineStore::create_tables() {
     const char* sql = R"(
@@ -60,10 +68,12 @@ void QuarantineStore::create_tables() {
 
 // ── Operations ───────────────────────────────────────────────────────────────
 
-std::expected<void, std::string>
-QuarantineStore::quarantine_device(const std::string& agent_id, const std::string& by,
-                                    const std::string& reason, const std::string& whitelist) {
-    if (!db_) return std::unexpected("database not open");
+std::expected<void, std::string> QuarantineStore::quarantine_device(const std::string& agent_id,
+                                                                    const std::string& by,
+                                                                    const std::string& reason,
+                                                                    const std::string& whitelist) {
+    if (!db_)
+        return std::unexpected("database not open");
 
     // Check if already quarantined
     auto current = get_status(agent_id);
@@ -72,10 +82,10 @@ QuarantineStore::quarantine_device(const std::string& agent_id, const std::strin
 
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "INSERT INTO quarantine_records "
-            "(agent_id, status, quarantined_by, quarantined_at, whitelist, reason) "
-            "VALUES (?, 'active', ?, ?, ?, ?);",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "INSERT INTO quarantine_records "
+                           "(agent_id, status, quarantined_by, quarantined_at, whitelist, reason) "
+                           "VALUES (?, 'active', ?, ?, ?, ?);",
+                           -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
 
     auto now = now_epoch();
@@ -92,15 +102,15 @@ QuarantineStore::quarantine_device(const std::string& agent_id, const std::strin
     return {};
 }
 
-std::expected<void, std::string>
-QuarantineStore::release_device(const std::string& agent_id) {
-    if (!db_) return std::unexpected("database not open");
+std::expected<void, std::string> QuarantineStore::release_device(const std::string& agent_id) {
+    if (!db_)
+        return std::unexpected("database not open");
 
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
-            "UPDATE quarantine_records SET status = 'released', released_at = ? "
-            "WHERE agent_id = ? AND status = 'active';",
-            -1, &s, nullptr) != SQLITE_OK)
+                           "UPDATE quarantine_records SET status = 'released', released_at = ? "
+                           "WHERE agent_id = ? AND status = 'active';",
+                           -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
 
     sqlite3_bind_int64(s, 1, now_epoch());
@@ -113,12 +123,14 @@ QuarantineStore::release_device(const std::string& agent_id) {
     return {};
 }
 
-std::optional<QuarantineRecord>
-QuarantineStore::get_status(const std::string& agent_id) const {
-    if (!db_) return std::nullopt;
+std::optional<QuarantineRecord> QuarantineStore::get_status(const std::string& agent_id) const {
+    if (!db_)
+        return std::nullopt;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason "
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
+            "reason "
             "FROM quarantine_records WHERE agent_id = ? AND status = 'active' LIMIT 1;",
             -1, &s, nullptr) != SQLITE_OK)
         return std::nullopt;
@@ -127,13 +139,13 @@ QuarantineStore::get_status(const std::string& agent_id) const {
     std::optional<QuarantineRecord> result;
     if (sqlite3_step(s) == SQLITE_ROW) {
         QuarantineRecord r;
-        r.agent_id       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at    = sqlite3_column_int64(s, 4);
-        r.whitelist      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        r.released_at = sqlite3_column_int64(s, 4);
+        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
+        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
         result = std::move(r);
     }
     sqlite3_finalize(s);
@@ -142,52 +154,57 @@ QuarantineStore::get_status(const std::string& agent_id) const {
 
 std::vector<QuarantineRecord> QuarantineStore::list_quarantined() const {
     std::vector<QuarantineRecord> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason "
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
+            "reason "
             "FROM quarantine_records WHERE status = 'active' ORDER BY quarantined_at DESC;",
             -1, &s, nullptr) != SQLITE_OK)
         return result;
     while (sqlite3_step(s) == SQLITE_ROW) {
         QuarantineRecord r;
-        r.agent_id       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at    = sqlite3_column_int64(s, 4);
-        r.whitelist      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        r.released_at = sqlite3_column_int64(s, 4);
+        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
+        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
         result.push_back(std::move(r));
     }
     sqlite3_finalize(s);
     return result;
 }
 
-std::vector<QuarantineRecord>
-QuarantineStore::get_history(const std::string& agent_id) const {
+std::vector<QuarantineRecord> QuarantineStore::get_history(const std::string& agent_id) const {
     std::vector<QuarantineRecord> result;
-    if (!db_) return result;
+    if (!db_)
+        return result;
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, reason "
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT agent_id, status, quarantined_by, quarantined_at, released_at, whitelist, "
+            "reason "
             "FROM quarantine_records WHERE agent_id = ? ORDER BY quarantined_at DESC, rowid DESC;",
             -1, &s, nullptr) != SQLITE_OK)
         return result;
     sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW) {
         QuarantineRecord r;
-        r.agent_id       = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        r.status         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        r.agent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        r.status = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         r.quarantined_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         r.quarantined_at = sqlite3_column_int64(s, 3);
-        r.released_at    = sqlite3_column_int64(s, 4);
-        r.whitelist      = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-        r.reason         = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
+        r.released_at = sqlite3_column_int64(s, 4);
+        r.whitelist = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
+        r.reason = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
         result.push_back(std::move(r));
     }
     sqlite3_finalize(s);
     return result;
 }
 
-}  // namespace yuzu::server
+} // namespace yuzu::server

@@ -41,10 +41,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// clang-format off
+#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+// clang-format on
 #include <bcrypt.h>
 #include <charconv>
 #include <tlhelp32.h>
-#include <windows.h>
 #endif
 
 namespace {

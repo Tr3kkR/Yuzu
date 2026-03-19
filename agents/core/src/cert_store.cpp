@@ -6,10 +6,12 @@
 #include <vector>
 
 #ifdef _WIN32
+// clang-format off
+#include <winsock2.h>  // must precede windows.h
+#include <windows.h>
+// clang-format on
 #include <ncrypt.h>
 #include <wincrypt.h>
-#include <windows.h>
-#include <winsock2.h>
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ncrypt.lib")
 

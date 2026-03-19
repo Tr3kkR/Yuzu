@@ -34,7 +34,8 @@ std::string run_command(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return result;
+    if (!pipe)
+        return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
@@ -54,7 +55,8 @@ int run_command_rc(const char* cmd) {
 #else
     FILE* pipe = popen(cmd, "r");
 #endif
-    if (!pipe) return -1;
+    if (!pipe)
+        return -1;
     std::array<char, 256> buf{};
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {}
 #ifdef _WIN32
@@ -67,14 +69,16 @@ int run_command_rc(const char* cmd) {
 // ── IP validation ────────────────────────────────────────────────────────────
 
 bool is_valid_ip_char(char c) {
-    return (c >= '0' && c <= '9') || c == '.' || c == ':' ||
-           (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    return (c >= '0' && c <= '9') || c == '.' || c == ':' || (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
 }
 
 bool is_safe_ip(std::string_view ip) {
-    if (ip.empty() || ip.size() > 45) return false;
+    if (ip.empty() || ip.size() > 45)
+        return false;
     for (char c : ip) {
-        if (!is_valid_ip_char(c)) return false;
+        if (!is_valid_ip_char(c))
+            return false;
     }
     return true;
 }
@@ -87,8 +91,10 @@ std::vector<std::string> split_ips(std::string_view csv) {
     std::string token;
     while (std::getline(iss, token, ',')) {
         // Trim whitespace
-        while (!token.empty() && token.front() == ' ') token.erase(token.begin());
-        while (!token.empty() && token.back() == ' ')  token.pop_back();
+        while (!token.empty() && token.front() == ' ')
+            token.erase(token.begin());
+        while (!token.empty() && token.back() == ' ')
+            token.pop_back();
         if (!token.empty() && is_safe_ip(token)) {
             ips.push_back(std::move(token));
         }
@@ -99,7 +105,8 @@ std::vector<std::string> split_ips(std::string_view csv) {
 std::string join_ips(const std::vector<std::string>& ips) {
     std::string result;
     for (size_t i = 0; i < ips.size(); ++i) {
-        if (i > 0) result += ',';
+        if (i > 0)
+            result += ',';
         result += ips[i];
     }
     return result;
@@ -113,45 +120,50 @@ constexpr const char* kRulePrefix = "YuzuQuarantine_";
 
 #ifdef _WIN32
 
-int win_quarantine(yuzu::CommandContext& ctx,
-                   const std::vector<std::string>& whitelist_ips) {
+int win_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
 
     // Block all inbound traffic
-    auto cmd = std::format(
-        "netsh advfirewall firewall add rule name=\"{}BlockAllInbound\" "
-        "dir=in action=block enable=yes protocol=any", kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+    auto cmd = std::format("netsh advfirewall firewall add rule name=\"{}BlockAllInbound\" "
+                           "dir=in action=block enable=yes protocol=any",
+                           kRulePrefix);
+    if (run_command_rc(cmd.c_str()) == 0)
+        ++rules_applied;
 
     // Block all outbound traffic
-    cmd = std::format(
-        "netsh advfirewall firewall add rule name=\"{}BlockAllOutbound\" "
-        "dir=out action=block enable=yes protocol=any", kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+    cmd = std::format("netsh advfirewall firewall add rule name=\"{}BlockAllOutbound\" "
+                      "dir=out action=block enable=yes protocol=any",
+                      kRulePrefix);
+    if (run_command_rc(cmd.c_str()) == 0)
+        ++rules_applied;
 
     // Allow loopback inbound
-    cmd = std::format(
-        "netsh advfirewall firewall add rule name=\"{}AllowLoopbackIn\" "
-        "dir=in action=allow enable=yes remoteip=127.0.0.1", kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+    cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowLoopbackIn\" "
+                      "dir=in action=allow enable=yes remoteip=127.0.0.1",
+                      kRulePrefix);
+    if (run_command_rc(cmd.c_str()) == 0)
+        ++rules_applied;
 
     // Allow loopback outbound
-    cmd = std::format(
-        "netsh advfirewall firewall add rule name=\"{}AllowLoopbackOut\" "
-        "dir=out action=allow enable=yes remoteip=127.0.0.1", kRulePrefix);
-    if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+    cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowLoopbackOut\" "
+                      "dir=out action=allow enable=yes remoteip=127.0.0.1",
+                      kRulePrefix);
+    if (run_command_rc(cmd.c_str()) == 0)
+        ++rules_applied;
 
     // Allow each whitelisted IP (inbound + outbound)
     for (const auto& ip : whitelist_ips) {
-        cmd = std::format(
-            "netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
-            "dir=in action=allow enable=yes remoteip={}", kRulePrefix, ip, ip);
-        if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+        cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
+                          "dir=in action=allow enable=yes remoteip={}",
+                          kRulePrefix, ip, ip);
+        if (run_command_rc(cmd.c_str()) == 0)
+            ++rules_applied;
 
-        cmd = std::format(
-            "netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
-            "dir=out action=allow enable=yes remoteip={}", kRulePrefix, ip, ip);
-        if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+        cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
+                          "dir=out action=allow enable=yes remoteip={}",
+                          kRulePrefix, ip, ip);
+        if (run_command_rc(cmd.c_str()) == 0)
+            ++rules_applied;
     }
 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
@@ -161,11 +173,9 @@ int win_quarantine(yuzu::CommandContext& ctx,
 int win_unquarantine(yuzu::CommandContext& ctx) {
     // Delete all rules whose name starts with the prefix
     // netsh does not support wildcards, so we list rules and delete matches.
-    auto output = run_command(
-        "netsh advfirewall firewall show rule name=all dir=in");
+    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
     // Also grab outbound rules
-    auto output_out = run_command(
-        "netsh advfirewall firewall show rule name=all dir=out");
+    auto output_out = run_command("netsh advfirewall firewall show rule name=all dir=out");
     output += "\n" + output_out;
 
     std::istringstream iss(output);
@@ -174,25 +184,32 @@ int win_unquarantine(yuzu::CommandContext& ctx) {
 
     while (std::getline(iss, line)) {
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
         auto key = line.substr(0, colon);
-        while (!key.empty() && key.back() == ' ') key.pop_back();
-        if (key != "Rule Name") continue;
+        while (!key.empty() && key.back() == ' ')
+            key.pop_back();
+        if (key != "Rule Name")
+            continue;
         auto val = line.substr(colon + 1);
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+        while (!val.empty() && val.front() == ' ')
+            val.erase(val.begin());
         if (val.starts_with(kRulePrefix)) {
             // Avoid duplicates
             bool found = false;
             for (const auto& r : rules_to_delete) {
-                if (r == val) { found = true; break; }
+                if (r == val) {
+                    found = true;
+                    break;
+                }
             }
-            if (!found) rules_to_delete.push_back(val);
+            if (!found)
+                rules_to_delete.push_back(val);
         }
     }
 
     for (const auto& rule : rules_to_delete) {
-        auto cmd = std::format(
-            "netsh advfirewall firewall delete rule name=\"{}\"", rule);
+        auto cmd = std::format("netsh advfirewall firewall delete rule name=\"{}\"", rule);
         run_command_rc(cmd.c_str());
     }
 
@@ -201,26 +218,27 @@ int win_unquarantine(yuzu::CommandContext& ctx) {
 }
 
 bool win_is_quarantined() {
-    auto output = run_command(
-        "netsh advfirewall firewall show rule name=all dir=in");
+    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
     return output.find(kRulePrefix) != std::string::npos;
 }
 
 std::vector<std::string> win_get_whitelist() {
     std::vector<std::string> ips;
-    auto output = run_command(
-        "netsh advfirewall firewall show rule name=all dir=in");
+    auto output = run_command("netsh advfirewall firewall show rule name=all dir=in");
     std::istringstream iss(output);
     std::string line;
     std::string current_rule;
 
     while (std::getline(iss, line)) {
         auto colon = line.find(':');
-        if (colon == std::string::npos) continue;
+        if (colon == std::string::npos)
+            continue;
         auto key = line.substr(0, colon);
-        while (!key.empty() && key.back() == ' ') key.pop_back();
+        while (!key.empty() && key.back() == ' ')
+            key.pop_back();
         auto val = line.substr(colon + 1);
-        while (!val.empty() && val.front() == ' ') val.erase(val.begin());
+        while (!val.empty() && val.front() == ' ')
+            val.erase(val.begin());
 
         if (key == "Rule Name") {
             current_rule = val;
@@ -229,12 +247,17 @@ std::vector<std::string> win_get_whitelist() {
             if (val != "127.0.0.1" && val != "Any") {
                 // Remove CIDR suffix if present (e.g., "1.2.3.4/32")
                 auto slash = val.find('/');
-                if (slash != std::string::npos) val = val.substr(0, slash);
+                if (slash != std::string::npos)
+                    val = val.substr(0, slash);
                 bool found = false;
                 for (const auto& existing : ips) {
-                    if (existing == val) { found = true; break; }
+                    if (existing == val) {
+                        found = true;
+                        break;
+                    }
                 }
-                if (!found && is_safe_ip(val)) ips.push_back(val);
+                if (!found && is_safe_ip(val))
+                    ips.push_back(val);
             }
         }
     }
@@ -247,8 +270,7 @@ std::vector<std::string> win_get_whitelist() {
 
 #ifdef __linux__
 
-int linux_quarantine(yuzu::CommandContext& ctx,
-                     const std::vector<std::string>& whitelist_ips) {
+int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
 
     // Create the yuzu-quarantine chain (ignore error if it already exists)
@@ -269,13 +291,13 @@ int linux_quarantine(yuzu::CommandContext& ctx,
 
     // Allow each whitelisted IP
     for (const auto& ip : whitelist_ips) {
-        auto cmd = std::format(
-            "iptables -A yuzu-quarantine -s {} -j ACCEPT", ip);
-        if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+        auto cmd = std::format("iptables -A yuzu-quarantine -s {} -j ACCEPT", ip);
+        if (run_command_rc(cmd.c_str()) == 0)
+            ++rules_applied;
 
-        cmd = std::format(
-            "iptables -A yuzu-quarantine -d {} -j ACCEPT", ip);
-        if (run_command_rc(cmd.c_str()) == 0) ++rules_applied;
+        cmd = std::format("iptables -A yuzu-quarantine -d {} -j ACCEPT", ip);
+        if (run_command_rc(cmd.c_str()) == 0)
+            ++rules_applied;
     }
 
     // Drop everything else
@@ -320,9 +342,12 @@ std::vector<std::string> linux_get_whitelist() {
 
     while (std::getline(iss, line)) {
         // Skip header lines and DROP/loopback rules
-        if (line.find("ACCEPT") == std::string::npos) continue;
-        if (line.find("lo") != std::string::npos) continue;
-        if (line.find("state") != std::string::npos) continue;
+        if (line.find("ACCEPT") == std::string::npos)
+            continue;
+        if (line.find("lo") != std::string::npos)
+            continue;
+        if (line.find("state") != std::string::npos)
+            continue;
 
         // Parse source/destination from iptables output
         // Typical line: "ACCEPT  all  --  1.2.3.4  0.0.0.0/0"
@@ -333,16 +358,24 @@ std::vector<std::string> linux_get_whitelist() {
         if (!source.empty() && source != "0.0.0.0/0" && is_safe_ip(source)) {
             bool found = false;
             for (const auto& existing : ips) {
-                if (existing == source) { found = true; break; }
+                if (existing == source) {
+                    found = true;
+                    break;
+                }
             }
-            if (!found) ips.push_back(source);
+            if (!found)
+                ips.push_back(source);
         }
         if (!dest.empty() && dest != "0.0.0.0/0" && is_safe_ip(dest)) {
             bool found = false;
             for (const auto& existing : ips) {
-                if (existing == dest) { found = true; break; }
+                if (existing == dest) {
+                    found = true;
+                    break;
+                }
             }
-            if (!found) ips.push_back(dest);
+            if (!found)
+                ips.push_back(dest);
         }
     }
     return ips;
@@ -354,8 +387,7 @@ std::vector<std::string> linux_get_whitelist() {
 
 #ifdef __APPLE__
 
-int macos_quarantine(yuzu::CommandContext& ctx,
-                     const std::vector<std::string>& whitelist_ips) {
+int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
 
     // Build pf anchor rules
@@ -379,8 +411,7 @@ int macos_quarantine(yuzu::CommandContext& ctx,
     // Write rules to a temporary file
     auto tmp_path = std::string{"/tmp/yuzu_quarantine_anchor.conf"};
     {
-        auto cmd = std::format(
-            "printf '%s' '{}' > {}", rules, tmp_path);
+        auto cmd = std::format("printf '%s' '{}' > {}", rules, tmp_path);
         // Use a safer write approach
         FILE* f = fopen(tmp_path.c_str(), "w");
         if (f) {
@@ -403,8 +434,7 @@ int macos_quarantine(yuzu::CommandContext& ctx,
     auto pf_conf = run_command("pfctl -s rules 2>/dev/null");
     if (pf_conf.find("yuzu-quarantine") == std::string::npos) {
         // Append anchor reference
-        run_command_rc(
-            "echo 'anchor \"yuzu-quarantine\"' | pfctl -f - 2>/dev/null");
+        run_command_rc("echo 'anchor \"yuzu-quarantine\"' | pfctl -f - 2>/dev/null");
     }
 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
@@ -432,35 +462,46 @@ std::vector<std::string> macos_get_whitelist() {
     std::string line;
 
     while (std::getline(iss, line)) {
-        if (line.find("pass") == std::string::npos) continue;
-        if (line.find("lo0") != std::string::npos) continue;
+        if (line.find("pass") == std::string::npos)
+            continue;
+        if (line.find("lo0") != std::string::npos)
+            continue;
 
         // Parse IP from "pass quick from <ip> to any" or "pass quick from any to <ip>"
         auto from_pos = line.find("from ");
-        auto to_pos   = line.find("to ");
+        auto to_pos = line.find("to ");
         if (from_pos != std::string::npos) {
             auto start = from_pos + 5;
-            auto end   = line.find(' ', start);
-            auto ip    = line.substr(start, end - start);
-            if (ip != "any" && is_safe_ip(ip)) {
-                bool found = false;
-                for (const auto& existing : ips) {
-                    if (existing == ip) { found = true; break; }
-                }
-                if (!found) ips.push_back(ip);
-            }
-        }
-        if (to_pos != std::string::npos) {
-            auto start = to_pos + 3;
-            auto end   = line.find(' ', start);
-            if (end == std::string::npos) end = line.size();
+            auto end = line.find(' ', start);
             auto ip = line.substr(start, end - start);
             if (ip != "any" && is_safe_ip(ip)) {
                 bool found = false;
                 for (const auto& existing : ips) {
-                    if (existing == ip) { found = true; break; }
+                    if (existing == ip) {
+                        found = true;
+                        break;
+                    }
                 }
-                if (!found) ips.push_back(ip);
+                if (!found)
+                    ips.push_back(ip);
+            }
+        }
+        if (to_pos != std::string::npos) {
+            auto start = to_pos + 3;
+            auto end = line.find(' ', start);
+            if (end == std::string::npos)
+                end = line.size();
+            auto ip = line.substr(start, end - start);
+            if (ip != "any" && is_safe_ip(ip)) {
+                bool found = false;
+                for (const auto& existing : ips) {
+                    if (existing == ip) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                    ips.push_back(ip);
             }
         }
     }
@@ -475,25 +516,21 @@ std::vector<std::string> macos_get_whitelist() {
 
 class QuarantinePlugin final : public yuzu::Plugin {
 public:
-    std::string_view name()        const noexcept override { return kName; }
-    std::string_view version()     const noexcept override { return kVersion; }
+    std::string_view name() const noexcept override { return kName; }
+    std::string_view version() const noexcept override { return kVersion; }
     std::string_view description() const noexcept override {
         return "Device network isolation (quarantine) with per-IP whitelisting";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {
-            "quarantine", "unquarantine", "status", "whitelist", nullptr
-        };
+        static const char* acts[] = {"quarantine", "unquarantine", "status", "whitelist", nullptr};
         return acts;
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
-    int execute(yuzu::CommandContext& ctx,
-                std::string_view action,
-                yuzu::Params params) override {
+    int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
 
         if (action == "quarantine") {
             return do_quarantine(ctx, params);
@@ -513,13 +550,13 @@ public:
     }
 
 private:
-    static constexpr const char* kName    = "quarantine";
+    static constexpr const char* kName = "quarantine";
     static constexpr const char* kVersion = "1.0.0";
 
     // ── quarantine action ────────────────────────────────────────────────────
 
     int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto server_ip     = params.get("server_ip");
+        auto server_ip = params.get("server_ip");
         auto whitelist_csv = params.get("whitelist_ips");
 
         // Build the full whitelist: always include loopback + management server
@@ -534,9 +571,13 @@ private:
             // Avoid duplicates with server_ip
             bool dup = false;
             for (const auto& existing : whitelist) {
-                if (existing == ip) { dup = true; break; }
+                if (existing == ip) {
+                    dup = true;
+                    break;
+                }
             }
-            if (!dup) whitelist.push_back(std::move(ip));
+            if (!dup)
+                whitelist.push_back(std::move(ip));
         }
 
 #ifdef _WIN32
@@ -599,7 +640,7 @@ private:
 
     int do_whitelist(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto action_param = params.get("action");
-        auto ips_csv      = params.get("ips");
+        auto ips_csv = params.get("ips");
 
         if (action_param.empty()) {
             ctx.write_output("error|missing required parameter: action (add/remove)");
@@ -619,31 +660,30 @@ private:
         if (action_param == "add") {
 #ifdef _WIN32
             for (const auto& ip : new_ips) {
-                auto cmd = std::format(
-                    "netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
-                    "dir=in action=allow enable=yes remoteip={}", kRulePrefix, ip, ip);
+                auto cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowIn_{}\" "
+                                       "dir=in action=allow enable=yes remoteip={}",
+                                       kRulePrefix, ip, ip);
                 run_command_rc(cmd.c_str());
-                cmd = std::format(
-                    "netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
-                    "dir=out action=allow enable=yes remoteip={}", kRulePrefix, ip, ip);
+                cmd = std::format("netsh advfirewall firewall add rule name=\"{}AllowOut_{}\" "
+                                  "dir=out action=allow enable=yes remoteip={}",
+                                  kRulePrefix, ip, ip);
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__linux__)
             for (const auto& ip : new_ips) {
                 // Insert before the DROP rule (second-to-last position)
-                auto cmd = std::format(
-                    "iptables -I yuzu-quarantine -s {} -j ACCEPT", ip);
+                auto cmd = std::format("iptables -I yuzu-quarantine -s {} -j ACCEPT", ip);
                 run_command_rc(cmd.c_str());
-                cmd = std::format(
-                    "iptables -I yuzu-quarantine -d {} -j ACCEPT", ip);
+                cmd = std::format("iptables -I yuzu-quarantine -d {} -j ACCEPT", ip);
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__APPLE__)
             // Re-read current rules and append new ones
             for (const auto& ip : new_ips) {
-                auto cmd = std::format(
-                    "echo 'pass quick from {} to any\npass quick from any to {}' | "
-                    "pfctl -a yuzu-quarantine -f - 2>/dev/null", ip, ip);
+                auto cmd =
+                    std::format("echo 'pass quick from {} to any\npass quick from any to {}' | "
+                                "pfctl -a yuzu-quarantine -f - 2>/dev/null",
+                                ip, ip);
                 run_command_rc(cmd.c_str());
             }
 #else
@@ -653,29 +693,26 @@ private:
         } else if (action_param == "remove") {
 #ifdef _WIN32
             for (const auto& ip : new_ips) {
-                auto cmd = std::format(
-                    "netsh advfirewall firewall delete rule name=\"{}AllowIn_{}\"",
-                    kRulePrefix, ip);
+                auto cmd =
+                    std::format("netsh advfirewall firewall delete rule name=\"{}AllowIn_{}\"",
+                                kRulePrefix, ip);
                 run_command_rc(cmd.c_str());
-                cmd = std::format(
-                    "netsh advfirewall firewall delete rule name=\"{}AllowOut_{}\"",
-                    kRulePrefix, ip);
+                cmd = std::format("netsh advfirewall firewall delete rule name=\"{}AllowOut_{}\"",
+                                  kRulePrefix, ip);
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__linux__)
             for (const auto& ip : new_ips) {
-                auto cmd = std::format(
-                    "iptables -D yuzu-quarantine -s {} -j ACCEPT 2>/dev/null", ip);
+                auto cmd =
+                    std::format("iptables -D yuzu-quarantine -s {} -j ACCEPT 2>/dev/null", ip);
                 run_command_rc(cmd.c_str());
-                cmd = std::format(
-                    "iptables -D yuzu-quarantine -d {} -j ACCEPT 2>/dev/null", ip);
+                cmd = std::format("iptables -D yuzu-quarantine -d {} -j ACCEPT 2>/dev/null", ip);
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__APPLE__)
             // Removing individual pf rules requires rewriting the anchor.
             // Read current rules, filter out the IPs, and reload.
-            auto current = run_command(
-                "pfctl -a yuzu-quarantine -s rules 2>/dev/null");
+            auto current = run_command("pfctl -a yuzu-quarantine -s rules 2>/dev/null");
             std::string filtered;
             std::istringstream iss(current);
             std::string line;
@@ -704,8 +741,7 @@ private:
 #endif
         } else {
             ctx.write_output(
-                std::format("error|invalid action '{}', expected 'add' or 'remove'",
-                            action_param));
+                std::format("error|invalid action '{}', expected 'add' or 'remove'", action_param));
             return 1;
         }
 

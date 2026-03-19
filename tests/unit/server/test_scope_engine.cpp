@@ -384,8 +384,7 @@ TEST_CASE("ScopeEngine: combined extended operators", "[scope][eval]") {
         {"hostname", "web-prod-01"}, {"tag:env", "production"}, {"ostype", "Linux"}};
     auto resolver = make_resolver(attrs);
 
-    auto expr = parse(
-        R"(EXISTS tag:env AND hostname MATCHES "^web-" AND LEN(tag:env) > 3)");
+    auto expr = parse(R"(EXISTS tag:env AND hostname MATCHES "^web-" AND LEN(tag:env) > 3)");
     REQUIRE(expr.has_value());
     CHECK(evaluate(*expr, resolver) == true);
 }
@@ -394,8 +393,7 @@ TEST_CASE("ScopeEngine: STARTSWITH and MATCHES in OR", "[scope][eval]") {
     std::unordered_map<std::string, std::string> attrs = {{"hostname", "db-replica-03"}};
     auto resolver = make_resolver(attrs);
 
-    auto expr = parse(
-        R"(STARTSWITH(hostname, "web-") OR hostname MATCHES "^db-replica-\d+$")");
+    auto expr = parse(R"(STARTSWITH(hostname, "web-") OR hostname MATCHES "^db-replica-\d+$")");
     REQUIRE(expr.has_value());
     CHECK(evaluate(*expr, resolver) == true);
 }

@@ -23,19 +23,20 @@ bootstrap: |
   # Install meson in a venv (avoids PEP 668 and PATH issues)
   python3 -m venv /tmp/meson-venv
   /tmp/meson-venv/bin/pip install meson==1.9.2
-  export PATH="/tmp/meson-venv/bin:/usr/local/bin:/usr/bin:/bin"
-  # Bootstrap vcpkg at a fixed path (avoid shell variables — Qodana expands $ before bash)
+  export PATH="/tmp/meson-venv/bin:$PATH"
+  # Bootstrap vcpkg
   git clone --depth 1 https://github.com/microsoft/vcpkg.git /tmp/vcpkg
   git -C /tmp/vcpkg fetch --depth 1 origin 4b77da7fed37817f124936239197833469f1b9a8
   git -C /tmp/vcpkg checkout FETCH_HEAD
   bash /tmp/vcpkg/bootstrap-vcpkg.sh -disableMetrics
-  # Install vcpkg packages
-  /tmp/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
+  # Install vcpkg packages — installs to <manifest-root>/vcpkg_installed
+  /tmp/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=/data/project
   # Configure with Meson (generates compile_commands.json in build/)
-  meson setup build \
+  # The vcpkg_installed dir is created under /data/project by vcpkg
+  /tmp/meson-venv/bin/meson setup build \
     --buildtype=debug \
     -Dcmake_prefix_path=/data/project/vcpkg_installed/x64-linux \
     -Dcpp_std=c++23 \
     -Dbuild_tests=false
   # Build so generated protobuf headers exist for clang-tidy resolution
-  meson compile -C build
+  /tmp/meson-venv/bin/meson compile -C build

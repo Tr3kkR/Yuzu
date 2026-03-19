@@ -23,7 +23,7 @@ struct TempDb {
     ~TempDb() { std::filesystem::remove(path); }
 };
 
-}  // namespace
+} // namespace
 
 TEST_CASE("ApiTokenStore: create and validate token", "[token][crud]") {
     TempDb tmp;
@@ -33,7 +33,7 @@ TEST_CASE("ApiTokenStore: create and validate token", "[token][crud]") {
     auto result = store.create_token("Test Token", "admin");
     REQUIRE(result.has_value());
     CHECK(result->starts_with("yuzu_"));
-    CHECK(result->size() == 37);  // "yuzu_" + 32 chars
+    CHECK(result->size() == 37); // "yuzu_" + 32 chars
 
     auto validated = store.validate_token(*result);
     REQUIRE(validated.has_value());

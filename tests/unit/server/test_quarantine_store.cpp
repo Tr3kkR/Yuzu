@@ -21,14 +21,15 @@ struct TempDb {
     ~TempDb() { std::filesystem::remove(path); }
 };
 
-}  // namespace
+} // namespace
 
 TEST_CASE("QuarantineStore: quarantine and release device", "[quarantine][crud]") {
     TempDb tmp;
     QuarantineStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto result = store.quarantine_device("agent-001", "admin", "Suspicious activity", "10.0.0.1,10.0.0.2");
+    auto result =
+        store.quarantine_device("agent-001", "admin", "Suspicious activity", "10.0.0.1,10.0.0.2");
     REQUIRE(result.has_value());
 
     auto status = store.get_status("agent-001");

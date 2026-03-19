@@ -21,7 +21,7 @@ struct TempDb {
     ~TempDb() { std::filesystem::remove(path); }
 };
 
-}  // namespace
+} // namespace
 
 TEST_CASE("ManagementGroupStore: create and retrieve group", "[mgmt][crud]") {
     TempDb tmp;
@@ -50,8 +50,12 @@ TEST_CASE("ManagementGroupStore: list groups", "[mgmt][crud]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g1; g1.name = "Group A"; g1.membership_type = "static";
-    ManagementGroup g2; g2.name = "Group B"; g2.membership_type = "static";
+    ManagementGroup g1;
+    g1.name = "Group A";
+    g1.membership_type = "static";
+    ManagementGroup g2;
+    g2.name = "Group B";
+    g2.membership_type = "static";
 
     store.create_group(g1);
     store.create_group(g2);
@@ -64,7 +68,9 @@ TEST_CASE("ManagementGroupStore: duplicate name rejected", "[mgmt][crud]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "Duplicate"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "Duplicate";
+    g.membership_type = "static";
     auto r1 = store.create_group(g);
     REQUIRE(r1.has_value());
 
@@ -76,7 +82,9 @@ TEST_CASE("ManagementGroupStore: update group", "[mgmt][crud]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "Original"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "Original";
+    g.membership_type = "static";
     auto id = store.create_group(g);
     REQUIRE(id.has_value());
 
@@ -100,7 +108,9 @@ TEST_CASE("ManagementGroupStore: delete group", "[mgmt][crud]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "ToDelete"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "ToDelete";
+    g.membership_type = "static";
     auto id = store.create_group(g);
     REQUIRE(id.has_value());
 
@@ -115,7 +125,9 @@ TEST_CASE("ManagementGroupStore: parent-child hierarchy", "[mgmt][hierarchy]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup parent; parent.name = "Parent"; parent.membership_type = "static";
+    ManagementGroup parent;
+    parent.name = "Parent";
+    parent.membership_type = "static";
     auto parent_id = store.create_group(parent);
     REQUIRE(parent_id.has_value());
 
@@ -156,7 +168,7 @@ TEST_CASE("ManagementGroupStore: hierarchy depth limit", "[mgmt][hierarchy]") {
                 prev_id = *result;
             } else {
                 // Depth exceeded
-                CHECK(i >= 5);  // Should fail at level 5 or later
+                CHECK(i >= 5); // Should fail at level 5 or later
                 break;
             }
         }
@@ -167,7 +179,9 @@ TEST_CASE("ManagementGroupStore: static membership", "[mgmt][members]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "Test"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "Test";
+    g.membership_type = "static";
     auto group_id = store.create_group(g);
     REQUIRE(group_id.has_value());
 
@@ -190,7 +204,9 @@ TEST_CASE("ManagementGroupStore: dynamic membership refresh", "[mgmt][members]")
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "Dynamic"; g.membership_type = "dynamic";
+    ManagementGroup g;
+    g.name = "Dynamic";
+    g.membership_type = "dynamic";
     auto group_id = store.create_group(g);
     REQUIRE(group_id.has_value());
 
@@ -208,7 +224,9 @@ TEST_CASE("ManagementGroupStore: group role assignments", "[mgmt][roles]") {
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "RoleGroup"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "RoleGroup";
+    g.membership_type = "static";
     auto group_id = store.create_group(g);
     REQUIRE(group_id.has_value());
 
@@ -235,7 +253,9 @@ TEST_CASE("ManagementGroupStore: cascade delete removes members and roles", "[mg
     TempDb tmp;
     ManagementGroupStore store(tmp.path);
 
-    ManagementGroup g; g.name = "CascadeTest"; g.membership_type = "static";
+    ManagementGroup g;
+    g.name = "CascadeTest";
+    g.membership_type = "static";
     auto group_id = store.create_group(g);
     REQUIRE(group_id.has_value());
 

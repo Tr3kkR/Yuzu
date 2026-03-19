@@ -10,8 +10,10 @@
 #include <string>
 
 #ifdef _WIN32
-#include <winsock2.h>
+// clang-format off
+#include <winsock2.h>  // must precede windows.h (which ws2tcpip.h pulls in)
 #include <ws2tcpip.h>
+// clang-format on
 #else
 #include <arpa/inet.h>
 #endif

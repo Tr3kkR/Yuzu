@@ -14,9 +14,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// clang-format off
+#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+// clang-format on
 #include <bcrypt.h>
 #include <sddl.h>
-#include <windows.h>
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
 #else

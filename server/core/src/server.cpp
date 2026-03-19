@@ -7,6 +7,7 @@
 #include "agent.grpc.pb.h"
 #include "analytics_event.hpp"
 #include "analytics_event_store.hpp"
+#include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "data_export.hpp"
@@ -14,10 +15,9 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "management.grpc.pb.h"
+#include "management_group_store.hpp"
 #include "nvd_db.hpp"
 #include "nvd_sync.hpp"
-#include "api_token_store.hpp"
-#include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
@@ -5341,8 +5341,8 @@ private:
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
                 -> std::optional<auth::Session> { return require_auth(req, res); },
-            [this](const httplib::Request& req, httplib::Response& res,
-                   const std::string& type, const std::string& op) -> bool {
+            [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op) -> bool {
                 return require_permission(req, res, type, op);
             },
             [this](const httplib::Request& req, const std::string& action,
