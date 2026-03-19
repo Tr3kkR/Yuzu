@@ -1,0 +1,1323 @@
+# Yuzu REST API Reference
+
+This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints are grouped by functional area.
+
+## Table of Contents
+
+- [Authentication](#authentication)
+- [JSON Envelope](#json-envelope)
+- [REST API v1 Endpoints](#rest-api-v1-endpoints)
+  - [Current User](#current-user)
+  - [Management Groups](#management-groups)
+  - [API Tokens](#api-tokens)
+  - [Quarantine](#quarantine)
+  - [RBAC](#rbac)
+  - [Tags](#tags)
+  - [Definitions](#definitions)
+  - [Audit Log](#audit-log)
+- [Legacy API Endpoints](#legacy-api-endpoints)
+  - [Commands](#commands)
+  - [Agents](#agents)
+  - [Help](#help)
+  - [Instructions](#instructions)
+  - [Instruction Sets](#instruction-sets)
+  - [Executions](#executions)
+  - [Schedules](#schedules)
+  - [Approvals](#approvals)
+  - [Audit (Legacy)](#audit-legacy)
+  - [Scope Engine](#scope-engine)
+  - [Data Export](#data-export)
+  - [Responses](#responses)
+  - [Tags (Legacy)](#tags-legacy)
+  - [Analytics and NVD](#analytics-and-nvd)
+  - [SSE Event Stream](#sse-event-stream)
+- [Authentication Endpoints](#authentication-endpoints)
+- [Metrics](#metrics)
+
+---
+
+## Authentication
+
+Every request must be authenticated using one of three methods:
+
+| Method | Header / Cookie | Example |
+|---|---|---|
+| Session cookie | `yuzu_session` cookie | Set automatically after `POST /login` |
+| Bearer token | `Authorization: Bearer <token>` | `Authorization: Bearer yzt_a1b2c3d4...` |
+| X-Yuzu-Token header | `X-Yuzu-Token: <token>` | `X-Yuzu-Token: yzt_a1b2c3d4...` |
+
+Unauthenticated browser requests are redirected to `/login`. Unauthenticated API requests receive a `401 Unauthorized` response.
+
+API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
+
+---
+
+## JSON Envelope
+
+All REST API v1 responses use a standard JSON envelope.
+
+**Success (single object):**
+
+```json
+{
+  "data": { ... },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Success (list):**
+
+```json
+{
+  "data": [ ... ],
+  "pagination": {
+    "total": 42,
+    "start": 0,
+    "page_size": 50
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error:**
+
+```json
+{
+  "error": "human-readable message",
+  "meta": { "api_version": "v1" }
+}
+```
+
+HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable.
+
+---
+
+## REST API v1 Endpoints
+
+All endpoints are under the `/api/v1/` prefix.
+
+---
+
+### Current User
+
+#### `GET /api/v1/me`
+
+Returns the authenticated user's identity and role.
+
+**Permission:** Authenticated session (no specific RBAC permission required).
+
+**Response:**
+
+```json
+{
+  "data": {
+    "username": "admin",
+    "role": "admin"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Management Groups
+
+Management groups organize agents into a hierarchy for access scoping. Groups can be **static** (manually assigned members) or **dynamic** (membership determined by a scope expression evaluated against agent tags and properties).
+
+#### `GET /api/v1/management-groups`
+
+List all management groups.
+
+**Permission:** `ManagementGroup:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "a1b2c3d4e5f6",
+      "name": "EU Production Servers",
+      "description": "All production endpoints in EU datacenters",
+      "parent_id": "",
+      "membership_type": "static",
+      "scope_expression": "",
+      "created_by": "admin",
+      "created_at": 1710849600,
+      "updated_at": 1710849600
+    },
+    {
+      "id": "f6e5d4c3b2a1",
+      "name": "Windows Desktops",
+      "description": "Dynamic group for all Windows endpoints",
+      "parent_id": "",
+      "membership_type": "dynamic",
+      "scope_expression": "os = 'windows'",
+      "created_by": "admin",
+      "created_at": 1710850000,
+      "updated_at": 1710850000
+    }
+  ],
+  "pagination": { "total": 2, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/management-groups`
+
+Create a new management group.
+
+**Permission:** `ManagementGroup:Write`
+
+**Request body:**
+
+```json
+{
+  "name": "EU Production Servers",
+  "description": "All production endpoints in EU datacenters",
+  "parent_id": "",
+  "membership_type": "static",
+  "scope_expression": ""
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Unique group name |
+| `description` | string | No | Human-readable description |
+| `parent_id` | string | No | ID of parent group (empty for root) |
+| `membership_type` | string | No | `"static"` (default) or `"dynamic"` |
+| `scope_expression` | string | No | Scope engine expression for dynamic groups |
+
+**Response (201):**
+
+```json
+{
+  "data": { "id": "a1b2c3d4e5f6" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/management-groups/{id}`
+
+Get a single group's details including its current members.
+
+**Permission:** `ManagementGroup:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "a1b2c3d4e5f6",
+    "name": "EU Production Servers",
+    "description": "All production endpoints in EU datacenters",
+    "parent_id": "",
+    "membership_type": "static",
+    "scope_expression": "",
+    "created_by": "admin",
+    "created_at": 1710849600,
+    "updated_at": 1710849600,
+    "members": [
+      {
+        "agent_id": "agent-eu-prod-01",
+        "source": "static",
+        "added_at": 1710850000
+      },
+      {
+        "agent_id": "agent-eu-prod-02",
+        "source": "static",
+        "added_at": 1710850100
+      }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/v1/management-groups/{id}`
+
+Delete a management group. Fails if the group has children.
+
+**Permission:** `ManagementGroup:Delete`
+
+**Response:**
+
+```json
+{
+  "data": { "deleted": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/management-groups/{id}/members`
+
+Add an agent to a static management group.
+
+**Permission:** `ManagementGroup:Write`
+
+**Request body:**
+
+```json
+{
+  "agent_id": "agent-eu-prod-03"
+}
+```
+
+**Response (201):**
+
+```json
+{
+  "data": { "added": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/v1/management-groups/{id}/members/{agent_id}`
+
+Remove an agent from a management group.
+
+**Permission:** `ManagementGroup:Write`
+
+**Response:**
+
+```json
+{
+  "data": { "removed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/management-groups/{id}/roles`
+
+List role assignments scoped to this management group.
+
+**Permission:** `ManagementGroup:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "group_id": "a1b2c3d4e5f6",
+      "principal_type": "user",
+      "principal_id": "jane.ops",
+      "role_name": "Operator"
+    },
+    {
+      "group_id": "a1b2c3d4e5f6",
+      "principal_type": "user",
+      "principal_id": "bob.viewer",
+      "role_name": "Viewer"
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/management-groups/{id}/roles`
+
+Assign a role to a principal within this management group. Only the `Operator` and `Viewer` roles can be delegated. The caller must be a global Administrator or hold the `ITServiceOwner` role on this group.
+
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+
+**Request body:**
+
+```json
+{
+  "principal_type": "user",
+  "principal_id": "jane.ops",
+  "role_name": "Operator"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `principal_type` | string | No | `"user"` (default) or `"group"` |
+| `principal_id` | string | Yes | Username or group name |
+| `role_name` | string | Yes | `"Operator"` or `"Viewer"` only |
+
+**Response (201):**
+
+```json
+{
+  "data": { "assigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (403) -- non-delegatable role:**
+
+```json
+{
+  "error": "only Operator and Viewer roles can be delegated",
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/v1/management-groups/{id}/roles`
+
+Remove a role assignment from this management group.
+
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+
+**Request body:**
+
+```json
+{
+  "principal_type": "user",
+  "principal_id": "jane.ops",
+  "role_name": "Operator"
+}
+```
+
+**Response:**
+
+```json
+{
+  "data": { "unassigned": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### API Tokens
+
+API tokens provide non-interactive authentication for scripts and automation. Tokens are scoped to the creating user's permissions. The raw token string is returned exactly once at creation time and cannot be retrieved afterward.
+
+#### `GET /api/v1/tokens`
+
+List the current user's API tokens. Raw token values are never returned.
+
+**Permission:** `ApiToken:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "token_id": "a1b2c3d4",
+      "name": "CI Pipeline Token",
+      "principal_id": "admin",
+      "created_at": 1710849600,
+      "expires_at": 1742385600,
+      "last_used_at": 1710936000,
+      "revoked": false
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/tokens`
+
+Create a new API token. The raw token is returned in the response and is never shown again. Store it immediately.
+
+**Permission:** `ApiToken:Write`
+
+**Request body:**
+
+```json
+{
+  "name": "CI Pipeline Token",
+  "expires_at": 1742385600
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Human-readable label |
+| `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. |
+
+**Response (201):**
+
+```json
+{
+  "data": {
+    "token": "yzt_a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678",
+    "name": "CI Pipeline Token"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+> **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
+
+---
+
+#### `DELETE /api/v1/tokens/{token_id}`
+
+Revoke an API token. The token becomes immediately unusable.
+
+**Permission:** `ApiToken:Delete`
+
+**Response:**
+
+```json
+{
+  "data": { "revoked": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Quarantine
+
+Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
+
+#### `GET /api/v1/quarantine`
+
+List all currently quarantined devices.
+
+**Permission:** `Security:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "agent_id": "agent-compromised-01",
+      "status": "active",
+      "quarantined_by": "admin",
+      "quarantined_at": 1710849600,
+      "whitelist": "10.0.1.50,10.0.1.51",
+      "reason": "Suspicious network activity detected"
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/quarantine`
+
+Quarantine a device.
+
+**Permission:** `Security:Execute`
+
+**Request body:**
+
+```json
+{
+  "agent_id": "agent-compromised-01",
+  "reason": "Suspicious network activity detected"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | Target device ID |
+| `reason` | string | No | Human-readable reason for quarantine |
+| `whitelist` | string | No | Comma-separated IPs still allowed to communicate |
+
+**Response (201):**
+
+```json
+{
+  "data": { "quarantined": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/v1/quarantine/{agent_id}`
+
+Release a device from quarantine.
+
+**Permission:** `Security:Execute`
+
+**Response:**
+
+```json
+{
+  "data": { "released": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### RBAC
+
+Role-Based Access Control endpoints for inspecting roles, permissions, and authorization decisions.
+
+#### `GET /api/v1/rbac/roles`
+
+List all defined roles.
+
+**Permission:** `UserManagement:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "name": "Administrator",
+      "description": "Full system access",
+      "is_system": true,
+      "created_at": 1710849600
+    },
+    {
+      "name": "Operator",
+      "description": "Can execute instructions and manage devices",
+      "is_system": true,
+      "created_at": 1710849600
+    },
+    {
+      "name": "Viewer",
+      "description": "Read-only access",
+      "is_system": true,
+      "created_at": 1710849600
+    },
+    {
+      "name": "ITServiceOwner",
+      "description": "Can delegate Operator and Viewer roles within their management groups",
+      "is_system": true,
+      "created_at": 1710849600
+    }
+  ],
+  "pagination": { "total": 4, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/rbac/roles/{role_name}/permissions`
+
+List all permissions granted to a role.
+
+**Permission:** `UserManagement:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "securable_type": "ManagementGroup",
+      "operation": "Read",
+      "effect": "allow"
+    },
+    {
+      "securable_type": "ManagementGroup",
+      "operation": "Write",
+      "effect": "allow"
+    },
+    {
+      "securable_type": "Tag",
+      "operation": "Read",
+      "effect": "allow"
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `POST /api/v1/rbac/check`
+
+Check whether the current user has a specific permission.
+
+**Permission:** Authenticated session (no specific RBAC permission required).
+
+**Request body:**
+
+```json
+{
+  "securable_type": "ManagementGroup",
+  "operation": "Write"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `securable_type` | string | Yes | The resource type to check |
+| `operation` | string | Yes | The operation to check (`Read`, `Write`, `Delete`, `Execute`) |
+
+**Response:**
+
+```json
+{
+  "data": { "allowed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Securable types:** `ManagementGroup`, `ApiToken`, `Security`, `UserManagement`, `Tag`, `InstructionDefinition`, `AuditLog`
+
+**Operations:** `Read`, `Write`, `Delete`, `Execute`
+
+---
+
+### Tags
+
+Tags are key-value pairs assigned to agents for categorization, scoping, and compliance tracking. Four structured categories are enforced: `role`, `environment`, `location`, and `service`. Custom keys are also supported.
+
+Tag key constraints: max 64 characters, pattern `[a-zA-Z0-9_.:-]`. Tag value constraints: max 448 bytes.
+
+#### `GET /api/v1/tag-categories`
+
+List the structured tag categories and their allowed values.
+
+**Permission:** `Tag:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "key": "role",
+      "display_name": "Device Role",
+      "allowed_values": ["server", "desktop", "kiosk", "virtual"]
+    },
+    {
+      "key": "environment",
+      "display_name": "Environment",
+      "allowed_values": ["production", "staging", "development", "test"]
+    },
+    {
+      "key": "location",
+      "display_name": "Location",
+      "allowed_values": []
+    },
+    {
+      "key": "service",
+      "display_name": "Service",
+      "allowed_values": []
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+Categories with an empty `allowed_values` array accept free-form values.
+
+---
+
+#### `GET /api/v1/tag-compliance`
+
+Identify agents missing required structured tag categories.
+
+**Permission:** `Tag:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "agent_id": "agent-untagged-01",
+      "missing_tags": ["role", "environment", "location", "service"]
+    },
+    {
+      "agent_id": "agent-partial-02",
+      "missing_tags": ["service"]
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/tags?agent_id=X`
+
+Get all tags for a specific agent.
+
+**Permission:** `Tag:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | The agent whose tags to retrieve |
+
+**Response:**
+
+```json
+{
+  "data": {
+    "role": "server",
+    "environment": "production",
+    "location": "eu-west-1",
+    "service": "web-frontend",
+    "custom.team": "platform-eng"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `PUT /api/v1/tags`
+
+Set a tag on an agent. Creates the tag if it does not exist, or updates the value if it does. If the key matches a structured category with allowed values, the value is validated.
+
+**Permission:** `Tag:Write`
+
+**Request body:**
+
+```json
+{
+  "agent_id": "agent-eu-prod-01",
+  "key": "environment",
+  "value": "production"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | Target agent |
+| `key` | string | Yes | Tag key (max 64 chars, `[a-zA-Z0-9_.:-]`) |
+| `value` | string | Yes | Tag value (max 448 bytes) |
+
+**Response:**
+
+```json
+{
+  "data": { "set": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- invalid value for structured category:**
+
+```json
+{
+  "error": "invalid value 'bogus' for category 'role'; allowed: server, desktop, kiosk, virtual",
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/v1/tags/{agent_id}/{key}`
+
+Delete a tag from an agent.
+
+**Permission:** `Tag:Delete`
+
+**Response:**
+
+```json
+{
+  "data": { "deleted": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Definitions
+
+Instruction definitions describe the schema and execution spec for operations that can be sent to agents.
+
+#### `GET /api/v1/definitions`
+
+List all instruction definitions.
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "name": "hardware.cpu-info",
+      "description": "Retrieve CPU model, core count, and architecture",
+      "plugin": "hardware",
+      "action": "cpu-info",
+      "version": "1.0.0",
+      "created_at": "2025-03-19T12:00:00Z"
+    },
+    {
+      "id": 2,
+      "name": "network.interfaces",
+      "description": "List all network interfaces with IP addresses",
+      "plugin": "network",
+      "action": "interfaces",
+      "version": "1.0.0",
+      "created_at": "2025-03-19T12:00:00Z"
+    }
+  ],
+  "pagination": { "total": 2, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Audit Log
+
+Query the server audit trail. All state-changing operations are recorded with the acting principal, action, target, and result.
+
+#### `GET /api/v1/audit`
+
+Query audit events.
+
+**Permission:** `AuditLog:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `limit` | integer | No | Max events to return (default 100, max 1000) |
+| `principal` | string | No | Filter by acting user |
+| `action` | string | No | Filter by action name |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "timestamp": 1710849600,
+      "principal": "admin",
+      "action": "management_group.create",
+      "result": "success",
+      "target_type": "ManagementGroup",
+      "target_id": "a1b2c3d4e5f6",
+      "detail": "EU Production Servers"
+    },
+    {
+      "timestamp": 1710849700,
+      "principal": "admin",
+      "action": "tag.set",
+      "result": "success",
+      "target_type": "Tag",
+      "target_id": "agent-eu-prod-01:environment",
+      "detail": "production"
+    },
+    {
+      "timestamp": 1710849800,
+      "principal": "jane.ops",
+      "action": "quarantine.enable",
+      "result": "success",
+      "target_type": "Security",
+      "target_id": "agent-compromised-01",
+      "detail": "Suspicious network activity detected"
+    }
+  ],
+  "pagination": { "total": 3, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit action names:**
+
+| Action | Description |
+|---|---|
+| `management_group.create` | Group created |
+| `management_group.delete` | Group deleted |
+| `management_group.add_member` | Agent added to group |
+| `management_group.remove_member` | Agent removed from group |
+| `management_group.assign_role` | Role assigned on group |
+| `management_group.unassign_role` | Role removed from group |
+| `api_token.create` | API token created |
+| `api_token.revoke` | API token revoked |
+| `quarantine.enable` | Device quarantined |
+| `quarantine.disable` | Device released from quarantine |
+| `tag.set` | Tag created or updated |
+| `tag.delete` | Tag deleted |
+
+---
+
+## Legacy API Endpoints
+
+The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.
+
+---
+
+### Commands
+
+#### `POST /api/command`
+
+Send a command to one or more connected agents.
+
+**Request body:**
+
+```json
+{
+  "plugin": "hardware",
+  "action": "cpu-info",
+  "agent_ids": ["agent-01", "agent-02"],
+  "parameters": {}
+}
+```
+
+If `agent_ids` is empty or omitted, the command is broadcast to all connected agents.
+
+---
+
+### Agents
+
+#### `GET /api/agents`
+
+List all currently connected agents with their metadata (hostname, OS, IP, connected plugins).
+
+---
+
+### Help
+
+#### `GET /api/help`
+
+Returns a catalog of all available plugins and their supported actions, as reported by connected agents.
+
+---
+
+### Instructions
+
+#### `GET /api/instructions`
+
+List all instruction definitions stored in the server.
+
+#### `GET /api/instructions/{id}`
+
+Get a single instruction definition by ID.
+
+#### `POST /api/instructions`
+
+Create a new instruction definition from JSON.
+
+#### `PUT /api/instructions/{id}`
+
+Update an existing instruction definition.
+
+#### `DELETE /api/instructions/{id}`
+
+Delete an instruction definition.
+
+#### `GET /api/instructions/{id}/export`
+
+Export an instruction definition in a portable format.
+
+#### `POST /api/instructions/import`
+
+Import instruction definitions from a YAML file.
+
+#### `POST /api/instructions/yaml`
+
+Store raw YAML source for an instruction definition.
+
+#### `POST /api/instructions/validate-yaml`
+
+Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
+
+---
+
+### Instruction Sets
+
+#### `GET /api/instruction-sets`
+
+List all instruction sets.
+
+#### `POST /api/instruction-sets`
+
+Create a new instruction set (a named collection of definitions).
+
+#### `DELETE /api/instruction-sets/{id}`
+
+Delete an instruction set.
+
+---
+
+### Executions
+
+#### `GET /api/executions`
+
+List executions. Accepts `definition_id`, `status`, and `limit` as query parameters.
+
+#### `GET /api/executions/{id}`
+
+Get details of a single execution.
+
+#### `GET /api/executions/{id}/summary`
+
+Get an execution summary (counts of targeted, responded, success, failure agents).
+
+#### `GET /api/executions/{id}/agents`
+
+List agents involved in an execution.
+
+#### `GET /api/executions/{id}/children`
+
+List child executions spawned from a parent execution.
+
+#### `POST /api/executions/{id}/rerun`
+
+Re-execute a previously run instruction with the same parameters and targets.
+
+#### `POST /api/executions/{id}/cancel`
+
+Cancel a running execution.
+
+---
+
+### Schedules
+
+#### `GET /api/schedules`
+
+List schedules. Accepts `definition_id` and `enabled_only` as query parameters.
+
+#### `POST /api/schedules`
+
+Create a recurring schedule for an instruction definition. Supports cron expressions.
+
+#### `DELETE /api/schedules/{id}`
+
+Delete a schedule.
+
+#### `POST /api/schedules/{id}/enable`
+
+Enable or disable a schedule.
+
+---
+
+### Approvals
+
+#### `GET /api/approvals`
+
+List approvals. Accepts `status` and `submitted_by` as query parameters.
+
+#### `GET /api/approvals/pending/count`
+
+Return the count of instructions awaiting approval.
+
+#### `POST /api/approvals/{id}/approve`
+
+Approve a pending instruction execution.
+
+#### `POST /api/approvals/{id}/reject`
+
+Reject a pending instruction execution.
+
+---
+
+### Audit (Legacy)
+
+#### `GET /api/audit`
+
+Query audit events. Accepts `limit`, `principal`, and `action` as query parameters. Functionally equivalent to `GET /api/v1/audit` but without the v1 envelope.
+
+---
+
+### Scope Engine
+
+#### `POST /api/scope/validate`
+
+Validate a scope expression without executing it.
+
+**Request body:**
+
+```json
+{
+  "expression": "os = 'windows' AND tag:environment = 'production'"
+}
+```
+
+#### `POST /api/scope/estimate`
+
+Estimate how many agents match a scope expression.
+
+**Request body:**
+
+```json
+{
+  "expression": "os = 'windows' AND tag:environment = 'production'"
+}
+```
+
+---
+
+### Data Export
+
+#### `POST /api/export/json-to-csv`
+
+Convert a JSON result set to CSV format for download.
+
+---
+
+### Responses
+
+#### `GET /api/responses/{id}`
+
+Get command responses for a specific command ID.
+
+#### `GET /api/responses/{id}/aggregate`
+
+Aggregate response data for a command (counts, summaries).
+
+#### `GET /api/responses/{id}/export`
+
+Export response data in CSV format.
+
+---
+
+### Tags (Legacy)
+
+#### `GET /api/tags`
+
+Get tags for an agent. Requires `agent_id` query parameter. Returns tags as an array of `{key, value, source, updated_at}` objects (different format from the v1 envelope).
+
+#### `POST /api/tags/set`
+
+Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`.
+
+#### `POST /api/tags/delete`
+
+Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`.
+
+#### `POST /api/tags/query`
+
+Query agents that have a specific tag. Request body: `{"key": "...", "value": "..."}`. Returns `{"agents": [...], "count": N}`.
+
+---
+
+### Analytics and NVD
+
+#### `GET /api/me`
+
+Returns current user info (legacy version; prefer `/api/v1/me`).
+
+#### `GET /api/analytics/status`
+
+Returns the status of the analytics event pipeline.
+
+#### `GET /api/analytics/recent`
+
+Returns recent analytics events. Accepts `limit` as a query parameter (default 50).
+
+#### `GET /api/nvd/status`
+
+Returns the status of the NVD (National Vulnerability Database) sync.
+
+#### `POST /api/nvd/sync`
+
+Trigger a manual NVD database sync. Admin only. Runs asynchronously and returns immediately.
+
+#### `POST /api/nvd/match`
+
+Match installed software against known CVEs in the NVD database.
+
+---
+
+### SSE Event Stream
+
+#### `GET /events`
+
+Server-Sent Events stream for real-time dashboard updates. Events include agent connections/disconnections, command responses, and system notifications.
+
+**Example (curl):**
+
+```bash
+curl -N -H "Cookie: yuzu_session=abc123" https://yuzu.example.com/events
+```
+
+**Event format:**
+
+```
+event: agent_connected
+data: {"agent_id":"agent-01","hostname":"web-server-01"}
+
+event: command_response
+data: {"agent_id":"agent-01","command_id":"cmd-abc","status":"COMPLETED"}
+```
+
+---
+
+## Authentication Endpoints
+
+These endpoints manage user sessions and SSO flows.
+
+#### `POST /login`
+
+Authenticate with username and password. Sets the `yuzu_session` cookie on success.
+
+**Request body (form-encoded):**
+
+```
+username=admin&password=secretpass
+```
+
+**Success:** Redirect to `/` (dashboard).
+**Failure:** Redirect to `/login?error=1`.
+
+#### `POST /logout`
+
+Destroy the current session. Clears the `yuzu_session` cookie.
+
+#### `GET /auth/oidc/start`
+
+Begin the OIDC SSO login flow. Redirects to the configured identity provider.
+
+#### `GET /auth/callback`
+
+OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+
+---
+
+## Metrics
+
+#### `GET /metrics`
+
+Prometheus exposition format. Returns all server metrics.
+
+**Example (curl):**
+
+```bash
+curl https://yuzu.example.com/metrics
+```
+
+**Example output (excerpt):**
+
+```
+# HELP yuzu_server_agents_connected Number of currently connected agents
+# TYPE yuzu_server_agents_connected gauge
+yuzu_server_agents_connected 42
+
+# HELP yuzu_server_grpc_requests_total Total gRPC requests by method and status
+# TYPE yuzu_server_grpc_requests_total counter
+yuzu_server_grpc_requests_total{method="Register",status="ok"} 156
+yuzu_server_grpc_requests_total{method="Heartbeat",status="ok"} 12483
+
+# HELP yuzu_server_command_duration_seconds Command execution duration
+# TYPE yuzu_server_command_duration_seconds histogram
+yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="0.1"} 89
+yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="1.0"} 95
+yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="+Inf"} 96
+```
+
+All server metrics use the `yuzu_server_` prefix. Standard labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.
