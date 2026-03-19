@@ -68,6 +68,7 @@ void ApiTokenStore::create_tables() {
             token_hash    TEXT NOT NULL UNIQUE,
             name          TEXT NOT NULL,
             principal_id  TEXT NOT NULL,
+            scope_service TEXT NOT NULL DEFAULT '',
             created_at    INTEGER NOT NULL DEFAULT 0,
             expires_at    INTEGER NOT NULL DEFAULT 0,
             last_used_at  INTEGER NOT NULL DEFAULT 0,
@@ -81,6 +82,10 @@ void ApiTokenStore::create_tables() {
         spdlog::error("ApiTokenStore: create_tables failed: {}", err ? err : "unknown");
         sqlite3_free(err);
     }
+
+    // Migration: add scope_service column if missing (existing databases)
+    sqlite3_exec(db_, "ALTER TABLE api_tokens ADD COLUMN scope_service TEXT NOT NULL DEFAULT '';",
+                 nullptr, nullptr, nullptr);
 }
 
 // ── Token generation and hashing ─────────────────────────────────────────────
@@ -132,11 +137,14 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 
 std::expected<std::string, std::string> ApiTokenStore::create_token(const std::string& name,
                                                                     const std::string& principal_id,
-                                                                    int64_t expires_at) {
+                                                                    int64_t expires_at,
+                                                                    const std::string& scope_service) {
     if (!db_)
         return std::unexpected("database not open");
     if (name.empty())
         return std::unexpected("token name cannot be empty");
+    if (!scope_service.empty() && expires_at <= 0)
+        return std::unexpected("service-scoped tokens must have an expiration time");
 
     auto raw = generate_raw_token();
     auto hash = sha256_hex(raw);
@@ -146,7 +154,7 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO api_tokens (token_id, token_hash, name, principal_id, "
-                           "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?);",
+                           "scope_service, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?);",
                            -1, &s, nullptr) != SQLITE_OK)
         return std::unexpected(sqlite3_errmsg(db_));
 
@@ -154,8 +162,9 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
     sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 3, name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 4, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 5, now);
-    sqlite3_bind_int64(s, 6, expires_at);
+    sqlite3_bind_text(s, 5, scope_service.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 6, now);
+    sqlite3_bind_int64(s, 7, expires_at);
 
     int rc = sqlite3_step(s);
     sqlite3_finalize(s);
@@ -172,8 +181,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,
-            "SELECT token_id, token_hash, name, principal_id, created_at, expires_at, "
-            "last_used_at, revoked FROM api_tokens WHERE token_hash = ?;",
+            "SELECT token_id, token_hash, name, principal_id, scope_service, created_at, "
+            "expires_at, last_used_at, revoked FROM api_tokens WHERE token_hash = ?;",
             -1, &s, nullptr) != SQLITE_OK)
         return std::nullopt;
     sqlite3_bind_text(s, 1, hash.c_str(), -1, SQLITE_TRANSIENT);
@@ -185,10 +194,11 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         t.token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.created_at = sqlite3_column_int64(s, 4);
-        t.expires_at = sqlite3_column_int64(s, 5);
-        t.last_used_at = sqlite3_column_int64(s, 6);
-        t.revoked = sqlite3_column_int(s, 7) != 0;
+        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        t.created_at = sqlite3_column_int64(s, 5);
+        t.expires_at = sqlite3_column_int64(s, 6);
+        t.last_used_at = sqlite3_column_int64(s, 7);
+        t.revoked = sqlite3_column_int(s, 8) != 0;
 
         // Check revocation
         if (t.revoked) {
@@ -227,8 +237,8 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
         return result;
 
     std::string sql =
-        "SELECT token_id, '', name, principal_id, created_at, expires_at, last_used_at, revoked "
-        "FROM api_tokens";
+        "SELECT token_id, '', name, principal_id, scope_service, created_at, expires_at, "
+        "last_used_at, revoked FROM api_tokens";
     if (!principal_id.empty())
         sql += " WHERE principal_id = ?";
     sql += " ORDER BY created_at DESC;";
@@ -245,10 +255,11 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
         t.token_hash = ""; // Never expose hash in listing
         t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        t.created_at = sqlite3_column_int64(s, 4);
-        t.expires_at = sqlite3_column_int64(s, 5);
-        t.last_used_at = sqlite3_column_int64(s, 6);
-        t.revoked = sqlite3_column_int(s, 7) != 0;
+        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
+        t.created_at = sqlite3_column_int64(s, 5);
+        t.expires_at = sqlite3_column_int64(s, 6);
+        t.last_used_at = sqlite3_column_int64(s, 7);
+        t.revoked = sqlite3_column_int(s, 8) != 0;
         result.push_back(std::move(t));
     }
     sqlite3_finalize(s);

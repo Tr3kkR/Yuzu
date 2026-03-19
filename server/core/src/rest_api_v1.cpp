@@ -385,20 +385,23 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 auto tokens = token_store->list_tokens(session->username);
                 nlohmann::json arr = nlohmann::json::array();
                 for (const auto& t : tokens) {
-                    arr.push_back({{"token_id", t.token_id},
-                                   {"name", t.name},
-                                   {"principal_id", t.principal_id},
-                                   {"created_at", t.created_at},
-                                   {"expires_at", t.expires_at},
-                                   {"last_used_at", t.last_used_at},
-                                   {"revoked", t.revoked}});
+                    nlohmann::json j = {{"token_id", t.token_id},
+                                        {"name", t.name},
+                                        {"principal_id", t.principal_id},
+                                        {"created_at", t.created_at},
+                                        {"expires_at", t.expires_at},
+                                        {"last_used_at", t.last_used_at},
+                                        {"revoked", t.revoked}};
+                    if (!t.scope_service.empty())
+                        j["scope_service"] = t.scope_service;
+                    arr.push_back(std::move(j));
                 }
                 res.set_content(list_response(arr, static_cast<int64_t>(tokens.size())).dump(),
                                 "application/json");
             });
 
-    svr.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn,
-                                token_store](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
+                                tag_store](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -413,18 +416,60 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         auto name = body.value("name", "");
         auto expires_at = body.value("expires_at", int64_t{0});
+        auto scope_service = body.value("scope_service", "");
 
-        auto result = token_store->create_token(name, session->username, expires_at);
+        // Authorization for service-scoped tokens: caller must have ITServiceOwner
+        // authority over the specified service (global admin or scoped role).
+        if (!scope_service.empty()) {
+            if (!rbac_store || !rbac_store->is_rbac_enabled()) {
+                res.status = 400;
+                res.set_content(
+                    error_response("service-scoped tokens require RBAC to be enabled").dump(),
+                    "application/json");
+                return;
+            }
+            // Check global admin privilege
+            bool authorized =
+                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
+            if (!authorized && mgmt_store) {
+                // Check if caller has ITServiceOwner on the service's management group
+                auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
+                if (svc_group) {
+                    auto group_roles = mgmt_store->get_group_roles(svc_group->id);
+                    for (const auto& gr : group_roles) {
+                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                            gr.role_name == "ITServiceOwner") {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!authorized) {
+                res.status = 403;
+                res.set_content(
+                    error_response("ITServiceOwner authority required for service '" +
+                                   scope_service + "'")
+                        .dump(),
+                    "application/json");
+                return;
+            }
+        }
+
+        auto result =
+            token_store->create_token(name, session->username, expires_at, scope_service);
         if (!result) {
             res.status = 400;
             res.set_content(error_response(result.error()).dump(), "application/json");
             return;
         }
-        audit_fn(req, "api_token.create", "success", "ApiToken", name, "");
+        auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
+        audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
         res.status = 201;
-        // Return the raw token — shown only once
-        res.set_content(ok_response({{"token", *result}, {"name", name}}).dump(),
-                        "application/json");
+        nlohmann::json resp = {{"token", *result}, {"name", name}};
+        if (!scope_service.empty())
+            resp["scope_service"] = scope_service;
+        res.set_content(ok_response(resp).dump(), "application/json");
     });
 
     svr.Delete(R"(/api/v1/tokens/(.+))", [perm_fn, audit_fn, token_store](

@@ -434,6 +434,14 @@ bool AuthManager::remove_user(const std::string& username) {
     return users_.erase(username) > 0;
 }
 
+std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+    std::lock_guard lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt;
+    return it->second.role;
+}
+
 // ── OIDC session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,

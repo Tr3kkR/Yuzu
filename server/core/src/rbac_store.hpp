@@ -99,6 +99,10 @@ public:
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
 
+    /// Check if a specific role grants a permission (for service-scoped token validation).
+    bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
+                                   const std::string& operation) const;
+
     /// All effective permissions for a user (for UI display).
     std::vector<Permission> get_effective_permissions(const std::string& username) const;
 

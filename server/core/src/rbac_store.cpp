@@ -961,4 +961,19 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     return has_allow;
 }
 
+bool RbacStore::check_role_has_permission(const std::string& role_name,
+                                          const std::string& securable_type,
+                                          const std::string& operation) const {
+    auto perms = get_role_permissions(role_name);
+    for (const auto& p : perms) {
+        if (p.securable_type == securable_type && p.operation == operation) {
+            if (p.effect == "deny")
+                return false;
+            if (p.effect == "allow")
+                return true;
+        }
+    }
+    return false;
+}
+
 } // namespace yuzu::server

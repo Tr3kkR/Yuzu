@@ -273,6 +273,7 @@ heartbeat_batch_scale() ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
+    application:set_env(yuzu_gw, max_heartbeat_buffer, N),
     case whereis(yuzu_gw_upstream) of
         undefined -> {ok, _} = yuzu_gw_upstream:start_link();
         _ -> ok

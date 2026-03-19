@@ -24,8 +24,9 @@ struct Session {
     std::string username;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"}; // "local" or "oidc"
-    std::string oidc_sub;             // OIDC subject claim (empty for local auth)
+    std::string auth_source{"local"};    // "local", "oidc", or "api_token"
+    std::string oidc_sub;                // OIDC subject claim (empty for local auth)
+    std::string token_scope_service;     // Non-empty = token scoped to this service
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
@@ -87,6 +88,9 @@ public:
 
     /// Remove a user by name.
     bool remove_user(const std::string& username);
+
+    /// Look up a user's legacy role. Returns nullopt if user not found.
+    std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;

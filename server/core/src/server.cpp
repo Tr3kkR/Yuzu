@@ -1987,6 +1987,20 @@ private:
         return url_decode(raw);
     }
 
+    /// Build a session from a validated API token, resolving the creator's actual role.
+    auth::Session synthesize_token_session(const ApiToken& api_token) {
+        auth::Session synth;
+        synth.username = api_token.principal_id;
+        synth.auth_source = "api_token";
+        synth.token_scope_service = api_token.scope_service;
+
+        // Resolve the creator's actual legacy role (not unconditional admin)
+        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+        synth.role = legacy_role.value_or(auth::Role::user);
+
+        return synth;
+    }
+
     std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res) {
         // 1. Try session cookie (existing browser auth)
         auto token = extract_session_cookie(req);
@@ -2000,12 +2014,8 @@ private:
             auto raw = auth_header.substr(7);
             if (api_token_store_) {
                 auto api_token = api_token_store_->validate_token(raw);
-                if (api_token) {
-                    auth::Session synth;
-                    synth.username = api_token->principal_id;
-                    synth.role = auth::Role::admin; // API tokens are always full-access
-                    return synth;
-                }
+                if (api_token)
+                    return synthesize_token_session(*api_token);
             }
         }
 
@@ -2013,12 +2023,8 @@ private:
         auto custom_header = req.get_header_value("X-Yuzu-Token");
         if (!custom_header.empty() && api_token_store_) {
             auto api_token = api_token_store_->validate_token(custom_header);
-            if (api_token) {
-                auth::Session synth;
-                synth.username = api_token->principal_id;
-                synth.role = auth::Role::admin;
-                return synth;
-            }
+            if (api_token)
+                return synthesize_token_session(*api_token);
         }
 
         res.status = 401;
@@ -2044,6 +2050,29 @@ private:
         auto session = require_auth(req, res);
         if (!session)
             return false;
+
+        // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
+        // Scoped tokens cannot be used when RBAC is disabled.
+        if (!session->token_scope_service.empty()) {
+            if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+                res.status = 403;
+                res.set_content(R"({"error":"service-scoped tokens require RBAC to be enabled"})",
+                                "application/json");
+                return false;
+            }
+            if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type,
+                                                        operation)) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"detail", "service-scoped token does not grant " +
+                                                   securable_type + ":" + operation}})
+                        .dump(),
+                    "application/json");
+                return false;
+            }
+            return true;
+        }
 
         if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
             if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
@@ -2074,6 +2103,45 @@ private:
         auto session = require_auth(req, res);
         if (!session)
             return false;
+
+        // Service-scoped tokens: verify the target agent belongs to the token's service,
+        // and that the ITServiceOwner role grants the required permission.
+        if (!session->token_scope_service.empty()) {
+            if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+                res.status = 403;
+                res.set_content(R"({"error":"service-scoped tokens require RBAC to be enabled"})",
+                                "application/json");
+                return false;
+            }
+            // Check that the ITServiceOwner role grants this permission type
+            if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type,
+                                                        operation)) {
+                res.status = 403;
+                res.set_content(
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"detail", "service-scoped token does not grant " +
+                                                   securable_type + ":" + operation}})
+                        .dump(),
+                    "application/json");
+                return false;
+            }
+            // Verify the target agent's service tag matches the token's scope
+            if (tag_store_ && !agent_id.empty()) {
+                auto agent_service = tag_store_->get_tag(agent_id, "service");
+                if (agent_service != session->token_scope_service) {
+                    res.status = 403;
+                    res.set_content(
+                        nlohmann::json(
+                            {{"error", "forbidden"},
+                             {"detail", "agent is not in service '" +
+                                            session->token_scope_service + "'"}})
+                            .dump(),
+                        "application/json");
+                    return false;
+                }
+            }
+            return true;
+        }
 
         if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
             if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
