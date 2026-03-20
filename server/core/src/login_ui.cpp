@@ -85,15 +85,15 @@ extern const char* const kLoginHtml =
       <div class="field">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" autocomplete="username"
-               autofocus required>
+               aria-label="Username" autofocus required>
       </div>
       <div class="field">
         <label for="password">Password</label>
         <input type="password" id="password" name="password"
-               autocomplete="current-password" required>
+               aria-label="Password" autocomplete="current-password" required>
       </div>
-      <button type="submit" class="btn-login" id="btn-login">Sign In</button>
-      <div class="error-msg" id="error-msg"></div>
+      <button type="submit" class="btn-login" id="btn-login" aria-label="Sign in">Sign In</button>
+      <div class="error-msg" id="error-msg" role="alert" aria-live="polite"></div>
     </form>
 
     <div class="sso-section" id="sso-section">

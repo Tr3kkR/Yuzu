@@ -362,9 +362,16 @@ extern const char* const kDashboardIndexHtml =
     <div class="results-header">
       <h2>Results</h2>
       <span id="result-context" style="font-size:0.75rem;color:#8b949e"></span>
+      <span style="flex:1"></span>
+      <button class="density-toggle" id="density-toggle" onclick="toggleDensity()" title="Toggle table density">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <line x1="2" y1="4" x2="14" y2="4"/><line x1="2" y1="8" x2="14" y2="8"/><line x1="2" y1="12" x2="14" y2="12"/>
+        </svg>
+        <span id="density-label">Comfortable</span>
+      </button>
     </div>
     <div class="table-wrap">
-      <table>
+      <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
         <tbody id="results-tbody">
           <tr id="empty-row"><td colspan="1" class="empty-state">
@@ -486,8 +493,51 @@ extern const char* const kDashboardIndexHtml =
       el.className = s.cls;
     }
 
+    /* ── Row detail drawer ──────────────────────────────────── */
+    function toggleDetail(row) {
+      var detail = row.nextElementSibling;
+      if (!detail || !detail.classList.contains('result-detail')) return;
+      var isOpen = detail.classList.contains('open');
+      /* Close any other open detail rows first */
+      var allOpen = document.querySelectorAll('.result-detail.open');
+      for (var i = 0; i < allOpen.length; i++) {
+        allOpen[i].classList.remove('open');
+        allOpen[i].previousElementSibling.classList.remove('expanded');
+      }
+      if (!isOpen) {
+        detail.classList.add('open');
+        row.classList.add('expanded');
+      }
+    }
+
+    /* ── Density toggle ────────────────────────────────────── */
+    var densityMode = localStorage.getItem('yuzu-table-density') || 'comfortable';
+
+    function applyDensity() {
+      var tbl = document.getElementById('results-table');
+      if (!tbl) return;
+      tbl.classList.remove('compact', 'comfortable');
+      tbl.classList.add(densityMode);
+      var label = document.getElementById('density-label');
+      if (label) label.textContent = densityMode === 'compact' ? 'Compact' : 'Comfortable';
+    }
+
+    function toggleDensity() {
+      densityMode = (densityMode === 'comfortable') ? 'compact' : 'comfortable';
+      localStorage.setItem('yuzu-table-density', densityMode);
+      applyDensity();
+    }
+
+    /* Apply saved density on load */
+    applyDensity();
+)HTM"
+    // Part 3b: Table management and row operations
+    R"HTM(
     /* ── Table management ─────────────────────────────────── */
+    var currentColumns = [];
+
     function setColumns(cols) {
+      currentColumns = cols;
       var thead = document.getElementById('results-thead');
       var html = '<tr>';
       for (var i = 0; i < cols.length; i++) {
@@ -503,7 +553,11 @@ extern const char* const kDashboardIndexHtml =
       if (er) er.remove();
 
       var tbody = document.getElementById('results-tbody');
+
+      /* Main data row */
       var tr = document.createElement('tr');
+      tr.className = 'result-row';
+      tr.setAttribute('onclick', 'toggleDetail(this)');
       var html = '';
       for (var i = 0; i < cells.length; i++) {
         var cls = i === 0 ? ' class="col-agent"' : '';
@@ -511,6 +565,20 @@ extern const char* const kDashboardIndexHtml =
       }
       tr.innerHTML = html;
       tbody.appendChild(tr);
+
+      /* Companion detail row */
+      var detailTr = document.createElement('tr');
+      detailTr.className = 'result-detail';
+      var colSpan = cells.length || 1;
+      var detailHtml = '<td colspan="' + colSpan + '"><div class="detail-content">';
+      for (var i = 0; i < cells.length; i++) {
+        var label = (currentColumns.length > i) ? currentColumns[i] : ('Column ' + (i + 1));
+        detailHtml += '<div class="detail-label">' + escapeHtml(label) + '</div>';
+        detailHtml += '<div class="detail-value">' + escapeHtml(cells[i]) + '</div>';
+      }
+      detailHtml += '</div></td>';
+      detailTr.innerHTML = detailHtml;
+      tbody.appendChild(detailTr);
 
       rowCount++;
       document.getElementById('row-count').textContent = rowCount.toLocaleString();
@@ -613,27 +681,21 @@ extern const char* const kDashboardIndexHtml =
       clearResults();
       document.getElementById('result-context').textContent = filter ? 'help ' + filter : 'help — all plugins';
       setBadge('idle');
-      var tbody = document.getElementById('results-tbody');
       for (var i = 0; i < plugins.length; i++) {
         var p = plugins[i];
         if (p.actions.length === 0) {
-          var tr = document.createElement('tr');
-          tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>&mdash;</td><td>' + escapeHtml(p.description) + '</td>';
-          tbody.appendChild(tr);
-          rowCount++;
+          addRow([p.name, '\u2014', p.description]);
         } else {
           for (var j = 0; j < p.actions.length; j++) {
-            var tr = document.createElement('tr');
-            tr.innerHTML = '<td>' + escapeHtml(p.name) + '</td><td>' + escapeHtml(p.actions[j]) +
-              '</td><td>' + (j === 0 ? escapeHtml(p.description) : '') + '</td>';
-            tbody.appendChild(tr);
-            rowCount++;
+            addRow([p.name, p.actions[j], j === 0 ? p.description : '']);
           }
         }
       }
       document.getElementById('row-count').textContent = rowCount;
     }
 
+)HTM"
+    R"HTM(
     function sendInstruction() {
       var input = document.getElementById('instr-input');
       var raw = input.value.trim().toLowerCase();

@@ -95,7 +95,7 @@ namespace gw = ::yuzu::gateway::v1;
 
 [[nodiscard]] std::filesystem::path server_log_path() {
 #ifdef _WIN32
-    return R"(C:\ProgramData\Yuzu\logs\agent.log)";
+    return R"(C:\ProgramData\Yuzu\logs\server.log)";
 #elif defined(__APPLE__)
     if (const char* home = std::getenv("HOME")) {
         return std::filesystem::path(home) / "Library/Logs/Yuzu/server.log";
@@ -3745,11 +3745,19 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page, metrics, health, and OIDC flow
-                if (req.path == "/login" || req.path == "/metrics" || req.path == "/health" ||
+                // Allow unauthenticated access to login page, health, and OIDC flow
+                if (req.path == "/login" || req.path == "/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
                     req.path.starts_with("/static/")) {
                     return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                // /metrics: allow unauthenticated from localhost only (Prometheus scraping)
+                if (req.path == "/metrics") {
+                    if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                        return httplib::Server::HandlerResponse::Unhandled;
+                    }
+                    // Remote callers fall through to normal auth check below
                 }
 
                 // Check session cookie
@@ -3761,13 +3769,13 @@ private:
                     auto auth_header = req.get_header_value("Authorization");
                     if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
                         auto api_token = api_token_store_->validate_token(auth_header.substr(7));
-                        if (api_token) session.emplace();
+                        if (api_token) session = synthesize_token_session(*api_token);
                     }
                     if (!session) {
                         auto custom_header = req.get_header_value("X-Yuzu-Token");
                         if (!custom_header.empty()) {
                             auto api_token = api_token_store_->validate_token(custom_header);
-                            if (api_token) session.emplace();
+                            if (api_token) session = synthesize_token_session(*api_token);
                         }
                     }
                 }
@@ -3842,13 +3850,17 @@ private:
                     res.set_content(R"({"error":"OIDC not configured"})", "application/json");
                     return;
                 }
-                // Derive redirect URI from the request Host header so OIDC works
-                // regardless of which IP/hostname the operator used to reach us.
-                auto host = req.get_header_value("Host");
-                std::string redirect_uri;
-                if (!host.empty()) {
-                    auto scheme = cfg_.https_enabled ? "https" : "http";
-                    redirect_uri = std::string(scheme) + "://" + host + "/auth/callback";
+                // Use configured redirect URI (from --oidc-redirect-uri or auto-computed).
+                // Falling back to Host header is a security risk (Host header manipulation).
+                std::string redirect_uri = cfg_.oidc_redirect_uri;
+                if (redirect_uri.empty()) {
+                    auto host = req.get_header_value("Host");
+                    if (!host.empty()) {
+                        spdlog::warn("OIDC redirect_uri derived from Host header — set "
+                                     "--oidc-redirect-uri for production deployments");
+                        auto scheme = cfg_.https_enabled ? "https" : "http";
+                        redirect_uri = std::string(scheme) + "://" + host + "/auth/callback";
+                    }
                 }
                 auto auth_url = oidc_provider_->start_auth_flow(redirect_uri);
                 res.set_redirect(auth_url);

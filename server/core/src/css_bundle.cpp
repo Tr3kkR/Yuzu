@@ -243,6 +243,36 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .yd { color: #8b949e; }
 .ya { color: #d2a8ff; }
 
+/* Row detail drawer */
+.result-row { cursor: pointer; }
+.result-row:hover { background: rgba(88,166,255,0.06); }
+.result-row.expanded { background: rgba(88,166,255,0.08); }
+.result-detail { display: none; }
+.result-detail.open { display: table-row; }
+.result-detail td { padding: var(--sp-3) var(--sp-4); background: var(--bg);
+                    border-bottom: 1px solid var(--border); }
+.detail-content { display: grid; grid-template-columns: auto 1fr; gap: var(--sp-2) var(--sp-4);
+                  max-width: 100%; }
+.detail-label { color: var(--muted); font-weight: 600; font-size: var(--text-sm);
+                white-space: nowrap; }
+.detail-value { font-family: var(--font-mono); font-size: var(--text-sm);
+                word-break: break-all; color: var(--fg); }
+
+/* Table density modes */
+.data-table.compact td, table.compact td { padding: 2px var(--sp-2); font-size: var(--text-xs); }
+.data-table.compact th, table.compact th { padding: 2px var(--sp-2); font-size: 0.6rem; }
+.data-table.comfortable td, table.comfortable td { padding: var(--sp-2) var(--sp-3); font-size: var(--text-base); }
+.data-table.comfortable th, table.comfortable th { padding: var(--sp-2) var(--sp-3); font-size: var(--text-sm); }
+
+/* Density toggle button */
+.density-toggle { display: inline-flex; align-items: center; gap: var(--sp-1);
+                  background: transparent; border: 1px solid var(--border);
+                  color: var(--muted); padding: 2px var(--sp-2); border-radius: var(--radius-sm);
+                  cursor: pointer; font-size: var(--text-xs); font-family: var(--font-sans);
+                  transition: color 0.15s, border-color 0.15s; }
+.density-toggle:hover { color: var(--fg); border-color: var(--subtle); }
+.density-toggle svg { width: 14px; height: 14px; }
+
 /* Compliance bars */
 .compliance-bar { height: 8px; background: var(--border); border-radius: 9999px; overflow: hidden; }
 .compliance-fill { height: 100%; border-radius: 9999px; transition: width 0.3s; }
