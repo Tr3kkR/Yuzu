@@ -551,7 +551,7 @@ Plugins for HTTP operations, file downloads, content staging, and package deploy
 |---|---|
 | **Version** | v1.0.0 |
 | **Platforms** | W L M |
-| **Description** | HTTP client for downloading files and making HTTP requests. Supports SHA256 hash verification on downloads. |
+| **Description** | HTTP client for downloading files and making HTTP requests. Uses cpp-httplib directly (no shell invocation). Supports SHA256 hash verification on downloads. Includes SSRF protection that blocks requests to private/reserved IP ranges (RFC 1918, link-local, loopback). |
 
 | Action | Description |
 |---|---|
@@ -559,13 +559,15 @@ Plugins for HTTP operations, file downloads, content staging, and package deploy
 | `get` | Perform an HTTP GET request and return the response status code and body. Parameters: `url` (required). |
 | `head` | Perform an HTTP HEAD request and return the response status code and headers. Parameters: `url` (required). Useful for checking file availability or size before downloading. |
 
+> **Security note:** All HTTP requests are made using cpp-httplib's native HTTP implementation. No shell commands are invoked. Outbound requests are subject to SSRF protection that rejects URLs resolving to private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, and IPv6 equivalents).
+
 ### content_dist
 
 | | |
 |---|---|
 | **Version** | v1.0.0 |
 | **Platforms** | W L M |
-| **Description** | Content staging and execution. Downloads files to the agent's staging directory with hash verification, then executes them with optional arguments. |
+| **Description** | Content staging and execution. Downloads files to the agent's staging directory using httplib (no shell invocation) with hash verification, then executes them via `CreateProcessW` (Windows) or `fork`+`execvp` (Linux/macOS) with no shell interpretation. Arguments are validated against a metacharacter blocklist. |
 
 | Action | Description |
 |---|---|
@@ -573,6 +575,8 @@ Plugins for HTTP operations, file downloads, content staging, and package deploy
 | `execute_staged` | Execute a previously staged file with optional arguments. Parameters: `filename` (required), `args` (optional). Returns status, exit code, and output. |
 | `list_staged` | List all files in the agent's staging directory with size and SHA256 hash. |
 | `cleanup` | Remove one or all files from the staging directory. Parameters: `filename` (optional; omit to clear all staged files). Returns status and count of files removed. |
+
+> **Security note:** Downloads use httplib's native HTTP client -- no shell commands are spawned for file retrieval. Execution of staged files uses `CreateProcessW` on Windows and `fork`+`execvp` on Linux/macOS, bypassing shell interpretation entirely. The `args` parameter is validated against a metacharacter blocklist (`;`, `|`, `&`, `` ` ``, `$`, `(`, `)`, `{`, `}`, `<`, `>`) to prevent command injection.
 
 ---
 

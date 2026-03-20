@@ -12,6 +12,7 @@ The scope engine is Yuzu's device targeting system. It evaluates expression stri
 4. [Boolean Combinators](#4-boolean-combinators)
 5. [Available Attributes](#5-available-attributes)
 6. [Tag Attributes](#6-tag-attributes)
+6a. [Custom Property Attributes](#6a-custom-property-attributes)
 7. [Wildcard Matching](#7-wildcard-matching)
 8. [Operator Precedence and Grouping](#8-operator-precedence-and-grouping)
 9. [Examples](#9-examples)
@@ -159,6 +160,10 @@ The scope engine resolves attributes through an `AttributeResolver` callback. Th
 
 Any device tag can be referenced using the `tag:` prefix. See [Section 6](#6-tag-attributes) for details.
 
+### Custom Property Attributes
+
+Custom properties set via the Custom Properties API can be referenced in scope expressions using the `props.` prefix. See [Section 6a](#6a-custom-property-attributes) for details.
+
 ---
 
 ## 6. Tag Attributes
@@ -198,6 +203,48 @@ Tags are subject to the following constraints:
 | `service` | Application or service name | `"payments"`, `"auth"`, `"api-gateway"` |
 | `tier` | Service tier | `"gold"`, `"silver"`, `"bronze"` |
 | `os_family` | OS family (set by agent) | `"debian"`, `"rhel"`, `"windows-server"` |
+
+---
+
+## 6a. Custom Property Attributes
+
+Custom properties are operator-defined key-value pairs on agents, managed via the REST API (see `PUT /api/agents/:id/properties/:key`). Unlike tags, properties can have schemas that enforce type and allowed values.
+
+### Syntax
+
+Custom properties are referenced in scope expressions using the `props.` prefix:
+
+```
+props.<key> <operator> <value>
+```
+
+### Examples
+
+```
+props.department == "Engineering"
+props.cost_center LIKE "CC-*"
+props.department == "Engineering" AND os == "windows"
+props.region IN ("us-east", "us-west", "eu-west")
+NOT props.decommissioned == "true"
+EXISTS props.department
+```
+
+### Combined with Tags and Built-in Attributes
+
+Custom properties work alongside tags and built-in attributes in any expression:
+
+```
+ostype == "windows" AND props.department == "Engineering" AND tag:environment == "Production"
+```
+
+### Custom Properties vs. Tags
+
+| | Tags | Custom Properties |
+|---|---|---|
+| **Prefix** | `tag:` | `props.` |
+| **Set by** | Agent, server, or API | API only (operator-managed) |
+| **Schema enforcement** | Category-based (4 categories) | Property schemas (type, allowed values, required) |
+| **Primary use** | Device classification and targeting | Organizational metadata and compliance attributes |
 
 ---
 

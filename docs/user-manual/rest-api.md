@@ -18,6 +18,8 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
   - [Policy Fragments](#policy-fragments)
   - [Policies](#policies)
   - [Compliance](#compliance)
+  - [Runtime Configuration](#runtime-configuration)
+  - [Custom Properties](#custom-properties)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -35,6 +37,7 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
   - [Analytics and NVD](#analytics-and-nvd)
   - [SSE Event Stream](#sse-event-stream)
 - [Authentication Endpoints](#authentication-endpoints)
+- [Health](#health)
 - [Metrics](#metrics)
 
 ---
@@ -1348,6 +1351,229 @@ Per-policy compliance detail with per-agent statuses.
 
 ---
 
+### Runtime Configuration
+
+Runtime configuration endpoints allow reading and updating server settings without a restart. Only a predefined set of keys can be changed at runtime.
+
+#### `GET /api/config`
+
+Returns current configuration values and any active runtime overrides.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "heartbeat_timeout": 120,
+    "response_retention_days": 90,
+    "audit_retention_days": 365,
+    "auto_approve_enabled": false,
+    "log_level": "info"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `PUT /api/config/:key`
+
+Update a single runtime configuration value. The key must be one of the allowed runtime-configurable keys.
+
+**Permission:** `Infrastructure:Write`
+
+**Allowed keys:**
+
+| Key | Type | Description |
+|---|---|---|
+| `heartbeat_timeout` | integer | Seconds before an agent is considered offline |
+| `response_retention_days` | integer | Days to retain command response data |
+| `audit_retention_days` | integer | Days to retain audit log entries |
+| `auto_approve_enabled` | boolean | Whether auto-approve rules are active |
+| `log_level` | string | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+
+**Request body:**
+
+```json
+{
+  "value": 180
+}
+```
+
+**Response:**
+
+```json
+{
+  "data": { "updated": true, "key": "heartbeat_timeout", "value": 180 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- invalid key:**
+
+```json
+{
+  "error": "unknown config key 'foo'; allowed: heartbeat_timeout, response_retention_days, audit_retention_days, auto_approve_enabled, log_level",
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Custom Properties
+
+Custom properties are operator-defined key-value pairs on agents, separate from tags. Properties can have schemas that enforce type, allowed values, and validation rules. Properties are available for use in scope expressions via the `props.<key>` prefix.
+
+#### `GET /api/agents/:id/properties`
+
+List all custom properties for a specific agent.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "key": "department",
+      "value": "Engineering"
+    },
+    {
+      "key": "cost_center",
+      "value": "CC-4200"
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `PUT /api/agents/:id/properties/:key`
+
+Set or update a custom property value on an agent. If a property schema exists for the key, the value is validated against it.
+
+**Permission:** `Infrastructure:Write`
+
+**Request body:**
+
+```json
+{
+  "value": "Engineering"
+}
+```
+
+**Response:**
+
+```json
+{
+  "data": { "set": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- schema validation failure:**
+
+```json
+{
+  "error": "value 'bogus' not allowed for property 'department'; allowed: Engineering, Sales, Operations, Support",
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `DELETE /api/agents/:id/properties/:key`
+
+Delete a custom property from an agent.
+
+**Permission:** `Infrastructure:Write`
+
+**Response:**
+
+```json
+{
+  "data": { "deleted": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/property-schemas`
+
+List all property schemas. Schemas define the allowed keys, types, and validation constraints for custom properties.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "key": "department",
+      "display_name": "Department",
+      "type": "string",
+      "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
+      "required": false
+    },
+    {
+      "key": "cost_center",
+      "display_name": "Cost Center",
+      "type": "string",
+      "allowed_values": [],
+      "required": true
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+Schemas with an empty `allowed_values` array accept free-form values.
+
+---
+
+#### `POST /api/property-schemas`
+
+Create or update a property schema. If a schema with the given key already exists, it is replaced.
+
+**Permission:** `Infrastructure:Write`
+
+**Request body:**
+
+```json
+{
+  "key": "department",
+  "display_name": "Department",
+  "type": "string",
+  "allowed_values": ["Engineering", "Sales", "Operations", "Support"],
+  "required": false
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `key` | string | Yes | Property key (unique identifier) |
+| `display_name` | string | No | Human-readable label |
+| `type` | string | No | Value type: `string` (default), `integer`, `boolean` |
+| `allowed_values` | array | No | Restrict values to this set (empty = free-form) |
+| `required` | boolean | No | Whether every agent must have this property |
+
+**Response (201):**
+
+```json
+{
+  "data": { "created": true, "key": "department" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
 ## Legacy API Endpoints
 
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.
@@ -1691,6 +1917,56 @@ Begin the OIDC SSO login flow. Redirects to the configured identity provider.
 #### `GET /auth/callback`
 
 OIDC callback endpoint. The identity provider redirects here after authentication. Exchanges the authorization code for tokens and creates a local session.
+
+---
+
+## Health
+
+#### `GET /health`
+
+Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
+
+**Permission:** None (unauthenticated).
+
+**Response:**
+
+```json
+{
+  "status": "healthy",
+  "uptime_seconds": 86400,
+  "agents": {
+    "online": 42,
+    "pending": 3
+  },
+  "stores": {
+    "response_store": "ok",
+    "audit_store": "ok",
+    "tag_store": "ok",
+    "policy_store": "ok",
+    "custom_properties_store": "ok"
+  },
+  "executions": {
+    "in_flight": 5,
+    "completed_last_hour": 120,
+    "failed_last_hour": 2
+  },
+  "version": "0.9.0"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | `"healthy"` or `"degraded"` |
+| `uptime_seconds` | integer | Server uptime in seconds |
+| `agents.online` | integer | Number of currently connected agents |
+| `agents.pending` | integer | Number of agents awaiting enrollment approval |
+| `stores` | object | Health status of each data store (`"ok"` or `"error"`) |
+| `executions.in_flight` | integer | Currently running instruction executions |
+| `executions.completed_last_hour` | integer | Executions completed in the past 60 minutes |
+| `executions.failed_last_hour` | integer | Executions that failed in the past 60 minutes |
+| `version` | string | Server binary version |
+
+The endpoint returns HTTP `200` when healthy and HTTP `503` when degraded.
 
 ---
 

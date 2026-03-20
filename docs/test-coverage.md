@@ -1,13 +1,15 @@
 # Test Coverage Tracking
 
-Last updated: 2026-03-16
+Last updated: 2026-03-20
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 7 files | Active |
-| Server unit tests | `yuzu_server_tests` | 10 files | Active (requires `build_server=true`) |
+| Agent unit tests | `yuzu_agent_tests` | 10 files | Active |
+| Server unit tests | `yuzu_server_tests` | 13 files | Active (requires `build_server=true`) |
+
+**Totals:** 628 test cases, 12,176 assertions, all passing.
 
 Run all tests: `meson test -C builddir --print-errorlogs`
 
@@ -26,13 +28,16 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 | `test_filesystem_read.cpp` | Filesystem plugin | validate_path, read parameters, CRLF stripping, binary detection, pagination |
 | `test_string_utils.cpp` | Shared utilities | icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line |
 | `test_vuln_rules.cpp` | Vuln scan rules | compare_versions, CveRule data integrity, CVE matching logic |
+| `test_kv_store.cpp` | KV storage | Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases) |
+| `test_trigger_engine.cpp` | Trigger engine | Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases) |
+| `test_new_plugins.cpp` | Plugin runtime | Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases) |
 
 ### Untested Agent Components
 
 | Component | Why Untested | Priority |
 |-----------|-------------|----------|
 | **Plugin host** (dynamic loading) | Requires .dll/.so artifacts | Low |
-| **Trigger engine** | Not yet implemented | N/A |
+| **Trigger engine** | Covered by test_trigger_engine.cpp | Done |
 | **gRPC client** | Requires mock server | Medium |
 | **Certificate discovery** | Windows-specific CryptoAPI | Low |
 | **Cloud identity** | Requires cloud environment | Low |
@@ -83,6 +88,9 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_tag_store.cpp` | Tag store | CRUD, sync_agent_tags, agents_with_tag, key/value validation |
 | `test_scope_engine.cpp` | Scope engine | Parser (equality, AND, OR, NOT, LIKE, IN, CONTAINS, parens, errors), evaluator, performance |
 | `test_web_utils.cpp` | Web utilities | base64_decode, html_escape, url_decode, extract_form_value, extract_plugin |
+| `test_policy_store.cpp` | Policy store | Policy CRUD, fragment binding, scope expression storage, enable/disable, management group association, trigger configuration, input parameters, cascade delete (42 cases) |
+| `test_compliance_eval.cpp` | Compliance evaluator | Status transitions (compliant/non_compliant/unknown/fixing/error), per-agent tracking, fleet summary aggregation, cache invalidation, policy-scoped queries, auto-remediation triggers (35 cases) |
+| `test_custom_properties_store.cpp` | Custom properties | Property CRUD, schema validation, allowed-value enforcement, type checking, required-property compliance, scope engine integration via `props.` prefix, bulk operations (34 cases) |
 
 ### Untested Server Components
 
