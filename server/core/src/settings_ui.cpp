@@ -9,21 +9,11 @@ extern const char* const kSettingsHtml =
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu — Settings</title>
+  <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
   <style>
-    :root {
-      --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff;
-      --green: #3fb950; --red: #f85149; --yellow: #d29922;
-      --surface: #161b22; --border: #30363d;
-      --mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background: var(--bg); color: var(--fg);
-      min-height: 100vh;
-    }
+    body { min-height: 100vh; }
 
     /* ── Top bar ───────────────────────────────────────────── */
     .topbar {
@@ -99,20 +89,8 @@ extern const char* const kSettingsHtml =
     .toggle input:checked + .slider { background: var(--green); }
     .toggle input:checked + .slider::before { transform: translateX(20px); }
 
-    /* ── Buttons ───────────────────────────────────────────── */
-    .btn {
-      padding: 0.4rem 1rem; font-size: 0.8rem; font-weight: 500;
-      border: none; border-radius: 0.3rem; cursor: pointer;
-      transition: opacity 0.15s;
-    }
-    .btn:hover { opacity: 0.85; }
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-danger  { background: var(--red); color: #fff; }
-    .btn-secondary {
-      background: var(--surface); color: var(--fg);
-      border: 1px solid var(--border);
-    }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    /* ── Settings button overrides (smaller than design-system default) ── */
+    .btn { height: auto; padding: 0.4rem 1rem; font-size: 0.8rem; border: none; }
 
     /* ── File upload ───────────────────────────────────────── */
     .file-upload {

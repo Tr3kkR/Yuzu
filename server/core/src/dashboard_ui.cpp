@@ -10,18 +10,10 @@ extern const char* const kDashboardIndexHtml =
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu — Dashboard</title>
+  <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <style>
-    :root {
-      --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff;
-      --green: #3fb950; --red: #f85149; --yellow: #d29922;
-      --surface: #161b22; --border: #30363d;
-      --mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background: var(--bg); color: var(--fg);
       display: grid; height: 100vh;
       grid-template-rows: auto 1fr auto;
       grid-template-columns: 220px 1fr 260px;

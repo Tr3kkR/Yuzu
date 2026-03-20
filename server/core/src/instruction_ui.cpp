@@ -8,56 +8,58 @@ extern const char* const kInstructionPageHtml = R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Instructions</title>
+<link rel="stylesheet" href="/static/yuzu.css">
 <script src="https://unpkg.com/htmx.org@1.9.12"></script>
 <style>
-body{background:#0d1117;color:#c9d1d9;font-family:system-ui,-apple-system,sans-serif;margin:0;padding:2rem}
-a{color:#58a6ff}h1{border-bottom:1px solid #21262d;padding-bottom:.5rem}
-.tabs{display:flex;gap:.5rem;margin-bottom:1rem;border-bottom:1px solid #21262d;padding-bottom:.5rem}
-.tab{padding:.4rem 1rem;cursor:pointer;border:1px solid transparent;border-radius:6px 6px 0 0;color:#8b949e}
-.tab.active,.tab:hover{color:#c9d1d9;border-color:#30363d;background:#161b22}
+body{padding:2rem}
+a{color:var(--accent)}h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
+.tabs{display:flex;gap:.5rem;margin-bottom:1rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}
+.tab{padding:.4rem 1rem;cursor:pointer;border:1px solid transparent;border-radius:6px 6px 0 0;color:var(--muted)}
+.tab.active,.tab:hover{color:var(--fg);border-color:var(--border);background:var(--surface)}
 table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid #21262d;font-size:.8rem}
-th{color:#8b949e;font-weight:600}
-.empty-state{color:#8b949e;text-align:center;padding:2rem}
+th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border);font-size:.8rem}
+th{color:var(--muted);font-weight:600}
+.empty-state{color:var(--muted);text-align:center;padding:2rem}
 .status-badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;font-size:.7rem;font-weight:600}
-.status-pending{background:#d29922;color:#0d1117}
+.status-pending{background:var(--yellow);color:#0d1117}
 .status-running{background:#1f6feb;color:#fff}
-.status-completed{background:#238636;color:#fff}
-.status-cancelled{background:#6e7681;color:#fff}
-.status-failed{background:#da3633;color:#fff}
-.status-approved{background:#238636;color:#fff}
-.status-rejected{background:#da3633;color:#fff}
-.btn{border:none;border-radius:6px;padding:.3rem .8rem;cursor:pointer;font-size:.75rem;font-weight:600;margin-right:.3rem}
-.btn-primary{background:#238636;color:#fff}
-.btn-secondary{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
-.btn-danger{background:#da3633;color:#fff}
+.status-completed{background:var(--green);color:#fff}
+.status-cancelled{background:var(--subtle);color:#fff}
+.status-failed{background:var(--red);color:#fff}
+.status-approved{background:var(--green);color:#fff}
+.status-rejected{background:var(--red);color:#fff}
+/* Instruction-page button overrides (smaller, denser) */
+.btn{height:auto;padding:.3rem .8rem;font-size:.75rem;margin-right:.3rem}
+.btn-primary{background:var(--green);color:#fff}
+.btn-secondary{background:var(--surface);color:var(--fg);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
 .btn-sm{padding:.2rem .5rem;font-size:.7rem}
-.progress-bar{width:80px;height:8px;background:#21262d;border-radius:4px;display:inline-block;vertical-align:middle}
-.progress-fill{height:100%;background:#238636;border-radius:4px}
-code{background:#161b22;padding:.1rem .3rem;border-radius:4px;font-size:.75rem}
+.progress-bar{width:80px;height:8px;background:var(--border);border-radius:4px;display:inline-block;vertical-align:middle}
+.progress-fill{height:100%;background:var(--green);border-radius:4px}
+code{background:var(--surface);padding:.1rem .3rem;border-radius:4px;font-size:.75rem}
 .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem}
 .role-badge{display:inline-block;padding:.1rem .4rem;border-radius:4px;font-size:.65rem;
   font-weight:600;background:#1f6feb;color:#fff;margin-left:.5rem;vertical-align:middle}
 /* Editor panel */
-.editor-panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.2rem;margin-bottom:1rem;display:none}
+.editor-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1rem;display:none}
 .editor-panel.active{display:block}
 .editor-tabs{display:flex;gap:.3rem;margin-bottom:1rem}
-.editor-tab{padding:.3rem .8rem;cursor:pointer;border:1px solid #30363d;border-radius:4px;
-  font-size:.75rem;color:#8b949e;background:transparent}
-.editor-tab.active{color:#c9d1d9;background:#21262d}
+.editor-tab{padding:.3rem .8rem;cursor:pointer;border:1px solid var(--border);border-radius:4px;
+  font-size:.75rem;color:var(--muted);background:transparent}
+.editor-tab.active{color:var(--fg);background:var(--border)}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
 .form-group{display:flex;flex-direction:column;gap:.2rem}
 .form-group.full{grid-column:1/-1}
-label{font-size:.75rem;color:#8b949e;font-weight:600}
-input,select,textarea{background:#0d1117;border:1px solid #30363d;border-radius:4px;
-  padding:.4rem .6rem;color:#c9d1d9;font-size:.8rem;font-family:inherit}
-textarea{font-family:'Cascadia Code','Fira Code',monospace;min-height:300px;resize:vertical;tab-size:2;display:none}
-input:focus,select:focus,textarea:focus{border-color:#58a6ff;outline:none}
+label{font-size:.75rem;color:var(--muted);font-weight:600}
+input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:4px;
+  padding:.4rem .6rem;color:var(--fg);font-size:.8rem;font-family:inherit}
+textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2;display:none}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 /* YAML syntax-highlighted editor */
-.yaml-editor{background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:.6rem;
-  font-family:'Cascadia Code','Fira Code',monospace;font-size:.8rem;line-height:1.6;
-  min-height:300px;overflow:auto;white-space:pre;color:#c9d1d9;outline:none;tab-size:2}
-.yaml-editor:focus{border-color:#58a6ff}
+.yaml-editor{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.6rem;
+  font-family:var(--font-mono);font-size:.8rem;line-height:1.6;
+  min-height:300px;overflow:auto;white-space:pre;color:var(--fg);outline:none;tab-size:2}
+.yaml-editor:focus{border-color:var(--accent)}
 /* Syntax token colors — GitHub-dark-inspired */
 .yk{color:#79c0ff}                     /* YAML key */
 .yv{color:#a5d6ff}                     /* YAML string value */
@@ -76,9 +78,8 @@ input:focus,select:focus,textarea:focus{border-color:#58a6ff;outline:none}
 .yaml-legend span{display:flex;align-items:center;gap:.3rem}
 .yaml-legend .swatch{width:10px;height:10px;border-radius:2px;display:inline-block}
 .form-actions{margin-top:1rem;display:flex;gap:.5rem}
-.alert{padding:.5rem 1rem;border-radius:6px;font-size:.8rem;margin-bottom:.8rem}
-.alert-error{background:#3d1418;border:1px solid #da3633;color:#f85149}
-.alert-success{background:#0d2818;border:1px solid #238636;color:#3fb950}
+/* alert overrides (shared .alert base from yuzu.css, page-specific padding) */
+.alert{padding:.5rem 1rem;font-size:.8rem;margin-bottom:.8rem}
 .legacy-badge{font-size:.65rem;background:#6e7681;color:#fff;padding:.05rem .4rem;border-radius:3px}
 </style>
 </head><body>

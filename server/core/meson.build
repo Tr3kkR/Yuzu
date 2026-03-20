@@ -79,6 +79,8 @@ yuzu_server_core_lib = static_library(
     'src/api_token_store.cpp',
     'src/quarantine_store.cpp',
     'src/rest_api_v1.cpp',
+    'src/css_bundle.cpp',
+    'src/icons_svg.cpp',
   ),
   include_directories: ['include'],
   cpp_args: https_cpp_args + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),

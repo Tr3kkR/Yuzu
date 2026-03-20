@@ -72,6 +72,10 @@ extern const char* const kInstructionPageHtml;
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
+// Shared design system assets (css_bundle.cpp, icons_svg.cpp).
+extern const char* const kYuzuCss;
+extern const char* const kYuzuIconsSvg;
+
 namespace yuzu::server {
 
 namespace detail {
@@ -3298,7 +3302,8 @@ private:
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
                 // Allow unauthenticated access to login page, metrics, health, and OIDC flow
                 if (req.path == "/login" || req.path == "/metrics" || req.path == "/health" ||
-                    req.path == "/auth/oidc/start" || req.path == "/auth/callback") {
+                    req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
+                    req.path.starts_with("/static/")) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -3503,6 +3508,18 @@ private:
                                 .dump(),
                             "application/json");
         });
+
+        // -- Static design-system assets ----------------------------------------
+        web_server_->Get("/static/yuzu.css",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=3600");
+                             res.set_content(kYuzuCss, "text/css; charset=utf-8");
+                         });
+        web_server_->Get("/static/icons.svg",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=3600");
+                             res.set_content(kYuzuIconsSvg, "image/svg+xml");
+                         });
 
         // -- Dashboard (unified UI) -------------------------------------------
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {

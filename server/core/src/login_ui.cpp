@@ -8,17 +8,9 @@ extern const char* const kLoginHtml =
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu — Login</title>
+  <link rel="stylesheet" href="/static/yuzu.css">
   <style>
-    :root {
-      --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff;
-      --green: #3fb950; --red: #f85149;
-      --surface: #161b22; --border: #30363d;
-      --mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      background: var(--bg); color: var(--fg);
       display: flex; align-items: center; justify-content: center;
       height: 100vh;
     }
