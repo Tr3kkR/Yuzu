@@ -309,6 +309,8 @@ std::expected<void, std::string> ManagementGroupStore::update_group(const Manage
 std::expected<void, std::string> ManagementGroupStore::delete_group(const std::string& id) {
     if (!db_)
         return std::unexpected("database not open");
+    if (id == kRootGroupId)
+        return std::unexpected("cannot delete root group");
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM management_groups WHERE id = ?;", -1, &s, nullptr) !=
         SQLITE_OK)
@@ -574,6 +576,51 @@ ManagementGroupStore::get_visible_agents(const std::string& username) const {
         result.emplace_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
     sqlite3_finalize(s);
     return result;
+}
+
+// ── Counting ─────────────────────────────────────────────────────────────────
+
+size_t ManagementGroupStore::count_groups() const {
+    if (!db_)
+        return 0;
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM management_groups;", -1, &s, nullptr) !=
+        SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW)
+        n = static_cast<size_t>(sqlite3_column_int64(s, 0));
+    sqlite3_finalize(s);
+    return n;
+}
+
+size_t ManagementGroupStore::count_all_members() const {
+    if (!db_)
+        return 0;
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM management_group_members;", -1, &s, nullptr) !=
+        SQLITE_OK)
+        return 0;
+    size_t n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW)
+        n = static_cast<size_t>(sqlite3_column_int64(s, 0));
+    sqlite3_finalize(s);
+    return n;
+}
+
+size_t ManagementGroupStore::count_members(const std::string& group_id) const {
+    if (!db_)
+        return 0;
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM management_group_members WHERE group_id = ?;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
+    size_t n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW)
+        n = static_cast<size_t>(sqlite3_column_int64(s, 0));
+    sqlite3_finalize(s);
+    return n;
 }
 
 } // namespace yuzu::server

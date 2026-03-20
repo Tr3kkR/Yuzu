@@ -241,9 +241,70 @@ Get a single group's details including its current members.
 
 ---
 
+#### `PUT /api/v1/management-groups/{id}`
+
+Update a management group. Only the fields provided in the request body are changed; omitted fields retain their current values.
+
+**Permission:** `ManagementGroup:Write`
+
+**Request body:**
+
+```json
+{
+  "name": "EU Production Servers (Renamed)",
+  "description": "Updated description",
+  "parent_id": "f6e5d4c3b2a1",
+  "membership_type": "dynamic",
+  "scope_expression": "os = 'linux' AND tag:environment = 'production'"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | New group name (must be unique) |
+| `description` | string | No | Updated description |
+| `parent_id` | string | No | New parent group ID (empty string for root-level) |
+| `membership_type` | string | No | `"static"` or `"dynamic"` |
+| `scope_expression` | string | No | Scope engine expression for dynamic groups |
+
+**Validation rules:**
+
+- The root group (`000000000000`, "All Devices") cannot be re-parented. Attempting to set `parent_id` on the root group returns `400`.
+- **Cycle detection:** The new parent must not be a descendant of the group being updated. Moving a group under one of its own children would create a circular hierarchy and returns `400`.
+- **Depth limit:** Re-parenting must not exceed the maximum hierarchy depth of 5 levels. Returns `400` if exceeded.
+
+**Response:**
+
+```json
+{
+  "data": { "updated": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- cycle detected:**
+
+```json
+{
+  "error": "re-parenting would create a cycle",
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- root group re-parent:**
+
+```json
+{
+  "error": "cannot re-parent root group",
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
 #### `DELETE /api/v1/management-groups/{id}`
 
-Delete a management group. Fails if the group has children.
+Delete a management group. The root group ("All Devices", ID `000000000000`) cannot be deleted and returns `403 Forbidden`. Deleting a group cascade-deletes all child groups, their membership records, and their role assignments.
 
 **Permission:** `ManagementGroup:Delete`
 
@@ -252,6 +313,15 @@ Delete a management group. Fails if the group has children.
 ```json
 {
   "data": { "deleted": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (403) -- root group:**
+
+```json
+{
+  "error": "cannot delete root group",
   "meta": { "api_version": "v1" }
 }
 ```
@@ -941,6 +1011,7 @@ Query audit events.
 | Action | Description |
 |---|---|
 | `management_group.create` | Group created |
+| `management_group.update` | Group updated (rename, re-parent, membership type change) |
 | `management_group.delete` | Group deleted |
 | `management_group.add_member` | Agent added to group |
 | `management_group.remove_member` | Agent removed from group |
@@ -1318,6 +1389,18 @@ yuzu_server_grpc_requests_total{method="Heartbeat",status="ok"} 12483
 yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="0.1"} 89
 yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="1.0"} 95
 yuzu_server_command_duration_seconds_bucket{plugin="hardware",le="+Inf"} 96
+```
+
+**Management group metrics:**
+
+```
+# HELP yuzu_server_management_groups_total Total number of management groups
+# TYPE yuzu_server_management_groups_total gauge
+yuzu_server_management_groups_total 5
+
+# HELP yuzu_server_group_members_total Total members across all management groups
+# TYPE yuzu_server_group_members_total gauge
+yuzu_server_group_members_total 42
 ```
 
 All server metrics use the `yuzu_server_` prefix. Standard labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.

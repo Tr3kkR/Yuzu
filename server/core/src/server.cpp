@@ -586,6 +586,7 @@ public:
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
+    void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override {
@@ -725,6 +726,9 @@ public:
         // ── Agent is enrolled — proceed with registration ────────────────
 
         registry_.register_agent(info);
+        // Auto-add to root management group
+        if (mgmt_group_store_ && mgmt_group_store_->is_open())
+            mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
         if (analytics_store_) {
             AnalyticsEvent ae;
@@ -1219,6 +1223,7 @@ private:
     TagStore* tag_store_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
+    ManagementGroupStore* mgmt_group_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1238,6 +1243,8 @@ public:
                                AgentHealthStore* health_store = nullptr)
         : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
           metrics_(metrics), health_store_(health_store) {}
+
+    void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
 
     // -- ProxyRegister --------------------------------------------------------
     // Gateway forwards an agent's RegisterRequest.  We run the same enrollment
@@ -1310,6 +1317,9 @@ public:
 
         // ── Enrolled — register the agent ────────────────────────────────────
         registry_.register_agent(info);
+        // Auto-add to root management group
+        if (mgmt_group_store_ && mgmt_group_store_->is_open())
+            mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
         auto session_id =
             "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
@@ -1448,6 +1458,7 @@ private:
     auth::AutoApproveEngine& auto_approve_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
+    ManagementGroupStore* mgmt_group_store_{nullptr};
 
     // Map of gateway session_id → agent_id for validation.
     std::mutex sessions_mu_;
@@ -1499,6 +1510,10 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_commands_executed_total",
                           "Fleet-wide commands executed (sum of agent-reported counts)", "gauge");
+        metrics_.describe("yuzu_server_management_groups_total",
+                         "Total number of management groups", "gauge");
+        metrics_.describe("yuzu_server_group_members_total",
+                         "Total members across all management groups", "gauge");
         metrics_.describe("yuzu_heartbeats_received_total", "Total heartbeats received from agents",
                           "counter");
 
@@ -1684,6 +1699,25 @@ public:
         {
             auto mgmt_db = cfg_.auth_config_path.parent_path() / "management-groups.db";
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
+            // Ensure root "All Devices" group exists
+            if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
+                auto root = mgmt_group_store_->get_group(ManagementGroupStore::kRootGroupId);
+                if (!root) {
+                    ManagementGroup g;
+                    g.id = ManagementGroupStore::kRootGroupId;
+                    g.name = "All Devices";
+                    g.description = "Root group containing all enrolled agents";
+                    g.membership_type = "dynamic";
+                    g.scope_expression = "*";
+                    g.created_by = "system";
+                    auto r = mgmt_group_store_->create_group(g);
+                    if (r)
+                        spdlog::info("Auto-created root management group 'All Devices'");
+                }
+            }
+            agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
+            if (gateway_service_)
+                gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
         }
         {
             auto token_db = cfg_.auth_config_path.parent_path() / "api-tokens.db";
@@ -2879,6 +2913,149 @@ private:
         return html;
     }
 
+    // -- Management Groups fragment renderer -----------------------------------
+
+    std::string render_management_groups_fragment() {
+        if (!mgmt_group_store_ || !mgmt_group_store_->is_open())
+            return "<span style=\"color:#484f58\">Management group store not available</span>";
+
+        auto groups = mgmt_group_store_->list_groups();
+
+        // Build parent->children map and find roots
+        std::unordered_map<std::string, std::vector<const ManagementGroup*>> children_map;
+        std::vector<const ManagementGroup*> roots;
+        for (const auto& g : groups) {
+            if (g.parent_id.empty())
+                roots.push_back(&g);
+            else
+                children_map[g.parent_id].push_back(&g);
+        }
+
+        // Sort roots: "All Devices" first
+        std::sort(roots.begin(), roots.end(), [](const ManagementGroup* a, const ManagementGroup* b) {
+            if (a->id == ManagementGroupStore::kRootGroupId)
+                return true;
+            if (b->id == ManagementGroupStore::kRootGroupId)
+                return false;
+            return a->name < b->name;
+        });
+
+        std::string html;
+
+        // Summary row
+        html += "<div style=\"margin-bottom:0.75rem;font-size:0.75rem;color:#8b949e\">"
+                "Total groups: " +
+                std::to_string(groups.size()) + " &middot; Total memberships: " +
+                std::to_string(mgmt_group_store_->count_all_members()) + "</div>";
+
+        // Tree table
+        html += "<table class=\"user-table\">"
+                "<thead><tr>"
+                "<th>Group</th>"
+                "<th>Type</th>"
+                "<th>Members</th>"
+                "<th>Actions</th>"
+                "</tr></thead><tbody>";
+
+        // Recursive tree renderer
+        std::function<void(const ManagementGroup*, int)> render_node =
+            [&](const ManagementGroup* g, int depth) {
+                auto member_count = mgmt_group_store_->count_members(g->id);
+                bool is_root = (g->id == ManagementGroupStore::kRootGroupId);
+
+                std::string indent;
+                for (int i = 0; i < depth; ++i)
+                    indent += "&nbsp;&nbsp;&nbsp;&nbsp;";
+                if (depth > 0)
+                    indent += "<span style=\"color:#484f58\">&boxur;</span> ";
+
+                std::string name_style = is_root ? "font-weight:600" : "";
+                std::string type_badge;
+                if (g->membership_type == "dynamic") {
+                    type_badge = "<span style=\"background:#1f6feb;color:#fff;padding:1px 6px;"
+                                 "border-radius:3px;font-size:0.7rem\">dynamic</span>";
+                } else {
+                    type_badge = "<span style=\"background:#484f58;color:#c9d1d9;padding:1px 6px;"
+                                 "border-radius:3px;font-size:0.7rem\">static</span>";
+                }
+
+                html += "<tr>";
+                html += "<td>" + indent + "<span style=\"" + name_style + "\">" + g->name +
+                         "</span></td>";
+                html += "<td>" + type_badge + "</td>";
+                html += "<td>" + std::to_string(member_count) + "</td>";
+                html += "<td>";
+                // Delete button (not for root group)
+                if (!is_root) {
+                    html +=
+                        "<button class=\"btn btn-sm\" "
+                        "hx-delete=\"/api/settings/management-groups/" +
+                        g->id +
+                        "\" "
+                        "hx-target=\"#mgmt-groups-section\" "
+                        "hx-confirm=\"Delete group '" +
+                        g->name +
+                        "' and all children?\" "
+                        "style=\"font-size:0.7rem;padding:1px 6px;color:#f85149;border-color:#f85149"
+                        "\">Delete</button>";
+                }
+                html += "</td></tr>";
+
+                // Render children
+                auto it = children_map.find(g->id);
+                if (it != children_map.end()) {
+                    auto sorted_children = it->second;
+                    std::sort(sorted_children.begin(), sorted_children.end(),
+                              [](const ManagementGroup* a, const ManagementGroup* b) {
+                                  return a->name < b->name;
+                              });
+                    for (const auto* child : sorted_children)
+                        render_node(child, depth + 1);
+                }
+            };
+
+        for (const auto* root : roots)
+            render_node(root, 0);
+
+        html += "</tbody></table>";
+
+        // Create group form
+        html +=
+            "<div style=\"margin-top:0.75rem\">"
+            "<details><summary style=\"cursor:pointer;color:#58a6ff;font-size:0.8rem\">"
+            "Create group</summary>"
+            "<form hx-post=\"/api/settings/management-groups\" "
+            "hx-target=\"#mgmt-groups-section\" "
+            "hx-swap=\"innerHTML\" "
+            "style=\"display:flex;gap:0.5rem;flex-wrap:wrap;margin-top:0.5rem;align-items:end\">"
+            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Name</label>"
+            "<input type=\"text\" name=\"name\" required "
+            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
+            "padding:4px 8px;border-radius:4px;font-size:0.8rem\"></div>"
+            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Parent</label>"
+            "<select name=\"parent_id\" "
+            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
+            "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
+            "<option value=\"\">— root —</option>";
+        for (const auto& g : groups) {
+            html += "<option value=\"" + g.id + "\">" + g.name + "</option>";
+        }
+        html +=
+            "</select></div>"
+            "<div><label style=\"font-size:0.7rem;color:#8b949e\">Type</label>"
+            "<select name=\"membership_type\" "
+            "style=\"display:block;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;"
+            "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
+            "<option value=\"static\">static</option>"
+            "<option value=\"dynamic\">dynamic</option>"
+            "</select></div>"
+            "<button type=\"submit\" class=\"btn\" "
+            "style=\"font-size:0.8rem;padding:4px 12px\">Create</button>"
+            "</form></details></div>";
+
+        return html;
+    }
+
     // -- OTA Updates fragment renderer ----------------------------------------
 
     std::string render_updates_fragment() {
@@ -3289,6 +3466,13 @@ private:
 
         // -- Prometheus metrics endpoint ----------------------------------------
         web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+            // Refresh management group gauges before serializing
+            if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
+                metrics_.gauge("yuzu_server_management_groups_total")
+                    .set(static_cast<double>(mgmt_group_store_->count_groups()));
+                metrics_.gauge("yuzu_server_group_members_total")
+                    .set(static_cast<double>(mgmt_group_store_->count_all_members()));
+            }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
 
@@ -3772,7 +3956,84 @@ private:
                                                 "text/html; charset=utf-8");
                             });
 
-        // -- Settings HTMX fragment: OTA Updates ---------------------------------
+        // -- Settings HTMX fragment: Management Groups ----------------------------
+
+        web_server_->Get("/fragments/settings/management-groups",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "ManagementGroup", "Read"))
+                                 return;
+                             res.set_content(render_management_groups_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
+
+        web_server_->Post("/api/settings/management-groups",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "ManagementGroup", "Write"))
+                                  return;
+                              auto name = extract_form_value(req.body, "name");
+                              auto parent_id = extract_form_value(req.body, "parent_id");
+                              auto mtype = extract_form_value(req.body, "membership_type");
+                              if (name.empty()) {
+                                  res.set_content(
+                                      "<span class=\"feedback-error\">Name required</span>",
+                                      "text/html; charset=utf-8");
+                                  return;
+                              }
+                              ManagementGroup g;
+                              g.name = name;
+                              g.parent_id = parent_id;
+                              g.membership_type = mtype.empty() ? "static" : mtype;
+                              auto session = require_auth(req, res);
+                              if (session)
+                                  g.created_by = session->username;
+                              auto result = mgmt_group_store_->create_group(g);
+                              if (!result) {
+                                  res.set_content(
+                                      "<span class=\"feedback-error\">" + result.error() + "</span>",
+                                      "text/html; charset=utf-8");
+                                  return;
+                              }
+                              if (audit_store_) {
+                                  AuditEvent ae;
+                                  ae.principal = session ? session->username : "unknown";
+                                  ae.action = "management_group.create";
+                                  ae.target_type = "ManagementGroup";
+                                  ae.target_id = *result;
+                                  ae.detail = name;
+                                  ae.result = "success";
+                                  audit_store_->log(ae);
+                              }
+                              res.set_content(render_management_groups_fragment(),
+                                              "text/html; charset=utf-8");
+                          });
+
+        web_server_->Delete(
+            R"(/api/settings/management-groups/([a-f0-9]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "ManagementGroup", "Delete"))
+                    return;
+                auto id = req.matches[1].str();
+                auto result = mgmt_group_store_->delete_group(id);
+                if (!result) {
+                    res.set_content(
+                        "<span class=\"feedback-error\">" + result.error() + "</span>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                auto session = require_auth(req, res);
+                if (audit_store_) {
+                    AuditEvent ae;
+                    ae.principal = session ? session->username : "unknown";
+                    ae.action = "management_group.delete";
+                    ae.target_type = "ManagementGroup";
+                    ae.target_id = id;
+                    ae.result = "success";
+                    audit_store_->log(ae);
+                }
+                res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
+            });
+
+        // -- Settings HTMX fragment: Tag Compliance / OTA Updates ----------------
 
         web_server_->Get("/fragments/settings/tag-compliance",
                          [this](const httplib::Request& req, httplib::Response& res) {
@@ -3991,8 +4252,37 @@ private:
 
         // -- Agent listing API ------------------------------------------------
 
-        web_server_->Get("/api/agents", [this](const httplib::Request&, httplib::Response& res) {
-            res.set_content(registry_.to_json(), "application/json");
+        web_server_->Get("/api/agents", [this](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session)
+                return;
+
+            auto full_json = registry_.to_json();
+
+            // If RBAC is enabled, filter to visible agents for non-global-admins
+            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
+                bool global_read =
+                    rbac_store_->check_permission(session->username, "Infrastructure", "Read");
+                if (!global_read) {
+                    auto visible = mgmt_group_store_->get_visible_agents(session->username);
+                    std::set<std::string> visible_set(visible.begin(), visible.end());
+                    try {
+                        auto arr = nlohmann::json::parse(full_json);
+                        nlohmann::json filtered = nlohmann::json::array();
+                        for (const auto& a : arr) {
+                            if (a.contains("agent_id") &&
+                                visible_set.count(a["agent_id"].get<std::string>()))
+                                filtered.push_back(a);
+                        }
+                        res.set_content(filtered.dump(), "application/json");
+                        return;
+                    } catch (...) {
+                        // Fall through to unfiltered
+                    }
+                }
+            }
+
+            res.set_content(full_json, "application/json");
         });
 
         web_server_->Get("/api/help", [this](const httplib::Request&, httplib::Response& res) {

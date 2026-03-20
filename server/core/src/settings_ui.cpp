@@ -328,6 +328,22 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── Management Groups ──────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Management Groups</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Organize devices into a hierarchy for access scoping and targeted operations.
+        </p>
+        <div id="mgmt-groups-section"
+             hx-get="/fragments/settings/management-groups"
+             hx-trigger="load, refreshMgmtGroups from:body"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Tag Compliance ──────────────────────────────────── -->
     <div class="section">
       <div class="section-header">Tag Compliance</div>

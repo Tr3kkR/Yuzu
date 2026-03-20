@@ -7,15 +7,27 @@ Management groups organize devices into a hierarchy for scoped access control an
 | Concept | Description |
 |---|---|
 | **Management group** | A named container for devices, with optional parent/child relationships. |
+| **Root group** | The built-in "All Devices" group (ID `000000000000`) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group. |
 | **Static membership** | Agents are explicitly added to or removed from the group by an operator. |
 | **Dynamic membership** | A scope expression (e.g., `os = "Windows" AND tag:department = "Finance"`) determines membership. Matching agents are included automatically. |
-| **Hierarchy** | Groups can be nested up to 6 levels deep (root + 5 child levels). Role assignments on a parent group cascade to all children. |
+| **Hierarchy** | Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children. |
 | **Service groups** | When a `service` tag is set on an agent, Yuzu auto-creates a `Service: {name}` management group containing all agents with that tag. |
+| **Visibility filtering** | Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership. |
+
+## Root Group
+
+The root "All Devices" group is special:
+
+- **Auto-created on startup** -- if the group does not exist when the server starts, it is created automatically with ID `000000000000`, membership type `dynamic`, and scope expression `*`.
+- **Auto-enrollment** -- when a new agent completes registration (whether via manual approval, enrollment token, or platform trust), it is automatically added to the root group.
+- **Cannot be deleted** -- `DELETE /api/v1/management-groups/000000000000` returns `403 Forbidden`.
+- **Cannot be re-parented** -- `PUT /api/v1/management-groups/000000000000` with a `parent_id` returns `400 Bad Request`.
+- **Can be renamed** -- you may update the root group's name or description via the PUT endpoint.
 
 ## Hierarchy Example
 
 ```
-All Devices
+All Devices (root, auto-created)
   |-- London Office
   |     |-- London Desktops
   |     |-- London Servers
@@ -26,6 +38,16 @@ All Devices
 ```
 
 A role assignment on "London Office" applies to both "London Desktops" and "London Servers". This avoids duplicating role assignments at every level.
+
+## Visibility Filtering
+
+When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:
+
+- **Global administrators** (users with the `Infrastructure:Read` permission) see all agents.
+- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator, Viewer, or ITServiceOwner).
+- This applies to the dashboard view, the `/api/agents` endpoint, and any UI page that lists devices.
+
+For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
 
 ## REST API
 
@@ -159,6 +181,62 @@ curl -s -b cookies.txt \
 
 Note: The `members` array contains `agent_id`, `source` (either `"static"` or `"dynamic"`), and `added_at` (Unix epoch seconds). It does not include hostname or OS -- use the agent details endpoint for that information.
 
+### Update a Group
+
+Use `PUT` to rename a group, change its description, re-parent it, or switch between static and dynamic membership. Only the fields you include in the request body are changed; omitted fields keep their current values.
+
+#### Rename a Group
+
+```bash
+curl -s -b cookies.txt -X PUT \
+  http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "London Production Servers",
+    "description": "Renamed from London Servers"
+  }'
+```
+
+#### Re-parent a Group
+
+Move a group under a different parent:
+
+```bash
+curl -s -b cookies.txt -X PUT \
+  http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "parent_id": "mg_new_york"
+  }'
+```
+
+**Cycle detection:** If the new parent is a descendant of the group being updated, the server returns `400 Bad Request` with `"re-parenting would create a cycle"`. For example, you cannot move "London Office" under "London Desktops" because "London Desktops" is already a child of "London Office".
+
+**Root group restriction:** The root "All Devices" group cannot be re-parented. Attempting to set `parent_id` on the root group returns `400 Bad Request`.
+
+**Depth limit:** Re-parenting must not push the group beyond the maximum hierarchy depth of 5 levels below root. Returns `400` if exceeded.
+
+#### Convert to Dynamic Membership
+
+```bash
+curl -s -b cookies.txt -X PUT \
+  http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "membership_type": "dynamic",
+    "scope_expression": "os = \"Linux\" AND tag:environment = \"production\""
+  }'
+```
+
+Returns `200 OK`:
+
+```json
+{
+  "data": { "updated": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
 ### Delete a Group
 
 ```bash
@@ -171,6 +249,15 @@ Returns `200 OK`:
 ```json
 {
   "data": { "deleted": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The root "All Devices" group (ID `000000000000`) cannot be deleted. Attempting to do so returns `403 Forbidden`:
+
+```json
+{
+  "error": "cannot delete root group",
   "meta": { "api_version": "v1" }
 }
 ```
@@ -350,6 +437,27 @@ curl -s -b cookies.txt -X POST \
 
 Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdesk` group can view those devices -- but neither has access to APAC devices.
 
+## Dashboard Management
+
+Management groups are managed through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
+
+From the Settings page, administrators can:
+
+- **Create groups** -- specify name, description, parent, and membership type.
+- **View member counts** -- each group row shows the number of member agents.
+- **Delete groups** -- a delete button appears on every group except the root group.
+
+Group updates (rename, re-parent, membership type changes) are performed via the REST API `PUT` endpoint.
+
+## Prometheus Metrics
+
+Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_management_groups_total` | gauge | Total number of management groups |
+| `yuzu_server_group_members_total` | gauge | Total membership records across all groups |
+
 ## API Endpoint Summary
 
 | Method | Endpoint | Description |
@@ -357,7 +465,8 @@ Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdes
 | `GET` | `/api/v1/management-groups` | List all management groups |
 | `POST` | `/api/v1/management-groups` | Create a management group |
 | `GET` | `/api/v1/management-groups/{id}` | Get group details and members |
-| `DELETE` | `/api/v1/management-groups/{id}` | Delete a management group |
+| `PUT` | `/api/v1/management-groups/{id}` | Update a group (rename, re-parent, change membership type) |
+| `DELETE` | `/api/v1/management-groups/{id}` | Delete a management group (root group returns 403) |
 | `POST` | `/api/v1/management-groups/{id}/members` | Add an agent to a static group |
 | `DELETE` | `/api/v1/management-groups/{id}/members/{agent_id}` | Remove an agent from a group |
 | `GET` | `/api/v1/management-groups/{id}/roles` | List role assignments for a group |
@@ -368,16 +477,18 @@ Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdes
 
 | Constraint | Value |
 |---|---|
-| Maximum hierarchy depth | 6 levels (root + 5 child levels). The parent's ancestor count must be < 5. |
+| Root group ID | `000000000000` -- auto-created on startup, cannot be deleted or re-parented |
+| Maximum hierarchy depth | 5 levels below root (root + 5 child levels) |
+| Cycle detection | Re-parenting a group under one of its own descendants is rejected |
 | Membership types | `static`, `dynamic` |
 | Delegatable roles | Only `Operator` and `Viewer` can be delegated via the roles API |
 | Cascade delete | Deleting a group cascade-deletes all children, memberships, and role assignments |
 | Dynamic scope syntax | Same as the scope engine (see `docs/yaml-dsl-spec.md` section on scope expressions) |
+| Visibility filtering | Non-admin users see only agents in groups where they hold a role assignment |
 
 ## Planned Features
 
 | Feature | Phase | Status |
 |---|---|---|
-| `PUT` endpoint for updating group metadata (name, description, parent, scope) | 3 | Store method exists, no REST route |
 | Policy assignment to management groups | 5 | Stub |
 | Dynamic membership auto-refresh on schedule | 3 | Stub |

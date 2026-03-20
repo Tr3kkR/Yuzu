@@ -83,6 +83,14 @@ public:
     /// Which agents can a user see based on group-scoped role assignments?
     std::vector<std::string> get_visible_agents(const std::string& username) const;
 
+    // ── Counting (for metrics / UI) ───────────────────────────────────────
+    size_t count_groups() const;
+    size_t count_all_members() const;
+    size_t count_members(const std::string& group_id) const;
+
+    /// Well-known root group ID.
+    static constexpr const char* kRootGroupId = "000000000000";
+
 private:
     sqlite3* db_{nullptr};
 

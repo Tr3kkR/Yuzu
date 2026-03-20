@@ -170,6 +170,41 @@ disconnect, plugin load) over a bidirectional stream. This is used internally
 by the gateway and can be consumed by custom integrations that prefer gRPC over
 SSE.
 
+## Management group metrics
+
+The server exposes two gauges for management group telemetry. These are
+refreshed on every `/metrics` scrape.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_management_groups_total` | gauge | Total number of management groups (including the root "All Devices" group) |
+| `yuzu_server_group_members_total` | gauge | Total membership records across all management groups |
+
+**Example output:**
+
+```
+# HELP yuzu_server_management_groups_total Total number of management groups
+# TYPE yuzu_server_management_groups_total gauge
+yuzu_server_management_groups_total 5
+
+# HELP yuzu_server_group_members_total Total members across all management groups
+# TYPE yuzu_server_group_members_total gauge
+yuzu_server_group_members_total 42
+```
+
+**Useful PromQL queries:**
+
+```promql
+# Total management groups
+yuzu_server_management_groups_total
+
+# Average members per group
+yuzu_server_group_members_total / yuzu_server_management_groups_total
+
+# Alert if no management groups exist (store may be down)
+yuzu_server_management_groups_total == 0
+```
+
 ## Useful PromQL queries
 
 ### Fleet overview

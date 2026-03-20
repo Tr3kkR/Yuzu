@@ -152,6 +152,86 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
+    // Update group (rename, re-parent, change description/membership)
+    svr.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
+            [auth_fn, perm_fn, audit_fn, mgmt_store](const httplib::Request& req,
+                                                      httplib::Response& res) {
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                if (!mgmt_store) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                auto existing = mgmt_store->get_group(id);
+                if (!existing) {
+                    res.status = 404;
+                    res.set_content(error_response("group not found").dump(), "application/json");
+                    return;
+                }
+
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded()) {
+                    res.status = 400;
+                    res.set_content(error_response("invalid JSON").dump(), "application/json");
+                    return;
+                }
+
+                // Merge provided fields over existing values
+                auto updated = *existing;
+                if (body.contains("name"))
+                    updated.name = body["name"].get<std::string>();
+                if (body.contains("description"))
+                    updated.description = body["description"].get<std::string>();
+                if (body.contains("parent_id"))
+                    updated.parent_id = body["parent_id"].get<std::string>();
+                if (body.contains("membership_type"))
+                    updated.membership_type = body["membership_type"].get<std::string>();
+                if (body.contains("scope_expression"))
+                    updated.scope_expression = body["scope_expression"].get<std::string>();
+
+                // Prevent re-parenting the root group
+                if (id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
+                    res.status = 400;
+                    res.set_content(error_response("cannot re-parent root group").dump(),
+                                    "application/json");
+                    return;
+                }
+
+                // Cycle detection: new parent must not be a descendant of this group
+                if (!updated.parent_id.empty() && updated.parent_id != existing->parent_id) {
+                    auto descendants = mgmt_store->get_descendant_ids(id);
+                    if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
+                        descendants.end()) {
+                        res.status = 400;
+                        res.set_content(
+                            error_response("re-parenting would create a cycle").dump(),
+                            "application/json");
+                        return;
+                    }
+                    // Depth check
+                    auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
+                    if (ancestors.size() >= 4) { // +1 for self = 5
+                        res.status = 400;
+                        res.set_content(
+                            error_response("maximum hierarchy depth (5) exceeded").dump(),
+                            "application/json");
+                        return;
+                    }
+                }
+
+                auto result = mgmt_store->update_group(updated);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(error_response(result.error()).dump(), "application/json");
+                    return;
+                }
+                audit_fn(req, "management_group.update", "success", "ManagementGroup", id,
+                         updated.name);
+                res.set_content(ok_response({{"updated", true}}).dump(), "application/json");
+            });
+
     svr.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+))",
         [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
@@ -165,7 +245,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             auto id = req.matches[1].str();
             auto result = mgmt_store->delete_group(id);
             if (!result) {
-                res.status = 404;
+                res.status = (result.error() == "cannot delete root group") ? 403 : 404;
                 res.set_content(error_response(result.error()).dump(), "application/json");
                 return;
             }
