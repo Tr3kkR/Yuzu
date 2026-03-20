@@ -1,7 +1,7 @@
 // Instruction management page with YAML authoring UI.
-// HTMX-driven with CodeMirror 6 YAML editor for Platform Engineers.
-// The authoring panel (New/Edit) is only shown to users with the
-// PlatformEngineer or Administrator role.
+// HTMX-driven with split-panel editor: textarea (left) + server-rendered
+// syntax-highlighted preview (right). The authoring panel (New/Edit) is
+// only shown to users with the PlatformEngineer or Administrator role.
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kInstructionPageHtml = R"HTM(<!DOCTYPE html>
@@ -53,13 +53,8 @@ code{background:var(--surface);padding:.1rem .3rem;border-radius:4px;font-size:.
 label{font-size:.75rem;color:var(--muted);font-weight:600}
 input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:4px;
   padding:.4rem .6rem;color:var(--fg);font-size:.8rem;font-family:inherit}
-textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2;display:none}
+textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
-/* YAML syntax-highlighted editor */
-.yaml-editor{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.6rem;
-  font-family:var(--font-mono);font-size:.8rem;line-height:1.6;
-  min-height:300px;overflow:auto;white-space:pre;color:var(--fg);outline:none;tab-size:2}
-.yaml-editor:focus{border-color:var(--accent)}
 /* Syntax token colors — GitHub-dark-inspired */
 .yk{color:#79c0ff}                     /* YAML key */
 .yv{color:#a5d6ff}                     /* YAML string value */
@@ -167,7 +162,14 @@ function showTab(name, el) {
 function openEditor(defId) {
     var url = defId ? '/fragments/instructions/editor?id=' + defId : '/fragments/instructions/editor';
     htmx.ajax('GET', url, {target:'#editor-host', swap:'innerHTML'}).then(function(){
-        setTimeout(initHighlighter, 50);
+        setTimeout(function() {
+            initScrollSync();
+            /* Trigger initial preview render for existing YAML */
+            var ta = document.getElementById('yaml-editor');
+            if (ta && ta.value.trim()) {
+                htmx.trigger(ta, 'keyup');
+            }
+        }, 50);
     });
 }
 function closeEditor() {
@@ -179,94 +181,16 @@ function switchEditorMode(mode, el) {
     document.getElementById('form-mode').style.display = mode === 'form' ? 'block' : 'none';
     document.getElementById('yaml-mode').style.display = mode === 'yaml' ? 'block' : 'none';
 }
-// --- YAML Syntax Highlighter ---
-function highlightYaml(text) {
-    return text.split('\n').map(function(line) {
-        // Comments
-        if (/^\s*#/.test(line))
-            return '<span class="yc">' + esc(line) + '</span>';
-        // apiVersion / kind lines (schema keywords)
-        if (/^\s*(apiVersion|kind):/.test(line)) {
-            var m = line.match(/^(\s*)(apiVersion|kind)(:)(.*)/);
-            return m ? m[1]+'<span class="ya">'+esc(m[2])+'</span>'+m[3]+'<span class="yv">'+esc(m[4])+'</span>' : esc(line);
-        }
-        // type: question vs action (privileged distinction)
-        if (/^\s*type:\s*(question|action)/.test(line)) {
-            var m = line.match(/^(\s*)(type)(:)\s*(question|action)(.*)/);
-            if (m) {
-                var cls = m[4]==='action' ? 'yt-a' : 'yt-q';
-                return m[1]+'<span class="yk">'+esc(m[2])+'</span>'+m[3]+' <span class="'+cls+'">'+esc(m[4])+'</span>'+esc(m[5]);
-            }
-        }
-        // approval mode highlighting
-        if (/^\s*approval:/.test(line)) {
-            var m = line.match(/^(\s*)(approval)(:)\s*(\S+)(.*)/);
-            if (m) {
-                var cls = m[4]==='auto' ? 'yap-auto' : 'yap';
-                return m[1]+'<span class="yk">'+esc(m[2])+'</span>'+m[3]+' <span class="'+cls+'">'+esc(m[4])+'</span>'+esc(m[5]);
-            }
-        }
-        // concurrency mode highlighting
-        if (/^\s*concurrency:/.test(line)) {
-            var m = line.match(/^(\s*)(concurrency)(:)\s*(\S+)(.*)/);
-            if (m)
-                return m[1]+'<span class="yk">'+esc(m[2])+'</span>'+m[3]+' <span class="ycc">'+esc(m[4])+'</span>'+esc(m[5]);
-        }
-        // List items (dashes)
-        if (/^\s*-\s/.test(line)) {
-            var m = line.match(/^(\s*)(-)(\s+)(.*)/);
-            if (m) return m[1]+'<span class="yd">'+m[2]+'</span>'+m[3]+highlightKV(m[4]);
-        }
-        // Key: value pairs
-        if (/:/.test(line)) return highlightKV(line);
-        return esc(line);
-    }).join('\n');
-}
-function highlightKV(line) {
-    var m = line.match(/^(\s*)([\w.\-]+)(:)(.*)/);
-    if (!m) return esc(line);
-    var val = m[4].trim();
-    var vcls = 'yv';
-    if (/^(true|false)$/i.test(val)) vcls = 'yb';
-    else if (/^\d+$/.test(val)) vcls = 'yn';
-    else if (/^["']/.test(val)) vcls = 'yv';
-    return m[1]+'<span class="yk">'+esc(m[2])+'</span>'+m[3]+'<span class="'+vcls+'">'+esc(m[4])+'</span>';
-}
-function esc(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-function syncYaml() {
-    var el = document.getElementById('yaml-highlighted');
-    if (el) document.getElementById('yaml-source').value = el.innerText;
-}
-function initHighlighter() {
-    var el = document.getElementById('yaml-highlighted');
-    if (!el) return;
-    var raw = el.innerText;
-    el.innerHTML = highlightYaml(raw);
-}
-// Re-highlight on input (debounced)
-var _hlTimer;
-document.addEventListener('input', function(e) {
-    if (e.target && e.target.id === 'yaml-highlighted') {
-        clearTimeout(_hlTimer);
-        _hlTimer = setTimeout(function() {
-            var sel = window.getSelection();
-            var range = sel.rangeCount ? sel.getRangeAt(0) : null;
-            var offset = range ? range.startOffset : 0;
-            var raw = e.target.innerText;
-            e.target.innerHTML = highlightYaml(raw);
-            // Best-effort caret restore
-            try {
-                var newRange = document.createRange();
-                newRange.setStart(e.target.firstChild || e.target, Math.min(offset, (e.target.firstChild||e.target).length||0));
-                newRange.collapse(true);
-                sel.removeAllRanges();
-                sel.addRange(newRange);
-            } catch(_) {}
-        }, 400);
+/* Scroll sync between textarea and preview panel */
+function initScrollSync() {
+    var ta = document.getElementById('yaml-editor');
+    var preview = document.getElementById('yaml-preview');
+    if (ta && preview) {
+        ta.addEventListener('scroll', function() {
+            preview.scrollTop = ta.scrollTop;
+        });
     }
-});
+}
 
 /* ── Populate nav bar + context bar ─────────────────────── */
 fetch('/api/me').then(function(r){return r.json()}).then(function(d){
@@ -297,9 +221,11 @@ function formToYaml() {
     if (d.get('platforms')) yaml += '  platforms: [' + d.get('platforms') + ']\n';
     yaml += '  parameters:\n    type: object\n    additionalProperties:\n      type: string\n';
     yaml += '  results:\n    - name: output\n      type: string\n';
-    document.getElementById('yaml-source').value = yaml;
-    var el = document.getElementById('yaml-highlighted');
-    if (el) { el.innerText = yaml; el.innerHTML = highlightYaml(yaml); }
+    var ta = document.getElementById('yaml-editor');
+    if (ta) {
+        ta.value = yaml;
+        htmx.trigger(ta, 'keyup');
+    }
     switchEditorMode('yaml', document.querySelectorAll('.editor-tab')[1]);
 }
 </script>
@@ -398,16 +324,25 @@ extern const char* const kInstructionEditorHtml = R"HTM(
                     <span><span class="swatch" style="background:#79c0ff"></span> keys</span>
                     <span><span class="swatch" style="background:#d2a8ff"></span> schema</span>
                 </div>
-                <div id="yaml-highlighted" class="yaml-editor" contenteditable="true"
-                     spellcheck="false" oninput="syncYaml()">{{YAML_SOURCE}}</div>
-                <textarea id="yaml-source" name="yaml_source" spellcheck="false">{{YAML_SOURCE}}</textarea>
+                <div class="yaml-split">
+                    <textarea id="yaml-editor" name="yaml_source"
+                              hx-post="/fragments/instructions/yaml-preview"
+                              hx-trigger="keyup changed delay:500ms"
+                              hx-target="#yaml-preview"
+                              hx-swap="innerHTML"
+                              spellcheck="false"
+                              placeholder="Paste or type YAML here...">{{YAML_SOURCE}}</textarea>
+                    <div id="yaml-preview" class="yaml-preview">
+                        <span style="color:var(--muted)">Preview will appear as you type...</span>
+                    </div>
+                </div>
+                <div id="yaml-errors" class="yaml-errors"></div>
             </div>
             <div class="form-actions">
-                <button type="submit" class="btn btn-primary" onclick="syncYaml()">Save Definition</button>
+                <button type="submit" class="btn btn-primary">Save Definition</button>
                 <button type="button" class="btn btn-secondary"
-                        onclick="syncYaml()"
                         hx-post="/api/instructions/validate-yaml"
-                        hx-include="#yaml-source"
+                        hx-include="#yaml-editor"
                         hx-target="#editor-alerts" hx-swap="innerHTML">Validate</button>
                 <button type="button" class="btn btn-secondary" onclick="closeEditor()">Cancel</button>
             </div>

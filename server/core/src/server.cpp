@@ -38,6 +38,7 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -1981,6 +1982,130 @@ private:
             }
         }
         return out;
+    }
+
+    // -- Server-side YAML syntax highlighter ----------------------------------
+    // Returns highlighted HTML from raw YAML source.  Each line is wrapped in
+    // <div class="yl"><span class="ln">N</span>content</div>.
+
+    static std::string highlight_yaml_value(const std::string& val) {
+        if (val.empty())
+            return {};
+        // Trim leading space for classification but keep original for output
+        auto trimmed = val;
+        auto sp = trimmed.find_first_not_of(' ');
+        if (sp == std::string::npos)
+            return html_escape(val);
+        trimmed = trimmed.substr(sp);
+
+        // Booleans
+        if (trimmed == "true" || trimmed == "false" || trimmed == "True" || trimmed == "False")
+            return "<span class=\"yb\">" + html_escape(val) + "</span>";
+        // Numbers
+        bool is_number = !trimmed.empty();
+        for (char c : trimmed) {
+            if (c != '-' && c != '.' && (c < '0' || c > '9')) {
+                is_number = false;
+                break;
+            }
+        }
+        if (is_number && !trimmed.empty())
+            return "<span class=\"yn\">" + html_escape(val) + "</span>";
+        // String value (quoted or bare)
+        return "<span class=\"yv\">" + html_escape(val) + "</span>";
+    }
+
+    static std::string highlight_yaml_kv(const std::string& line) {
+        // Match key: value — key is [\w.\-]+
+        std::size_t i = 0;
+        while (i < line.size() && line[i] == ' ')
+            ++i;
+        auto key_start = i;
+        while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) ||
+                                   line[i] == '_' || line[i] == '-' || line[i] == '.'))
+            ++i;
+        if (i >= line.size() || line[i] != ':' || i == key_start)
+            return html_escape(line);
+
+        auto indent = line.substr(0, key_start);
+        auto key = line.substr(key_start, i - key_start);
+        auto rest = line.substr(i + 1); // after ':'
+
+        // Special schema keywords
+        bool is_schema = (key == "apiVersion" || key == "kind");
+        std::string key_cls = is_schema ? "ya" : "yk";
+
+        return html_escape(indent) + "<span class=\"" + key_cls + "\">" +
+               html_escape(key) + "</span>:" + highlight_yaml_value(rest);
+    }
+
+    static std::string highlight_yaml(std::string_view source) {
+        std::string result;
+        result.reserve(source.size() * 2);
+        int line_num = 1;
+
+        std::size_t pos = 0;
+        while (pos <= source.size()) {
+            auto nl = source.find('\n', pos);
+            std::string line;
+            if (nl == std::string_view::npos) {
+                line = std::string(source.substr(pos));
+                pos = source.size() + 1;
+            } else {
+                line = std::string(source.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+
+            result += "<div class=\"yl\"><span class=\"ln\">" +
+                      std::to_string(line_num++) + "</span>";
+
+            // Classify line
+            auto trimmed_start = line.find_first_not_of(' ');
+            if (trimmed_start == std::string::npos) {
+                // Blank line
+                result += "&nbsp;";
+            } else if (line[trimmed_start] == '#') {
+                // Comment
+                result += "<span class=\"yc\">" + html_escape(line) + "</span>";
+            } else if (line == "---" || line == "...") {
+                // Document separator
+                result += "<span class=\"yd\">" + html_escape(line) + "</span>";
+            } else if (line[trimmed_start] == '-' && trimmed_start + 1 < line.size() &&
+                       line[trimmed_start + 1] == ' ') {
+                // List marker
+                auto indent = line.substr(0, trimmed_start);
+                auto after_dash = line.substr(trimmed_start + 2);
+                result += html_escape(indent) + "<span class=\"yd\">-</span> ";
+                // Check if remainder is key:value
+                if (after_dash.find(':') != std::string::npos)
+                    result += highlight_yaml_kv(after_dash);
+                else
+                    result += highlight_yaml_value(after_dash);
+            } else if (line.find(':') != std::string::npos) {
+                // Key: value pair
+                result += highlight_yaml_kv(line);
+            } else {
+                result += html_escape(line);
+            }
+
+            result += "</div>";
+        }
+        return result;
+    }
+
+    static std::vector<std::string> validate_yaml_source(const std::string& yaml_source) {
+        std::vector<std::string> errors;
+        if (yaml_source.empty())
+            errors.push_back("YAML source is empty");
+        if (yaml_source.find("apiVersion:") == std::string::npos)
+            errors.push_back("Missing apiVersion field");
+        if (yaml_source.find("kind:") == std::string::npos)
+            errors.push_back("Missing kind field");
+        if (yaml_source.find("plugin:") == std::string::npos)
+            errors.push_back("Missing spec.plugin field");
+        if (yaml_source.find("action:") == std::string::npos)
+            errors.push_back("Missing spec.action field");
+        return errors;
     }
 
     // -- Auth helpers for HTTP ------------------------------------------------
@@ -6025,18 +6150,7 @@ private:
                 return;
 
             auto yaml_source = req.get_param_value("yaml_source");
-            std::vector<std::string> errors;
-
-            if (yaml_source.empty())
-                errors.push_back("YAML source is empty");
-            if (yaml_source.find("apiVersion:") == std::string::npos)
-                errors.push_back("Missing apiVersion field");
-            if (yaml_source.find("kind:") == std::string::npos)
-                errors.push_back("Missing kind field");
-            if (yaml_source.find("plugin:") == std::string::npos)
-                errors.push_back("Missing spec.plugin field");
-            if (yaml_source.find("action:") == std::string::npos)
-                errors.push_back("Missing spec.action field");
+            auto errors = validate_yaml_source(yaml_source);
 
             if (errors.empty()) {
                 res.set_content("<div class=\"alert alert-success\">YAML validation passed</div>",
@@ -6050,6 +6164,30 @@ private:
                 res.set_content(html, "text/html");
             }
         });
+
+        // -- YAML preview endpoint (server-side highlighting + validation) --
+        web_server_->Post(
+            "/fragments/instructions/yaml-preview",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "InstructionDefinition", "Read"))
+                    return;
+
+                auto yaml_source = req.get_param_value("yaml_source");
+                auto highlighted = highlight_yaml(yaml_source);
+                auto errors = validate_yaml_source(yaml_source);
+
+                std::string html = highlighted;
+                if (!errors.empty()) {
+                    html += R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors">)";
+                    for (const auto& e : errors)
+                        html += "<div class='err'>" + html_escape(e) + "</div>";
+                    html += "</div>";
+                } else {
+                    html +=
+                        R"(<div id="yaml-errors" hx-swap-oob="innerHTML:#yaml-errors"></div>)";
+                }
+                res.set_content(html, "text/html");
+            });
 
         web_server_->Get("/fragments/executions", [this](const httplib::Request& req,
                                                          httplib::Response& res) {

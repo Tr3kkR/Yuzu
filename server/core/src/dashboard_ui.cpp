@@ -323,6 +323,26 @@ extern const char* const kDashboardIndexHtml =
   </div>
 
 )HTM"
+    // Part 1b: Command palette overlay
+    R"HTM(
+  <!-- ── Command Palette ─────────────────────────────────────── -->
+  <div id="cmd-palette" class="cmd-palette-overlay" style="display:none" onclick="if(event.target===this)cmdPalette.close()">
+    <div class="cmd-palette">
+      <div class="cmd-palette-input-row">
+        <svg class="icon"><use href="/static/icons.svg#search"></use></svg>
+        <input type="text" id="cmd-input" placeholder="Search agents, instructions, settings..." autocomplete="off" spellcheck="false">
+        <span class="cmd-palette-hint">ESC to close</span>
+      </div>
+      <div id="cmd-results" class="cmd-palette-results"></div>
+      <div class="cmd-palette-footer">
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
+        <span><kbd>&crarr;</kbd> select</span>
+        <span><kbd>esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+)HTM"
     // Part 2: HTML body continued
     R"HTM(
   <!-- ── History Panel ──────────────────────────────────────── -->
@@ -367,7 +387,7 @@ extern const char* const kDashboardIndexHtml =
     </div>
   </div>
 
-  <footer>Yuzu Server &mdash; Dashboard</footer>
+  <footer>Yuzu Server &mdash; Dashboard <span style="float:right;color:var(--subtle)">Press <kbd style="display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:18px;padding:0 4px;background:var(--bg);border:1px solid var(--border);border-radius:3px;font-size:0.6rem;font-family:var(--font-sans);color:var(--muted)">Ctrl+K</kbd> to search</span></footer>
 
   </div><!-- /.dashboard-grid -->
 )HTM"
@@ -970,6 +990,307 @@ extern const char* const kDashboardIndexHtml =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
+)HTM"
+    // Part 5: Command palette JavaScript
+    R"HTM(
+    /* ── Command Palette ─────────────────────────────────── */
+    var cmdPalette = {
+      isOpen: false,
+      selectedIndex: -1,
+      results: [],
+      agentsCache: null,
+
+      open: function() {
+        if (cmdPalette.isOpen) return;
+        cmdPalette.isOpen = true;
+        cmdPalette.selectedIndex = -1;
+        cmdPalette.results = [];
+        var overlay = document.getElementById('cmd-palette');
+        var input = document.getElementById('cmd-input');
+        overlay.style.display = 'flex';
+        input.value = '';
+        input.focus();
+        cmdPalette.showDefault();
+        /* Cache agents on first open */
+        if (!cmdPalette.agentsCache) {
+          cmdPalette.agentsCache = [];
+          var ids = Object.keys(agents);
+          for (var i = 0; i < ids.length; i++) {
+            var a = agents[ids[i]];
+            cmdPalette.agentsCache.push({
+              id: ids[i],
+              hostname: a.hostname || ids[i],
+              os: a.os || '?',
+              arch: a.arch || '?'
+            });
+          }
+        }
+      },
+
+      close: function() {
+        if (!cmdPalette.isOpen) return;
+        cmdPalette.isOpen = false;
+        document.getElementById('cmd-palette').style.display = 'none';
+        document.getElementById('cmd-input').value = '';
+        document.getElementById('cmd-results').innerHTML = '';
+      },
+
+      /* Static entries for settings and navigation */
+      settingsEntries: [
+        { name: 'Users', desc: 'Manage user accounts', url: '/settings#users', type: 'Settings' },
+        { name: 'Enrollment Tokens', desc: 'Manage enrollment tokens', url: '/settings#tokens', type: 'Settings' },
+        { name: 'Pending Agents', desc: 'Approve or deny pending agents', url: '/settings#pending', type: 'Settings' },
+        { name: 'TLS Settings', desc: 'Configure TLS certificates', url: '/settings#tls', type: 'Settings' },
+        { name: 'API Tokens', desc: 'Manage API tokens', url: '/settings#api-tokens', type: 'Settings' }
+      ],
+      navEntries: [
+        { name: 'Dashboard', desc: 'Main dashboard view', url: '/', type: 'Navigation' },
+        { name: 'Instructions', desc: 'Browse instruction definitions', url: '/instructions', type: 'Navigation' },
+        { name: 'Settings', desc: 'Server settings', url: '/settings', type: 'Navigation' },
+        { name: 'About', desc: 'About Yuzu', url: '#about', type: 'Navigation' }
+      ],
+
+      showDefault: function() {
+        /* Show navigation and a hint when palette first opens */
+        var results = [];
+        for (var i = 0; i < cmdPalette.navEntries.length; i++) {
+          results.push(cmdPalette.navEntries[i]);
+        }
+        cmdPalette.results = results;
+        cmdPalette.selectedIndex = 0;
+        cmdPalette.render();
+      },
+
+      search: function(query) {
+        if (!query) { cmdPalette.showDefault(); return; }
+        var q = query.toLowerCase();
+        var results = [];
+
+        /* Search instructions */
+        var instrResults = [];
+        if (helpData.plugins) {
+          for (var i = 0; i < helpData.plugins.length; i++) {
+            var p = helpData.plugins[i];
+            for (var j = 0; j < p.actions.length; j++) {
+              var fullName = p.name + ' ' + p.actions[j];
+              var desc = p.description || '';
+              if (fullName.toLowerCase().indexOf(q) >= 0 || desc.toLowerCase().indexOf(q) >= 0) {
+                instrResults.push({
+                  name: p.name + ' ' + p.actions[j],
+                  desc: desc,
+                  type: 'Instruction',
+                  plugin: p.name,
+                  action: p.actions[j]
+                });
+              }
+            }
+            /* Also match just the plugin name */
+            if (p.name.toLowerCase().indexOf(q) >= 0 && p.actions.length > 0) {
+              var already = false;
+              for (var k = 0; k < instrResults.length; k++) {
+                if (instrResults[k].plugin === p.name) { already = true; break; }
+              }
+              if (!already) {
+                instrResults.push({
+                  name: p.name + ' ' + p.actions[0],
+                  desc: p.description || '',
+                  type: 'Instruction',
+                  plugin: p.name,
+                  action: p.actions[0]
+                });
+              }
+            }
+          }
+        }
+
+        /* Search agents */
+        var agentResults = [];
+        var agentSrc = cmdPalette.agentsCache || [];
+        for (var i = 0; i < agentSrc.length; i++) {
+          var a = agentSrc[i];
+          if (a.hostname.toLowerCase().indexOf(q) >= 0 || a.id.toLowerCase().indexOf(q) >= 0) {
+            agentResults.push({
+              name: a.hostname,
+              desc: a.id.substring(0, 12) + ' \u00b7 ' + a.os + '/' + a.arch,
+              type: 'Agent',
+              agentId: a.id
+            });
+          }
+        }
+
+        /* Search settings */
+        var settingsResults = [];
+        for (var i = 0; i < cmdPalette.settingsEntries.length; i++) {
+          var s = cmdPalette.settingsEntries[i];
+          if (s.name.toLowerCase().indexOf(q) >= 0 || s.desc.toLowerCase().indexOf(q) >= 0) {
+            settingsResults.push(s);
+          }
+        }
+
+        /* Search navigation */
+        var navResults = [];
+        for (var i = 0; i < cmdPalette.navEntries.length; i++) {
+          var n = cmdPalette.navEntries[i];
+          if (n.name.toLowerCase().indexOf(q) >= 0 || n.desc.toLowerCase().indexOf(q) >= 0) {
+            navResults.push(n);
+          }
+        }
+
+        /* Combine with limits */
+        results = instrResults.slice(0, 8)
+          .concat(agentResults.slice(0, 6))
+          .concat(settingsResults.slice(0, 4))
+          .concat(navResults.slice(0, 4));
+
+        cmdPalette.results = results;
+        cmdPalette.selectedIndex = results.length > 0 ? 0 : -1;
+        cmdPalette.render();
+      },
+
+      render: function() {
+        var container = document.getElementById('cmd-results');
+        var html = '';
+        var lastType = '';
+
+        for (var i = 0; i < cmdPalette.results.length; i++) {
+          var r = cmdPalette.results[i];
+
+          /* Section header when type changes */
+          if (r.type !== lastType) {
+            html += '<div class="cmd-section-header">' + escapeHtml(r.type) + 's</div>';
+            lastType = r.type;
+          }
+
+          /* Badge class per type */
+          var badgeCls = 'badge-info';
+          if (r.type === 'Agent') badgeCls = 'badge-success';
+          else if (r.type === 'Settings') badgeCls = 'badge-warning';
+          else if (r.type === 'Navigation') badgeCls = 'badge-neutral';
+
+          var activeCls = i === cmdPalette.selectedIndex ? ' active' : '';
+          html += '<div class="cmd-result' + activeCls + '" data-index="' + i + '"'
+            + ' onmouseenter="cmdPalette.selectedIndex=' + i + ';cmdPalette.render()"'
+            + ' onclick="cmdPalette.select()">'
+            + '<span class="cmd-result-name">' + escapeHtml(r.name) + '</span>'
+            + '<span class="cmd-result-desc">' + escapeHtml(r.desc) + '</span>'
+            + '<span class="cmd-result-type badge ' + badgeCls + '">' + escapeHtml(r.type) + '</span>'
+            + '</div>';
+        }
+
+        container.innerHTML = html;
+
+        /* Scroll active item into view */
+        var active = container.querySelector('.cmd-result.active');
+        if (active) active.scrollIntoView({ block: 'nearest' });
+      },
+
+      navigate: function(delta) {
+        if (cmdPalette.results.length === 0) return;
+        cmdPalette.selectedIndex += delta;
+        if (cmdPalette.selectedIndex < 0) cmdPalette.selectedIndex = cmdPalette.results.length - 1;
+        if (cmdPalette.selectedIndex >= cmdPalette.results.length) cmdPalette.selectedIndex = 0;
+        cmdPalette.render();
+      },
+
+      select: function() {
+        if (cmdPalette.selectedIndex < 0 || cmdPalette.selectedIndex >= cmdPalette.results.length) return;
+        var r = cmdPalette.results[cmdPalette.selectedIndex];
+        cmdPalette.close();
+
+        if (r.type === 'Instruction') {
+          /* Populate the instruction bar */
+          var instrInput = document.getElementById('instr-input');
+          instrInput.value = r.name;
+          instrInput.focus();
+          closeAC();
+        } else if (r.type === 'Agent') {
+          /* Select agent in scope panel */
+          var items = document.querySelectorAll('.scope-item');
+          for (var i = 0; i < items.length; i++) {
+            if (items[i].getAttribute('data-agent-id') === r.agentId) {
+              selectScope(items[i]);
+              break;
+            }
+          }
+          showToast('Scope set to ' + r.name, 'info');
+        } else if (r.type === 'Navigation' && r.url === '#about') {
+          showAbout();
+        } else if (r.url) {
+          window.location.href = r.url;
+        }
+      }
+    };
+
+    /* Command palette input handler */
+    document.getElementById('cmd-input').addEventListener('input', function() {
+      cmdPalette.search(this.value.trim());
+    });
+
+    /* Command palette keyboard navigation */
+    document.getElementById('cmd-input').addEventListener('keydown', function(e) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        cmdPalette.navigate(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        cmdPalette.navigate(-1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        cmdPalette.select();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cmdPalette.close();
+      }
+    });
+
+    /* ── Global Keyboard Shortcuts ───────────────────────── */
+    document.addEventListener('keydown', function(e) {
+      var tag = (e.target.tagName || '').toLowerCase();
+      var isInput = (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable);
+
+      /* Ctrl+K / Cmd+K — open command palette */
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        if (cmdPalette.isOpen) { cmdPalette.close(); } else { cmdPalette.open(); }
+        return;
+      }
+
+      /* Escape — close palette or clear instruction input */
+      if (e.key === 'Escape') {
+        if (cmdPalette.isOpen) {
+          cmdPalette.close();
+          return;
+        }
+        var instrInput = document.getElementById('instr-input');
+        if (document.activeElement === instrInput) {
+          instrInput.value = '';
+          instrInput.blur();
+          closeAC();
+        }
+        return;
+      }
+
+      /* Ctrl+Enter — send current instruction */
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        sendInstruction();
+        return;
+      }
+
+      /* / — focus instruction input (when not in a text field) */
+      if (e.key === '/' && !isInput && !cmdPalette.isOpen) {
+        e.preventDefault();
+        document.getElementById('instr-input').focus();
+        return;
+      }
+    });
+
+    /* Invalidate agent cache when agent list refreshes */
+    var origRenderAgentList = renderAgentList;
+    renderAgentList = function() {
+      origRenderAgentList();
+      cmdPalette.agentsCache = null;
+    };
 
     /* ── Init ─────────────────────────────────────────────── */
     connectSSE();
