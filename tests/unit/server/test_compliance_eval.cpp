@@ -229,9 +229,8 @@ TEST_CASE("ComplianceEval: negative numbers", "[compliance_eval][edge]") {
     std::map<std::string, std::string> fields = {{"temp", "-5"}};
     CHECK(evaluate_compliance("result.temp < 0", fields) == true);
     CHECK(evaluate_compliance("result.temp > -10", fields) == true);
-    CHECK(evaluate_compliance("result.temp == -5", fields) == false);
-    // Note: -5 is tokenized as NumberLit "-5", but result.temp resolves to "-5"
-    // and direct == between string "-5" and NumberLit "-5" should work
+    CHECK(evaluate_compliance("result.temp == -5", fields) == true);
+    CHECK(evaluate_compliance("result.temp == -3", fields) == false);
 }
 
 TEST_CASE("ComplianceEval: boolean literal true", "[compliance_eval][edge]") {

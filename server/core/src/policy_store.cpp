@@ -812,19 +812,36 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     auto triggers_section = extract_yaml_section(yaml_source, "triggers");
     if (!triggers_section.empty()) {
         // Each trigger is a "- type: xxx" block in the triggers list
-        // Parse as sequential list items
-        size_t pos = 0;
-        while (pos < triggers_section.size()) {
-            auto dash = triggers_section.find("- ", pos);
-            if (dash == std::string::npos)
-                break;
+        // Parse as sequential list items. The extracted section preserves
+        // original indentation, so list dashes may have leading whitespace.
+        // Find all positions of "- " that represent top-level list items.
+        std::vector<size_t> dash_positions;
+        {
+            // Find the first dash to determine its indentation level
+            auto first_dash = triggers_section.find('-');
+            if (first_dash == std::string::npos)
+                goto done_triggers;
+            // Determine indent: count spaces from start of its line
+            auto line_start = triggers_section.rfind('\n', first_dash);
+            size_t dash_indent = (line_start == std::string::npos) ? first_dash : first_dash - line_start - 1;
 
-            // Find the end of this list item (next dash at same indentation or end)
-            size_t item_end = triggers_section.find("\n- ", dash + 1);
-            if (item_end == std::string::npos)
-                item_end = triggers_section.size();
-            else
-                item_end++; // include the newline
+            // Scan for all dashes at this indentation level
+            size_t scan = 0;
+            while (scan < triggers_section.size()) {
+                auto nl = triggers_section.find('\n', scan);
+                if (nl == std::string::npos) nl = triggers_section.size();
+                auto line = triggers_section.substr(scan, nl - scan);
+                auto fc = line.find_first_not_of(" \t");
+                if (fc != std::string::npos && line[fc] == '-' && fc == dash_indent) {
+                    dash_positions.push_back(scan + fc);
+                }
+                scan = nl + 1;
+            }
+        }
+
+        for (size_t di = 0; di < dash_positions.size(); ++di) {
+            auto dash = dash_positions[di];
+            size_t item_end = (di + 1 < dash_positions.size()) ? dash_positions[di + 1] : triggers_section.size();
 
             auto item_block = triggers_section.substr(dash + 2, item_end - dash - 2);
 
@@ -861,9 +878,8 @@ PolicyStore::create_policy(const std::string& yaml_source) {
             t.config_json = config.dump();
             if (!t.trigger_type.empty())
                 triggers.push_back(std::move(t));
-
-            pos = item_end;
         }
+        done_triggers:;
     }
 
     // Parse management groups
