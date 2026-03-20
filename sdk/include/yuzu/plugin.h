@@ -25,7 +25,13 @@ extern "C" {
 
 /* ── Version ────────────────────────────────────────────────────────────────── */
 
-#define YUZU_PLUGIN_ABI_VERSION 1
+#define YUZU_PLUGIN_ABI_VERSION 2
+
+/**
+ * Plugins compiled against ABI version 1 are still loadable.
+ * The agent checks descriptor->abi_version >= YUZU_PLUGIN_ABI_VERSION_MIN.
+ */
+#define YUZU_PLUGIN_ABI_VERSION_MIN 1
 
 /* ── Forward declarations ────────────────────────────────────────────────────── */
 
@@ -146,6 +152,40 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
  */
 YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* key);
 
+/* ── KV Storage (ABI v2) — persistent SQLite-backed storage per plugin ─────── */
+
+/**
+ * Store a key-value pair in the plugin's persistent namespace.
+ * @return 0 on success, non-zero on error.
+ */
+YUZU_EXPORT int yuzu_ctx_storage_set(YuzuPluginContext* ctx, const char* key, const char* value);
+
+/**
+ * Retrieve a value by key from the plugin's persistent namespace.
+ * @return Allocated string on success, NULL if key not found.
+ *         Caller must free with yuzu_free_string().
+ */
+YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char* key);
+
+/**
+ * Delete a key from the plugin's persistent namespace.
+ * @return 0 on success, non-zero on error.
+ */
+YUZU_EXPORT int yuzu_ctx_storage_delete(YuzuPluginContext* ctx, const char* key);
+
+/**
+ * Check whether a key exists in the plugin's persistent namespace.
+ * @return 0 if exists, 1 if not found, negative on error.
+ */
+YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key);
+
+/**
+ * List keys matching a prefix from the plugin's persistent namespace.
+ * Returns a JSON array string, e.g. '["key1","key2"]'.
+ * @return Allocated JSON string, or NULL on error. Free with yuzu_free_string().
+ */
+YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix);
+
 /* ── SDK utility functions (format conversion) ──────────────────────────────── */
 
 /**
@@ -226,6 +266,35 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
  */
 YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
                                      size_t path_out_size);
+
+/* ── Trigger registration (agent-side event-driven execution) ───────────── */
+
+/**
+ * Register a trigger from a plugin. When the trigger condition is met, the
+ * agent will dispatch the plugin action specified in the config_json.
+ *
+ * @param ctx            Plugin context from init().
+ * @param trigger_id     Unique trigger identifier (scoped to this plugin).
+ * @param trigger_type   Type string: "interval", "filesystem", "service", "agent-startup".
+ * @param config_json    JSON object with trigger-specific configuration:
+ *                       - interval:    {"interval_seconds": 300, "plugin": "...", "action": "...", "parameters": {...}}
+ *                       - filesystem:  {"watch_path": "/etc/hosts", "plugin": "...", "action": "...", "parameters": {...}}
+ *                       - service:     {"service_name": "sshd", "expected_status": "stopped", "plugin": "...", "action": "...", "parameters": {...}}
+ *                       - agent-startup: {"plugin": "...", "action": "...", "parameters": {...}}
+ *                       Optional field: "debounce_seconds" (integer, suppress re-fires within window).
+ * @return               0 on success, non-zero on failure.
+ */
+YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
+                                      const char* trigger_type, const char* config_json);
+
+/**
+ * Unregister a previously registered trigger.
+ *
+ * @param ctx            Plugin context.
+ * @param trigger_id     The trigger ID to remove.
+ * @return               0 on success, non-zero if not found.
+ */
+YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trigger_id);
 
 #ifdef __cplusplus
 } /* extern "C" */

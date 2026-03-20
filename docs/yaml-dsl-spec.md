@@ -125,6 +125,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `maxDelaySeconds` | integer | No | `0` | Maximum random delay before execution on each agent. `0` = no stagger (all agents execute immediately). |
+| `fixedDelaySeconds` | integer | No | `0` | Fixed delay before execution on each agent, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
 
 #### `spec.parameters`
 
@@ -247,6 +248,7 @@ spec:
     concurrency: per-device              # per-device | per-definition | per-set | global:<N> | unlimited
     stagger:
       maxDelaySeconds: 0                 # 0 = no stagger
+      fixedDelaySeconds: 0               # 0 = no fixed delay
   parameters:
     type: object
     required:
@@ -1300,7 +1302,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `service.start` | `services` | Y | Y | Y | Verified |
 | `service.stop` | `services` | Y | Y | Y | Verified |
 | `service.restart` | `services` | Y | Y | Y | Verified |
-| `service.set_start_mode` | `services` | Y | Y | Y | Proposed |
+| `service.set_start_mode` | `services` | Y | Y | Y | Verified |
 
 ### 14.4 User, Session, and Identity
 

@@ -1,0 +1,151 @@
+## Trigger Template Definitions
+## Server-defined trigger configurations for event-driven automation.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: TriggerTemplate
+metadata:
+  id: trigger.interval
+  displayName: Interval Trigger
+  version: 1.0.0
+  description: >
+    Fires a plugin action at a fixed time interval. Useful for periodic
+    compliance checks, inventory collection, or health monitoring.
+  tags: [trigger, scheduling, automation]
+
+spec:
+  triggerType: interval
+  platforms: [windows, linux, darwin]
+
+  parameters:
+    type: object
+    required: [interval_seconds, plugin, action]
+    properties:
+      interval_seconds:
+        type: int32
+        displayName: Interval (seconds)
+        description: Time between trigger firings.
+        validation:
+          minimum: 10
+          maximum: 86400
+      plugin:
+        type: string
+        displayName: Plugin
+        description: Plugin to invoke when the trigger fires.
+      action:
+        type: string
+        displayName: Action
+        description: Action to invoke on the plugin.
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: TriggerTemplate
+metadata:
+  id: trigger.file_change
+  displayName: File Change Trigger
+  version: 1.0.0
+  description: >
+    Fires when a monitored file or directory is modified. Detects changes
+    via periodic polling of file modification timestamps.
+  tags: [trigger, filesystem, automation]
+
+spec:
+  triggerType: file_change
+  platforms: [windows, linux, darwin]
+
+  parameters:
+    type: object
+    required: [watch_path, plugin, action]
+    properties:
+      watch_path:
+        type: string
+        displayName: Watch Path
+        description: File or directory path to monitor for changes.
+      plugin:
+        type: string
+        displayName: Plugin
+        description: Plugin to invoke when a change is detected.
+      action:
+        type: string
+        displayName: Action
+        description: Action to invoke on the plugin.
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: TriggerTemplate
+metadata:
+  id: trigger.service_status
+  displayName: Service Status Trigger
+  version: 1.0.0
+  description: >
+    Fires when a system service reaches an expected state. Useful for
+    detecting service failures or unexpected restarts.
+  tags: [trigger, services, automation]
+
+spec:
+  triggerType: service_status
+  platforms: [windows, linux, darwin]
+
+  parameters:
+    type: object
+    required: [service_name, expected_status, plugin, action]
+    properties:
+      service_name:
+        type: string
+        displayName: Service Name
+        description: Name of the system service to monitor.
+      expected_status:
+        type: string
+        displayName: Expected Status
+        description: Fire the trigger when the service reaches this state.
+        validation:
+          enum: ["running", "stopped", "paused"]
+      plugin:
+        type: string
+        displayName: Plugin
+        description: Plugin to invoke when the condition is met.
+      action:
+        type: string
+        displayName: Action
+        description: Action to invoke on the plugin.
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: TriggerTemplate
+metadata:
+  id: trigger.agent_startup
+  displayName: Agent Startup Trigger
+  version: 1.0.0
+  description: >
+    Fires once when the agent starts. Useful for initial inventory
+    collection, compliance baseline checks, or registration tasks.
+  tags: [trigger, lifecycle, automation]
+
+spec:
+  triggerType: agent_startup
+  platforms: [windows, linux, darwin]
+
+  parameters:
+    type: object
+    required: [plugin, action]
+    properties:
+      plugin:
+        type: string
+        displayName: Plugin
+        description: Plugin to invoke at agent startup.
+      action:
+        type: string
+        displayName: Action
+        description: Action to invoke on the plugin.
+
+status:
+  phase: active

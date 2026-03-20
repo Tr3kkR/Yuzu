@@ -4421,6 +4421,12 @@ private:
             cmd.set_plugin(plugin);
             cmd.set_action(action);
 
+            // Stagger/delay: prevent thundering herd on large-fleet dispatch
+            auto stagger = extract_json_int(req.body, "stagger", 0);
+            auto delay = extract_json_int(req.body, "delay", 0);
+            if (stagger > 0) cmd.set_stagger_seconds(stagger);
+            if (delay > 0) cmd.set_delay_seconds(delay);
+
             agent_service_.record_send_time(command_id);
 
             // Check for scope-based targeting
@@ -6242,6 +6248,17 @@ private:
             }
         } catch (...) {}
         return {};
+    }
+
+    static int32_t extract_json_int(const std::string& body, const std::string& key,
+                                    int32_t default_value = 0) {
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.contains(key) && j[key].is_number_integer()) {
+                return j[key].get<int32_t>();
+            }
+        } catch (...) {}
+        return default_value;
     }
 
     // -- Data members ---------------------------------------------------------

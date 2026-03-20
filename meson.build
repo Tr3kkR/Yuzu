@@ -122,6 +122,7 @@ if build_agent
     subdir('agents/plugins/quarantine')
     subdir('agents/plugins/certificates')
     subdir('agents/plugins/ioc')
+    subdir('agents/plugins/storage')
   endif
 endif
 

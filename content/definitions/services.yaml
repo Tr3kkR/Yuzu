@@ -1,6 +1,6 @@
 ## System Services Definitions
 ## Enumerates installed and running system services on all platforms.
-## Plugin: services | Actions: list, running
+## Plugin: services | Actions: list, running, set_start_mode
 ##
 ## Note: Output columns vary by platform:
 ##   Windows: name, display_name, status, startup_type
@@ -127,6 +127,82 @@ spec:
 
   compatibility:
     minAgentVersion: 0.1.0
+    requiredPlugins: [services]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.service.set_start_mode
+  displayName: Set Service Start Mode
+  version: 1.0.0
+  description: >
+    Changes a service's startup type to automatic, manual, or disabled.
+    On Windows, uses the Service Control Manager (ChangeServiceConfig).
+    On Linux, maps to systemctl enable/disable/mask. On macOS, uses
+    launchctl enable/disable on the system domain. This is a state-changing
+    action that requires role-gated approval.
+  tags: [services, configuration, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: services
+    action: set_start_mode
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [name, mode]
+    properties:
+      name:
+        type: string
+        displayName: Service Name
+        description: >
+          The service identifier. On Windows, the short service name
+          (e.g. "Spooler"). On Linux, the systemd unit name
+          (e.g. "nginx.service"). On macOS, the launchd label
+          (e.g. "com.apple.metadata.mds").
+        validation:
+          minLength: 1
+          maxLength: 256
+          pattern: "^[a-zA-Z0-9._@-]+$"
+      mode:
+        type: string
+        displayName: Startup Mode
+        description: >
+          Target startup type. "automatic" starts the service at boot.
+          "manual" prevents auto-start but allows on-demand start.
+          "disabled" prevents the service from starting entirely
+          (Linux: systemctl mask; macOS: launchctl disable).
+        validation:
+          enum: [automatic, manual, disabled]
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: service
+        type: string
+      - name: mode
+        type: string
+
+  readablePayload: "Set service ${name} start mode to ${mode}"
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.2.0
     requiredPlugins: [services]
 
 status:

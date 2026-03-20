@@ -149,12 +149,13 @@ Plugins for enumerating running processes, fetching process metadata, and queryi
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Query system services. Uses Service Control Manager on Windows, `systemctl` on Linux, and `launchd` on macOS. |
+| **Description** | Query and configure system services. Uses Service Control Manager on Windows, `systemctl` on Linux, and `launchd` on macOS. |
 
 | Action | Description |
 |---|---|
 | `list` | List all registered services with their current state and start type. |
 | `running` | List only services that are currently running. |
+| `set_start_mode` | Change a service's startup type. Parameters: `name` (service identifier), `mode` (`automatic`, `manual`, or `disabled`). On Windows, calls `ChangeServiceConfig`. On Linux, maps to `systemctl enable`/`disable`/`mask`. On macOS, uses `launchctl enable`/`disable` on the system domain. Requires `endpoint-admin` role and role-gated approval. |
 
 ---
 

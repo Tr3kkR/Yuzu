@@ -134,6 +134,7 @@ spec:
     concurrency: per-device
     stagger:
       maxDelaySeconds: 0
+      fixedDelaySeconds: 0
     minSuccessPercent: 100
 
   parameters:
@@ -226,7 +227,8 @@ spec:
 | `plugin` | string | -- | Plugin identifier (must match a registered plugin's `name`). |
 | `action` | string | -- | Action name (must exist in the plugin's `actions[]` array). |
 | `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. |
-| `stagger.maxDelaySeconds` | int | `0` | Random delay per agent before execution. `0` = immediate. |
+| `stagger.maxDelaySeconds` | int | `0` | Max random delay per agent before execution. `0` = no stagger. |
+| `stagger.fixedDelaySeconds` | int | `0` | Fixed delay per agent before execution, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
 | `minSuccessPercent` | int | `100` | Minimum success percentage. `0` = best-effort. |
 
 ### Compatibility
@@ -509,13 +511,24 @@ spec:
 
 ### Stagger
 
-For large-fleet dispatch, stagger adds a random delay per agent to avoid thundering herd:
+For large-fleet dispatch, stagger introduces a per-agent delay before execution to avoid thundering herd problems. Each agent calculates: **total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`)**.
 
 ```yaml
 spec:
   execution:
     stagger:
-      maxDelaySeconds: 60    # each agent delays 0-60s randomly
+      maxDelaySeconds: 60       # each agent delays 0-60s randomly
+      fixedDelaySeconds: 5      # plus a fixed 5s base delay
+```
+
+If the command has an expiration (`expires_at`) and the total delay causes it to expire, the agent sends a `REJECTED` response and skips execution.
+
+The REST API also supports stagger/delay via the `stagger` and `delay` integer fields on `POST /api/command`:
+
+```bash
+curl -X POST http://server:8080/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"plugin":"hardware","action":"cpu-info","stagger":30,"delay":5}'
 ```
 
 ---

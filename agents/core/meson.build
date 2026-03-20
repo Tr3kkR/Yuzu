@@ -9,7 +9,7 @@ endif
 
 yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
-  files('src/agent.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/identity_store.cpp', 'src/plugin_loader.cpp', 'src/sdk_utilities.cpp', 'src/temp_file.cpp', 'src/updater.cpp'),
+  files('src/agent.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/plugin_loader.cpp', 'src/sdk_utilities.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),

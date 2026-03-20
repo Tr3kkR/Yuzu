@@ -1045,11 +1045,23 @@ Send a command to one or more connected agents.
   "plugin": "hardware",
   "action": "cpu-info",
   "agent_ids": ["agent-01", "agent-02"],
-  "parameters": {}
+  "parameters": {},
+  "stagger": 30,
+  "delay": 5
 }
 ```
 
-If `agent_ids` is empty or omitted, the command is broadcast to all connected agents.
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `plugin` | string | Yes | -- | Target plugin name. |
+| `action` | string | Yes | -- | Action within the plugin. |
+| `agent_ids` | array of string | No | `[]` | Target agent IDs. Empty = broadcast to all. |
+| `parameters` | object | No | `{}` | Key-value parameters passed to the plugin. |
+| `scope` | string | No | `""` | Scope expression for device targeting (alternative to `agent_ids`). |
+| `stagger` | integer | No | `0` | Max random delay in seconds per agent before execution. Prevents thundering herd on large-fleet dispatch. `0` = no stagger. |
+| `delay` | integer | No | `0` | Fixed delay in seconds per agent before execution. Added before the random stagger. `0` = immediate. Total agent wait = `delay` + random(`0`, `stagger`). |
+
+If `agent_ids` is empty or omitted and no `scope` is provided, the command is broadcast to all connected agents.
 
 ---
 

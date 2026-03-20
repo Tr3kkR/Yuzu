@@ -12,13 +12,16 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/version.hpp>
 
 #include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
@@ -37,6 +40,7 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -84,6 +88,9 @@ using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::Comman
 
 struct PluginContextImpl {
     std::unordered_map<std::string, std::string> config;
+    KvStore* kv_store{nullptr};            // non-owning; lifetime managed by AgentImpl
+    TriggerEngine* trigger_engine{nullptr}; // non-owning; lifetime managed by AgentImpl
+    std::string plugin_name;               // set per-plugin during init/execute for KV namespacing
 };
 
 struct CommandContextImpl {
@@ -140,6 +147,86 @@ YUZU_EXPORT const char* yuzu_ctx_get_secret(YuzuPluginContext* ctx, const char* 
     return nullptr;
 }
 
+// ── KV Storage C ABI (ABI v2) ────────────────────────────────────────────────
+
+YUZU_EXPORT int yuzu_ctx_storage_set(YuzuPluginContext* ctx, const char* key, const char* value) {
+    if (!ctx || !key || !value)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->kv_store || impl->plugin_name.empty())
+        return -2;
+    return impl->kv_store->set(impl->plugin_name, key, value) ? 0 : 1;
+}
+
+YUZU_EXPORT const char* yuzu_ctx_storage_get(YuzuPluginContext* ctx, const char* key) {
+    if (!ctx || !key)
+        return nullptr;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->kv_store || impl->plugin_name.empty())
+        return nullptr;
+    auto val = impl->kv_store->get(impl->plugin_name, key);
+    if (!val.has_value())
+        return nullptr;
+    // Caller must free with yuzu_free_string()
+    char* result = static_cast<char*>(std::malloc(val->size() + 1));
+    if (!result)
+        return nullptr;
+    std::memcpy(result, val->c_str(), val->size() + 1);
+    return result;
+}
+
+YUZU_EXPORT int yuzu_ctx_storage_delete(YuzuPluginContext* ctx, const char* key) {
+    if (!ctx || !key)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->kv_store || impl->plugin_name.empty())
+        return -2;
+    return impl->kv_store->del(impl->plugin_name, key) ? 0 : 1;
+}
+
+YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key) {
+    if (!ctx || !key)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->kv_store || impl->plugin_name.empty())
+        return -2;
+    return impl->kv_store->exists(impl->plugin_name, key) ? 0 : 1;
+}
+
+YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
+    if (!ctx)
+        return nullptr;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->kv_store || impl->plugin_name.empty())
+        return nullptr;
+    auto keys = impl->kv_store->list(impl->plugin_name, prefix ? prefix : "");
+
+    // Build JSON array: ["key1","key2",...]
+    std::string json = "[";
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i > 0)
+            json += ',';
+        json += '"';
+        // Escape any quotes in key names
+        for (char c : keys[i]) {
+            if (c == '"')
+                json += "\\\"";
+            else if (c == '\\')
+                json += "\\\\";
+            else
+                json += c;
+        }
+        json += '"';
+    }
+    json += ']';
+
+    char* result = static_cast<char*>(std::malloc(json.size() + 1));
+    if (!result)
+        return nullptr;
+    std::memcpy(result, json.c_str(), json.size() + 1);
+    return result;
+}
+
 } // extern "C"
 
 // AgentImpl
@@ -181,6 +268,20 @@ public:
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
         plugin_ctx_.config["agent.reconnect_count"] = "0";
 
+        // 1b. Open KV store for plugin persistent storage
+        {
+            auto kv_path = cfg_.data_dir / "kv_store.db";
+            auto kv_result = KvStore::open(kv_path);
+            if (kv_result.has_value()) {
+                kv_store_ = std::make_unique<KvStore>(std::move(*kv_result));
+                plugin_ctx_.kv_store = kv_store_.get();
+                spdlog::info("KV store ready: {}", kv_path.string());
+            } else {
+                spdlog::error("Failed to open KV store: {}", kv_result.error().message);
+                spdlog::warn("Plugin KV storage will be unavailable");
+            }
+        }
+
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -207,6 +308,8 @@ public:
 
         for (auto& handle : candidates) {
             const auto* descriptor = handle.descriptor();
+            // Set plugin name on context so KV storage is namespaced per-plugin
+            plugin_ctx_.plugin_name = descriptor->name;
             if (handle.descriptor()->init) {
                 int rc = handle.descriptor()->init(raw_plugin_ctx);
                 if (rc != 0) {
@@ -643,6 +746,49 @@ public:
                 // Each thread captures the shared_ptr to guarantee the stream
                 // outlives all writers (fixes use-after-free risk from #66).
                 std::thread exec_thread([this, target, cmd, stream]() {
+                    // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
+                    const int32_t stagger_s = cmd.stagger_seconds();
+                    const int32_t delay_s = cmd.delay_seconds();
+                    if (stagger_s > 0 || delay_s > 0) {
+                        int32_t random_stagger = 0;
+                        if (stagger_s > 0) {
+                            std::random_device rd;
+                            std::mt19937 gen(rd());
+                            std::uniform_int_distribution<int32_t> dist(0, stagger_s);
+                            random_stagger = dist(gen);
+                        }
+                        const int32_t total_delay = (delay_s > 0 ? delay_s : 0) + random_stagger;
+                        spdlog::debug("Command {} stagger {}s + delay {}s = {}s",
+                                      cmd.command_id(), random_stagger, delay_s, total_delay);
+
+                        if (total_delay > 0) {
+                            std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+                        }
+
+                        // Check expiration after the delay — skip stale commands
+                        if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+                            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::system_clock::now().time_since_epoch())
+                                              .count();
+                            if (now_ms > cmd.expires_at().millis_epoch()) {
+                                spdlog::warn("Command {} expired after stagger/delay (expired_at={}, now={})",
+                                             cmd.command_id(), cmd.expires_at().millis_epoch(), now_ms);
+                                pb::CommandResponse expired_resp;
+                                expired_resp.set_command_id(cmd.command_id());
+                                expired_resp.set_status(pb::CommandResponse::REJECTED);
+                                expired_resp.set_output("command expired after stagger/delay");
+                                auto epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::system_clock::now().time_since_epoch())
+                                                 .count();
+                                expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
+
+                                std::lock_guard lock(stream_write_mu_);
+                                stream->Write(expired_resp, grpc::WriteOptions());
+                                return;
+                            }
+                        }
+                    }
+
                     metrics_
                         .counter("yuzu_agent_commands_executed_total", {{"plugin", cmd.plugin()}})
                         .increment();
@@ -767,6 +913,11 @@ public:
 private:
     Config cfg_;
     PluginContextImpl plugin_ctx_;
+    // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
+    // correct plugin_name for KV storage namespacing. Stored as unique_ptrs so
+    // pointers remain stable after map insertions.
+    std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
+    std::unique_ptr<KvStore> kv_store_;
     yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;

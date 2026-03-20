@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace yuzu {
 
@@ -93,6 +94,82 @@ public:
     [[nodiscard]] std::string_view get_secret(std::string_view key) const noexcept {
         const char* v = yuzu_ctx_get_secret(raw_, std::string{key}.c_str());
         return v ? v : std::string_view{};
+    }
+
+    // ── KV Storage (ABI v2) ───────────────────────────────────────────────────
+
+    /** Store a key-value pair. Returns true on success. */
+    bool storage_set(std::string_view key, std::string_view value) {
+        return yuzu_ctx_storage_set(raw_, std::string{key}.c_str(),
+                                    std::string{value}.c_str()) == 0;
+    }
+
+    /** Retrieve a value by key. Returns empty string if not found. */
+    [[nodiscard]] std::string storage_get(std::string_view key) {
+        const char* v = yuzu_ctx_storage_get(raw_, std::string{key}.c_str());
+        if (!v)
+            return {};
+        std::string result{v};
+        yuzu_free_string(const_cast<char*>(v));
+        return result;
+    }
+
+    /** Delete a key. Returns true on success. */
+    bool storage_delete(std::string_view key) {
+        return yuzu_ctx_storage_delete(raw_, std::string{key}.c_str()) == 0;
+    }
+
+    /** Check if a key exists. */
+    [[nodiscard]] bool storage_exists(std::string_view key) {
+        return yuzu_ctx_storage_exists(raw_, std::string{key}.c_str()) == 0;
+    }
+
+    /** List keys matching a prefix. Returns a vector of key strings. */
+    [[nodiscard]] std::vector<std::string> storage_list(std::string_view prefix = "") {
+        const char* json = yuzu_ctx_storage_list(raw_, std::string{prefix}.c_str());
+        if (!json)
+            return {};
+        std::string json_str{json};
+        yuzu_free_string(const_cast<char*>(json));
+
+        // Minimal JSON array parse: ["key1","key2",...]
+        std::vector<std::string> result;
+        size_t pos = 0;
+        while ((pos = json_str.find('"', pos)) != std::string::npos) {
+            size_t start = pos + 1;
+            size_t end = json_str.find('"', start);
+            if (end == std::string::npos)
+                break;
+            result.emplace_back(json_str.substr(start, end - start));
+            pos = end + 1;
+        }
+        return result;
+    }
+
+    // ── Trigger registration ─────────────────────────────────────────────────
+
+    /**
+     * Register a trigger. When the trigger condition is met, the agent will
+     * dispatch the specified plugin action.
+     *
+     * @param trigger_id    Unique trigger ID (scoped to this plugin).
+     * @param trigger_type  Type: "interval", "filesystem", "service", "agent-startup".
+     * @param config_json   JSON trigger configuration (see plugin.h for schema).
+     * @return true on success.
+     */
+    bool register_trigger(std::string_view trigger_id, std::string_view trigger_type,
+                          std::string_view config_json) {
+        return yuzu_register_trigger(raw_, std::string{trigger_id}.c_str(),
+                                     std::string{trigger_type}.c_str(),
+                                     std::string{config_json}.c_str()) == 0;
+    }
+
+    /**
+     * Unregister a previously registered trigger.
+     * @return true on success, false if not found.
+     */
+    bool unregister_trigger(std::string_view trigger_id) {
+        return yuzu_unregister_trigger(raw_, std::string{trigger_id}.c_str()) == 0;
     }
 
 private:
