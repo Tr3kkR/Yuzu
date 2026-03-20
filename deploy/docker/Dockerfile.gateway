@@ -1,0 +1,29 @@
+# Yuzu Gateway — Erlang/OTP Docker build
+# Build:  docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
+# Run:    docker run -p 50051:50051 -p 9568:9568 yuzu-gateway
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────
+FROM erlang:27-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /src
+COPY gateway/ .
+RUN rebar3 as prod release
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────
+FROM alpine:3.20
+
+RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
+    && adduser -D -s /sbin/nologin yuzu-gw
+
+COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /opt/yuzu_gw/
+RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
+
+USER yuzu-gw
+WORKDIR /opt/yuzu_gw
+
+EXPOSE 50051 50052 9568
+
+ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
+CMD ["foreground"]

@@ -1,0 +1,30 @@
+[Unit]
+Description=Yuzu Endpoint Management Server
+Documentation=https://github.com/Tr3kkR/Yuzu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yuzu
+Group=yuzu
+ExecStart=/usr/local/bin/yuzu-server \
+    --listen 0.0.0.0:50054 \
+    --gateway-upstream 0.0.0.0:50055 \
+    --web-port 8080
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/yuzu
+StateDirectory=yuzu
+LogsDirectory=yuzu
+ConfigurationDirectory=yuzu
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/yuzu /var/log/yuzu /etc/yuzu
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

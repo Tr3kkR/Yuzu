@@ -1,0 +1,21 @@
+# Prometheus config for Docker Compose stack
+# Targets use Docker service names instead of localhost
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'yuzu-server'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['server:8080']
+        labels:
+          component: 'server'
+
+  - job_name: 'yuzu-gateway'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['gateway:9568']
+        labels:
+          component: 'gateway'

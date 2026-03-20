@@ -123,6 +123,12 @@ if build_agent
     subdir('agents/plugins/certificates')
     subdir('agents/plugins/ioc')
     subdir('agents/plugins/storage')
+    subdir('agents/plugins/interaction')
+    subdir('agents/plugins/agent_logging')
+    subdir('agents/plugins/http_client')
+    subdir('agents/plugins/content_dist')
+    subdir('agents/plugins/registry')
+    subdir('agents/plugins/wmi')
   endif
 endif
 

@@ -1,0 +1,97 @@
+## HTTP Client Plugin Definitions
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.http_client.download
+  displayName: Download File
+  version: 1.0.0
+  description: >
+    Download a file from a URL to a local path with optional SHA256 hash verification.
+  tags: [http, download, content]
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: http_client
+    action: download
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [url, path]
+    properties:
+      url:
+        type: string
+        displayName: URL
+        description: HTTP or HTTPS URL to download.
+      path:
+        type: string
+        displayName: Destination Path
+        description: Local file path to save the download.
+      expected_hash:
+        type: string
+        displayName: Expected SHA256 Hash
+        description: Optional SHA256 hash for verification.
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: path
+        type: string
+      - name: size
+        type: int64
+      - name: hash
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [http_client]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.http_client.get
+  displayName: HTTP GET
+  version: 1.0.0
+  description: >
+    Perform an HTTP GET request and return the response status and body.
+  tags: [http, network]
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: http_client
+    action: get
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [url]
+    properties:
+      url:
+        type: string
+        displayName: URL
+        description: HTTP or HTTPS URL to request.
+  result:
+    columns:
+      - name: status
+        type: int32
+      - name: body
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [http_client]
+status:
+  phase: active

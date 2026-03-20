@@ -1,0 +1,27 @@
+[Unit]
+Description=Yuzu Erlang/OTP Gateway
+Documentation=https://github.com/Tr3kkR/Yuzu
+After=network-online.target yuzu-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yuzu-gw
+Group=yuzu-gw
+ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/opt/yuzu_gw
+
+# Erlang VM settings
+Environment=ERL_CRASH_DUMP=/var/log/yuzu/gateway-crash.dump
+Environment=RELX_REPLACE_OS_VARS=true
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/yuzu /opt/yuzu_gw
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

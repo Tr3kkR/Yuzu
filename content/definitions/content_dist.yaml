@@ -1,0 +1,133 @@
+## Content Distribution Plugin Definitions
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.content_dist.stage
+  displayName: Stage Content
+  version: 1.0.0
+  description: >
+    Download a file to the agent's staging directory and verify its SHA256 hash.
+  tags: [content, staging, deployment]
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: content_dist
+    action: stage
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [url, filename, sha256]
+    properties:
+      url:
+        type: string
+        displayName: URL
+      filename:
+        type: string
+        displayName: Filename
+      sha256:
+        type: string
+        displayName: Expected SHA256
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: staged_path
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [content_dist]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.content_dist.execute_staged
+  displayName: Execute Staged File
+  version: 1.0.0
+  description: >
+    Execute a previously staged file with optional arguments.
+  tags: [content, execution, deployment]
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: content_dist
+    action: execute_staged
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [filename]
+    properties:
+      filename:
+        type: string
+        displayName: Filename
+      args:
+        type: string
+        displayName: Arguments
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: exit_code
+        type: int32
+      - name: output
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [content_dist]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.content_dist.list_staged
+  displayName: List Staged Files
+  version: 1.0.0
+  description: >
+    List all files in the agent's staging directory with size and hash.
+  tags: [content, staging]
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: content_dist
+    action: list_staged
+    concurrency: per-device
+  parameters:
+    type: object
+    properties: {}
+  result:
+    columns:
+      - name: file
+        type: string
+      - name: size
+        type: int64
+      - name: sha256
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [content_dist]
+status:
+  phase: active

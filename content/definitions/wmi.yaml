@@ -1,0 +1,93 @@
+## WMI Plugin Definitions
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.wmi.query
+  displayName: WMI Query
+  version: 1.0.0
+  description: >
+    Execute a WQL SELECT query against Windows Management Instrumentation.
+    Only SELECT statements are allowed.
+  tags: [wmi, windows, inventory]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: wmi
+    action: query
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [wql]
+    properties:
+      wql:
+        type: string
+        displayName: WQL Query
+        description: A WQL SELECT statement (e.g., "SELECT * FROM Win32_OperatingSystem").
+      namespace:
+        type: string
+        displayName: WMI Namespace
+        description: WMI namespace (default root\cimv2).
+  result:
+    columns:
+      - name: property
+        type: string
+      - name: value
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [wmi]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.wmi.get_instance
+  displayName: WMI Get Instance
+  version: 1.0.0
+  description: >
+    Get all properties of the first instance of a WMI class.
+  tags: [wmi, windows, inventory]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: wmi
+    action: get_instance
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [class]
+    properties:
+      class:
+        type: string
+        displayName: WMI Class
+        description: WMI class name (e.g., Win32_OperatingSystem).
+      namespace:
+        type: string
+        displayName: WMI Namespace
+  result:
+    columns:
+      - name: property
+        type: string
+      - name: value
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [wmi]
+status:
+  phase: active

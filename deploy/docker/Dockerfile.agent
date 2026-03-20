@@ -1,0 +1,52 @@
+# Yuzu Agent — Multi-stage Docker build
+# Build:  docker build -t yuzu-agent -f deploy/docker/Dockerfile.agent .
+# Run:    docker run --network host yuzu-agent --server localhost:50054 --no-tls
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────
+FROM ubuntu:24.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build gcc-13 g++-13 pkg-config \
+    curl zip unzip tar git ca-certificates python3-pip \
+    && pip3 install --break-system-packages meson==1.9.2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+ENV VCPKG_ROOT=/opt/vcpkg
+
+WORKDIR /src
+COPY vcpkg.json vcpkg-configuration.json ./
+RUN /opt/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
+
+COPY . .
+RUN meson setup builddir \
+    --native-file meson/native/linux-gcc13.ini \
+    --buildtype=release \
+    -Db_lto=true \
+    -Dcmake_prefix_path=/src/vcpkg_installed/x64-linux \
+    -Dbuild_tests=false \
+    -Dbuild_server=false \
+    && meson compile -C builddir
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -s /usr/sbin/nologin yuzu-agent \
+    && mkdir -p /var/lib/yuzu-agent /usr/lib/yuzu/plugins \
+    && chown yuzu-agent:yuzu-agent /var/lib/yuzu-agent
+
+COPY --from=builder /src/builddir/agents/core/yuzu-agent /usr/local/bin/
+COPY --from=builder /src/builddir/agents/core/libyuzu_agent_core.so /usr/local/lib/
+COPY --from=builder /src/builddir/agents/plugins/ /usr/lib/yuzu/plugins/
+
+RUN ldconfig
+
+USER yuzu-agent
+WORKDIR /var/lib/yuzu-agent
+
+ENTRYPOINT ["yuzu-agent"]
+CMD ["--server", "yuzu-server:50054", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]

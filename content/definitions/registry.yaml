@@ -1,0 +1,142 @@
+## Windows Registry Plugin Definitions
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.get_value
+  displayName: Get Registry Value
+  version: 1.0.0
+  description: >
+    Read a value from the Windows registry.
+  tags: [registry, windows, configuration]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: get_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key, name]
+    properties:
+      hive:
+        type: string
+        displayName: Registry Hive
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+        displayName: Key Path
+      name:
+        type: string
+        displayName: Value Name
+  result:
+    columns:
+      - name: value
+        type: string
+      - name: type
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.set_value
+  displayName: Set Registry Value
+  version: 1.0.0
+  description: >
+    Write a value to the Windows registry. Creates the key if it does not exist.
+  tags: [registry, windows, configuration]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: set_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key, name, value]
+    properties:
+      hive:
+        type: string
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+      name:
+        type: string
+      value:
+        type: string
+      type:
+        type: string
+        validation:
+          enum: ["REG_SZ", "REG_DWORD"]
+  result:
+    columns:
+      - name: status
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.enumerate_keys
+  displayName: Enumerate Registry Subkeys
+  version: 1.0.0
+  description: >
+    List all subkeys under a registry key.
+  tags: [registry, windows]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: enumerate_keys
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key]
+    properties:
+      hive:
+        type: string
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+  result:
+    columns:
+      - name: subkey
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active

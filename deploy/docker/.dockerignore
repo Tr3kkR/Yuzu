@@ -1,0 +1,14 @@
+builddir/
+.git/
+.github/
+.claude/
+*.md
+docs/
+tests/
+vcpkg_installed/
+gateway/_build/
+gateway/erl_crash.dump
+*.exe
+*.dll
+*.pdb
+*.obj

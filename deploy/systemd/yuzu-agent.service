@@ -1,0 +1,27 @@
+[Unit]
+Description=Yuzu Endpoint Management Agent
+Documentation=https://github.com/Tr3kkR/Yuzu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yuzu-agent
+Group=yuzu-agent
+ExecStart=/usr/local/bin/yuzu-agent \
+    --server %H:50054 \
+    --plugin-dir /usr/lib/yuzu/plugins \
+    --data-dir /var/lib/yuzu-agent
+Restart=always
+RestartSec=10
+WorkingDirectory=/var/lib/yuzu-agent
+StateDirectory=yuzu-agent
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/yuzu-agent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
