@@ -243,6 +243,13 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .yd { color: #8b949e; }
 .ya { color: #d2a8ff; }
 
+/* Compliance bars */
+.compliance-bar { height: 8px; background: var(--border); border-radius: 9999px; overflow: hidden; }
+.compliance-fill { height: 100%; border-radius: 9999px; transition: width 0.3s; }
+.compliance-fill.good { background: var(--green); }
+.compliance-fill.warn { background: var(--yellow); }
+.compliance-fill.bad { background: var(--red); }
+
 /* Reduced motion */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }

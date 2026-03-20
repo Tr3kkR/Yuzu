@@ -1,0 +1,434 @@
+## Policy Management Definitions
+## Server-side instruction definitions for CRUD operations on the policy engine.
+## These definitions are used by the management API and dashboard UI.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.list
+  displayName: List Policies
+  version: 1.0.0
+  description: >
+    Lists all policies configured in the policy engine, with their
+    fragment bindings, scope expressions, trigger configuration,
+    and enabled/disabled state.
+  tags: [policy, compliance, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.list
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Filter policies by name (substring match)
+      fragment_id:
+        type: string
+        description: Filter policies by fragment ID
+      enabled_only:
+        type: boolean
+        description: Return only enabled policies
+        default: false
+      limit:
+        type: integer
+        description: Maximum number of results
+        default: 100
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: fragment_id
+        type: string
+      - name: scope_expression
+        type: string
+      - name: enabled
+        type: bool
+      - name: management_groups
+        type: string
+      - name: created_at
+        type: datetime
+      - name: updated_at
+        type: datetime
+
+  readablePayload: "List all policies"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.create
+  displayName: Create Policy
+  version: 1.0.0
+  description: >
+    Creates a new policy from a YAML definition. The YAML must be a valid
+    Policy kind document with a fragment reference, scope expression,
+    trigger configuration, and optional management group bindings.
+  tags: [policy, compliance, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.create
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [yaml_source]
+    properties:
+      yaml_source:
+        type: string
+        description: >
+          Complete YAML source for the Policy definition. Must have
+          kind: Policy and reference an existing PolicyFragment.
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Create policy from YAML"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.enable
+  displayName: Enable Policy
+  version: 1.0.0
+  description: >
+    Enables a previously disabled policy, allowing its triggers to fire
+    and compliance checks to run against targeted agents.
+  tags: [policy, compliance, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.enable
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [policy_id]
+    properties:
+      policy_id:
+        type: string
+        description: The ID of the policy to enable
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Enable policy '${policy_id}'"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.disable
+  displayName: Disable Policy
+  version: 1.0.0
+  description: >
+    Disables a policy, stopping its triggers from firing and pausing
+    compliance checks. Existing compliance status data is preserved.
+  tags: [policy, compliance, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.disable
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [policy_id]
+    properties:
+      policy_id:
+        type: string
+        description: The ID of the policy to disable
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Disable policy '${policy_id}'"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.delete
+  displayName: Delete Policy
+  version: 1.0.0
+  description: >
+    Permanently deletes a policy and all associated compliance status data.
+    This action cannot be undone.
+  tags: [policy, compliance, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.delete
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [policy_id]
+    properties:
+      policy_id:
+        type: string
+        description: The ID of the policy to delete
+
+  result:
+    columns:
+      - name: deleted
+        type: bool
+
+  readablePayload: "Delete policy '${policy_id}'"
+
+  approval:
+    mode: always
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy_fragment.list
+  displayName: List Policy Fragments
+  version: 1.0.0
+  description: >
+    Lists all policy fragments — reusable check/fix/postCheck patterns
+    that define compliance checks and auto-remediation actions.
+  tags: [policy, compliance, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy_fragment.list
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Filter fragments by name (substring match)
+      limit:
+        type: integer
+        description: Maximum number of results
+        default: 100
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: description
+        type: string
+      - name: check_instruction
+        type: string
+      - name: fix_instruction
+        type: string
+      - name: post_check_instruction
+        type: string
+      - name: created_at
+        type: datetime
+
+  readablePayload: "List all policy fragments"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy_fragment.create
+  displayName: Create Policy Fragment
+  version: 1.0.0
+  description: >
+    Creates a new policy fragment from a YAML definition. The YAML must
+    be a valid PolicyFragment kind document with at least a check section
+    defining the compliance expression.
+  tags: [policy, compliance, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy_fragment.create
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [yaml_source]
+    properties:
+      yaml_source:
+        type: string
+        description: >
+          Complete YAML source for the PolicyFragment definition.
+          Must have kind: PolicyFragment with a spec.check section.
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Create policy fragment from YAML"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.compliance.summary
+  displayName: Fleet Compliance Summary
+  version: 1.0.0
+  description: >
+    Returns the overall fleet compliance percentage and per-status
+    breakdown across all active policies. Used by the compliance
+    dashboard and automation scripts.
+  tags: [policy, compliance, reporting]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: compliance.summary
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: compliance_pct
+        type: string
+      - name: total_checks
+        type: int64
+      - name: compliant
+        type: int64
+      - name: non_compliant
+        type: int64
+      - name: unknown
+        type: int64
+      - name: fixing
+        type: int64
+      - name: error
+        type: int64
+
+  readablePayload: "Fleet compliance summary"
+
+  gather:
+    ttlSeconds: 15
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.compliance.policy_detail
+  displayName: Policy Compliance Detail
+  version: 1.0.0
+  description: >
+    Returns per-agent compliance status for a specific policy,
+    including last check time, last fix time, and the check result
+    output for each agent.
+  tags: [policy, compliance, reporting]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: compliance.policy_detail
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [policy_id]
+    properties:
+      policy_id:
+        type: string
+        description: The policy ID to get compliance detail for
+
+  result:
+    columns:
+      - name: agent_id
+        type: string
+      - name: status
+        type: string
+      - name: last_check_at
+        type: datetime
+      - name: last_fix_at
+        type: datetime
+      - name: check_result
+        type: string
+
+  readablePayload: "Compliance detail for policy '${policy_id}'"
+
+  gather:
+    ttlSeconds: 15
+
+  approval:
+    mode: auto

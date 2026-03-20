@@ -85,6 +85,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   </a>
   <a href="/" class="nav-link">Dashboard</a>
   <a href="/instructions" class="nav-link active">Instructions</a>
+  <a href="/compliance" class="nav-link">Compliance</a>
   <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
   <span class="nav-spacer"></span>
   <span class="nav-user" id="nav-user"></span>

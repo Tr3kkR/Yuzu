@@ -1,0 +1,121 @@
+## Agent Logging Plugin Definitions
+## Provides remote access to agent log files and lists key agent files
+## with their sizes and modification timestamps.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.agent_logging.get_log
+  displayName: Agent Log Tail
+  version: 1.0.0
+  description: >
+    Returns the last N lines of the agent's log file. The log file
+    path is discovered from agent config (agent.log_file or
+    agent.data_dir), falling back to platform default paths
+    (/var/log/yuzu on Linux, ProgramData/Yuzu on Windows). The
+    number of lines is configurable (default 50, max 500).
+  tags: [diagnostics, logging, agent]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: agent_logging
+    action: get_log
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      lines:
+        type: int32
+        description: Number of log lines to return (1-500)
+        default: 50
+        minimum: 1
+        maximum: 500
+
+  result:
+    columns:
+      - name: log_file
+        type: string
+      - name: line_count
+        type: int32
+      - name: line
+        type: string
+
+  readablePayload: "Get last {{lines}} lines of agent log"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [agent_logging]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.agent_logging.get_key_files
+  displayName: Agent Key Files
+  version: 1.0.0
+  description: >
+    Lists important agent files — the agent executable, log files,
+    config files, data stores, plugins, and TLS certificates — with
+    their absolute paths, sizes in bytes, and last-modified timestamps
+    (as Unix epoch seconds). Useful for remote diagnostics and
+    inventory of agent deployment state.
+  tags: [diagnostics, inventory, agent]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: agent_logging
+    action: get_key_files
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: path
+        type: string
+      - name: size
+        type: int64
+      - name: modified
+        type: int64
+
+  readablePayload: "List agent key files"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [agent_logging]
+
+status:
+  phase: active

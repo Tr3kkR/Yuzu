@@ -1,0 +1,201 @@
+## Desktop User Interaction Plugin Definitions
+## Provides desktop notifications, message box dialogs, and text input
+## dialogs on Windows, Linux, and macOS endpoints.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.interaction.notify
+  displayName: Desktop Notification
+  version: 1.0.0
+  description: >
+    Shows a desktop notification/toast on the endpoint. On Windows uses
+    ShellNotifyIcon balloon notifications, on Linux uses notify-send,
+    and on macOS uses osascript 'display notification'. Supports info,
+    warning, and error severity levels.
+  tags: [interaction, notification, user]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: interaction
+    action: notify
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [title, message]
+    properties:
+      title:
+        type: string
+        description: Notification title text
+        maxLength: 128
+      message:
+        type: string
+        description: Notification body text
+        maxLength: 512
+      type:
+        type: string
+        description: "Notification severity: info, warning, or error"
+        enum: [info, warning, error]
+        default: info
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Show desktop notification: {{title}}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [interaction]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.interaction.message_box
+  displayName: Message Box Dialog
+  version: 1.0.0
+  description: >
+    Shows a modal message box dialog on the endpoint desktop. On Windows
+    uses MessageBoxW, on Linux uses zenity, and on macOS uses osascript
+    'display dialog'. Returns which button the user clicked (ok, cancel,
+    yes, or no). The dialog blocks until the user responds.
+  tags: [interaction, dialog, user]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: interaction
+    action: message_box
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [title, message]
+    properties:
+      title:
+        type: string
+        description: Dialog title text
+        maxLength: 128
+      message:
+        type: string
+        description: Dialog body text
+        maxLength: 1024
+      buttons:
+        type: string
+        description: "Button configuration: ok, okcancel, or yesno"
+        enum: [ok, okcancel, yesno]
+        default: ok
+
+  result:
+    columns:
+      - name: response
+        type: string
+
+  readablePayload: "Show message box: {{title}} ({{buttons}})"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [interaction]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.interaction.input
+  displayName: Text Input Dialog
+  version: 1.0.0
+  description: >
+    Shows a text input dialog on the endpoint desktop. On Windows uses
+    PowerShell with Microsoft.VisualBasic.Interaction.InputBox, on Linux
+    uses zenity --entry, and on macOS uses osascript 'display dialog'
+    with default answer. Returns the text entered by the user, or
+    indicates cancellation.
+  tags: [interaction, dialog, input, user]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: interaction
+    action: input
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [title, prompt]
+    properties:
+      title:
+        type: string
+        description: Dialog title text
+        maxLength: 128
+      prompt:
+        type: string
+        description: Prompt text shown above the input field
+        maxLength: 512
+      default_value:
+        type: string
+        description: Pre-filled default text in the input field
+        maxLength: 256
+        default: ""
+
+  result:
+    columns:
+      - name: response
+        type: string
+      - name: cancelled
+        type: bool
+
+  readablePayload: "Show input dialog: {{title}}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [interaction]
+
+status:
+  phase: active
