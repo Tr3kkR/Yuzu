@@ -1,26 +1,20 @@
 # Yuzu Policy Engine
 
-> **Status: PLANNED -- NOT YET IMPLEMENTED**
->
-> The policy engine is Phase 5 of the Yuzu roadmap. This document describes
-> the planned design based on the architecture blueprint. All features
-> described here are subject to change during implementation.
-
 ## Table of Contents
 
 - [Overview](#overview)
-- [Policy Rules and Fragments (Issue 5.1)](#policy-rules-and-fragments-issue-51) -- PLANNED
-- [Policy Assignment and Deployment (Issue 5.2)](#policy-assignment-and-deployment-issue-52) -- PLANNED
-- [Compliance Dashboard (Issue 5.3)](#compliance-dashboard-issue-53) -- PLANNED
-- [Policy Cache Invalidation (Issue 5.4)](#policy-cache-invalidation-issue-54) -- PLANNED
-- [CEL Adoption (Issue 5.5)](#cel-adoption-issue-55) -- PLANNED
-- [YAML Schema Reference](#yaml-schema-reference) -- PLANNED
+- [Policy Fragments](#policy-fragments)
+- [Policies](#policies)
+- [Compliance Tracking](#compliance-tracking)
+- [Fleet Compliance Summary](#fleet-compliance-summary)
+- [Cache Invalidation](#cache-invalidation)
+- [CEL Expressions](#cel-expressions)
+- [REST API Endpoints](#rest-api-endpoints)
+- [YAML Schema Reference](#yaml-schema-reference)
 
 ---
 
 ## Overview
-
-> **NOT YET IMPLEMENTED**
 
 The policy engine provides **Guaranteed State** -- a desired-state enforcement
 system where the server declares what state endpoints should be in, and agents
@@ -28,34 +22,54 @@ continuously evaluate and remediate drift.
 
 The system is built on two primitives:
 
-1. **PolicyFragment** -- a single check/fix pair that tests one condition and
-   optionally remediates it.
-2. **Policy** -- a named collection of fragments assigned to a set of devices
-   via management groups.
+1. **PolicyFragment** -- a single check/fix/postCheck pattern that tests one
+   condition and optionally remediates it.
+2. **Policy** -- a named binding of a fragment to a set of devices via scope
+   expressions, triggers, management group bindings, and input parameters.
 
 Policies are defined in YAML using the `yuzu.io/v1alpha1` DSL (the same schema
-used for instruction definitions) and are evaluated agent-side on configurable
-triggers.
+used for instruction definitions) and are managed through the REST API and the
+compliance dashboard.
+
+The implementation is backed by `PolicyStore` (SQLite WAL), which stores
+fragments, policies, triggers, group bindings, input parameters, and per-agent
+compliance status. A mutex protects the database handle for thread-safe access.
 
 ---
 
-## Policy Rules and Fragments (Issue 5.1)
-
-> **NOT YET IMPLEMENTED**
-
-### PolicyFragment
+## Policy Fragments
 
 A PolicyFragment is the atomic unit of compliance. It contains:
 
 - **Check instruction** -- an instruction definition that evaluates the current
-  state and returns a pass/fail result.
+  state. The check compliance expression (CEL) determines pass/fail.
 - **Fix instruction** (optional) -- an instruction definition that remediates
   drift when the check fails.
-- **Trigger** -- when to evaluate (interval, file change, service status,
-  event log entry, registry change, or startup).
+- **Post-check instruction** (optional) -- a follow-up check to verify the fix
+  was successful.
+
+### Fragment Structure
+
+Each fragment stores:
+
+| Field | Description |
+|---|---|
+| `id` | Auto-generated unique identifier |
+| `name` | Human-readable fragment name |
+| `description` | What this fragment checks and fixes |
+| `yaml_source` | Verbatim YAML source (source of truth) |
+| `check_instruction` | Instruction definition ID for the check step |
+| `check_compliance` | CEL expression evaluated against check results |
+| `check_parameters` | JSON parameter bindings for the check instruction |
+| `fix_instruction` | Instruction definition ID for the fix step |
+| `fix_parameters` | JSON parameter bindings for the fix instruction |
+| `post_check_instruction` | Instruction definition ID for the post-check step |
+| `post_check_compliance` | CEL expression for post-check evaluation |
+| `post_check_parameters` | JSON parameter bindings for post-check |
+
+### Example Fragment YAML
 
 ```yaml
-# PLANNED YAML schema -- not yet accepted by the server
 apiVersion: yuzu.io/v1alpha1
 kind: PolicyFragment
 metadata:
@@ -65,220 +79,203 @@ spec:
   check:
     plugin: security
     action: defender-status
-    expect:
-      field: realtime_protection
-      operator: equals
-      value: true
+    compliance: "result.realtime_protection == true"
   fix:
     plugin: security
     action: enable-defender
-  trigger:
-    type: interval
-    interval: 300   # seconds
+  postCheck:
+    plugin: security
+    action: defender-status
+    compliance: "result.realtime_protection == true"
 ```
 
-### Rule Types
+---
 
-Each fragment operates as one of two rule types:
+## Policies
 
-| Type | Behavior |
+A Policy binds a fragment to devices, defining when and where compliance
+checks run.
+
+### Policy Structure
+
+| Field | Description |
 |---|---|
-| **Check** | Evaluates condition only. Reports pass/fail but does not remediate. |
-| **Fix** | Evaluates condition, and if failed, executes the fix instruction and re-checks. |
+| `id` | Auto-generated unique identifier |
+| `name` | Human-readable policy name |
+| `description` | What this policy enforces |
+| `yaml_source` | Verbatim YAML source (source of truth) |
+| `fragment_id` | Reference to the PolicyFragment |
+| `scope_expression` | Scope engine expression for device targeting |
+| `enabled` | Whether the policy is active (can be toggled) |
+| `inputs` | Key-value parameters passed to the fragment's instructions |
+| `triggers` | When to evaluate (interval, file_change, event_log, etc.) |
+| `management_groups` | Group IDs this policy is scoped to |
 
-### Status Codes
+### Trigger Configuration
 
-Each rule evaluation produces a status code:
+Triggers are stored per-policy with type-specific JSON configuration:
+
+| Trigger Type | Config Example |
+|---|---|
+| `interval` | `{"interval_seconds": 300}` |
+| `file_change` | `{"path": "/etc/hosts"}` |
+| `service_status` | `{"service": "sshd"}` |
+| `event_log` | `{"log": "Security", "event_id": 4625}` |
+| `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` |
+| `startup` | `{}` |
+
+### Management Group Bindings
+
+Policies can be scoped to specific management groups. When a policy is bound
+to a group, only agents that are members of that group (or its descendant
+groups) are subject to the policy's compliance checks.
+
+### Example Policy YAML
+
+```yaml
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+metadata:
+  name: baseline-security
+  description: Enforce security baseline on production servers
+spec:
+  fragment: ensure-defender-enabled
+  scope: "tag:environment = 'production'"
+  triggers:
+    - type: interval
+      interval: 300
+  managementGroups:
+    - eu-production-servers
+  inputs:
+    severity_threshold: "high"
+```
+
+---
+
+## Compliance Tracking
+
+The policy engine tracks compliance status per agent per policy. Each
+`PolicyAgentStatus` record contains:
+
+| Field | Description |
+|---|---|
+| `policy_id` | The policy being tracked |
+| `agent_id` | The agent being evaluated |
+| `status` | Current compliance state |
+| `last_check_at` | Unix timestamp of last check evaluation |
+| `last_fix_at` | Unix timestamp of last fix execution |
+| `check_result` | JSON output from the last check instruction |
+
+### Status Values
 
 | Status | Meaning |
 |---|---|
-| `Received` | Rule delivered to agent, evaluation not yet started |
-| `CheckErrored` | Check instruction failed to execute (plugin error, timeout) |
-| `CheckFailed` | Check instruction executed successfully but the condition is not met |
-| `CheckPassed` | Check instruction executed successfully and the condition is met |
-| `FixErrored` | Fix instruction failed to execute |
-| `FixPassed` | Fix instruction executed and subsequent re-check passed |
-| `FixFailed` | Fix instruction executed but subsequent re-check still failed |
-
-### Agent-Side Evaluation
-
-Policy evaluation happens on the agent, not the server. The agent:
-
-1. Receives the policy definition (fragments + triggers) from the server.
-2. Registers triggers with the local trigger engine.
-3. On each trigger firing, executes the check instruction.
-4. If the check fails and a fix is defined, executes the fix and re-checks.
-5. Reports the result status back to the server.
-
-This design ensures policies are enforced even when the agent is temporarily
-disconnected from the server.
+| `compliant` | Check passed -- the endpoint is in the desired state |
+| `non_compliant` | Check failed -- the endpoint is not in the desired state |
+| `unknown` | Not yet evaluated or status invalidated |
+| `fixing` | Fix instruction is currently running |
+| `error` | Check or fix instruction failed to execute |
 
 ---
 
-## Policy Assignment and Deployment (Issue 5.2)
+## Fleet Compliance Summary
 
-> **NOT YET IMPLEMENTED**
+The `FleetCompliance` aggregate provides a fleet-wide view:
 
-### Assignment Model
+- **compliance_pct** -- percentage of (policy, agent) pairs that are compliant
+- **total_checks** -- total number of tracked (policy, agent) pairs
+- Breakdown by status: compliant, non_compliant, unknown, fixing, error
 
-Policies are assigned to **management groups**, not individual agents. When
-an agent is a member of a management group (statically or dynamically), it
-receives all policies assigned to that group and its ancestor groups.
+Per-policy summaries (`ComplianceSummary`) provide the same breakdown scoped
+to a single policy.
+
+The compliance dashboard (accessible at the Policies page in the web UI)
+displays:
+
+- Fleet compliance percentage with a color-coded bar
+- Count of active policies
+- Per-policy compliance percentage with drill-down to agent-level detail
+- Per-agent status with last check time and check result
+
+---
+
+## Cache Invalidation
+
+When a policy's check instruction or compliance expression changes, agents
+need to re-evaluate. The policy engine supports:
+
+- **Per-policy invalidation** -- Reset all agent statuses to `pending` for a
+  specific policy, forcing re-evaluation on the next trigger.
+- **Fleet-wide invalidation** -- Reset all agent statuses across all policies.
+  Use sparingly, primarily after bulk configuration changes or server upgrades.
+
+Both operations are available via the REST API.
+
+---
+
+## CEL Expressions
+
+Compliance expressions use [Common Expression Language (CEL)](https://github.com/google/cel-spec),
+a non-Turing-complete expression language designed for security policies. CEL
+provides strong typing, compile-time checks, and no side effects.
+
+Compliance expressions are stored in `check_compliance` and
+`post_check_compliance` fields. They are evaluated against the check
+instruction's result data to determine pass/fail.
+
+Example expressions:
 
 ```
-Management Group Hierarchy        Policies
-================================  ================
-All Devices                       baseline-security
-  +-- EU Production               eu-compliance
-  |     +-- EU Web Servers        web-hardening
-  +-- US Staging                  (none)
+result.realtime_protection == true
+result.value == "expected" && result.type == "REG_SZ"
+result.signature_age < duration('24h')
 ```
 
-In this example, an agent in "EU Web Servers" receives three policies:
-`baseline-security`, `eu-compliance`, and `web-hardening`.
-
-### Pending Changes
-
-Policy changes are not applied immediately. Instead they enter a **pending
-changes** queue:
-
-1. Operator modifies a policy or its group assignment.
-2. The change appears in the pending changes list with a diff view.
-3. An authorized user reviews and approves the deployment.
-4. The server pushes the updated policy set to affected agents.
-
-This prevents accidental fleet-wide changes and provides an audit trail.
-
-### Deployment Push
-
-Once approved, the server:
-
-1. Computes the effective policy set for each affected agent.
-2. Sends the updated policy definition over the Subscribe bidi stream.
-3. Waits for agent acknowledgment.
-4. Records the deployment event in the audit log.
-
 ---
 
-## Compliance Dashboard (Issue 5.3)
+## REST API Endpoints
 
-> **NOT YET IMPLEMENTED**
+All policy engine endpoints are under `/api/` (legacy prefix). They require
+the `Policy:Read` or `Policy:Write` RBAC permission.
 
-The compliance dashboard provides fleet-wide visibility into policy
-enforcement status.
+### Policy Fragments
 
-### Planned Views
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. |
+| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Body: `{"yaml_source": "..."}`. |
+| `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. |
 
-**Per-device compliance status:**
-- Shows each device with its assigned policies and current evaluation status.
-- Color-coded: green (all passing), amber (fix in progress), red (check failed
-  or fix failed), grey (not yet evaluated).
+### Policies
 
-**Fleet posture summary:**
-- Aggregate compliance percentage across all devices.
-- Breakdown by policy, management group, OS, and location tag.
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. |
+| `POST` | `/api/policies` | Create a policy from YAML. Body: `{"yaml_source": "..."}`. |
+| `GET` | `/api/policies/{id}` | Get policy detail including compliance summary. |
+| `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. |
+| `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. |
+| `POST` | `/api/policies/{id}/disable` | Disable an active policy. |
+| `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. |
+| `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). |
 
-**Rule evaluation history:**
-- Timeline view of check/fix results for a specific device and policy fragment.
-- Useful for diagnosing intermittent compliance failures.
+### Compliance
 
-**Effectiveness metrics:**
-- Auto-fix success rate per fragment.
-- Mean time to remediation.
-- Most frequently failing rules.
-- Devices that consistently fail despite fix attempts.
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/compliance` | Fleet compliance summary (total, compliant, non_compliant, etc.). |
+| `GET` | `/api/compliance/{policy_id}` | Per-policy compliance detail with per-agent statuses. |
 
-### Data Model
+### HTMX Fragments
 
-Compliance data is stored in the response store (SQLite) with typed columns
-matching the instruction definition result schema. This enables:
-
-- Filtering and aggregation via the REST API.
-- Export to external analytics (ClickHouse, Splunk) via the existing
-  data export pipeline.
-- Prometheus metrics for compliance percentages (gauge per policy).
-
----
-
-## Policy Cache Invalidation (Issue 5.4)
-
-> **NOT YET IMPLEMENTED**
-
-### Problem
-
-Agents cache their assigned policy set locally to enable offline evaluation.
-When a policy is modified server-side, agents must be notified to refresh
-their cache.
-
-### Planned Approach
-
-- **Version vector** -- each policy has a monotonically increasing version
-  number. The agent reports its cached versions during heartbeat.
-- **Delta push** -- if the server detects a version mismatch, it pushes only
-  the changed fragments over the Subscribe stream.
-- **Full reset** -- an operator can force a full policy re-evaluation on a
-  device via:
-  ```
-  POST /api/v1/policies/{agent_id}/reset
-  ```
-  This clears the agent's policy cache and forces a complete re-download.
-- **Heartbeat protocol extension** -- the `HeartbeatRequest` message will
-  include a `policy_version_map` field mapping policy IDs to cached versions.
-
----
-
-## CEL Adoption (Issue 5.5)
-
-> **NOT YET IMPLEMENTED**
-
-### Motivation
-
-The current scope engine uses a custom expression language for device
-targeting. Policy evaluation conditions (the `expect` block in
-PolicyFragment) would benefit from a more expressive, typed language.
-
-### Planned Approach
-
-[Common Expression Language (CEL)](https://github.com/google/cel-spec) is a
-non-Turing-complete expression language designed for security policies. It
-provides:
-
-- Strong typing with compile-time checks.
-- A well-defined evaluation model (no side effects).
-- Native support in the Google ecosystem (used by Kubernetes, Envoy, Firebase).
-- C++ reference implementation (`cel-cpp`).
-
-### Usage in Yuzu
-
-CEL expressions would replace the `expect` block in PolicyFragment:
-
-```yaml
-# Current (planned) -- simple field comparison
-spec:
-  check:
-    plugin: security
-    action: defender-status
-    expect:
-      field: realtime_protection
-      operator: equals
-      value: true
-
-# Future (with CEL) -- arbitrary typed expressions
-spec:
-  check:
-    plugin: security
-    action: defender-status
-    expect_cel: "result.realtime_protection == true && result.signature_age < duration('24h')"
-```
-
-CEL would also be evaluated agent-side, with the `cel-cpp` library embedded
-in the agent binary.
+| Route | Description |
+|---|---|
+| `/fragments/compliance/summary` | Compliance dashboard summary fragment |
+| `/fragments/compliance/{policy_id}` | Per-policy compliance detail fragment |
 
 ---
 
 ## YAML Schema Reference
-
-> **NOT YET IMPLEMENTED**
 
 Both policy kinds use `apiVersion: yuzu.io/v1alpha1`. The full DSL
 specification is in `docs/yaml-dsl-spec.md`.
@@ -297,22 +294,20 @@ spec:
   check:
     plugin: <plugin-name>
     action: <action-name>
+    compliance: <CEL expression>
     parameters:             # optional
       <key>: <value>
-    expect:
-      field: <result-field>
-      operator: <equals|not_equals|greater_than|less_than|contains|matches>
-      value: <expected-value>
   fix:                      # optional -- omit for check-only rules
     plugin: <plugin-name>
     action: <action-name>
     parameters:             # optional
       <key>: <value>
-  trigger:
-    type: <interval|file_change|service_status|event_log|registry|startup>
-    interval: <seconds>     # for type: interval
-    path: <file-path>       # for type: file_change
-    service: <service-name> # for type: service_status
+  postCheck:                # optional -- verify fix was successful
+    plugin: <plugin-name>
+    action: <action-name>
+    compliance: <CEL expression>
+    parameters:             # optional
+      <key>: <value>
 ```
 
 ### Policy
@@ -324,14 +319,15 @@ metadata:
   name: <unique-name>
   description: <human-readable description>
 spec:
-  fragments:
-    - <fragment-name-1>
-    - <fragment-name-2>
-  assignment:
-    management_groups:
-      - <group-name-or-id>
-  deployment:
-    require_approval: <true|false>
-    rollout_strategy: <all_at_once|phased>
-    phased_percentage: <1-100>    # for phased rollout
+  fragment: <fragment-name-or-id>
+  scope: <scope-expression>
+  triggers:
+    - type: <interval|file_change|service_status|event_log|registry|startup>
+      interval: <seconds>     # for type: interval
+      path: <file-path>       # for type: file_change
+      service: <service-name> # for type: service_status
+  managementGroups:
+    - <group-name-or-id>
+  inputs:
+    <key>: <value>
 ```

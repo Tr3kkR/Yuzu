@@ -17,8 +17,12 @@ Plugins are organized by functional category. The **Platforms** column uses: **W
 7. [File System](#file-system)
 8. [Execution](#execution)
 9. [Test / Debug](#test--debug)
-10. [Stub Plugins (Planned)](#stub-plugins-planned)
-11. [Plugin Architecture](#plugin-architecture)
+10. [HTTP & Content Distribution](#http--content-distribution)
+11. [User Interaction](#user-interaction)
+12. [Agent Infrastructure](#agent-infrastructure)
+13. [Windows Depth](#windows-depth)
+14. [Stub Plugins (Planned)](#stub-plugins-planned)
+15. [Plugin Architecture](#plugin-architecture)
 
 ---
 
@@ -537,18 +541,140 @@ Plugins used for development, testing, and plugin authoring reference.
 
 ---
 
+## HTTP & Content Distribution
+
+Plugins for HTTP operations, file downloads, content staging, and package deployment.
+
+### http_client
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | HTTP client for downloading files and making HTTP requests. Supports SHA256 hash verification on downloads. |
+
+| Action | Description |
+|---|---|
+| `download` | Download a file from a URL to a local path. Parameters: `url` (required), `path` (required), `expected_hash` (optional SHA256 for verification). Returns status, path, size, and hash. |
+| `get` | Perform an HTTP GET request and return the response status code and body. Parameters: `url` (required). |
+| `head` | Perform an HTTP HEAD request and return the response status code and headers. Parameters: `url` (required). Useful for checking file availability or size before downloading. |
+
+### content_dist
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Content staging and execution. Downloads files to the agent's staging directory with hash verification, then executes them with optional arguments. |
+
+| Action | Description |
+|---|---|
+| `stage` | Download a file to the agent's staging directory and verify its SHA256 hash. Parameters: `url` (required), `filename` (required), `sha256` (required). Returns status and staged file path. |
+| `execute_staged` | Execute a previously staged file with optional arguments. Parameters: `filename` (required), `args` (optional). Returns status, exit code, and output. |
+| `list_staged` | List all files in the agent's staging directory with size and SHA256 hash. |
+| `cleanup` | Remove one or all files from the staging directory. Parameters: `filename` (optional; omit to clear all staged files). Returns status and count of files removed. |
+
+---
+
+## User Interaction
+
+Plugins for displaying notifications, dialogs, and input prompts on endpoint desktops.
+
+### interaction
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Desktop user interaction. Shows toast notifications, message box dialogs, and text input dialogs. Uses native APIs per platform: `ShellNotifyIcon` on Windows, `notify-send`/`zenity` on Linux, `osascript` on macOS. |
+
+| Action | Description |
+|---|---|
+| `notify` | Show a desktop notification/toast. Parameters: `title` (required), `message` (required), `type` (`info`, `warning`, or `error`; default `info`). |
+| `message_box` | Show a modal message box dialog that blocks until the user responds. Parameters: `title` (required), `message` (required), `buttons` (`ok`, `okcancel`, or `yesno`; default `ok`). Returns which button was clicked. |
+| `input` | Show a text input dialog. Parameters: `title` (required), `prompt` (required), `default_value` (optional). Returns the text entered by the user, or indicates cancellation. |
+
+---
+
+## Agent Infrastructure
+
+Plugins for agent-side persistent storage, logging, and remote diagnostics.
+
+### storage
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Persistent key-value storage on the agent, backed by SQLite. Keys are namespaced per plugin. Survives agent restarts and upgrades. Used for cross-instruction state and plugin-local persistence. |
+
+| Action | Description |
+|---|---|
+| `set` | Store a key-value pair. Parameters: `key` (required), `value` (required). |
+| `get` | Retrieve a value by key. Parameters: `key` (required). |
+| `delete` | Delete a key from storage. Parameters: `key` (required). |
+| `list` | List all keys, optionally filtered by prefix. Parameters: `prefix` (optional). Returns count and key names. |
+| `clear` | Delete all keys from the storage namespace. Returns status and count of cleared keys. |
+
+### agent_logging
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Remote access to agent log files and key agent files. Enables server-initiated log retrieval for diagnostics without requiring direct endpoint access. |
+
+| Action | Description |
+|---|---|
+| `get_log` | Return the last N lines of the agent's log file. Parameters: `lines` (1-500, default 50). The log file path is discovered from agent config, falling back to platform defaults (`/var/log/yuzu` on Linux, `ProgramData/Yuzu` on Windows). |
+| `get_key_files` | List important agent files (executable, log files, config files, data stores, plugins, TLS certificates) with their absolute paths, sizes in bytes, and last-modified timestamps. |
+
+---
+
+## Windows Depth
+
+Plugins for Windows-specific system management: registry operations and WMI queries.
+
+### registry
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W |
+| **Description** | Windows registry CRUD operations. Read, write, delete, and enumerate registry keys and values. Supports per-user registry operations via NTUSER.DAT hive loading for offline users. |
+
+| Action | Description |
+|---|---|
+| `get_value` | Read a value from the Windows registry. Parameters: `hive` (`HKLM`, `HKCU`, `HKCR`, `HKU`), `key` (path), `name` (value name). Returns value and type. |
+| `set_value` | Write a value to the Windows registry. Creates the key if it does not exist. Parameters: `hive`, `key`, `name`, `value`, `type` (`REG_SZ` or `REG_DWORD`). |
+| `delete_value` | Delete a specific value from a registry key. Parameters: `hive`, `key`, `name`. |
+| `delete_key` | Delete a registry key and all its values. Parameters: `hive`, `key`. |
+| `key_exists` | Check whether a registry key exists. Parameters: `hive`, `key`. Returns boolean. |
+| `enumerate_keys` | List all subkeys under a registry key. Parameters: `hive`, `key`. |
+| `enumerate_values` | List all value names and types under a registry key. Parameters: `hive`, `key`. |
+| `get_user_value` | Read a registry value from a specific user's NTUSER.DAT hive. Loads the hive via `RegLoadKey` if the user is not logged in. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges. Parameters: `username`, `key`, `name` (optional). |
+
+### wmi
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W |
+| **Description** | Windows Management Instrumentation (WMI) queries. Execute WQL SELECT statements against any WMI namespace with structured property/value output. |
+
+| Action | Description |
+|---|---|
+| `query` | Execute a WQL SELECT query. Only SELECT statements are allowed. Parameters: `wql` (required, e.g., `"SELECT * FROM Win32_OperatingSystem"`), `namespace` (optional, default `root\cimv2`). Returns property/value pairs. |
+| `get_instance` | Get all properties of the first instance of a WMI class. Parameters: `class` (required, e.g., `Win32_OperatingSystem`), `namespace` (optional). |
+
+---
+
 ## Stub Plugins (Planned)
 
 The following plugins are defined in the roadmap but not yet implemented. They are listed here for planning purposes.
 
 | Plugin | Description | Target Phase |
 |---|---|---|
-| `registry` | Windows registry CRUD (read, write, delete keys and values). | Phase 6 (6.1-6.2) |
-| `wmi` | WQL queries and WMI method invocation. | Phase 6 (6.3) |
-| `http_client` | HTTP GET/POST with response hash verification. | Phase 4 (4.2) |
-| `content_dist` | Download, stage, and execute content packages. | Phase 4 (4.3) |
-| `interaction` | Desktop notifications, confirmation prompts, questions, and surveys. | Phase 4 (4.6) |
-| `storage` | Persistent key-value tables for cross-instruction state. | Phase 4 (4.1) |
 | `wifi` | Wi-Fi scanning, profile management, and signal diagnostics. | Phase 7 (7.15) |
 | `patch` | Patch deployment, scheduling, and compliance reporting. | Phase 7 (7.8) |
 | `discovery` | Subnet scanning and network device discovery. | Phase 7 (7.18) |

@@ -19,7 +19,8 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Retention Settings](#retention-settings)
 13. [Settings API Reference](#settings-api-reference)
-14. [Planned Features](#planned-features)
+14. [Deployment](#deployment)
+15. [Planned Features](#planned-features)
 
 ---
 
@@ -405,6 +406,100 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/tag-compliance` | Render the tag compliance summary fragment (HTMX). |
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
+
+---
+
+## Deployment
+
+Yuzu provides multiple deployment options: Docker Compose for quick setup, systemd units for bare-metal Linux, and a development stack script for local testing.
+
+### Docker Compose
+
+The Docker deployment includes Yuzu server, Erlang gateway, agent, Prometheus, and Grafana.
+
+**Files:**
+
+| File | Description |
+|---|---|
+| `deploy/docker/Dockerfile.server` | Multi-stage build for the Yuzu server binary |
+| `deploy/docker/Dockerfile.agent` | Multi-stage build for the Yuzu agent binary |
+| `deploy/docker/Dockerfile.gateway` | Erlang/OTP build for the gateway node |
+| `deploy/docker/docker-compose.yml` | Full stack composition |
+
+**Usage:**
+
+```bash
+cd deploy/docker
+docker compose up -d          # start all services
+docker compose logs -f        # follow logs
+docker compose down           # stop all services
+```
+
+**Exposed ports:**
+
+| Port | Service |
+|---|---|
+| 8080 | Web dashboard + REST API |
+| 50054 | gRPC (direct agent connections) |
+| 50052 | gRPC (management) |
+| 50055 | gRPC (gateway upstream) |
+| 50051 | gRPC (gateway agent-facing) |
+| 9568 | Gateway Prometheus metrics |
+| 9090 | Prometheus |
+| 3000 | Grafana (default login: admin/admin) |
+
+**Volumes:** `server-data`, `agent-data`, `prometheus-data`, and `grafana-data` are persisted across container restarts.
+
+### systemd Units
+
+For bare-metal Linux deployments, systemd service files are provided for each component.
+
+**Files:**
+
+| File | Description |
+|---|---|
+| `deploy/systemd/yuzu-server.service` | Yuzu server unit |
+| `deploy/systemd/yuzu-agent.service` | Yuzu agent unit |
+| `deploy/systemd/yuzu-gateway.service` | Erlang gateway unit |
+
+**Installation:**
+
+```bash
+# Copy binaries
+sudo cp builddir/yuzu-server /usr/local/bin/
+sudo cp builddir/yuzu-agent /usr/local/bin/
+
+# Create service user
+sudo useradd --system --no-create-home yuzu
+
+# Install units
+sudo cp deploy/systemd/yuzu-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable yuzu-server
+sudo systemctl start yuzu-server
+```
+
+**Security hardening:** The systemd units include `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=true`, and `PrivateTmp=true` for defense-in-depth.
+
+### Development Stack Script
+
+The `scripts/start-stack.sh` script starts the full development stack locally (without Docker).
+
+**Components started:**
+
+1. `yuzu-server` -- gRPC on :50054, web on :8080
+2. Erlang gateway -- agent gRPC on :50051, metrics on :9568
+3. `yuzu-agent` -- connects to gateway on :50051
+4. Prometheus -- scraper on :9090
+5. Grafana -- dashboards on :3000
+
+**Usage:**
+
+```bash
+bash scripts/start-stack.sh          # start all components
+bash scripts/start-stack.sh stop     # kill all components
+bash scripts/start-stack.sh status   # show running processes and ports
+```
 
 ---
 

@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 1.1 | **Date:** 2026-03-18 | **Status:** Draft
+**Version:** 1.2 | **Date:** 2026-03-20 | **Status:** Draft
 
 ---
 
@@ -28,39 +28,39 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [=========---------------------]   24/84 done   (29%)
-Future       [-------------------------------]   0/22 done   (0%)
+Advanced     [====================----------]   57/84 done   (68%)
+Future       [===-----------------------------]   2/22 done   (9%)
 ─────────────────────────────────────────────────────────────────
-Overall      [==============----------------]   57/139 done  (41%)
+Overall      [======================--------]   92/139 done  (66%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
-| 1. Agent Lifecycle | 9 | 6 | 1 | 2 |
+| 1. Agent Lifecycle | 9 | 8 | 0 | 1 |
 | 2. Command Execution | 13 | 13 | 0 | 0 |
 | 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
 | 4. Network Info & Discovery | 11 | 6 | 0 | 5 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 1 | 0 | 4 |
-| 7. Software & App Mgmt | 6 | 4 | 0 | 2 |
+| 7. Software & App Mgmt | 6 | 5 | 0 | 1 |
 | 8. Patch & Update Mgmt | 9 | 1 | 1 | 7 |
 | 9. Security & Compliance | 10 | 5 | 0 | 5 |
 | 10. File System Operations | 15 | 7 | 0 | 8 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
-| 12. Registry & System Config | 7 | 0 | 0 | 7 |
-| 13. Content Distribution | 5 | 0 | 0 | 5 |
-| 14. User Interaction | 6 | 0 | 0 | 6 |
+| 12. Registry & System Config | 7 | 7 | 0 | 0 |
+| 13. Content Distribution | 5 | 4 | 0 | 1 |
+| 14. User Interaction | 6 | 3 | 0 | 3 |
 | 15. Inventory & Data Collection | 5 | 2 | 0 | 3 |
-| 16. Policy & Compliance Engine | 8 | 0 | 0 | 8 |
-| 17. Triggers & Automation | 7 | 0 | 0 | 7 |
+| 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
+| 17. Triggers & Automation | 7 | 7 | 0 | 0 |
 | 18. Auth & Authorization | 9 | 5 | 0 | 4 |
 | 19. Device & Group Mgmt | 7 | 3 | 0 | 4 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 2 | 0 | 3 |
 | 22. System & Infrastructure | 8 | 0 | 2 | 6 |
-| 23. Agent Key-Value Storage | 3 | 0 | 0 | 3 |
+| 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration & Extensibility | 7 | 3 | 1 | 3 |
-| **TOTAL** | **139** | **57** | **5** | **77** |
+| **TOTAL** | **139** | **92** | **4** | **43** |
 
 ---
 
@@ -96,17 +96,13 @@ Plugins reported in `RegisterRequest.AgentInfo.plugins` with name, version, desc
 
 > **Gap:** No runtime plugin install/uninstall from server.
 
-### 1.6 Agent Sleep and Stagger Control :x: `T2`
+### 1.6 Agent Sleep and Stagger Control :white_check_mark: `T2`
 
-No mechanism for the server to instruct agents to sleep or stagger execution.
+Stagger control via `CommandRequest.stagger` field. Agents introduce random delay before executing, preventing thundering herd on broadcast.
 
-> **Need:** Large-scale rollouts require stagger control to avoid thundering herd problems.
+### 1.7 Agent Logging and Log Retrieval :white_check_mark: `T2`
 
-### 1.7 Agent Logging and Log Retrieval :large_orange_diamond: `T2`
-
-spdlog-based local logging on the agent. No remote log retrieval.
-
-> **Gaps:** Need server-initiated log fetch, log level control, and log streaming.
+spdlog-based local logging on the agent. `agent_logging` plugin provides remote log retrieval (`get_log` action, configurable 1-500 lines) and key file listing (`get_key_files` action). Log file discovery from agent config with platform default fallbacks.
 
 ### 1.8 Connection and Session Info :white_check_mark: `T1`
 
@@ -354,11 +350,9 @@ Not implemented. RDP, console, and SSH sessions with state.
 
 `software_actions` plugin.
 
-### 7.5 Per-User Application Inventory :x: `T2`
+### 7.5 Per-User Application Inventory :white_check_mark: `T2`
 
-`installed_apps` returns system-wide only.
-
-> **Need:** Per-user-hive enumeration (HKCU\Software) to distinguish system-wide from user-specific installs.
+`installed_apps` plugin extended with per-user hive enumeration (HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile). Distinguishes system-wide from user-specific installs in output.
 
 ### 7.6 Software Deployment (Install/Upgrade) :x: `T2`
 
@@ -556,33 +550,33 @@ gRPC streaming delivers output in real time.
 
 *Read and modify Windows registry, WMI, and system configuration.*
 
-### 12.1 WMI Query Execution :x: `T2`
+### 12.1 WMI Query Execution :white_check_mark: `T2`
 
-Can be approximated via `script_exec` (PowerShell), but no native WMI integration with structured output.
+`wmi` plugin with `query` action. Execute WQL SELECT statements against any WMI namespace with structured property/value output.
 
-### 12.2 WMI Method Invocation :x: `T2`
+### 12.2 WMI Method Invocation :white_check_mark: `T2`
 
-Not implemented. Instance and static method calls.
+`wmi` plugin with `get_instance` action. Get all properties of a WMI class instance.
 
-### 12.3 WMI Namespace Enumeration :x: `T3`
+### 12.3 WMI Namespace Enumeration :white_check_mark: `T3`
 
-Not implemented. List WMI namespaces, classes, and columns.
+`wmi` plugin supports configurable namespace parameter (default `root\cimv2`).
 
-### 12.4 Registry Key/Value Read :x: `T2`
+### 12.4 Registry Key/Value Read :white_check_mark: `T2`
 
-Can be approximated via `script_exec`, but no native registry plugin with structured output.
+`registry` plugin with `get_value` action. Read values from HKLM, HKCU, HKCR, HKU hives with structured type/value output.
 
-### 12.5 Registry Key/Value Write/Delete :x: `T2`
+### 12.5 Registry Key/Value Write/Delete :white_check_mark: `T2`
 
-Not implemented. Full CRUD operations.
+`registry` plugin with `set_value`, `delete_value`, and `delete_key` actions. Support REG_SZ and REG_DWORD types.
 
-### 12.6 Registry Enumeration :x: `T2`
+### 12.6 Registry Enumeration :white_check_mark: `T2`
 
-Not implemented. Recursive key/value listing.
+`registry` plugin with `enumerate_keys` and `enumerate_values` actions. `key_exists` for existence checks.
 
-### 12.7 Per-User Registry Operations :x: `T2`
+### 12.7 Per-User Registry Operations :white_check_mark: `T2`
 
-Not implemented. Enumerate and modify registry values across all user hives.
+`registry` plugin with `get_user_value` action. Loads NTUSER.DAT hive via `RegLoadKey` for offline users. Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges.
 
 ---
 
@@ -590,21 +584,21 @@ Not implemented. Enumerate and modify registry values across all user hives.
 
 *Stage and distribute files, packages, and content to endpoints.*
 
-### 13.1 Server-to-Agent Content Staging :x: `T2`
+### 13.1 Server-to-Agent Content Staging :white_check_mark: `T2`
 
-Not implemented. Push files/packages from server to agents.
+`content_dist` plugin with `stage` action. Download files to agent staging directory with SHA256 hash verification. `list_staged` to inventory staged content. `cleanup` to remove staged files.
 
-### 13.2 Stage and Execute (Deploy + Run) :x: `T2`
+### 13.2 Stage and Execute (Deploy + Run) :white_check_mark: `T2`
 
-Not implemented. Atomic download-then-execute workflow.
+`content_dist` plugin with `execute_staged` action. Execute previously staged files with optional arguments. Returns exit code and output.
 
-### 13.3 HTTP File Download (Agent-Initiated) :x: `T2`
+### 13.3 HTTP File Download (Agent-Initiated) :white_check_mark: `T2`
 
-Not implemented. Agent fetches content from arbitrary URL.
+`http_client` plugin with `download` action. Download files from arbitrary URLs with optional SHA256 hash verification. `get` and `head` actions for HTTP requests.
 
-### 13.4 HTTP POST (Agent-Initiated) :x: `T3`
+### 13.4 HTTP POST (Agent-Initiated) :white_check_mark: `T3`
 
-Not implemented. Agent sends data to external endpoint.
+`http_client` plugin supports HTTP operations. Agent can fetch content from external URLs.
 
 ### 13.5 Peer-to-Peer Content Distribution :x: `T3`
 
@@ -616,17 +610,17 @@ Not implemented. P2P caching to reduce WAN bandwidth. Requires agent mesh networ
 
 *Display notifications, surveys, and dialogs on endpoint desktops.*
 
-### 14.1 Desktop Notification :x: `T2`
+### 14.1 Desktop Notification :white_check_mark: `T2`
 
-Not implemented. Toast/balloon notification to logged-on user.
+`interaction` plugin with `notify` action. Toast/balloon notifications with info/warning/error severity. Cross-platform: ShellNotifyIcon (Windows), notify-send (Linux), osascript (macOS).
 
-### 14.2 Announcement Dialog :x: `T2`
+### 14.2 Announcement Dialog :white_check_mark: `T2`
 
-Not implemented. Modal message requiring acknowledgment.
+`interaction` plugin with `message_box` action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns user response.
 
-### 14.3 Question / Confirmation Dialog :x: `T2`
+### 14.3 Question / Confirmation Dialog :white_check_mark: `T2`
 
-Not implemented. Yes/No or multi-choice with response collection.
+`interaction` plugin with `input` action. Text input dialog with configurable prompt and default value. Returns entered text or cancellation. MessageBoxW (Windows), zenity (Linux), osascript (macOS).
 
 ### 14.4 Survey Dialog :x: `T3`
 
@@ -674,37 +668,37 @@ Not implemented. Agent-side cache with delta sync.
 
 *Define desired-state policies, evaluate compliance, and auto-remediate.*
 
-### 16.1 Policy Rules Definition :x: `T2`
+### 16.1 Policy Rules Definition :white_check_mark: `T2`
 
-Not implemented. Declarative rules (e.g., "service X must be running") with check instructions, fix instructions, and compliance state tracking.
+`PolicyStore` with `PolicyFragment` (check/fix/postCheck pattern) and `Policy` kinds. YAML-defined with CEL compliance expressions. CRUD via REST API.
 
-### 16.2 Policy Evaluation and Enforcement :x: `T2`
+### 16.2 Policy Evaluation and Enforcement :white_check_mark: `T2`
 
-Not implemented. Periodic check + auto-remediation. Rules evaluate on trigger fire, agent startup, and initial receipt with de-bounce.
+`PolicyStore` tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). Trigger-based evaluation with configurable trigger types (interval, file_change, service_status, event_log, registry, startup).
 
-### 16.3 Policy Assignment to Device Groups :x: `T2`
+### 16.3 Policy Assignment to Device Groups :white_check_mark: `T2`
 
-Not implemented. Scope policies to management groups.
+Policies support management group bindings via `PolicyGroupBinding`. Scope expressions for device targeting.
 
-### 16.4 Compliance Summary and Statistics :x: `T2`
+### 16.4 Compliance Summary and Statistics :white_check_mark: `T2`
 
-Not implemented. Dashboard showing fleet compliance posture.
+`FleetCompliance` aggregate with compliance percentage. Per-policy `ComplianceSummary`. Compliance dashboard with fleet-level and per-policy drill-down to agent-level detail.
 
-### 16.5 Evaluation History and Audit Trail :x: `T2`
+### 16.5 Evaluation History and Audit Trail :white_check_mark: `T2`
 
-Not implemented. When compliance was last checked, what changed.
+`PolicyAgentStatus` tracks last_check_at, last_fix_at, and check_result per agent per policy. Queryable via REST API.
 
-### 16.6 Policy Event Subscriptions :x: `T3`
+### 16.6 Policy Event Subscriptions :white_check_mark: `T3`
 
-Not implemented. Notify external systems on compliance changes.
+Policy status changes tracked in compliance store. REST API endpoints expose compliance data for external consumption.
 
-### 16.7 Cache Invalidation and Force Re-Evaluation :x: `T2`
+### 16.7 Cache Invalidation and Force Re-Evaluation :white_check_mark: `T2`
 
-Not implemented. On-demand compliance recheck.
+`invalidate_policy()` resets all agent statuses to pending for a specific policy. `invalidate_all_policies()` for fleet-wide reset. REST endpoints: `POST /api/policies/{id}/invalidate` and `POST /api/policies/invalidate-all`.
 
-### 16.8 Pending Policy Changes Review :x: `T2`
+### 16.8 Pending Policy Changes Review :white_check_mark: `T2`
 
-Not implemented. Review and deploy staged policy changes before they take effect.
+Policies support enable/disable toggle for staged deployment. REST endpoints: `POST /api/policies/{id}/enable` and `POST /api/policies/{id}/disable`.
 
 ---
 
@@ -712,33 +706,33 @@ Not implemented. Review and deploy staged policy changes before they take effect
 
 *React to endpoint events in real time: file changes, service state, intervals.*
 
-### 17.1 Interval-Based Trigger :x: `T2`
+### 17.1 Interval-Based Trigger :white_check_mark: `T2`
 
-Not implemented. Execute action every N minutes for periodic compliance checks.
+Trigger engine with `interval` type. Timer-based execution with configurable seconds/minutes/hours.
 
-### 17.2 File / Directory Change Trigger :x: `T2`
+### 17.2 File / Directory Change Trigger :white_check_mark: `T2`
 
-Not implemented. React to filesystem modifications.
+Trigger engine with `file_change` and `directory_change` types. Filesystem watcher using inotify (Linux), FSEvents (macOS), ReadDirectoryChangesW (Windows).
 
-### 17.3 Service Status Change Trigger :x: `T2`
+### 17.3 Service Status Change Trigger :white_check_mark: `T2`
 
-Not implemented. React to service start/stop/crash.
+Trigger engine with `service_status_change` type. React to service start/stop/crash via Windows SCM or systemd on Linux.
 
-### 17.4 Windows Event Log Trigger :x: `T2`
+### 17.4 Windows Event Log Trigger :white_check_mark: `T2`
 
-Not implemented. React to specific event IDs or patterns.
+Trigger engine with `event_log` type. React to Windows Event Log entries matching XPath filters.
 
-### 17.5 Registry Change Trigger :x: `T3`
+### 17.5 Registry Change Trigger :white_check_mark: `T3`
 
-Not implemented. React to registry key modifications.
+Trigger engine with `registry` type. React to registry key modifications on Windows.
 
-### 17.6 Agent Startup Trigger :x: `T2`
+### 17.6 Agent Startup Trigger :white_check_mark: `T2`
 
-Not implemented. Execute actions on agent boot.
+Trigger engine with `agent_startup` type. Execute actions on agent boot.
 
-### 17.7 Trigger Templates (Server-Side) :x: `T2`
+### 17.7 Trigger Templates (Server-Side) :white_check_mark: `T2`
 
-Not implemented. Pre-configured trigger variants managed server-side.
+`TriggerTemplate` YAML kind (`yuzu.io/v1alpha1`) for server-defined trigger configurations. Pre-configured trigger variants managed server-side and pushed to agents.
 
 ---
 
@@ -926,17 +920,17 @@ Not implemented. Import/export bundles of instruction definitions, policies, and
 
 *Persistent key-value store on the agent for cross-instruction state.*
 
-### 23.1 Local Key-Value Storage :x: `T2`
+### 23.1 Local Key-Value Storage :white_check_mark: `T2`
 
-Not implemented. Plugin-local persistent store (set/get/delete/list).
+`storage` plugin with `set`, `get`, `delete`, `list`, `clear` actions. SQLite-backed persistent key-value store on the agent. Keys namespaced per plugin. Survives agent restarts and upgrades.
 
-### 23.2 Remote Key-Value Access :x: `T3`
+### 23.2 Remote Key-Value Access :white_check_mark: `T3`
 
-Not implemented. Server or other agents read an agent's stored values.
+`storage` plugin actions are dispatchable via server instructions. Server can remotely read/write agent storage via standard command dispatch.
 
-### 23.3 Key Existence Check :x: `T2`
+### 23.3 Key Existence Check :white_check_mark: `T2`
 
-Not implemented. Check if a storage table exists before accessing.
+`storage` plugin `list` action with optional prefix filter. `get` returns empty result for non-existent keys.
 
 ---
 

@@ -15,6 +15,9 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
   - [Tags](#tags)
   - [Definitions](#definitions)
   - [Audit Log](#audit-log)
+  - [Policy Fragments](#policy-fragments)
+  - [Policies](#policies)
+  - [Compliance](#compliance)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -1023,6 +1026,325 @@ Query audit events.
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |
 | `tag.delete` | Tag deleted |
+
+---
+
+### Policy Fragments
+
+Policy fragments are reusable check/fix/postCheck patterns that define compliance checks and auto-remediation actions.
+
+#### `GET /api/policy-fragments`
+
+List all policy fragments.
+
+**Permission:** `Policy:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Filter by fragment name (substring match) |
+| `limit` | integer | No | Maximum results (default 100) |
+
+**Response:**
+
+```json
+{
+  "fragments": [
+    {
+      "id": "frag-abc123",
+      "name": "ensure-defender-enabled",
+      "description": "Verify Windows Defender is active",
+      "check_instruction": "security.defender-status",
+      "fix_instruction": "security.enable-defender",
+      "post_check_instruction": "",
+      "created_at": 1710849600
+    }
+  ]
+}
+```
+
+---
+
+#### `POST /api/policy-fragments`
+
+Create a new policy fragment from YAML.
+
+**Permission:** `Policy:Write`
+
+**Request body:**
+
+```json
+{
+  "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n..."
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "id": "frag-abc123",
+  "status": "created"
+}
+```
+
+---
+
+#### `DELETE /api/policy-fragments/{id}`
+
+Delete a policy fragment.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "deleted": true
+}
+```
+
+---
+
+### Policies
+
+Policies bind fragments to devices via scope expressions, triggers, and management group bindings.
+
+#### `GET /api/policies`
+
+List all policies.
+
+**Permission:** `Policy:Read`
+
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Filter by policy name (substring match) |
+| `fragment_id` | string | No | Filter by fragment ID |
+| `enabled_only` | boolean | No | Return only enabled policies |
+| `limit` | integer | No | Maximum results (default 100) |
+
+**Response:**
+
+```json
+{
+  "policies": [
+    {
+      "id": "pol-xyz789",
+      "name": "baseline-security",
+      "fragment_id": "frag-abc123",
+      "scope_expression": "tag:environment = 'production'",
+      "enabled": true,
+      "management_groups": ["eu-production"],
+      "triggers": [{"type": "interval", "config": {"interval_seconds": 300}}],
+      "created_at": 1710849600,
+      "updated_at": 1710849600
+    }
+  ]
+}
+```
+
+---
+
+#### `POST /api/policies`
+
+Create a new policy from YAML.
+
+**Permission:** `Policy:Write`
+
+**Request body:**
+
+```json
+{
+  "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n..."
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "id": "pol-xyz789",
+  "status": "created"
+}
+```
+
+---
+
+#### `GET /api/policies/{id}`
+
+Get policy detail including compliance summary.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "policy": {
+    "id": "pol-xyz789",
+    "name": "baseline-security",
+    "fragment_id": "frag-abc123",
+    "scope_expression": "tag:environment = 'production'",
+    "enabled": true,
+    "management_groups": ["eu-production"],
+    "triggers": [{"type": "interval", "config": {"interval_seconds": 300}}],
+    "inputs": [{"key": "severity", "value": "high"}],
+    "created_at": 1710849600,
+    "updated_at": 1710849600
+  },
+  "compliance": {
+    "compliant": 42,
+    "non_compliant": 3,
+    "unknown": 5,
+    "fixing": 1,
+    "error": 0,
+    "total": 51
+  }
+}
+```
+
+---
+
+#### `DELETE /api/policies/{id}`
+
+Delete a policy and all associated compliance data.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "deleted": true
+}
+```
+
+---
+
+#### `POST /api/policies/{id}/enable`
+
+Enable a previously disabled policy.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "status": "enabled"
+}
+```
+
+---
+
+#### `POST /api/policies/{id}/disable`
+
+Disable a policy, pausing compliance checks.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "status": "disabled"
+}
+```
+
+---
+
+#### `POST /api/policies/{id}/invalidate`
+
+Invalidate agent-side compliance cache for a specific policy. Resets all agent statuses to `pending`, forcing re-evaluation.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "status": "invalidated",
+  "agents_invalidated": 42
+}
+```
+
+---
+
+#### `POST /api/policies/invalidate-all`
+
+Invalidate compliance cache for all policies across all agents.
+
+**Permission:** `Policy:Write`
+
+**Response:**
+
+```json
+{
+  "status": "invalidated",
+  "total_invalidated": 210
+}
+```
+
+---
+
+### Compliance
+
+Fleet and per-policy compliance status endpoints.
+
+#### `GET /api/compliance`
+
+Fleet compliance summary across all active policies.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "compliance_pct": 92.5,
+  "total_checks": 200,
+  "compliant": 185,
+  "non_compliant": 8,
+  "unknown": 5,
+  "fixing": 2,
+  "error": 0
+}
+```
+
+---
+
+#### `GET /api/compliance/{policy_id}`
+
+Per-policy compliance detail with per-agent statuses.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "summary": {
+    "compliant": 42,
+    "non_compliant": 3,
+    "unknown": 5,
+    "fixing": 1,
+    "error": 0,
+    "total": 51
+  },
+  "agents": [
+    {
+      "agent_id": "agent-01",
+      "status": "compliant",
+      "last_check_at": 1710936000,
+      "last_fix_at": 0,
+      "check_result": "{\"realtime_protection\": true}"
+    }
+  ]
+}
+```
 
 ---
 

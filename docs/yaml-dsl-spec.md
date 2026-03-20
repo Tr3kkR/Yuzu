@@ -1279,8 +1279,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `device.asset_tags.changes` | `asset_tags` | Y | Y | Y | Verified |
 | `agent.health` | `diagnostics` | Y | Y | Y | Verified |
 | `agent.restart` | `agent_actions` | Y | Y | Y | Verified |
-| `agent.sleep` | agent core | Y | Y | Y | Planned |
-| `agent.log.read` | `diagnostics` | Y | Y | Y | Planned |
+| `agent.sleep` | agent core | Y | Y | Y | Verified |
+| `agent.log.read` | `agent_logging` | Y | Y | Y | Verified |
+| `agent.log.key_files` | `agent_logging` | Y | Y | Y | Verified |
 
 ### 14.2 Process and Execution
 
@@ -1313,8 +1314,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `user.group_membership` | `users` (ext) | Y | Y | Y | Planned |
 | `session.list` | `users` (ext) | Y | Y | Y | Planned |
 | `session.active_user` | `users` (ext) | Y | Y | Y | Planned |
-| `session.notify` | `interaction` | Y | - | - | Planned |
-| `session.prompt` | `interaction` | Y | - | - | Planned |
+| `session.notify` | `interaction` | Y | Y | Y | Verified |
+| `session.prompt` | `interaction` | Y | Y | Y | Verified |
+| `session.input` | `interaction` | Y | Y | Y | Verified |
 
 ### 14.5 Network
 
@@ -1358,10 +1360,13 @@ This section enumerates the stable builtin primitives that content authors targe
 | `file.permissions.inspect` | `filesystem` (ext) | Y | Y | Y | Planned |
 | `file.signature.verify` | `filesystem` (ext) | Y | - | Y | Planned |
 | `file.temp.create` | SDK (`yuzu_create_temp_file`) | Y | Y | Y | Verified |
-| `content.download` | `http_client` | Y | Y | Y | Planned |
-| `content.upload` | `http_client` | Y | Y | Y | Planned |
-| `content.stage` | `content_dist` | Y | Y | Y | Planned |
-| `content.execute` | `content_dist` | Y | Y | Y | Planned |
+| `content.download` | `http_client` | Y | Y | Y | Verified |
+| `content.get` | `http_client` | Y | Y | Y | Verified |
+| `content.head` | `http_client` | Y | Y | Y | Verified |
+| `content.stage` | `content_dist` | Y | Y | Y | Verified |
+| `content.execute` | `content_dist` | Y | Y | Y | Verified |
+| `content.list_staged` | `content_dist` | Y | Y | Y | Verified |
+| `content.cleanup` | `content_dist` | Y | Y | Y | Verified |
 
 ### 14.8 Security and Compliance
 
@@ -1376,7 +1381,32 @@ This section enumerates the stable builtin primitives that content authors targe
 | `security.ioc.check` | `ioc` | Y | Y | Y | Planned |
 | `security.certificate.inventory` | `certificates` | Y | Y | Y | Planned |
 
-### 14.9 Workflow Primitives
+### 14.9 Registry and WMI (Windows)
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status |
+|---|---|:---:|:---:|:---:|---|
+| `registry.get_value` | `registry` | Y | - | - | Verified |
+| `registry.set_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_value` | `registry` | Y | - | - | Verified |
+| `registry.delete_key` | `registry` | Y | - | - | Verified |
+| `registry.key_exists` | `registry` | Y | - | - | Verified |
+| `registry.enumerate_keys` | `registry` | Y | - | - | Verified |
+| `registry.enumerate_values` | `registry` | Y | - | - | Verified |
+| `registry.get_user_value` | `registry` | Y | - | - | Verified |
+| `wmi.query` | `wmi` | Y | - | - | Verified |
+| `wmi.get_instance` | `wmi` | Y | - | - | Verified |
+
+### 14.10 Agent Key-Value Storage
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status |
+|---|---|:---:|:---:|:---:|---|
+| `storage.set` | `storage` | Y | Y | Y | Verified |
+| `storage.get` | `storage` | Y | Y | Y | Verified |
+| `storage.delete` | `storage` | Y | Y | Y | Verified |
+| `storage.list` | `storage` | Y | Y | Y | Verified |
+| `storage.clear` | `storage` | Y | Y | Y | Verified |
+
+### 14.11 Workflow Primitives
 
 | Primitive | Backing | Status |
 |---|---|---|
@@ -1388,18 +1418,18 @@ This section enumerates the stable builtin primitives that content authors targe
 | `workflow.foreach` | Server orchestrator | Proposed |
 | `workflow.retry` | Server orchestrator | Proposed |
 
-### 14.10 Trigger Primitives
+### 14.12 Trigger Primitives
 
 | Primitive | Backing | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
-| `trigger.interval` | Trigger engine | Y | Y | Y | Planned |
-| `trigger.filesystem_change` | Trigger engine | Y | Y | Y | Planned |
-| `trigger.service_change` | Trigger engine | Y | Y | - | Planned |
-| `trigger.windows_event_log` | Trigger engine | Y | - | - | Planned |
-| `trigger.registry_change` | Trigger engine | Y | - | - | Planned |
-| `trigger.agent_startup` | Agent core | Y | Y | Y | Planned |
+| `trigger.interval` | Trigger engine | Y | Y | Y | Verified |
+| `trigger.filesystem_change` | Trigger engine | Y | Y | Y | Verified |
+| `trigger.service_change` | Trigger engine | Y | Y | - | Verified |
+| `trigger.windows_event_log` | Trigger engine | Y | - | - | Verified |
+| `trigger.registry_change` | Trigger engine | Y | - | - | Verified |
+| `trigger.agent_startup` | Agent core | Y | Y | Y | Verified |
 
-### 14.11 Governance Primitives
+### 14.13 Governance Primitives
 
 | Primitive | Backing | Status |
 |---|---|---|
@@ -1412,7 +1442,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `response.persist` | ResponseStore | Verified |
 | `response.aggregate` | ResponseStore | Planned |
 | `response.export` | Data export | Planned |
-| `policy.check` | Policy engine | Planned |
-| `policy.fix` | Policy engine | Planned |
-| `policy.evaluate` | Policy engine | Planned |
-| `policy.recheck` | Policy engine | Planned |
+| `policy.check` | Policy engine | Verified |
+| `policy.fix` | Policy engine | Verified |
+| `policy.evaluate` | Policy engine | Verified |
+| `policy.recheck` | Policy engine | Verified |

@@ -1,6 +1,6 @@
 # Yuzu Development Roadmap
 
-**Version:** 1.2 | **Date:** 2026-03-18
+**Version:** 1.3 | **Date:** 2026-03-20
 
 This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.
 
@@ -41,25 +41,25 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Open |
 | | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management | Open |
 | | 3.9 | [#210](https://github.com/Tr3kkR/Yuzu/issues/210) | Scope DSL Extensions (MATCHES, EXISTS, len, startswith) | **Done** |
-| **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage | Open |
-| | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) | Open |
-| | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution | Open |
-| | 4.4 | [#181](https://github.com/Tr3kkR/Yuzu/issues/181) | Agent Sleep and Stagger Control | Open |
-| | 4.5 | [#184](https://github.com/Tr3kkR/Yuzu/issues/184) | Trigger Framework (Agent-Side) | Open |
-| | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) | Open |
-| | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval | Open |
-| | 4.8 | [#212](https://github.com/Tr3kkR/Yuzu/issues/212) | service.set_start_mode Cross-Platform Primitive | Open |
-| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Open |
-| | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment | Open |
-| | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics | Open |
-| | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation | Open |
-| | 5.5 | [#211](https://github.com/Tr3kkR/Yuzu/issues/211) | CEL Adoption for Policy Compliance Expressions | Open |
-| **6** | 6.1 | [#180](https://github.com/Tr3kkR/Yuzu/issues/180) | Registry Plugin (Read/Write/Enumerate) | Open |
-| | 6.2 | [#182](https://github.com/Tr3kkR/Yuzu/issues/182) | Per-User Registry Operations | Open |
-| | 6.3 | [#183](https://github.com/Tr3kkR/Yuzu/issues/183) | WMI Query and Method Invocation | Open |
-| | 6.4 | [#186](https://github.com/Tr3kkR/Yuzu/issues/186) | Per-User Application Inventory | Open |
-| | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations | Open |
-| | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger | Open |
+| **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage | Done |
+| | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) | Done |
+| | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution | Done |
+| | 4.4 | [#181](https://github.com/Tr3kkR/Yuzu/issues/181) | Agent Sleep and Stagger Control | Done |
+| | 4.5 | [#184](https://github.com/Tr3kkR/Yuzu/issues/184) | Trigger Framework (Agent-Side) | Done |
+| | 4.6 | [#189](https://github.com/Tr3kkR/Yuzu/issues/189) | Desktop User Interaction (Windows) | Done |
+| | 4.7 | [#193](https://github.com/Tr3kkR/Yuzu/issues/193) | Agent Logging and Remote Log Retrieval | Done |
+| | 4.8 | [#212](https://github.com/Tr3kkR/Yuzu/issues/212) | service.set_start_mode Cross-Platform Primitive | Done |
+| **5** | 5.1 | [#175](https://github.com/Tr3kkR/Yuzu/issues/175) | Policy Rules and Fragments | Done |
+| | 5.2 | [#176](https://github.com/Tr3kkR/Yuzu/issues/176) | Policy Assignment and Deployment | Done |
+| | 5.3 | [#178](https://github.com/Tr3kkR/Yuzu/issues/178) | Compliance Dashboard and Statistics | Done |
+| | 5.4 | [#179](https://github.com/Tr3kkR/Yuzu/issues/179) | Policy Cache Invalidation and Force Re-Evaluation | Done |
+| | 5.5 | [#211](https://github.com/Tr3kkR/Yuzu/issues/211) | CEL Adoption for Policy Compliance Expressions | Done |
+| **6** | 6.1 | [#180](https://github.com/Tr3kkR/Yuzu/issues/180) | Registry Plugin (Read/Write/Enumerate) | Done |
+| | 6.2 | [#182](https://github.com/Tr3kkR/Yuzu/issues/182) | Per-User Registry Operations | Done |
+| | 6.3 | [#183](https://github.com/Tr3kkR/Yuzu/issues/183) | WMI Query and Method Invocation | Done |
+| | 6.4 | [#186](https://github.com/Tr3kkR/Yuzu/issues/186) | Per-User Application Inventory | Done |
+| | 6.5 | [#188](https://github.com/Tr3kkR/Yuzu/issues/188) | File System Advanced Operations | Done |
+| | 6.6 | [#192](https://github.com/Tr3kkR/Yuzu/issues/192) | Registry Change Trigger | Done |
 | **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation | Open |
 | | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Open |
 | | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Open |
@@ -87,11 +87,11 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
 | 2: Instruction System | 12 | 0 | 12 | 100% |
 | 3: Security & RBAC | 2 | 7 | 9 | 22% |
-| 4: Agent Infrastructure | 0 | 8 | 8 | 0% |
-| 5: Policy Engine | 0 | 5 | 5 | 0% |
-| 6: Windows Depth | 0 | 6 | 6 | 0% |
+| 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
+| 5: Policy Engine | 5 | 0 | 5 | 100% |
+| 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 0 | 19 | 19 | 0% |
-| **Total** | **26** | **45** | **71** | |
+| **Total** | **45** | **26** | **71** | |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -439,8 +439,8 @@ Add 4 operators to `scope_engine.cpp`: `MATCHES` (regex), `EXISTS` (tag presence
 
 *Agent-side capabilities that enable advanced features: persistent storage, content distribution, triggers, and user interaction.*
 
-### Issue 4.1: Agent-Side Key-Value Storage
-**Capabilities:** 23.1, 23.3 | **Scope:** Agent SDK + Plugin
+### Issue 4.1: Agent-Side Key-Value Storage :white_check_mark:
+**Capabilities:** 23.1, 23.3 | **Scope:** Agent SDK + Plugin | **Status:** Done
 
 Add persistent key-value storage to the agent, backed by the existing `agent.db` SQLite database:
 - **Storage.Set:** Store a named table (overwrite or append with max row limit)
@@ -453,8 +453,8 @@ Expose via plugin SDK (new `yuzu_ctx_storage_*` functions in `plugin.h`) and as 
 
 **Files:** `sdk/include/yuzu/plugin.h`, `sdk/include/yuzu/plugin.hpp`, `agents/core/src/agent.cpp`, new `agents/plugins/storage/`
 
-### Issue 4.2: HTTP Download and Upload (Agent-Initiated)
-**Capabilities:** 13.3, 13.4, 10.13 | **Scope:** Plugin + Agent
+### Issue 4.2: HTTP Download and Upload (Agent-Initiated) :white_check_mark:
+**Capabilities:** 13.3, 13.4, 10.13 | **Scope:** Plugin + Agent | **Status:** Done
 
 New `http` plugin or extend agent core:
 - **HttpGetFile:** Download file from URL with hash/size verification. Support both server content channel and external URLs. Return temp file path (cleaned up after instruction).
@@ -463,8 +463,8 @@ New `http` plugin or extend agent core:
 
 **Files:** New `agents/plugins/http_client/`, `server/core/src/server.cpp` (file receive endpoint)
 
-### Issue 4.3: Content Staging and Execution
-**Capabilities:** 13.1, 13.2 | **Scope:** Agent + Server
+### Issue 4.3: Content Staging and Execution :white_check_mark:
+**Capabilities:** 13.1, 13.2 | **Scope:** Agent + Server | **Status:** Done
 
 Server-to-agent content distribution:
 - **Stage:** Server pushes content manifest, agent downloads files to local staging directory. Verify integrity via hash.
@@ -474,8 +474,8 @@ Server side: content repository for hosting files, manifest generation, and down
 
 **Files:** New `agents/plugins/content_dist/`, `server/core/src/server.cpp` (content hosting endpoints)
 
-### Issue 4.4: Agent Sleep and Stagger Control
-**Capability:** 1.6 | **Scope:** Agent
+### Issue 4.4: Agent Sleep and Stagger Control :white_check_mark:
+**Capability:** 1.6 | **Scope:** Agent | **Status:** Done
 
 - **Sleep:** Server instructs agent to pause for N seconds (testing/maintenance).
 - **Stagger:** Agent introduces random delay (0 to N seconds) before executing an instruction, preventing thundering herd on broadcast. Configurable default stagger range.
@@ -484,8 +484,8 @@ Implement as built-in agent behavior (not a plugin), triggered by fields in `Com
 
 **Files:** `agents/core/src/agent.cpp`, `proto/yuzu/agent/v1/agent.proto`
 
-### Issue 4.5: Trigger Framework (Agent-Side)
-**Capabilities:** 17.1-17.6 | **Scope:** Agent SDK + Agent Core
+### Issue 4.5: Trigger Framework (Agent-Side) :white_check_mark:
+**Capabilities:** 17.1-17.6 | **Scope:** Agent SDK + Agent Core | **Status:** Done
 
 Add a trigger evaluation engine to the agent:
 - **Plugin SDK extension:** New `yuzu_register_trigger` function in `plugin.h` for plugins to register trigger handlers.
@@ -503,8 +503,8 @@ Triggers invoke a callback (plugin action + params) when they fire. Used by the 
 
 **Files:** `sdk/include/yuzu/plugin.h`, `sdk/include/yuzu/plugin.hpp`, `agents/core/src/agent.cpp`, new `agents/core/src/trigger_engine.cpp`
 
-### Issue 4.6: Desktop User Interaction (Windows)
-**Capabilities:** 14.1-14.3 | **Scope:** Plugin
+### Issue 4.6: Desktop User Interaction (Windows) :white_check_mark:
+**Capabilities:** 14.1-14.3 | **Scope:** Plugin | **Status:** Done
 
 New `interaction` plugin (Windows-only initially):
 - **ShowNotification:** Toast notification (Information/Warning/Error) with configurable timeout. Returns immediately.
@@ -515,8 +515,8 @@ New `interaction` plugin (Windows-only initially):
 
 **Files:** New `agents/plugins/interaction/`
 
-### Issue 4.7: Agent Logging and Remote Log Retrieval
-**Capability:** 1.7 | **Scope:** Agent + Plugin
+### Issue 4.7: Agent Logging and Remote Log Retrieval :white_check_mark:
+**Capability:** 1.7 | **Scope:** Agent + Plugin | **Status:** Done
 
 Extend the `diagnostics` plugin:
 - **GetKeyFiles:** Return paths to config, executable, log, data directory, temp directory.
@@ -525,8 +525,8 @@ Extend the `diagnostics` plugin:
 
 **Files:** `agents/plugins/diagnostics/src/diagnostics_plugin.cpp`, `agents/core/src/agent.cpp`
 
-### Issue 4.8: service.set_start_mode Cross-Platform Primitive
-**Scope:** Plugin
+### Issue 4.8: service.set_start_mode Cross-Platform Primitive :white_check_mark:
+**Scope:** Plugin | **Status:** Done
 
 Add `set_start_mode` action to the `services` plugin. Parameters: `serviceName`, `mode` (automatic/manual/disabled/masked). Cross-platform: Windows `ChangeServiceConfigW`, Linux `systemctl enable/disable/mask`, macOS `launchctl enable/disable`. `masked` maps to `disabled` with warning on non-Linux. Returns previous/new/effective mode. Design: `docs/Instruction-Engine.md` Section 16.
 
@@ -538,8 +538,8 @@ Add `set_start_mode` action to the `services` plugin. Parameters: `serviceName`,
 
 *Desired-state policies with trigger-based evaluation and auto-remediation.*
 
-### Issue 5.1: Policy Rules and Fragments
-**Capabilities:** 16.1, 16.2 | **Scope:** Server + Agent
+### Issue 5.1: Policy Rules and Fragments :white_check_mark:
+**Capabilities:** 16.1, 16.2 | **Scope:** Server + Agent | **Status:** Done
 
 Core policy engine:
 - **Fragments:** Reusable compliance check/fix code blocks. Each fragment defines a check instruction (evaluate state) and optional fix instruction (remediate). Parameters are configured when rules are created.
@@ -549,8 +549,8 @@ Core policy engine:
 
 **Files:** New `server/core/src/policy_engine.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/agent/v1/agent.proto` (policy push/status RPCs)
 
-### Issue 5.2: Policy Assignment and Deployment
-**Capabilities:** 16.3, 16.8 | **Scope:** Server
+### Issue 5.2: Policy Assignment and Deployment :white_check_mark:
+**Capabilities:** 16.3, 16.8 | **Scope:** Server | **Status:** Done
 
 - Policies are assigned to management groups (from Issue 3.2)
 - Changes accumulate as pending; admin explicitly deploys
@@ -560,8 +560,8 @@ Core policy engine:
 
 **Files:** `server/core/src/policy_engine.cpp`, `server/core/src/server.cpp`, dashboard UI updates
 
-### Issue 5.3: Compliance Dashboard and Statistics
-**Capabilities:** 16.4, 16.5 | **Scope:** Server
+### Issue 5.3: Compliance Dashboard and Statistics :white_check_mark:
+**Capabilities:** 16.4, 16.5 | **Scope:** Server | **Status:** Done
 
 - Device compliance status per policy and per rule
 - Fleet-wide compliance posture summary (% compliant, % non-compliant, % unknown)
@@ -571,8 +571,8 @@ Core policy engine:
 
 **Files:** `server/core/src/policy_engine.cpp`, `server/core/src/dashboard_ui.cpp`, `server/core/src/server.cpp`
 
-### Issue 5.4: Policy Cache Invalidation and Force Re-Evaluation
-**Capabilities:** 16.7 | **Scope:** Agent + Server
+### Issue 5.4: Policy Cache Invalidation and Force Re-Evaluation :white_check_mark:
+**Capabilities:** 16.7 | **Scope:** Agent + Server | **Status:** Done
 
 - **Invalidate:** Reset agent's policy to empty; agent re-downloads on next connection.
 - **ForceStatusReport:** Schedule a full compliance status report on next agent restart.
@@ -580,8 +580,8 @@ Core policy engine:
 
 **Files:** `agents/core/src/agent.cpp`, `server/core/src/server.cpp`
 
-### Issue 5.5: CEL Adoption for Policy Compliance Expressions
-**Scope:** Server
+### Issue 5.5: CEL Adoption for Policy Compliance Expressions :white_check_mark:
+**Scope:** Server | **Status:** Done
 **Depends on:** 5.1
 
 Adopt [Common Expression Language (CEL)](https://github.com/google/cel-spec) for typed policy evaluation. CEL handles `spec.compliance.expression`, `spec.fix.when`, and `spec.rollout.condition` — typed evaluation that the scope DSL cannot do. The scope DSL stays for device targeting. abseil is already a transitive dep via gRPC, making cel-cpp a natural addition. Design: `docs/Instruction-Engine.md` Section 8.3.
@@ -594,8 +594,8 @@ Adopt [Common Expression Language (CEL)](https://github.com/google/cel-spec) for
 
 *Registry, WMI, per-user operations, and Windows-specific advanced capabilities.*
 
-### Issue 6.1: Registry Plugin (Read/Write/Enumerate)
-**Capabilities:** 12.4-12.6 | **Scope:** Plugin
+### Issue 6.1: Registry Plugin (Read/Write/Enumerate) :white_check_mark:
+**Capabilities:** 12.4-12.6 | **Scope:** Plugin | **Status:** Done
 
 New `registry` plugin (Windows-only):
 - **GetValue:** Read registry value by hive/subkey/name. Return name, type, data.
@@ -608,8 +608,8 @@ All operations support HKLM, HKCU, HKCR, HKU hives.
 
 **Files:** New `agents/plugins/registry/`
 
-### Issue 6.2: Per-User Registry Operations
-**Capability:** 12.7 | **Scope:** Plugin
+### Issue 6.2: Per-User Registry Operations :white_check_mark:
+**Capability:** 12.7 | **Scope:** Plugin | **Status:** Done
 
 Extend the registry plugin with per-user variants:
 - Load each user's NTUSER.DAT hive
@@ -618,8 +618,8 @@ Extend the registry plugin with per-user variants:
 
 **Files:** `agents/plugins/registry/src/registry_plugin.cpp`
 
-### Issue 6.3: WMI Query and Method Invocation
-**Capabilities:** 12.1, 12.2 | **Scope:** Plugin
+### Issue 6.3: WMI Query and Method Invocation :white_check_mark:
+**Capabilities:** 12.1, 12.2 | **Scope:** Plugin | **Status:** Done
 
 New `wmi` plugin (Windows-only):
 - **RunWmiQuery:** Execute WQL query against any WMI namespace. Return structured tabular results.
@@ -629,8 +629,8 @@ New `wmi` plugin (Windows-only):
 
 **Files:** New `agents/plugins/wmi/`
 
-### Issue 6.4: Per-User Application Inventory
-**Capability:** 7.5 | **Scope:** Plugin
+### Issue 6.4: Per-User Application Inventory :white_check_mark:
+**Capability:** 7.5 | **Scope:** Plugin | **Status:** Done
 
 Extend `installed_apps` plugin:
 - Enumerate per-user installations from HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile.
@@ -638,8 +638,8 @@ Extend `installed_apps` plugin:
 
 **Files:** `agents/plugins/installed_apps/src/installed_apps_plugin.cpp`
 
-### Issue 6.5: File System Advanced Operations
-**Capabilities:** 10.7-10.10, 10.14, 10.15 | **Scope:** Plugin
+### Issue 6.5: File System Advanced Operations :white_check_mark:
+**Capabilities:** 10.7-10.10, 10.14, 10.15 | **Scope:** Plugin | **Status:** Done
 
 Extend the `filesystem` plugin:
 - **GetFilePermissions:** ACL enumeration (Windows DACL, POSIX permissions)
@@ -651,8 +651,8 @@ Extend the `filesystem` plugin:
 
 **Files:** `agents/plugins/filesystem/src/filesystem_plugin.cpp`
 
-### Issue 6.6: Registry Change Trigger
-**Capability:** 17.5 | **Scope:** Agent
+### Issue 6.6: Registry Change Trigger :white_check_mark:
+**Capability:** 17.5 | **Scope:** Agent | **Status:** Done
 
 Add `registry_change` trigger type to the trigger framework (Issue 4.5):
 - Monitor HKLM or HKCR subkeys using Windows Registry change notification APIs
