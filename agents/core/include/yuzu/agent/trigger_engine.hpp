@@ -88,7 +88,7 @@ struct TriggerConfig {
  * Thread safety: register/unregister are safe to call from any thread while
  * the engine is running. The dispatch callback is invoked from worker threads.
  */
-class TriggerEngine {
+class YUZU_EXPORT TriggerEngine {
 public:
     /// Callback type for dispatching triggered actions.
     using DispatchFn = std::function<void(const std::string& plugin,
@@ -122,6 +122,10 @@ public:
     /// Returns true if the engine is currently running.
     [[nodiscard]] bool is_running() const noexcept;
 
+    /// Validate service name (alphanumeric + ._@- only, blocks shell metacharacters).
+    /// Public so callers can validate before creating triggers.
+    [[nodiscard]] static bool is_valid_service_name(const std::string& name);
+
 private:
     // Worker loops for each trigger type
     void interval_loop();
@@ -132,9 +136,6 @@ private:
 
     // Dispatch helper (applies debounce and calls dispatch_)
     void fire_trigger(const TriggerConfig& trigger);
-
-    // Validate service name (alphanumeric + ._@- only, blocks shell metacharacters)
-    static bool is_valid_service_name(const std::string& name);
 
     // Query service status (platform-specific)
     static std::string query_service_status(const std::string& service_name);
