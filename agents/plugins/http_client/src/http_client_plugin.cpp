@@ -10,15 +10,12 @@
  *                Params: url (required).
  *
  * Output: pipe-delimited via write_output()
+ *
+ * Security: uses cpp-httplib directly — no shell invocation, no command injection.
+ *           SSRF protection: blocks requests to private/internal IP ranges.
  */
 
 #include <yuzu/plugin.hpp>
-
-#include <filesystem>
-#include <format>
-#include <fstream>
-#include <string>
-#include <string_view>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,11 +25,26 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ws2_32.lib")
 #else
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <openssl/evp.h>
 #endif
+
+#include <httplib.h>
+
+#include <cstring>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -43,6 +55,134 @@ YuzuPluginContext* g_ctx = nullptr;
 bool is_valid_url(std::string_view url) {
     return url.starts_with("http://") || url.starts_with("https://");
 }
+
+// ── SSRF protection: reject private/internal IP addresses ───────────────────
+
+bool is_private_ipv4(const struct sockaddr_in* addr) {
+    uint32_t ip = ntohl(addr->sin_addr.s_addr);
+    // 127.0.0.0/8
+    if ((ip >> 24) == 127) return true;
+    // 10.0.0.0/8
+    if ((ip >> 24) == 10) return true;
+    // 172.16.0.0/12
+    if ((ip >> 20) == (172 << 4 | 1)) return true;  // 172.16-31.x.x
+    if ((ip & 0xFFF00000) == 0xAC100000) return true;
+    // 192.168.0.0/16
+    if ((ip >> 16) == (192 << 8 | 168)) return true;
+    if ((ip & 0xFFFF0000) == 0xC0A80000) return true;
+    // 169.254.0.0/16 (link-local)
+    if ((ip >> 16) == (169 << 8 | 254)) return true;
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
+    // 0.0.0.0
+    if (ip == 0) return true;
+    return false;
+}
+
+bool is_private_ipv6(const struct sockaddr_in6* addr) {
+    const uint8_t* b = addr->sin6_addr.s6_addr;
+    // ::1 (loopback)
+    static const uint8_t loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    if (std::memcmp(b, loopback, 16) == 0) return true;
+    // :: (unspecified)
+    static const uint8_t unspec[16] = {0};
+    if (std::memcmp(b, unspec, 16) == 0) return true;
+    // fd00::/8 (unique local)
+    if (b[0] == 0xfd) return true;
+    // fc00::/7 (unique local, broader)
+    if ((b[0] & 0xfe) == 0xfc) return true;
+    // fe80::/10 (link-local)
+    if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return true;
+    // ::ffff:0:0/96 (IPv4-mapped) — check the embedded IPv4
+    static const uint8_t v4mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    if (std::memcmp(b, v4mapped_prefix, 12) == 0) {
+        struct sockaddr_in sa4{};
+        sa4.sin_family = AF_INET;
+        std::memcpy(&sa4.sin_addr.s_addr, b + 12, 4);
+        return is_private_ipv4(&sa4);
+    }
+    return false;
+}
+
+bool hostname_resolves_to_private(const std::string& hostname) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = nullptr;
+    int rc = getaddrinfo(hostname.c_str(), nullptr, &hints, &result);
+    if (rc != 0 || !result) return true; // fail-closed: block on resolution failure
+
+    bool is_private = false;
+    for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            if (is_private_ipv4(reinterpret_cast<struct sockaddr_in*>(rp->ai_addr))) {
+                is_private = true;
+                break;
+            }
+        } else if (rp->ai_family == AF_INET6) {
+            if (is_private_ipv6(reinterpret_cast<struct sockaddr_in6*>(rp->ai_addr))) {
+                is_private = true;
+                break;
+            }
+        }
+    }
+
+    freeaddrinfo(result);
+    return is_private;
+}
+
+// Parse a URL into scheme, host, port, path components
+struct ParsedUrl {
+    bool is_https = false;
+    std::string host;
+    int port = 0;
+    std::string path;
+};
+
+bool parse_url(std::string_view url, ParsedUrl& out) {
+    if (url.starts_with("https://")) {
+        out.is_https = true;
+        url.remove_prefix(8);
+    } else if (url.starts_with("http://")) {
+        out.is_https = false;
+        url.remove_prefix(7);
+    } else {
+        return false;
+    }
+
+    // Split host from path
+    auto slash_pos = url.find('/');
+    std::string_view authority;
+    if (slash_pos != std::string_view::npos) {
+        authority = url.substr(0, slash_pos);
+        out.path = std::string(url.substr(slash_pos));
+    } else {
+        authority = url;
+        out.path = "/";
+    }
+
+    // Split host from port
+    auto colon_pos = authority.rfind(':');
+    // Handle IPv6 addresses in brackets
+    auto bracket_pos = authority.find(']');
+    if (colon_pos != std::string_view::npos &&
+        (bracket_pos == std::string_view::npos || colon_pos > bracket_pos)) {
+        out.host = std::string(authority.substr(0, colon_pos));
+        auto port_str = authority.substr(colon_pos + 1);
+        try { out.port = std::stoi(std::string(port_str)); } catch (...) { out.port = 0; }
+    } else {
+        out.host = std::string(authority);
+        out.port = 0;
+    }
+
+    if (out.port == 0) {
+        out.port = out.is_https ? 443 : 80;
+    }
+
+    return !out.host.empty();
+}
+
+// ── SHA-256 file hashing ────────────────────────────────────────────────────
 
 std::string sha256_file(const fs::path& path) {
     std::ifstream file(path, std::ios::binary);
@@ -89,57 +229,149 @@ std::string sha256_file(const fs::path& path) {
 #endif
 }
 
-// Simple HTTP download using platform tools
-// Uses PowerShell on Windows, curl on Linux/macOS
+// ── Safe HTTP operations using cpp-httplib ───────────────────────────────────
+
+// Download a file via httplib (no shell, no command injection)
 int download_url(std::string_view url, const fs::path& dest, std::string& error) {
-    std::string cmd;
-#ifdef _WIN32
-    cmd = std::format(
-        "powershell -NoProfile -Command \"Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing\"",
-        url, dest.string());
-#else
-    cmd = std::format("curl -fsSL -o '{}' '{}'", dest.string(), url);
-#endif
-    int rc = std::system(cmd.c_str());
-    if (rc != 0) {
-        error = "download failed with exit code " + std::to_string(rc);
+    ParsedUrl parsed;
+    if (!parse_url(url, parsed)) {
+        error = "invalid URL";
+        return 1;
     }
-    return rc;
+
+    // SSRF check
+    if (hostname_resolves_to_private(parsed.host)) {
+        error = "SSRF blocked: URL resolves to a private/internal IP address";
+        return 1;
+    }
+
+    std::string origin = (parsed.is_https ? "https://" : "http://") + parsed.host + ":" + std::to_string(parsed.port);
+
+    std::ofstream ofs(dest, std::ios::binary);
+    if (!ofs) {
+        error = "failed to open destination file for writing";
+        return 1;
+    }
+
+    auto content_receiver = [&](const char* data, size_t len) {
+        ofs.write(data, static_cast<std::streamsize>(len));
+        return true;
+    };
+
+    httplib::Result res;
+    if (parsed.is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(300);
+        cli.enable_server_certificate_verification(true);
+        res = cli.Get(parsed.path, content_receiver);
+#else
+        ofs.close();
+        error = "HTTPS not supported (OpenSSL not available)";
+        return 1;
+#endif
+    } else {
+        httplib::Client cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(300);
+        res = cli.Get(parsed.path, content_receiver);
+    }
+
+    ofs.close();
+    if (!res || res->status < 200 || res->status >= 400) {
+        error = "download failed: HTTP " + (res ? std::to_string(res->status) : "connection error");
+        return 1;
+    }
+
+    return 0;
 }
 
+// HTTP GET via httplib (no shell, no command injection)
 std::string http_get(std::string_view url, int& status_code) {
-    std::string result;
-#ifdef _WIN32
-    auto cmd = std::format(
-        "powershell -NoProfile -Command \"try {{ $r = Invoke-WebRequest -Uri '{}' -UseBasicParsing; Write-Host $r.StatusCode; Write-Host $r.Content }} catch {{ Write-Host $_.Exception.Response.StatusCode.Value__; Write-Host $_.ErrorDetails.Message }}\"",
-        url);
-    FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-    auto cmd = std::format("curl -sS -w '\\n%{{http_code}}' '{}'", url);
-    FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-    if (!pipe) { status_code = 0; return "failed to execute"; }
-
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), pipe)) result += buf;
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-
-    // Parse status code from last line
-    auto last_nl = result.rfind('\n', result.size() - 2);
-    if (last_nl != std::string::npos) {
-        auto code_str = result.substr(last_nl + 1);
-        while (!code_str.empty() && (code_str.back() == '\n' || code_str.back() == '\r'))
-            code_str.pop_back();
-        try { status_code = std::stoi(code_str); } catch (...) { status_code = 0; }
-        result = result.substr(0, last_nl);
-    } else {
-        status_code = 200;
+    ParsedUrl parsed;
+    if (!parse_url(url, parsed)) {
+        status_code = 0;
+        return "invalid URL";
     }
-    return result;
+
+    // SSRF check
+    if (hostname_resolves_to_private(parsed.host)) {
+        status_code = 0;
+        return "SSRF blocked: URL resolves to a private/internal IP address";
+    }
+
+    httplib::Result res;
+    if (parsed.is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(60);
+        cli.enable_server_certificate_verification(true);
+        res = cli.Get(parsed.path);
+#else
+        status_code = 0;
+        return "HTTPS not supported (OpenSSL not available)";
+#endif
+    } else {
+        httplib::Client cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(60);
+        res = cli.Get(parsed.path);
+    }
+
+    if (!res) {
+        status_code = 0;
+        return "connection failed";
+    }
+    status_code = res->status;
+    return res->body;
+}
+
+// HTTP HEAD via httplib (no shell, no command injection)
+std::string http_head(std::string_view url, int& status_code) {
+    ParsedUrl parsed;
+    if (!parse_url(url, parsed)) {
+        status_code = 0;
+        return "invalid URL";
+    }
+
+    // SSRF check
+    if (hostname_resolves_to_private(parsed.host)) {
+        status_code = 0;
+        return "SSRF blocked: URL resolves to a private/internal IP address";
+    }
+
+    httplib::Result res;
+    if (parsed.is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(60);
+        cli.enable_server_certificate_verification(true);
+        res = cli.Head(parsed.path);
+#else
+        status_code = 0;
+        return "HTTPS not supported (OpenSSL not available)";
+#endif
+    } else {
+        httplib::Client cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(60);
+        res = cli.Head(parsed.path);
+    }
+
+    if (!res) {
+        status_code = 0;
+        return "connection failed";
+    }
+    status_code = res->status;
+
+    std::string headers_str;
+    for (const auto& [k, v] : res->headers) {
+        headers_str += k + ": " + v + "\n";
+    }
+    return headers_str;
 }
 
 } // namespace
@@ -147,9 +379,9 @@ std::string http_get(std::string_view url, int& status_code) {
 class HttpClientPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "http_client"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "HTTP client — download files, GET/HEAD requests with hash verification";
+        return "HTTP client — download files, GET/HEAD requests with hash verification (no shell-out)";
     }
 
     const char* const* actions() const noexcept override {
@@ -227,26 +459,11 @@ private:
         if (url.empty()) { ctx.write_output("error|missing required parameter: url"); return 1; }
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
-        std::string cmd;
-#ifdef _WIN32
-        cmd = std::format("powershell -NoProfile -Command \"(Invoke-WebRequest -Uri '{}' -Method Head -UseBasicParsing).Headers | ConvertTo-Json\"", url);
-        FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-        cmd = std::format("curl -sI '{}'", url);
-        FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-        if (!pipe) { ctx.write_output("error|failed to execute head request"); return 1; }
-
-        char buf[1024];
-        std::string output;
-        while (fgets(buf, sizeof(buf), pipe)) output += buf;
-#ifdef _WIN32
-        _pclose(pipe);
-#else
-        pclose(pipe);
-#endif
-        ctx.write_output(std::format("headers|{}", output));
-        return 0;
+        int status = 0;
+        auto headers = http_head(url, status);
+        ctx.write_output(std::format("status|{}", status));
+        ctx.write_output(std::format("headers|{}", headers));
+        return status >= 200 && status < 400 ? 0 : 1;
     }
 };
 

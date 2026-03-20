@@ -6,16 +6,22 @@
  *   "execute_staged" — Execute a previously staged file.
  *   "list_staged"    — List files in the staging directory.
  *   "cleanup"        — Remove staged files older than N hours.
+ *
+ * Security: uses cpp-httplib for downloads (no shell invocation).
+ *           execute_staged uses CreateProcessW/fork+execvp (no shell interpretation).
+ *           Args validated to block shell metacharacters.
  */
 
 #include <yuzu/plugin.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -28,7 +34,12 @@
 #include <bcrypt.h>
 #else
 #include <openssl/evp.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
+
+#include <httplib.h>
 
 namespace fs = std::filesystem;
 
@@ -90,14 +101,287 @@ bool is_safe_filename(std::string_view name) {
     return true;
 }
 
+// ── URL parsing (same as http_client) ───────────────────────────────────────
+
+struct ParsedUrl {
+    bool is_https = false;
+    std::string host;
+    int port = 0;
+    std::string path;
+};
+
+bool parse_url(std::string_view url, ParsedUrl& out) {
+    if (url.starts_with("https://")) {
+        out.is_https = true;
+        url.remove_prefix(8);
+    } else if (url.starts_with("http://")) {
+        out.is_https = false;
+        url.remove_prefix(7);
+    } else {
+        return false;
+    }
+
+    auto slash_pos = url.find('/');
+    std::string_view authority;
+    if (slash_pos != std::string_view::npos) {
+        authority = url.substr(0, slash_pos);
+        out.path = std::string(url.substr(slash_pos));
+    } else {
+        authority = url;
+        out.path = "/";
+    }
+
+    auto colon_pos = authority.rfind(':');
+    auto bracket_pos = authority.find(']');
+    if (colon_pos != std::string_view::npos &&
+        (bracket_pos == std::string_view::npos || colon_pos > bracket_pos)) {
+        out.host = std::string(authority.substr(0, colon_pos));
+        auto port_str = authority.substr(colon_pos + 1);
+        try { out.port = std::stoi(std::string(port_str)); } catch (...) { out.port = 0; }
+    } else {
+        out.host = std::string(authority);
+        out.port = 0;
+    }
+
+    if (out.port == 0) {
+        out.port = out.is_https ? 443 : 80;
+    }
+
+    return !out.host.empty();
+}
+
+// Download via httplib — no shell invocation
+int download_file(std::string_view url, const fs::path& dest, std::string& error) {
+    ParsedUrl parsed;
+    if (!parse_url(url, parsed)) {
+        error = "invalid URL";
+        return 1;
+    }
+
+    std::ofstream ofs(dest, std::ios::binary);
+    if (!ofs) {
+        error = "failed to open destination file";
+        return 1;
+    }
+
+    auto content_receiver = [&](const char* data, size_t len) {
+        ofs.write(data, static_cast<std::streamsize>(len));
+        return true;
+    };
+
+    httplib::Result res;
+    if (parsed.is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        httplib::SSLClient cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(300);
+        cli.enable_server_certificate_verification(true);
+        res = cli.Get(parsed.path, content_receiver);
+#else
+        ofs.close();
+        error = "HTTPS not supported (OpenSSL not available)";
+        return 1;
+#endif
+    } else {
+        httplib::Client cli(parsed.host, parsed.port);
+        cli.set_connection_timeout(30);
+        cli.set_read_timeout(300);
+        res = cli.Get(parsed.path, content_receiver);
+    }
+
+    ofs.close();
+    if (!res || res->status < 200 || res->status >= 400) {
+        error = "download failed: HTTP " + (res ? std::to_string(res->status) : "connection error");
+        return 1;
+    }
+
+    return 0;
+}
+
+// ── Safe argument validation and splitting ──────────────────────────────────
+
+// Validate args contain no shell metacharacters
+bool is_safe_arg(std::string_view arg) {
+    // Allow alphanumeric, dash, underscore, dot, equals, colon, slash, backslash, space
+    // Block: ; & | ` $ ( ) { } < > ! ~ ^ " ' # * ? [ ] \n \r
+    for (char c : arg) {
+        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' ||
+            c == '(' || c == ')' || c == '{' || c == '}' || c == '<' ||
+            c == '>' || c == '!' || c == '~' || c == '^' || c == '\'' ||
+            c == '"' || c == '#' || c == '*' || c == '?' || c == '[' ||
+            c == ']' || c == '\n' || c == '\r') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Split a string by spaces into argument vector (simple split, no shell parsing)
+std::vector<std::string> split_args(std::string_view args) {
+    std::vector<std::string> result;
+    std::string current;
+    for (char c : args) {
+        if (c == ' ' || c == '\t') {
+            if (!current.empty()) {
+                result.push_back(std::move(current));
+                current.clear();
+            }
+        } else {
+            current += c;
+        }
+    }
+    if (!current.empty()) result.push_back(std::move(current));
+    return result;
+}
+
+// ── Safe process execution (no shell) ───────────────────────────────────────
+
+#ifdef _WIN32
+
+// Windows: CreateProcessW — no shell interpretation
+int safe_execute(const fs::path& exe_path, std::string_view args_str, std::string& output) {
+    // Build command line: "path" arg1 arg2 ...
+    std::wstring wpath = exe_path.wstring();
+    std::wstring cmdline = L"\"" + wpath + L"\"";
+
+    if (!args_str.empty()) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, args_str.data(),
+                                       static_cast<int>(args_str.size()), nullptr, 0);
+        std::wstring wargs(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, args_str.data(),
+                             static_cast<int>(args_str.size()), wargs.data(), len);
+        cmdline += L" " + wargs;
+    }
+
+    // Create pipes for stdout capture
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE stdout_rd = nullptr, stdout_wr = nullptr;
+    if (!CreatePipe(&stdout_rd, &stdout_wr, &sa, 0)) {
+        output = "failed to create pipe";
+        return -1;
+    }
+    SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.hStdOutput = stdout_wr;
+    si.hStdError = stdout_wr;
+    si.dwFlags = STARTF_USESTDHANDLES;
+
+    PROCESS_INFORMATION pi{};
+
+    BOOL ok = CreateProcessW(
+        wpath.c_str(),      // application name
+        cmdline.data(),     // command line (mutable)
+        nullptr,            // process security attributes
+        nullptr,            // thread security attributes
+        TRUE,               // inherit handles
+        CREATE_NO_WINDOW,   // creation flags — no console window
+        nullptr,            // environment
+        nullptr,            // current directory
+        &si,                // startup info
+        &pi                 // process info
+    );
+
+    CloseHandle(stdout_wr); // close write end in parent
+
+    if (!ok) {
+        CloseHandle(stdout_rd);
+        output = "CreateProcessW failed: " + std::to_string(GetLastError());
+        return -1;
+    }
+
+    // Read stdout
+    char buf[1024];
+    DWORD bytes_read = 0;
+    while (ReadFile(stdout_rd, buf, sizeof(buf) - 1, &bytes_read, nullptr) && bytes_read > 0) {
+        buf[bytes_read] = '\0';
+        output += buf;
+    }
+    CloseHandle(stdout_rd);
+
+    // Wait for process
+    WaitForSingleObject(pi.hProcess, 30000); // 30 second timeout
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return static_cast<int>(exit_code);
+}
+
+#else
+
+// Unix: fork + execvp — no shell interpretation
+int safe_execute(const fs::path& exe_path, std::string_view args_str, std::string& output) {
+    // Make executable
+    std::error_code ec;
+    fs::permissions(exe_path, fs::perms::owner_exec, fs::perm_options::add, ec);
+
+    auto args = split_args(args_str);
+
+    // Build argv
+    std::vector<const char*> argv;
+    std::string exe_str = exe_path.string();
+    argv.push_back(exe_str.c_str());
+    for (const auto& a : args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+
+    // Create pipe for stdout capture
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        output = "failed to create pipe";
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        output = "fork failed";
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child
+        close(pipefd[0]); // close read end
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        execvp(exe_str.c_str(), const_cast<char* const*>(argv.data()));
+        _exit(127); // execvp failed
+    }
+
+    // Parent
+    close(pipefd[1]); // close write end
+
+    char buf[1024];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
+        buf[n] = '\0';
+        output += buf;
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+#endif
+
 } // namespace
 
 class ContentDistPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "content_dist"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "Content staging — download, verify, execute, and manage staged files";
+        return "Content staging — download, verify, execute, and manage staged files (no shell-out)";
     }
 
     const char* const* actions() const noexcept override {
@@ -132,15 +416,9 @@ private:
         }
 
         auto dest = staging_dir() / std::string{filename};
-        std::string cmd;
-#ifdef _WIN32
-        cmd = std::format("powershell -NoProfile -Command \"Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing\"",
-                          url, dest.string());
-#else
-        cmd = std::format("curl -fsSL -o '{}' '{}'", dest.string(), url);
-#endif
-        if (std::system(cmd.c_str()) != 0) {
-            ctx.write_output("error|download failed");
+        std::string error;
+        if (download_file(url, dest, error) != 0) {
+            ctx.write_output(std::format("error|{}", error));
             return 1;
         }
 
@@ -169,26 +447,15 @@ private:
         }
 
         auto args = params.get("args");
-        std::string cmd = "\"" + path.string() + "\"";
-        if (!args.empty()) cmd += " " + std::string{args};
+        // Validate args to block shell metacharacters
+        if (!args.empty() && !is_safe_arg(args)) {
+            ctx.write_output("error|args contain forbidden characters (shell metacharacters blocked)");
+            return 1;
+        }
 
-#ifdef _WIN32
-        FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-        // Make executable on Unix
-        fs::permissions(path, fs::perms::owner_exec, fs::perm_options::add);
-        FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-        if (!pipe) { ctx.write_output("error|failed to execute"); return 1; }
-
-        char buf[1024];
         std::string output;
-        while (fgets(buf, sizeof(buf), pipe)) output += buf;
-#ifdef _WIN32
-        int rc = _pclose(pipe);
-#else
-        int rc = pclose(pipe);
-#endif
+        int rc = safe_execute(path, args, output);
+
         ctx.write_output(std::format("status|{}", rc == 0 ? "ok" : "error"));
         ctx.write_output(std::format("exit_code|{}", rc));
         if (!output.empty()) ctx.write_output(std::format("output|{}", output));

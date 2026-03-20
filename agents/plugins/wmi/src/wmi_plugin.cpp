@@ -78,6 +78,37 @@ bool is_select_only(std::string_view wql) {
            (trimmed[5] == 'T' || trimmed[5] == 't');
 }
 
+// Validate WMI class name: only alphanumeric and underscores
+bool is_valid_wmi_class(std::string_view cls) {
+    if (cls.empty() || cls.size() > 256) return false;
+    for (char c : cls) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+            return false;
+    }
+    return true;
+}
+
+// Validate WMI namespace against whitelist
+bool is_valid_wmi_namespace(std::string_view ns) {
+    // Allowed namespaces (case-insensitive comparison)
+    // Using backslash as separator (WMI convention)
+    static const char* allowed[] = {
+        "root\\cimv2",
+        "root\\wmi",
+        "root\\standardcimv2",
+    };
+
+    // Normalize to lowercase for comparison
+    std::string lower;
+    lower.reserve(ns.size());
+    for (char c : ns) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    for (const auto* a : allowed) {
+        if (lower == a) return true;
+    }
+    return false;
+}
+
 class ComInit {
 public:
     ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
@@ -127,6 +158,10 @@ private:
 
         auto ns = params.get("namespace");
         if (ns.empty()) ns = "root\\cimv2";
+        if (!is_valid_wmi_namespace(ns)) {
+            ctx.write_output("error|namespace not allowed (must be root\\cimv2, root\\wmi, or root\\standardcimv2)");
+            return 1;
+        }
 
         ComInit com;
         if (!com.ok()) { ctx.write_output("error|COM initialization failed"); return 1; }
@@ -174,14 +209,20 @@ private:
     int do_get_instance(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto cls = params.get("class");
         if (cls.empty()) { ctx.write_output("error|missing required parameter: class"); return 1; }
+        // Validate class name: alphanumeric + underscores only
+        if (!is_valid_wmi_class(cls)) {
+            ctx.write_output("error|invalid WMI class name (alphanumeric and underscores only)");
+            return 1;
+        }
 
         auto wql = std::format("SELECT * FROM {}", cls);
-        // Reuse query logic with synthesized WQL
-        yuzu::Params synth_params = params;
-        // Directly call do_query with the synthesized WQL — but we need to pass the wql param
-        // Instead, just execute the WQL directly
         auto ns = params.get("namespace");
         if (ns.empty()) ns = "root\\cimv2";
+        // Validate namespace against whitelist
+        if (!is_valid_wmi_namespace(ns)) {
+            ctx.write_output("error|namespace not allowed (must be root\\cimv2, root\\wmi, or root\\standardcimv2)");
+            return 1;
+        }
 
         ComInit com;
         if (!com.ok()) { ctx.write_output("error|COM initialization failed"); return 1; }

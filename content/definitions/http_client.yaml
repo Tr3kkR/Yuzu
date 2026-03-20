@@ -95,3 +95,48 @@ spec:
     requiredPlugins: [http_client]
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.http_client.head
+  displayName: HTTP HEAD
+  version: 1.0.0
+  description: >
+    Perform an HTTP HEAD request and return the response status code and headers.
+    Useful for checking file availability or size before downloading.
+  tags: [http, network]
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: http_client
+    action: head
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [url]
+    properties:
+      url:
+        type: string
+        displayName: URL
+        description: HTTP or HTTPS URL to request.
+  result:
+    columns:
+      - name: status
+        type: int32
+      - name: content_length
+        type: int64
+      - name: content_type
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [http_client]
+status:
+  phase: active

@@ -130,7 +130,8 @@ void RbacStore::seed_defaults() {
                            "Response",
                            "ManagementGroup",
                            "ApiToken",
-                           "Security"};
+                           "Security",
+                           "Policy"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -226,6 +227,20 @@ void RbacStore::seed_defaults() {
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
+    // PlatformEngineer: read + write + delete on Policy
+    {
+        const char* pe_policy_ops[] = {"Read", "Write", "Delete"};
+        for (auto* o : pe_policy_ops) {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(db_,
+                               "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', "
+                               "'Policy', ?, 'allow');",
+                               -1, &s, nullptr);
+            sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
 
     // Operator: read/write/execute on operational types, read on audit/response
     const char* op_rwe_types[] = {"InstructionDefinition", "InstructionSet", "Execution",
@@ -272,6 +287,15 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Response', 'Read', 'allow');",
         nullptr, nullptr, nullptr);
+    // Operator: read + execute on Policy
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Policy', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Policy', 'Execute', 'allow');",
+        nullptr, nullptr, nullptr);
 
     // ApiTokenManager: read + write + delete on ApiToken
     const char* atm_ops[] = {"Read", "Write", "Delete"};
@@ -298,7 +322,8 @@ void RbacStore::seed_defaults() {
                                 "Tag",
                                 "AuditLog",
                                 "Response",
-                                "ManagementGroup"};
+                                "ManagementGroup",
+                                "Policy"};
     for (auto* t : itso_types) {
         for (auto* o : ops) {
             sqlite3_stmt* s = nullptr;
@@ -325,7 +350,8 @@ void RbacStore::seed_defaults() {
                                   "Response",
                                   "ManagementGroup",
                                   "ApiToken",
-                                  "Security"};
+                                  "Security",
+                                  "Policy"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

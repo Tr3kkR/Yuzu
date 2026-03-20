@@ -80,11 +80,12 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
             LoadError{so_path.string(), "yuzu_plugin_descriptor() returned null"});
     }
 
-    if (desc->abi_version != YUZU_PLUGIN_ABI_VERSION) {
+    if (desc->abi_version < YUZU_PLUGIN_ABI_VERSION_MIN || desc->abi_version > YUZU_PLUGIN_ABI_VERSION) {
         YUZU_DLCLOSE(handle);
         return std::unexpected(LoadError{
             so_path.string(), "ABI version mismatch: plugin=" + std::to_string(desc->abi_version) +
-                                  " host=" + std::to_string(YUZU_PLUGIN_ABI_VERSION)});
+                                  " host_range=[" + std::to_string(YUZU_PLUGIN_ABI_VERSION_MIN) +
+                                  "," + std::to_string(YUZU_PLUGIN_ABI_VERSION) + "]"});
     }
 
     PluginHandle ph;

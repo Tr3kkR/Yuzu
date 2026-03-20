@@ -78,8 +78,9 @@ void TriggerEngine::start() {
     workers_.emplace_back([this]() { interval_loop(); });
     workers_.emplace_back([this]() { file_watch_loop(); });
     workers_.emplace_back([this]() { service_watch_loop(); });
+    workers_.emplace_back([this]() { registry_watch_loop(); });
 
-    spdlog::info("TriggerEngine started with 3 worker threads");
+    spdlog::info("TriggerEngine started with 4 worker threads");
 }
 
 void TriggerEngine::stop() {
@@ -342,11 +343,189 @@ void TriggerEngine::service_watch_loop() {
     spdlog::debug("TriggerEngine: service_watch_loop stopped");
 }
 
+// ── Registry watch loop (Windows-only) ───────────────────────────────────────
+
+#ifdef _WIN32
+
+void TriggerEngine::registry_watch_loop() {
+    spdlog::debug("TriggerEngine: registry_watch_loop started");
+
+    // Map trigger_id -> HKEY handle for notification
+    std::map<std::string, HKEY> watched_keys;
+    std::map<std::string, HANDLE> watch_events;
+
+    auto cleanup = [&]() {
+        for (auto& [id, evt] : watch_events) {
+            if (evt) CloseHandle(evt);
+        }
+        for (auto& [id, key] : watched_keys) {
+            if (key) RegCloseKey(key);
+        }
+        watched_keys.clear();
+        watch_events.clear();
+    };
+
+    auto parse_hive = [](const std::string& hive) -> HKEY {
+        if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
+        if (hive == "HKCU") return HKEY_CURRENT_USER;
+        if (hive == "HKCR") return HKEY_CLASSES_ROOT;
+        if (hive == "HKU")  return HKEY_USERS;
+        return nullptr;
+    };
+
+    while (running_.load(std::memory_order_acquire)) {
+        // Take a snapshot of registry change triggers
+        std::vector<TriggerConfig> snapshot;
+        {
+            std::lock_guard lock(mu_);
+            for (const auto& t : triggers_) {
+                if (t.type == TriggerType::RegistryChange) {
+                    snapshot.push_back(t);
+                }
+            }
+        }
+
+        // Register new watches and clean up stale ones
+        for (const auto& trigger : snapshot) {
+            if (watched_keys.contains(trigger.id))
+                continue; // already watching
+
+            if (trigger.registry_key.empty() || trigger.registry_hive.empty()) {
+                spdlog::warn("Trigger '{}': registry_hive and registry_key are required", trigger.id);
+                continue;
+            }
+
+            HKEY root = parse_hive(trigger.registry_hive);
+            if (!root) {
+                spdlog::warn("Trigger '{}': invalid registry hive '{}'",
+                             trigger.id, trigger.registry_hive);
+                continue;
+            }
+
+            // Convert key path to wide string
+            std::wstring wkey;
+            {
+                int len = MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(),
+                                               -1, nullptr, 0);
+                wkey.resize(static_cast<size_t>(len));
+                MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(),
+                                     -1, wkey.data(), len);
+            }
+
+            HKEY opened = nullptr;
+            if (RegOpenKeyExW(root, wkey.c_str(), 0,
+                              KEY_NOTIFY | KEY_READ, &opened) != ERROR_SUCCESS) {
+                spdlog::warn("Trigger '{}': failed to open registry key '{}'",
+                             trigger.id, trigger.registry_key);
+                continue;
+            }
+
+            HANDLE evt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!evt) {
+                RegCloseKey(opened);
+                continue;
+            }
+
+            // Request notification for any change to the key or its values
+            LONG rc = RegNotifyChangeKeyValue(
+                opened, TRUE,
+                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
+                evt, TRUE);
+
+            if (rc != ERROR_SUCCESS) {
+                spdlog::warn("Trigger '{}': RegNotifyChangeKeyValue failed (error {})",
+                             trigger.id, rc);
+                CloseHandle(evt);
+                RegCloseKey(opened);
+                continue;
+            }
+
+            watched_keys[trigger.id] = opened;
+            watch_events[trigger.id] = evt;
+            spdlog::info("Trigger '{}': watching registry key '{}\\{}'",
+                         trigger.id, trigger.registry_hive, trigger.registry_key);
+        }
+
+        // Check all watched events
+        for (auto it = watch_events.begin(); it != watch_events.end(); ) {
+            DWORD wait = WaitForSingleObject(it->second, 0);
+            if (wait == WAIT_OBJECT_0) {
+                // Change detected — fire the trigger
+                spdlog::info("Trigger '{}': registry change detected", it->first);
+
+                // Find the trigger config
+                for (const auto& t : snapshot) {
+                    if (t.id == it->first) {
+                        fire_trigger(t);
+                        break;
+                    }
+                }
+
+                // Re-register the notification
+                ResetEvent(it->second);
+                auto key_it = watched_keys.find(it->first);
+                if (key_it != watched_keys.end()) {
+                    RegNotifyChangeKeyValue(
+                        key_it->second, TRUE,
+                        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+                        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
+                        it->second, TRUE);
+                }
+                ++it;
+            } else {
+                ++it;
+            }
+        }
+
+        // Sleep 2 seconds between polls
+        for (int i = 0; i < 2 && running_.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds{1});
+        }
+    }
+
+    cleanup();
+    spdlog::debug("TriggerEngine: registry_watch_loop stopped");
+}
+
+#else // Non-Windows: no-op
+
+void TriggerEngine::registry_watch_loop() {
+    spdlog::debug("TriggerEngine: registry_watch_loop is a no-op on this platform");
+    // No registry on Linux/macOS — just wait for shutdown
+    while (running_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::seconds{5});
+    }
+}
+
+#endif
+
+// ── Service name validation ───────────────────────────────────────────────────
+
+bool TriggerEngine::is_valid_service_name(const std::string& name) {
+    // Service names must be alphanumeric + dots, underscores, hyphens, @
+    // This blocks ALL shell metacharacters (;, &, |, `, $, (, ), etc.)
+    if (name.empty() || name.size() > 256) return false;
+    for (char c : name) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) &&
+            c != '.' && c != '_' && c != '-' && c != '@') {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ── Platform-specific service status query ───────────────────────────────────
 
 #ifdef _WIN32
 
 std::string TriggerEngine::query_service_status(const std::string& service_name) {
+    // Validate service name to prevent injection
+    if (!is_valid_service_name(service_name)) {
+        spdlog::warn("Rejected invalid service name: '{}'", service_name);
+        return {};
+    }
+
     // Open the Service Control Manager
     SC_HANDLE scm = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) {
@@ -398,6 +577,12 @@ std::string TriggerEngine::query_service_status(const std::string& service_name)
 #elif defined(__APPLE__)
 
 std::string TriggerEngine::query_service_status(const std::string& service_name) {
+    // Validate service name to prevent command injection
+    if (!is_valid_service_name(service_name)) {
+        spdlog::warn("Rejected invalid service name: '{}'", service_name);
+        return {};
+    }
+
     // On macOS, use launchctl to check if a service is loaded and running
     std::string cmd = "launchctl list " + service_name + " 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
@@ -428,6 +613,12 @@ std::string TriggerEngine::query_service_status(const std::string& service_name)
 #else // Linux
 
 std::string TriggerEngine::query_service_status(const std::string& service_name) {
+    // Validate service name to prevent command injection
+    if (!is_valid_service_name(service_name)) {
+        spdlog::warn("Rejected invalid service name: '{}'", service_name);
+        return {};
+    }
+
     // On Linux, use systemctl is-active to check service status
     std::string cmd = "systemctl is-active " + service_name + " 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");

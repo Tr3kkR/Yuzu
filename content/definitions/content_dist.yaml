@@ -131,3 +131,46 @@ spec:
     requiredPlugins: [content_dist]
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.content_dist.cleanup
+  displayName: Cleanup Staged Files
+  version: 1.0.0
+  description: >
+    Remove one or all files from the agent's staging directory. If a filename
+    is specified, only that file is removed. If no filename is given, all
+    staged files are removed.
+  tags: [content, staging, cleanup]
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+  execution:
+    plugin: content_dist
+    action: cleanup
+    concurrency: per-device
+  parameters:
+    type: object
+    properties:
+      filename:
+        type: string
+        displayName: Filename
+        description: Specific file to remove. Omit to clear all staged files.
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: files_removed
+        type: int32
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [content_dist]
+status:
+  phase: active

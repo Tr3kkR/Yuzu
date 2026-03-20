@@ -1,14 +1,35 @@
+cd_cpp_args = []
 if host_machine.system() == 'windows'
-  cd_extra_deps = [cxx.find_library('bcrypt')]
+  _cd_bcrypt = cxx.find_library('bcrypt')
+  # Try to find OpenSSL on Windows for HTTPS support
+  _cd_openssl = dependency('openssl', method: 'cmake',
+                            modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'],
+                            required: false)
+  if not _cd_openssl.found()
+    _cd_ssl_lib = cxx.find_library('libssl', required: false)
+    _cd_crypto_lib = cxx.find_library('libcrypto', required: false)
+    if _cd_ssl_lib.found() and _cd_crypto_lib.found()
+      _cd_openssl = declare_dependency(dependencies: [_cd_ssl_lib, _cd_crypto_lib])
+    endif
+  endif
+  if not is_disabler(_cd_openssl) and _cd_openssl.found()
+    cd_extra_deps = [_cd_bcrypt, _cd_openssl]
+    cd_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
+  else
+    cd_extra_deps = [_cd_bcrypt]
+  endif
 else
-  cd_extra_deps = [dependency('openssl', required: true)]
+  _cd_openssl = dependency('openssl', required: true)
+  cd_extra_deps = [_cd_openssl]
+  cd_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
 endif
 
 shared_library(
   'content_dist',
   files('src/content_dist_plugin.cpp'),
   name_prefix: '',
-  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep] + cd_extra_deps,
+  cpp_args: cd_cpp_args,
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep, httplib_dep] + cd_extra_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )

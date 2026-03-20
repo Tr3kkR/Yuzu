@@ -10,6 +10,8 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "compliance_eval.hpp"
+#include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
@@ -24,6 +26,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "runtime_config_store.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -396,7 +399,8 @@ public:
 
     // Evaluate a scope expression against all agents, return matching agent IDs.
     std::vector<std::string> evaluate_scope(const yuzu::scope::Expression& expr,
-                                            const TagStore* tag_store) const {
+                                            const TagStore* tag_store,
+                                            const CustomPropertiesStore* props_store = nullptr) const {
         std::vector<std::string> matched;
         std::lock_guard lock(mu_);
         for (const auto& [id, session] : agents_) {
@@ -420,6 +424,12 @@ public:
                     // Then check persistent TagStore
                     if (tag_store)
                         return tag_store->get_tag(id, tag_key);
+                }
+                // props:X lookups (custom properties, Phase 7.6)
+                if (key.starts_with("props.")) {
+                    auto prop_key = key.substr(6);
+                    if (props_store)
+                        return props_store->get_value(id, prop_key);
                 }
                 return {};
             };
@@ -1744,6 +1754,20 @@ public:
             if (policy_store_ && policy_store_->is_open()) {
                 spdlog::info("PolicyStore initialized at {}", policy_db.string());
             }
+        }
+
+        // Phase 7: Runtime Configuration + Custom Properties
+        {
+            auto rtcfg_db = cfg_.auth_config_path.parent_path() / "runtime-config.db";
+            runtime_config_store_ = std::make_unique<RuntimeConfigStore>(rtcfg_db);
+            if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                // Apply stored overrides on startup
+                apply_runtime_config_overrides();
+            }
+        }
+        {
+            auto props_db = cfg_.auth_config_path.parent_path() / "custom-properties.db";
+            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
         }
     }
 
@@ -3639,6 +3663,32 @@ private:
         audit_store_->log(event);
     }
 
+    // Apply stored runtime config overrides on startup
+    void apply_runtime_config_overrides() {
+        if (!runtime_config_store_ || !runtime_config_store_->is_open())
+            return;
+        auto entries = runtime_config_store_->get_all();
+        for (const auto& e : entries) {
+            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value);
+            if (e.key == "log_level") {
+                spdlog::set_level(spdlog::level::from_str(e.value));
+            } else if (e.key == "heartbeat_timeout") {
+                try {
+                    cfg_.session_timeout = std::chrono::seconds(std::stoi(e.value));
+                } catch (...) {}
+            } else if (e.key == "response_retention_days") {
+                try {
+                    cfg_.response_retention_days = std::stoi(e.value);
+                } catch (...) {}
+            } else if (e.key == "audit_retention_days") {
+                try {
+                    cfg_.audit_retention_days = std::stoi(e.value);
+                } catch (...) {}
+            }
+            // auto_approve_enabled is read dynamically, no startup action needed
+        }
+    }
+
     // Analytics helper — emit an analytics event with HTTP request context
     void emit_event(const std::string& event_type, const httplib::Request& req,
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},
@@ -3892,6 +3942,468 @@ private:
             }
             res.set_content(metrics_.serialize(), "text/plain; version=0.0.4; charset=utf-8");
         });
+
+        // -- Health endpoint (7.2) ------------------------------------------------
+        web_server_->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            auto now = std::chrono::steady_clock::now();
+            auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                                  now - server_start_time_)
+                                  .count();
+
+            // Agent counts
+            auto online = registry_.agent_count();
+            auto pending_agents = auth_mgr_.list_pending_agents();
+            int pending_count = 0;
+            for (const auto& a : pending_agents) {
+                if (a.status == auth::PendingStatus::pending)
+                    ++pending_count;
+            }
+
+            // Store health
+            auto response_ok = response_store_ && response_store_->is_open();
+            auto audit_ok = audit_store_ && audit_store_->is_open();
+            auto instruction_ok = instruction_store_ && instruction_store_->is_open();
+            auto policy_ok = policy_store_ && policy_store_->is_open();
+
+            // Execution stats
+            int in_flight = 0;
+            int completed_last_hour = 0;
+            int failed_last_hour = 0;
+            if (execution_tracker_) {
+                auto running = execution_tracker_->query_executions({.status = "running"});
+                in_flight = static_cast<int>(running.size());
+                auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                auto hour_ago = now_epoch - 3600;
+                auto recent = execution_tracker_->query_executions({.limit = 1000});
+                for (const auto& e : recent) {
+                    if (e.completed_at >= hour_ago) {
+                        if (e.status == "completed")
+                            ++completed_last_hour;
+                        else if (e.status == "failed")
+                            ++failed_last_hour;
+                    }
+                }
+            }
+
+            // Determine overall status
+            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+            std::string status = all_stores_ok ? "healthy" : "degraded";
+
+            nlohmann::json health = {
+                {"status", status},
+                {"uptime_seconds", uptime_sec},
+                {"agents",
+                 {{"online", online}, {"pending", pending_count}}},
+                {"stores",
+                 {{"responses", response_ok ? "ok" : "error"},
+                  {"audit", audit_ok ? "ok" : "error"},
+                  {"instructions", instruction_ok ? "ok" : "error"},
+                  {"policies", policy_ok ? "ok" : "error"}}},
+                {"executions",
+                 {{"in_flight", in_flight},
+                  {"completed_last_hour", completed_last_hour},
+                  {"failed_last_hour", failed_last_hour}}},
+                {"version", "0.1.0"}};
+
+            res.set_content(health.dump(), "application/json");
+        });
+
+        // -- Health summary dashboard fragment (7.2) ----------------------------
+        web_server_->Get("/fragments/health/summary",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session)
+                                 return;
+
+                             auto now = std::chrono::steady_clock::now();
+                             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                                                   now - server_start_time_)
+                                                   .count();
+
+                             // Store health
+                             bool response_ok = response_store_ && response_store_->is_open();
+                             bool audit_ok = audit_store_ && audit_store_->is_open();
+                             bool instruction_ok = instruction_store_ && instruction_store_->is_open();
+                             bool policy_ok = policy_store_ && policy_store_->is_open();
+                             bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+
+                             // Execution stats
+                             int in_flight = 0;
+                             if (execution_tracker_) {
+                                 auto running = execution_tracker_->query_executions({.status = "running"});
+                                 in_flight = static_cast<int>(running.size());
+                             }
+
+                             // Format uptime
+                             auto days = uptime_sec / 86400;
+                             auto hours = (uptime_sec % 86400) / 3600;
+                             auto mins = (uptime_sec % 3600) / 60;
+                             std::string uptime_str;
+                             if (days > 0)
+                                 uptime_str = std::to_string(days) + "d " + std::to_string(hours) + "h";
+                             else if (hours > 0)
+                                 uptime_str = std::to_string(hours) + "h " + std::to_string(mins) + "m";
+                             else
+                                 uptime_str = std::to_string(mins) + "m";
+
+                             auto online = registry_.agent_count();
+
+                             // Only render the strip if there are issues
+                             if (all_ok && in_flight == 0) {
+                                 // Minimal healthy summary
+                                 std::string html =
+                                     "<div class=\"health-strip health-ok\" "
+                                     "style=\"display:flex;gap:1.5rem;align-items:center;"
+                                     "padding:0.4rem 1rem;background:var(--surface-1);"
+                                     "border-left:3px solid var(--green);border-radius:4px;"
+                                     "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">"
+                                     "<span>Server healthy</span>"
+                                     "<span>Uptime: " + uptime_str + "</span>"
+                                     "<span>Agents online: " + std::to_string(online) + "</span>"
+                                     "</div>";
+                                 res.set_content(html, "text/html; charset=utf-8");
+                                 return;
+                             }
+
+                             // Degraded or busy — show warning strip
+                             std::string html =
+                                 "<div class=\"health-strip health-warn\" "
+                                 "style=\"display:flex;gap:1.5rem;align-items:center;"
+                                 "padding:0.4rem 1rem;background:var(--surface-1);"
+                                 "border-left:3px solid var(--yellow);border-radius:4px;"
+                                 "font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.75rem\">";
+
+                             if (!all_ok) {
+                                 html += "<span style=\"color:var(--yellow)\">Stores degraded: ";
+                                 if (!response_ok) html += "responses ";
+                                 if (!audit_ok) html += "audit ";
+                                 if (!instruction_ok) html += "instructions ";
+                                 if (!policy_ok) html += "policies ";
+                                 html += "</span>";
+                             }
+
+                             html += "<span>Uptime: " + uptime_str + "</span>";
+                             html += "<span>Agents: " + std::to_string(online) + "</span>";
+                             if (in_flight > 0)
+                                 html += "<span>In-flight: " + std::to_string(in_flight) + "</span>";
+
+                             html += "</div>";
+                             res.set_content(html, "text/html; charset=utf-8");
+                         });
+
+        // -- Runtime Configuration API (7.3) ------------------------------------
+        web_server_->Get("/api/config",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+
+                             nlohmann::json config_obj;
+                             // Current effective values (from cfg_ + overrides)
+                             config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
+                             config_obj["response_retention_days"] = cfg_.response_retention_days;
+                             config_obj["audit_retention_days"] = cfg_.audit_retention_days;
+                             config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
+                             config_obj["log_level"] = spdlog::level::to_string_view(
+                                                           spdlog::default_logger()->level())
+                                                           .data();
+
+                             // Overrides from store
+                             nlohmann::json overrides = nlohmann::json::object();
+                             if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                                 auto entries = runtime_config_store_->get_all();
+                                 for (const auto& e : entries) {
+                                     overrides[e.key] = {{"value", e.value},
+                                                         {"updated_by", e.updated_by},
+                                                         {"updated_at", e.updated_at}};
+                                 }
+                             }
+
+                             nlohmann::json allowed = nlohmann::json::array();
+                             for (const auto& k : RuntimeConfigStore::allowed_keys())
+                                 allowed.push_back(k);
+
+                             res.set_content(
+                                 nlohmann::json({{"config", config_obj},
+                                                 {"overrides", overrides},
+                                                 {"allowed_keys", allowed}})
+                                     .dump(),
+                                 "application/json");
+                         });
+
+        web_server_->Put(R"(/api/config/([a-z_]+))",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Write"))
+                                 return;
+                             if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"runtime config store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             auto key = req.matches[1].str();
+                             std::string value;
+                             try {
+                                 auto j = nlohmann::json::parse(req.body);
+                                 if (j.contains("value"))
+                                     value = j["value"].is_string() ? j["value"].get<std::string>()
+                                                                     : j["value"].dump();
+                                 else {
+                                     res.status = 400;
+                                     res.set_content(R"({"error":"missing 'value' in request body"})",
+                                                     "application/json");
+                                     return;
+                                 }
+                             } catch (...) {
+                                 res.status = 400;
+                                 res.set_content(R"({"error":"invalid JSON body"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             // Get username from session
+                             auto session = require_auth(req, res);
+                             if (!session)
+                                 return;
+
+                             auto result = runtime_config_store_->set(key, value, session->username);
+                             if (!result) {
+                                 res.status = 400;
+                                 res.set_content(
+                                     nlohmann::json({{"error", result.error()}}).dump(),
+                                     "application/json");
+                                 return;
+                             }
+
+                             // Apply the change to in-memory config
+                             if (key == "heartbeat_timeout") {
+                                 try {
+                                     cfg_.session_timeout = std::chrono::seconds(std::stoi(value));
+                                 } catch (...) {}
+                             } else if (key == "response_retention_days") {
+                                 try {
+                                     cfg_.response_retention_days = std::stoi(value);
+                                 } catch (...) {}
+                             } else if (key == "audit_retention_days") {
+                                 try {
+                                     cfg_.audit_retention_days = std::stoi(value);
+                                 } catch (...) {}
+                             }
+                             // log_level is applied inside RuntimeConfigStore::set()
+
+                             audit_log(req, "config.update", "success", "RuntimeConfig", key,
+                                       "value=" + value);
+
+                             res.set_content(
+                                 nlohmann::json({{"key", key}, {"value", value}, {"applied", true}})
+                                     .dump(),
+                                 "application/json");
+                         });
+
+        // -- Custom Properties API (7.6) ----------------------------------------
+
+        // GET /api/agents/:id/properties
+        web_server_->Get(R"(/api/agents/([^/]+)/properties)",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             auto agent_id = req.matches[1].str();
+                             auto props = custom_properties_store_->get_properties(agent_id);
+                             nlohmann::json arr = nlohmann::json::array();
+                             for (const auto& p : props) {
+                                 arr.push_back({{"key", p.key},
+                                                {"value", p.value},
+                                                {"type", p.type},
+                                                {"updated_at", p.updated_at}});
+                             }
+                             res.set_content(
+                                 nlohmann::json({{"agent_id", agent_id}, {"properties", arr}}).dump(),
+                                 "application/json");
+                         });
+
+        // PUT /api/agents/:id/properties/:key
+        web_server_->Put(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Write"))
+                                 return;
+                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             auto agent_id = req.matches[1].str();
+                             auto key = req.matches[2].str();
+
+                             std::string value;
+                             std::string type = "string";
+                             try {
+                                 auto j = nlohmann::json::parse(req.body);
+                                 if (j.contains("value"))
+                                     value = j["value"].is_string() ? j["value"].get<std::string>()
+                                                                     : j["value"].dump();
+                                 else {
+                                     res.status = 400;
+                                     res.set_content(R"({"error":"missing 'value' in request body"})",
+                                                     "application/json");
+                                     return;
+                                 }
+                                 if (j.contains("type") && j["type"].is_string())
+                                     type = j["type"].get<std::string>();
+                             } catch (...) {
+                                 res.status = 400;
+                                 res.set_content(R"({"error":"invalid JSON body"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             auto result =
+                                 custom_properties_store_->set_property(agent_id, key, value, type);
+                             if (!result) {
+                                 res.status = 400;
+                                 res.set_content(
+                                     nlohmann::json({{"error", result.error()}}).dump(),
+                                     "application/json");
+                                 return;
+                             }
+
+                             audit_log(req, "custom_property.set", "success", "Agent", agent_id,
+                                       key + "=" + value);
+
+                             res.set_content(
+                                 nlohmann::json(
+                                     {{"agent_id", agent_id}, {"key", key}, {"value", value}, {"type", type}})
+                                     .dump(),
+                                 "application/json");
+                         });
+
+        // DELETE /api/agents/:id/properties/:key
+        web_server_->Delete(R"(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))",
+                            [this](const httplib::Request& req, httplib::Response& res) {
+                                if (!require_permission(req, res, "Infrastructure", "Write"))
+                                    return;
+                                if (!custom_properties_store_ ||
+                                    !custom_properties_store_->is_open()) {
+                                    res.status = 503;
+                                    res.set_content(
+                                        R"({"error":"custom properties store unavailable"})",
+                                        "application/json");
+                                    return;
+                                }
+
+                                auto agent_id = req.matches[1].str();
+                                auto key = req.matches[2].str();
+
+                                bool deleted =
+                                    custom_properties_store_->delete_property(agent_id, key);
+                                if (!deleted) {
+                                    res.status = 404;
+                                    res.set_content(R"({"error":"property not found"})",
+                                                    "application/json");
+                                    return;
+                                }
+
+                                audit_log(req, "custom_property.delete", "success", "Agent",
+                                          agent_id, "key=" + key);
+
+                                res.set_content(
+                                    nlohmann::json({{"deleted", true}, {"key", key}}).dump(),
+                                    "application/json");
+                            });
+
+        // GET /api/property-schemas
+        web_server_->Get("/api/property-schemas",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+
+                             auto schemas = custom_properties_store_->list_schemas();
+                             nlohmann::json arr = nlohmann::json::array();
+                             for (const auto& s : schemas) {
+                                 arr.push_back({{"key", s.key},
+                                                {"display_name", s.display_name},
+                                                {"type", s.type},
+                                                {"description", s.description},
+                                                {"validation_regex", s.validation_regex}});
+                             }
+                             res.set_content(nlohmann::json({{"schemas", arr}}).dump(),
+                                             "application/json");
+                         });
+
+        // POST /api/property-schemas
+        web_server_->Post("/api/property-schemas",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Infrastructure", "Write"))
+                                  return;
+                              if (!custom_properties_store_ ||
+                                  !custom_properties_store_->is_open()) {
+                                  res.status = 503;
+                                  res.set_content(
+                                      R"({"error":"custom properties store unavailable"})",
+                                      "application/json");
+                                  return;
+                              }
+
+                              CustomPropertySchema schema;
+                              try {
+                                  auto j = nlohmann::json::parse(req.body);
+                                  schema.key = j.value("key", "");
+                                  schema.display_name = j.value("display_name", "");
+                                  schema.type = j.value("type", "string");
+                                  schema.description = j.value("description", "");
+                                  schema.validation_regex = j.value("validation_regex", "");
+                              } catch (...) {
+                                  res.status = 400;
+                                  res.set_content(R"({"error":"invalid JSON body"})",
+                                                  "application/json");
+                                  return;
+                              }
+
+                              if (schema.key.empty()) {
+                                  res.status = 400;
+                                  res.set_content(R"({"error":"'key' is required"})",
+                                                  "application/json");
+                                  return;
+                              }
+
+                              auto result = custom_properties_store_->upsert_schema(schema);
+                              if (!result) {
+                                  res.status = 400;
+                                  res.set_content(
+                                      nlohmann::json({{"error", result.error()}}).dump(),
+                                      "application/json");
+                                  return;
+                              }
+
+                              audit_log(req, "property_schema.create", "success",
+                                        "PropertySchema", schema.key);
+
+                              res.status = 201;
+                              res.set_content(
+                                  nlohmann::json({{"key", schema.key},
+                                                  {"display_name", schema.display_name},
+                                                  {"type", schema.type},
+                                                  {"description", schema.description},
+                                                  {"validation_regex", schema.validation_regex}})
+                                      .dump(),
+                                  "application/json");
+                          });
 
         // -- Current user info (/api/me) --------------------------------------
         web_server_->Get("/api/me", [this](const httplib::Request& req, httplib::Response& res) {
@@ -4927,7 +5439,7 @@ private:
                         "application/json");
                     return;
                 }
-                auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get());
+                auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -5047,12 +5559,18 @@ private:
             ResponseQuery filter;
             if (req.has_param("agent_id"))
                 filter.agent_id = req.get_param_value("agent_id");
-            if (req.has_param("status"))
-                filter.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                filter.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                filter.until = std::stoll(req.get_param_value("until"));
+            try {
+                if (req.has_param("status"))
+                    filter.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    filter.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    filter.until = std::stoll(req.get_param_value("until"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                return;
+            }
 
             auto results = response_store_->aggregate(instruction_id, aq, filter);
 
@@ -5089,16 +5607,22 @@ private:
             ResponseQuery q;
             if (req.has_param("agent_id"))
                 q.agent_id = req.get_param_value("agent_id");
-            if (req.has_param("status"))
-                q.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
-            else
-                q.limit = 10000; // higher default for exports
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                else
+                    q.limit = 10000; // higher default for exports
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                return;
+            }
 
             auto results = response_store_->query(instruction_id, q);
             auto format = req.get_param_value("format");
@@ -5159,16 +5683,22 @@ private:
             ResponseQuery q;
             if (req.has_param("agent_id"))
                 q.agent_id = req.get_param_value("agent_id");
-            if (req.has_param("status"))
-                q.status = std::stoi(req.get_param_value("status"));
-            if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
-            if (req.has_param("offset"))
-                q.offset = std::stoi(req.get_param_value("offset"));
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                return;
+            }
 
             auto results = response_store_->query(instruction_id, q);
 
@@ -5206,14 +5736,20 @@ private:
                 q.target_type = req.get_param_value("target_type");
             if (req.has_param("target_id"))
                 q.target_id = req.get_param_value("target_id");
-            if (req.has_param("since"))
-                q.since = std::stoll(req.get_param_value("since"));
-            if (req.has_param("until"))
-                q.until = std::stoll(req.get_param_value("until"));
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
-            if (req.has_param("offset"))
-                q.offset = std::stoi(req.get_param_value("offset"));
+            try {
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+                if (req.has_param("offset"))
+                    q.offset = std::stoi(req.get_param_value("offset"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                return;
+            }
 
             auto results = audit_store_->query(q);
 
@@ -5451,8 +5987,14 @@ private:
                 q.set_id_filter = req.get_param_value("set_id");
             if (req.has_param("enabled_only"))
                 q.enabled_only = true;
-            if (req.has_param("limit"))
-                q.limit = std::stoi(req.get_param_value("limit"));
+            try {
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                return;
+            }
 
             auto defs = instruction_store_->query_definitions(q);
             nlohmann::json arr = nlohmann::json::array();
@@ -5733,8 +6275,14 @@ private:
                     q.definition_id = req.get_param_value("definition_id");
                 if (req.has_param("status"))
                     q.status = req.get_param_value("status");
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                try {
+                    if (req.has_param("limit"))
+                        q.limit = std::stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    return;
+                }
 
                 auto execs = execution_tracker_->query_executions(q);
                 nlohmann::json arr = nlohmann::json::array();
@@ -6658,7 +7206,7 @@ private:
                 return;
             }
 
-            auto matched = registry_.evaluate_scope(*parsed, tag_store_.get());
+            auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
             res.set_content(
                 nlohmann::json({{"matched", matched.size()}, {"total", registry_.agent_count()}})
                     .dump(),
@@ -6681,8 +7229,14 @@ private:
                 FragmentQuery q;
                 if (req.has_param("name"))
                     q.name_filter = req.get_param_value("name");
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                try {
+                    if (req.has_param("limit"))
+                        q.limit = std::stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    return;
+                }
 
                 auto frags = policy_store_->query_fragments(q);
                 nlohmann::json arr = nlohmann::json::array();
@@ -6778,8 +7332,14 @@ private:
                     q.fragment_filter = req.get_param_value("fragment_id");
                 if (req.has_param("enabled_only"))
                     q.enabled_only = true;
-                if (req.has_param("limit"))
-                    q.limit = std::stoi(req.get_param_value("limit"));
+                try {
+                    if (req.has_param("limit"))
+                        q.limit = std::stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    return;
+                }
 
                 auto policies = policy_store_->query_policies(q);
                 nlohmann::json arr = nlohmann::json::array();
@@ -6974,6 +7534,57 @@ private:
                 res.set_header("HX-Trigger",
                     R"({"showToast":{"message":"Policy disabled","level":"warning"}})");
                 res.set_content(R"({"status":"ok"})", "application/json");
+            });
+
+        // POST /api/policies/:id/invalidate — invalidate cache for one policy
+        web_server_->Post(R"(/api/policies/([^/]+)/invalidate)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Policy", "Execute"))
+                    return;
+                if (!policy_store_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                auto result = policy_store_->invalidate_policy(id);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "policy.invalidate", "success", "policy", id);
+                emit_event("policy.invalidated", req, {}, {{"policy_id", id}, {"agents_reset", std::to_string(*result)}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Policy cache invalidated","level":"success"}})");
+                res.set_content(
+                    nlohmann::json({{"status", "ok"}, {"agents_invalidated", *result}}).dump(),
+                    "application/json");
+            });
+
+        // POST /api/policies/invalidate-all — invalidate cache for all policies
+        web_server_->Post("/api/policies/invalidate-all",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Policy", "Execute"))
+                    return;
+                if (!policy_store_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto result = policy_store_->invalidate_all_policies();
+                if (!result) {
+                    res.status = 500;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "policy.invalidate_all", "success");
+                emit_event("policy.invalidated_all", req, {}, {{"total_reset", std::to_string(*result)}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"All policy caches invalidated","level":"success"}})");
+                res.set_content(
+                    nlohmann::json({{"status", "ok"}, {"total_invalidated", *result}}).dump(),
+                    "application/json");
             });
 
         // GET /api/compliance — fleet compliance summary
@@ -7246,6 +7857,11 @@ private:
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
+
+    // Phase 7: Runtime config, custom properties, health monitoring
+    std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
+    std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
+    std::chrono::steady_clock::time_point server_start_time_{std::chrono::steady_clock::now()};
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
