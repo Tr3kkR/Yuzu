@@ -97,6 +97,10 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .toast-info { border-left: 3px solid var(--accent); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 
+/* Two-click confirm button */
+.btn-confirming { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+
 /* Alerts */
 .alert { padding: var(--sp-3) var(--sp-4); border-radius: var(--radius-md); font-size: var(--text-base);
          display: flex; align-items: flex-start; gap: var(--sp-3); margin-bottom: var(--sp-4); }

@@ -38,6 +38,33 @@ h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
 <p>Help page is under construction. See the <a href="/">dashboard</a>.</p>
 </div>
 
+<div id="toast-container" class="toast-container"></div>
+
+<script>
+/* ── Toast notification system ─────────────────────────── */
+function showToast(message, level) {
+  var c = document.getElementById('toast-container');
+  if (!c) return;
+  var t = document.createElement('div');
+  t.className = 'toast toast-' + (level || 'info');
+  t.textContent = message;
+  var close = document.createElement('button');
+  close.textContent = '\u00d7';
+  close.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;margin-left:auto;font-size:1.2rem;padding:0 0 0 var(--sp-3);';
+  close.onclick = function() { t.remove(); };
+  t.style.display = 'flex';
+  t.style.alignItems = 'center';
+  t.appendChild(close);
+  c.appendChild(t);
+  if (level !== 'error') {
+    setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity 0.3s'; setTimeout(function() { t.remove(); }, 300); }, level === 'warning' ? 8000 : 4000);
+  }
+}
+document.body.addEventListener('showToast', function(e) {
+  var d = e.detail || {};
+  showToast(d.message || 'Done', d.level || 'success');
+});
+</script>
 <script>
 fetch('/api/me').then(function(r){return r.json()}).then(function(d){
   document.getElementById('nav-user').textContent = d.username;

@@ -2720,8 +2720,30 @@ private:
         }
 
         html += "  </tbody>"
-                "</table>"
-                "<div class=\"feedback\" id=\"pending-feedback\"></div>";
+                "</table>";
+
+        // Bulk actions for pending agents (uses two-click confirm)
+        auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
+            return a.status == auth::PendingStatus::pending;
+        });
+        if (pending_count > 1) {
+            html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
+                    "<button class=\"btn btn-primary\" "
+                    "style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
+                    "onclick=\"twoClickConfirm(this, function() { "
+                    "htmx.ajax('POST','/api/settings/pending-agents/bulk-approve',"
+                    "{target:'#pending-section',swap:'innerHTML'}); })\">"
+                    "Approve All (" + std::to_string(pending_count) + ")</button>"
+                    "<button class=\"btn btn-danger\" "
+                    "style=\"padding:0.3rem 0.8rem;font-size:0.75rem\" "
+                    "onclick=\"twoClickConfirm(this, function() { "
+                    "htmx.ajax('POST','/api/settings/pending-agents/bulk-deny',"
+                    "{target:'#pending-section',swap:'innerHTML'}); })\">"
+                    "Deny All (" + std::to_string(pending_count) + ")</button>"
+                    "</div>";
+        }
+
+        html += "<div class=\"feedback\" id=\"pending-feedback\"></div>";
 
         return html;
     }
@@ -3605,6 +3627,8 @@ private:
                                            cfg_.tls_enabled ? "enabled" : "disabled");
                               // Return updated TLS fragment
                               res.set_header("HX-Retarget", "#tls-section");
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":"TLS settings saved","level":"success"}})");
                               res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
                           });
 
@@ -3686,6 +3710,8 @@ private:
             spdlog::info("Certificate uploaded: {} → {}", type, out_path.string());
             // Re-render TLS section to show new file paths
             res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Certificate uploaded","level":"success"}})");
             res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
         });
 
@@ -3715,6 +3741,8 @@ private:
                     spdlog::error("Failed to save config after user upsert");
                 }
                 spdlog::info("User '{}' added/updated (role={})", username, role_str);
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"User created","level":"success"}})");
                 res.set_content(render_users_fragment(), "text/html; charset=utf-8");
             });
 
@@ -3729,6 +3757,8 @@ private:
                     spdlog::error("Failed to save config after user removal");
                 }
                 spdlog::info("User '{}' removed", username);
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"User deleted","level":"success"}})");
             }
             res.set_content(render_users_fragment(), "text/html; charset=utf-8");
         });
@@ -3762,6 +3792,8 @@ private:
             auto raw_token = auth_mgr_.create_enrollment_token(label, max_uses, ttl);
 
             // Return token list fragment with the one-time token reveal
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
             res.set_content(render_tokens_fragment(raw_token), "text/html; charset=utf-8");
         });
 
@@ -3771,6 +3803,8 @@ private:
                                     return;
                                 auto token_id = req.matches[1].str();
                                 auth_mgr_.revoke_enrollment_token(token_id);
+                                res.set_header("HX-Trigger",
+                                    R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
                                 res.set_content(render_tokens_fragment(),
                                                 "text/html; charset=utf-8");
                             });
@@ -3876,6 +3910,8 @@ private:
                                    .result = "success"});
             }
 
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"API token created","level":"success"}})");
             res.set_content(render_api_tokens_fragment(result.value()),
                             "text/html; charset=utf-8");
         });
@@ -3903,11 +3939,52 @@ private:
                                                        .result = "success"});
                                 }
 
+                                res.set_header("HX-Trigger",
+                                    R"({"showToast":{"message":"API token revoked","level":"success"}})");
                                 res.set_content(render_api_tokens_fragment(),
                                                 "text/html; charset=utf-8");
                             });
 
         // -- Settings API: Pending agents (admin only, HTMX) --------------------
+
+        // Bulk approve/deny — must be registered BEFORE the (.+) catch-all patterns
+        web_server_->Post("/api/settings/pending-agents/bulk-approve",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_admin(req, res))
+                                  return;
+                              int count = 0;
+                              for (const auto& a : auth_mgr_.list_pending_agents()) {
+                                  if (a.status == auth::PendingStatus::pending) {
+                                      auth_mgr_.approve_pending_agent(a.agent_id);
+                                      ++count;
+                                  }
+                              }
+                              spdlog::info("Bulk approved {} pending agent(s)", count);
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":")" + std::to_string(count) +
+                                  R"( agent(s) approved","level":"success"}})");
+                              res.set_content(render_pending_fragment(),
+                                              "text/html; charset=utf-8");
+                          });
+
+        web_server_->Post("/api/settings/pending-agents/bulk-deny",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_admin(req, res))
+                                  return;
+                              int count = 0;
+                              for (const auto& a : auth_mgr_.list_pending_agents()) {
+                                  if (a.status == auth::PendingStatus::pending) {
+                                      auth_mgr_.deny_pending_agent(a.agent_id);
+                                      ++count;
+                                  }
+                              }
+                              spdlog::info("Bulk denied {} pending agent(s)", count);
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":")" + std::to_string(count) +
+                                  R"( agent(s) denied","level":"warning"}})");
+                              res.set_content(render_pending_fragment(),
+                                              "text/html; charset=utf-8");
+                          });
 
         web_server_->Post(R"(/api/settings/pending-agents/(.+)/approve)",
                           [this](const httplib::Request& req, httplib::Response& res) {
@@ -3915,6 +3992,8 @@ private:
                                   return;
                               auto agent_id = req.matches[1].str();
                               auth_mgr_.approve_pending_agent(agent_id);
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":"Agent approved","level":"success"}})");
                               res.set_content(render_pending_fragment(),
                                               "text/html; charset=utf-8");
                           });
@@ -3925,6 +4004,8 @@ private:
                                   return;
                               auto agent_id = req.matches[1].str();
                               auth_mgr_.deny_pending_agent(agent_id);
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":"Agent denied","level":"warning"}})");
                               res.set_content(render_pending_fragment(),
                                               "text/html; charset=utf-8");
                           });
@@ -4506,6 +4587,9 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
+            res.set_header("HX-Trigger",
+                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
+                " agent(s)\",\"level\":\"success\"}}");
             res.set_content(
                 nlohmann::json(
                     {{"status", "sent"}, {"command_id", command_id}, {"agents_reached", sent}})
@@ -4847,6 +4931,8 @@ private:
                     }
                 }
                 audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Tag updated","level":"success"}})");
                 res.set_content(R"({"status":"ok"})", "application/json");
             });
 
@@ -4872,6 +4958,10 @@ private:
                 bool deleted = tag_store_->delete_tag(agent_id, key);
                 audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
                           agent_id + ":" + key);
+                if (deleted) {
+                    res.set_header("HX-Trigger",
+                        R"({"showToast":{"message":"Tag deleted","level":"success"}})");
+                }
                 res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
             });
 
@@ -5022,6 +5112,8 @@ private:
                             {"action", def.action},
                             {"type", def.type}},
                            {{"instruction_id", *result}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Instruction definition created","level":"success"}})");
                 res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
@@ -5096,6 +5188,8 @@ private:
                 }
                 audit_log(req, "instruction.update", "success", "instruction", id);
                 emit_event("instruction.updated", req, {}, {{"instruction_id", id}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Instruction definition updated","level":"success"}})");
                 res.set_content(R"({"status":"ok"})", "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
@@ -5117,6 +5211,8 @@ private:
             if (deleted) {
                 audit_log(req, "instruction.delete", "success", "instruction", id);
                 emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Instruction definition deleted","level":"success"}})");
             }
             res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
         });
@@ -5152,6 +5248,8 @@ private:
                 return;
             }
             audit_log(req, "instruction.import", "success", "instruction", *result);
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Definitions imported","level":"success"}})");
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
         });
 
@@ -5362,6 +5460,8 @@ private:
             audit_log(req, "execution.rerun", "success", "execution", *result, "rerun of " + id);
             emit_event("execution.created", req, {},
                        {{"execution_id", *result}, {"parent_id", id}, {"trigger", "rerun"}});
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Execution rerun initiated","level":"success"}})");
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
         });
 
@@ -5383,6 +5483,8 @@ private:
                               audit_log(req, "execution.cancel", "success", "execution", id);
                               emit_event("execution.completed", req, {{"status", "cancelled"}},
                                          {{"execution_id", id}});
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":"Execution cancelled","level":"success"}})");
                               res.set_content(R"({"status":"cancelled"})", "application/json");
                           });
 
@@ -5472,6 +5574,8 @@ private:
                     return;
                 }
                 audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Schedule created","level":"success"}})");
                 res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
             } catch (const std::exception& e) {
                 res.status = 400;
@@ -5490,8 +5594,11 @@ private:
 
             auto id = req.matches[1].str();
             bool deleted = schedule_engine_->delete_schedule(id);
-            if (deleted)
+            if (deleted) {
                 audit_log(req, "schedule.delete", "success", "schedule", id);
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
+            }
             res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
         });
 
@@ -5580,6 +5687,8 @@ private:
             }
             audit_log(req, "approval.approve", "success", "approval", id);
             emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Approved","level":"success"}})");
             res.set_content(R"({"status":"approved"})", "application/json");
         });
 
@@ -5608,6 +5717,8 @@ private:
             audit_log(req, "approval.reject", "success", "approval", id);
             emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
                        {{"approval_id", id}});
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Rejected","level":"warning"}})");
             res.set_content(R"({"status":"rejected"})", "application/json");
         });
 
@@ -5898,6 +6009,11 @@ private:
 
                 std::string cls =
                     msg.find("failed") != std::string::npos ? "alert-error" : "alert-success";
+                {
+                    auto level = msg.find("failed") == std::string::npos ? "success" : "error";
+                    nlohmann::json trigger = {{"showToast", {{"message", msg}, {"level", level}}}};
+                    res.set_header("HX-Trigger", trigger.dump());
+                }
                 res.set_content("<div class=\"alert " + cls + "\">" + html_escape(msg) + "</div>",
                                 "text/html");
             });
