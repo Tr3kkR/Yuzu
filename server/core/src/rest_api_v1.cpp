@@ -40,14 +40,26 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── /api/v1/me ───────────────────────────────────────────────────────
 
-    svr.Get("/api/v1/me", [auth_fn](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
-        res.set_content(ok_response({{"username", session->username},
-                                     {"role", auth::role_to_string(session->role)}})
-                            .dump(),
-                        "application/json");
+        auto data = nlohmann::json({{"username", session->username},
+                                     {"role", auth::role_to_string(session->role)}});
+        // Add RBAC role if enabled
+        if (rbac_store && rbac_store->is_rbac_enabled()) {
+            data["rbac_enabled"] = true;
+            auto roles = rbac_store->get_principal_roles("user", session->username);
+            if (!roles.empty()) {
+                data["rbac_role"] = roles[0].role_name;
+            } else {
+                data["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
+            }
+        } else {
+            data["rbac_enabled"] = false;
+            data["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
+        }
+        res.set_content(ok_response(data).dump(), "application/json");
     });
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────

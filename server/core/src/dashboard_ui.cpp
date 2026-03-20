@@ -14,7 +14,11 @@ extern const char* const kDashboardIndexHtml =
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <style>
     body {
-      display: grid; height: 100vh;
+      display: flex; flex-direction: column; height: 100vh;
+      overflow: hidden;
+    }
+    .dashboard-grid {
+      display: grid; flex: 1; min-height: 0;
       grid-template-rows: auto 1fr auto;
       grid-template-columns: 220px 1fr 260px;
       grid-template-areas:
@@ -234,41 +238,6 @@ extern const char* const kDashboardIndexHtml =
       font-size: 0.7rem; color: #484f58;
     }
 
-    /* ── Hamburger Menu ──────────────────────────────────────── */
-    .hamburger-wrap {
-      position: relative; margin-left: auto;
-    }
-    .hamburger-btn {
-      background: none; border: 1px solid var(--border); border-radius: 0.375rem;
-      color: var(--fg); font-size: 1.2rem; padding: 0.2rem 0.55rem;
-      cursor: pointer; line-height: 1; transition: background 0.15s;
-    }
-    .hamburger-btn:hover { background: rgba(88,166,255,0.1); }
-    .hamburger-menu {
-      display: none; position: absolute; right: 0; top: 110%;
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 0.5rem; min-width: 160px; z-index: 1000;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-      overflow: hidden;
-    }
-    .hamburger-menu.open { display: block; }
-    .hamburger-menu a, .hamburger-menu button {
-      display: block; width: 100%; padding: 0.55rem 1rem;
-      font-size: 0.8rem; color: var(--fg); text-align: left;
-      text-decoration: none; background: none; border: none;
-      cursor: pointer; transition: background 0.1s;
-    }
-    .hamburger-menu a:hover, .hamburger-menu button:hover {
-      background: rgba(88,166,255,0.1);
-    }
-    .hamburger-menu .divider {
-      height: 1px; background: var(--border); margin: 0.25rem 0;
-    }
-    .hamburger-user {
-      padding: 0.55rem 1rem; font-size: 0.7rem; color: #8b949e;
-      border-bottom: 1px solid var(--border);
-    }
-
     /* ── About Modal ─────────────────────────────────────────── */
     .modal-overlay {
       display: none; position: fixed; inset: 0;
@@ -293,6 +262,28 @@ extern const char* const kDashboardIndexHtml =
 </head>
 <body>
 
+  <nav class="nav-bar">
+    <a href="/" class="nav-brand">
+      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
+    </a>
+    <a href="/" class="nav-link active">Dashboard</a>
+    <a href="/instructions" class="nav-link">Instructions</a>
+    <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
+    <span class="nav-spacer"></span>
+    <span class="nav-user" id="nav-user"></span>
+    <button class="nav-logout" onclick="fetch('/logout',{method:'POST'}).then(function(){location='/login'})">Logout</button>
+  </nav>
+  <div class="context-bar" id="context-bar">
+    <span class="context-role-badge" id="role-badge"></span>
+    <span class="context-user" id="context-user"></span>
+    <span class="context-spacer"></span>
+    <button class="context-bell" title="Notifications">
+      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
+    </button>
+  </div>
+
+  <div class="dashboard-grid">
+
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <div class="instr-bar">
     <label>Instruction</label>
@@ -309,18 +300,6 @@ extern const char* const kDashboardIndexHtml =
       <span>Network: <strong id="stat-network">&mdash;</strong></span>
       <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
       <span>Total: <strong id="stat-total">&mdash;</strong></span>
-    </div>
-    <div class="hamburger-wrap">
-      <button class="hamburger-btn" onclick="toggleMenu()" title="Menu">&#9776;</button>
-      <div class="hamburger-menu" id="hamburger-menu">
-        <div class="hamburger-user" id="menu-user">Signed in</div>
-        <a href="/instructions">Instructions</a>
-        <a href="/settings">Settings</a>
-        <a href="/help">Help</a>
-        <button onclick="showAbout()">About</button>
-        <div class="divider"></div>
-        <button onclick="doLogout()">Logout</button>
-      </div>
     </div>
   </div>
 
@@ -389,6 +368,8 @@ extern const char* const kDashboardIndexHtml =
   </div>
 
   <footer>Yuzu Server &mdash; Dashboard</footer>
+
+  </div><!-- /.dashboard-grid -->
 )HTM"
     // Part 2: JavaScript
     R"HTM(
@@ -932,22 +913,9 @@ extern const char* const kDashboardIndexHtml =
       evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
     }
 
-    /* ── Hamburger menu ───────────────────────────────────── */
-    function toggleMenu() {
-      document.getElementById('hamburger-menu').classList.toggle('open');
-    }
-    document.addEventListener('click', function(e) {
-      var wrap = document.querySelector('.hamburger-wrap');
-      if (wrap && !wrap.contains(e.target)) {
-        document.getElementById('hamburger-menu').classList.remove('open');
-      }
-    });
-
     /* ── About modal ─────────────────────────────────────── */
     function showAbout() {
-      document.getElementById('hamburger-menu').classList.remove('open');
       document.getElementById('about-modal').classList.add('open');
-      /* Populate dynamic about info */
       var agentCount = Object.keys(agents).length;
       var details = 'Agents: ' + agentCount + ' connected';
       document.getElementById('about-details').textContent = details;
@@ -958,34 +926,19 @@ extern const char* const kDashboardIndexHtml =
       }
     }
 
-    /* ── Logout ──────────────────────────────────────────── */
-    function doLogout() {
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/logout');
-      xhr.onload = function() { window.location.href = '/login'; };
-      xhr.onerror = function() { window.location.href = '/login'; };
-      xhr.send();
-    }
-
-    /* ── Load current user info ──────────────────────────── */
+    /* ── Load current user info (nav bar + context bar) ─── */
     function loadUserInfo() {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/me');
-      xhr.onload = function() {
-        if (xhr.status === 200) {
-          var data = JSON.parse(xhr.responseText);
-          document.getElementById('menu-user').textContent =
-            'Signed in as ' + data.username + ' (' + data.role + ')';
-          /* Hide settings link for non-admin */
-          if (data.role !== 'admin') {
-            var links = document.querySelectorAll('.hamburger-menu a[href="/settings"]');
-            for (var i = 0; i < links.length; i++) {
-              links[i].style.display = 'none';
-            }
-          }
+      fetch('/api/me').then(function(r){return r.json()}).then(function(d){
+        document.getElementById('nav-user').textContent = d.username;
+        var role = d.rbac_role || d.role;
+        document.getElementById('role-badge').textContent = role;
+        document.getElementById('context-user').textContent = d.username;
+        document.body.setAttribute('data-role', role);
+        if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
+          var sl = document.getElementById('nav-settings-link');
+          if(sl) sl.style.display = 'none';
         }
-      };
-      xhr.send();
+      });
     }
 
     /* ── Init ─────────────────────────────────────────────── */

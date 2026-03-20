@@ -3503,10 +3503,23 @@ private:
             auto session = require_auth(req, res);
             if (!session)
                 return;
-            res.set_content(nlohmann::json({{"username", session->username},
-                                            {"role", auth::role_to_string(session->role)}})
-                                .dump(),
-                            "application/json");
+            auto j = nlohmann::json({{"username", session->username},
+                                     {"role", auth::role_to_string(session->role)}});
+            // Add RBAC role if enabled
+            if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+                j["rbac_enabled"] = true;
+                auto roles = rbac_store_->get_principal_roles("user", session->username);
+                if (!roles.empty()) {
+                    j["rbac_role"] = roles[0].role_name;
+                } else {
+                    // Fallback: map legacy role to RBAC role name
+                    j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
+                }
+            } else {
+                j["rbac_enabled"] = false;
+                j["rbac_role"] = session->role == auth::Role::admin ? "Administrator" : "Viewer";
+            }
+            res.set_content(j.dump(), "application/json");
         });
 
         // -- Static design-system assets ----------------------------------------

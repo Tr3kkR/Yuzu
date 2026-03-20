@@ -15,19 +15,6 @@ extern const char* const kSettingsHtml =
   <style>
     body { min-height: 100vh; }
 
-    /* ── Top bar ───────────────────────────────────────────── */
-    .topbar {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 0.75rem 1.5rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--surface);
-    }
-    .topbar h1 { font-size: 1rem; font-weight: 600; }
-    .topbar a {
-      color: var(--accent); text-decoration: none; font-size: 0.85rem;
-    }
-    .topbar a:hover { text-decoration: underline; }
-
     /* ── Content ───────────────────────────────────────────── */
     .content {
       max-width: 800px; margin: 1.5rem auto; padding: 0 1.5rem;
@@ -184,9 +171,24 @@ extern const char* const kSettingsHtml =
 </head>
 <body>
 
-  <div class="topbar">
-    <h1>Settings</h1>
-    <a href="/">&larr; Back to Dashboard</a>
+  <nav class="nav-bar">
+    <a href="/" class="nav-brand">
+      <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
+    </a>
+    <a href="/" class="nav-link">Dashboard</a>
+    <a href="/instructions" class="nav-link">Instructions</a>
+    <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
+    <span class="nav-spacer"></span>
+    <span class="nav-user" id="nav-user"></span>
+    <button class="nav-logout" onclick="fetch('/logout',{method:'POST'}).then(function(){location='/login'})">Logout</button>
+  </nav>
+  <div class="context-bar" id="context-bar">
+    <span class="context-role-badge" id="role-badge"></span>
+    <span class="context-user" id="context-user"></span>
+    <span class="context-spacer"></span>
+    <button class="context-bell" title="Notifications">
+      <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
+    </button>
   </div>
 
   <div class="content">
@@ -370,6 +372,19 @@ extern const char* const kSettingsHtml =
   </div>
 
   <script>
+    /* ── Populate nav bar + context bar ─────────────────────── */
+    fetch('/api/me').then(function(r){return r.json()}).then(function(d){
+      document.getElementById('nav-user').textContent = d.username;
+      var role = d.rbac_role || d.role;
+      document.getElementById('role-badge').textContent = role;
+      document.getElementById('context-user').textContent = d.username;
+      document.body.setAttribute('data-role', role);
+      if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
+        var sl = document.getElementById('nav-settings-link');
+        if(sl) sl.style.display = 'none';
+      }
+    });
+
     /* Minimal vanilla JS — only for clipboard copy (no HTMX equivalent) */
     document.body.addEventListener('click', function(e) {
       if (e.target.closest('[data-copy-token]')) {

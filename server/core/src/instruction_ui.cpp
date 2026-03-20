@@ -11,7 +11,7 @@ extern const char* const kInstructionPageHtml = R"HTM(<!DOCTYPE html>
 <link rel="stylesheet" href="/static/yuzu.css">
 <script src="https://unpkg.com/htmx.org@1.9.12"></script>
 <style>
-body{padding:2rem}
+body{padding:0}
 a{color:var(--accent)}h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}
 .tabs{display:flex;gap:.5rem;margin-bottom:1rem;border-bottom:1px solid var(--border);padding-bottom:.5rem}
 .tab{padding:.4rem 1rem;cursor:pointer;border:1px solid transparent;border-radius:6px 6px 0 0;color:var(--muted)}
@@ -83,6 +83,28 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 .legacy-badge{font-size:.65rem;background:#6e7681;color:#fff;padding:.05rem .4rem;border-radius:3px}
 </style>
 </head><body>
+
+<nav class="nav-bar">
+  <a href="/" class="nav-brand">
+    <svg class="icon"><use href="/static/icons.svg#home"></use></svg> Yuzu
+  </a>
+  <a href="/" class="nav-link">Dashboard</a>
+  <a href="/instructions" class="nav-link active">Instructions</a>
+  <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
+  <span class="nav-spacer"></span>
+  <span class="nav-user" id="nav-user"></span>
+  <button class="nav-logout" onclick="fetch('/logout',{method:'POST'}).then(function(){location='/login'})">Logout</button>
+</nav>
+<div class="context-bar" id="context-bar">
+  <span class="context-role-badge" id="role-badge"></span>
+  <span class="context-user" id="context-user"></span>
+  <span class="context-spacer"></span>
+  <button class="context-bell" title="Notifications">
+    <svg class="icon"><use href="/static/icons.svg#bell"></use></svg>
+  </button>
+</div>
+
+<div style="padding:2rem">
 <h1>Instructions</h1>
 <div class="tabs">
     <div class="tab active" onclick="showTab('definitions',this)">Definitions</div>
@@ -106,6 +128,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 
 <!-- YAML Authoring Panel — rendered by /fragments/instructions/editor -->
 <div id="editor-host"></div>
+
+</div><!-- /padding wrapper -->
 
 <script>
 function showTab(name, el) {
@@ -216,6 +240,19 @@ document.addEventListener('input', function(e) {
             } catch(_) {}
         }, 400);
     }
+});
+
+/* ── Populate nav bar + context bar ─────────────────────── */
+fetch('/api/me').then(function(r){return r.json()}).then(function(d){
+  document.getElementById('nav-user').textContent = d.username;
+  var role = d.rbac_role || d.role;
+  document.getElementById('role-badge').textContent = role;
+  document.getElementById('context-user').textContent = d.username;
+  document.body.setAttribute('data-role', role);
+  if(d.role !== 'admin' && role !== 'Administrator' && role !== 'PlatformEngineer') {
+    var sl = document.getElementById('nav-settings-link');
+    if(sl) sl.style.display = 'none';
+  }
 });
 
 function formToYaml() {
