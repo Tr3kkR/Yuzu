@@ -144,3 +144,70 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.software.per_user_inventory
+  displayName: Per-User Installed Applications
+  version: 1.0.0
+  description: >
+    Enumerates installed applications on a per-user basis. On Windows,
+    iterates user profiles and loads each user's NTUSER.DAT registry hive
+    to read HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall.
+    On Linux, reports system-wide packages (dpkg/rpm). On macOS, reports
+    system apps plus per-user Homebrew packages. Output includes the
+    username (or "system") alongside each application record.
+  tags: [software, inventory, per-user, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: installed_apps
+    action: list_per_user
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: publisher
+        type: string
+      - name: install_date
+        type: string
+    aggregation:
+      groupBy:
+        - username
+        - name
+      operations:
+        - count
+
+  readablePayload: "List installed applications per user"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [installed_apps]
+
+status:
+  phase: active

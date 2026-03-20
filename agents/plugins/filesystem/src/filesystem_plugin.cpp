@@ -43,10 +43,20 @@
 // clang-format off
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
+#include <aclapi.h>
 #include <bcrypt.h>
+#include <sddl.h>
+#include <softpub.h>
+#include <wintrust.h>
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 #else
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <grp.h>
+#include <pwd.h>
 #include <unistd.h>
 #endif
 
@@ -282,8 +292,9 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"exists",          "list_dir", "file_hash", "create_temp",
-                                     "create_temp_dir", "read",     nullptr};
+        static const char* acts[] = {"exists",          "list_dir",      "file_hash",   "create_temp",
+                                     "create_temp_dir", "read",          "get_acl",     "get_signature",
+                                     "find_by_hash",    nullptr};
         return acts;
     }
 
@@ -309,6 +320,15 @@ public:
         }
         if (action == "read") {
             return do_read(ctx, params);
+        }
+        if (action == "get_acl") {
+            return do_get_acl(ctx, params);
+        }
+        if (action == "get_signature") {
+            return do_get_signature(ctx, params);
+        }
+        if (action == "find_by_hash") {
+            return do_find_by_hash(ctx, params);
         }
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -666,6 +686,293 @@ private:
             ctx.write_output("cleanup|deleted");
         }
 
+        return 0;
+    }
+
+    // ── get_acl: Return file/directory ACL permissions ────────────────────
+
+    int do_get_acl(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+#ifdef _WIN32
+        // Windows: Use GetNamedSecurityInfo to retrieve the DACL
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        PACL dacl = nullptr;
+        std::wstring wpath;
+        {
+            std::string p = validated;
+            int len = MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, nullptr, 0);
+            wpath.resize(static_cast<size_t>(len));
+            MultiByteToWideChar(CP_UTF8, 0, p.c_str(), -1, wpath.data(), len);
+        }
+
+        DWORD result = GetNamedSecurityInfoW(
+            wpath.c_str(), SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, &dacl, nullptr, &sd);
+
+        if (result != ERROR_SUCCESS) {
+            ctx.write_output(std::format("error|GetNamedSecurityInfo failed (error {})", result));
+            return 1;
+        }
+
+        // Convert security descriptor to SDDL string for readable output
+        LPSTR sddl_str = nullptr;
+        if (ConvertSecurityDescriptorToStringSecurityDescriptorA(
+                sd, SDDL_REVISION_1,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &sddl_str, nullptr)) {
+            ctx.write_output(std::format("sddl|{}", sddl_str));
+            LocalFree(sddl_str);
+        }
+
+        // Enumerate individual ACEs
+        if (dacl) {
+            ACL_SIZE_INFORMATION acl_info{};
+            if (GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation)) {
+                for (DWORD i = 0; i < acl_info.AceCount; ++i) {
+                    LPVOID ace = nullptr;
+                    if (!GetAce(dacl, i, &ace)) continue;
+
+                    auto* header = static_cast<ACE_HEADER*>(ace);
+                    std::string ace_type =
+                        (header->AceType == ACCESS_ALLOWED_ACE_TYPE) ? "allow" :
+                        (header->AceType == ACCESS_DENIED_ACE_TYPE)  ? "deny"  : "other";
+
+                    PSID sid = nullptr;
+                    ACCESS_MASK mask = 0;
+                    if (header->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+                        auto* a = static_cast<ACCESS_ALLOWED_ACE*>(ace);
+                        sid = &a->SidStart;
+                        mask = a->Mask;
+                    } else if (header->AceType == ACCESS_DENIED_ACE_TYPE) {
+                        auto* a = static_cast<ACCESS_DENIED_ACE*>(ace);
+                        sid = &a->SidStart;
+                        mask = a->Mask;
+                    }
+
+                    if (sid) {
+                        char name[256]{}, domain[256]{};
+                        DWORD name_len = sizeof(name), domain_len = sizeof(domain);
+                        SID_NAME_USE use;
+                        std::string account;
+                        if (LookupAccountSidA(nullptr, sid, name, &name_len,
+                                              domain, &domain_len, &use)) {
+                            account = std::format("{}\\{}", domain, name);
+                        } else {
+                            LPSTR sid_str = nullptr;
+                            if (ConvertSidToStringSidA(sid, &sid_str)) {
+                                account = sid_str;
+                                LocalFree(sid_str);
+                            }
+                        }
+                        ctx.write_output(std::format("ace|{}|{}|0x{:08x}", ace_type, account, mask));
+                    }
+                }
+            }
+        }
+
+        LocalFree(sd);
+        return 0;
+
+#else
+        // Linux/macOS: Use stat() for basic POSIX permissions
+        struct stat st{};
+        if (stat(validated.c_str(), &st) != 0) {
+            ctx.write_output("error|stat failed");
+            return 1;
+        }
+
+        // Owner info
+        struct passwd* pw = getpwuid(st.st_uid);
+        struct group* gr = getgrgid(st.st_gid);
+        ctx.write_output(std::format("owner|{}", pw ? pw->pw_name : std::to_string(st.st_uid)));
+        ctx.write_output(std::format("group|{}", gr ? gr->gr_name : std::to_string(st.st_gid)));
+
+        // Permission string
+        auto perm_char = [](mode_t mode, mode_t bit, char c) { return (mode & bit) ? c : '-'; };
+        std::string perms;
+        perms += perm_char(st.st_mode, S_IRUSR, 'r');
+        perms += perm_char(st.st_mode, S_IWUSR, 'w');
+        perms += perm_char(st.st_mode, S_IXUSR, 'x');
+        perms += perm_char(st.st_mode, S_IRGRP, 'r');
+        perms += perm_char(st.st_mode, S_IWGRP, 'w');
+        perms += perm_char(st.st_mode, S_IXGRP, 'x');
+        perms += perm_char(st.st_mode, S_IROTH, 'r');
+        perms += perm_char(st.st_mode, S_IWOTH, 'w');
+        perms += perm_char(st.st_mode, S_IXOTH, 'x');
+
+        ctx.write_output(std::format("permissions|{}", perms));
+        ctx.write_output(std::format("mode|{:04o}", st.st_mode & 07777));
+        return 0;
+#endif
+    }
+
+    // ── get_signature: Check Authenticode signature (Windows only) ────────
+
+    int do_get_signature(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+#ifdef _WIN32
+        // Convert path to wide string
+        std::wstring wpath;
+        {
+            int len = MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, nullptr, 0);
+            wpath.resize(static_cast<size_t>(len));
+            MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, wpath.data(), len);
+        }
+
+        // Set up WINTRUST_FILE_INFO
+        WINTRUST_FILE_INFO file_info{};
+        file_info.cbStruct = sizeof(file_info);
+        file_info.pcwszFilePath = wpath.c_str();
+
+        // Set up WINTRUST_DATA
+        GUID action_id = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        WINTRUST_DATA trust_data{};
+        trust_data.cbStruct = sizeof(trust_data);
+        trust_data.dwUIChoice = WTD_UI_NONE;
+        trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        trust_data.dwUnionChoice = WTD_CHOICE_FILE;
+        trust_data.pFile = &file_info;
+        trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
+        trust_data.dwProvFlags = WTD_SAFER_FLAG;
+
+        LONG status = WinVerifyTrust(
+            static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
+
+        std::string sig_status;
+        switch (status) {
+        case ERROR_SUCCESS:
+            sig_status = "valid";
+            break;
+        case TRUST_E_NOSIGNATURE:
+            sig_status = "unsigned";
+            break;
+        case TRUST_E_EXPLICIT_DISTRUST:
+            sig_status = "distrusted";
+            break;
+        case TRUST_E_SUBJECT_NOT_TRUSTED:
+            sig_status = "untrusted";
+            break;
+        case CRYPT_E_SECURITY_SETTINGS:
+            sig_status = "security_settings_blocked";
+            break;
+        default:
+            sig_status = std::format("error_0x{:08x}", static_cast<unsigned long>(status));
+            break;
+        }
+
+        ctx.write_output(std::format("signature_status|{}", sig_status));
+
+        // Clean up the trust state
+        trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_id, &trust_data);
+
+        return 0;
+#else
+        ctx.write_output("error|Authenticode signature verification is not supported on this platform");
+        return 1;
+#endif
+    }
+
+    // ── find_by_hash: Search for a file by SHA256 hash ───────────────────
+
+    int do_find_by_hash(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto directory = params.get("directory");
+        auto target_hash = params.get("sha256");
+        auto max_depth_str = params.get("max_depth", "3");
+
+        if (directory.empty() || target_hash.empty()) {
+            ctx.write_output("error|missing required parameters: directory, sha256");
+            return 1;
+        }
+
+        auto validated = validate_path(directory, {});
+        if (validated.empty()) {
+            ctx.write_output("error|directory is not accessible");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_directory(validated, ec)) {
+            ctx.write_output("error|path is not a directory");
+            return 1;
+        }
+
+        int max_depth = 3;
+        try { max_depth = std::stoi(std::string{max_depth_str}); }
+        catch (...) { max_depth = 3; }
+        if (max_depth < 1) max_depth = 1;
+        if (max_depth > 10) max_depth = 10;
+
+        // Normalize target hash to lowercase
+        std::string target(target_hash);
+        std::transform(target.begin(), target.end(), target.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        int found_count = 0;
+        constexpr int max_results = 100;
+
+        // Recursive directory walk with depth limit
+        auto base_depth = std::count(validated.begin(), validated.end(), '/') +
+                          std::count(validated.begin(), validated.end(), '\\');
+
+        for (auto it = fs::recursive_directory_iterator(validated,
+                 fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator() && found_count < max_results;
+             it.increment(ec)) {
+            if (ec) continue;
+
+            const auto& entry = *it;
+            auto entry_path = entry.path().string();
+            auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
+                         std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
+            if (depth > max_depth) {
+                it.disable_recursion_pending();
+                continue;
+            }
+
+            std::error_code fec;
+            if (!entry.is_regular_file(fec) || fec) continue;
+
+            auto file_size = entry.file_size(fec);
+            if (fec || file_size == 0 || file_size > kMaxHashFileSize) continue;
+
+#ifdef _WIN32
+            auto hash = compute_hash_win(entry_path, "sha256");
+#else
+            auto hash = compute_hash_unix(entry_path, "sha256");
+#endif
+            if (!hash.empty() && hash == target) {
+                ctx.write_output(std::format("match|{}|{}", entry_path, file_size));
+                ++found_count;
+            }
+        }
+
+        ctx.write_output(std::format("matches_found|{}", found_count));
         return 0;
     }
 };

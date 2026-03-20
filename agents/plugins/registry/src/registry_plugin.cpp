@@ -84,7 +84,8 @@ public:
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"get_value", "set_value", "delete_value", "delete_key",
-                                     "key_exists", "enumerate_keys", "enumerate_values", nullptr};
+                                     "key_exists", "enumerate_keys", "enumerate_values",
+                                     "get_user_value", nullptr};
         return acts;
     }
 
@@ -103,6 +104,7 @@ public:
         if (action == "key_exists")       return do_key_exists(ctx, params);
         if (action == "enumerate_keys")   return do_enumerate_keys(ctx, params);
         if (action == "enumerate_values") return do_enumerate_values(ctx, params);
+        if (action == "get_user_value")   return do_get_user_value(ctx, params);
         ctx.write_output(std::format("error|unknown action: {}", action));
         return 1;
 #endif
@@ -249,6 +251,81 @@ private:
             ctx.write_output(std::format("value|{}|{}", from_wide(name, static_cast<int>(name_len)), reg_type_name(type)));
         }
         RegCloseKey(opened);
+        return 0;
+    }
+
+    int do_get_user_value(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto username = params.get("username");
+        auto key = params.get("key");
+        auto val_name = params.get("name");
+        if (username.empty() || key.empty()) {
+            ctx.write_output("error|missing required parameters: username, key");
+            return 1;
+        }
+
+        // Build the path to the user's NTUSER.DAT
+        // Typical location: C:\Users\<username>\NTUSER.DAT
+        std::string profile_path = std::format("C:\\Users\\{}\\NTUSER.DAT", username);
+
+        // Use a unique temporary subkey name under HKEY_USERS for the loaded hive
+        std::string mount_key = std::format("YUZU_TEMP_{}", username);
+        auto wmount = to_wide(mount_key);
+
+        // Attempt to load the user's registry hive
+        // Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges
+        LONG load_result = RegLoadKeyW(HKEY_USERS, wmount.c_str(), to_wide(profile_path).c_str());
+
+        bool we_loaded = (load_result == ERROR_SUCCESS);
+        if (load_result != ERROR_SUCCESS && load_result != ERROR_SHARING_VIOLATION) {
+            // ERROR_SHARING_VIOLATION means the hive is already loaded (user is logged in)
+            // Try reading from HKU\<SID> — for simplicity, try the mount key anyway
+            // or fall back to profile list
+            ctx.write_output(std::format("error|failed to load hive for user '{}' (error {})",
+                                          username, load_result));
+            return 1;
+        }
+
+        // Read the value from the loaded hive
+        std::string full_key = mount_key + "\\" + std::string{key};
+        HKEY opened = nullptr;
+        if (RegOpenKeyExW(HKEY_USERS, to_wide(full_key).c_str(), 0, KEY_READ, &opened) != ERROR_SUCCESS) {
+            if (we_loaded) RegUnLoadKeyW(HKEY_USERS, wmount.c_str());
+            ctx.write_output("error|key not found in user hive");
+            return 1;
+        }
+
+        DWORD type = 0, size = 0;
+        auto wname = to_wide(val_name);
+        RegQueryValueExW(opened, wname.c_str(), nullptr, &type, nullptr, &size);
+
+        std::vector<BYTE> data(size);
+        if (RegQueryValueExW(opened, wname.c_str(), nullptr, &type, data.data(), &size) != ERROR_SUCCESS) {
+            RegCloseKey(opened);
+            if (we_loaded) RegUnLoadKeyW(HKEY_USERS, wmount.c_str());
+            ctx.write_output("error|value not found in user hive");
+            return 1;
+        }
+        RegCloseKey(opened);
+
+        // Unload the hive if we loaded it
+        if (we_loaded) {
+            RegUnLoadKeyW(HKEY_USERS, wmount.c_str());
+        }
+
+        std::string value;
+        if (type == REG_SZ || type == REG_EXPAND_SZ) {
+            value = from_wide(reinterpret_cast<const wchar_t*>(data.data()), static_cast<int>(size / sizeof(wchar_t)));
+        } else if (type == REG_DWORD && size >= 4) {
+            value = std::to_string(*reinterpret_cast<const DWORD*>(data.data()));
+        } else if (type == REG_QWORD && size >= 8) {
+            value = std::to_string(*reinterpret_cast<const uint64_t*>(data.data()));
+        } else {
+            for (DWORD i = 0; i < size; ++i) value += std::format("{:02x}", data[i]);
+        }
+
+        ctx.write_output(std::format("username|{}", username));
+        ctx.write_output(std::format("value|{}", value));
+        ctx.write_output(std::format("type|{}", reg_type_name(type)));
         return 0;
     }
 

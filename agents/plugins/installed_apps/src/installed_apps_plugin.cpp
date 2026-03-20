@@ -396,7 +396,7 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"list", "query", nullptr};
+        static const char* acts[] = {"list", "query", "list_per_user", nullptr};
         return acts;
     }
 
@@ -409,9 +409,138 @@ public:
             return do_list(ctx);
         if (action == "query")
             return do_query(ctx, params);
+        if (action == "list_per_user")
+            return do_list_per_user(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
+    }
+
+private:
+    int do_list_per_user([[maybe_unused]] yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+        // Enumerate user profiles from the ProfileList registry key
+        static const char* kProfileListKey =
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+        static const char* kUninstallKey =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+
+        HKEY profiles_key{};
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, kProfileListKey, 0,
+                          KEY_READ | KEY_ENUMERATE_SUB_KEYS, &profiles_key) != ERROR_SUCCESS) {
+            ctx.write_output("error|failed to open ProfileList registry key");
+            return 1;
+        }
+
+        char sid_buf[256]{};
+        DWORD idx = 0;
+        DWORD sid_len = sizeof(sid_buf);
+
+        while (RegEnumKeyExA(profiles_key, idx++, sid_buf, &sid_len,
+                             nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            std::string sid(sid_buf, sid_len);
+            sid_len = sizeof(sid_buf);
+
+            // Read ProfileImagePath to get the username
+            HKEY sid_key{};
+            if (RegOpenKeyExA(profiles_key, sid.c_str(), 0, KEY_READ, &sid_key) != ERROR_SUCCESS)
+                continue;
+
+            char path_buf[512]{};
+            DWORD path_size = sizeof(path_buf);
+            DWORD type = 0;
+            std::string username = sid; // fallback to SID
+            if (RegQueryValueExA(sid_key, "ProfileImagePath", nullptr, &type,
+                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS) {
+                std::string profile_path(path_buf, path_size > 0 ? path_size - 1 : 0);
+                auto last_sep = profile_path.find_last_of("\\/");
+                if (last_sep != std::string::npos)
+                    username = profile_path.substr(last_sep + 1);
+            }
+            RegCloseKey(sid_key);
+
+            // Skip system SIDs (S-1-5-18, S-1-5-19, S-1-5-20)
+            if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20")
+                continue;
+
+            // Try to read the user's Uninstall key from HKU\<SID>
+            std::string user_uninstall = sid + "\\" + kUninstallKey;
+            std::vector<AppInfo> user_apps;
+            enumerate_uninstall_key(HKEY_USERS, user_uninstall.c_str(), 0, user_apps);
+
+            if (user_apps.empty()) {
+                // User hive may not be loaded — try loading NTUSER.DAT
+                std::string ntuser_path = std::string(path_buf) + "\\NTUSER.DAT";
+                std::string mount_key = "YUZU_APPS_" + sid;
+
+                // Attempt to expand environment variables in the path
+                char expanded[512]{};
+                ExpandEnvironmentStringsA(ntuser_path.c_str(), expanded, sizeof(expanded));
+
+                LONG load_res = RegLoadKeyA(HKEY_USERS, mount_key.c_str(), expanded);
+                if (load_res == ERROR_SUCCESS) {
+                    std::string mounted_uninstall = mount_key + "\\" + kUninstallKey;
+                    enumerate_uninstall_key(HKEY_USERS, mounted_uninstall.c_str(), 0, user_apps);
+                    RegUnLoadKeyA(HKEY_USERS, mount_key.c_str());
+                }
+            }
+
+            for (const auto& app : user_apps) {
+                ctx.write_output(sanitize_utf8(
+                    std::format("user_app|{}|{}|{}|{}|{}", username,
+                                app.name, app.version.empty() ? "-" : app.version,
+                                app.publisher.empty() ? "-" : app.publisher,
+                                app.install_date.empty() ? "-" : app.install_date)));
+            }
+        }
+        RegCloseKey(profiles_key);
+        return 0;
+
+#elif defined(__linux__)
+        // List packages installed per-user via dpkg or per-user snap/flatpak
+        // For dpkg-based systems, packages are system-wide. Report them as system.
+        auto apps = get_installed_apps_linux();
+        for (const auto& app : apps) {
+            ctx.write_output(sanitize_utf8(
+                std::format("user_app|system|{}|{}|{}|{}", app.name,
+                            app.version.empty() ? "-" : app.version,
+                            app.publisher.empty() ? "-" : app.publisher,
+                            app.install_date.empty() ? "-" : app.install_date)));
+        }
+        return 0;
+
+#elif defined(__APPLE__)
+        // On macOS, use brew list per user if Homebrew is installed
+        // First list system apps
+        auto apps = get_installed_apps_macos();
+        for (const auto& app : apps) {
+            ctx.write_output(sanitize_utf8(
+                std::format("user_app|system|{}|{}|{}|{}", app.name,
+                            app.version.empty() ? "-" : app.version,
+                            app.publisher.empty() ? "-" : app.publisher,
+                            app.install_date.empty() ? "-" : app.install_date)));
+        }
+
+        // Try Homebrew per-user (runs under current user)
+        if (command_exists("brew")) {
+            auto brew_out = run_command("brew list --versions 2>/dev/null");
+            if (!brew_out.empty()) {
+                std::istringstream ss(brew_out);
+                std::string line;
+                while (std::getline(ss, line)) {
+                    auto sp = line.find(' ');
+                    std::string name = (sp != std::string::npos) ? line.substr(0, sp) : line;
+                    std::string version = (sp != std::string::npos) ? line.substr(sp + 1) : "-";
+                    ctx.write_output(sanitize_utf8(
+                        std::format("user_app|brew|{}|{}|-|-", name, version)));
+                }
+            }
+        }
+        return 0;
+#else
+        ctx.write_output("error|per-user app inventory not supported on this platform");
+        return 1;
+#endif
     }
 };
 

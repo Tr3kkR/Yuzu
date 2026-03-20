@@ -149,3 +149,49 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: TriggerTemplate
+metadata:
+  id: trigger.registry_change
+  displayName: Registry Change Trigger
+  version: 1.0.0
+  description: >
+    Fires when a monitored Windows registry key is modified. Uses
+    RegNotifyChangeKeyValue to detect changes to key names, values,
+    attributes, and security descriptors. Windows-only; no-op on
+    Linux/macOS.
+  tags: [trigger, registry, windows, automation]
+
+spec:
+  triggerType: registry_change
+  platforms: [windows]
+
+  parameters:
+    type: object
+    required: [registry_hive, registry_key, plugin, action]
+    properties:
+      registry_hive:
+        type: string
+        displayName: Registry Hive
+        description: The root hive to watch.
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      registry_key:
+        type: string
+        displayName: Registry Key Path
+        description: >
+          The registry key to monitor for changes. Watches the key and
+          all its subkeys and values.
+      plugin:
+        type: string
+        displayName: Plugin
+        description: Plugin to invoke when a change is detected.
+      action:
+        type: string
+        displayName: Action
+        description: Action to invoke on the plugin.
+
+status:
+  phase: active

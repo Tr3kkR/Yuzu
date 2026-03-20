@@ -432,3 +432,85 @@ spec:
 
   approval:
     mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.invalidate
+  displayName: Invalidate Policy Cache
+  version: 1.0.0
+  description: >
+    Invalidates the agent-side cached compliance state for a specific
+    policy, forcing all agents to re-evaluate. Sets all agent statuses
+    to 'pending' for the given policy. Use when a policy's check
+    instruction or compliance expression has changed.
+  tags: [policy, compliance, management, cache]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.invalidate
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [policy_id]
+    properties:
+      policy_id:
+        type: string
+        description: The ID of the policy to invalidate
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: agents_invalidated
+        type: int64
+
+  readablePayload: "Invalidate cache for policy '${policy_id}'"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.policy.invalidate_all
+  displayName: Invalidate All Policy Caches
+  version: 1.0.0
+  description: >
+    Invalidates the cached compliance state for ALL policies across
+    ALL agents. Forces a complete re-evaluation of every policy. Use
+    sparingly — primarily after bulk configuration changes or server
+    upgrades that affect compliance logic.
+  tags: [policy, compliance, management, cache]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: policy.invalidate_all
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: total_invalidated
+        type: int64
+
+  readablePayload: "Invalidate all policy caches"
+
+  approval:
+    mode: always

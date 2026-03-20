@@ -1248,4 +1248,58 @@ FleetCompliance PolicyStore::get_fleet_compliance() const {
     return fc;
 }
 
+// ── Cache invalidation ───────────────────────────────────────────────────────
+
+std::expected<int64_t, std::string>
+PolicyStore::invalidate_policy(const std::string& policy_id) {
+    std::lock_guard lock(mtx_);
+    if (!db_)
+        return std::unexpected("database not open");
+    if (policy_id.empty())
+        return std::unexpected("policy_id is required");
+
+    const char* sql = "UPDATE policy_status SET status = 'pending' WHERE policy_id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+
+    sqlite3_bind_text(stmt, 1, policy_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        auto err = std::string(sqlite3_errmsg(db_));
+        sqlite3_finalize(stmt);
+        return std::unexpected("update failed: " + err);
+    }
+
+    auto changes = static_cast<int64_t>(sqlite3_changes(db_));
+    sqlite3_finalize(stmt);
+
+    spdlog::info("PolicyStore: invalidated {} agent statuses for policy '{}'", changes, policy_id);
+    return changes;
+}
+
+std::expected<int64_t, std::string>
+PolicyStore::invalidate_all_policies() {
+    std::lock_guard lock(mtx_);
+    if (!db_)
+        return std::unexpected("database not open");
+
+    const char* sql = "UPDATE policy_status SET status = 'pending'";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        auto err = std::string(sqlite3_errmsg(db_));
+        sqlite3_finalize(stmt);
+        return std::unexpected("update failed: " + err);
+    }
+
+    auto changes = static_cast<int64_t>(sqlite3_changes(db_));
+    sqlite3_finalize(stmt);
+
+    spdlog::info("PolicyStore: invalidated ALL agent statuses ({} rows)", changes);
+    return changes;
+}
+
 } // namespace yuzu::server

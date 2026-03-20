@@ -467,3 +467,226 @@ spec:
 
 status:
   phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.get_acl
+  displayName: Get File ACL / Permissions
+  version: 0.3.0
+  description: >
+    Retrieve access control list (ACL) or permissions for a file or
+    directory. On Windows, returns the SDDL representation and individual
+    ACE entries (allow/deny, account, access mask). On Linux/macOS,
+    returns POSIX owner, group, and permission mode (rwxrwxrwx).
+  tags: [filesystem, security, compliance, acl]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: get_acl
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: Path
+        description: The file or directory to inspect.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to paths within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: sddl
+        type: string
+      - name: ace_type
+        type: string
+      - name: account
+        type: string
+      - name: access_mask
+        type: string
+      - name: owner
+        type: string
+      - name: group
+        type: string
+      - name: permissions
+        type: string
+      - name: mode
+        type: string
+
+  readablePayload: "Get ACL/permissions for ${path}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.3.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.get_signature
+  displayName: Check Authenticode Signature
+  version: 0.3.0
+  description: >
+    Verify the Authenticode digital signature of a Windows executable
+    or DLL. Uses WinVerifyTrust to check the signature chain. Returns
+    the signature status (valid, unsigned, distrusted, untrusted).
+    Windows-only; returns error on Linux/macOS.
+  tags: [filesystem, security, compliance, authenticode]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: filesystem
+    action: get_signature
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The executable or DLL to verify.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: signature_status
+        type: string
+
+  readablePayload: "Check Authenticode signature of ${path}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.3.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.find_by_hash
+  displayName: Find File By SHA256 Hash
+  version: 0.3.0
+  description: >
+    Search a directory tree for files matching a specific SHA256 hash.
+    Useful for IOC hunting, malware detection, and file integrity
+    verification. Walks the directory recursively up to the specified
+    depth limit. Returns matching file paths and sizes.
+  tags: [filesystem, security, ioc, compliance, hash]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: find_by_hash
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [directory, sha256]
+    properties:
+      directory:
+        type: string
+        displayName: Search Directory
+        description: The root directory to search.
+        validation:
+          maxLength: 4096
+      sha256:
+        type: string
+        displayName: SHA256 Hash
+        description: >
+          The SHA256 hex digest to search for (case-insensitive).
+        validation:
+          minLength: 64
+          maxLength: 64
+      max_depth:
+        type: int32
+        displayName: Maximum Depth
+        description: >
+          Maximum directory recursion depth. Default: 3, max: 10.
+        default: 3
+        validation:
+          minimum: 1
+          maximum: 10
+
+  result:
+    columns:
+      - name: path
+        type: string
+      - name: size
+        type: int64
+      - name: matches_found
+        type: int32
+
+  readablePayload: "Find files with SHA256 ${sha256} in ${directory}"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.3.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active

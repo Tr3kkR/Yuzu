@@ -144,6 +144,15 @@ public:
     ComplianceSummary get_compliance_summary(const std::string& policy_id) const;
     FleetCompliance get_fleet_compliance() const;
 
+    // ── Cache invalidation ───────────────────────────────────────────────
+    /// Reset all agent statuses to 'pending' for a specific policy, forcing re-check.
+    /// Returns the number of agent statuses invalidated.
+    std::expected<int64_t, std::string> invalidate_policy(const std::string& policy_id);
+
+    /// Reset all agent statuses to 'pending' across ALL policies.
+    /// Returns the total number of agent statuses invalidated.
+    std::expected<int64_t, std::string> invalidate_all_policies();
+
 private:
     sqlite3* db_{nullptr};
     mutable std::mutex mtx_;

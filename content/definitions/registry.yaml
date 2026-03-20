@@ -53,6 +53,72 @@ status:
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
+  id: windows.registry.get_user_value
+  displayName: Get Per-User Registry Value
+  version: 1.0.0
+  description: >
+    Read a registry value from a specific user's NTUSER.DAT hive.
+    Loads the user's hive via RegLoadKey if the user is not logged in.
+    Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges (i.e., run
+    as SYSTEM or elevated admin). Windows-only.
+  tags: [registry, windows, per-user, configuration]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: get_user_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [username, key]
+    properties:
+      username:
+        type: string
+        displayName: Username
+        description: >
+          Windows username whose NTUSER.DAT hive to read from.
+          The user profile must exist at C:\Users\<username>.
+        validation:
+          maxLength: 256
+      key:
+        type: string
+        displayName: Key Path
+        description: >
+          Registry key path relative to the user's HKCU root
+          (e.g., "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer").
+        validation:
+          maxLength: 1024
+      name:
+        type: string
+        displayName: Value Name
+        description: The registry value name to read.
+        validation:
+          maxLength: 256
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: value
+        type: string
+      - name: type
+        type: string
+  readablePayload: "Read registry value '${name}' from user '${username}' key '${key}'"
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.3.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
   id: windows.registry.set_value
   displayName: Set Registry Value
   version: 1.0.0
@@ -129,6 +195,187 @@ spec:
   result:
     columns:
       - name: subkey
+        type: string
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.delete_value
+  displayName: Delete Registry Value
+  version: 1.0.0
+  description: >
+    Delete a specific value from a Windows registry key.
+  tags: [registry, windows, configuration]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: delete_value
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key, name]
+    properties:
+      hive:
+        type: string
+        displayName: Registry Hive
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+        displayName: Key Path
+      name:
+        type: string
+        displayName: Value Name
+  result:
+    columns:
+      - name: status
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.delete_key
+  displayName: Delete Registry Key
+  version: 1.0.0
+  description: >
+    Delete a Windows registry key and all its values.
+  tags: [registry, windows, configuration]
+spec:
+  type: action
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: delete_key
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key]
+    properties:
+      hive:
+        type: string
+        displayName: Registry Hive
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+        displayName: Key Path
+  result:
+    columns:
+      - name: status
+        type: string
+  approval:
+    mode: role-gated
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.key_exists
+  displayName: Check Registry Key Exists
+  version: 1.0.0
+  description: >
+    Check whether a Windows registry key exists.
+  tags: [registry, windows, configuration]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: key_exists
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key]
+    properties:
+      hive:
+        type: string
+        displayName: Registry Hive
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+        displayName: Key Path
+  result:
+    columns:
+      - name: exists
+        type: bool
+  approval:
+    mode: auto
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [registry]
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.registry.enumerate_values
+  displayName: Enumerate Registry Values
+  version: 1.0.0
+  description: >
+    List all value names and types under a Windows registry key.
+  tags: [registry, windows]
+spec:
+  type: question
+  platforms: [windows]
+  execution:
+    plugin: registry
+    action: enumerate_values
+    concurrency: per-device
+  parameters:
+    type: object
+    required: [hive, key]
+    properties:
+      hive:
+        type: string
+        displayName: Registry Hive
+        validation:
+          enum: ["HKLM", "HKCU", "HKCR", "HKU"]
+      key:
+        type: string
+        displayName: Key Path
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: type
         type: string
   approval:
     mode: auto
