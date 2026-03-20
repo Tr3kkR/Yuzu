@@ -1,0 +1,157 @@
+## Device Identity Plugin Definitions
+## Queries device hostname, DNS/AD domain membership, and Active
+## Directory organizational unit from each endpoint.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.device_identity.device_name
+  displayName: Device Hostname
+  version: 1.0.0
+  description: >
+    Returns the machine hostname. Uses gethostname() on Linux/macOS and
+    GetComputerNameExA(ComputerNamePhysicalDnsHostname) on Windows.
+  tags: [identity, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: device_identity
+    action: device_name
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: device_name
+        type: string
+
+  readablePayload: "Get device hostname"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [device_identity]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.device_identity.domain
+  displayName: Domain Membership
+  version: 1.0.0
+  description: >
+    Returns the DNS or Active Directory domain name and whether the
+    device is domain-joined. On Windows, uses NetGetJoinInformation. On
+    Linux, reads /etc/resolv.conf and checks realm/sssd for AD join
+    status. On macOS, uses dsconfigad -show with hostname -f fallback.
+  tags: [identity, inventory, directory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: device_identity
+    action: domain
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: domain
+        type: string
+      - name: joined
+        type: bool
+
+  readablePayload: "Get domain membership"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [device_identity]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.device_identity.ou
+  displayName: Active Directory OU
+  version: 1.0.0
+  description: >
+    Returns the Active Directory organizational unit (OU) path for the
+    device. On Windows, uses GetComputerObjectNameA with
+    NameFullyQualifiedDN and extracts the OU= components. On Linux,
+    checks realm list and sssd.conf. On macOS, parses dsconfigad -show.
+    Returns "N/A" if the device is not domain-joined.
+  tags: [identity, inventory, directory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: device_identity
+    action: ou
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: ou
+        type: string
+
+  readablePayload: "Get Active Directory organizational unit"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [device_identity]
+
+status:
+  phase: active

@@ -1,0 +1,112 @@
+## Windows Updates / OS Package Updates Definitions
+## Provides queries for installed updates/packages and available (missing)
+## updates. Despite the name, works cross-platform: Windows (Get-HotFix,
+## WUA), Linux (rpm, apt), macOS (system_profiler, softwareupdate).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.windows_updates.installed
+  displayName: List Installed Updates
+  version: 1.0.0
+  description: >
+    Lists recently installed OS updates and packages on the endpoint.
+    On Windows uses Get-HotFix (returns KB ID, description, install date,
+    limited to 50 most recent). On Linux tries rpm --last then apt.
+    On macOS uses system_profiler SPInstallHistoryDataType.
+  tags: [updates, patching, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: windows_updates
+    action: installed
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: identifier
+        type: string
+      - name: description
+        type: string
+      - name: install_date
+        type: string
+
+  readablePayload: "List installed OS updates and packages"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [windows_updates]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.windows_updates.missing
+  displayName: List Missing Updates
+  version: 1.0.0
+  description: >
+    Lists available OS updates and packages that are not yet installed.
+    On Windows uses the Windows Update Agent COM API to search for
+    updates where IsInstalled=0, returning title and MSRC severity.
+    On Linux tries apt then yum. On macOS uses softwareupdate -l.
+  tags: [updates, patching, compliance, security, vulnerability]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: windows_updates
+    action: missing
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: title
+        type: string
+      - name: severity
+        type: string
+
+  readablePayload: "List available (missing) OS updates"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [windows_updates]
+
+status:
+  phase: active

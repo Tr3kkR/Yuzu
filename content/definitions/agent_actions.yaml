@@ -1,0 +1,122 @@
+## Agent Actions Plugin Definitions
+## Provides runtime agent management actions: changing the log level
+## and querying agent runtime info.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.agent_actions.set_log_level
+  displayName: Set Agent Log Level
+  version: 1.0.0
+  description: >
+    Changes the agent's spdlog log level at runtime. Accepts any valid
+    spdlog level: trace, debug, info, warn, error, critical, off. The
+    change takes effect immediately and persists until the agent
+    restarts or the level is changed again.
+  tags: [agent, logging, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: agent_actions
+    action: set_log_level
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [level]
+    properties:
+      level:
+        type: string
+        displayName: Log Level
+        description: >
+          The desired spdlog log level. Case-insensitive.
+        validation:
+          enum: ["trace", "debug", "info", "warn", "error", "critical", "off"]
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: level
+        type: string
+
+  readablePayload: "Set agent log level to ${level}"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [agent_actions]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.agent_actions.info
+  displayName: Agent Runtime Info
+  version: 1.0.0
+  description: >
+    Returns agent runtime information from the config context: agent ID,
+    version, server address, heartbeat interval, and loaded plugin
+    count.
+  tags: [agent, inventory, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: agent_actions
+    action: info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: agent_id
+        type: string
+      - name: agent_version
+        type: string
+      - name: server_address
+        type: string
+      - name: heartbeat_interval
+        type: string
+      - name: plugins_count
+        type: int32
+
+  readablePayload: "Get agent runtime info"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [agent_actions]
+
+status:
+  phase: active

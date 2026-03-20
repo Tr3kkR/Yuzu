@@ -471,10 +471,10 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-  # ── Coverage — main push only, after Linux passes ──────────────────────
+  # ── Coverage — main/dev push only, after Linux passes ─────────────────
   coverage:
     name: "Coverage (GCC 13)"
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
     runs-on: ubuntu-24.04
 
@@ -538,10 +538,12 @@ jobs:
           gcovr --root . \
             --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
             --exclude '.*\.pb\.(h|cc)$' \
+            --branches \
             --xml -o builddir/coverage.xml
           gcovr --root . \
             --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
             --exclude '.*\.pb\.(h|cc)$' \
+            --branches \
             --html --html-details -o builddir/coverage-html/index.html
 
       - name: Upload coverage to Codecov

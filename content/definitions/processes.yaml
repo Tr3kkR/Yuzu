@@ -1,0 +1,131 @@
+## Process Listing Definitions
+## Enumerates and queries running processes on any platform.
+## Plugin: processes | Actions: list, query
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.process.list
+  displayName: List Running Processes
+  version: 1.0.0
+  description: >
+    Enumerates all running processes on the endpoint, returning each
+    process's PID and executable name. Uses native APIs on each
+    platform: CreateToolhelp32Snapshot (Windows), /proc filesystem
+    (Linux), ps (macOS).
+  tags: [processes, inventory, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: processes
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: pid
+        type: int64
+      - name: name
+        type: string
+    aggregation:
+      groupBy:
+        - name
+      operations:
+        - count
+
+  readablePayload: "List all running processes"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [processes]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.process.query
+  displayName: Query Processes by Name
+  version: 1.0.0
+  description: >
+    Searches running processes by case-insensitive partial name match.
+    Returns a found/not-found indicator followed by matching process
+    records (PID and name). Useful for checking whether a specific
+    application or daemon is running on an endpoint.
+  tags: [processes, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: processes
+    action: query
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [name]
+    properties:
+      name:
+        type: string
+        displayName: Process Name Filter
+        description: >
+          Case-insensitive substring to match against process names.
+          All processes whose name contains this string are returned.
+        validation:
+          minLength: 1
+          maxLength: 256
+
+  result:
+    columns:
+      - name: found
+        type: bool
+      - name: pid
+        type: int64
+      - name: name
+        type: string
+    aggregation:
+      groupBy:
+        - found
+      operations:
+        - count
+
+  readablePayload: "Query processes matching '${name}'"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [processes]
+
+status:
+  phase: active

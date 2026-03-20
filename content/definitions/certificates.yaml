@@ -1,0 +1,229 @@
+## Certificate Inventory and Management Definitions
+## Enumerates and manages certificates in system stores.
+## Windows: CryptoAPI (MY, ROOT, CA, Trust stores)
+## Linux: PEM files in /etc/ssl/certs/ via openssl
+## macOS: System.keychain and SystemRootCertificates.keychain via security CLI
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.certificates.list
+  displayName: List Certificates
+  version: 1.0.0
+  description: >
+    Enumerate certificates in system certificate stores. On Windows this
+    queries the CryptoAPI stores (MY, ROOT, CA, Trust). On Linux it parses
+    PEM files in /etc/ssl/certs/. On macOS it reads System.keychain and
+    SystemRootCertificates.keychain. Results can be filtered by store name
+    and by expiration window.
+  tags: [security, certificates, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: certificates
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      store:
+        type: string
+        displayName: Certificate Store
+        description: >
+          Filter by store name. On Windows: MY, ROOT, CA, Trust, or "all"
+          for all stores. Ignored on Linux and macOS which enumerate all
+          available stores. Defaults to "all".
+        default: "all"
+      expiring_within_days:
+        type: int32
+        displayName: Expiring Within Days
+        description: >
+          Only return certificates expiring within this many days. Set to
+          0 to return all certificates regardless of expiry. Useful for
+          compliance audits of soon-to-expire certificates.
+        default: 0
+        validation:
+          minimum: 0
+
+  result:
+    columns:
+      - name: subject
+        type: string
+      - name: issuer
+        type: string
+      - name: thumbprint
+        type: string
+      - name: not_before
+        type: string
+      - name: not_after
+        type: string
+      - name: serial
+        type: string
+      - name: store
+        type: string
+      - name: key_usage
+        type: string
+    aggregation:
+      groupBy: [store, issuer]
+      operations: [count]
+
+  readablePayload: "List certificates (store=${store}, expiring within ${expiring_within_days} days)"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [certificates]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.certificates.details
+  displayName: Certificate Details
+  version: 1.0.0
+  description: >
+    Retrieve full details for a specific certificate identified by its
+    SHA-1 thumbprint. Searches all available certificate stores on the
+    device.
+  tags: [security, certificates, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: certificates
+    action: details
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [thumbprint]
+    properties:
+      thumbprint:
+        type: string
+        displayName: Certificate Thumbprint
+        description: >
+          SHA-1 thumbprint (hex string, no colons) of the certificate
+          to retrieve. Case-insensitive.
+
+  result:
+    columns:
+      - name: subject
+        type: string
+      - name: issuer
+        type: string
+      - name: thumbprint
+        type: string
+      - name: not_before
+        type: string
+      - name: not_after
+        type: string
+      - name: serial
+        type: string
+      - name: store
+        type: string
+      - name: key_usage
+        type: string
+
+  readablePayload: "Get certificate details (thumbprint=${thumbprint})"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [certificates]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.certificates.delete
+  displayName: Delete Certificate
+  version: 1.0.0
+  description: >
+    Delete a certificate from a system store by SHA-1 thumbprint. On
+    Windows this targets a specific named store (defaults to MY). On
+    Linux it removes the matching PEM/CRT file from /etc/ssl/certs/.
+    On macOS it uses the security CLI to delete from System.keychain.
+    This is a destructive action and requires approval.
+  tags: [security, certificates, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: certificates
+    action: delete
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [thumbprint]
+    properties:
+      thumbprint:
+        type: string
+        displayName: Certificate Thumbprint
+        description: >
+          SHA-1 thumbprint (hex string, no colons) of the certificate
+          to delete. Case-insensitive.
+      store:
+        type: string
+        displayName: Certificate Store
+        description: >
+          The certificate store to delete from. On Windows: MY, ROOT, CA,
+          or Trust. Defaults to "MY". Ignored on Linux and macOS.
+        default: "MY"
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Delete certificate ${thumbprint} from store ${store}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [certificates]
+
+status:
+  phase: active

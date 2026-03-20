@@ -1,0 +1,232 @@
+## User Accounts Definitions
+## Provides discovery and enumeration of local user accounts,
+## logged-on users, interactive sessions, and local admin group members.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.logged_on
+  displayName: List Logged-On Users
+  version: 1.0.0
+  description: >
+    Enumerates currently logged-on users on the endpoint. Reports each
+    user's name, domain/host, logon type (console, RDP, remote), and
+    session identifier. Uses WTS APIs on Windows, utmp on Linux, and
+    the 'who' command on macOS.
+  tags: [users, sessions, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: logged_on
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: domain
+        type: string
+      - name: logon_type
+        type: string
+      - name: session_id
+        type: string
+
+  readablePayload: "List currently logged-on users"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.sessions
+  displayName: List Active Sessions
+  version: 1.0.0
+  description: >
+    Lists active interactive sessions on the endpoint, including session
+    state (Active, Connected, Disconnected, Idle), the connected user,
+    remote client name or host, and idle time. Uses WTS session APIs on
+    Windows and the 'w' command on Linux/macOS.
+  tags: [users, sessions, security, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: sessions
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: session_id
+        type: string
+      - name: username
+        type: string
+      - name: state
+        type: string
+      - name: client
+        type: string
+      - name: idle
+        type: string
+
+  readablePayload: "List active interactive sessions"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.local_users
+  displayName: Enumerate Local User Accounts
+  version: 1.0.0
+  description: >
+    Enumerates local user accounts on the endpoint. Reports the username,
+    enabled/disabled status, last logon timestamp, and account description.
+    On Linux reads /etc/passwd (skipping system accounts with UID < 1000),
+    on macOS uses dscl, on Windows uses NetUserEnum.
+  tags: [users, accounts, security, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: local_users
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: enabled
+        type: bool
+      - name: last_logon
+        type: string
+      - name: description
+        type: string
+
+  readablePayload: "Enumerate local user accounts"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.local_admins
+  displayName: List Local Administrators
+  version: 1.0.0
+  description: >
+    Lists members of the local Administrators group. On Windows this
+    queries the Administrators group via NetLocalGroupGetMembers and
+    reports member type (user, group, well_known_group, alias) and domain.
+    On Linux checks sudo/wheel groups plus root. On macOS reads the
+    admin group via dscl.
+  tags: [users, admins, security, compliance, privilege-audit]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: local_admins
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: member_name
+        type: string
+      - name: member_type
+        type: string
+      - name: domain_or_group
+        type: string
+
+  readablePayload: "List local administrator group members"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active

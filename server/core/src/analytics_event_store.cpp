@@ -86,11 +86,12 @@ std::vector<AnalyticsEvent> AnalyticsEventStore::query_recent(int limit) const {
     if (!db_)
         return results;
 
-    auto sql =
-        "SELECT event_json FROM analytics_buffer ORDER BY id DESC LIMIT " + std::to_string(limit);
+    const char* sql = "SELECT event_json FROM analytics_buffer ORDER BY id DESC LIMIT ?";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return results;
+
+    sqlite3_bind_int64(stmt, 1, limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         auto text = sqlite3_column_text(stmt, 0);
@@ -193,12 +194,13 @@ void AnalyticsEventStore::drain_batch() {
         return;
 
     // Read a batch of undrained events
-    auto sql =
-        "SELECT id, event_json FROM analytics_buffer WHERE drained = 0 ORDER BY id ASC LIMIT " +
-        std::to_string(batch_size_);
+    const char* sql =
+        "SELECT id, event_json FROM analytics_buffer WHERE drained = 0 ORDER BY id ASC LIMIT ?";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return;
+
+    sqlite3_bind_int64(stmt, 1, batch_size_);
 
     std::vector<int64_t> ids;
     std::vector<AnalyticsEvent> events;
@@ -232,16 +234,22 @@ void AnalyticsEventStore::drain_batch() {
         }
     }
 
-    // Mark as drained only if all sinks succeeded
+    // Mark as drained only if all sinks succeeded.
+    // Note: ids originate from the prior SELECT's integer PRIMARY KEY column (not user input),
+    // but we still use parameterized queries for consistency and to prevent future regressions.
     if (all_ok && !ids.empty()) {
-        std::string id_list;
-        for (size_t i = 0; i < ids.size(); ++i) {
-            if (i > 0)
-                id_list += ',';
-            id_list += std::to_string(ids[i]);
+        sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr);
+        sqlite3_stmt* upd = nullptr;
+        if (sqlite3_prepare_v2(db_, "UPDATE analytics_buffer SET drained = 1 WHERE id = ?", -1,
+                               &upd, nullptr) == SQLITE_OK) {
+            for (auto id : ids) {
+                sqlite3_bind_int64(upd, 1, id);
+                sqlite3_step(upd);
+                sqlite3_reset(upd);
+            }
+            sqlite3_finalize(upd);
         }
-        auto update_sql = "UPDATE analytics_buffer SET drained = 1 WHERE id IN (" + id_list + ")";
-        sqlite3_exec(db_, update_sql.c_str(), nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
     }
 }
 

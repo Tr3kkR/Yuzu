@@ -1,0 +1,183 @@
+## Event Log Viewer Definitions
+## Queries system event logs for errors and filtered event searches.
+## Plugin: event_logs | Actions: errors, query
+##
+## Sources by platform:
+##   Windows: Get-WinEvent PowerShell cmdlet
+##   Linux:   journalctl (systemd journal)
+##   macOS:   log show (unified logging)
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.event_logs.errors
+  displayName: Recent Error Events
+  version: 1.0.0
+  description: >
+    Retrieve recent error-level events from a system event log. On
+    Windows, queries the specified log (default "System") for Level 2
+    (Error) events within the time window via Get-WinEvent. On Linux,
+    uses journalctl -p err. On macOS, uses log show with error predicate.
+    Returns up to 100 events with timestamp, event ID, source, and
+    truncated message (max 200 chars). Input sanitization prevents
+    command injection.
+  tags: [diagnostics, event-logs, monitoring, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: event_logs
+    action: errors
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      log:
+        type: string
+        displayName: Log Name
+        description: >
+          The event log to query. On Windows: System, Application,
+          Security, etc. Ignored on Linux/macOS. Default: "System".
+        default: "System"
+        validation:
+          maxLength: 128
+      hours:
+        type: int32
+        displayName: Hours Back
+        description: >
+          Number of hours to look back for error events. Range: 1-720
+          (30 days). Default: 24.
+        default: 24
+        validation:
+          minimum: 1
+          maximum: 720
+
+  result:
+    columns:
+      - name: timestamp
+        type: string
+      - name: event_id
+        type: string
+      - name: source
+        type: string
+      - name: message
+        type: string
+    aggregation:
+      groupBy: [source]
+      operations: [count]
+
+  readablePayload: "Get error events from '${log}' log (last ${hours} hours)"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [event_logs]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.event_logs.query
+  displayName: Search Event Log
+  version: 1.0.0
+  description: >
+    Search event log entries by keyword filter within a specified log.
+    On Windows, uses Get-WinEvent with a Where-Object message filter.
+    On Linux, uses journalctl --grep. On macOS, uses log show with an
+    eventMessage contains predicate (last 24h). Returns matching events
+    with timestamp, level, event ID, source, and message. Input is
+    sanitized to prevent command injection.
+  tags: [diagnostics, event-logs, search, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: event_logs
+    action: query
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [log, filter]
+    properties:
+      log:
+        type: string
+        displayName: Log Name
+        description: >
+          The event log to search. On Windows: System, Application,
+          Security, etc.
+        validation:
+          minLength: 1
+          maxLength: 128
+      filter:
+        type: string
+        displayName: Search Filter
+        description: >
+          Keyword to search for in event messages. Case-insensitive
+          substring match. Only alphanumeric characters, spaces, dots,
+          hyphens, underscores, and slashes are allowed.
+        validation:
+          minLength: 1
+          maxLength: 256
+      count:
+        type: int32
+        displayName: Max Results
+        description: >
+          Maximum number of events to return. Range: 1-500. Default: 50.
+        default: 50
+        validation:
+          minimum: 1
+          maximum: 500
+
+  result:
+    columns:
+      - name: timestamp
+        type: string
+      - name: level
+        type: string
+      - name: event_id
+        type: string
+      - name: source
+        type: string
+      - name: message
+        type: string
+    aggregation:
+      groupBy: [level, source]
+      operations: [count]
+
+  readablePayload: "Search '${log}' log for '${filter}' (max ${count} results)"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [event_logs]
+
+status:
+  phase: active

@@ -1,0 +1,30 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.users
+  displayName: User Account Management
+  version: 1.0.0
+  description: >
+    Discovery and enumeration of user accounts, sessions, and privilege
+    groups. Provides visibility into who is logged on, active sessions,
+    local accounts, and local admin group membership across all platforms.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      - device.users.logged_on
+      - device.users.sessions
+      - device.users.local_users
+      - device.users.local_admins
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

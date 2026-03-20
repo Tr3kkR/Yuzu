@@ -1,0 +1,146 @@
+## Installed Applications Definitions
+## Inventories and queries installed applications across all platforms.
+## Plugin: installed_apps | Actions: list, query
+##
+## Sources by platform:
+##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
+##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
+##   macOS:   system_profiler SPApplicationsDataType
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.software.inventory
+  displayName: List Installed Applications
+  version: 1.0.0
+  description: >
+    Enumerates all installed applications on the endpoint. On Windows,
+    reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and
+    HKCU), deduplicates by name+version, and skips system components.
+    On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
+    On macOS, queries system_profiler for GUI applications. Returns
+    application name, version, publisher, and install date.
+  tags: [software, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: installed_apps
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: publisher
+        type: string
+      - name: install_date
+        type: string
+    aggregation:
+      groupBy:
+        - name
+      operations:
+        - count
+
+  readablePayload: "List all installed applications"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [installed_apps]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.software.query
+  displayName: Query Installed Application
+  version: 1.0.0
+  description: >
+    Searches for a specific installed application by case-insensitive
+    partial name match. Returns a found/not-found indicator followed
+    by matching application records. Useful for compliance checks
+    (e.g. verifying a required security agent is installed) and
+    license auditing.
+  tags: [software, compliance, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: installed_apps
+    action: query
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [name]
+    properties:
+      name:
+        type: string
+        displayName: Application Name
+        description: >
+          Case-insensitive substring to match against installed
+          application names. All apps whose name contains this
+          string are returned.
+        validation:
+          minLength: 1
+          maxLength: 256
+
+  result:
+    columns:
+      - name: found
+        type: bool
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: publisher
+        type: string
+    aggregation:
+      groupBy:
+        - found
+      operations:
+        - count
+
+  readablePayload: "Query installed applications matching '${name}'"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [installed_apps]
+
+status:
+  phase: active

@@ -1,0 +1,238 @@
+## Device Quarantine (Network Isolation) Definitions
+## Manages network isolation of endpoints via firewall rules.
+## Windows: netsh advfirewall, Linux: iptables, macOS: pf anchors.
+## All quarantine rules are prefixed with "YuzuQuarantine_" for identification.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.quarantine.isolate
+  displayName: Quarantine Device
+  version: 1.0.0
+  description: >
+    Isolate the device from the network by applying firewall rules that
+    block all inbound and outbound traffic except loopback and explicitly
+    whitelisted IP addresses. The management server IP should always be
+    whitelisted to maintain remote control. On Windows this creates netsh
+    advfirewall rules, on Linux iptables chains, and on macOS pf anchors.
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: quarantine
+    action: quarantine
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      server_ip:
+        type: string
+        displayName: Management Server IP
+        description: >
+          IP address of the Yuzu management server. This IP is always
+          whitelisted to maintain the agent connection during quarantine.
+      whitelist_ips:
+        type: string
+        displayName: Additional Whitelisted IPs
+        description: >
+          Comma-separated list of additional IP addresses to allow through
+          the quarantine firewall (e.g. DNS server, SIEM collector).
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: rules_applied
+        type: int32
+
+  readablePayload: >
+    Quarantine device (server=${server_ip}, whitelist=${whitelist_ips})
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [quarantine]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.quarantine.release
+  displayName: Release Device from Quarantine
+  version: 1.0.0
+  description: >
+    Remove all quarantine firewall rules and restore normal network access.
+    On Windows this deletes all netsh rules prefixed with "YuzuQuarantine_",
+    on Linux it flushes and removes the yuzu-quarantine iptables chain,
+    and on macOS it flushes the yuzu-quarantine pf anchor.
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: quarantine
+    action: unquarantine
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Release device from quarantine"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [quarantine]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.quarantine.status
+  displayName: Quarantine Status
+  version: 1.0.0
+  description: >
+    Check whether quarantine firewall rules are currently active on the
+    device and report the current whitelist of allowed IP addresses.
+  tags: [security, quarantine, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: quarantine
+    action: status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: state
+        type: string
+      - name: whitelist
+        type: string
+
+  readablePayload: "Query quarantine status"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [quarantine]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.quarantine.whitelist
+  displayName: Modify Quarantine Whitelist
+  version: 1.0.0
+  description: >
+    Add or remove IP addresses from an active quarantine whitelist without
+    fully releasing or re-applying the quarantine. Reports the resulting
+    whitelist after the modification.
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: quarantine
+    action: whitelist
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [action, ips]
+    properties:
+      action:
+        type: string
+        displayName: Whitelist Action
+        description: Whether to add or remove the specified IPs from the quarantine whitelist.
+        validation:
+          enum: ["add", "remove"]
+      ips:
+        type: string
+        displayName: IP Addresses
+        description: >
+          Comma-separated list of IP addresses to add to or remove from
+          the quarantine whitelist.
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: whitelist
+        type: string
+
+  readablePayload: "Quarantine whitelist: ${action} IPs ${ips}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [quarantine]
+
+status:
+  phase: active

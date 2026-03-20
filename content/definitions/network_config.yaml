@@ -1,0 +1,316 @@
+## Network Configuration Definitions
+## Reports network adapter configuration, IP addresses, DNS, and proxy settings.
+## Plugin: network_config | Actions: adapters, ip_addresses, dns_servers, proxy, dns_cache
+##
+## Sources by platform:
+##   Windows: IP Helper API (GetAdaptersAddresses), WinHTTP proxy API, dnsapi.dll
+##   Linux:   ip(8), /etc/resolv.conf, resolvectl, sysfs, environment variables
+##   macOS:   ifconfig, scutil, networksetup, dscacheutil
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.adapters
+  displayName: Network Adapters
+  version: 1.0.0
+  description: >
+    Lists network adapters with MAC address, link speed, and
+    operational status. Skips loopback and tunnel interfaces.
+    On Windows uses GetAdaptersAddresses, on Linux reads ip-link
+    and sysfs speed, on macOS parses ifconfig output.
+  tags: [network, inventory, hardware]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: adapters
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: mac
+        type: string
+      - name: speed_mbps
+        type: int64
+      - name: status
+        type: string
+    aggregation:
+      groupBy:
+        - status
+      operations:
+        - count
+
+  readablePayload: "List network adapters"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.ip_addresses
+  displayName: IP Addresses
+  version: 1.0.0
+  description: >
+    Lists assigned IP addresses per adapter with subnet prefix length
+    and default gateway. Returns both IPv4 and IPv6 unicast addresses.
+    On Windows uses GetAdaptersAddresses with GAA_FLAG_INCLUDE_GATEWAYS,
+    on Linux parses ip-addr and ip-route, on macOS parses ifconfig and
+    route output.
+  tags: [network, inventory, addressing]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: ip_addresses
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: adapter
+        type: string
+      - name: address
+        type: string
+      - name: prefix_length
+        type: int32
+      - name: gateway
+        type: string
+    aggregation:
+      groupBy:
+        - adapter
+      operations:
+        - count
+
+  readablePayload: "List IP addresses"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.dns_servers
+  displayName: DNS Servers
+  version: 1.0.0
+  description: >
+    Lists configured DNS servers per adapter, including address
+    family (IPv4/IPv6). On Windows enumerates per-adapter DNS
+    server addresses via GetAdaptersAddresses. On Linux reads
+    /etc/resolv.conf nameserver entries. On macOS parses scutil
+    --dns output.
+  tags: [network, inventory, dns]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: dns_servers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: adapter
+        type: string
+      - name: server
+        type: string
+      - name: type
+        type: string
+    aggregation:
+      groupBy:
+        - adapter
+      operations:
+        - count
+
+  readablePayload: "List DNS servers"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.proxy
+  displayName: Proxy Configuration
+  version: 1.0.0
+  description: >
+    Returns the system proxy configuration including proxy type
+    (none, http, pac, auto_detect), proxy address, and bypass list.
+    On Windows reads WinHTTP IE proxy config. On Linux checks
+    http_proxy/https_proxy/all_proxy/no_proxy environment variables.
+    On macOS queries networksetup for web proxy and auto-proxy URL.
+  tags: [network, inventory, proxy, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: proxy
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: proxy_type
+        type: string
+      - name: proxy_address
+        type: string
+      - name: bypass
+        type: string
+    aggregation:
+      groupBy:
+        - proxy_type
+      operations:
+        - count
+
+  readablePayload: "Get proxy configuration"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.dns_cache
+  displayName: DNS Cache
+  version: 1.0.0
+  description: >
+    Dumps the local DNS resolver cache. On Windows dynamically loads
+    DnsGetCacheDataTable from dnsapi.dll and returns cached entries
+    with record type (A, AAAA, CNAME, PTR, MX, SRV). On Linux reads
+    resolvectl cache or falls back to systemd-resolve statistics. On
+    macOS invokes dscacheutil -cachedump.
+  tags: [network, dns, diagnostics, security]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: dns_cache
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: record_type
+        type: string
+      - name: ttl
+        type: int32
+    aggregation:
+      groupBy:
+        - record_type
+      operations:
+        - count
+
+  readablePayload: "Dump DNS resolver cache"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active

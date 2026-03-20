@@ -1,0 +1,109 @@
+## Software Actions Definitions
+## Provides read-only queries for upgradable packages and installed
+## software counts across all platforms (winget, apt, yum, softwareupdate,
+## dpkg, rpm, pkgutil).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.software_actions.list_upgradable
+  displayName: List Upgradable Packages
+  version: 1.0.0
+  description: >
+    Lists packages and applications that have updates available. On
+    Windows uses winget, on Linux tries apt then yum, on macOS uses
+    softwareupdate. Reports the package name, current version, and
+    available version for each upgradable package.
+  tags: [software, updates, patching, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: software_actions
+    action: list_upgradable
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: package_name
+        type: string
+      - name: current_version
+        type: string
+      - name: available_version
+        type: string
+
+  readablePayload: "List upgradable packages"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [software_actions]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.software_actions.installed_count
+  displayName: Count Installed Software
+  version: 1.0.0
+  description: >
+    Returns a quick count of installed packages or applications on the
+    endpoint. On Windows queries the Uninstall registry, on Linux
+    uses dpkg or rpm, on macOS uses pkgutil.
+  tags: [software, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: software_actions
+    action: installed_count
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: count
+        type: int32
+
+  readablePayload: "Count installed software packages"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [software_actions]
+
+status:
+  phase: active

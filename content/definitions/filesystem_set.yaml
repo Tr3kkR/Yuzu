@@ -1,0 +1,34 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.filesystem
+  displayName: Filesystem Operations
+  version: 0.3.0
+  description: >
+    Secure filesystem operations including path existence checks, directory
+    listing, file hashing, file reading, and temporary file/directory
+    creation. All paths are canonicalized to prevent traversal attacks.
+    Read-only operations are available to operators; write operations
+    (temp file/dir creation) require admin role.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      - device.filesystem.exists
+      - device.filesystem.list_dir
+      - device.filesystem.file_hash
+      - device.filesystem.read
+      - device.filesystem.create_temp
+      - device.filesystem.create_temp_dir
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

@@ -1,0 +1,30 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.scripting
+  displayName: Script Execution
+  version: 1.1.0
+  description: >
+    Command and script execution with streaming output, timeout enforcement,
+    and exit code reporting. Includes raw command execution, PowerShell
+    scripting (Windows), and bash scripting (Linux/macOS). All actions
+    require admin role.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      - device.script_exec.exec
+      - device.script_exec.powershell
+      - device.script_exec.bash
+
+  defaults:
+    approvalMode: role-gated
+    responseRetentionDays: 90
+
+status:
+  phase: active

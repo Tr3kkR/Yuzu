@@ -1,0 +1,112 @@
+## SCCM / ConfigMgr Client Info Definitions (Windows-only)
+## Reports SCCM client installation status, version, service state,
+## and site assignment details.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.sccm.client_version
+  displayName: SCCM Client Version
+  version: 1.0.0
+  description: >
+    Check whether the SCCM/ConfigMgr client is installed, report its
+    version from the registry, and check the CcmExec service status.
+    Returns installed flag, version string, and service state. Useful
+    for compliance verification that endpoints have the configuration
+    management agent deployed.
+  tags: [security, sccm, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: sccm
+    action: client_version
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: installed
+        type: bool
+      - name: version
+        type: string
+      - name: service_status
+        type: string
+
+  readablePayload: "Query SCCM client version and status"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [sccm]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.sccm.site
+  displayName: SCCM Site Assignment
+  version: 1.0.0
+  description: >
+    Retrieve the SCCM site assignment details including the assigned site
+    code and current management point. Reads from the registry first,
+    falling back to the COM object via PowerShell if registry values are
+    not present.
+  tags: [security, sccm, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: sccm
+    action: site
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: site_code
+        type: string
+      - name: management_point
+        type: string
+
+  readablePayload: "Query SCCM site assignment"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [sccm]
+
+status:
+  phase: active

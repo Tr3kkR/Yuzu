@@ -1,0 +1,123 @@
+## Antivirus Product Detection Definitions
+## Detects installed antivirus products and queries Windows Defender status.
+## Plugin: antivirus | Actions: products, status
+##
+## Sources by platform:
+##   Windows: WMI SecurityCenter2 (products), Get-MpComputerStatus (Defender)
+##   Linux:   Process detection for ClamAV, CrowdStrike Falcon, Sophos
+##   macOS:   XProtect (always present), CrowdStrike/Sophos process detection
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.antivirus.products
+  displayName: List Antivirus Products
+  version: 1.0.0
+  description: >
+    Enumerate installed antivirus products on the endpoint. On Windows,
+    queries WMI SecurityCenter2 for registered AV products and their
+    productState. On Linux, checks for running ClamAV (clamd),
+    CrowdStrike Falcon (falcon-sensor), and Sophos processes or
+    installation directories. On macOS, reports XProtect (always active)
+    and checks for CrowdStrike/Sophos processes.
+  tags: [security, antivirus, compliance, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: antivirus
+    action: products
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: state
+        type: string
+    aggregation:
+      groupBy: [name]
+      operations: [count]
+
+  readablePayload: "List installed antivirus products"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [antivirus]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.antivirus.defender_status
+  displayName: Windows Defender Status
+  version: 1.0.0
+  description: >
+    Query the detailed status of Windows Defender on a Windows endpoint.
+    Reports real-time protection state, antivirus signature version,
+    last signature update time, and last quick scan completion time.
+    Returns "not_available" on non-Windows platforms.
+  tags: [security, antivirus, defender, compliance, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: antivirus
+    action: status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: realtime_protection
+        type: string
+      - name: definition_version
+        type: string
+      - name: last_update
+        type: string
+      - name: last_quick_scan
+        type: string
+
+  readablePayload: "Query Windows Defender status"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [antivirus]
+
+status:
+  phase: active

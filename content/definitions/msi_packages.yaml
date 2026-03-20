@@ -1,0 +1,119 @@
+## MSI Package Inventory Definitions
+## Enumerates installed MSI packages and product codes (Windows only).
+## Plugin: msi_packages | Actions: list, product_codes
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.software.msi.list
+  displayName: List MSI Packages
+  version: 1.0.0
+  description: >
+    Enumerates all installed Windows Installer (MSI) packages using
+    the MsiEnumProducts API. Returns each package's product code GUID,
+    display name, version string, and install location. Useful for
+    software inventory, patch compliance, and license auditing on
+    Windows endpoints.
+  tags: [software, msi, inventory, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: msi_packages
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: product_code
+        type: guid
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: install_location
+        type: string
+    aggregation:
+      groupBy:
+        - name
+      operations:
+        - count
+
+  readablePayload: "List all installed MSI packages"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [msi_packages]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.software.msi.product_codes
+  displayName: List MSI Product Codes
+  version: 1.0.0
+  description: >
+    Returns a compact list of installed MSI product code GUIDs with
+    their associated product names. This is a lightweight alternative
+    to the full MSI list when only product identification is needed,
+    such as for uninstall targeting or compliance matching.
+  tags: [software, msi, inventory, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: msi_packages
+    action: product_codes
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: product_code
+        type: guid
+      - name: name
+        type: string
+
+  readablePayload: "List MSI product codes"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [msi_packages]
+
+status:
+  phase: active

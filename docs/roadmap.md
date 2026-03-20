@@ -40,7 +40,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) | Open |
 | | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Open |
 | | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management | Open |
-| | 3.9 | [#210](https://github.com/Tr3kkR/Yuzu/issues/210) | Scope DSL Extensions (MATCHES, EXISTS, len, startswith) | Open |
+| | 3.9 | [#210](https://github.com/Tr3kkR/Yuzu/issues/210) | Scope DSL Extensions (MATCHES, EXISTS, len, startswith) | **Done** |
 | **4** | 4.1 | [#173](https://github.com/Tr3kkR/Yuzu/issues/173) | Agent-Side Key-Value Storage | Open |
 | | 4.2 | [#174](https://github.com/Tr3kkR/Yuzu/issues/174) | HTTP Download and Upload (Agent-Initiated) | Open |
 | | 4.3 | [#177](https://github.com/Tr3kkR/Yuzu/issues/177) | Content Staging and Execution | Open |

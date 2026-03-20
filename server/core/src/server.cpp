@@ -3305,6 +3305,23 @@ private:
                 // Check session cookie
                 auto token = extract_session_cookie(req);
                 auto session = auth_mgr_.validate_session(token);
+
+                // If no session cookie, try API token auth (Bearer or X-Yuzu-Token)
+                if (!session && api_token_store_) {
+                    auto auth_header = req.get_header_value("Authorization");
+                    if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
+                        auto api_token = api_token_store_->validate_token(auth_header.substr(7));
+                        if (api_token) session.emplace();
+                    }
+                    if (!session) {
+                        auto custom_header = req.get_header_value("X-Yuzu-Token");
+                        if (!custom_header.empty()) {
+                            auto api_token = api_token_store_->validate_token(custom_header);
+                            if (api_token) session.emplace();
+                        }
+                    }
+                }
+
                 if (!session) {
                     // API calls get 401, pages get redirect
                     if (req.path.starts_with("/api/") || req.path == "/events") {
@@ -4253,10 +4270,10 @@ private:
         // -- Agent listing API ------------------------------------------------
 
         web_server_->Get("/api/agents", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Infrastructure", "Read"))
                 return;
 
+            auto session = require_auth(req, res);
             auto full_json = registry_.to_json();
 
             // If RBAC is enabled, filter to visible agents for non-global-admins
@@ -4285,7 +4302,9 @@ private:
             res.set_content(full_json, "application/json");
         });
 
-        web_server_->Get("/api/help", [this](const httplib::Request&, httplib::Response& res) {
+        web_server_->Get("/api/help", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
             res.set_content(registry_.help_json(), "application/json");
         });
 
@@ -4293,7 +4312,7 @@ private:
 
         web_server_->Get("/api/nvd/status",
                          [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_auth(req, res))
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
                                  return;
                              if (!nvd_db_ || !nvd_db_->is_open()) {
                                  res.set_content(R"({"enabled":false})", "application/json");
@@ -4313,7 +4332,7 @@ private:
 
         web_server_->Post(
             "/api/nvd/sync", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res))
+                if (!require_permission(req, res, "Infrastructure", "Execute"))
                     return;
                 if (!nvd_sync_) {
                     res.status = 503;
@@ -4327,7 +4346,7 @@ private:
 
         web_server_->Post("/api/nvd/match", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_auth(req, res))
+            if (!require_permission(req, res, "Infrastructure", "Read"))
                 return;
             if (!nvd_db_ || !nvd_db_->is_open()) {
                 res.status = 503;
@@ -4370,11 +4389,6 @@ private:
 
         // -- Generic command dispatch API -------------------------------------
 
-        // Plugins that require admin role to invoke
-        static const std::unordered_set<std::string> kAdminOnlyPlugins = {
-            "script_exec", "software_actions", "services",       "processes",
-            "filesystem",  "agent_actions",    "network_actions"};
-
         web_server_->Post("/api/command", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
             // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
@@ -4389,20 +4403,9 @@ private:
                 return;
             }
 
-            // All commands require authentication
-            auto session = require_auth(req, res);
-            if (!session)
+            // All commands require Execution:Execute permission
+            if (!require_permission(req, res, "Execution", "Execute"))
                 return;
-
-            // Restricted plugins require admin role
-            if (kAdminOnlyPlugins.contains(plugin) && session->role != auth::Role::admin) {
-                res.status = 403;
-                res.set_content(
-                    nlohmann::json({{"error", "admin role required for plugin '" + plugin + "'"}})
-                        .dump(),
-                    "application/json");
-                return;
-            }
 
             if (!registry_.has_any()) {
                 res.status = 503;
@@ -4477,28 +4480,38 @@ private:
         // -- Legacy API endpoints (still functional, delegate to generic path) --
 
         web_server_->Post("/api/chargen/start",
-                          [this](const httplib::Request&, httplib::Response& res) {
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Execution", "Execute"))
+                                  return;
                               forward_legacy_command("chargen", "chargen_start", res);
                           });
 
         web_server_->Post("/api/chargen/stop",
-                          [this](const httplib::Request&, httplib::Response& res) {
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Execution", "Execute"))
+                                  return;
                               forward_legacy_command("chargen", "chargen_stop", res);
                           });
 
         web_server_->Post("/api/procfetch/fetch",
-                          [this](const httplib::Request&, httplib::Response& res) {
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Execution", "Execute"))
+                                  return;
                               forward_legacy_command("procfetch", "procfetch_fetch", res);
                           });
 
         web_server_->Get(
-            "/api/chargen/status", [this](const httplib::Request&, httplib::Response& res) {
+            "/api/chargen/status", [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Infrastructure", "Read"))
+                    return;
                 res.set_content(nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
                                 "application/json");
             });
 
         web_server_->Get(
-            "/api/procfetch/status", [this](const httplib::Request&, httplib::Response& res) {
+            "/api/procfetch/status", [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Infrastructure", "Read"))
+                    return;
                 res.set_content(nlohmann::json({{"agent_connected", registry_.has_any()}}).dump(),
                                 "application/json");
             });
@@ -4508,8 +4521,7 @@ private:
         // Aggregate endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Response", "Read"))
                 return;
 
             auto instruction_id = req.matches[1].str();
@@ -4571,8 +4583,7 @@ private:
         // Export endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
                                                                     httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Response", "Read"))
                 return;
 
             auto instruction_id = req.matches[1].str();
@@ -4636,8 +4647,7 @@ private:
 
         web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
                                                           httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Response", "Read"))
                 return;
 
             auto instruction_id = req.matches[1].str();
@@ -4683,9 +4693,9 @@ private:
                             "application/json");
         });
 
-        // -- Audit API (admin-only) -------------------------------------------
+        // -- Audit API -----------------------------------------------------------
         web_server_->Get("/api/audit", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "AuditLog", "Read"))
                 return;
 
             if (!audit_store_ || !audit_store_->is_open()) {
@@ -4736,8 +4746,7 @@ private:
 
         // -- Tags API ---------------------------------------------------------
         web_server_->Get("/api/tags", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Tag", "Read"))
                 return;
 
             if (!tag_store_ || !tag_store_->is_open()) {
@@ -4767,7 +4776,7 @@ private:
 
         web_server_->Post(
             "/api/tags/set", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res))
+                if (!require_permission(req, res, "Tag", "Write"))
                     return;
                 if (!tag_store_) {
                     res.status = 503;
@@ -4807,7 +4816,7 @@ private:
 
         web_server_->Post(
             "/api/tags/delete", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res))
+                if (!require_permission(req, res, "Tag", "Delete"))
                     return;
                 if (!tag_store_) {
                     res.status = 503;
@@ -4832,8 +4841,7 @@ private:
 
         web_server_->Post(
             "/api/tags/query", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Tag", "Read"))
                     return;
                 if (!tag_store_) {
                     res.status = 503;
@@ -4877,8 +4885,7 @@ private:
         // -- Generic JSON-to-CSV export -----------------------------------------
         web_server_->Post(
             "/api/export/json-to-csv", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Response", "Read"))
                     return;
 
                 auto csv = data_export::json_array_to_csv(req.body);
@@ -4895,8 +4902,7 @@ private:
 
         web_server_->Get("/api/instructions", [this](const httplib::Request& req,
                                                      httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "InstructionDefinition", "Read"))
                 return;
             if (!instruction_store_ || !instruction_store_->is_open()) {
                 res.status = 503;
@@ -4940,7 +4946,7 @@ private:
 
         web_server_->Post("/api/instructions", [this](const httplib::Request& req,
                                                       httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "InstructionDefinition", "Write"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -4989,8 +4995,7 @@ private:
 
         web_server_->Get(R"(/api/instructions/([^/]+))", [this](const httplib::Request& req,
                                                                 httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "InstructionDefinition", "Read"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -5025,7 +5030,7 @@ private:
 
         web_server_->Put(R"(/api/instructions/([^/]+))", [this](const httplib::Request& req,
                                                                 httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "InstructionDefinition", "Write"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -5064,7 +5069,7 @@ private:
 
         web_server_->Delete(R"(/api/instructions/([^/]+))", [this](const httplib::Request& req,
                                                                    httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "InstructionDefinition", "Delete"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -5082,8 +5087,7 @@ private:
 
         web_server_->Get(R"(/api/instructions/([^/]+)/export)",
                          [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session)
+                             if (!require_permission(req, res, "InstructionDefinition", "Read"))
                                  return;
                              if (!instruction_store_) {
                                  res.status = 503;
@@ -5097,7 +5101,7 @@ private:
 
         web_server_->Post("/api/instructions/import", [this](const httplib::Request& req,
                                                              httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "InstructionDefinition", "Write"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -5119,8 +5123,7 @@ private:
 
         web_server_->Get(
             "/api/instruction-sets", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "InstructionSet", "Read"))
                     return;
                 if (!instruction_store_) {
                     res.status = 503;
@@ -5141,7 +5144,7 @@ private:
 
         web_server_->Post(
             "/api/instruction-sets", [this](const httplib::Request& req, httplib::Response& res) {
-                if (!require_admin(req, res))
+                if (!require_permission(req, res, "InstructionSet", "Write"))
                     return;
                 if (!instruction_store_) {
                     res.status = 503;
@@ -5165,7 +5168,7 @@ private:
 
         web_server_->Delete(R"(/api/instruction-sets/([^/]+))", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "InstructionSet", "Delete"))
                 return;
             if (!instruction_store_) {
                 res.status = 503;
@@ -5181,8 +5184,7 @@ private:
 
         web_server_->Get(
             "/api/executions", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Execution", "Read"))
                     return;
                 if (!execution_tracker_) {
                     res.status = 503;
@@ -5218,8 +5220,7 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+))", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Execution", "Read"))
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
@@ -5254,8 +5255,7 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+)/summary)", [this](const httplib::Request& req,
                                                                       httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Execution", "Read"))
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
@@ -5277,8 +5277,7 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+)/agents)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Execution", "Read"))
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
@@ -5302,7 +5301,7 @@ private:
 
         web_server_->Post(R"(/api/executions/([^/]+)/rerun)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Execution", "Execute"))
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
@@ -5332,7 +5331,7 @@ private:
 
         web_server_->Post(R"(/api/executions/([^/]+)/cancel)",
                           [this](const httplib::Request& req, httplib::Response& res) {
-                              if (!require_admin(req, res))
+                              if (!require_permission(req, res, "Execution", "Execute"))
                                   return;
                               if (!execution_tracker_) {
                                   res.status = 503;
@@ -5353,8 +5352,7 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+)/children)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Execution", "Read"))
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
@@ -5375,8 +5373,7 @@ private:
 
         web_server_->Get(
             "/api/schedules", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Schedule", "Read"))
                     return;
                 if (!schedule_engine_) {
                     res.status = 503;
@@ -5406,7 +5403,7 @@ private:
 
         web_server_->Post("/api/schedules", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Schedule", "Write"))
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
@@ -5448,7 +5445,7 @@ private:
 
         web_server_->Delete(R"(/api/schedules/([^/]+))", [this](const httplib::Request& req,
                                                                 httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Schedule", "Delete"))
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
@@ -5464,7 +5461,7 @@ private:
 
         web_server_->Post(R"(/api/schedules/([^/]+)/enable)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Schedule", "Write"))
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
@@ -5482,8 +5479,7 @@ private:
 
         web_server_->Get(
             "/api/approvals", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Approval", "Read"))
                     return;
                 if (!approval_manager_) {
                     res.status = 503;
@@ -5514,8 +5510,7 @@ private:
 
         web_server_->Get("/api/approvals/pending/count", [this](const httplib::Request& req,
                                                                 httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "Approval", "Read"))
                 return;
             if (!approval_manager_) {
                 res.set_content(R"({"count":0})", "application/json");
@@ -5527,7 +5522,7 @@ private:
 
         web_server_->Post(R"(/api/approvals/([^/]+)/approve)", [this](const httplib::Request& req,
                                                                       httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Approval", "Approve"))
                 return;
             if (!approval_manager_) {
                 res.status = 503;
@@ -5554,7 +5549,7 @@ private:
 
         web_server_->Post(R"(/api/approvals/([^/]+)/reject)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_admin(req, res))
+            if (!require_permission(req, res, "Approval", "Approve"))
                 return;
             if (!approval_manager_) {
                 res.status = 503;
@@ -5584,8 +5579,7 @@ private:
 
         web_server_->Get("/api/analytics/status",
                          [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session)
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
                                  return;
 
                              nlohmann::json j;
@@ -5603,8 +5597,7 @@ private:
 
         web_server_->Get(
             "/api/analytics/recent", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session)
+                if (!require_permission(req, res, "Infrastructure", "Read"))
                     return;
 
                 int limit = 50;
@@ -5713,11 +5706,10 @@ private:
             if (!session)
                 return;
 
-            // PlatformEngineer or Administrator can author definitions.
-            // When RBAC enforcement is fully wired, this will check the
-            // PlatformEngineer role via RbacStore::check_permission().
-            bool can_author = (session->role == auth::Role::admin);
-            if (!can_author) {
+            // Check InstructionDefinition:Write via RBAC; falls back to admin check
+            if (!require_permission(req, res, "InstructionDefinition", "Write")) {
+                // Override JSON 403 with HTML denial for HTMX fragment
+                res.status = 200;
                 res.set_content(kInstructionEditorDeniedHtml, "text/html; charset=utf-8");
                 return;
             }
@@ -5799,20 +5791,11 @@ private:
         // -- YAML save endpoint (HTMX form POST from editor) --
         web_server_->Post(
             "/api/instructions/yaml", [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "InstructionDefinition", "Write"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
-
-                // PlatformEngineer or Administrator can author definitions.
-                // When RBAC enforcement is fully wired, this will check the
-                // PlatformEngineer role via RbacStore::check_permission().
-                bool can_author = (session->role == auth::Role::admin);
-                if (!can_author) {
-                    res.set_content("<div class=\"alert alert-error\">Permission denied: "
-                                    "PlatformEngineer role required</div>",
-                                    "text/html");
-                    return;
-                }
                 if (!instruction_store_) {
                     res.set_content(
                         "<div class=\"alert alert-error\">Instruction store not available</div>",
@@ -5886,8 +5869,7 @@ private:
         // -- YAML validate endpoint --
         web_server_->Post("/api/instructions/validate-yaml", [this](const httplib::Request& req,
                                                                     httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session)
+            if (!require_permission(req, res, "InstructionDefinition", "Read"))
                 return;
 
             auto yaml_source = req.get_param_value("yaml_source");

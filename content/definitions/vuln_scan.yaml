@@ -1,0 +1,296 @@
+## Host Vulnerability Scanning Definitions
+## Matches installed software against known CVEs and runs configuration
+## compliance checks. Reports findings by severity.
+## Plugin: vuln_scan | Actions: scan, cve_scan, config_scan, summary, inventory
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.scan
+  displayName: Full Vulnerability Scan
+  version: 1.0.0
+  description: >
+    Run a full host vulnerability scan combining CVE matching and
+    configuration compliance checks. CVE matching compares installed
+    software versions against a built-in rule database. Configuration
+    checks verify security hardening settings (firewall state, password
+    policy, remote desktop config, etc.). Each finding is classified by
+    severity (CRITICAL, HIGH, MEDIUM, LOW, INFO). Reports progress at
+    0%, 50%, 90%, 100%.
+  tags: [security, vulnerability, cve, compliance, audit]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity, category]
+      operations: [count]
+
+  readablePayload: "Run full vulnerability scan (CVE + configuration)"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.cve_scan
+  displayName: CVE Vulnerability Scan
+  version: 1.0.0
+  description: >
+    Scan installed software against known CVE rules. Enumerates installed
+    applications (registry on Windows, dpkg/rpm/pacman on Linux,
+    system_profiler/brew on macOS) and compares versions against the
+    built-in CVE database. Returns only CVE findings, not configuration
+    checks. Use the full "scan" action for combined results.
+  tags: [security, vulnerability, cve, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: cve_scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity]
+      operations: [count]
+
+  readablePayload: "Run CVE vulnerability scan"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.config_scan
+  displayName: Configuration Compliance Scan
+  version: 1.0.0
+  description: >
+    Run security configuration compliance checks on the endpoint.
+    Verifies settings such as firewall state, password policy,
+    remote desktop configuration, and other hardening baselines.
+    Returns findings classified by severity. Does not include CVE
+    matching; use the full "scan" action for combined results.
+  tags: [security, compliance, configuration, hardening]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: config_scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity]
+      operations: [count]
+
+  readablePayload: "Run configuration compliance scan"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.summary
+  displayName: Vulnerability Scan Summary
+  version: 1.0.0
+  description: >
+    Run a full vulnerability scan (CVE + configuration) and return
+    only the severity summary counts. Provides a quick overview of
+    the endpoint's security posture without the full finding details.
+    Returns total findings, total issues, and per-severity counts
+    (CRITICAL, HIGH, MEDIUM, LOW, INFO).
+  tags: [security, vulnerability, compliance, dashboard]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: summary
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: count
+        type: int32
+
+  readablePayload: "Get vulnerability scan summary"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.inventory
+  displayName: Software Inventory for NVD Matching
+  version: 1.0.0
+  description: >
+    Return the raw installed software inventory (name and version pairs)
+    for server-side NVD matching. This is a lightweight alternative to
+    client-side CVE scanning that enables the server to perform
+    centralized vulnerability correlation against the full NVD database.
+  tags: [security, vulnerability, inventory, software]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: inventory
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: version
+        type: string
+
+  readablePayload: "Collect software inventory for NVD matching"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active

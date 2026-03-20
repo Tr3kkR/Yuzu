@@ -1,0 +1,172 @@
+## Agent Diagnostics Plugin Definitions
+## Provides log-level inspection, TLS certificate status, and detailed
+## gRPC connection diagnostics from the agent.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.diagnostics.log_level
+  displayName: Current Log Level
+  version: 1.0.0
+  description: >
+    Reads the agent's current log level from the config context. Returns
+    the spdlog level string (trace, debug, info, warn, error, critical,
+    off). Defaults to "info" if not explicitly configured.
+  tags: [diagnostics, logging]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: diagnostics
+    action: log_level
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: log_level
+        type: string
+
+  readablePayload: "Get current log level"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [diagnostics]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.diagnostics.certificates
+  displayName: TLS Certificate Status
+  version: 1.0.0
+  description: >
+    Lists the configured TLS certificate paths (CA cert, client cert,
+    client key) and whether each file exists on the endpoint's
+    filesystem. Useful for diagnosing mTLS connectivity issues.
+  tags: [diagnostics, tls, security]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: diagnostics
+    action: certificates
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: cert_type
+        type: string
+      - name: path
+        type: string
+      - name: exists
+        type: bool
+
+  readablePayload: "Check TLS certificate status"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [diagnostics]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.diagnostics.connection_info
+  displayName: Connection Diagnostics
+  version: 1.0.0
+  description: >
+    Returns detailed gRPC connection diagnostics: server address, TLS
+    status, session ID, gRPC channel state, reconnect count, round-trip
+    latency in milliseconds, agent uptime in seconds, and the
+    connected_since timestamp.
+  tags: [diagnostics, connection, health]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: diagnostics
+    action: connection_info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: server_address
+        type: string
+      - name: tls_enabled
+        type: bool
+      - name: session_id
+        type: string
+      - name: grpc_channel_state
+        type: string
+      - name: reconnect_count
+        type: int32
+      - name: latency_ms
+        type: int32
+      - name: uptime_seconds
+        type: int64
+      - name: connected_since
+        type: string
+
+  readablePayload: "Get connection diagnostics"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [diagnostics]
+
+status:
+  phase: active

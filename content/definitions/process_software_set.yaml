@@ -1,0 +1,42 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.process-software
+  displayName: Process and Software Management
+  version: 1.0.0
+  description: >
+    Comprehensive process enumeration and software inventory
+    definitions spanning five plugins: processes, procfetch, services,
+    installed_apps, and msi_packages. Covers running process listing,
+    deep process hashing, service enumeration, application inventory,
+    and MSI package auditing across Windows, Linux, and macOS.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      # Process enumeration (processes plugin)
+      - crossplatform.process.list
+      - crossplatform.process.query
+      # Deep process fetch with SHA-1 hashing (procfetch plugin)
+      - crossplatform.process.fetch
+      # Service enumeration (services plugin)
+      - crossplatform.service.list
+      - crossplatform.service.running
+      # Application inventory (installed_apps plugin)
+      - crossplatform.software.inventory
+      - crossplatform.software.query
+      # MSI package inventory (msi_packages plugin, Windows only)
+      - windows.software.msi.list
+      - windows.software.msi.product_codes
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

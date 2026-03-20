@@ -113,43 +113,57 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
     std::string sql =
         "SELECT id, timestamp, principal, principal_role, action, target_type, target_id, detail, "
         "source_ip, user_agent, session_id, result FROM audit_events WHERE 1=1";
-    std::vector<std::pair<int, std::string>> binds;
+    std::vector<std::pair<int, std::string>> text_binds;
+    // int64_binds: (param_index, value) pairs for integer parameters
+    std::vector<std::pair<int, int64_t>> int_binds;
     int bind_idx = 1;
 
     if (!q.principal.empty()) {
         sql += " AND principal = ?";
-        binds.emplace_back(bind_idx++, q.principal);
+        text_binds.emplace_back(bind_idx++, q.principal);
     }
     if (!q.action.empty()) {
         sql += " AND action = ?";
-        binds.emplace_back(bind_idx++, q.action);
+        text_binds.emplace_back(bind_idx++, q.action);
     }
     if (!q.target_type.empty()) {
         sql += " AND target_type = ?";
-        binds.emplace_back(bind_idx++, q.target_type);
+        text_binds.emplace_back(bind_idx++, q.target_type);
     }
     if (!q.target_id.empty()) {
         sql += " AND target_id = ?";
-        binds.emplace_back(bind_idx++, q.target_id);
+        text_binds.emplace_back(bind_idx++, q.target_id);
     }
     if (q.since > 0) {
-        sql += " AND timestamp >= " + std::to_string(q.since);
+        sql += " AND timestamp >= ?";
+        int_binds.emplace_back(bind_idx++, q.since);
     }
     if (q.until > 0) {
-        sql += " AND timestamp <= " + std::to_string(q.until);
+        sql += " AND timestamp <= ?";
+        int_binds.emplace_back(bind_idx++, q.until);
     }
     sql += " ORDER BY timestamp DESC";
-    sql += " LIMIT " + std::to_string(q.limit);
+    sql += " LIMIT ?";
+    int limit_idx = bind_idx++;
+    int offset_idx = 0;
     if (q.offset > 0) {
-        sql += " OFFSET " + std::to_string(q.offset);
+        sql += " OFFSET ?";
+        offset_idx = bind_idx++;
     }
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return results;
 
-    for (const auto& [idx, val] : binds) {
+    for (const auto& [idx, val] : text_binds) {
         sqlite3_bind_text(stmt, idx, val.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& [idx, val] : int_binds) {
+        sqlite3_bind_int64(stmt, idx, val);
+    }
+    sqlite3_bind_int64(stmt, limit_idx, q.limit);
+    if (offset_idx > 0) {
+        sqlite3_bind_int64(stmt, offset_idx, q.offset);
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -237,17 +251,20 @@ void AuditStore::run_cleanup() {
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();
 
-        char* err = nullptr;
-        auto sql = "DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < " +
-                   std::to_string(now);
-        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK) {
-            auto deleted = sqlite3_changes(db_);
-            if (deleted > 0) {
-                spdlog::info("AuditStore: expired {} rows", deleted);
+        sqlite3_stmt* cleanup_stmt = nullptr;
+        if (sqlite3_prepare_v2(
+                db_, "DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
+                -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(cleanup_stmt, 1, now);
+            if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
+                auto deleted = sqlite3_changes(db_);
+                if (deleted > 0) {
+                    spdlog::info("AuditStore: expired {} rows", deleted);
+                }
+            } else {
+                spdlog::warn("AuditStore: cleanup error: {}", sqlite3_errmsg(db_));
             }
-        } else {
-            spdlog::warn("AuditStore: cleanup error: {}", err ? err : "unknown");
-            sqlite3_free(err);
+            sqlite3_finalize(cleanup_stmt);
         }
     }
 }

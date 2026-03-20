@@ -800,7 +800,7 @@ Not implemented. Per-instruction or per-device auth tokens.
 
 ### 19.3 Scope / Filter-Based Device Selection :white_check_mark: `T2`
 
-494-line recursive-descent `ScopeEngine` parser. 9 operators (`==`, `!=`, `LIKE`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`), AND/OR/NOT combinators. Attributes: ostype, osver, hostname, arch, fqdn, `tag:*`. Target estimation via `/api/target/estimate`.
+750-line recursive-descent `ScopeEngine` parser. 10 binary operators (`==`, `!=`, `LIKE`, `MATCHES`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`) plus 3 extended operators/functions (`EXISTS`, `LEN()`, `STARTSWITH()`), AND/OR/NOT combinators. `MATCHES` uses ECMAScript regex with safe error handling. Attributes: ostype, osver, hostname, arch, fqdn, `tag:*`. Target estimation via `/api/scope/estimate`.
 
 ### 19.4 Hierarchical Management Groups :x: `T2`
 

@@ -1,0 +1,469 @@
+## Filesystem Definitions
+## Provides secure file and directory operations: existence checks,
+## directory listing, file hashing, file reading, and temp file creation.
+## All paths are canonicalized to prevent traversal attacks.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.exists
+  displayName: Check Path Exists
+  version: 0.3.0
+  description: >
+    Check whether a filesystem path exists on the endpoint. Reports
+    the existence, type (file, directory, other), and size. Paths are
+    canonicalized via std::filesystem::canonical() to resolve symlinks.
+    An optional base_dir parameter restricts access to a subtree.
+  tags: [filesystem, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: exists
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: Path
+        description: The filesystem path to check.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. If set, the path must resolve within this directory.
+          Prevents directory traversal outside the allowed subtree.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: exists
+        type: bool
+      - name: type
+        type: string
+      - name: size
+        type: int64
+
+  readablePayload: "Check if path exists: ${path}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.list_dir
+  displayName: List Directory Contents
+  version: 0.3.0
+  description: >
+    List the contents of a directory on the endpoint, up to 1000 entries.
+    Reports each entry's filename, type (file, directory, symlink, other),
+    and size. Paths are canonicalized; optional base_dir restricts access.
+  tags: [filesystem, diagnostics, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: list_dir
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: Directory Path
+        description: The directory to list.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to paths within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: entry_name
+        type: string
+      - name: entry_type
+        type: string
+      - name: entry_size
+        type: int64
+
+  readablePayload: "List directory: ${path}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.file_hash
+  displayName: Compute File Hash
+  version: 0.3.0
+  description: >
+    Compute the SHA-256 (default) or SHA-1 hash of a file on the endpoint.
+    Uses BCrypt on Windows and sha256sum/shasum on POSIX. Files larger
+    than 10 GB are rejected. Returns the hex digest, algorithm used, and
+    file size in bytes.
+  tags: [filesystem, security, integrity, compliance, ioc]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: file_hash
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The file to hash.
+        validation:
+          maxLength: 4096
+      algorithm:
+        type: string
+        displayName: Hash Algorithm
+        description: The hash algorithm to use.
+        default: "sha256"
+        validation:
+          enum: ["sha256", "sha1"]
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: hash
+        type: string
+      - name: algorithm
+        type: string
+      - name: size
+        type: int64
+
+  readablePayload: "Compute ${algorithm} hash of ${path}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.read
+  displayName: Read File Contents
+  version: 0.3.0
+  description: >
+    Read lines from a text file on the endpoint with pagination support.
+    Returns lines with 1-based line numbers, total line count, and file
+    size. Binary files are detected and rejected. Maximum file size is
+    100 MB, maximum lines per request is 10000. Paths are canonicalized;
+    optional base_dir restricts access.
+  tags: [filesystem, diagnostics, log-analysis]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: read
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The text file to read.
+        validation:
+          maxLength: 4096
+      offset:
+        type: int32
+        displayName: Start Line
+        description: >
+          1-based line number to start reading from. Default: 1.
+        default: 1
+        validation:
+          minimum: 1
+      limit:
+        type: int32
+        displayName: Line Limit
+        description: >
+          Maximum number of lines to return. Default: 100, max: 10000.
+        default: 100
+        validation:
+          minimum: 1
+          maximum: 10000
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: line_number
+        type: int32
+      - name: content
+        type: string
+      - name: total_lines
+        type: int32
+      - name: file_size
+        type: int64
+
+  readablePayload: "Read file ${path} (offset=${offset}, limit=${limit})"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.create_temp
+  displayName: Create Temporary File
+  version: 0.3.0
+  description: >
+    Create a secure temporary file on the endpoint with restrictive
+    permissions (mode 0600 on POSIX, owner-only DACL on Windows).
+    Uses mkstemps/CreateFile+CREATE_NEW to prevent TOCTOU races.
+    Optionally deletes the file immediately (persist=false) for use
+    as a unique path generator.
+  tags: [filesystem, admin, staging]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: create_temp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      prefix:
+        type: string
+        displayName: Filename Prefix
+        description: Prefix for the temp file name.
+        default: "yuzu-"
+        validation:
+          maxLength: 64
+      suffix:
+        type: string
+        displayName: Filename Suffix
+        description: Suffix/extension for the temp file name.
+        default: ".tmp"
+        validation:
+          maxLength: 32
+      directory:
+        type: string
+        displayName: Target Directory
+        description: >
+          Optional. Create the temp file in this directory instead of
+          the system default temp directory.
+        validation:
+          maxLength: 4096
+      persist:
+        type: string
+        displayName: Persist
+        description: >
+          If "true" (default), the file is kept. If "false", the file
+          is deleted after creation (useful for generating unique paths).
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+
+  result:
+    columns:
+      - name: path
+        type: string
+      - name: persist
+        type: bool
+
+  readablePayload: "Create temporary file (prefix=${prefix}, suffix=${suffix})"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.create_temp_dir
+  displayName: Create Temporary Directory
+  version: 0.3.0
+  description: >
+    Create a secure temporary directory on the endpoint with restrictive
+    permissions (mode 0700 on POSIX, owner-only DACL on Windows).
+    Optionally deletes the directory immediately (persist=false) for
+    use as a unique path generator.
+  tags: [filesystem, admin, staging]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: create_temp_dir
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      prefix:
+        type: string
+        displayName: Directory Prefix
+        description: Prefix for the temp directory name.
+        default: "yuzu-"
+        validation:
+          maxLength: 64
+      directory:
+        type: string
+        displayName: Parent Directory
+        description: >
+          Optional. Create the temp directory inside this parent instead
+          of the system default temp directory.
+        validation:
+          maxLength: 4096
+      persist:
+        type: string
+        displayName: Persist
+        description: >
+          If "true" (default), the directory is kept. If "false", deleted
+          after creation.
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+
+  result:
+    columns:
+      - name: path
+        type: string
+      - name: persist
+        type: bool
+
+  readablePayload: "Create temporary directory (prefix=${prefix})"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active

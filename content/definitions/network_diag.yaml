@@ -1,0 +1,143 @@
+## Network Diagnostics Definitions
+## Focused diagnostics for listening ports and established connections.
+## Plugin: network_diag | Actions: listening, connections
+##
+## Sources by platform:
+##   Windows: IP Helper API (GetExtendedTcpTable with LISTENER/CONNECTIONS filter)
+##   Linux:   /proc/net/tcp, /proc/net/tcp6 (state-filtered)
+##   macOS:   lsof -iTCP with state filter (-sTCP:LISTEN or -sTCP:ESTABLISHED)
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_diag.listening
+  displayName: Listening Ports
+  version: 0.1.0
+  description: >
+    Lists all TCP ports in LISTEN state on the endpoint. Returns the
+    bind address, port number, and owning PID (or inode on Linux).
+    On Windows uses GetExtendedTcpTable with TCP_TABLE_OWNER_PID_LISTENER.
+    On Linux reads /proc/net/tcp and /proc/net/tcp6 filtering state 0x0A.
+    On macOS runs lsof -iTCP -sTCP:LISTEN and parses the NAME column.
+    Useful for security audits and compliance checks to detect
+    unexpected open ports.
+  tags: [network, security, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_diag
+    action: listening
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: proto
+        type: string
+      - name: local_addr
+        type: string
+      - name: local_port
+        type: int32
+      - name: pid
+        type: int32
+    aggregation:
+      groupBy:
+        - local_port
+      operations:
+        - count
+
+  readablePayload: "List listening TCP ports"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [network_diag]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_diag.connections
+  displayName: Established Connections
+  version: 0.1.0
+  description: >
+    Lists all established TCP connections on the endpoint. Returns
+    local address/port, remote address/port, and owning PID (or inode
+    on Linux). On Windows uses GetExtendedTcpTable with
+    TCP_TABLE_OWNER_PID_CONNECTIONS and filters for MIB_TCP_STATE_ESTAB.
+    On Linux reads /proc/net/tcp and /proc/net/tcp6 filtering state 0x01.
+    On macOS runs lsof -iTCP -sTCP:ESTABLISHED and parses the connection
+    arrow notation. Useful for detecting unauthorized outbound connections
+    and lateral movement.
+  tags: [network, security, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_diag
+    action: connections
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: proto
+        type: string
+      - name: local_addr
+        type: string
+      - name: local_port
+        type: int32
+      - name: remote_addr
+        type: string
+      - name: remote_port
+        type: int32
+      - name: pid
+        type: int32
+    aggregation:
+      groupBy:
+        - remote_addr
+      operations:
+        - count
+
+  readablePayload: "List established TCP connections"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [network_diag]
+
+status:
+  phase: active

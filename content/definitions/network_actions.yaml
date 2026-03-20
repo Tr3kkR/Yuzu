@@ -1,0 +1,137 @@
+## Network Actions Definitions
+## Active network operations: DNS flush and ping.
+## Plugin: network_actions | Actions: flush_dns, ping
+##
+## Sources by platform:
+##   Windows: ipconfig /flushdns, ping -n
+##   Linux:   resolvectl flush-caches / systemd-resolve --flush-caches, ping -c
+##   macOS:   dscacheutil -flushcache, ping -c
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_actions.flush_dns
+  displayName: Flush DNS Cache
+  version: 0.1.0
+  description: >
+    Flushes the local DNS resolver cache on the endpoint. On Windows
+    runs ipconfig /flushdns. On Linux attempts resolvectl flush-caches
+    then falls back to systemd-resolve --flush-caches. On macOS runs
+    dscacheutil -flushcache. Returns a status indicator and the
+    command output. This is a mutating action that clears cached DNS
+    records, forcing fresh resolution on subsequent lookups.
+  tags: [network, dns, action, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_actions
+    action: flush_dns
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: output
+        type: string
+
+  readablePayload: "Flush DNS cache"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [network_actions]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_actions.ping
+  displayName: Ping Host
+  version: 0.1.0
+  description: >
+    Pings a specified host from the endpoint and streams back the
+    per-line output. Validates the host parameter to prevent command
+    injection (alphanumeric, dots, hyphens, and colons only). The
+    count parameter controls the number of ICMP echo requests. On
+    Windows uses ping -n, on Linux/macOS uses ping -c. Returns the
+    raw ping output line by line for diagnostics.
+  tags: [network, diagnostics, action, connectivity]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_actions
+    action: ping
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [host]
+    properties:
+      host:
+        type: string
+        displayName: Target Host
+        description: >
+          Hostname or IP address to ping. Must contain only
+          alphanumeric characters, dots, hyphens, and colons.
+          Maximum length 253 characters.
+        validation:
+          minLength: 1
+          maxLength: 253
+          pattern: "^[a-zA-Z0-9.:\\-]+$"
+      count:
+        type: string
+        displayName: Ping Count
+        description: >
+          Number of ICMP echo requests to send. Must be a positive
+          integer. Defaults to 4 if not specified.
+        default: "4"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: output
+        type: string
+
+  readablePayload: "Ping ${host} (${count} packets)"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [network_actions]
+
+status:
+  phase: active

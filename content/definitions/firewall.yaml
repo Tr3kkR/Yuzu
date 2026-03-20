@@ -1,0 +1,125 @@
+## Firewall Status and Rules Definitions
+## Queries firewall state and enumerates rules across platforms.
+## Plugin: firewall | Actions: state, rules
+##
+## Sources by platform:
+##   Windows: netsh advfirewall (Domain/Private/Public profiles)
+##   Linux:   firewalld, ufw, or iptables (auto-detected)
+##   macOS:   pf (pfctl)
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.state
+  displayName: Firewall State
+  version: 1.0.0
+  description: >
+    Query the firewall state on the endpoint. On Windows, reports the
+    enabled/disabled status of each Windows Firewall profile (Domain,
+    Private, Public). On Linux, auto-detects the active firewall backend
+    (firewalld, ufw, or iptables) and reports its state. On macOS,
+    queries pf (pfctl) for enabled/disabled status.
+  tags: [security, firewall, compliance, network]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: state
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: profile_or_backend
+        type: string
+      - name: state
+        type: string
+    aggregation:
+      groupBy: [state]
+      operations: [count]
+
+  readablePayload: "Query firewall state"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.rules
+  displayName: List Firewall Rules
+  version: 1.0.0
+  description: >
+    List firewall rules on the endpoint. On Windows, enumerates inbound
+    rules via netsh (capped at 100 rules) with rule name, enabled state,
+    direction, action, and profiles. On Linux, uses the detected backend
+    (firewall-cmd --list-all, ufw status numbered, or iptables -L). On
+    macOS, lists pf rules via pfctl -s rules.
+  tags: [security, firewall, compliance, network, audit]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: rules
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: rule_name
+        type: string
+      - name: enabled
+        type: string
+      - name: direction
+        type: string
+      - name: action
+        type: string
+      - name: profiles
+        type: string
+
+  readablePayload: "List firewall rules"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active

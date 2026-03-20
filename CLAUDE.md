@@ -36,6 +36,38 @@ Yuzu Server
     └── Metrics — Prometheus-compatible, per-plugin counters
 ```
 
+## Agent Team
+
+Yuzu uses specialized Claude Code agents for enterprise-quality development.
+Agents live in `.claude/agents/` and are invoked by name.
+
+| Agent | Role | Primary Concern |
+|-------|------|-----------------|
+| architect | System Architect | Module boundaries, proto compat, ABI stability |
+| security-guardian | Security Engineer | Auth enforcement, crypto, input validation, audit |
+| quality-engineer | QA & Test Engineer | Test coverage, fuzz targets, coverage thresholds |
+| cross-platform | Platform Compatibility | Win/Linux/macOS/ARM64 builds, OS-specific code |
+| docs-writer | Technical Writer | User manual, YAML defs, API docs, roadmap |
+| build-ci | Build & CI/CD | Meson, vcpkg, GitHub Actions, proto codegen |
+| performance | Performance Engineer | SQLite optimization, load testing, gateway scaling |
+| gateway-erlang | Erlang/OTP Specialist | Gateway supervision, rebar3, EUnit/CT |
+| plugin-developer | Plugin Dev & SDK | New plugins, ABI guard, InstructionDefinition YAML |
+| release-deploy | Release & Deployment | Docker, systemd, installers, release workflow |
+| dsl-engineer | DSL & Expression Language | Scope DSL, CEL, parameter interpolation, trigger expressions, workflow primitives |
+
+**Workflow:** architect first (design) → feature agents (implement) → cross-platform (compile) → security-guardian (review) → quality-engineer (test) → docs-writer (document) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
+
+**DSL touchpoints:** dsl-engineer is invoked as a feature agent for scope targeting, policy conditions (CEL), trigger template expressions, parameter binding, workflow primitives, and any YAML DSL spec evolution.
+
+### Governance
+
+Every code change follows mandatory governance gates:
+
+1. **Change Summary** — the producing agent writes a structured summary (files, what, why, interfaces affected, security surface, user-facing impact) shared with ALL agents.
+2. **Mandatory deep-dive** — security-guardian and docs-writer read every modified file for every change. Security reviews block on CRITICAL/HIGH findings. Documentation blocks if user-facing changes lack doc updates.
+3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
+4. **All findings addressed** before merge.
+
 ## Darwin Compatibility
 
 This Claude instance is the designated **macOS/Darwin compatibility guardian** for Yuzu. When Windows-originated changes land on `origin/dev`, the standing workflow is:

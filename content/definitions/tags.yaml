@@ -1,0 +1,398 @@
+## Device Tag Definitions
+## Provides free-form key-value tagging on the agent. Tags are stored
+## locally in tags.json and reported to the server via AgentInfo.scopable_tags
+## for scope expression evaluation.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.set
+  displayName: Set Device Tag
+  version: 0.1.0
+  description: >
+    Set a free-form tag on the device. Tags are key-value pairs stored
+    locally in tags.json and reported to the server for scope evaluation.
+    Key max 64 characters, value max 448 bytes. Allowed key characters:
+    a-zA-Z0-9_-.:
+  tags: [tags, scope, identity]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: set
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [key]
+    properties:
+      key:
+        type: string
+        displayName: Tag Key
+        description: "The tag key. Max 64 characters, alphanumeric plus _-.:"
+        validation:
+          maxLength: 64
+          pattern: "^[a-zA-Z0-9_.:\\-]+$"
+      value:
+        type: string
+        displayName: Tag Value
+        description: The tag value. Max 448 bytes.
+        validation:
+          maxLength: 448
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+
+  readablePayload: "Set tag '${key}' = '${value}'"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.get
+  displayName: Get Device Tag
+  version: 0.1.0
+  description: >
+    Retrieve the value of a single free-form tag by key. Returns an
+    empty value if the key does not exist.
+  tags: [tags, scope, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: get
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [key]
+    properties:
+      key:
+        type: string
+        displayName: Tag Key
+        description: The tag key to look up.
+        validation:
+          maxLength: 64
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+
+  readablePayload: "Get tag '${key}'"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.get_all
+  displayName: Get All Device Tags
+  version: 0.1.0
+  description: >
+    Retrieve all free-form tags on the device. Returns each tag as a
+    key-value pair plus a total count. Useful for inventory and scope
+    verification.
+  tags: [tags, scope, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: get_all
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+      - name: count
+        type: int32
+
+  readablePayload: "Get all device tags"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.delete
+  displayName: Delete Device Tag
+  version: 0.1.0
+  description: >
+    Delete a free-form tag by key from the device. Reports whether the
+    key existed before deletion. The change is persisted to tags.json
+    immediately.
+  tags: [tags, scope, admin]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: delete
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [key]
+    properties:
+      key:
+        type: string
+        displayName: Tag Key
+        description: The tag key to delete.
+        validation:
+          maxLength: 64
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: found
+        type: bool
+
+  readablePayload: "Delete tag '${key}'"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.check
+  displayName: Check Tag Exists
+  version: 0.1.0
+  description: >
+    Check whether a free-form tag key exists on the device. Returns a
+    boolean result. Useful for scope pre-checks and policy conditions.
+  tags: [tags, scope, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: check
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [key]
+    properties:
+      key:
+        type: string
+        displayName: Tag Key
+        description: The tag key to check for existence.
+        validation:
+          maxLength: 64
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: exists
+        type: bool
+
+  readablePayload: "Check if tag '${key}' exists"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.clear
+  displayName: Clear All Device Tags
+  version: 0.1.0
+  description: >
+    Remove all free-form tags from the device. Reports the number of
+    tags that were cleared. This is a destructive action — all scope
+    tags will be lost until re-applied.
+  tags: [tags, scope, admin]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: clear
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: cleared_count
+        type: int32
+
+  readablePayload: "Clear all device tags"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.tags.count
+  displayName: Count Device Tags
+  version: 0.1.0
+  description: >
+    Return the number of free-form tags currently set on the device.
+  tags: [tags, scope, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tags
+    action: count
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: count
+        type: int32
+
+  readablePayload: "Count device tags"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tags]
+
+status:
+  phase: active

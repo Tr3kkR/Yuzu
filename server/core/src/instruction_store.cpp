@@ -186,7 +186,7 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
     if (q.enabled_only) {
         sql += " AND enabled = 1";
     }
-    sql += " ORDER BY name ASC LIMIT " + std::to_string(q.limit);
+    sql += " ORDER BY name ASC LIMIT ?";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
@@ -194,6 +194,7 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
 
     for (int i = 0; i < static_cast<int>(binds.size()); ++i)
         sqlite3_bind_text(stmt, i + 1, binds[i].c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, static_cast<int>(binds.size()) + 1, q.limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW)
         results.push_back(row_to_def(stmt));

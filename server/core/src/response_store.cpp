@@ -107,25 +107,36 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
                       "error_detail, ttl_expires_at FROM responses WHERE instruction_id = ?";
     std::vector<std::string> bind_texts;
+    // int64_binds: (param_index, value) pairs for integer parameters
+    std::vector<std::pair<int, int64_t>> int_binds;
+    int bind_idx = 1;
     bind_texts.push_back(instruction_id);
+    bind_idx++;
 
     if (!q.agent_id.empty()) {
         sql += " AND agent_id = ?";
         bind_texts.push_back(q.agent_id);
+        bind_idx++;
     }
     if (q.status >= 0) {
-        sql += " AND status = " + std::to_string(q.status);
+        sql += " AND status = ?";
+        int_binds.emplace_back(bind_idx++, static_cast<int64_t>(q.status));
     }
     if (q.since > 0) {
-        sql += " AND timestamp >= " + std::to_string(q.since);
+        sql += " AND timestamp >= ?";
+        int_binds.emplace_back(bind_idx++, q.since);
     }
     if (q.until > 0) {
-        sql += " AND timestamp <= " + std::to_string(q.until);
+        sql += " AND timestamp <= ?";
+        int_binds.emplace_back(bind_idx++, q.until);
     }
     sql += " ORDER BY timestamp DESC";
-    sql += " LIMIT " + std::to_string(q.limit);
+    sql += " LIMIT ?";
+    int limit_idx = bind_idx++;
+    int offset_idx = 0;
     if (q.offset > 0) {
-        sql += " OFFSET " + std::to_string(q.offset);
+        sql += " OFFSET ?";
+        offset_idx = bind_idx++;
     }
 
     sqlite3_stmt* stmt = nullptr;
@@ -134,6 +145,13 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
 
     for (int i = 0; i < static_cast<int>(bind_texts.size()); ++i) {
         sqlite3_bind_text(stmt, i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& [idx, val] : int_binds) {
+        sqlite3_bind_int64(stmt, idx, val);
+    }
+    sqlite3_bind_int64(stmt, limit_idx, q.limit);
+    if (offset_idx > 0) {
+        sqlite3_bind_int64(stmt, offset_idx, q.offset);
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -207,18 +225,29 @@ std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instr
     std::string sql = "SELECT " + aq.group_by + ", COUNT(*), " + agg_func +
                       " FROM responses WHERE instruction_id = ?";
     std::vector<std::string> bind_texts;
+    // int64_binds: (param_index, value) pairs for integer parameters
+    std::vector<std::pair<int, int64_t>> int_binds;
+    int bind_idx = 1;
     bind_texts.push_back(instruction_id);
+    bind_idx++;
 
     if (!filter.agent_id.empty()) {
         sql += " AND agent_id = ?";
         bind_texts.push_back(filter.agent_id);
+        bind_idx++;
     }
-    if (filter.status >= 0)
-        sql += " AND status = " + std::to_string(filter.status);
-    if (filter.since > 0)
-        sql += " AND timestamp >= " + std::to_string(filter.since);
-    if (filter.until > 0)
-        sql += " AND timestamp <= " + std::to_string(filter.until);
+    if (filter.status >= 0) {
+        sql += " AND status = ?";
+        int_binds.emplace_back(bind_idx++, static_cast<int64_t>(filter.status));
+    }
+    if (filter.since > 0) {
+        sql += " AND timestamp >= ?";
+        int_binds.emplace_back(bind_idx++, filter.since);
+    }
+    if (filter.until > 0) {
+        sql += " AND timestamp <= ?";
+        int_binds.emplace_back(bind_idx++, filter.until);
+    }
 
     sql += " GROUP BY " + aq.group_by + " ORDER BY COUNT(*) DESC";
 
@@ -228,6 +257,9 @@ std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instr
 
     for (int i = 0; i < static_cast<int>(bind_texts.size()); ++i) {
         sqlite3_bind_text(stmt, i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& [idx, val] : int_binds) {
+        sqlite3_bind_int64(stmt, idx, val);
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -310,17 +342,20 @@ void ResponseStore::run_cleanup() {
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();
 
-        char* err = nullptr;
-        auto sql = "DELETE FROM responses WHERE ttl_expires_at > 0 AND ttl_expires_at < " +
-                   std::to_string(now);
-        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK) {
-            auto deleted = sqlite3_changes(db_);
-            if (deleted > 0) {
-                spdlog::info("ResponseStore: expired {} rows", deleted);
+        sqlite3_stmt* cleanup_stmt = nullptr;
+        if (sqlite3_prepare_v2(
+                db_, "DELETE FROM responses WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
+                -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(cleanup_stmt, 1, now);
+            if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
+                auto deleted = sqlite3_changes(db_);
+                if (deleted > 0) {
+                    spdlog::info("ResponseStore: expired {} rows", deleted);
+                }
+            } else {
+                spdlog::warn("ResponseStore: cleanup error: {}", sqlite3_errmsg(db_));
             }
-        } else {
-            spdlog::warn("ResponseStore: cleanup error: {}", err ? err : "unknown");
-            sqlite3_free(err);
+            sqlite3_finalize(cleanup_stmt);
         }
     }
 }

@@ -1,0 +1,261 @@
+## OS Information Plugin Definitions
+## Queries operating system name, version, build identifier, CPU
+## architecture, and system uptime from each endpoint.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.os_info.os_name
+  displayName: Operating System Name
+  version: 1.0.0
+  description: >
+    Returns the full OS product name (e.g. "Windows 11 Pro",
+    "Ubuntu 24.04.1 LTS", "macOS 15.2"). On Windows, reads the registry
+    ProductName and corrects the Windows 10/11 naming for builds >= 22000.
+    On Linux, reads PRETTY_NAME from /etc/os-release. On macOS, uses
+    sw_vers.
+  tags: [os, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: os_info
+    action: os_name
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: os_name
+        type: string
+
+  readablePayload: "Get operating system name"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [os_info]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.os_info.os_version
+  displayName: OS Kernel / Version String
+  version: 1.0.0
+  description: >
+    Returns the OS version string. On Windows, reports Major.Minor.Build
+    from RtlGetVersion (avoids manifest-dependent version lies). On Linux
+    and macOS, reports the kernel release from uname. On macOS, also
+    returns the user-facing product version from sw_vers.
+  tags: [os, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: os_info
+    action: os_version
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: os_version
+        type: string
+      - name: os_product_version
+        type: string
+
+  readablePayload: "Get OS version string"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [os_info]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.os_info.os_build
+  displayName: OS Build Identifier
+  version: 1.0.0
+  description: >
+    Returns the OS build identifier. On Windows, reports
+    CurrentBuildNumber.UBR from the registry (e.g. "22631.4890"). On
+    Linux, extracts the kernel build version from /proc/version. On
+    macOS, returns the build version from sw_vers -buildVersion.
+  tags: [os, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: os_info
+    action: os_build
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: os_build
+        type: string
+
+  readablePayload: "Get OS build identifier"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [os_info]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.os_info.os_arch
+  displayName: CPU Architecture
+  version: 1.0.0
+  description: >
+    Returns the CPU architecture of the endpoint (e.g. "x86_64",
+    "aarch64", "arm"). On Windows, uses GetNativeSystemInfo. On Linux
+    and macOS, uses uname().machine.
+  tags: [os, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: os_info
+    action: os_arch
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: os_arch
+        type: string
+
+  readablePayload: "Get CPU architecture"
+
+  gather:
+    ttlSeconds: 86400
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [os_info]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.os_info.uptime
+  displayName: System Uptime
+  version: 1.0.0
+  description: >
+    Returns the system uptime in seconds and a human-readable display
+    string (e.g. "12d 5h 23m"). Uses /proc/uptime on Linux,
+    kern.boottime sysctl on macOS, GetTickCount64 on Windows.
+  tags: [os, health, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: os_info
+    action: uptime
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: uptime_seconds
+        type: int64
+      - name: uptime_display
+        type: string
+
+  readablePayload: "Get system uptime"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [os_info]
+
+status:
+  phase: active

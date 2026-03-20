@@ -1,0 +1,100 @@
+## Indicator of Compromise (IOC) Checking Definition
+## Checks IOCs against local endpoint state: active connections,
+## DNS cache, file hashes, file existence, and listening ports.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.ioc.check
+  displayName: Check Indicators of Compromise
+  version: 1.0.0
+  description: >
+    Check one or more Indicators of Compromise against the local endpoint
+    state. Supports five IOC types: IP addresses (checked against active
+    TCP/UDP connections), domains (checked against DNS cache on Windows or
+    /etc/hosts on Linux/macOS), file hashes (SHA-256 compared against
+    specified file paths), file paths (existence and size), and ports
+    (checked for listening services). All parameters are optional but at
+    least one must be provided. Values within each parameter are
+    comma-separated.
+  tags: [security, ioc, threat-hunting, incident-response]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: ioc
+    action: check
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      ip_addresses:
+        type: string
+        displayName: IP Addresses
+        description: >
+          Comma-separated list of IP addresses to check against active
+          network connections (TCP and UDP).
+      domains:
+        type: string
+        displayName: Domain Names
+        description: >
+          Comma-separated list of domain names to check against the DNS
+          resolver cache (Windows) or /etc/hosts (Linux/macOS).
+      file_hashes:
+        type: string
+        displayName: File Hashes (SHA-256)
+        description: >
+          Comma-separated list of SHA-256 hashes to compare against files
+          specified in file_paths. Both parameters should be provided for
+          hash matching.
+      file_paths:
+        type: string
+        displayName: File Paths
+        description: >
+          Comma-separated list of file paths to check for existence and
+          size. Also used as the target set for file_hashes comparison.
+      ports:
+        type: string
+        displayName: Ports
+        description: >
+          Comma-separated list of port numbers to check for listening
+          or established services.
+
+  result:
+    columns:
+      - name: type
+        type: string
+      - name: value
+        type: string
+      - name: matched
+        type: bool
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [type, matched]
+      operations: [count]
+
+  readablePayload: >
+    IOC check: IPs=${ip_addresses}, domains=${domains},
+    hashes=${file_hashes}, files=${file_paths}, ports=${ports}
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [ioc]
+
+status:
+  phase: active

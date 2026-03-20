@@ -1,0 +1,45 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.security.endpoint-security
+  displayName: Endpoint Security Posture
+  version: 1.0.0
+  description: >
+    Security posture assessment instructions covering antivirus product
+    detection, firewall state and rules, disk encryption verification,
+    host vulnerability scanning, and event log analysis. Provides the
+    foundational security visibility needed for compliance dashboards
+    and policy enforcement.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+    approveRoles: [security-admin]
+
+  contents:
+    instructionDefinitions:
+      # Antivirus detection
+      - security.antivirus.products
+      - security.antivirus.defender_status
+      # Firewall state and rules
+      - security.firewall.state
+      - security.firewall.rules
+      # Disk encryption
+      - security.encryption.state
+      # Vulnerability scanning
+      - security.vuln_scan.scan
+      - security.vuln_scan.cve_scan
+      - security.vuln_scan.config_scan
+      - security.vuln_scan.summary
+      - security.vuln_scan.inventory
+      # Event log analysis
+      - device.event_logs.errors
+      - device.event_logs.query
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

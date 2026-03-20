@@ -1,0 +1,63 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.crossplatform.system
+  displayName: Core System Inventory & Diagnostics
+  version: 1.0.0
+  description: >
+    Foundational cross-platform instruction set covering hardware
+    inventory (manufacturer, model, BIOS, CPU, memory, disks), OS
+    information (name, version, build, architecture, uptime), device
+    identity (hostname, domain, OU), agent status (version, info,
+    health, plugins, modules, connection, switch, config), agent
+    diagnostics (log level, certificates, connection info), and agent
+    runtime actions (set log level, agent info query).
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      # Hardware plugin
+      - device.hardware.manufacturer
+      - device.hardware.model
+      - device.hardware.bios
+      - device.hardware.processors
+      - device.hardware.memory
+      - device.hardware.disks
+      # OS info plugin
+      - device.os_info.os_name
+      - device.os_info.os_version
+      - device.os_info.os_build
+      - device.os_info.os_arch
+      - device.os_info.uptime
+      # Device identity plugin
+      - device.device_identity.device_name
+      - device.device_identity.domain
+      - device.device_identity.ou
+      # Status plugin
+      - device.status.version
+      - device.status.info
+      - device.status.health
+      - device.status.plugins
+      - device.status.modules
+      - device.status.connection
+      - device.status.switch
+      - device.status.config
+      # Diagnostics plugin
+      - device.diagnostics.log_level
+      - device.diagnostics.certificates
+      - device.diagnostics.connection_info
+      # Agent actions plugin
+      - device.agent_actions.set_log_level
+      - device.agent_actions.info
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

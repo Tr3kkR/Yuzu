@@ -1,0 +1,238 @@
+## Script Execution Definitions
+## Provides command execution, PowerShell scripting, and bash scripting
+## with streaming output, timeout enforcement, and exit code reporting.
+## All actions are admin-only due to their privileged nature.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.script_exec.exec
+  displayName: Execute Command
+  version: 1.1.0
+  description: >
+    Execute a command with arguments directly on the endpoint. No shell
+    interpretation is applied — the program is invoked via CreateProcess
+    (Windows) or execvp (POSIX). Stdout and stderr are streamed back
+    line-by-line. Enforces a configurable timeout (default 300 seconds,
+    max 3600). Returns the process exit code and final status.
+  tags: [scripting, execution, admin, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: script_exec
+    action: exec
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [command]
+    properties:
+      command:
+        type: string
+        displayName: Command
+        description: >
+          Full path or name of the program to execute. Resolved via PATH
+          on POSIX systems.
+        validation:
+          maxLength: 4096
+      args:
+        type: string
+        displayName: Arguments
+        description: >
+          Space-separated arguments passed to the command. Supports
+          single and double quoting for arguments containing spaces.
+        validation:
+          maxLength: 8192
+      timeout:
+        type: int32
+        displayName: Timeout (seconds)
+        description: >
+          Maximum execution time in seconds. Process is terminated if
+          this threshold is exceeded. Range: 1-3600.
+        default: 300
+        validation:
+          minimum: 1
+          maximum: 3600
+
+  result:
+    columns:
+      - name: stream
+        type: string
+      - name: content
+        type: string
+      - name: exit_code
+        type: int32
+      - name: status
+        type: string
+
+  readablePayload: "Execute command '${command}' with args '${args}'"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [script_exec]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.script_exec.powershell
+  displayName: Run PowerShell Script
+  version: 1.1.0
+  description: >
+    Execute a PowerShell script on a Windows endpoint. The script is
+    Base64-encoded as UTF-16LE and passed via -EncodedCommand to prevent
+    shell metacharacter injection. Runs with -NoProfile -NonInteractive.
+    Output is streamed line-by-line with timeout enforcement.
+  tags: [scripting, powershell, windows, admin, remediation]
+
+spec:
+  type: action
+  platforms: [windows]
+
+  execution:
+    plugin: script_exec
+    action: powershell
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [script]
+    properties:
+      script:
+        type: string
+        displayName: PowerShell Script
+        description: >
+          The PowerShell script body to execute. Automatically encoded
+          as UTF-16LE Base64 for safe transport.
+        validation:
+          maxLength: 65536
+      timeout:
+        type: int32
+        displayName: Timeout (seconds)
+        description: >
+          Maximum execution time in seconds. Range: 1-3600.
+        default: 300
+        validation:
+          minimum: 1
+          maximum: 3600
+
+  result:
+    columns:
+      - name: stream
+        type: string
+      - name: content
+        type: string
+      - name: exit_code
+        type: int32
+      - name: status
+        type: string
+
+  readablePayload: "Run PowerShell script (${timeout}s timeout)"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [script_exec]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.script_exec.bash
+  displayName: Run Bash Script
+  version: 1.1.0
+  description: >
+    Execute a bash script on a Linux or macOS endpoint. The script body
+    is passed as a single argument to /bin/bash -c via execvp (no shell
+    expansion of the outer wrapper). Output is streamed line-by-line
+    with timeout enforcement.
+  tags: [scripting, bash, linux, macos, admin, remediation]
+
+spec:
+  type: action
+  platforms: [linux, darwin]
+
+  execution:
+    plugin: script_exec
+    action: bash
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [script]
+    properties:
+      script:
+        type: string
+        displayName: Bash Script
+        description: >
+          The bash script body to execute. Passed to /bin/bash -c.
+        validation:
+          maxLength: 65536
+      timeout:
+        type: int32
+        displayName: Timeout (seconds)
+        description: >
+          Maximum execution time in seconds. Range: 1-3600.
+        default: 300
+        validation:
+          minimum: 1
+          maximum: 3600
+
+  result:
+    columns:
+      - name: stream
+        type: string
+      - name: content
+        type: string
+      - name: exit_code
+        type: int32
+      - name: status
+        type: string
+
+  readablePayload: "Run bash script (${timeout}s timeout)"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [script_exec]
+
+status:
+  phase: active

@@ -1,0 +1,467 @@
+## Agent Status Plugin Definitions
+## Queries agent version, platform info, health metrics, loaded plugins,
+## loaded modules, server connection details, switch state, and full
+## agent configuration.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.version
+  displayName: Agent Version
+  version: 1.0.0
+  description: >
+    Returns the agent version string, build number, and git commit hash.
+    Reads compile-time constants from yuzu/version.hpp.
+  tags: [agent, version, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: version
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: version
+        type: string
+      - name: build_number
+        type: string
+      - name: git_commit
+        type: string
+
+  readablePayload: "Get agent version"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.info
+  displayName: Agent Platform Info
+  version: 1.0.0
+  description: >
+    Returns the agent's platform OS name, CPU architecture, and
+    hostname. Uses uname on Linux/macOS, GetNativeSystemInfo and
+    GetComputerNameA on Windows.
+  tags: [agent, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: os
+        type: string
+      - name: arch
+        type: string
+      - name: hostname
+        type: string
+
+  readablePayload: "Get agent platform info"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.health
+  displayName: Agent Health
+  version: 1.0.0
+  description: >
+    Returns agent health metrics: uptime in seconds since plugin init,
+    current epoch timestamp in milliseconds, and process resident set
+    size (RSS) in kilobytes.
+  tags: [agent, health, monitoring]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: health
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: uptime_seconds
+        type: int64
+      - name: timestamp_epoch_ms
+        type: int64
+      - name: memory_rss_kb
+        type: int64
+
+  readablePayload: "Get agent health metrics"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.plugins
+  displayName: Loaded Plugins
+  version: 1.0.0
+  description: >
+    Lists all plugins currently loaded by the agent, with their name,
+    version, and description. Returns the total plugin count followed
+    by one row per plugin.
+  tags: [agent, inventory, plugins]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: plugins
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: plugins_count
+        type: int32
+      - name: plugin_name
+        type: string
+      - name: plugin_version
+        type: string
+      - name: plugin_description
+        type: string
+
+  readablePayload: "List loaded plugins"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.modules
+  displayName: Loaded Modules
+  version: 1.0.0
+  description: >
+    Lists all modules currently loaded by the agent, with their name,
+    version, status, and optional description. Returns the total module
+    count followed by one row per module.
+  tags: [agent, inventory, modules]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: modules
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: modules_count
+        type: int32
+      - name: module_name
+        type: string
+      - name: module_version
+        type: string
+      - name: module_status
+        type: string
+      - name: module_description
+        type: string
+
+  readablePayload: "List loaded modules"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.connection
+  displayName: Server Connection Details
+  version: 1.0.0
+  description: >
+    Returns the agent's server connection details: server address, TLS
+    status, encryption status, debug mode, verbose logging flag, and
+    log level.
+  tags: [agent, connection, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: connection
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: server_address
+        type: string
+      - name: tls_enabled
+        type: bool
+      - name: encrypted
+        type: bool
+      - name: debug_mode
+        type: bool
+      - name: verbose_logging
+        type: bool
+      - name: log_level
+        type: string
+
+  readablePayload: "Get server connection details"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.switch
+  displayName: Switch / Session State
+  version: 1.0.0
+  description: >
+    Returns the agent's switch state: the server address it is connected
+    to, current session ID, connection timestamp, and reconnect count.
+  tags: [agent, connection, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: switch
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: switch_address
+        type: string
+      - name: session_id
+        type: string
+      - name: connected_since
+        type: string
+      - name: reconnect_count
+        type: int32
+
+  readablePayload: "Get switch / session state"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.status.config
+  displayName: Full Agent Configuration
+  version: 1.0.0
+  description: >
+    Returns the full agent configuration: agent ID, version, build
+    number, git commit, server address, TLS status, heartbeat interval,
+    plugin directory, data directory, log level, debug mode, and verbose
+    logging flag.
+  tags: [agent, configuration, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: status
+    action: config
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: agent_id
+        type: string
+      - name: agent_version
+        type: string
+      - name: build_number
+        type: string
+      - name: git_commit
+        type: string
+      - name: server_address
+        type: string
+      - name: tls_enabled
+        type: bool
+      - name: heartbeat_interval
+        type: string
+      - name: plugin_dir
+        type: string
+      - name: data_dir
+        type: string
+      - name: log_level
+        type: string
+      - name: debug_mode
+        type: bool
+      - name: verbose_logging
+        type: bool
+
+  readablePayload: "Get full agent configuration"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [status]
+
+status:
+  phase: active

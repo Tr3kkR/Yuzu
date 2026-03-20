@@ -1,0 +1,42 @@
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: core.security.security-response
+  displayName: Security Response Toolkit
+  version: 1.0.0
+  description: >
+    A collection of security incident response and compliance verification
+    instructions. Includes device quarantine (network isolation with
+    whitelisting), indicator of compromise checking (IPs, domains, hashes,
+    files, ports), certificate inventory and management, and SCCM/ConfigMgr
+    client status queries.
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+    approveRoles: [security-admin]
+
+  contents:
+    instructionDefinitions:
+      # Quarantine (network isolation)
+      - security.quarantine.isolate
+      - security.quarantine.release
+      - security.quarantine.status
+      - security.quarantine.whitelist
+      # Indicator of Compromise checking
+      - security.ioc.check
+      # Certificate inventory and management
+      - security.certificates.list
+      - security.certificates.details
+      - security.certificates.delete
+      # SCCM/ConfigMgr client info (Windows-only)
+      - security.sccm.client_version
+      - security.sccm.site
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 90
+
+status:
+  phase: active

@@ -114,7 +114,7 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
         sql += " AND status = ?";
         binds.push_back(q.status);
     }
-    sql += " ORDER BY dispatched_at DESC LIMIT " + std::to_string(q.limit);
+    sql += " ORDER BY dispatched_at DESC LIMIT ?";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
@@ -122,6 +122,7 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
 
     for (int i = 0; i < static_cast<int>(binds.size()); ++i)
         sqlite3_bind_text(stmt, i + 1, binds[i].c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, static_cast<int>(binds.size()) + 1, q.limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW)
         results.push_back(row_to_exec(stmt));

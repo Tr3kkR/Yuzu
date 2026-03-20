@@ -1,0 +1,333 @@
+## Hardware Inventory Plugin Definitions
+## Queries manufacturer, model, BIOS/UEFI, processor, memory, and disk
+## information from each endpoint using WMI (Windows), sysfs/dmidecode
+## (Linux), or sysctl/system_profiler (macOS).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.manufacturer
+  displayName: Hardware Manufacturer
+  version: 1.0.0
+  description: >
+    Returns the system manufacturer string (e.g. "Dell Inc.",
+    "Apple Inc.", "Lenovo"). Uses Win32_ComputerSystem on Windows,
+    /sys/class/dmi/id/sys_vendor on Linux, sysctl on macOS.
+  tags: [hardware, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: manufacturer
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: manufacturer
+        type: string
+
+  readablePayload: "Get hardware manufacturer"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.model
+  displayName: Hardware Model
+  version: 1.0.0
+  description: >
+    Returns the system model or product name (e.g. "OptiPlex 7090",
+    "MacBookPro18,1"). Uses Win32_ComputerSystem on Windows,
+    /sys/class/dmi/id/product_name on Linux, sysctl hw.model on macOS.
+  tags: [hardware, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: model
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: model
+        type: string
+
+  readablePayload: "Get hardware model"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.bios
+  displayName: BIOS / UEFI Information
+  version: 1.0.0
+  description: >
+    Returns BIOS or UEFI firmware details: vendor, version, and release
+    date. Uses Win32_BIOS on Windows, /sys/class/dmi/id/bios_* on Linux,
+    and system_profiler Boot ROM on macOS.
+  tags: [hardware, inventory, firmware]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: bios
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: bios_vendor
+        type: string
+      - name: bios_version
+        type: string
+      - name: bios_date
+        type: string
+
+  readablePayload: "Get BIOS/UEFI information"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.processors
+  displayName: Installed Processors
+  version: 1.0.0
+  description: >
+    Lists installed CPUs with model name, physical core count, logical
+    thread count, and clock speed in MHz. Uses Win32_Processor on Windows,
+    /proc/cpuinfo on Linux, sysctl on macOS. Returns one row per physical
+    CPU socket.
+  tags: [hardware, inventory, cpu]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: processors
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: index
+        type: int32
+      - name: model
+        type: string
+      - name: cores
+        type: int32
+      - name: threads
+        type: int32
+      - name: clock_mhz
+        type: int32
+
+  readablePayload: "List installed processors"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.memory
+  displayName: Installed Memory Modules
+  version: 1.0.0
+  description: >
+    Lists installed memory DIMMs with slot locator, capacity in MB,
+    memory type (DDR3/DDR4/DDR5), and speed in MHz. Uses
+    Win32_PhysicalMemory on Windows, dmidecode on Linux (falls back to
+    /proc/meminfo total), sysctl hw.memsize on macOS.
+  tags: [hardware, inventory, memory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: memory
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: slot
+        type: string
+      - name: size_mb
+        type: int64
+      - name: type
+        type: string
+      - name: speed_mhz
+        type: int32
+
+  readablePayload: "List installed memory modules"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.hardware.disks
+  displayName: Physical Disk Drives
+  version: 1.0.0
+  description: >
+    Lists physical disk drives with model name, capacity in GB, media
+    type (SSD/HDD/Removable), and interface type (SCSI, NVMe, SATA, USB).
+    Uses Win32_DiskDrive on Windows, lsblk on Linux, system_profiler on
+    macOS.
+  tags: [hardware, inventory, storage]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: hardware
+    action: disks
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: index
+        type: int32
+      - name: model
+        type: string
+      - name: size_gb
+        type: int64
+      - name: media_type
+        type: string
+      - name: interface
+        type: string
+
+  readablePayload: "List physical disk drives"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active

@@ -1,0 +1,73 @@
+## Disk Encryption Status Definitions
+## Reports BitLocker, LUKS, and FileVault encryption state per volume.
+## Plugin: bitlocker | Actions: state
+##
+## Sources by platform:
+##   Windows: manage-bde -status (BitLocker)
+##   Linux:   lsblk + cryptsetup status (LUKS)
+##   macOS:   fdesetup status (FileVault)
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.encryption.state
+  displayName: Disk Encryption Status
+  version: 1.0.0
+  description: >
+    Query disk encryption status on the endpoint. On Windows, runs
+    manage-bde to report BitLocker status per volume including
+    conversion status, percentage encrypted, encryption method, and
+    protection state. On Linux, scans block devices for LUKS volumes
+    via lsblk and cryptsetup. On macOS, queries FileVault status via
+    fdesetup. Essential for compliance verification that endpoint
+    storage is encrypted at rest.
+  tags: [security, encryption, bitlocker, luks, filevault, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: bitlocker
+    action: state
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: volume
+        type: string
+      - name: conversion_status
+        type: string
+      - name: percentage_encrypted
+        type: string
+      - name: encryption_method
+        type: string
+      - name: protection_status
+        type: string
+    aggregation:
+      groupBy: [protection_status]
+      operations: [count]
+
+  readablePayload: "Query disk encryption status"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [bitlocker]
+
+status:
+  phase: active

@@ -1,0 +1,133 @@
+## System Services Definitions
+## Enumerates installed and running system services on all platforms.
+## Plugin: services | Actions: list, running
+##
+## Note: Output columns vary by platform:
+##   Windows: name, display_name, status, startup_type
+##   Linux:   name, status, description
+##   macOS:   label, pid, status
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.service.list
+  displayName: List All Services
+  version: 1.0.0
+  description: >
+    Lists all installed system services regardless of their current
+    state. On Windows, uses the Service Control Manager to enumerate
+    Win32 services with name, display name, status, and startup type.
+    On Linux, queries systemctl for all service units. On macOS, uses
+    launchctl to list launchd services.
+  tags: [services, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: services
+    action: list
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: display_name
+        type: string
+      - name: status
+        type: string
+      - name: startup_type
+        type: string
+    aggregation:
+      groupBy:
+        - status
+      operations:
+        - count
+
+  readablePayload: "List all installed services"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [services]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.service.running
+  displayName: List Running Services
+  version: 1.0.0
+  description: >
+    Lists only services that are currently running. On Windows,
+    filters to SERVICE_ACTIVE state. On Linux, filters systemctl
+    to --state=running. On macOS, filters launchctl output to
+    services with a non-dash PID.
+  tags: [services, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: services
+    action: running
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: name
+        type: string
+      - name: display_name
+        type: string
+      - name: status
+        type: string
+      - name: startup_type
+        type: string
+    aggregation:
+      groupBy:
+        - status
+      operations:
+        - count
+
+  readablePayload: "List running services"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [services]
+
+status:
+  phase: active

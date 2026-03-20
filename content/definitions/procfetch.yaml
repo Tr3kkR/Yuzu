@@ -1,0 +1,68 @@
+## Process Fetch (Deep Enumeration) Definitions
+## Enumerates running processes with executable path and SHA-1 hash.
+## Plugin: procfetch | Actions: procfetch_fetch
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.process.fetch
+  displayName: Fetch Processes with Hashes
+  version: 1.0.0
+  description: >
+    Deep process enumeration that returns PID, process name, full
+    executable path, and SHA-1 hash of each executable binary.
+    Hashes are cached per path to avoid re-hashing duplicate
+    executables (e.g. svchost.exe). Useful for security auditing,
+    IOC matching, and software inventory validation.
+    Supported on Windows (CreateToolhelp32Snapshot + BCrypt) and
+    Linux (/proc + OpenSSL EVP).
+  tags: [processes, security, hashing, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: procfetch
+    action: procfetch_fetch
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: pid
+        type: int64
+      - name: name
+        type: string
+      - name: path
+        type: string
+      - name: sha1
+        type: string
+    aggregation:
+      groupBy:
+        - name
+      operations:
+        - count
+
+  readablePayload: "Fetch running processes with SHA-1 hashes"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [procfetch]
+
+status:
+  phase: active
