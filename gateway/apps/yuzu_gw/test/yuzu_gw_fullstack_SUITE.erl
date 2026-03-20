@@ -1,20 +1,13 @@
 %%%-------------------------------------------------------------------
-%%% @doc Full-stack tests: real C++ server + Erlang gateway + simulated agents.
+%%% @doc Full-stack tests: gateway modules + mocked upstream gRPC.
 %%%
-%%% These tests verify end-to-end behaviour with the actual upstream
-%%% server running.  The gateway modules (registry, upstream, router)
-%%% are started inside the test VM and the upstream gRPC channel points
-%%% at the running server.  Agent-side gRPC calls are simulated by
-%%% invoking the gateway's service handlers directly.
-%%%
-%%% Prerequisites:
-%%%   1. The C++ yuzu-server must be running on the configured port.
-%%%   2. No other gateway instance should be listening on ports
-%%%      50051/50052 (or override via env vars).
+%%% These tests verify end-to-end behaviour of the gateway modules
+%%% (registry, upstream, router) with a mocked gRPC layer.  The
+%%% upstream C++ server is replaced by meck stubs on grpcbox_channel
+%%% and grpcbox_client that return canned responses, so no external
+%%% process is needed.
 %%%
 %%% Configuration:
-%%%   YUZU_SERVER_HOST  — server hostname (default 127.0.0.1)
-%%%   YUZU_SERVER_PORT  — server gRPC port  (default 50054)
 %%%   YUZU_FULLSTACK_AGENTS — concurrent agent count (default 20)
 %%%
 %%% Run:
@@ -43,50 +36,42 @@ suite() ->
     [{timetrap, {minutes, 5}}].
 
 init_per_suite(Config) ->
-    ServerHost = os:getenv("YUZU_SERVER_HOST", "127.0.0.1"),
-    ServerPort = get_env_int("YUZU_SERVER_PORT", 50054),
-
-    %% Verify the C++ server is reachable.
-    case gen_tcp:connect(ServerHost, ServerPort, [], 3000) of
-        {ok, Sock} ->
-            gen_tcp:close(Sock),
-            do_init_suite(ServerHost, ServerPort, Config);
-        {error, Reason} ->
-            {skip, lists:flatten(io_lib:format(
-                "Server not reachable at ~s:~B (~p) — start yuzu-server first",
-                [ServerHost, ServerPort, Reason]))}
-    end.
-
-do_init_suite(ServerHost, ServerPort, Config) ->
     %% Start dependencies.
-    ok = ensure_started(grpcbox),
     ok = ensure_started(ctx),
+    ok = ensure_started(gproc),
 
-    %% Set up the upstream gRPC channel (same name the upstream module uses).
-    ok = setup_upstream_channel(ServerHost, ServerPort),
+    %% Mock the gRPC transport layer so we never hit a real server.
+    ok = setup_upstream_mocks(),
 
-    %% Start gateway modules.
+    %% Start gateway modules (unlink so they outlive CT process transitions).
     case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _         -> ok
+        undefined ->
+            {ok, PgPid} = pg:start_link(yuzu_gw),
+            unlink(PgPid);
+        _ -> ok
     end,
     catch yuzu_gw_telemetry:setup(),
     case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _         -> ok
+        undefined ->
+            {ok, RegPid} = yuzu_gw_registry:start_link(),
+            unlink(RegPid);
+        _ -> ok
     end,
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 1000),
     case whereis(yuzu_gw_upstream) of
-        undefined -> {ok, _} = yuzu_gw_upstream:start_link();
-        _         -> ok
+        undefined ->
+            {ok, UpPid} = yuzu_gw_upstream:start_link(),
+            unlink(UpPid);
+        _ -> ok
     end,
     case whereis(yuzu_gw_router) of
-        undefined -> {ok, _} = yuzu_gw_router:start_link();
-        _         -> ok
+        undefined ->
+            {ok, RouterPid} = yuzu_gw_router:start_link(),
+            unlink(RouterPid);
+        _ -> ok
     end,
 
-    [{server_host, ServerHost},
-     {server_port, ServerPort} | Config].
+    Config.
 
 end_per_suite(_Config) ->
     %% Deregister all agents.
@@ -96,6 +81,9 @@ end_per_suite(_Config) ->
         timer:sleep(500)
     catch _:_ -> ok
     end,
+    %% Unload mocks.
+    catch meck:unload(grpcbox_channel),
+    catch meck:unload(grpcbox_client),
     ok.
 
 init_per_testcase(_TC, Config) ->
@@ -347,23 +335,60 @@ ensure_started(App) ->
         {error, Reason}    -> {error, Reason}
     end.
 
-%% @doc Set up a grpcbox channel named `default_channel` pointing at the server.
-%% This is the channel name used by yuzu_gw_upstream's do_rpc/3.
-setup_upstream_channel(Host, Port) ->
-    %% Configure grpcbox client environment before (re)starting.
-    Endpoint = case Port of
-        443 -> {https, Host, Port, []};
-        _   -> {http, Host, Port, []}
-    end,
-    application:set_env(grpcbox, client, #{
-        channels => [
-            {default_channel, [Endpoint], #{}}
-        ]
-    }),
-    %% Restart grpcbox to pick up the new channel config.
-    _ = application:stop(grpcbox),
-    {ok, _} = application:ensure_all_started(grpcbox),
+%% @doc Mock grpcbox_channel and grpcbox_client so that
+%% yuzu_gw_upstream's do_rpc/3 gets canned responses without
+%% needing a real gRPC server.
+%%
+%% RPC dispatch is based on the Path binary that do_rpc/3 builds:
+%%   "/yuzu.gateway.v1.GatewayUpstream/ProxyRegister"
+%%   "/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat"
+%%   "/yuzu.gateway.v1.GatewayUpstream/ProxyInventory"
+%%   "/yuzu.gateway.v1.GatewayUpstream/NotifyStreamStatus"
+setup_upstream_mocks() ->
+    %% grpcbox_channel:pick/2 is called internally by grpcbox_client.
+    meck:new(grpcbox_channel, [non_strict, no_link]),
+    meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
+
+    %% grpcbox_client:unary/5 is the actual RPC call site.
+    SessionCounter = atomics:new(1, []),
+    meck:new(grpcbox_client, [non_strict, no_link]),
+    meck:expect(grpcbox_client, unary, fun(_Ctx, Path, Req, _Def, _Opts) ->
+        mock_upstream_rpc(Path, Req, SessionCounter)
+    end),
     ok.
+
+%% @doc Route a mock upstream RPC based on the method in the Path.
+mock_upstream_rpc(Path, Req, SessionCounter) ->
+    case classify_rpc(Path) of
+        proxy_register ->
+            N = atomics:add_get(SessionCounter, 1, 1),
+            SessionId = iolist_to_binary(
+                io_lib:format("mock-session-~6..0B", [N])),
+            {ok, #{session_id => SessionId,
+                   heartbeat_interval_seconds => 30,
+                   server_version => <<"mock-0.1.0">>}, #{}};
+        batch_heartbeat ->
+            HBs = maps:get(heartbeats, Req, []),
+            {ok, #{acknowledged_count => length(HBs)}, #{}};
+        proxy_inventory ->
+            {ok, #{received => true}, #{}};
+        notify_stream_status ->
+            {ok, #{acknowledged => true}, #{}};
+        unknown ->
+            {ok, #{}, #{}}
+    end.
+
+classify_rpc(Path) when is_binary(Path) ->
+    case {binary:match(Path, <<"ProxyRegister">>),
+          binary:match(Path, <<"BatchHeartbeat">>),
+          binary:match(Path, <<"ProxyInventory">>),
+          binary:match(Path, <<"NotifyStreamStatus">>)} of
+        {{_, _}, _, _, _} -> proxy_register;
+        {_, {_, _}, _, _} -> batch_heartbeat;
+        {_, _, {_, _}, _} -> proxy_inventory;
+        {_, _, _, {_, _}} -> notify_stream_status;
+        _                 -> unknown
+    end.
 
 flush_mailbox() ->
     receive _ -> flush_mailbox()
