@@ -7,7 +7,9 @@
 #include "audit_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
@@ -45,7 +47,9 @@ public:
                          ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
                          ApprovalManager* approval_manager, TagStore* tag_store,
                          AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
-                         TagPushFn tag_push_fn = {});
+                         TagPushFn tag_push_fn = {},
+                         InventoryStore* inventory_store = nullptr,
+                         ProductPackStore* product_pack_store = nullptr);
 
 private:
     // JSON envelope helpers
@@ -53,6 +57,12 @@ private:
     static nlohmann::json error_response(const std::string& message, int code = 0);
     static nlohmann::json list_response(const nlohmann::json& data, int64_t total,
                                         int64_t start = 0, int64_t page_size = 50);
+
+    // CORS helper — adds CORS headers to a response for /api/v1/* routes
+    static void add_cors_headers(httplib::Response& res);
+
+    // OpenAPI 3.0 spec generator
+    static std::string generate_openapi_spec();
 };
 
 } // namespace yuzu::server

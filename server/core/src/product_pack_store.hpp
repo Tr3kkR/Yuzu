@@ -29,6 +29,7 @@ struct ProductPack {
     std::string description;
     std::string yaml_source;    // The full multi-document YAML bundle
     int64_t installed_at{0};
+    bool verified{false};       // Whether the Ed25519 signature was verified
 
     // Populated by get()
     std::vector<ProductPackItem> items;
@@ -85,6 +86,16 @@ public:
 
     // Minimal YAML value extraction — public so install callbacks can use it
     static std::string extract_yaml_value(const std::string& yaml, const std::string& key);
+
+    /// Verify an Ed25519 signature over content.
+    /// Uses OpenSSL EVP_DigestVerify on Unix, BCrypt on Windows.
+    /// @param content     The data that was signed
+    /// @param signature_hex  Hex-encoded Ed25519 signature (128 hex chars = 64 bytes)
+    /// @param public_key_hex Hex-encoded Ed25519 public key (64 hex chars = 32 bytes)
+    /// @return true if signature is valid, false otherwise
+    static bool verify_signature(const std::string& content,
+                                 const std::string& signature_hex,
+                                 const std::string& public_key_hex);
 
 private:
     sqlite3* db_{nullptr};

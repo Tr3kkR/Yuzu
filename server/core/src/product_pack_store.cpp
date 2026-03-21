@@ -3,9 +3,20 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 #include <shared_mutex>
+#include <stdexcept>
+
+// Platform-specific crypto for Ed25519 signature verification
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+#else
+#include <openssl/evp.h>
+#endif
 
 namespace yuzu::server {
 
@@ -122,6 +133,141 @@ std::vector<std::string> ProductPackStore::split_yaml_documents(const std::strin
     return docs;
 }
 
+// ── Hex decode helper ───────────────────────────────────────────────────────
+
+namespace {
+
+bool hex_decode(const std::string& hex, std::vector<uint8_t>& out) {
+    if (hex.size() % 2 != 0)
+        return false;
+    out.resize(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        unsigned int byte = 0;
+        auto hi = hex[i];
+        auto lo = hex[i + 1];
+
+        auto hex_val = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            return -1;
+        };
+
+        int h = hex_val(hi);
+        int l = hex_val(lo);
+        if (h < 0 || l < 0)
+            return false;
+        byte = static_cast<unsigned int>((h << 4) | l);
+        out[i / 2] = static_cast<uint8_t>(byte);
+    }
+    return true;
+}
+
+} // namespace
+
+// ── Ed25519 signature verification ──────────────────────────────────────────
+
+bool ProductPackStore::verify_signature(const std::string& content,
+                                        const std::string& signature_hex,
+                                        const std::string& public_key_hex) {
+    // Decode hex strings
+    std::vector<uint8_t> sig_bytes;
+    std::vector<uint8_t> key_bytes;
+
+    if (!hex_decode(signature_hex, sig_bytes) || sig_bytes.size() != 64) {
+        spdlog::warn("ProductPackStore: invalid signature hex (expected 128 hex chars / 64 bytes)");
+        return false;
+    }
+    if (!hex_decode(public_key_hex, key_bytes) || key_bytes.size() != 32) {
+        spdlog::warn("ProductPackStore: invalid public key hex (expected 64 hex chars / 32 bytes)");
+        return false;
+    }
+
+#ifdef _WIN32
+    // Windows: BCrypt Ed25519 verification
+    // Note: Ed25519 support requires Windows 10 1809+ with BCRYPT_ECC_CURVE_25519
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::warn("ProductPackStore: BCryptOpenAlgorithmProvider failed: 0x{:08x}",
+                      static_cast<unsigned int>(status));
+        return false;
+    }
+
+    // Set the Ed25519 curve
+    status = BCryptSetProperty(alg, BCRYPT_ECC_CURVE_NAME,
+                               reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_ECC_CURVE_25519)),
+                               static_cast<ULONG>((wcslen(BCRYPT_ECC_CURVE_25519) + 1) * sizeof(wchar_t)),
+                               0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::warn("ProductPackStore: BCrypt Ed25519 curve not available (0x{:08x}). "
+                      "Ed25519 requires Windows 10 1809+", static_cast<unsigned int>(status));
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    // Build the public key blob: BCRYPT_ECCKEY_BLOB header + 32 bytes of public key
+    struct {
+        BCRYPT_ECCKEY_BLOB header;
+        uint8_t key_data[32];
+    } key_blob;
+    key_blob.header.dwMagic = BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC;
+    key_blob.header.cbKey = 32;
+    std::memcpy(key_blob.key_data, key_bytes.data(), 32);
+
+    BCRYPT_KEY_HANDLE key_handle = nullptr;
+    status = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+                                  &key_handle, reinterpret_cast<PUCHAR>(&key_blob),
+                                  sizeof(key_blob), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::warn("ProductPackStore: BCryptImportKeyPair failed: 0x{:08x}",
+                      static_cast<unsigned int>(status));
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    // Verify the signature
+    status = BCryptVerifySignature(key_handle, nullptr,
+                                   reinterpret_cast<PUCHAR>(const_cast<char*>(content.data())),
+                                   static_cast<ULONG>(content.size()),
+                                   const_cast<PUCHAR>(sig_bytes.data()),
+                                   static_cast<ULONG>(sig_bytes.size()), 0);
+
+    bool valid = BCRYPT_SUCCESS(status);
+    BCryptDestroyKey(key_handle);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return valid;
+
+#else
+    // Unix: OpenSSL EVP Ed25519 verification
+    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr,
+                                                   key_bytes.data(), key_bytes.size());
+    if (!pkey) {
+        spdlog::warn("ProductPackStore: EVP_PKEY_new_raw_public_key (Ed25519) failed");
+        return false;
+    }
+
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
+    bool valid = false;
+    if (EVP_DigestVerifyInit(md_ctx, nullptr, nullptr, nullptr, pkey) == 1) {
+        int rc = EVP_DigestVerify(md_ctx,
+                                   sig_bytes.data(), sig_bytes.size(),
+                                   reinterpret_cast<const unsigned char*>(content.data()),
+                                   content.size());
+        valid = (rc == 1);
+    }
+
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(pkey);
+    return valid;
+#endif
+}
+
 // ── Construction / destruction ──────────────────────────────────────────────
 
 ProductPackStore::ProductPackStore(const std::filesystem::path& db_path) {
@@ -161,7 +307,8 @@ void ProductPackStore::create_tables() {
             version TEXT NOT NULL DEFAULT '1.0.0',
             description TEXT NOT NULL DEFAULT '',
             yaml_source TEXT NOT NULL,
-            installed_at INTEGER NOT NULL DEFAULT 0
+            installed_at INTEGER NOT NULL DEFAULT 0,
+            verified INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS product_pack_items (
@@ -181,6 +328,10 @@ void ProductPackStore::create_tables() {
         spdlog::error("ProductPackStore: DDL failed: {}", err ? err : "unknown");
         sqlite3_free(err);
     }
+
+    // Migration: add `verified` column for databases created before 7.13
+    sqlite3_exec(db_, "ALTER TABLE product_packs ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
 }
 
 std::string ProductPackStore::generate_id() const {
@@ -232,6 +383,44 @@ std::expected<std::string, std::string> ProductPackStore::install(
             pack_name = "Unnamed Pack";
     }
 
+    // ── Ed25519 signature verification (Issue 7.13) ─────────────────────
+    // If the ProductPack document includes a `signature` field, verify it
+    // against the content using a public key from `publicKey` in metadata.
+    bool pack_verified = false;
+    std::string pack_signature;
+    std::string pack_public_key;
+
+    if (pack_doc_idx >= 0) {
+        pack_signature = extract_yaml_value(documents[pack_doc_idx], "signature");
+        pack_public_key = extract_yaml_value(documents[pack_doc_idx], "publicKey");
+    }
+
+    if (!pack_signature.empty() && !pack_public_key.empty()) {
+        // Build the content to verify: all non-metadata documents concatenated
+        std::string content_to_verify;
+        for (int i = 0; i < static_cast<int>(documents.size()); ++i) {
+            if (i == pack_doc_idx)
+                continue;
+            if (!content_to_verify.empty())
+                content_to_verify += "\n---\n";
+            content_to_verify += documents[i];
+        }
+
+        pack_verified = verify_signature(content_to_verify, pack_signature, pack_public_key);
+        if (pack_verified) {
+            spdlog::info("ProductPackStore: signature verified for '{}'", pack_name);
+        } else {
+            spdlog::warn("ProductPackStore: signature verification FAILED for '{}' — "
+                          "pack will be installed as unverified", pack_name);
+        }
+    } else if (!pack_signature.empty()) {
+        spdlog::warn("ProductPackStore: pack '{}' has signature but no publicKey — "
+                      "cannot verify", pack_name);
+    } else {
+        spdlog::info("ProductPackStore: pack '{}' has no signature — installing as unverified",
+                      pack_name);
+    }
+
     auto pack_id = generate_id();
     auto now = now_epoch();
 
@@ -240,8 +429,8 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // Insert pack record
     {
         const char* sql = "INSERT INTO product_packs "
-                          "(id, name, version, description, yaml_source, installed_at) "
-                          "VALUES (?, ?, ?, ?, ?, ?)";
+                          "(id, name, version, description, yaml_source, installed_at, verified) "
+                          "VALUES (?, ?, ?, ?, ?, ?, ?)";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
             return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
@@ -252,6 +441,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
         sqlite3_bind_text(stmt, 4, pack_description.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 5, yaml_bundle.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 6, now);
+        sqlite3_bind_int(stmt, 7, pack_verified ? 1 : 0);
         int rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         if (rc != SQLITE_DONE)
@@ -320,7 +510,7 @@ std::vector<ProductPack> ProductPackStore::list(const ProductPackQuery& q) const
     std::shared_lock lock(mtx_);
     std::vector<ProductPack> result;
 
-    std::string sql = "SELECT id, name, version, description, yaml_source, installed_at "
+    std::string sql = "SELECT id, name, version, description, yaml_source, installed_at, verified "
                       "FROM product_packs";
     std::vector<std::string> binds;
     if (!q.name_filter.empty()) {
@@ -346,6 +536,7 @@ std::vector<ProductPack> ProductPackStore::list(const ProductPackQuery& q) const
         p.description = col_text(stmt, 3);
         p.yaml_source = col_text(stmt, 4);
         p.installed_at = sqlite3_column_int64(stmt, 5);
+        p.verified = (sqlite3_column_int(stmt, 6) != 0);
         p.items = load_items(p.id);
         result.push_back(std::move(p));
     }
@@ -356,7 +547,7 @@ std::vector<ProductPack> ProductPackStore::list(const ProductPackQuery& q) const
 std::optional<ProductPack> ProductPackStore::get(const std::string& id) const {
     std::shared_lock lock(mtx_);
 
-    const char* sql = "SELECT id, name, version, description, yaml_source, installed_at "
+    const char* sql = "SELECT id, name, version, description, yaml_source, installed_at, verified "
                       "FROM product_packs WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -375,6 +566,7 @@ std::optional<ProductPack> ProductPackStore::get(const std::string& id) const {
     p.description = col_text(stmt, 3);
     p.yaml_source = col_text(stmt, 4);
     p.installed_at = sqlite3_column_int64(stmt, 5);
+    p.verified = (sqlite3_column_int(stmt, 6) != 0);
     sqlite3_finalize(stmt);
 
     p.items = load_items(p.id);

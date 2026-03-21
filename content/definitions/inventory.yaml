@@ -1,0 +1,193 @@
+## Inventory Table Enumeration Definitions
+## Query and manage per-plugin structured inventory data collected from agents.
+## Supports listing available data types, querying by agent/plugin, and
+## cross-fleet inventory queries with filter expressions.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.inventory.tables
+  displayName: List Inventory Tables
+  version: 1.0.0
+  description: >
+    Lists all available inventory data types (per-plugin structured data)
+    with agent counts and last collection timestamps. Each "table" corresponds
+    to a plugin that has reported inventory data.
+  tags: [inventory, server, query]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: inventory_tables
+    concurrency: global
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: plugin
+        type: string
+      - name: agent_count
+        type: int64
+      - name: last_collected
+        type: datetime
+
+  readablePayload: "List available inventory tables"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.inventory.agent
+  displayName: Get Agent Inventory
+  version: 1.0.0
+  description: >
+    Retrieves inventory data for a specific agent and plugin combination.
+    Returns the structured JSON data blob last reported by that plugin
+    on the specified agent.
+  tags: [inventory, server, query]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: inventory_agent
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      agent_id:
+        type: string
+        description: The agent ID to query
+        required: true
+      plugin:
+        type: string
+        description: The plugin name to query inventory for
+        required: true
+
+  result:
+    columns:
+      - name: agent_id
+        type: string
+      - name: plugin
+        type: string
+      - name: data_json
+        type: clob
+      - name: collected_at
+        type: datetime
+
+  readablePayload: "Get inventory for agent {{agent_id}} plugin {{plugin}}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.inventory.query
+  displayName: Query Fleet Inventory
+  version: 1.0.0
+  description: >
+    Queries inventory data across the fleet with filter expressions.
+    Supports filtering by agent ID, plugin name, and time range.
+    Returns matching inventory records with their JSON data blobs.
+  tags: [inventory, server, query, fleet]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: inventory_query
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      agent_id:
+        type: string
+        description: Filter by agent ID (optional)
+      plugin:
+        type: string
+        description: Filter by plugin name (optional)
+      since:
+        type: int64
+        description: Only include records collected after this epoch timestamp
+      until:
+        type: int64
+        description: Only include records collected before this epoch timestamp
+      limit:
+        type: int32
+        description: Maximum number of records to return (default 100)
+
+  result:
+    columns:
+      - name: agent_id
+        type: string
+      - name: plugin
+        type: string
+      - name: data_json
+        type: clob
+      - name: collected_at
+        type: datetime
+
+  readablePayload: "Query fleet inventory"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
