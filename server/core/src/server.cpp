@@ -53,6 +53,7 @@
 #include "workflow_engine.hpp"
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
+#include "rate_limiter.hpp"
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
@@ -1589,7 +1590,9 @@ public:
         : cfg_(std::move(cfg)), auth_mgr_(auth_mgr), auto_approve_(), metrics_(), event_bus_(),
           registry_(event_bus_, metrics_),
           agent_service_(registry_, event_bus_, cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
-                         auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode) {
+                         auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode),
+          api_rate_limiter_(cfg_.rate_limit),
+          login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
@@ -2025,6 +2028,19 @@ public:
 
     void stop() noexcept override {
         spdlog::info("Shutting down server...");
+        draining_.store(true, std::memory_order_release);
+
+        // Graceful drain: wait for in-flight executions (up to 30s)
+        if (execution_tracker_) {
+            for (int i = 0; i < 30; ++i) {
+                auto running = execution_tracker_->query_executions({.status = "running"});
+                if (running.empty())
+                    break;
+                spdlog::info("Draining: {} executions in flight, waiting...", running.size());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+
         stop_requested_.store(true, std::memory_order_release);
 
         // Join the fleet health recomputation thread
@@ -3912,6 +3928,21 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
+                // Lightweight probes — always allowed, no auth, no rate limit
+                if (req.path == "/livez" || req.path == "/readyz") {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                // Rate limiting — check before auth to protect against brute force
+                bool is_login = (req.path == "/login" && req.method == "POST");
+                auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
+                if (!limiter.allow(req.remote_addr)) {
+                    res.status = 429;
+                    res.set_header("Retry-After", "1");
+                    res.set_content(R"({"error":"rate limit exceeded"})", "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+
                 // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
                 if (req.path == "/login" || req.path == "/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
@@ -4188,6 +4219,30 @@ private:
                 {"version", "0.1.0"}};
 
             res.set_content(health.dump(), "application/json");
+        });
+
+        // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
+        web_server_->Get("/livez", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"status":"ok"})", "application/json");
+        });
+
+        web_server_->Get("/readyz", [this](const httplib::Request&, httplib::Response& res) {
+            if (draining_.load(std::memory_order_acquire)) {
+                res.status = 503;
+                res.set_content(R"({"status":"draining"})", "application/json");
+                return;
+            }
+
+            bool stores_ok = (response_store_ && response_store_->is_open()) &&
+                             (audit_store_ && audit_store_->is_open()) &&
+                             (instruction_store_ && instruction_store_->is_open());
+
+            if (stores_ok) {
+                res.set_content(R"({"status":"ready"})", "application/json");
+            } else {
+                res.status = 503;
+                res.set_content(R"({"status":"not ready"})", "application/json");
+            }
         });
 
         // -- Health summary dashboard fragment (7.2) ----------------------------
@@ -8834,6 +8889,11 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> draining_{false};
+
+    // Rate limiting
+    RateLimiter api_rate_limiter_;
+    RateLimiter login_rate_limiter_;
 };
 
 // -- Factory ------------------------------------------------------------------

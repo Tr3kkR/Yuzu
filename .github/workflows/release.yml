@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 env:
   MESON_VERSION: "1.9.2"
@@ -104,6 +105,93 @@ jobs:
         with:
           name: yuzu-linux-x64
           path: yuzu-linux-x64.tar.gz
+          retention-days: 5
+
+  # ── Linux ARM64 release build (cross-compile) ───────────────────────
+  build-linux-arm64:
+    name: "Build Linux ARM64"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install cross-compile toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            pkg-config curl zip unzip tar python3-pip
+          pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-arm64-linux-
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages (cross)
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet arm64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson cross release + LTO)
+        run: |
+          meson setup builddir \
+            --cross-file meson/cross/aarch64-linux-gnu.ini \
+            --buildtype=release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-linux \
+            -Dbuild_tests=false \
+            -Db_lto=true
+
+      - name: Build
+        run: meson compile -C builddir
+
+      - name: Package archive
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="yuzu-${VERSION}-linux-arm64"
+          mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
+
+          # Binaries
+          cp builddir/yuzu-server "${STAGING}/bin/"
+          cp builddir/yuzu-agent "${STAGING}/bin/"
+
+          # Agent core shared library
+          find builddir -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
+
+          # Plugin shared libraries
+          find builddir/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
+
+          # Content definitions
+          cp content/definitions/*.yaml "${STAGING}/content/definitions/"
+
+          tar czf "yuzu-linux-arm64.tar.gz" "${STAGING}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-linux-arm64
+          path: yuzu-linux-arm64.tar.gz
           retention-days: 5
 
   # ── Windows x64 release build ────────────────────────────────────────
@@ -294,10 +382,91 @@ jobs:
           path: yuzu-macos-arm64.tar.gz
           retention-days: 5
 
+  # ── Docker multi-arch publish ────────────────────────────────────────
+  docker-publish:
+    name: "Docker multi-arch push"
+    needs: [build-linux, build-linux-arm64]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute Docker tags
+        id: tags
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          REGISTRY="ghcr.io/${{ github.repository_owner }}"
+
+          IS_PRERELEASE="false"
+          if [[ "$TAG" == *"-alpha"* ]] || [[ "$TAG" == *"-beta"* ]] || [[ "$TAG" == *"-rc"* ]]; then
+            IS_PRERELEASE="true"
+          fi
+
+          # Build tag lists for each image (newline-separated for build-push-action)
+          for IMAGE in yuzu-server yuzu-agent yuzu-gateway; do
+            OUTPUT_KEY="tags_${IMAGE//-/_}"
+            EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "${OUTPUT_KEY}<<${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+            echo "${REGISTRY}/${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+            if [[ "$IS_PRERELEASE" == "false" ]]; then
+              echo "${REGISTRY}/${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+              echo "${REGISTRY}/${IMAGE}:${MAJOR_MINOR}" >> "$GITHUB_OUTPUT"
+            fi
+            echo "${EOF_MARKER}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push yuzu-server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags_yuzu_server }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push yuzu-agent
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.agent
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags_yuzu_agent }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push yuzu-gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.gateway
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags_yuzu_gateway }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"
-    needs: [build-linux, build-windows, build-macos]
+    needs: [build-linux, build-linux-arm64, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
 
     steps:
@@ -325,42 +494,80 @@ jobs:
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract the section for this version from CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \[${VERSION}\]/{found=1;next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > changelog_section.md
+          fi
+          # Check if we got content
+          if [ -s changelog_section.md ]; then
+            echo "has_changelog=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changelog=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Generate release notes
         run: |
-          cat > release-notes.md << 'NOTES_EOF'
+          OWNER="${{ github.repository_owner }}"
+          TAG="${{ github.ref_name }}"
+
+          # Start with changelog content if available
+          if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+            cat changelog_section.md > release-notes.md
+            echo "" >> release-notes.md
+          else
+            echo "_See commit history for changes in this release._" > release-notes.md
+            echo "" >> release-notes.md
+          fi
+
+          cat >> release-notes.md <<NOTES_EOF
           ## Platform archives
 
           | Archive | Platform | Arch |
           |---|---|---|
-          | `yuzu-linux-x64.tar.gz` | Linux | x86_64 |
-          | `yuzu-windows-x64.zip` | Windows | x86_64 |
-          | `yuzu-macos-arm64.tar.gz` | macOS | ARM64 (Apple Silicon) |
+          | \`yuzu-linux-x64.tar.gz\` | Linux | x86_64 |
+          | \`yuzu-linux-arm64.tar.gz\` | Linux | ARM64 |
+          | \`yuzu-windows-x64.zip\` | Windows | x86_64 |
+          | \`yuzu-macos-arm64.tar.gz\` | macOS | ARM64 (Apple Silicon) |
+
+          ## Docker images
+
+          \`\`\`bash
+          docker pull ghcr.io/${OWNER}/yuzu-server:${TAG}
+          docker pull ghcr.io/${OWNER}/yuzu-agent:${TAG}
+          docker pull ghcr.io/${OWNER}/yuzu-gateway:${TAG}
+          \`\`\`
+
+          Multi-arch: \`linux/amd64\`, \`linux/arm64\`
 
           ### What's included
 
-          - `bin/yuzu-server` — Yuzu server daemon
-          - `bin/yuzu-agent` — Yuzu agent daemon
-          - `plugins/` — Agent plugin shared libraries
-          - `content/definitions/` — YAML instruction definitions
+          - \`bin/yuzu-server\` — Yuzu server daemon
+          - \`bin/yuzu-agent\` — Yuzu agent daemon
+          - \`plugins/\` — Agent plugin shared libraries
+          - \`content/definitions/\` — YAML instruction definitions
 
           ### Verify checksums
 
-          ```bash
+          \`\`\`bash
           sha256sum -c SHA256SUMS
-          ```
+          \`\`\`
 
           ### Quick start
 
-          ```bash
+          \`\`\`bash
           # Linux / macOS
           tar xzf yuzu-linux-x64.tar.gz
           cd yuzu-*/bin
           ./yuzu-server
-          ```
+          \`\`\`
 
           See the [user manual](docs/user-manual/) for full setup instructions.
           NOTES_EOF
-          # Strip leading whitespace from heredoc lines
+          # Strip leading whitespace from heredoc indentation
           sed -i 's/^          //' release-notes.md
 
       - name: Create GitHub Release
@@ -377,6 +584,7 @@ jobs:
             --notes-file release-notes.md \
             ${PRERELEASE_FLAG} \
             artifacts/yuzu-linux-x64.tar.gz \
+            artifacts/yuzu-linux-arm64.tar.gz \
             artifacts/yuzu-windows-x64.zip \
             artifacts/yuzu-macos-arm64.tar.gz \
             artifacts/SHA256SUMS

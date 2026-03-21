@@ -77,6 +77,8 @@ if build_server
       'unit/server/test_custom_properties_store.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
+      'unit/server/test_migration_runner.cpp',
+      'unit/server/test_rate_limiter.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

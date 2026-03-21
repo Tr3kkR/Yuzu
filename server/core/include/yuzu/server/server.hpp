@@ -82,6 +82,10 @@ struct Config {
     std::string clickhouse_username;
     std::string clickhouse_password;
     std::filesystem::path analytics_jsonl_path; // empty = disabled
+
+    // Rate limiting
+    int rate_limit{100};      // Max API requests/second per IP
+    int login_rate_limit{10}; // Max login attempts/second per IP
 };
 
 /**

@@ -1,6 +1,6 @@
 # Yuzu Development Roadmap
 
-**Version:** 1.3 | **Date:** 2026-03-20
+**Version:** 1.4 | **Date:** 2026-03-21
 
 This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.
 
@@ -36,7 +36,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 3.2 | [#156](https://github.com/Tr3kkR/Yuzu/issues/156) | Management Groups | Done |
 | | 3.3 | [#157](https://github.com/Tr3kkR/Yuzu/issues/157) | Token-Based API Authentication | Done |
 | | 3.4 | [#159](https://github.com/Tr3kkR/Yuzu/issues/159) | OIDC / SSO Integration | Done |
-| | 3.5 | [#161](https://github.com/Tr3kkR/Yuzu/issues/161) | REST / HTTP Management API (v1) | Open |
+| | 3.5 | [#161](https://github.com/Tr3kkR/Yuzu/issues/161) | REST / HTTP Management API (v1) | Done |
 | | 3.6 | [#162](https://github.com/Tr3kkR/Yuzu/issues/162) | Device Quarantine (Network Isolation) | Done |
 | | 3.7 | [#164](https://github.com/Tr3kkR/Yuzu/issues/164) | IOC Checking | Done |
 | | 3.8 | [#165](https://github.com/Tr3kkR/Yuzu/issues/165) | Certificate Inventory and Management | Done |
@@ -64,20 +64,20 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Done |
 | | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Done |
 | | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
-| | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Open |
+| | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Done |
 | | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Done |
-| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Open |
-| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | Open |
+| | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Done |
+| | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | Done |
 | | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Done |
 | | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Done |
-| | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Open |
+| | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Done |
 | | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) | Done |
-| | 7.13 | [#213](https://github.com/Tr3kkR/Yuzu/issues/213) | ProductPack Ed25519 Trust Chain and Verification | Open |
+| | 7.13 | [#213](https://github.com/Tr3kkR/Yuzu/issues/213) | ProductPack Ed25519 Trust Chain and Verification | Done |
 | | 7.14 | [#214](https://github.com/Tr3kkR/Yuzu/issues/214) | Workflow Primitives (if, foreach, retry) | Done |
 | | 7.15 | [#215](https://github.com/Tr3kkR/Yuzu/issues/215) | WiFi Network Enumeration | Done |
 | | 7.16 | [#216](https://github.com/Tr3kkR/Yuzu/issues/216) | Wake-on-LAN Support | Done |
-| | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Open |
-| | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Open |
+| | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Done |
+| | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 
 ## Current Status
@@ -87,12 +87,12 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 0: Foundation | 5 | 0 | 5 | 100% |
 | 1: Data Infrastructure | 7 | 0 | 7 | 100% |
 | 2: Instruction System | 12 | 0 | 12 | 100% |
-| 3: Security & RBAC | 2 | 7 | 9 | 22% |
+| 3: Security & RBAC | 9 | 0 | 9 | 100% |
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
-| 7: Scale & Integration | 0 | 19 | 19 | 0% |
-| **Total** | **45** | **26** | **71** | |
+| 7: Scale & Integration | 19 | 0 | 19 | 100% |
+| **Total** | **71** | **0** | **71** | **100%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
