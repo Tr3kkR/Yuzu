@@ -1,0 +1,365 @@
+## Patch Management Definitions
+## Server-side patch deployment workflow that orchestrates existing plugins
+## (windows_updates, script_exec) to scan, deploy, verify, and optionally
+## reboot endpoints across the fleet.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.patches.list_missing
+  displayName: List Missing Patches (Fleet)
+  version: 1.0.0
+  description: >
+    Queries the server-side patch inventory to list patches that are
+    reported as missing across the fleet. Can be filtered by agent ID
+    and severity. Data is populated when agents report scan results
+    from the windows_updates.missing instruction.
+  tags: [patches, compliance, security, fleet, inventory]
+
+spec:
+  type: question
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: patches_list_missing
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      agent_id:
+        type: string
+        displayName: Agent ID Filter
+        description: >
+          Optional agent ID to filter patches for a specific endpoint.
+      severity:
+        type: string
+        displayName: Severity Filter
+        description: >
+          Filter by severity level: Critical, Important, Moderate, Low.
+        validation:
+          enum: [Critical, Important, Moderate, Low, Unspecified]
+      limit:
+        type: string
+        displayName: Result Limit
+        description: Maximum number of results to return.
+        default: "100"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: kb_id
+        type: string
+      - name: title
+        type: string
+      - name: severity
+        type: string
+      - name: status
+        type: string
+      - name: agent_id
+        type: string
+      - name: released_at
+        type: datetime
+      - name: scanned_at
+        type: datetime
+
+  readablePayload: "List missing patches across the fleet"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [admin, endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.patches.deploy
+  displayName: Deploy Patch
+  version: 1.0.0
+  description: >
+    Deploys a specific patch (identified by KB ID) to one or more
+    agents. The deployment workflow orchestrates multiple steps:
+    1) Scan the target to confirm the patch is missing
+    2) Install the patch via Windows Update Agent
+    3) Verify successful installation
+    4) Optionally reboot the endpoint
+    Each step's progress is tracked per-target and the overall
+    deployment status is updated in real time.
+  tags: [patches, deployment, remediation, security, compliance]
+
+spec:
+  type: action
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: patches_deploy
+    concurrency: global-singleton
+
+  parameters:
+    type: object
+    required: [kb_id, agent_ids]
+    properties:
+      kb_id:
+        type: string
+        displayName: KB ID
+        description: >
+          The Knowledge Base identifier of the patch to deploy
+          (e.g., "KB5034441", "KB5035845").
+        validation:
+          minLength: 1
+          maxLength: 20
+      agent_ids:
+        type: string
+        displayName: Target Agent IDs
+        description: >
+          JSON array of agent IDs to deploy the patch to.
+      reboot_if_needed:
+        type: string
+        displayName: Reboot If Needed
+        description: >
+          Whether to automatically reboot targets after patch
+          installation if required. Default is false.
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+
+  result:
+    columns:
+      - name: deployment_id
+        type: string
+      - name: kb_id
+        type: string
+      - name: target_count
+        type: int32
+      - name: status
+        type: string
+
+  readablePayload: "Deploy patch ${kb_id} to ${agent_ids}"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [admin, endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [windows_updates, script_exec]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.patches.deployment_status
+  displayName: Patch Deployment Status
+  version: 1.0.0
+  description: >
+    Returns the status of a patch deployment including overall
+    progress and per-target status. Each target shows its current
+    step (scanning, installing, verifying, completed, failed) and
+    any error details.
+  tags: [patches, deployment, status, monitoring]
+
+spec:
+  type: question
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: patches_deployment_status
+    concurrency: global
+
+  parameters:
+    type: object
+    required: [deployment_id]
+    properties:
+      deployment_id:
+        type: string
+        displayName: Deployment ID
+        description: >
+          The ID of the patch deployment to query.
+        validation:
+          minLength: 1
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: kb_id
+        type: string
+      - name: status
+        type: string
+      - name: total_targets
+        type: int32
+      - name: completed_targets
+        type: int32
+      - name: failed_targets
+        type: int32
+      - name: created_at
+        type: datetime
+      - name: completed_at
+        type: datetime
+
+  readablePayload: "Check deployment status for ${deployment_id}"
+
+  gather:
+    ttlSeconds: 15
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [admin, endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.patches.cancel_deployment
+  displayName: Cancel Patch Deployment
+  version: 1.0.0
+  description: >
+    Cancels a running or pending patch deployment. Targets that have
+    already completed installation are not affected. Targets in
+    pending or scanning state are marked as cancelled.
+  tags: [patches, deployment, cancel, management]
+
+spec:
+  type: action
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: patches_cancel_deployment
+    concurrency: global-singleton
+
+  parameters:
+    type: object
+    required: [deployment_id]
+    properties:
+      deployment_id:
+        type: string
+        displayName: Deployment ID
+        description: >
+          The ID of the patch deployment to cancel.
+        validation:
+          minLength: 1
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: deployment_id
+        type: string
+
+  readablePayload: "Cancel patch deployment ${deployment_id}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [admin, endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.patches.fleet_summary
+  displayName: Fleet Patch Summary
+  version: 1.0.0
+  description: >
+    Returns a fleet-wide summary of missing patches, showing which
+    patches are missing on the most endpoints. Useful for prioritizing
+    patch deployment based on fleet exposure.
+  tags: [patches, fleet, summary, compliance, dashboard]
+
+spec:
+  type: question
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: patches_fleet_summary
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      limit:
+        type: string
+        displayName: Top N Patches
+        description: >
+          Number of top missing patches to return, ordered by
+          affected agent count. Default is 20.
+        default: "20"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: kb_id
+        type: string
+      - name: affected_agents
+        type: int32
+
+  readablePayload: "Fleet-wide patch compliance summary"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [admin, endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active

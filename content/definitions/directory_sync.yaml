@@ -1,0 +1,274 @@
+## Directory Sync (AD/Entra Integration) Definitions
+## Server-side directory synchronization with Microsoft Entra ID (Azure AD)
+## and on-prem Active Directory. Imports users and groups, maps groups to
+## RBAC roles for centralized identity management.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.directory.sync_entra
+  displayName: Sync Entra ID Directory
+  version: 1.0.0
+  description: >
+    Triggers a directory synchronization from Microsoft Entra ID (Azure AD)
+    via the Microsoft Graph API. Uses OAuth2 client credentials flow to
+    authenticate, then fetches users, groups, and group memberships.
+    Synced data is stored server-side and can be mapped to RBAC roles.
+    Requires the yuzu-directory-sync app registration with User.Read.All,
+    Group.Read.All, and GroupMember.Read.All application permissions.
+  tags: [directory, entra, azure-ad, identity, rbac, sync]
+
+spec:
+  type: action
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: directory_sync_entra
+    concurrency: global-singleton
+
+  parameters:
+    type: object
+    required: [tenant_id, client_id, client_secret]
+    properties:
+      tenant_id:
+        type: string
+        displayName: Tenant ID
+        description: >
+          Microsoft Entra ID tenant ID (GUID format).
+        validation:
+          pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      client_id:
+        type: string
+        displayName: Application (Client) ID
+        description: >
+          The client ID of the yuzu-directory-sync app registration.
+        validation:
+          pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      client_secret:
+        type: string
+        displayName: Client Secret
+        description: >
+          Client secret for the app registration. Used for OAuth2 client
+          credentials flow.
+        validation:
+          minLength: 1
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: user_count
+        type: int32
+      - name: group_count
+        type: int32
+      - name: provider
+        type: string
+
+  readablePayload: "Sync users and groups from Entra ID tenant ${tenant_id}"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [admin, directory-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.directory.list_users
+  displayName: List Directory Users
+  version: 1.0.0
+  description: >
+    Lists users that have been synced from the configured directory
+    provider (Entra ID or LDAP). Returns display name, email, UPN,
+    enabled status, and group memberships. Can be filtered by group.
+  tags: [directory, users, identity, inventory]
+
+spec:
+  type: question
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: directory_list_users
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      group_id:
+        type: string
+        displayName: Filter by Group ID
+        description: >
+          Optional group object ID to filter users by membership.
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: display_name
+        type: string
+      - name: email
+        type: string
+      - name: upn
+        type: string
+      - name: enabled
+        type: bool
+      - name: groups
+        type: string
+      - name: synced_at
+        type: datetime
+
+  readablePayload: "List synced directory users"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [admin, directory-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.directory.sync_status
+  displayName: Directory Sync Status
+  version: 1.0.0
+  description: >
+    Returns the current status of directory synchronization including
+    the provider type, last sync timestamp, user and group counts,
+    and any error from the most recent sync attempt.
+  tags: [directory, status, monitoring]
+
+spec:
+  type: question
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: directory_sync_status
+    concurrency: global
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: provider
+        type: string
+      - name: status
+        type: string
+      - name: last_sync_at
+        type: datetime
+      - name: user_count
+        type: int32
+      - name: group_count
+        type: int32
+      - name: last_error
+        type: string
+
+  readablePayload: "Check directory sync status"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [admin, directory-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.directory.configure_group_mappings
+  displayName: Configure Group-to-Role Mappings
+  version: 1.0.0
+  description: >
+    Maps directory groups (from Entra ID or AD) to Yuzu RBAC roles.
+    When a user authenticates via OIDC SSO and belongs to a mapped
+    group, they automatically receive the corresponding RBAC role.
+    Multiple mappings can be configured in a single call.
+  tags: [directory, rbac, groups, roles, identity, security]
+
+spec:
+  type: action
+  platforms: [server]
+
+  execution:
+    plugin: server_internal
+    action: directory_configure_group_mappings
+    concurrency: global-singleton
+
+  parameters:
+    type: object
+    required: [mappings]
+    properties:
+      mappings:
+        type: string
+        displayName: Group-to-Role Mappings
+        description: >
+          JSON array of objects, each with "group_id" (directory group
+          object ID) and "role_name" (Yuzu RBAC role name). Set
+          role_name to empty string to remove a mapping.
+
+  result:
+    columns:
+      - name: group_id
+        type: string
+      - name: role_name
+        type: string
+
+  readablePayload: "Configure directory group-to-RBAC role mappings"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: []
+
+status:
+  phase: active

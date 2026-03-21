@@ -1,0 +1,98 @@
+## Device Discovery Plugin Definitions
+## Network device discovery via ARP table lookup and ping sweep.
+## Identifies managed and unmanaged endpoints on a subnet.
+## Plugin: discovery | Actions: scan_subnet
+##
+## Sources by platform:
+##   Windows: Win32 GetIpNetTable API + ping -n
+##   Linux:   arp -n + ping -c
+##   macOS:   arp -a + ping -c
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.discovery.scan_subnet
+  displayName: Subnet Discovery Scan
+  version: 1.0.0
+  description: >
+    Scans a subnet to discover devices on the network. Uses a combination
+    of ARP table lookups (for hosts already known to the OS) and ICMP ping
+    sweeps (for additional hosts). For each discovered host, returns the
+    IP address, MAC address (from ARP), hostname (via reverse DNS), and
+    managed status (correlated server-side with enrolled agents).
+    Supports subnets from /20 to /30 (max 4094 hosts per scan). On
+    Windows uses the Win32 GetIpNetTable API for ARP data; on Linux
+    uses arp -n; on macOS uses arp -a.
+  tags: [discovery, network, scan, inventory]
+
+spec:
+  type: query
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: discovery
+    action: scan_subnet
+    concurrency: per-device
+    timeoutSeconds: 600
+
+  parameters:
+    type: object
+    required: [subnet]
+    properties:
+      subnet:
+        type: string
+        displayName: Subnet (CIDR)
+        description: >
+          Target subnet in CIDR notation (e.g., 192.168.1.0/24).
+          Minimum prefix length is /20 (4094 hosts), maximum is /30
+          (2 hosts). Only IPv4 is supported.
+        validation:
+          pattern: "^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/\\d{1,2}$"
+          minLength: 9
+          maxLength: 18
+      timeout_ms:
+        type: int32
+        displayName: Ping Timeout (ms)
+        description: >
+          Timeout in milliseconds for each ping probe. Lower values
+          scan faster but may miss hosts on slow networks. Minimum
+          100ms, maximum 10000ms.
+        default: 1000
+        validation:
+          minimum: 100
+          maximum: 10000
+
+  result:
+    columns:
+      - name: host
+        type: string
+      - name: ip_address
+        type: string
+      - name: mac_address
+        type: string
+      - name: hostname
+        type: string
+      - name: managed
+        type: string
+      - name: scan_complete
+        type: string
+
+  readablePayload: "Scan subnet {{subnet}} for devices"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [discovery]
+
+status:
+  phase: active

@@ -1,6 +1,7 @@
 ## Desktop User Interaction Plugin Definitions
-## Provides desktop notifications, message box dialogs, and text input
-## dialogs on Windows, Linux, and macOS endpoints.
+## Provides desktop notifications, message box dialogs, text input
+## dialogs, multi-question surveys, and Do Not Disturb mode on
+## Windows, Linux, and macOS endpoints.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -195,6 +196,163 @@ spec:
 
   compatibility:
     minAgentVersion: 0.1.0
+    requiredPlugins: [interaction]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.interaction.survey
+  displayName: User Survey
+  version: 1.0.0
+  description: >
+    Shows a multi-question survey form on the endpoint desktop. On Windows
+    uses a PowerShell-generated Windows.Forms dialog with text inputs,
+    checkboxes, and combo boxes. On Linux uses sequential zenity dialogs.
+    On macOS uses sequential osascript dialogs (display dialog, choose
+    from list). Supports three question types: text (free-form input),
+    yesno (boolean checkbox/question), and choice (pick from a list).
+    Returns numbered answer fields and a question_count. If the user
+    cancels at any point, cancelled=true is returned. Respects Do Not
+    Disturb mode — if DND is active, the survey is suppressed.
+  tags: [interaction, survey, user, form]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: interaction
+    action: survey
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [title, questions]
+    properties:
+      title:
+        type: string
+        description: Survey window title
+        maxLength: 128
+      questions:
+        type: string
+        description: >
+          JSON array of question objects. Each object has: prompt (string),
+          type (text|yesno|choice), and choices (array of strings, required
+          when type=choice). Example:
+          [{"prompt":"Your name?","type":"text"},
+           {"prompt":"Agree?","type":"yesno"},
+           {"prompt":"Department","type":"choice","choices":["IT","HR","Eng"]}]
+        maxLength: 8192
+
+  result:
+    columns:
+      - name: cancelled
+        type: bool
+      - name: question_count
+        type: int32
+      - name: answer_0
+        type: string
+      - name: answer_1
+        type: string
+      - name: answer_2
+        type: string
+      - name: answer_3
+        type: string
+      - name: answer_4
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Show survey: {{title}}"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.2.0
+    requiredPlugins: [interaction]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.interaction.set_dnd
+  displayName: Set Do Not Disturb
+  version: 1.0.0
+  description: >
+    Enables or disables Do Not Disturb (DND) mode on the endpoint.
+    When DND is active, notifications and surveys are suppressed
+    (the action returns status=suppressed instead of showing a dialog).
+    An optional duration_minutes parameter sets a time-limited DND
+    window; after expiry, DND is automatically cleared. DND state is
+    persisted in the agent's KV store so it survives agent restarts.
+  tags: [interaction, dnd, notification, control]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: interaction
+    action: set_dnd
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [enabled]
+    properties:
+      enabled:
+        type: string
+        description: "Set to 'true' to enable DND, 'false' to disable"
+        enum: ["true", "false"]
+      duration_minutes:
+        type: int32
+        description: >
+          Optional duration in minutes. If set and enabled=true, DND
+          will automatically expire after this many minutes. If 0 or
+          omitted, DND remains active indefinitely until explicitly
+          disabled.
+        default: 0
+
+  result:
+    columns:
+      - name: dnd_enabled
+        type: bool
+      - name: dnd_duration_minutes
+        type: int32
+      - name: dnd_expires_at
+        type: int64
+      - name: status
+        type: string
+
+  readablePayload: "Set Do Not Disturb: {{enabled}}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: none
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.2.0
     requiredPlugins: [interaction]
 
 status:

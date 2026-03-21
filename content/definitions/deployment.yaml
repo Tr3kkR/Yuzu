@@ -1,0 +1,152 @@
+## Agent Deployment Job Definitions
+## Server-side job management for deploying the Yuzu agent to new endpoints.
+## These definitions describe the REST API operations, not agent plugin actions.
+## Deployment jobs are managed entirely server-side.
+##
+## REST API:
+##   GET    /api/deployment-jobs       — list all deployment jobs
+##   POST   /api/deployment-jobs       — create a new deployment job
+##   GET    /api/deployment-jobs/:id   — get job status
+##   DELETE /api/deployment-jobs/:id   — cancel a pending/running job
+##
+## Deployment methods:
+##   ssh          — run install script via SSH (stores connection details)
+##   group_policy — Windows GPO deployment (documentation/tracking only)
+##   manual       — generate install command for operator to run
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.deployment.create_job
+  displayName: Create Deployment Job
+  version: 1.0.0
+  description: >
+    Creates a new agent deployment job for a target endpoint. The job
+    tracks the lifecycle of deploying a Yuzu agent to an unmanaged
+    endpoint. Three deployment methods are supported: ssh (remote
+    install via SSH), group_policy (Windows GPO, tracking only), and
+    manual (generates install command). The job progresses through
+    states: pending -> running -> completed|failed|cancelled.
+  tags: [deployment, server, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: create_deployment_job
+    concurrency: global
+
+  parameters:
+    type: object
+    required: [target_host, os, method]
+    properties:
+      target_host:
+        type: string
+        description: >
+          Hostname or IP address of the target endpoint to deploy to.
+        maxLength: 256
+      os:
+        type: string
+        description: "Target operating system: windows, linux, or darwin"
+        enum: [windows, linux, darwin]
+      method:
+        type: string
+        description: >
+          Deployment method. ssh runs an install script remotely.
+          group_policy tracks a Windows GPO deployment. manual generates
+          a command for the operator to run on the target.
+        enum: [ssh, group_policy, manual]
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: status
+        type: string
+      - name: install_command
+        type: string
+
+  readablePayload: "Deploy agent to {{target_host}} via {{method}}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.deployment.list_jobs
+  displayName: List Deployment Jobs
+  version: 1.0.0
+  description: >
+    Lists all agent deployment jobs with their current status.
+    Returns job details including target host, OS, method, status,
+    and timestamps. Jobs are ordered by creation time (newest first).
+  tags: [deployment, server, management, query]
+
+spec:
+  type: query
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: list_deployment_jobs
+    concurrency: global
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: target_host
+        type: string
+      - name: os
+        type: string
+      - name: method
+        type: string
+      - name: status
+        type: string
+      - name: created_at
+        type: int64
+      - name: started_at
+        type: int64
+      - name: completed_at
+        type: int64
+      - name: error
+        type: string
+
+  readablePayload: "List deployment jobs"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: none
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active

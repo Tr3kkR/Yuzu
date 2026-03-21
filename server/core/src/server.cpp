@@ -13,9 +13,12 @@
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
+#include "deployment_store.hpp"
+#include "discovery_store.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
+#include "inventory_store.hpp"
 #include "management.grpc.pb.h"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -35,6 +38,8 @@
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "workflow_engine.hpp"
+#include "directory_sync.hpp"
+#include "patch_manager.hpp"
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
@@ -612,6 +617,7 @@ public:
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
+    void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override {
@@ -1293,6 +1299,7 @@ private:
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};
     WebhookStore* webhook_store_{nullptr};
+    InventoryStore* inventory_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1314,6 +1321,7 @@ public:
           metrics_(metrics), health_store_(health_store) {}
 
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
+    void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
 
     // -- ProxyRegister --------------------------------------------------------
     // Gateway forwards an agent's RegisterRequest.  We run the same enrollment
@@ -1462,9 +1470,23 @@ public:
             return grpc::Status::OK;
         }
 
-        // TODO: Persist inventory data once storage layer is implemented.
-        spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={}", agent_id,
-                     request->plugin_data_size());
+        // Persist inventory data via InventoryStore (Issue 7.17)
+        if (inventory_store_ && inventory_store_->is_open()) {
+            int64_t collected_epoch = 0;
+            if (request->has_collected_at()) {
+                collected_epoch = request->collected_at().millis_epoch() / 1000;
+            }
+            for (const auto& [plugin_name, data_bytes] : request->plugin_data()) {
+                std::string json_str(data_bytes.begin(), data_bytes.end());
+                inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
+            }
+            spdlog::info("[gateway] ProxyInventory persisted for agent={}, plugins={}",
+                          agent_id, request->plugin_data_size());
+        } else {
+            spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={} "
+                          "(inventory store not available)",
+                          agent_id, request->plugin_data_size());
+        }
         response->set_received(true);
         return grpc::Status::OK;
     }
@@ -1528,6 +1550,7 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
+    InventoryStore* inventory_store_{nullptr};
 
     // Map of gateway session_id → agent_id for validation.
     std::mutex sessions_mu_;
@@ -1736,6 +1759,8 @@ public:
             agent_service_.set_notification_store(notification_store_.get());
         if (webhook_store_)
             agent_service_.set_webhook_store(webhook_store_.get());
+        if (inventory_store_)
+            agent_service_.set_inventory_store(inventory_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -1850,6 +1875,53 @@ public:
         {
             auto webhook_db = cfg_.auth_config_path.parent_path() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+        }
+
+        // Phase 7: Inventory Store (Issue 7.17)
+        {
+            auto inv_db = cfg_.auth_config_path.parent_path() / "inventory.db";
+            inventory_store_ = std::make_unique<InventoryStore>(inv_db);
+            if (inventory_store_ && inventory_store_->is_open()) {
+                spdlog::info("InventoryStore initialized at {}", inv_db.string());
+            }
+            if (gateway_service_)
+                gateway_service_->set_inventory_store(inventory_store_.get());
+        }
+
+        // Phase 7: Directory Sync (AD/Entra integration)
+        {
+            auto dirsync_db = cfg_.auth_config_path.parent_path() / "directory-sync.db";
+            directory_sync_ = std::make_unique<DirectorySync>(dirsync_db);
+            if (directory_sync_ && directory_sync_->is_open()) {
+                spdlog::info("DirectorySync initialized at {}", dirsync_db.string());
+            }
+        }
+
+        // Phase 7: Patch Manager
+        {
+            auto patch_db = cfg_.auth_config_path.parent_path() / "patches.db";
+            patch_manager_ = std::make_unique<PatchManager>(patch_db);
+            if (patch_manager_ && patch_manager_->is_open()) {
+                spdlog::info("PatchManager initialized at {}", patch_db.string());
+            }
+        }
+
+        // Phase 7: Deployment Jobs (Issue 7.7)
+        {
+            auto deploy_db = cfg_.auth_config_path.parent_path() / "deployment-jobs.db";
+            deployment_store_ = std::make_unique<DeploymentStore>(deploy_db);
+            if (deployment_store_ && deployment_store_->is_open()) {
+                spdlog::info("DeploymentStore initialized at {}", deploy_db.string());
+            }
+        }
+
+        // Phase 7: Device Discovery (Issue 7.18)
+        {
+            auto discovery_db = cfg_.auth_config_path.parent_path() / "discovery.db";
+            discovery_store_ = std::make_unique<DiscoveryStore>(discovery_db);
+            if (discovery_store_ && discovery_store_->is_open()) {
+                spdlog::info("DiscoveryStore initialized at {}", discovery_db.string());
+            }
         }
     }
 
@@ -3827,9 +3899,10 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Allow unauthenticated access to login page, health, and OIDC flow
+                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
                 if (req.path == "/login" || req.path == "/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
+                    req.path == "/api/v1/openapi.json" ||
                     req.path.starts_with("/static/")) {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
@@ -8050,7 +8123,8 @@ private:
                                    {"description", p.description},
                                    {"item_count", p.items.size()},
                                    {"items", items_arr},
-                                   {"installed_at", p.installed_at}});
+                                   {"installed_at", p.installed_at},
+                                   {"verified", p.verified}});
                 }
                 res.set_content(
                     nlohmann::json({{"product_packs", arr}, {"count", arr.size()}}).dump(),
@@ -8171,7 +8245,8 @@ private:
                                     {"description", pack->description},
                                     {"yaml_source", pack->yaml_source},
                                     {"items", items_arr},
-                                    {"installed_at", pack->installed_at}})
+                                    {"installed_at", pack->installed_at},
+                                    {"verified", pack->verified}})
                         .dump(),
                     "application/json");
             });
@@ -8214,6 +8289,99 @@ private:
                 res.set_header("HX-Trigger",
                     R"({"showToast":{"message":"Product pack uninstalled","level":"success"}})");
                 res.set_content(R"({"status":"uninstalled"})", "application/json");
+            });
+
+        // -- Inventory REST endpoints (Issue 7.17) --------------------------------
+
+        // GET /api/inventory/tables — list available inventory data types
+        web_server_->Get("/api/inventory/tables",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Inventory", "Read"))
+                    return;
+                if (!inventory_store_ || !inventory_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    return;
+                }
+                auto tables = inventory_store_->list_tables();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& t : tables) {
+                    arr.push_back({{"plugin", t.plugin},
+                                   {"agent_count", t.agent_count},
+                                   {"last_collected", t.last_collected}});
+                }
+                res.set_content(nlohmann::json({{"tables", arr}, {"count", arr.size()}}).dump(),
+                                "application/json");
+            });
+
+        // GET /api/inventory/:agent_id/:plugin — get inventory for agent+plugin
+        web_server_->Get(R"(/api/inventory/([^/]+)/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Inventory", "Read"))
+                    return;
+                if (!inventory_store_ || !inventory_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    return;
+                }
+                auto agent_id = req.matches[1].str();
+                auto plugin = req.matches[2].str();
+                auto record = inventory_store_->get(agent_id, plugin);
+                if (!record) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"no inventory data found"})", "application/json");
+                    return;
+                }
+                nlohmann::json data_obj;
+                try {
+                    data_obj = nlohmann::json::parse(record->data_json);
+                } catch (...) {
+                    data_obj = record->data_json;
+                }
+                res.set_content(nlohmann::json({{"agent_id", record->agent_id},
+                                                {"plugin", record->plugin},
+                                                {"data", data_obj},
+                                                {"collected_at", record->collected_at}}).dump(),
+                                "application/json");
+            });
+
+        // POST /api/inventory/query — query inventory across agents
+        web_server_->Post("/api/inventory/query",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Inventory", "Read"))
+                    return;
+                if (!inventory_store_ || !inventory_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    return;
+                }
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid JSON"})", "application/json");
+                    return;
+                }
+                InventoryQuery q;
+                q.agent_id = body.value("agent_id", "");
+                q.plugin = body.value("plugin", "");
+                q.since = body.value("since", int64_t{0});
+                q.until = body.value("until", int64_t{0});
+                q.limit = body.value("limit", 100);
+                if (q.limit > 1000) q.limit = 1000;
+
+                auto records = inventory_store_->query(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& r : records) {
+                    nlohmann::json data_obj;
+                    try { data_obj = nlohmann::json::parse(r.data_json); }
+                    catch (...) { data_obj = r.data_json; }
+                    arr.push_back({{"agent_id", r.agent_id},
+                                   {"plugin", r.plugin},
+                                   {"data", data_obj},
+                                   {"collected_at", r.collected_at}});
+                }
+                res.set_content(nlohmann::json({{"results", arr}, {"count", arr.size()}}).dump(),
+                                "application/json");
             });
 
         // -- Notification REST endpoints ----------------------------------------
@@ -8410,6 +8578,8 @@ private:
                                              "application/json");
                          });
 
+#include "directory_patch_routes.inc"
+
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
         rest_api_v1_ = std::make_unique<RestApiV1>();
@@ -8441,7 +8611,9 @@ private:
                         break;
                     }
                 }
-            });
+            },
+            inventory_store_.get(),
+            product_pack_store_.get());
 
         // -- Listen -----------------------------------------------------------
 
@@ -8632,6 +8804,17 @@ private:
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
     std::unique_ptr<WebhookStore> webhook_store_;
+
+    // Phase 7: Inventory Store (Issue 7.17)
+    std::unique_ptr<InventoryStore> inventory_store_;
+
+    // Phase 7: Directory Sync (AD/Entra) & Patch Manager
+    std::unique_ptr<DirectorySync> directory_sync_;
+    std::unique_ptr<PatchManager> patch_manager_;
+
+    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18)
+    std::unique_ptr<DeploymentStore> deployment_store_;
+    std::unique_ptr<DiscoveryStore> discovery_store_;
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;

@@ -132,6 +132,7 @@ if build_agent
     subdir('agents/plugins/tar')
     subdir('agents/plugins/wifi')
     subdir('agents/plugins/wol')
+    subdir('agents/plugins/discovery')
   endif
 endif
 
