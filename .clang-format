@@ -25,24 +25,8 @@ NamespaceIndentation: None
 CompactNamespaces: true
 FixNamespaceComments: true
 
-IncludeBlocks: Regroup
-IncludeCategories:
-  # Project headers (yuzu/)
-  - Regex: '^[<"]yuzu/'
-    Priority: 1
-  # Local/private headers (quoted, no yuzu/ prefix)
-  - Regex: '^"'
-    Priority: 2
-  # Generated protobuf headers
-  - Regex: '\.pb\.h[">]$'
-    Priority: 3
-  # Third-party headers
-  - Regex: '^<(spdlog|httplib|nlohmann|grpcpp|grpc/|google/|absl/|sqlite3|CLI/|catch2/)'
-    Priority: 4
-  # System/STL headers
-  - Regex: '^<'
-    Priority: 5
-SortIncludes: CaseInsensitive
+IncludeBlocks: Preserve
+SortIncludes: Never
 
 BinPackArguments: true
 BinPackParameters: true

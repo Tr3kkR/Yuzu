@@ -25,6 +25,7 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <filesystem>
