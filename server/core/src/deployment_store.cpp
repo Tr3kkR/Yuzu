@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 
@@ -90,6 +91,19 @@ DeploymentStore::create_job(const std::string& target_host, const std::string& o
 
     if (target_host.empty())
         return std::unexpected("target_host is required");
+
+    // Validate hostname: must match DNS rules — [a-zA-Z0-9._-] only, max 253 chars.
+    // Reject anything with shell metacharacters to prevent command injection.
+    if (target_host.size() > 253)
+        return std::unexpected("target_host exceeds DNS limit of 253 characters");
+
+    auto is_valid_hostname_char = [](char c) -> bool {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    };
+    if (!std::all_of(target_host.begin(), target_host.end(), is_valid_hostname_char))
+        return std::unexpected("target_host contains invalid characters "
+                               "(only [a-zA-Z0-9._-] allowed)");
 
     // Validate OS
     if (os != "windows" && os != "linux" && os != "darwin")

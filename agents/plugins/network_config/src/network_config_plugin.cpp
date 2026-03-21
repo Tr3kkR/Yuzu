@@ -73,7 +73,7 @@ std::string format_mac(const BYTE* addr, DWORD len) {
                        addr[3], addr[4], addr[5]);
 }
 
-// Convert wide string to UTF-8
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* ws) {
     if (!ws || !*ws)
         return {};

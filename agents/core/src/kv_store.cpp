@@ -233,7 +233,18 @@ std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view
     if (!db_)
         return result;
 
-    const char* sql = "SELECT key FROM kv_store WHERE plugin = ? AND key LIKE ? || '%' ORDER BY key";
+    // L6: Escape LIKE wildcards (%, _, \) in the prefix to prevent unintended matching
+    std::string escaped_prefix;
+    escaped_prefix.reserve(prefix.size());
+    for (char c : prefix) {
+        if (c == '%' || c == '_' || c == '\\') {
+            escaped_prefix += '\\';
+        }
+        escaped_prefix += c;
+    }
+    escaped_prefix += '%';
+
+    const char* sql = "SELECT key FROM kv_store WHERE plugin = ? AND key LIKE ? ESCAPE '\\' ORDER BY key";
 
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
@@ -244,7 +255,7 @@ std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view
     StmtPtr stmt(raw_stmt);
 
     sqlite3_bind_text(stmt.get(), 1, plugin.data(), static_cast<int>(plugin.size()), SQLITE_STATIC);
-    sqlite3_bind_text(stmt.get(), 2, prefix.data(), static_cast<int>(prefix.size()), SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 2, escaped_prefix.c_str(), static_cast<int>(escaped_prefix.size()), SQLITE_STATIC);
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));

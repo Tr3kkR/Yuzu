@@ -1,5 +1,7 @@
 #include "policy_store.hpp"
 
+#include "compliance_eval.hpp"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -424,6 +426,10 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     if (yaml_source.empty())
         return std::unexpected("yaml_source is required");
 
+    // M9: Reject oversized YAML input to prevent resource exhaustion
+    if (yaml_source.size() > 1048576)
+        return std::unexpected("YAML too large (max 1MB)");
+
     // Validate kind
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "PolicyFragment")
@@ -463,6 +469,18 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     for (const auto& [k, v] : post_params_map)
         post_params_json[k] = v;
 
+    // M11: Validate compliance expressions before storing
+    if (!check_compliance.empty()) {
+        auto err = validate_compliance_expression(check_compliance);
+        if (!err.empty())
+            return std::unexpected("invalid check compliance expression: " + err);
+    }
+    if (!post_compliance.empty()) {
+        auto err = validate_compliance_expression(post_compliance);
+        if (!err.empty())
+            return std::unexpected("invalid postCheck compliance expression: " + err);
+    }
+
     auto now = now_epoch();
 
     const char* sql = R"(
@@ -475,8 +493,11 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        // M10: Do not expose raw SQLite error messages to callers
+        spdlog::error("PolicyStore: prepare failed in create_fragment: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to create fragment");
+    }
 
     int i = 1;
     sqlite3_bind_text(stmt, i++, id.c_str(), -1, SQLITE_TRANSIENT);
@@ -498,9 +519,10 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     sqlite3_bind_int64(stmt, i++, now);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        // M10: Log the real error but return a generic message to the caller
+        spdlog::error("PolicyStore: insert failed in create_fragment: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("insert failed: " + err);
+        return std::unexpected("failed to create fragment");
     }
     sqlite3_finalize(stmt);
     spdlog::info("PolicyStore: created fragment '{}' ({})", name, id);
@@ -761,6 +783,10 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     if (yaml_source.empty())
         return std::unexpected("yaml_source is required");
 
+    // M9: Reject oversized YAML input to prevent resource exhaustion
+    if (yaml_source.size() > 1048576)
+        return std::unexpected("YAML too large (max 1MB)");
+
     // Validate kind
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "Policy")
@@ -896,8 +922,11 @@ PolicyStore::create_policy(const std::string& yaml_source) {
         VALUES (?,?,?,?,?,?,1,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        // M10: Do not expose raw SQLite error messages to callers
+        spdlog::error("PolicyStore: prepare failed in create_policy: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to create policy");
+    }
 
     int i = 1;
     sqlite3_bind_text(stmt, i++, id.c_str(), -1, SQLITE_TRANSIENT);
@@ -910,9 +939,10 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     sqlite3_bind_int64(stmt, i++, now);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        // M10: Log the real error but return a generic message to the caller
+        spdlog::error("PolicyStore: insert failed in create_policy: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("insert failed: " + err);
+        return std::unexpected("failed to create policy");
     }
     sqlite3_finalize(stmt);
 
@@ -921,7 +951,7 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     store_triggers(id, triggers);
     store_groups(id, groups);
 
-    spdlog::info("PolicyStore: created policy '{}' ({}) → fragment '{}'", name, id, fragment_id);
+    spdlog::info("PolicyStore: created policy '{}' ({}) -> fragment '{}'", name, id, fragment_id);
     return id;
 }
 
@@ -1014,16 +1044,18 @@ std::expected<void, std::string> PolicyStore::enable_policy(const std::string& i
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, "UPDATE policies SET enabled = 1, updated_at = ? WHERE id = ?", -1,
-                           &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+                           &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("PolicyStore: prepare failed in enable_policy: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to enable policy");
+    }
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
     sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        spdlog::error("PolicyStore: update failed in enable_policy: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("update failed: " + err);
+        return std::unexpected("failed to enable policy");
     }
     auto changes = sqlite3_changes(db_);
     sqlite3_finalize(stmt);
@@ -1040,16 +1072,18 @@ std::expected<void, std::string> PolicyStore::disable_policy(const std::string& 
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, "UPDATE policies SET enabled = 0, updated_at = ? WHERE id = ?", -1,
-                           &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+                           &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("PolicyStore: prepare failed in disable_policy: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to disable policy");
+    }
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
     sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        spdlog::error("PolicyStore: update failed in disable_policy: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("update failed: " + err);
+        return std::unexpected("failed to disable policy");
     }
     auto changes = sqlite3_changes(db_);
     sqlite3_finalize(stmt);
@@ -1119,8 +1153,10 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
                           ELSE policy_status.last_fix_at END
     )";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("PolicyStore: prepare failed in update_compliance_status: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to update compliance status");
+    }
 
     sqlite3_bind_text(stmt, 1, policy_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1129,9 +1165,9 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
     sqlite3_bind_text(stmt, 5, check_result.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        spdlog::error("PolicyStore: upsert failed in update_compliance_status: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("upsert failed: " + err);
+        return std::unexpected("failed to update compliance status");
     }
     sqlite3_finalize(stmt);
     return {};
@@ -1303,15 +1339,17 @@ PolicyStore::invalidate_policy(const std::string& policy_id) {
 
     const char* sql = "UPDATE policy_status SET status = 'pending' WHERE policy_id = ?";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("PolicyStore: prepare failed in invalidate_policy: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to invalidate policy");
+    }
 
     sqlite3_bind_text(stmt, 1, policy_id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        spdlog::error("PolicyStore: update failed in invalidate_policy: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("update failed: " + err);
+        return std::unexpected("failed to invalidate policy");
     }
 
     auto changes = static_cast<int64_t>(sqlite3_changes(db_));
@@ -1329,13 +1367,15 @@ PolicyStore::invalidate_all_policies() {
 
     const char* sql = "UPDATE policy_status SET status = 'pending'";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("PolicyStore: prepare failed in invalidate_all_policies: {}", sqlite3_errmsg(db_));
+        return std::unexpected("failed to invalidate policies");
+    }
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
+        spdlog::error("PolicyStore: update failed in invalidate_all_policies: {}", sqlite3_errmsg(db_));
         sqlite3_finalize(stmt);
-        return std::unexpected("update failed: " + err);
+        return std::unexpected("failed to invalidate policies");
     }
 
     auto changes = static_cast<int64_t>(sqlite3_changes(db_));

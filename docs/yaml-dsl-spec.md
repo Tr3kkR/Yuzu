@@ -1311,6 +1311,9 @@ This section enumerates the stable builtin primitives that content authors targe
 |---|---|:---:|:---:|:---:|---|
 | `user.list` | `users` | Y | Y | Y | Verified |
 | `user.logged_on` | `users` | Y | Y | Y | Verified |
+| `user.group_members` | `users` | Y | Y | Y | Verified |
+| `user.primary_user` | `users` | Y | Y | Y | Verified |
+| `user.session_history` | `users` | Y | Y | Y | Verified |
 | `user.group_membership` | `users` (ext) | Y | Y | Y | Planned |
 | `session.list` | `users` (ext) | Y | Y | Y | Planned |
 | `session.active_user` | `users` (ext) | Y | Y | Y | Planned |
@@ -1330,6 +1333,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified |
 | `network.adapter.enable` | `network_actions` | Y | Y | Y | Verified |
 | `network.adapter.disable` | `network_actions` | Y | Y | Y | Verified |
+| `network.wifi.list` | `wifi` | Y | Y | Y | Verified |
+| `network.wol.wake` | `wol` | Y | Y | Y | Verified |
+| `network.wol.check` | `wol` | Y | Y | Y | Verified |
 | `network.quarantine` | `quarantine` | Y | Y | - | Planned |
 
 ### 14.6 Software and Patching
@@ -1446,3 +1452,20 @@ This section enumerates the stable builtin primitives that content authors targe
 | `policy.fix` | Policy engine | Verified |
 | `policy.evaluate` | Policy engine | Verified |
 | `policy.recheck` | Policy engine | Verified |
+
+### 14.14 Device Discovery
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status |
+|---|---|:---:|:---:|:---:|---|
+| `discovery.arp_scan` | `discovery` | Y | Y | Y | Verified |
+| `discovery.ping_sweep` | `discovery` | Y | Y | Y | Verified |
+| `discovery.port_scan` | `discovery` | Y | Y | Y | Verified |
+
+### 14.15 Timeline Activity Record (TAR)
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status |
+|---|---|:---:|:---:|:---:|---|
+| `tar.query` | `tar` | Y | Y | Y | Verified |
+| `tar.stats` | `tar` | Y | Y | Y | Verified |
+| `tar.purge` | `tar` | Y | Y | Y | Verified |
+| `tar.configure` | `tar` | Y | Y | Y | Verified |

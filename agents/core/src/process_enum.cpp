@@ -46,6 +46,7 @@ namespace {
 
 #ifdef _WIN32
 
+// Canonical wide_to_utf8 implementation — duplicated in other plugins for build isolation
 std::string wide_to_utf8(const wchar_t* wstr) {
     if (!wstr || !*wstr)
         return {};

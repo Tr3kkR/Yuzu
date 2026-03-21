@@ -46,6 +46,7 @@ namespace yuzu::tar {
 
 namespace {
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8_user(const wchar_t* wstr) {
     if (!wstr || !*wstr)
         return {};

@@ -60,7 +60,7 @@ std::string run_command(const char* cmd) {
 #endif
 
 #ifdef _WIN32
-// Convert a wide string to UTF-8
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* ws) {
     if (!ws || !*ws)
         return {};

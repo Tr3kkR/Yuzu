@@ -250,3 +250,52 @@ TEST_CASE("TAR diff: process with sensitive cmdline is redacted in events", "[ta
     CHECK(events[0].detail_json.find("[REDACTED by TAR]") != std::string::npos);
     CHECK(events[0].detail_json.find("hunter2") == std::string::npos);
 }
+
+// =============================================================================
+// L3: Edge case tests — empty redaction patterns, long cmdline, unicode username
+// =============================================================================
+
+TEST_CASE("TAR redaction: empty patterns list never redacts", "[tar][diff][redaction][edge]") {
+    std::vector<std::string> empty_patterns;
+    CHECK_FALSE(should_redact("myapp --password=hunter2", empty_patterns));
+    CHECK_FALSE(should_redact("export API_KEY=abc123", empty_patterns));
+    CHECK_FALSE(should_redact("", empty_patterns));
+
+    auto result = redact_cmdline("myapp --password=hunter2", empty_patterns);
+    CHECK(result == "myapp --password=hunter2");
+}
+
+TEST_CASE("TAR diff: long cmdline (1KB+) is handled correctly", "[tar][diff][process][edge]") {
+    // Build a command line longer than 1KB
+    std::string long_cmdline = "java -jar app.jar";
+    for (int i = 0; i < 100; ++i) {
+        long_cmdline += " --option-" + std::to_string(i) + "=value" + std::to_string(i);
+    }
+    REQUIRE(long_cmdline.size() > 1024);
+
+    std::vector<ProcessInfo> prev;
+    std::vector<ProcessInfo> curr = {{500, 1, "java", long_cmdline, "appuser"}};
+
+    auto events = compute_process_diff(prev, curr, 15000, 15);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_type == "process");
+    CHECK(events[0].event_action == "started");
+    // The long cmdline should appear in detail_json (not truncated silently)
+    CHECK(events[0].detail_json.find("java") != std::string::npos);
+}
+
+TEST_CASE("TAR diff: unicode username in process events", "[tar][diff][process][edge]") {
+    std::vector<ProcessInfo> prev;
+    // Use a username with multi-byte UTF-8 characters
+    std::vector<ProcessInfo> curr = {
+        {77, 1, "editor", "editor /tmp/file.txt", "\xc3\xa9\x6d\x69\x6c\x65"}};  // "emile" with accented e
+
+    auto events = compute_process_diff(prev, curr, 16000, 16);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_type == "process");
+    CHECK(events[0].event_action == "started");
+    // The unicode username should be preserved in the JSON
+    CHECK(events[0].detail_json.find("\xc3\xa9\x6d\x69\x6c\x65") != std::string::npos);
+}

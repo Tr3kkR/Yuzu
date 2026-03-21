@@ -410,13 +410,28 @@ std::expected<std::string, std::string> ProductPackStore::install(
         if (pack_verified) {
             spdlog::info("ProductPackStore: signature verified for '{}'", pack_name);
         } else {
-            spdlog::warn("ProductPackStore: signature verification FAILED for '{}' — "
-                          "pack will be installed as unverified", pack_name);
+            // Signature was present but verification FAILED — reject the pack.
+            // A failed signature means the content may have been tampered with.
+            spdlog::error("ProductPackStore: signature verification FAILED for '{}' — "
+                           "rejecting pack (content may be tampered)", pack_name);
+            return std::unexpected("signature verification failed for pack '" + pack_name +
+                                    "' — content may have been tampered with");
         }
     } else if (!pack_signature.empty()) {
-        spdlog::warn("ProductPackStore: pack '{}' has signature but no publicKey — "
-                      "cannot verify", pack_name);
+        // Signature present but no public key — cannot verify, reject
+        spdlog::error("ProductPackStore: pack '{}' has signature but no publicKey — "
+                       "rejecting pack", pack_name);
+        return std::unexpected("pack '" + pack_name +
+                                "' has signature but no publicKey — cannot verify");
     } else {
+        // No signature field at all — unsigned pack. This is a separate policy
+        // question controlled by require_signed_packs_.
+        if (require_signed_packs_) {
+            spdlog::error("ProductPackStore: pack '{}' is unsigned but "
+                           "require_signed_packs is enabled — rejecting", pack_name);
+            return std::unexpected("pack '" + pack_name +
+                                    "' is unsigned and require_signed_packs is enabled");
+        }
         spdlog::info("ProductPackStore: pack '{}' has no signature — installing as unverified",
                       pack_name);
     }
@@ -425,6 +440,9 @@ std::expected<std::string, std::string> ProductPackStore::install(
     auto now = now_epoch();
 
     std::unique_lock lock(mtx_);
+
+    // M5: Wrap entire install in a transaction so partial failures are rolled back
+    sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
 
     // Insert pack record
     {
@@ -488,16 +506,13 @@ std::expected<std::string, std::string> ProductPackStore::install(
     }
 
     if (installed_count == 0 && !errors.empty()) {
-        // Rollback the pack record — nothing was installed
-        const char* del_sql = "DELETE FROM product_packs WHERE id = ?";
-        sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, del_sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, pack_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
-        }
+        // Rollback the entire transaction — nothing was installed
+        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
         return std::unexpected("no items installed: " + errors[0]);
     }
+
+    // Commit the transaction — all items installed successfully (or partial with warnings)
+    sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
 
     spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
                  pack_name, pack_version, pack_id, installed_count, errors.size());

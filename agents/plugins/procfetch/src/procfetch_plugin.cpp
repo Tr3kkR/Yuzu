@@ -168,6 +168,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 // -- Windows implementation ---------------------------------------------------
 #elif defined(_WIN32)
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* ws) {
     if (!ws || !*ws)
         return {};

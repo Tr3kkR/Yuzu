@@ -253,7 +253,17 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
         return 1;
     }
 
+    // L9: Enforce a maximum download size of 100MB to prevent disk exhaustion
+    constexpr size_t kMaxDownloadSize = 100 * 1024 * 1024; // 100 MB
+    size_t total_bytes = 0;
+    bool size_exceeded = false;
+
     auto content_receiver = [&](const char* data, size_t len) {
+        total_bytes += len;
+        if (total_bytes > kMaxDownloadSize) {
+            size_exceeded = true;
+            return false; // abort download
+        }
         ofs.write(data, static_cast<std::streamsize>(len));
         return true;
     };
@@ -279,6 +289,14 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
     }
 
     ofs.close();
+
+    if (size_exceeded) {
+        std::error_code ec;
+        std::filesystem::remove(dest, ec);
+        error = "download aborted: exceeded maximum size limit (100 MB)";
+        return 1;
+    }
+
     if (!res || res->status < 200 || res->status >= 400) {
         error = "download failed: HTTP " + (res ? std::to_string(res->status) : "connection error");
         return 1;

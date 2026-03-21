@@ -153,6 +153,35 @@ std::vector<uint8_t> build_magic_packet(const uint8_t mac[6]) {
     return packet;
 }
 
+// ── L11: RAII wrapper for Winsock lifecycle ─────────────────────────────────
+
+#ifdef _WIN32
+struct WinsockGuard {
+    bool ok{false};
+    WinsockGuard() {
+        WSADATA wsa_data;
+        ok = (WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0);
+    }
+    ~WinsockGuard() {
+        if (ok) WSACleanup();
+    }
+    WinsockGuard(const WinsockGuard&) = delete;
+    WinsockGuard& operator=(const WinsockGuard&) = delete;
+};
+
+struct SocketGuard {
+    SOCKET sock{INVALID_SOCKET};
+    explicit SocketGuard(SOCKET s) : sock(s) {}
+    ~SocketGuard() {
+        if (sock != INVALID_SOCKET) closesocket(sock);
+    }
+    SocketGuard(const SocketGuard&) = delete;
+    SocketGuard& operator=(const SocketGuard&) = delete;
+    explicit operator bool() const { return sock != INVALID_SOCKET; }
+    SOCKET get() const { return sock; }
+};
+#endif
+
 // ── wake action ────────────────────────────────────────────────────────────
 
 int do_wake(yuzu::CommandContext& ctx, yuzu::Params params) {
@@ -184,22 +213,19 @@ int do_wake(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto packet = build_magic_packet(mac);
 
 #ifdef _WIN32
-    // Initialize Winsock
-    WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+    // L11: RAII wrappers ensure cleanup on all exit paths
+    WinsockGuard wsa;
+    if (!wsa.ok) {
         ctx.write_output("wake|error|WSAStartup failed");
         return 1;
     }
-#endif
 
-    // Create UDP socket
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
+    SocketGuard sg(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+    if (!sg) {
         ctx.write_output("wake|error|Failed to create UDP socket");
-        WSACleanup();
         return 1;
     }
+    auto sock = sg.get();
 #else
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
@@ -224,12 +250,10 @@ int do_wake(yuzu::CommandContext& ctx, yuzu::Params params) {
                        static_cast<int>(packet.size()), 0,
                        reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
 
-#ifdef _WIN32
-    closesocket(sock);
-    WSACleanup();
-#else
+#ifndef _WIN32
     close(sock);
 #endif
+    // On Windows, SocketGuard and WinsockGuard destructors handle cleanup
 
     if (sent < 0) {
         ctx.write_output(std::format("wake|error|Failed to send magic packet to {}", mac_param));

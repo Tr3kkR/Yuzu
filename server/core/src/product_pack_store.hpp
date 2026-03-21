@@ -60,6 +60,13 @@ public:
     explicit ProductPackStore(const std::filesystem::path& db_path);
     ~ProductPackStore();
 
+    /// When true, packs that include a signature field MUST pass verification
+    /// or they are rejected. Unsigned packs (no signature field) are still
+    /// allowed as a separate policy question.
+    /// Defaults to false for backward compatibility.
+    void set_require_signed_packs(bool require) { require_signed_packs_ = require; }
+    bool require_signed_packs() const { return require_signed_packs_; }
+
     ProductPackStore(const ProductPackStore&) = delete;
     ProductPackStore& operator=(const ProductPackStore&) = delete;
 
@@ -100,6 +107,7 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_;
+    bool require_signed_packs_{false};
 
     void create_tables();
     std::string generate_id() const;

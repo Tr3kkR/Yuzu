@@ -90,6 +90,7 @@ static std::wstring build_temp_path_w(const wchar_t* dir, const char* prefix, co
     return result;
 }
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 static int wide_to_utf8(const wchar_t* wide, char* out, size_t out_size) {
     int written = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<int>(out_size),
                                       nullptr, nullptr);

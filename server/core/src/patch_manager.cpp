@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <random>
+#include <regex>
 #include <shared_mutex>
 
 namespace yuzu::server {
@@ -280,6 +281,13 @@ PatchManager::deploy_patch(const std::string& kb_id,
                            const std::string& created_by) {
     if (kb_id.empty())
         return std::unexpected("kb_id is required");
+
+    // KB IDs must be KBnnnnn format — reject anything else to prevent
+    // PowerShell -match injection when the kb_id is interpolated into scripts
+    std::regex kb_pattern("^KB\\d{4,10}$", std::regex::icase);
+    if (!std::regex_match(kb_id, kb_pattern))
+        return std::unexpected("invalid KB ID format (must be KBnnnnnnn)");
+
     if (agent_ids.empty())
         return std::unexpected("at least one agent_id is required");
 

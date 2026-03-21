@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <format>
@@ -132,8 +133,8 @@ std::vector<std::string> enumerate_hosts(uint32_t base_ip, int prefix_len) {
     uint32_t network = base_ip & mask;
     uint32_t broadcast = network | ~mask;
 
-    // Limit to /20 (4094 hosts) to prevent excessive scans
-    if (prefix_len < 20) return result;
+    // Limit to /24 (254 hosts) to prevent DoS from scanning overly large subnets
+    if (prefix_len < 24) return result;
 
     for (uint32_t ip = network + 1; ip < broadcast; ++ip) {
         result.push_back(ip_to_string(ip));
@@ -395,11 +396,16 @@ private:
 
         auto hosts = enumerate_hosts(base_ip, prefix_len);
         if (hosts.empty()) {
-            ctx.write_output("status|error|subnet too large (max /20) or no valid hosts");
+            ctx.write_output("status|error|subnet too large (max /24) or no valid hosts");
             return 1;
         }
 
         ctx.report_progress(5);
+
+        // Overall scan timeout: abort after 300 seconds and return partial results
+        constexpr int kScanTimeoutSeconds = 300;
+        auto scan_start = std::chrono::steady_clock::now();
+        bool timed_out = false;
 
         // Step 1: Get current ARP table (fast, pre-populated entries)
         auto arp_entries = get_arp_table();
@@ -419,6 +425,17 @@ private:
         std::set<std::string> alive_ips;
 
         for (const auto& ip : hosts) {
+            // Check overall scan timeout
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - scan_start).count();
+            if (elapsed >= kScanTimeoutSeconds) {
+                timed_out = true;
+                ctx.write_output(std::format("status|warning|scan timed out after {}s, "
+                                             "returning partial results ({}/{})",
+                                             elapsed, done, total));
+                break;
+            }
+
             // If already in ARP table, it's alive
             if (arp_ips.count(ip)) {
                 alive_ips.insert(ip);
@@ -433,6 +450,13 @@ private:
             int progress = 10 + (done * 80 / total);
             if (done % 10 == 0 || done == total) {
                 ctx.report_progress(progress);
+            }
+
+            // Progress reporting every 50 hosts
+            if (done % 50 == 0) {
+                ctx.write_output(std::format("progress|scanned {} of {} hosts, "
+                                             "{} alive so far",
+                                             done, total, alive_ips.size()));
             }
         }
 

@@ -236,24 +236,13 @@ std::vector<TarEvent> TarDatabase::query(int64_t from, int64_t to,
     if (!db_)
         return results;
 
-    std::string sql;
-    if (type_filter.empty()) {
-        sql = R"(
-            SELECT id, timestamp, event_type, event_action, detail_json, snapshot_id
-            FROM tar_events
-            WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp ASC
-            LIMIT ?
-        )";
-    } else {
-        sql = R"(
-            SELECT id, timestamp, event_type, event_action, detail_json, snapshot_id
-            FROM tar_events
-            WHERE timestamp >= ? AND timestamp <= ? AND event_type = ?
-            ORDER BY timestamp ASC
-            LIMIT ?
-        )";
+    // L2: Single SQL string with optional WHERE clause to avoid duplication
+    std::string sql = "SELECT id, timestamp, event_type, event_action, detail_json, snapshot_id "
+                      "FROM tar_events WHERE timestamp >= ? AND timestamp <= ?";
+    if (!type_filter.empty()) {
+        sql += " AND event_type = ?";
     }
+    sql += " ORDER BY timestamp ASC LIMIT ?";
 
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &raw_stmt, nullptr);
@@ -263,16 +252,14 @@ std::vector<TarEvent> TarDatabase::query(int64_t from, int64_t to,
     }
     StmtPtr stmt(raw_stmt);
 
-    sqlite3_bind_int64(stmt.get(), 1, from);
-    sqlite3_bind_int64(stmt.get(), 2, to);
-
-    if (type_filter.empty()) {
-        sqlite3_bind_int(stmt.get(), 3, limit);
-    } else {
-        sqlite3_bind_text(stmt.get(), 3, type_filter.c_str(),
+    int bind_idx = 1;
+    sqlite3_bind_int64(stmt.get(), bind_idx++, from);
+    sqlite3_bind_int64(stmt.get(), bind_idx++, to);
+    if (!type_filter.empty()) {
+        sqlite3_bind_text(stmt.get(), bind_idx++, type_filter.c_str(),
                           static_cast<int>(type_filter.size()), SQLITE_STATIC);
-        sqlite3_bind_int(stmt.get(), 4, limit);
     }
+    sqlite3_bind_int(stmt.get(), bind_idx, limit);
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         TarEvent ev;

@@ -20,6 +20,8 @@ This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints a
   - [Compliance](#compliance)
   - [Runtime Configuration](#runtime-configuration)
   - [Custom Properties](#custom-properties)
+  - [Webhooks](#webhooks)
+  - [Workflows](#workflows)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -1571,6 +1573,139 @@ Create or update a property schema. If a schema with the given key already exist
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Webhooks
+
+Webhooks deliver real-time HTTP POST notifications to external systems when events occur in Yuzu (e.g., agent registration, command completion, policy compliance changes).
+
+#### `GET /api/webhooks`
+
+List all configured webhooks.
+
+**Response:**
+
+```json
+{
+  "webhooks": [
+    {
+      "id": 1,
+      "url": "https://example.com/hooks/yuzu",
+      "event_types": ["agent.registered", "command.completed"],
+      "enabled": true,
+      "created_at": 1710849600
+    }
+  ]
+}
+```
+
+#### `POST /api/webhooks`
+
+Create a new webhook subscription.
+
+**Request body:**
+
+```json
+{
+  "url": "https://example.com/hooks/yuzu",
+  "event_types": ["agent.registered", "command.completed", "policy.violation"],
+  "secret": "optional-hmac-secret"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `url` | string | Yes | HTTPS endpoint to receive POST notifications |
+| `event_types` | array | Yes | Events to subscribe to |
+| `secret` | string | No | HMAC-SHA256 secret for payload signing |
+
+If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
+
+#### `DELETE /api/webhooks/{id}`
+
+Delete a webhook by numeric ID.
+
+#### `GET /api/webhooks/{id}/deliveries`
+
+List recent delivery attempts for a webhook. Includes HTTP status code, response time, and any error message for failed deliveries.
+
+**Usage guide:**
+
+1. Create a webhook targeting your SIEM, Slack, or automation endpoint.
+2. Subscribe to the event types relevant to your workflow.
+3. Optionally set an HMAC secret and verify the `X-Yuzu-Signature` header on receipt.
+4. Monitor delivery history via `GET /api/webhooks/{id}/deliveries` to detect failures.
+
+---
+
+### Workflows
+
+Workflows define multi-step instruction sequences that execute in order against a set of agents. Each step references an instruction definition and can include parameter overrides.
+
+#### `GET /api/workflows`
+
+List all workflows. Supports `?q=<search>` query parameter for name filtering.
+
+**Response:**
+
+```json
+{
+  "workflows": [
+    {
+      "id": "abc123",
+      "name": "Patch and Reboot",
+      "description": "Install patches then reboot if required",
+      "steps": [
+        { "instruction": "windows-update-install", "parameters": {} },
+        { "instruction": "system-reboot", "parameters": { "delay": "60" } }
+      ],
+      "created_at": 1710849600
+    }
+  ]
+}
+```
+
+#### `POST /api/workflows`
+
+Create a workflow from YAML. The request body is the raw YAML text with `Content-Type: text/x-yaml` or `application/json` with a `yaml_source` field.
+
+#### `GET /api/workflows/{id}`
+
+Get a single workflow by ID, including its full step definitions.
+
+#### `DELETE /api/workflows/{id}`
+
+Delete a workflow by ID.
+
+#### `POST /api/workflows/{id}/execute`
+
+Execute a workflow against targeted agents.
+
+**Request body:**
+
+```json
+{
+  "scope": "os = 'windows' AND tag:environment = 'production'",
+  "parameters": {}
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `scope` | string | Yes | Scope expression selecting target agents |
+| `parameters` | object | No | Override parameters for workflow steps |
+
+#### `GET /api/workflow-executions/{id}`
+
+Get the status of a running or completed workflow execution, including per-step and per-agent results.
+
+**Usage guide:**
+
+1. Define a workflow with ordered steps (each step maps to an instruction definition).
+2. Execute the workflow against a scope expression to target specific agents.
+3. Monitor execution progress via `GET /api/workflow-executions/{id}`.
+4. Each step runs sequentially; if a step fails on an agent, subsequent steps for that agent are skipped.
 
 ---
 

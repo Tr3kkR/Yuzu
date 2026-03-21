@@ -8,8 +8,15 @@ namespace yuzu::server {
 
 // ── CORS helpers ────────────────────────────────────────────────────────────
 
-void RestApiV1::add_cors_headers(httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
+void RestApiV1::add_cors_headers(httplib::Response& res, const httplib::Request& req) {
+    // Don't use wildcard — restrict to same origin (the server's own web UI).
+    // Only reflect the request's Origin header so that the browser enforces
+    // same-origin policy for cross-site requests.
+    auto origin = req.get_header_value("Origin");
+    if (!origin.empty()) {
+        res.set_header("Access-Control-Allow-Origin", origin);
+        res.set_header("Access-Control-Allow-Credentials", "true");
+    }
     res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Yuzu-Token");
     res.set_header("Access-Control-Max-Age", "86400");
@@ -426,16 +433,16 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Handles OPTIONS requests with proper CORS headers so cross-origin
     // clients (Swagger UI, SPAs, scripts) can call the API.
-    svr.Options(R"(/api/v1/.*)", [](const httplib::Request& /*req*/, httplib::Response& res) {
-        add_cors_headers(res);
+    svr.Options(R"(/api/v1/.*)", [](const httplib::Request& req, httplib::Response& res) {
+        add_cors_headers(res, req);
         res.status = 204; // No Content
     });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
     // Returns the OpenAPI 3.0 specification as JSON. Unauthenticated so
     // external tools (Swagger UI, Postman) can discover the API.
-    svr.Get("/api/v1/openapi.json", [](const httplib::Request& /*req*/, httplib::Response& res) {
-        add_cors_headers(res);
+    svr.Get("/api/v1/openapi.json", [](const httplib::Request& req, httplib::Response& res) {
+        add_cors_headers(res, req);
         res.set_content(generate_openapi_spec(), "application/json");
     });
 
@@ -1320,7 +1327,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // GET /api/v1/inventory/tables — list available inventory data types
     svr.Get("/api/v1/inventory/tables",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                add_cors_headers(res);
+                add_cors_headers(res, req);
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
@@ -1344,7 +1351,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // GET /api/v1/inventory/:agent_id/:plugin — get inventory for agent+plugin
     svr.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                add_cors_headers(res);
+                add_cors_headers(res, req);
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
@@ -1385,7 +1392,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // POST /api/v1/inventory/query — query inventory across agents
     svr.Post("/api/v1/inventory/query",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                 add_cors_headers(res);
+                 add_cors_headers(res, req);
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return;
                  if (!inventory_store || !inventory_store->is_open()) {

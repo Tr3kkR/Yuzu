@@ -407,6 +407,11 @@ CustomPropertiesStore::upsert_schema(const CustomPropertySchema& schema) {
 
     // Validate regex if provided
     if (!schema.validation_regex.empty()) {
+        // L10: Limit regex length to prevent ReDoS (regex denial of service)
+        constexpr size_t kMaxRegexLength = 256;
+        if (schema.validation_regex.size() > kMaxRegexLength) {
+            return std::unexpected("validation regex exceeds maximum length of 256 characters");
+        }
         try {
             std::regex re(schema.validation_regex, std::regex::ECMAScript);
             (void)re;

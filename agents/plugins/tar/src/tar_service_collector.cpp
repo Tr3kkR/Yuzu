@@ -36,6 +36,7 @@ namespace yuzu::tar {
 
 namespace {
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* wstr) {
     if (!wstr || !*wstr)
         return {};
@@ -236,6 +237,7 @@ std::vector<ServiceInfo> enumerate_services() {
         si.name = next_field();
 
         si.status = (pid_str != "-" && !pid_str.empty()) ? "running" : "stopped";
+        // macOS launchctl list does not provide startup type; 'unknown' is correct
         si.startup_type = "unknown";
         services.push_back(std::move(si));
     }

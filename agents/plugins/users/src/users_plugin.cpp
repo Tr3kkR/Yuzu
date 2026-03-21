@@ -96,7 +96,7 @@ std::string run_command(const char* cmd) {
 }
 
 #ifdef _WIN32
-// Convert a wide string to UTF-8
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* ws) {
     if (!ws || !*ws)
         return {};
@@ -380,6 +380,12 @@ int do_local_users(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
+    // M7: macOS dscl output format assumption.
+    // `dscl . -list /Users UniqueID` outputs lines of "username  UID" separated
+    // by whitespace. `dscl . -read /Users/<name> <key>` outputs "Key: Value"
+    // on a single line (or "Key:\n Value" for multi-line values like RealName).
+    // Tested and verified on macOS 14 (Sonoma). If Apple changes the dscl
+    // output format in a future macOS release, this parsing will need updating.
     auto dscl_out = run_command("dscl . -list /Users UniqueID 2>/dev/null");
     if (!dscl_out.empty()) {
         std::istringstream ss(dscl_out);

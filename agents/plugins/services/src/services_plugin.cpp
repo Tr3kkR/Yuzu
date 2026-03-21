@@ -41,6 +41,7 @@ namespace {
 
 #ifdef _WIN32
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* wstr) {
     if (!wstr || !*wstr)
         return {};

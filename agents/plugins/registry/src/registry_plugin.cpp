@@ -15,6 +15,9 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <spdlog/spdlog.h>
+
+#include <cctype>
 #include <format>
 #include <string>
 #include <string_view>
@@ -329,6 +332,24 @@ private:
         return 0;
     }
 
+    // L7: Log access to sensitive registry paths for audit trail
+    static void audit_sensitive_path(std::string_view hive, std::string_view key_path) {
+        // Normalize to uppercase for comparison
+        std::string upper_key;
+        upper_key.reserve(key_path.size());
+        for (char c : key_path) {
+            upper_key += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        // Check for sensitive paths
+        if (hive == "HKLM") {
+            if (upper_key.starts_with("SOFTWARE\\MICROSOFT\\WINDOWS\\CURRENTVERSION\\RUN")) {
+                spdlog::info("Registry: accessing sensitive path HKLM\\{}", key_path);
+            } else if (upper_key.starts_with("SYSTEM\\CURRENTCONTROLSET\\SERVICES")) {
+                spdlog::info("Registry: accessing sensitive path HKLM\\{}", key_path);
+            }
+        }
+    }
+
     struct ParsedParams { HKEY hkey; std::string_view key_path; bool ok; };
     ParsedParams parse_params(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto hive = params.get("hive");
@@ -342,6 +363,7 @@ private:
             ctx.write_output("error|invalid hive (use HKLM, HKCU, HKCR, or HKU)");
             return {nullptr, {}, false};
         }
+        audit_sensitive_path(hive, key);
         return {hkey, key, true};
     }
 #endif

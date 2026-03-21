@@ -52,21 +52,27 @@ namespace {
 
 /**
  * Returns true if the character is safe for inclusion in shell commands.
- * Blocks backticks, $, |, ;, &, <, >, (, ), {, }, [, ], \, newlines, and
- * other shell metacharacters.
+ * Blocks backticks, $, |, ;, &, <, >, (, ), {, }, [, ], \, newlines,
+ * single quotes, double quotes, and other shell metacharacters.
+ *
+ * M13: Single and double quotes are blocked on macOS/Linux because
+ * osascript and zenity commands embed user text inside shell quotes.
+ * Allowing quotes would enable shell injection via quote-breaking.
+ * On Windows, native APIs (MessageBoxW, ShellNotifyIconW) are used
+ * so quotes are safe — but we block them uniformly for defense-in-depth.
  */
 bool is_safe_char(char c) {
     if (c >= 'a' && c <= 'z') return true;
     if (c >= 'A' && c <= 'Z') return true;
     if (c >= '0' && c <= '9') return true;
     // Safe punctuation: space, period, comma, hyphen, underscore, colon,
-    // question mark, exclamation, slash, at, hash, percent, plus, equals,
-    // single quote, double quote (for display text)
+    // question mark, exclamation, slash, at, hash, percent, plus, equals.
+    // Note: single quote and double quote are intentionally excluded (M13)
+    // to prevent shell injection on macOS/Linux popen calls.
     switch (c) {
     case ' ':  case '.':  case ',':  case '-':  case '_':
     case ':':  case '?':  case '!':  case '/':  case '@':
-    case '#':  case '%':  case '+':  case '=':  case '\'':
-    case '"':  case '\t':
+    case '#':  case '%':  case '+':  case '=':  case '\t':
         return true;
     default:
         return false;

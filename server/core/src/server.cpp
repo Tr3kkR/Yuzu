@@ -1,3 +1,16 @@
+// M14/L15: This file (server.cpp) is ~8,800+ lines and due for decomposition.
+// Planned extraction into separate translation units:
+//   - settings_routes.cpp   — Settings page HTMX routes (TLS, users, enrollment, AD)
+//   - compliance_routes.cpp — Compliance dashboard routes and policy evaluation
+//   - auth_routes.cpp       — Login, logout, OIDC, session management routes
+//   - webhook_routes.cpp    — Webhook CRUD and delivery routes
+//   - workflow_routes.cpp   — Workflow engine routes and execution tracking
+//   - notification_routes.cpp — Notification CRUD and bell icon routes
+//   - discovery_routes.cpp  — Device discovery scan and result routes
+// Each extraction should move the route registration lambdas and any
+// helper functions they closure-capture. The Server class itself stays here
+// as the composition root.
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
 #include <yuzu/server/auth.hpp>
@@ -8579,6 +8592,7 @@ private:
                          });
 
 #include "directory_patch_routes.inc"
+#include "deployment_discovery_routes.inc"
 
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 

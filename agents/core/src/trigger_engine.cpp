@@ -43,6 +43,13 @@ void TriggerEngine::register_trigger(TriggerConfig config) {
                      trigger_type_to_string(config.type));
         *it = std::move(config);
     } else {
+        // L8: Enforce maximum trigger count to prevent resource exhaustion
+        constexpr size_t kMaxTriggers = 500;
+        if (triggers_.size() >= kMaxTriggers) {
+            spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached",
+                         config.id, kMaxTriggers);
+            return;
+        }
         spdlog::info("Trigger '{}' registered (type={}, plugin={}, action={})", config.id,
                      trigger_type_to_string(config.type), config.plugin, config.action);
         triggers_.push_back(std::move(config));

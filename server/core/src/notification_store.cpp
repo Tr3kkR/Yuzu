@@ -9,9 +9,21 @@
 namespace yuzu::server {
 
 NotificationStore::NotificationStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    // M8: Canonicalize the path before opening to handle macOS /var -> /private/var
+    // symlink and other platform-specific path resolution issues.
+    auto canonical_path = db_path;
+    {
+        std::error_code ec;
+        auto parent = db_path.parent_path();
+        if (!parent.empty() && std::filesystem::exists(parent, ec)) {
+            auto canon_parent = std::filesystem::canonical(parent, ec);
+            if (!ec)
+                canonical_path = canon_parent / db_path.filename();
+        }
+    }
+    int rc = sqlite3_open(canonical_path.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
-        spdlog::error("NotificationStore: failed to open {}: {}", db_path.string(),
+        spdlog::error("NotificationStore: failed to open {}: {}", canonical_path.string(),
                       sqlite3_errmsg(db_));
         if (db_) {
             sqlite3_close(db_);
@@ -23,7 +35,7 @@ NotificationStore::NotificationStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("NotificationStore: opened {}", db_path.string());
+    spdlog::info("NotificationStore: opened {}", canonical_path.string());
 }
 
 NotificationStore::~NotificationStore() {

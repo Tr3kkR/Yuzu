@@ -296,17 +296,29 @@ DirectorySync::http_get(const std::string& url, const std::string& bearer_token)
 #endif
 
 // ── OAuth2 client credentials flow ──────────────────────────────────────────
+//
+// Per RFC 6749 Section 2.3.1, the client secret is sent in the request body
+// for the client_credentials grant type. This is standard OAuth2 behavior.
+// SECURITY: The token endpoint MUST be accessed over HTTPS to protect the
+// client secret in transit. Both WinHTTP and httplib paths below enforce this
+// by connecting to https://login.microsoftonline.com.
 
 std::expected<std::string, std::string>
 DirectorySync::acquire_token(const EntraConfig& config) {
     auto token_url = "https://login.microsoftonline.com/" + config.tenant_id +
                      "/oauth2/v2.0/token";
 
+    // Make a mutable copy of the secret so we can zero it after use
+    std::string secret_copy = config.client_secret;
+
     std::string form_body =
         "grant_type=client_credentials"
         "&client_id=" + url_encode(config.client_id) +
-        "&client_secret=" + url_encode(config.client_secret) +
+        "&client_secret=" + url_encode(secret_copy) +
         "&scope=" + url_encode("https://graph.microsoft.com/.default");
+
+    // Zero the secret copy now that it has been encoded into the form body
+    std::fill(secret_copy.begin(), secret_copy.end(), '\0');
 
     spdlog::info("DirectorySync: acquiring token from {}", token_url);
 
@@ -387,25 +399,24 @@ DirectorySync::acquire_token(const EntraConfig& config) {
 
 #else
     // httplib POST for Linux/macOS
+    // SECURITY: Reject non-HTTPS URLs — client secret MUST NOT be sent over plaintext
     std::string u = token_url;
-    std::string scheme;
-    if (u.starts_with("https://")) {
-        scheme = "https://";
-        u = u.substr(8);
-    } else if (u.starts_with("http://")) {
-        scheme = "http://";
-        u = u.substr(7);
-    } else {
-        return std::unexpected("invalid token URL");
+    if (!u.starts_with("https://")) {
+        std::fill(form_body.begin(), form_body.end(), '\0');
+        return std::unexpected("token endpoint must use HTTPS (client secret protection)");
     }
+    u = u.substr(8); // strip "https://"
 
     auto slash = u.find('/');
     auto h = (slash != std::string::npos) ? u.substr(0, slash) : u;
     auto p = (slash != std::string::npos) ? u.substr(slash) : "/";
 
-    httplib::Client client(scheme + h);
+    httplib::Client client("https://" + h);
     client.set_connection_timeout(10);
     client.set_read_timeout(15);
+    // Enable TLS peer verification (httplib verifies by default with OpenSSL,
+    // but set explicitly for clarity)
+    client.enable_server_certificate_verification(true);
 
     auto result = client.Post(p, form_body, "application/x-www-form-urlencoded");
     if (!result) {
@@ -419,6 +430,10 @@ DirectorySync::acquire_token(const EntraConfig& config) {
     }
     std::string response_body = result->body;
 #endif
+
+    // Zero the form body containing the client secret now that the request is complete
+    std::fill(form_body.begin(), form_body.end(), '\0');
+    form_body.clear();
 
     // Parse token response
     nlohmann::json j;

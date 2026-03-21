@@ -471,6 +471,7 @@ std::string format_addr6(const void* addr) {
     return buf;
 }
 
+// Intentionally duplicated for build isolation — see process_enum.cpp for canonical implementation
 std::string wide_to_utf8(const wchar_t* ws) {
     if (!ws || !*ws)
         return {};

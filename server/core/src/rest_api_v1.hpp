@@ -58,8 +58,10 @@ private:
     static nlohmann::json list_response(const nlohmann::json& data, int64_t total,
                                         int64_t start = 0, int64_t page_size = 50);
 
-    // CORS helper — adds CORS headers to a response for /api/v1/* routes
-    static void add_cors_headers(httplib::Response& res);
+    // CORS helper — adds CORS headers to a response for /api/v1/* routes.
+    // Reflects the request Origin instead of using wildcard (*) to enforce
+    // same-origin policy.
+    static void add_cors_headers(httplib::Response& res, const httplib::Request& req);
 
     // OpenAPI 3.0 spec generator
     static std::string generate_openapi_spec();
