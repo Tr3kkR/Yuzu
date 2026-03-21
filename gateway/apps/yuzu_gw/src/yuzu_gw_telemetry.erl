@@ -95,9 +95,8 @@ handle_event([yuzu, gw, command, fanout], #{target_count := T, dispatched := D},
     prometheus_histogram:observe(yuzu_gw_fanout_target_count, [], T),
     prometheus_histogram:observe(yuzu_gw_fanout_dispatched_count, [], D);
 
-handle_event([yuzu, gw, stream, backpressure], #{queue_len := Q}, Meta, _Config) ->
-    AgentId = maps:get(agent_id, Meta, <<"unknown">>),
-    prometheus_gauge:set(yuzu_gw_stream_queue_len, [AgentId], Q);
+handle_event([yuzu, gw, stream, backpressure], #{queue_len := Q}, _Meta, _Config) ->
+    prometheus_histogram:observe(yuzu_gw_stream_queue_len_distribution, [], Q);
 
 handle_event([yuzu, gw, stream, write_error], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_stream_write_errors_total, [], N);
@@ -209,10 +208,11 @@ declare_metrics() ->
         {name, yuzu_gw_agents_current},
         {labels, [node]},
         {help, "Current number of connected agents"}]),
-    prometheus_gauge:declare([
-        {name, yuzu_gw_stream_queue_len},
-        {labels, [agent_id]},
-        {help, "Agent process mailbox queue length"}]),
+    prometheus_histogram:declare([
+        {name, yuzu_gw_stream_queue_len_distribution},
+        {labels, []},
+        {buckets, [10, 100, 500, 1000, 5000]},
+        {help, "Distribution of stream handler mailbox queue lengths at backpressure events"}]),
     prometheus_gauge:declare([
         {name, yuzu_gw_beam_process_count},
         {labels, [node]},

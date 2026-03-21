@@ -119,6 +119,13 @@ subscribe(Ref, State) ->
     end.
 
 %% Subscribe stream loop: relay messages between grpcbox and the agent process.
+%%
+%% Backpressure: before writing a command to the HTTP/2 stream, we check
+%% our own message queue length. If it exceeds the threshold (1000), we
+%% emit a telemetry event and skip the send to prevent unbounded mailbox
+%% growth under load.
+-define(BACKPRESSURE_THRESHOLD, 1000).
+
 stream_loop(Ref, State, AgentPid) ->
     receive
         {Ref, eos} ->
@@ -133,11 +140,30 @@ stream_loop(Ref, State, AgentPid) ->
 
         {send_command, Cmd} ->
             %% Command from the agent gen_statem to send to the agent.
-            grpcbox_stream:send(Cmd, State),
-            stream_loop(Ref, State, AgentPid);
+            %% Check backpressure before writing to stream.
+            case check_backpressure() of
+                ok ->
+                    grpcbox_stream:send(Cmd, State),
+                    stream_loop(Ref, State, AgentPid);
+                backpressure ->
+                    %% Drop this command — the agent process will see a timeout.
+                    stream_loop(Ref, State, AgentPid)
+            end;
 
         close_stream ->
             %% Agent process requested graceful disconnect.
+            ok
+    end.
+
+%% @doc Check if our message queue is too deep; emit telemetry if so.
+check_backpressure() ->
+    case process_info(self(), message_queue_len) of
+        {message_queue_len, Len} when Len > ?BACKPRESSURE_THRESHOLD ->
+            telemetry:execute([yuzu, gw, stream, backpressure],
+                              #{queue_len => Len},
+                              #{stream_pid => self()}),
+            backpressure;
+        _ ->
             ok
     end.
 
@@ -146,7 +172,7 @@ stream_loop(Ref, State, AgentPid) ->
 %%--------------------------------------------------------------------
 
 heartbeat(Ctx, HeartbeatReq) ->
-    yuzu_gw_upstream:queue_heartbeat(HeartbeatReq),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HeartbeatReq),
 
     %% Respond immediately — the agent doesn't need to wait for upstream ack.
     Response = #{

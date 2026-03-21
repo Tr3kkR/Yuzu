@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -154,7 +155,7 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
 
     bool has_users = false;
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         users_.clear();
 
         std::string line;
@@ -197,7 +198,7 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
 }
 
 bool AuthManager::save_config() const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
 
     auto parent = cfg_path_.parent_path();
     if (!parent.empty()) {
@@ -350,7 +351,7 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
                                                      const std::string& password) {
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
 
     auto it = users_.find(username);
     if (it == users_.end()) {
@@ -379,14 +380,15 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
 }
 
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
 
     auto it = sessions_.find(token);
     if (it == sessions_.end())
         return std::nullopt;
 
     if (std::chrono::steady_clock::now() > it->second.expires_at) {
-        sessions_.erase(it);
+        // Expired sessions are cleaned up lazily; don't mutate under shared lock.
+        // Return nullopt; the session will be reaped on next authenticate/invalidate.
         return std::nullopt;
     }
 
@@ -394,19 +396,19 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
 }
 
 void AuthManager::invalidate_session(const std::string& token) {
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
     sessions_.erase(token);
 }
 
 // ── User management ─────────────────────────────────────────────────────────
 
 bool AuthManager::has_users() const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     return !users_.empty();
 }
 
 std::vector<UserEntry> AuthManager::list_users() const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     std::vector<UserEntry> out;
     out.reserve(users_.size());
     for (const auto& [_, e] : users_) {
@@ -419,7 +421,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     auto salt = random_bytes(16);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
     UserEntry entry;
     entry.username = username;
     entry.role = role;
@@ -430,12 +432,12 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
 }
 
 bool AuthManager::remove_user(const std::string& username) {
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
     return users_.erase(username) > 0;
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
         return std::nullopt;
@@ -448,7 +450,7 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& email, const std::string& oidc_sub,
                                              const std::vector<std::string>& groups,
                                              const std::string& admin_group_id) {
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
 
     // Determine role: admin if user is in the configured admin group,
     // or if email/display_name matches a local admin account
@@ -563,7 +565,7 @@ std::string AuthManager::create_enrollment_token(const std::string& label, int m
     et.revoked = false;
 
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         enrollment_tokens_[token_id] = std::move(et);
     }
 
@@ -592,7 +594,7 @@ bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
     auto hash = sha256_hex(raw_token);
     auto now = std::chrono::system_clock::now();
 
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
 
     for (auto& [id, et] : enrollment_tokens_) {
         if (!constant_time_compare(et.token_hash, hash))
@@ -624,7 +626,7 @@ bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
 }
 
 std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     std::vector<EnrollmentToken> out;
     out.reserve(enrollment_tokens_.size());
     for (const auto& [_, et] : enrollment_tokens_) {
@@ -635,7 +637,7 @@ std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
 
 bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         auto it = enrollment_tokens_.find(token_id);
         if (it == enrollment_tokens_.end())
             return false;
@@ -651,7 +653,7 @@ bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
 bool AuthManager::save_tokens() const {
     auto path = cfg_path_.parent_path() / "enrollment-tokens.cfg";
 
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
 
     std::ofstream f(path, std::ios::trunc);
     if (!f.is_open()) {
@@ -688,7 +690,7 @@ bool AuthManager::load_tokens() {
     if (!f.is_open())
         return false;
 
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
     enrollment_tokens_.clear();
 
     std::string line;
@@ -757,7 +759,7 @@ void AuthManager::add_pending_agent(const std::string& agent_id, const std::stri
                                     const std::string& os, const std::string& arch,
                                     const std::string& agent_version) {
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         // Don't overwrite if already exists
         if (pending_agents_.contains(agent_id))
             return;
@@ -777,7 +779,7 @@ void AuthManager::add_pending_agent(const std::string& agent_id, const std::stri
 }
 
 std::optional<PendingStatus> AuthManager::get_pending_status(const std::string& agent_id) const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     auto it = pending_agents_.find(agent_id);
     if (it == pending_agents_.end())
         return std::nullopt;
@@ -785,7 +787,7 @@ std::optional<PendingStatus> AuthManager::get_pending_status(const std::string& 
 }
 
 std::vector<PendingAgent> AuthManager::list_pending_agents() const {
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
     std::vector<PendingAgent> out;
     out.reserve(pending_agents_.size());
     for (const auto& [_, pa] : pending_agents_) {
@@ -796,7 +798,7 @@ std::vector<PendingAgent> AuthManager::list_pending_agents() const {
 
 bool AuthManager::approve_pending_agent(const std::string& agent_id) {
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         auto it = pending_agents_.find(agent_id);
         if (it == pending_agents_.end())
             return false;
@@ -809,7 +811,7 @@ bool AuthManager::approve_pending_agent(const std::string& agent_id) {
 
 bool AuthManager::deny_pending_agent(const std::string& agent_id) {
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         auto it = pending_agents_.find(agent_id);
         if (it == pending_agents_.end())
             return false;
@@ -822,7 +824,7 @@ bool AuthManager::deny_pending_agent(const std::string& agent_id) {
 
 bool AuthManager::remove_pending_agent(const std::string& agent_id) {
     {
-        std::lock_guard lock(mu_);
+        std::unique_lock lock(mu_);
         if (pending_agents_.erase(agent_id) == 0)
             return false;
     }
@@ -835,7 +837,7 @@ bool AuthManager::remove_pending_agent(const std::string& agent_id) {
 bool AuthManager::save_pending() const {
     auto path = cfg_path_.parent_path() / "pending-agents.cfg";
 
-    std::lock_guard lock(mu_);
+    std::shared_lock lock(mu_);
 
     std::ofstream f(path, std::ios::trunc);
     if (!f.is_open()) {
@@ -865,7 +867,7 @@ bool AuthManager::load_pending() {
     if (!f.is_open())
         return false;
 
-    std::lock_guard lock(mu_);
+    std::unique_lock lock(mu_);
     pending_agents_.clear();
 
     std::string line;

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,6 +76,8 @@ private:
     std::filesystem::path db_path_;
     int retention_days_;
     int cleanup_interval_min_;
+    mutable std::shared_mutex mtx_;
+    sqlite3_stmt* insert_stmt_{nullptr}; // Cached prepared INSERT statement
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else
@@ -83,6 +86,7 @@ private:
 #endif
 
     void create_tables();
+    void prepare_insert_stmt();
 #ifdef __cpp_lib_jthread
     void run_cleanup(std::stop_token stop);
 #else

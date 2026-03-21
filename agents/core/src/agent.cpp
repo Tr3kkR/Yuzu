@@ -35,11 +35,14 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <string>
 #include <thread>
@@ -83,6 +86,77 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
+// ── Bounded Thread Pool ──────────────────────────────────────────────────────
+// Replaces unbounded std::thread-per-command dispatch. Workers pull tasks from
+// a shared queue protected by a mutex + condition variable. If the queue exceeds
+// max_queue_size, submit() returns false so the caller can reject the command.
+
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t num_threads, size_t max_queue_size = 1000)
+        : max_queue_size_{max_queue_size} {
+        // Clamp thread count: min 4, max 32
+        num_threads = std::max<size_t>(num_threads, 4);
+        num_threads = std::min<size_t>(num_threads, 32);
+        workers_.reserve(num_threads);
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock lock(mu_);
+                        cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty())
+                            return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+        spdlog::info("Thread pool started: {} workers, max queue {}", num_threads, max_queue_size);
+    }
+
+    // Returns false if the queue is full (backpressure).
+    bool submit(std::function<void()> task) {
+        {
+            std::lock_guard lock(mu_);
+            if (stop_)
+                return false;
+            if (tasks_.size() >= max_queue_size_)
+                return false;
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable())
+                w.join();
+        }
+    }
+
+    // Non-copyable, non-movable
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    size_t max_queue_size_;
+};
+
 // Context implementations
 // These are passed to plugins; they bridge the C ABI callbacks to gRPC streams.
 
@@ -93,12 +167,62 @@ struct PluginContextImpl {
     std::string plugin_name;               // set per-plugin during init/execute for KV namespacing
 };
 
+// Per-command output is buffered and flushed in a single gRPC Write instead of
+// issuing one Write per line. This reduces serialized gRPC writes from N-per-
+// command to 1-per-command for most plugins.
+static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
+
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
     std::mutex* write_mu; // protects concurrent stream->Write()
     std::string command_id;
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
+
+    // Buffered output — flushed once after execute(), or when buffer exceeds threshold
+    std::vector<std::string> output_buffer;
+    size_t output_buffer_bytes{0};
+    std::mutex buf_mu;
+
+    void append_output(const char* text) {
+        std::lock_guard lock(buf_mu);
+        size_t len = std::strlen(text);
+        output_buffer.emplace_back(text, len);
+        output_buffer_bytes += len;
+        if (output_buffer_bytes >= kOutputFlushThreshold) {
+            flush_output_locked();
+        }
+    }
+
+    void flush_output() {
+        std::lock_guard lock(buf_mu);
+        flush_output_locked();
+    }
+
+private:
+    void flush_output_locked() {
+        if (output_buffer.empty())
+            return;
+
+        // Concatenate all buffered lines into a single payload
+        std::string combined;
+        combined.reserve(output_buffer_bytes + output_buffer.size()); // +size for newlines
+        for (size_t i = 0; i < output_buffer.size(); ++i) {
+            if (i > 0)
+                combined += '\n';
+            combined += output_buffer[i];
+        }
+        output_buffer.clear();
+        output_buffer_bytes = 0;
+
+        pb::CommandResponse resp;
+        resp.set_command_id(command_id);
+        resp.set_status(pb::CommandResponse::RUNNING);
+        resp.set_output(std::move(combined));
+
+        std::lock_guard lock(*write_mu);
+        stream->Write(resp, grpc::WriteOptions());
+    }
 };
 
 template <typename F> struct ScopeExit {
@@ -116,14 +240,7 @@ YUZU_EXPORT void yuzu_ctx_write_output(YuzuCommandContext* ctx, const char* text
     if (!ctx || !text)
         return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
-
-    pb::CommandResponse resp;
-    resp.set_command_id(impl->command_id);
-    resp.set_status(pb::CommandResponse::RUNNING);
-    resp.set_output(text);
-
-    std::lock_guard lock(*impl->write_mu);
-    impl->stream->Write(resp, grpc::WriteOptions());
+    impl->append_output(text);
 }
 
 YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent) {
@@ -340,7 +457,11 @@ public:
         start_time_ = std::chrono::steady_clock::now();
         spdlog::info("Loaded {} plugin(s)", plugins_.size());
 
-        // Scope guard: shutdown plugins and join exec threads on any exit path
+        // Initialize bounded thread pool for command dispatch
+        thread_pool_ = std::make_unique<ThreadPool>(
+            std::thread::hardware_concurrency());
+
+        // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
@@ -348,14 +469,8 @@ public:
                         reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
                 }
             }
-            {
-                std::lock_guard lock(exec_mu_);
-                for (auto& t : exec_threads_) {
-                    if (t.joinable())
-                        t.join();
-                }
-                exec_threads_.clear();
-            }
+            // Destroy the thread pool — signals stop, drains queue, joins workers
+            thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
 
@@ -740,12 +855,12 @@ public:
                     continue;
                 }
 
-                // Dispatch execute() in a background thread.
+                // Dispatch execute() via bounded thread pool.
                 // chargen_start blocks until chargen_stop sets the atomic flag,
                 // so concurrent dispatch is required.
-                // Each thread captures the shared_ptr to guarantee the stream
+                // Each task captures the shared_ptr to guarantee the stream
                 // outlives all writers (fixes use-after-free risk from #66).
-                std::thread exec_thread([this, target, cmd, stream]() {
+                bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
                     // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
                     const int32_t stagger_s = cmd.stagger_seconds();
                     const int32_t delay_s = cmd.delay_seconds();
@@ -801,18 +916,20 @@ public:
                     auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
 
                     // Convert protobuf parameter map -> C ABI YuzuParam array
-                    std::vector<std::string> keys, values;
-                    for (const auto& [k, v] : cmd.parameters()) {
-                        keys.push_back(k);
-                        values.push_back(v);
-                    }
+                    // Direct construction: single vector of YuzuParam pointing at proto map
+                    // entries (no intermediate string copies — proto owns the data).
+                    const auto& proto_params = cmd.parameters();
                     std::vector<YuzuParam> params;
-                    for (size_t i = 0; i < keys.size(); ++i) {
-                        params.push_back(YuzuParam{keys[i].c_str(), values[i].c_str()});
+                    params.reserve(proto_params.size());
+                    for (const auto& [k, v] : proto_params) {
+                        params.push_back(YuzuParam{k.c_str(), v.c_str()});
                     }
 
                     int rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
                                              params.size());
+
+                    // Flush any buffered output before sending timing/status
+                    ctx_impl.flush_output();
 
                     auto end_time = std::chrono::steady_clock::now();
                     auto exec_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -851,9 +968,14 @@ public:
                                  exec_ms);
                 });
 
-                {
-                    std::lock_guard lock(exec_mu_);
-                    exec_threads_.push_back(std::move(exec_thread));
+                if (!submitted) {
+                    spdlog::warn("Thread pool queue full — rejecting command {}", cmd.command_id());
+                    pb::CommandResponse reject_resp;
+                    reject_resp.set_command_id(cmd.command_id());
+                    reject_resp.set_status(pb::CommandResponse::REJECTED);
+                    reject_resp.set_output("agent overloaded: command queue full");
+                    std::lock_guard lock(stream_write_mu_);
+                    stream->Write(reject_resp, grpc::WriteOptions());
                 }
             }
 
@@ -868,16 +990,10 @@ public:
                 }
             }
 
-            // Join all exec threads BEFORE stream goes out of scope,
-            // since they hold raw pointers to the stream for Write() calls.
-            {
-                std::lock_guard lock(exec_mu_);
-                for (auto& t : exec_threads_) {
-                    if (t.joinable())
-                        t.join();
-                }
-                exec_threads_.clear();
-            }
+            // Destroy thread pool BEFORE stream goes out of scope — this drains
+            // the queue, waits for in-flight tasks, and joins all worker threads,
+            // ensuring no task holds a dangling stream pointer.
+            thread_pool_.reset();
 
             // Stop and join the OTA update thread
             if (updater_) {
@@ -926,8 +1042,7 @@ private:
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
-    std::mutex exec_mu_;
-    std::vector<std::thread> exec_threads_;
+    std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;

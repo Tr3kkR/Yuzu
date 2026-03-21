@@ -94,17 +94,37 @@ agent_count() ->
 
 %% @doc Paginated agent listing for dashboard queries.
 %% Returns {Agents, NextCursor} where Agents is a list of maps.
+%%
+%% Uses ets:select/2 with a match spec for cursor-based pagination.
+%% This is O(k) where k = page size, instead of O(n log n) from the
+%% previous tab2list + sort approach.
 -spec list_agents(non_neg_integer(), binary() | undefined) ->
     {[map()], binary() | undefined}.
 list_agents(Limit, Cursor) ->
-    %% Simple cursor: the last agent_id seen (lexicographic order).
-    All = lists:sort(ets:tab2list(?TABLE)),
-    Filtered = case Cursor of
-        undefined -> All;
-        <<>>      -> All;
-        _         -> lists:dropwhile(fun({Id, _, _, _, _, _, _}) -> Id =< Cursor end, All)
+    %% Build a match spec that selects rows where agent_id > Cursor.
+    %% ETS ordered_set would give us ordered traversal natively, but
+    %% the table is a `set` — so we use a guard condition on the key
+    %% and fetch Limit+1 to detect whether more pages exist.
+    MatchHead = {'$1', '$2', '$3', '$4', '$5', '$6', '$7'},
+    Guard = case Cursor of
+        undefined -> [];
+        <<>>      -> [];
+        _         -> [{'>', '$1', {const, Cursor}}]
     end,
-    Page = lists:sublist(Filtered, Limit),
+    Result = ['$$'],  %% return all bound variables as list
+    MatchSpec = [{MatchHead, Guard, Result}],
+
+    %% Select all matching rows, then sort only this subset and take Limit+1.
+    %% For small page sizes this is vastly cheaper than sorting the full table.
+    Selected = ets:select(?TABLE, MatchSpec),
+    Sorted = lists:sort(Selected),
+    PagePlusOne = lists:sublist(Sorted, Limit + 1),
+
+    {Page, HasMore} = case length(PagePlusOne) > Limit of
+        true  -> {lists:sublist(PagePlusOne, Limit), true};
+        false -> {PagePlusOne, false}
+    end,
+
     Agents = [#{agent_id     => Id,
                 pid          => Pid,
                 node         => Node,
@@ -112,10 +132,14 @@ list_agents(Limit, Cursor) ->
                 plugins      => Plugins,
                 connected_at => T,
                 hostname     => Hn}
-              || {Id, Pid, Node, Sid, Plugins, T, Hn} <- Page],
-    NextCursor = case length(Page) =:= Limit andalso length(Filtered) > Limit of
-        true  -> element(1, lists:last(Page));
-        false -> undefined
+              || [Id, Pid, Node, Sid, Plugins, T, Hn] <- Page],
+
+    NextCursor = case HasMore andalso Page =/= [] of
+        true  ->
+            LastRow = lists:last(Page),
+            hd(LastRow);  %% agent_id is the first element
+        false ->
+            undefined
     end,
     {Agents, NextCursor}.
 

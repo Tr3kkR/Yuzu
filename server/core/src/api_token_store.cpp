@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 #include <random>
 
 #ifdef _WIN32
@@ -178,6 +179,29 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         return std::nullopt;
 
     auto hash = sha256_hex(raw_token);
+
+    // Check cache first (avoids SHA256 recomputation is already done, but avoids SQLite query)
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        auto it = token_cache_.find(hash);
+        if (it != token_cache_.end()) {
+            auto age = std::chrono::steady_clock::now() - it->second.cached_at;
+            if (age < kTokenCacheTtl) {
+                const auto& cached = it->second.token;
+                // Re-check expiration against current time
+                auto now = now_epoch();
+                if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
+                    token_cache_.erase(it);
+                    return std::nullopt;
+                }
+                return cached;
+            }
+            // Expired cache entry — remove and fall through to DB lookup
+            token_cache_.erase(it);
+        }
+    }
+
+    // Cache miss — query SQLite
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,
@@ -217,7 +241,7 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
     }
     sqlite3_finalize(s);
 
-    // Update last_used_at
+    // Update last_used_at and cache the result
     if (result) {
         sqlite3_stmt* upd = nullptr;
         sqlite3_prepare_v2(db_, "UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?;", -1,
@@ -226,9 +250,18 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         sqlite3_bind_text(upd, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(upd);
         sqlite3_finalize(upd);
+
+        // Store in cache
+        std::lock_guard cache_lock(cache_mtx_);
+        token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
     }
 
     return result;
+}
+
+void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
+    std::lock_guard cache_lock(cache_mtx_);
+    token_cache_.erase(token_hash);
 }
 
 std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {
@@ -269,6 +302,20 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
 bool ApiTokenStore::revoke_token(const std::string& token_id) {
     if (!db_)
         return false;
+
+    // Look up the token_hash before revoking so we can invalidate the cache
+    std::string token_hash;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT token_hash FROM api_tokens WHERE token_id = ?;", -1, &q,
+                               nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(q, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(q) == SQLITE_ROW)
+                token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
+            sqlite3_finalize(q);
+        }
+    }
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_, "UPDATE api_tokens SET revoked = 1 WHERE token_id = ?;", -1, &s,
                            nullptr) != SQLITE_OK)
@@ -276,12 +323,30 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
-    return sqlite3_changes(db_) > 0;
+
+    bool changed = sqlite3_changes(db_) > 0;
+    if (changed && !token_hash.empty())
+        invalidate_cache(token_hash);
+    return changed;
 }
 
 bool ApiTokenStore::delete_token(const std::string& token_id) {
     if (!db_)
         return false;
+
+    // Look up the token_hash before deleting so we can invalidate the cache
+    std::string token_hash;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT token_hash FROM api_tokens WHERE token_id = ?;", -1, &q,
+                               nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(q, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(q) == SQLITE_ROW)
+                token_hash = safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)));
+            sqlite3_finalize(q);
+        }
+    }
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM api_tokens WHERE token_id = ?;", -1, &s, nullptr) !=
         SQLITE_OK)
@@ -289,7 +354,11 @@ bool ApiTokenStore::delete_token(const std::string& token_id) {
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
-    return sqlite3_changes(db_) > 0;
+
+    bool changed = sqlite3_changes(db_) > 0;
+    if (changed && !token_hash.empty())
+        invalidate_cache(token_hash);
+    return changed;
 }
 
 } // namespace yuzu::server

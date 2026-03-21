@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <random>
+#include <shared_mutex>
 
 namespace yuzu::server {
 
@@ -417,7 +418,7 @@ std::string PolicyStore::generate_id() const {
 
 std::expected<std::string, std::string>
 PolicyStore::create_fragment(const std::string& yaml_source) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (yaml_source.empty())
@@ -508,7 +509,7 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
 
 std::vector<PolicyFragment>
 PolicyStore::query_fragments(const FragmentQuery& q) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     std::vector<PolicyFragment> results;
     if (!db_)
         return results;
@@ -558,7 +559,7 @@ PolicyStore::query_fragments(const FragmentQuery& q) const {
 }
 
 std::optional<PolicyFragment> PolicyStore::get_fragment(const std::string& id) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
 
@@ -597,7 +598,7 @@ std::optional<PolicyFragment> PolicyStore::get_fragment(const std::string& id) c
 }
 
 bool PolicyStore::delete_fragment(const std::string& id) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return false;
 
@@ -754,7 +755,7 @@ void PolicyStore::load_policy_details(Policy& p) const {
 
 std::expected<std::string, std::string>
 PolicyStore::create_policy(const std::string& yaml_source) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (yaml_source.empty())
@@ -925,7 +926,7 @@ PolicyStore::create_policy(const std::string& yaml_source) {
 }
 
 std::vector<Policy> PolicyStore::query_policies(const PolicyQuery& q) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     std::vector<Policy> results;
     if (!db_)
         return results;
@@ -975,7 +976,7 @@ std::vector<Policy> PolicyStore::query_policies(const PolicyQuery& q) const {
 }
 
 std::optional<Policy> PolicyStore::get_policy(const std::string& id) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
 
@@ -1007,7 +1008,7 @@ std::optional<Policy> PolicyStore::get_policy(const std::string& id) const {
 }
 
 std::expected<void, std::string> PolicyStore::enable_policy(const std::string& id) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -1033,7 +1034,7 @@ std::expected<void, std::string> PolicyStore::enable_policy(const std::string& i
 }
 
 std::expected<void, std::string> PolicyStore::disable_policy(const std::string& id) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -1059,7 +1060,7 @@ std::expected<void, std::string> PolicyStore::disable_policy(const std::string& 
 }
 
 bool PolicyStore::delete_policy(const std::string& id) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return false;
 
@@ -1092,7 +1093,7 @@ bool PolicyStore::delete_policy(const std::string& id) {
 std::expected<void, std::string>
 PolicyStore::update_agent_status(const std::string& policy_id, const std::string& agent_id,
                                  const std::string& status, const std::string& check_result) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (policy_id.empty() || agent_id.empty())
@@ -1138,7 +1139,7 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
 
 std::optional<PolicyAgentStatus>
 PolicyStore::get_agent_status(const std::string& policy_id, const std::string& agent_id) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
 
@@ -1168,7 +1169,7 @@ PolicyStore::get_agent_status(const std::string& policy_id, const std::string& a
 
 std::vector<PolicyAgentStatus>
 PolicyStore::get_policy_agent_statuses(const std::string& policy_id) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     std::vector<PolicyAgentStatus> results;
     if (!db_)
         return results;
@@ -1196,7 +1197,7 @@ PolicyStore::get_policy_agent_statuses(const std::string& policy_id) const {
 }
 
 ComplianceSummary PolicyStore::get_compliance_summary(const std::string& policy_id) const {
-    std::lock_guard lock(mtx_);
+    std::shared_lock lock(mtx_);
     ComplianceSummary cs;
     cs.policy_id = policy_id;
     if (!db_)
@@ -1229,8 +1230,8 @@ ComplianceSummary PolicyStore::get_compliance_summary(const std::string& policy_
     return cs;
 }
 
-FleetCompliance PolicyStore::get_fleet_compliance() const {
-    std::lock_guard lock(mtx_);
+FleetCompliance PolicyStore::compute_fleet_compliance_locked() const {
+    // Caller must hold at least a shared lock on mtx_
     FleetCompliance fc;
     if (!db_)
         return fc;
@@ -1264,11 +1265,37 @@ FleetCompliance PolicyStore::get_fleet_compliance() const {
     return fc;
 }
 
+FleetCompliance PolicyStore::get_fleet_compliance() const {
+    auto now = std::chrono::steady_clock::now();
+
+    // Fast path: return cached value if still fresh (under shared lock)
+    {
+        std::shared_lock lock(mtx_);
+        if (fleet_compliance_last_computed_.time_since_epoch().count() > 0 &&
+            (now - fleet_compliance_last_computed_) < kFleetComplianceCacheTtl) {
+            return cached_fleet_compliance_;
+        }
+    }
+
+    // Slow path: recompute under shared lock, then update cache
+    std::shared_lock lock(mtx_);
+    // Double-check: another thread may have refreshed while we waited
+    if (fleet_compliance_last_computed_.time_since_epoch().count() > 0 &&
+        (now - fleet_compliance_last_computed_) < kFleetComplianceCacheTtl) {
+        return cached_fleet_compliance_;
+    }
+
+    auto fc = compute_fleet_compliance_locked();
+    cached_fleet_compliance_ = fc;
+    fleet_compliance_last_computed_ = now;
+    return fc;
+}
+
 // ── Cache invalidation ───────────────────────────────────────────────────────
 
 std::expected<int64_t, std::string>
 PolicyStore::invalidate_policy(const std::string& policy_id) {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (policy_id.empty())
@@ -1296,7 +1323,7 @@ PolicyStore::invalidate_policy(const std::string& policy_id) {
 
 std::expected<int64_t, std::string>
 PolicyStore::invalidate_all_policies() {
-    std::lock_guard lock(mtx_);
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 

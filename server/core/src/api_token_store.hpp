@@ -2,11 +2,14 @@
 
 #include <sqlite3.h>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -54,9 +57,19 @@ public:
 private:
     sqlite3* db_{nullptr};
 
+    // LRU cache for validated tokens: token_hash -> (ApiToken, expiry_time)
+    struct CachedToken {
+        ApiToken token;
+        std::chrono::steady_clock::time_point cached_at;
+    };
+    mutable std::mutex cache_mtx_;
+    mutable std::unordered_map<std::string, CachedToken> token_cache_;
+    static constexpr auto kTokenCacheTtl = std::chrono::seconds(60);
+
     void create_tables();
     std::string generate_raw_token() const;
     std::string sha256_hex(const std::string& input) const;
+    void invalidate_cache(const std::string& token_hash);
 };
 
 } // namespace yuzu::server

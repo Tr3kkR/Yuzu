@@ -3,8 +3,8 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -173,7 +173,7 @@ private:
     /// Load pending agents from disk.
     bool load_pending();
 
-    mutable std::mutex mu_;
+    mutable std::shared_mutex mu_;
     std::filesystem::path cfg_path_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;

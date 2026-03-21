@@ -1,15 +1,11 @@
 %%%-------------------------------------------------------------------
 %%% @doc gRPC client to the C++ yuzu-server (control plane).
 %%%
-%%% Proxies Register, Heartbeat (batched), Inventory, and stream
-%%% status notifications to the upstream server.
+%%% Proxies Register, Inventory, and stream status notifications
+%%% to the upstream server. All are synchronous or fire-and-forget RPCs.
 %%%
-%%% Heartbeats are batched: individual agent heartbeats are buffered
-%%% and sent in a single BatchHeartbeat RPC at a configurable interval,
-%%% reducing upstream load from O(agents/interval) to O(nodes/interval).
-%%%
-%%% On RPC failure, heartbeat buffers are retained (capped) for retry
-%%% on the next flush cycle rather than being silently discarded.
+%%% Heartbeat buffering has been moved to yuzu_gw_heartbeat_buffer
+%%% to prevent registration storms from blocking heartbeat processing.
 %%%
 %%% Upstream connection is managed by grpcbox via the `default_channel`
 %%% configured in sys.config.
@@ -23,7 +19,6 @@
 %% API
 -export([start_link/0,
          proxy_register/1,
-         queue_heartbeat/1,
          proxy_inventory/1,
          notify_stream_status/4]).
 
@@ -31,15 +26,9 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
--define(DEFAULT_MAX_HB_BUFFER, 10000).
 -define(MAX_NOTIFY_INFLIGHT, 10).
 
 -record(state, {
-    hb_buffer     :: [map()],           %% buffered heartbeat requests
-    hb_buf_len    :: non_neg_integer(), %% tracked length of hb_buffer
-    hb_timer      :: reference() | undefined,
-    hb_interval   :: non_neg_integer(), %% ms
-    max_hb_buffer :: non_neg_integer(), %% cap for retained buffer on failure
     notify_pids   :: #{pid() => true}   %% in-flight notification processes
 }).
 
@@ -54,11 +43,6 @@ start_link() ->
 -spec proxy_register(map()) -> {ok, map()} | {error, term()}.
 proxy_register(RegisterReq) ->
     gen_server:call(?SERVER, {proxy_register, RegisterReq}, 30000).
-
-%% @doc Queue a heartbeat for batching.
--spec queue_heartbeat(map()) -> ok.
-queue_heartbeat(HeartbeatReq) ->
-    gen_server:cast(?SERVER, {queue_heartbeat, HeartbeatReq}).
 
 %% @doc Forward an InventoryReport to the C++ server.
 -spec proxy_inventory(map()) -> {ok, map()} | {error, term()}.
@@ -75,22 +59,8 @@ notify_stream_status(AgentId, SessionId, Event, PeerAddr) ->
 %%%===================================================================
 
 init([]) ->
-    Interval = application:get_env(yuzu_gw, heartbeat_batch_interval_ms, 10000),
-    MaxBuf = application:get_env(yuzu_gw, max_heartbeat_buffer, ?DEFAULT_MAX_HB_BUFFER),
-
-    TRef = erlang:send_after(Interval, self(), flush_heartbeats),
-
-    logger:info("Upstream client started, hb_interval=~bms, max_buf=~b",
-                [Interval, MaxBuf]),
-
-    {ok, #state{
-        hb_buffer     = [],
-        hb_buf_len    = 0,
-        hb_timer      = TRef,
-        hb_interval   = Interval,
-        max_hb_buffer = MaxBuf,
-        notify_pids   = #{}
-    }}.
+    logger:info("Upstream client started (register/inventory/notify only)"),
+    {ok, #state{notify_pids = #{}}}.
 
 handle_call({proxy_register, RegisterReq}, _From, State) ->
     Result = do_rpc('ProxyRegister', RegisterReq, register),
@@ -102,15 +72,6 @@ handle_call({proxy_inventory, InventoryReport}, _From, State) ->
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
-
-handle_cast({queue_heartbeat, HbReq},
-            #state{hb_buffer = Buf, hb_buf_len = Len,
-                   max_hb_buffer = MaxBuf} = State) ->
-    case Len >= MaxBuf of
-        true  -> {noreply, State};  %% drop — buffer at capacity
-        false -> {noreply, State#state{hb_buffer = [HbReq | Buf],
-                                       hb_buf_len = Len + 1}}
-    end;
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
             #state{notify_pids = Pids} = State) ->
@@ -141,37 +102,6 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(flush_heartbeats, #state{hb_buffer = [], hb_interval = Interval} = State) ->
-    TRef = erlang:send_after(Interval, self(), flush_heartbeats),
-    {noreply, State#state{hb_timer = TRef}};
-
-handle_info(flush_heartbeats, #state{hb_buffer = Buf, hb_buf_len = BufLen,
-                                       hb_interval = Interval,
-                                       max_hb_buffer = MaxBuf} = State) ->
-    BatchReq = #{
-        heartbeats   => lists:reverse(Buf),
-        gateway_node => atom_to_binary(node(), utf8)
-    },
-
-    {NewBuf, NewLen} = case do_rpc('BatchHeartbeat', BatchReq, batch_heartbeat) of
-        {ok, #{acknowledged_count := Count}} ->
-            logger:debug("Flushed ~b heartbeats (ack=~b)", [BufLen, Count]),
-            {[], 0};
-        {ok, _} ->
-            {[], 0};
-        {error, Reason} ->
-            logger:warning("BatchHeartbeat failed (~b buffered): ~p",
-                           [BufLen, Reason]),
-            %% Retain buffer for retry, capped to prevent unbounded growth.
-            case BufLen > MaxBuf of
-                true  -> {lists:sublist(Buf, MaxBuf), MaxBuf};
-                false -> {Buf, BufLen}
-            end
-    end,
-
-    TRef = erlang:send_after(Interval, self(), flush_heartbeats),
-    {noreply, State#state{hb_buffer = NewBuf, hb_buf_len = NewLen, hb_timer = TRef}};
-
 handle_info({'DOWN', _MonRef, process, Pid, _Reason},
             #state{notify_pids = Pids} = State) ->
     {noreply, State#state{notify_pids = maps:remove(Pid, Pids)}};
@@ -189,8 +119,6 @@ terminate(_Reason, _State) ->
 %% Map each GatewayUpstream RPC to its protobuf input/output message types.
 rpc_types('ProxyRegister')      -> {'yuzu.agent.v1.RegisterRequest',
                                     'yuzu.agent.v1.RegisterResponse'};
-rpc_types('BatchHeartbeat')     -> {'yuzu.gateway.v1.BatchHeartbeatRequest',
-                                    'yuzu.gateway.v1.BatchHeartbeatResponse'};
 rpc_types('ProxyInventory')     -> {'yuzu.agent.v1.InventoryReport',
                                     'yuzu.agent.v1.InventoryAck'};
 rpc_types('NotifyStreamStatus') -> {'yuzu.gateway.v1.StreamStatusNotification',

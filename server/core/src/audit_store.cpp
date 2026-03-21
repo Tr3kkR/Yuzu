@@ -4,6 +4,7 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <shared_mutex>
 
 namespace yuzu::server {
 
@@ -70,6 +71,7 @@ void AuditStore::create_tables() {
 }
 
 void AuditStore::log(const AuditEvent& event) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
 
@@ -106,6 +108,7 @@ void AuditStore::log(const AuditEvent& event) {
 }
 
 std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
+    std::shared_lock lock(mtx_);
     std::vector<AuditEvent> results;
     if (!db_)
         return results;
@@ -191,6 +194,7 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {
 }
 
 std::size_t AuditStore::total_count() const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return 0;
     sqlite3_stmt* stmt = nullptr;

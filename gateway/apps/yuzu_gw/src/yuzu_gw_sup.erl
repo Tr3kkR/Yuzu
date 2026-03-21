@@ -2,10 +2,11 @@
 %%% @doc Top-level supervisor for the yuzu gateway.
 %%%
 %%% Supervision tree (one_for_one):
-%%%   1. yuzu_gw_registry   — ETS owner + pg coordinator
-%%%   2. yuzu_gw_upstream   — gRPC client pool to C++ server
-%%%   3. yuzu_gw_router     — command fanout coordinator
-%%%   4. yuzu_gw_agent_sup  — simple_one_for_one for agent processes
+%%%   1. yuzu_gw_registry          — ETS owner + pg coordinator
+%%%   2. yuzu_gw_upstream          — gRPC client for register/inventory/notify
+%%%   3. yuzu_gw_heartbeat_buffer  — dedicated heartbeat batching worker
+%%%   4. yuzu_gw_router            — command fanout coordinator
+%%%   5. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_sup).
@@ -57,6 +58,12 @@ init([]) ->
 
         #{id       => yuzu_gw_upstream,
           start    => {yuzu_gw_upstream, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        #{id       => yuzu_gw_heartbeat_buffer,
+          start    => {yuzu_gw_heartbeat_buffer, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},

@@ -7,6 +7,7 @@
 #include <expected>
 #include <filesystem>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -113,13 +114,15 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::atomic<bool> rbac_enabled_{false};
+    mutable std::shared_mutex mtx_;
 
     void create_tables();
     void seed_defaults();
     void load_enabled_flag();
 
     /// Collect all role names for a user (direct + via group membership).
-    std::vector<std::string> collect_roles(const std::string& username) const;
+    /// Caller must hold at least a shared lock on mtx_.
+    std::vector<std::string> collect_roles_locked(const std::string& username) const;
 };
 
 } // namespace yuzu::server

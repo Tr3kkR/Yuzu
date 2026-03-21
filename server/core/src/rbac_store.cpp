@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <shared_mutex>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -384,6 +385,7 @@ bool RbacStore::is_rbac_enabled() const {
 }
 
 void RbacStore::set_rbac_enabled(bool enabled) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
     sqlite3_stmt* s = nullptr;
@@ -399,6 +401,7 @@ void RbacStore::set_rbac_enabled(bool enabled) {
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {
+    std::shared_lock lock(mtx_);
     std::vector<RbacRole> result;
     if (!db_)
         return result;
@@ -421,6 +424,7 @@ std::vector<RbacRole> RbacStore::list_roles() const {
 }
 
 std::optional<RbacRole> RbacStore::get_role(const std::string& name) const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
     sqlite3_stmt* s = nullptr;
@@ -443,6 +447,7 @@ std::optional<RbacRole> RbacStore::get_role(const std::string& name) const {
 }
 
 std::expected<void, std::string> RbacStore::create_role(const RbacRole& role) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (role.name.empty())
@@ -471,6 +476,7 @@ std::expected<void, std::string> RbacStore::create_role(const RbacRole& role) {
 
 std::expected<void, std::string> RbacStore::update_role(const std::string& name,
                                                         const std::string& description) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -487,15 +493,26 @@ std::expected<void, std::string> RbacStore::update_role(const std::string& name,
 }
 
 std::expected<void, std::string> RbacStore::delete_role(const std::string& name) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
-    // Check system role protection
-    auto role = get_role(name);
-    if (!role)
-        return std::unexpected("role not found");
-    if (role->is_system)
-        return std::unexpected("cannot delete system role");
+    // Check system role protection inline (avoid calling get_role which takes its own lock)
+    {
+        sqlite3_stmt* chk = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT is_system FROM roles WHERE name = ?;", -1, &chk,
+                               nullptr) != SQLITE_OK)
+            return std::unexpected(sqlite3_errmsg(db_));
+        sqlite3_bind_text(chk, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(chk) != SQLITE_ROW) {
+            sqlite3_finalize(chk);
+            return std::unexpected("role not found");
+        }
+        bool is_sys = sqlite3_column_int(chk, 0) != 0;
+        sqlite3_finalize(chk);
+        if (is_sys)
+            return std::unexpected("cannot delete system role");
+    }
 
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_, "DELETE FROM roles WHERE name = ? AND is_system = 0;", -1, &s,
@@ -510,6 +527,7 @@ std::expected<void, std::string> RbacStore::delete_role(const std::string& name)
 // ── Permissions CRUD ─────────────────────────────────────────────────────────
 
 std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_name) const {
+    std::shared_lock lock(mtx_);
     std::vector<Permission> result;
     if (!db_)
         return result;
@@ -534,6 +552,7 @@ std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_
 }
 
 std::expected<void, std::string> RbacStore::set_permission(const Permission& perm) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -557,6 +576,7 @@ std::expected<void, std::string> RbacStore::set_permission(const Permission& per
 std::expected<void, std::string> RbacStore::remove_permission(const std::string& role_name,
                                                               const std::string& securable_type,
                                                               const std::string& operation) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -577,6 +597,7 @@ std::expected<void, std::string> RbacStore::remove_permission(const std::string&
 
 std::vector<PrincipalRole> RbacStore::get_principal_roles(const std::string& principal_type,
                                                           const std::string& principal_id) const {
+    std::shared_lock lock(mtx_);
     std::vector<PrincipalRole> result;
     if (!db_)
         return result;
@@ -600,6 +621,7 @@ std::vector<PrincipalRole> RbacStore::get_principal_roles(const std::string& pri
 }
 
 std::vector<PrincipalRole> RbacStore::get_role_members(const std::string& role_name) const {
+    std::shared_lock lock(mtx_);
     std::vector<PrincipalRole> result;
     if (!db_)
         return result;
@@ -622,6 +644,7 @@ std::vector<PrincipalRole> RbacStore::get_role_members(const std::string& role_n
 }
 
 std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -644,6 +667,7 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
 std::expected<void, std::string> RbacStore::unassign_role(const std::string& principal_type,
                                                           const std::string& principal_id,
                                                           const std::string& role_name) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -663,6 +687,7 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
 // ── Groups CRUD ──────────────────────────────────────────────────────────────
 
 std::vector<RbacGroup> RbacStore::list_groups() const {
+    std::shared_lock lock(mtx_);
     std::vector<RbacGroup> result;
     if (!db_)
         return result;
@@ -687,6 +712,7 @@ std::vector<RbacGroup> RbacStore::list_groups() const {
 }
 
 std::expected<void, std::string> RbacStore::create_group(const RbacGroup& group) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (group.name.empty())
@@ -714,6 +740,7 @@ std::expected<void, std::string> RbacStore::create_group(const RbacGroup& group)
 }
 
 std::expected<void, std::string> RbacStore::delete_group(const std::string& name) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -726,6 +753,7 @@ std::expected<void, std::string> RbacStore::delete_group(const std::string& name
 }
 
 std::vector<std::string> RbacStore::get_group_members(const std::string& group_name) const {
+    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;
@@ -743,6 +771,7 @@ std::vector<std::string> RbacStore::get_group_members(const std::string& group_n
 
 std::expected<void, std::string> RbacStore::add_group_member(const std::string& group_name,
                                                              const std::string& username) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -759,6 +788,7 @@ std::expected<void, std::string> RbacStore::add_group_member(const std::string& 
 
 std::expected<void, std::string> RbacStore::remove_group_member(const std::string& group_name,
                                                                 const std::string& username) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     sqlite3_stmt* s = nullptr;
@@ -774,7 +804,7 @@ std::expected<void, std::string> RbacStore::remove_group_member(const std::strin
 
 // ── Authorization check ──────────────────────────────────────────────────────
 
-std::vector<std::string> RbacStore::collect_roles(const std::string& username) const {
+std::vector<std::string> RbacStore::collect_roles_locked(const std::string& username) const {
     std::vector<std::string> roles;
     if (!db_)
         return roles;
@@ -800,10 +830,11 @@ std::vector<std::string> RbacStore::collect_roles(const std::string& username) c
 
 bool RbacStore::check_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation) const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return false;
 
-    auto roles = collect_roles(username);
+    auto roles = collect_roles_locked(username);
     if (roles.empty())
         return false;
 
@@ -843,11 +874,12 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
 }
 
 std::vector<Permission> RbacStore::get_effective_permissions(const std::string& username) const {
+    std::shared_lock lock(mtx_);
     std::vector<Permission> result;
     if (!db_)
         return result;
 
-    auto roles = collect_roles(username);
+    auto roles = collect_roles_locked(username);
     if (roles.empty())
         return result;
 
@@ -884,6 +916,7 @@ std::vector<Permission> RbacStore::get_effective_permissions(const std::string& 
 // ── Reference data ───────────────────────────────────────────────────────────
 
 std::vector<std::string> RbacStore::list_securable_types() const {
+    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;
@@ -898,6 +931,7 @@ std::vector<std::string> RbacStore::list_securable_types() const {
 }
 
 std::vector<std::string> RbacStore::list_operations() const {
+    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;
@@ -918,6 +952,9 @@ bool RbacStore::check_scoped_permission(const std::string& username,
                                         const std::string& operation,
                                         const std::string& agent_id,
                                         const ManagementGroupStore* mgmt_store) const {
+    // Note: does NOT hold its own lock. Delegates to check_permission and
+    // get_role_permissions which each acquire shared_lock independently.
+
     // 1. Try global permission first — if passes, return true immediately
     if (check_permission(username, securable_type, operation))
         return true;
@@ -990,6 +1027,7 @@ bool RbacStore::check_scoped_permission(const std::string& username,
 bool RbacStore::check_role_has_permission(const std::string& role_name,
                                           const std::string& securable_type,
                                           const std::string& operation) const {
+    // Delegates to get_role_permissions which acquires its own shared_lock
     auto perms = get_role_permissions(role_name);
     for (const auto& p : perms) {
         if (p.securable_type == securable_type && p.operation == operation) {

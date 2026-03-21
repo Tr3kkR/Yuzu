@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -60,6 +61,7 @@ private:
     sqlite3* db_{nullptr};
     int retention_days_;
     int cleanup_interval_min_;
+    mutable std::shared_mutex mtx_;
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else

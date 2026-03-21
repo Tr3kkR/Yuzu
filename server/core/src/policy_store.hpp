@@ -2,11 +2,12 @@
 
 #include <sqlite3.h>
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
-#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -155,7 +156,12 @@ public:
 
 private:
     sqlite3* db_{nullptr};
-    mutable std::mutex mtx_;
+    mutable std::shared_mutex mtx_;
+
+    // Fleet compliance cache (recomputed at most every 60s)
+    mutable FleetCompliance cached_fleet_compliance_;
+    mutable std::chrono::steady_clock::time_point fleet_compliance_last_computed_{};
+    static constexpr auto kFleetComplianceCacheTtl = std::chrono::seconds(60);
 
     void create_tables();
     std::string generate_id() const;
@@ -168,6 +174,9 @@ private:
     void store_groups(const std::string& policy_id,
                       const std::vector<std::string>& group_ids);
     void load_policy_details(Policy& p) const;
+
+    // Compute fleet compliance from DB (caller must hold at least shared lock)
+    FleetCompliance compute_fleet_compliance_locked() const;
 };
 
 } // namespace yuzu::server

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <shared_mutex>
 
 namespace yuzu::server {
 
@@ -27,11 +28,14 @@ ResponseStore::ResponseStore(const std::filesystem::path& db_path, int retention
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
+    prepare_insert_stmt();
     spdlog::info("ResponseStore: opened {} (retention={}d)", db_path.string(), retention_days_);
 }
 
 ResponseStore::~ResponseStore() {
     stop_cleanup();
+    if (insert_stmt_)
+        sqlite3_finalize(insert_stmt_);
     if (db_)
         sqlite3_close(db_);
 }
@@ -66,16 +70,22 @@ void ResponseStore::create_tables() {
     }
 }
 
-void ResponseStore::store(const StoredResponse& resp) {
+void ResponseStore::prepare_insert_stmt() {
     if (!db_)
         return;
-
     const char* sql = R"(
         INSERT INTO responses (instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, sql, -1, &insert_stmt_, nullptr) != SQLITE_OK) {
+        spdlog::error("ResponseStore: failed to prepare insert statement: {}", sqlite3_errmsg(db_));
+        insert_stmt_ = nullptr;
+    }
+}
+
+void ResponseStore::store(const StoredResponse& resp) {
+    std::unique_lock lock(mtx_);
+    if (!db_ || !insert_stmt_)
         return;
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -86,20 +96,23 @@ void ResponseStore::store(const StoredResponse& resp) {
                    ? resp.ttl_expires_at
                    : (retention_days_ > 0 ? now + retention_days_ * 86400LL : 0);
 
-    sqlite3_bind_text(stmt, 1, resp.instruction_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, resp.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, ts);
-    sqlite3_bind_int(stmt, 4, resp.status);
-    sqlite3_bind_text(stmt, 5, resp.output.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, resp.error_detail.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 7, ttl);
+    sqlite3_reset(insert_stmt_);
+    sqlite3_clear_bindings(insert_stmt_);
 
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    sqlite3_bind_text(insert_stmt_, 1, resp.instruction_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt_, 2, resp.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert_stmt_, 3, ts);
+    sqlite3_bind_int(insert_stmt_, 4, resp.status);
+    sqlite3_bind_text(insert_stmt_, 5, resp.output.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(insert_stmt_, 6, resp.error_detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert_stmt_, 7, ttl);
+
+    sqlite3_step(insert_stmt_);
 }
 
 std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_id,
                                                  const ResponseQuery& q) const {
+    std::shared_lock lock(mtx_);
     std::vector<StoredResponse> results;
     if (!db_)
         return results;
@@ -182,6 +195,7 @@ ResponseStore::get_by_instruction(const std::string& instruction_id) const {
 std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instruction_id,
                                                         const AggregationQuery& aq,
                                                         const ResponseQuery& filter) const {
+    std::shared_lock lock(mtx_);
     std::vector<AggregationResult> results;
     if (!db_)
         return results;
@@ -276,6 +290,7 @@ std::vector<AggregationResult> ResponseStore::aggregate(const std::string& instr
 }
 
 std::size_t ResponseStore::total_count() const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return 0;
     sqlite3_stmt* stmt = nullptr;
