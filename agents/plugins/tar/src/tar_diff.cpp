@@ -155,7 +155,8 @@ std::vector<TarEvent> compute_process_diff(
             // PID reused with different process -- old process died, new one started
             auto old_cmd = redact_cmdline(it->second.cmdline, redaction_patterns);
             TarEvent death;
-            death.timestamp = timestamp;
+            // Death gets timestamp-1 so death always sorts before birth for PID reuse
+            death.timestamp = timestamp - 1;
             death.event_type = "process";
             death.event_action = "stopped";
             death.detail_json = std::format(

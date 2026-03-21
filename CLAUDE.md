@@ -61,12 +61,15 @@ Agents live in `.claude/agents/` and are invoked by name.
 
 ### Governance
 
-Every code change follows mandatory governance gates:
+**Better process makes better products.** Every code change follows mandatory governance gates — no shortcuts, no exceptions:
 
 1. **Change Summary** — the producing agent writes a structured summary (files, what, why, interfaces affected, security surface, user-facing impact) shared with ALL agents.
 2. **Mandatory deep-dive** — security-guardian and docs-writer read every modified file for every change. Security reviews block on CRITICAL/HIGH findings. Documentation blocks if user-facing changes lack doc updates.
 3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
-4. **All findings addressed** before merge.
+4. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
+5. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
+
+**Lesson learned:** Waves 1-4 shipped without governance and accumulated 4 CRITICAL command injection vulnerabilities, untested stores, stale docs, and performance bottlenecks. These were caught before production but should have been caught before commit.
 
 ## Darwin Compatibility
 

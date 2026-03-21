@@ -410,12 +410,26 @@ private:
         int64_t to = now_epoch_seconds();
         int limit = 1000;
 
-        try { from = std::stoll(std::string{from_str}); } catch (...) {}
+        try { from = std::stoll(std::string{from_str}); } catch (...) {
+            ctx.write_output("error|invalid 'from' parameter (must be epoch seconds)");
+            return 1;
+        }
         if (!to_str.empty()) {
-            try { to = std::stoll(std::string{to_str}); } catch (...) {}
+            try { to = std::stoll(std::string{to_str}); } catch (...) {
+                ctx.write_output("error|invalid 'to' parameter (must be epoch seconds)");
+                return 1;
+            }
         }
         try { limit = std::stoi(std::string{limit_str}); } catch (...) {}
 
+        if (from < 0 || to < 0) {
+            ctx.write_output("error|timestamps must be non-negative");
+            return 1;
+        }
+        if (from > to) {
+            ctx.write_output("error|'from' must be <= 'to'");
+            return 1;
+        }
         if (limit <= 0 || limit > 10000)
             limit = 1000;
 
@@ -566,6 +580,23 @@ private:
         if (!changed) {
             ctx.write_output("error|no valid configuration parameters provided");
             return 1;
+        }
+
+        // Re-register triggers with new intervals if changed
+        if (fast_secs > 0 || slow_secs > 0) {
+            yuzu::PluginContext pctx{g_ctx_};
+            if (fast_secs > 0) {
+                pctx.unregister_trigger("tar.fast");
+                auto cfg = std::format(R"({{"interval_seconds":{},"plugin":"tar","action":"collect_fast"}})", fast_secs);
+                pctx.register_trigger("tar.fast", "interval", cfg);
+                ctx.write_output(std::format("trigger|tar.fast|re-registered|{}s", fast_secs));
+            }
+            if (slow_secs > 0) {
+                pctx.unregister_trigger("tar.slow");
+                auto cfg = std::format(R"({{"interval_seconds":{},"plugin":"tar","action":"collect_slow"}})", slow_secs);
+                pctx.register_trigger("tar.slow", "interval", cfg);
+                ctx.write_output(std::format("trigger|tar.slow|re-registered|{}s", slow_secs));
+            }
         }
 
         ctx.write_output("status|ok");
