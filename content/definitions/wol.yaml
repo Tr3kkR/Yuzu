@@ -1,0 +1,164 @@
+## Wake-on-LAN Definitions
+## Sends WoL magic packets and checks host reachability after wake.
+## Plugin: wol | Actions: wake, check
+##
+## Sources by platform:
+##   Windows: Winsock2 UDP broadcast (ws2_32), ping -n
+##   Linux:   POSIX UDP sockets, ping -c
+##   macOS:   POSIX UDP sockets, ping -c
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.wol.wake
+  displayName: Wake-on-LAN
+  version: 1.0.0
+  description: >
+    Sends a Wake-on-LAN magic packet to the specified MAC address.
+    The magic packet consists of 6 bytes of 0xFF followed by the
+    target MAC address repeated 16 times, broadcast via UDP.
+    The target machine must have WoL enabled in its BIOS/UEFI and
+    NIC settings. This is a network action that may wake a powered-off
+    device. An optional port parameter can override the default WoL
+    port (9).
+  tags: [wol, network, power, remote, action]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: wol
+    action: wake
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [mac]
+    properties:
+      mac:
+        type: string
+        displayName: MAC Address
+        description: >
+          Target MAC address in colon or hyphen-separated format
+          (e.g., AA:BB:CC:DD:EE:FF or AA-BB-CC-DD-EE-FF).
+        validation:
+          minLength: 17
+          maxLength: 17
+          pattern: "^([0-9A-Fa-f]{2}[:\\-]){5}[0-9A-Fa-f]{2}$"
+      port:
+        type: string
+        displayName: UDP Port
+        description: >
+          UDP port for the magic packet broadcast. Standard WoL
+          port is 9. Some setups use port 7 or other values.
+        default: "9"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: message
+        type: string
+      - name: port
+        type: string
+      - name: bytes_sent
+        type: string
+
+  readablePayload: "Send Wake-on-LAN packet to ${mac}"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [wol]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.wol.check
+  displayName: Check Host Reachability
+  version: 1.0.0
+  description: >
+    Pings a host to verify it is reachable, typically used after
+    sending a Wake-on-LAN packet to confirm the target machine has
+    booted. Validates the host parameter to prevent command injection.
+    Returns reachability status and raw ping output. The count
+    parameter controls the number of ICMP echo requests sent.
+  tags: [wol, network, diagnostics, connectivity, action]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: wol
+    action: check
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [host]
+    properties:
+      host:
+        type: string
+        displayName: Target Host
+        description: >
+          Hostname or IP address to ping. Must contain only
+          alphanumeric characters, dots, hyphens, and colons.
+        validation:
+          minLength: 1
+          maxLength: 253
+          pattern: "^[a-zA-Z0-9.:\\-]+$"
+      count:
+        type: string
+        displayName: Ping Count
+        description: >
+          Number of ICMP echo requests to send (1-10).
+          Defaults to 3 if not specified.
+        default: "3"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: host
+        type: string
+      - name: status
+        type: string
+      - name: count
+        type: string
+
+  readablePayload: "Ping ${host} (${count} packets)"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [wol]
+
+status:
+  phase: active

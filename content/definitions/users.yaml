@@ -1,6 +1,7 @@
 ## User Accounts Definitions
 ## Provides discovery and enumeration of local user accounts,
-## logged-on users, interactive sessions, and local admin group members.
+## logged-on users, interactive sessions, local admin group members,
+## arbitrary group membership, primary user identification, and session history.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -216,6 +217,202 @@ spec:
 
   gather:
     ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.group_members
+  displayName: List Group Members
+  version: 1.0.0
+  description: >
+    Lists members of a specified local group. On Windows queries
+    NetLocalGroupGetMembers and reports member type (user, group,
+    well_known_group, alias). On Linux reads /etc/group and checks
+    primary GID assignments in /etc/passwd. On macOS reads the group
+    via dscl. The group name is a required parameter.
+  tags: [users, groups, security, compliance, privilege-audit]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: group_members
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [group]
+    properties:
+      group:
+        type: string
+        displayName: Group Name
+        description: >
+          Name of the local group to enumerate members for
+          (e.g., "Administrators", "Remote Desktop Users", "sudo").
+        validation:
+          minLength: 1
+          maxLength: 256
+
+  result:
+    columns:
+      - name: member_name
+        type: string
+      - name: group_name
+        type: string
+      - name: member_type
+        type: string
+
+  readablePayload: "List members of group '${group}'"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.primary_user
+  displayName: Identify Primary User
+  version: 1.0.0
+  description: >
+    Identifies the primary user of the endpoint by analyzing login
+    frequency. On Windows queries Security Event Log for Event ID
+    4624 (logon) events and counts occurrences per user, falling back
+    to the registry profile list. On Linux and macOS parses the output
+    of the 'last' command. Returns the user with the most login events
+    and the count. Machine accounts (ending with $) and SYSTEM are
+    excluded.
+  tags: [users, inventory, compliance, primary-user]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: primary_user
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: login_count
+        type: int32
+      - name: source
+        type: string
+
+  readablePayload: "Identify primary user of this endpoint"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [users]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.users.session_history
+  displayName: Session History
+  version: 1.0.0
+  description: >
+    Shows historical login and logout session records. On Windows
+    queries the Security Event Log for Event IDs 4624 (logon) and
+    4634 (logoff), parsing logon type, source address, and timestamps.
+    On Linux and macOS parses the 'last' command output. The count
+    parameter controls how many records to return. Requires elevated
+    privileges on Windows to read the Security event log.
+  tags: [users, sessions, security, audit, compliance, history]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: users
+    action: session_history
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      count:
+        type: string
+        displayName: Record Count
+        description: >
+          Maximum number of session records to return (1-500).
+          Defaults to 50 if not specified.
+        default: "50"
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: username
+        type: string
+      - name: event_type
+        type: string
+      - name: logon_type
+        type: string
+      - name: source
+        type: string
+      - name: timestamp
+        type: string
+      - name: detail
+        type: string
+
+  readablePayload: "Show session history (last ${count} records)"
+
+  gather:
+    ttlSeconds: 120
 
   approval:
     mode: auto

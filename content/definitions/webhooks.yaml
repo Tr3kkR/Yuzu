@@ -1,0 +1,283 @@
+## Webhook Management Definitions
+## Server-side webhook configuration for event-driven integrations.
+## These are server-only operations (no agent plugin required).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.webhooks.list
+  displayName: List Webhooks
+  version: 1.0.0
+  description: >
+    Returns all configured webhooks. The webhook secret is intentionally
+    omitted from the response for security. Use this to audit which
+    external systems are receiving event notifications.
+  tags: [webhooks, server, integration, events]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: webhooks.list
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      limit:
+        type: string
+        displayName: Result Limit
+        description: Maximum webhooks to return. Default 100.
+        validation:
+          pattern: "^[0-9]+$"
+      offset:
+        type: string
+        displayName: Offset
+        description: Pagination offset. Default 0.
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: id
+        type: int64
+      - name: url
+        type: string
+      - name: event_types
+        type: string
+      - name: enabled
+        type: bool
+      - name: created_at
+        type: int64
+
+  readablePayload: "List configured webhooks"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.webhooks.create
+  displayName: Create Webhook
+  version: 1.0.0
+  description: >
+    Creates a new webhook endpoint. When matching events occur, Yuzu will
+    POST a JSON payload to the configured URL. If a secret is provided,
+    the payload is signed with HMAC-SHA256 and the signature is sent in
+    the X-Yuzu-Signature header (format: sha256=<hex>).
+
+    Supported event types: agent.registered, execution.completed, or
+    use "*" to receive all events.
+  tags: [webhooks, server, integration, events, security]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: webhooks.create
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      url:
+        type: string
+        displayName: Webhook URL
+        description: >
+          The HTTPS (or HTTP) URL to POST event payloads to.
+          Must be reachable from the Yuzu server.
+        required: true
+      event_types:
+        type: string
+        displayName: Event Types
+        description: >
+          Comma-separated list of event types to subscribe to.
+          Use "*" for all events. Examples: "agent.registered",
+          "execution.completed", "agent.registered,execution.completed".
+      secret:
+        type: string
+        displayName: Signing Secret
+        description: >
+          Optional HMAC-SHA256 signing secret. If provided, each delivery
+          includes an X-Yuzu-Signature header for payload verification.
+      enabled:
+        type: string
+        displayName: Enabled
+        description: >
+          Whether the webhook is active. Default "true".
+        validation:
+          enum: ["true", "false", ""]
+
+  result:
+    columns:
+      - name: id
+        type: int64
+      - name: status
+        type: string
+
+  readablePayload: "Create webhook for ${url} events=${event_types}"
+
+  gather:
+    ttlSeconds: 5
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.webhooks.delete
+  displayName: Delete Webhook
+  version: 1.0.0
+  description: >
+    Deletes a webhook and its delivery history. This is a permanent
+    operation -- the webhook will stop receiving events immediately.
+  tags: [webhooks, server, integration]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: webhooks.delete
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      id:
+        type: string
+        displayName: Webhook ID
+        description: The integer ID of the webhook to delete.
+        required: true
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Delete webhook ${id}"
+
+  gather:
+    ttlSeconds: 5
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.webhooks.deliveries
+  displayName: Webhook Delivery History
+  version: 1.0.0
+  description: >
+    Returns the delivery history for a specific webhook, including
+    HTTP status codes and any errors. Use this to diagnose delivery
+    failures or verify that events are reaching the target system.
+  tags: [webhooks, server, integration, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: webhooks.deliveries
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      webhook_id:
+        type: string
+        displayName: Webhook ID
+        description: The integer ID of the webhook to get deliveries for.
+        required: true
+        validation:
+          pattern: "^[0-9]+$"
+      limit:
+        type: string
+        displayName: Result Limit
+        description: Maximum deliveries to return. Default 50.
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: id
+        type: int64
+      - name: webhook_id
+        type: int64
+      - name: event_type
+        type: string
+      - name: payload
+        type: clob
+      - name: status_code
+        type: int32
+      - name: delivered_at
+        type: int64
+      - name: error
+        type: string
+
+  readablePayload: "Get delivery history for webhook ${webhook_id}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active

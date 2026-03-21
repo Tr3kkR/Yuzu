@@ -1,0 +1,128 @@
+## WiFi Network Definitions
+## Scans visible WiFi networks and reports current connection status.
+## Plugin: wifi | Actions: list_networks, connected
+##
+## Sources by platform:
+##   Windows: WlanEnumInterfaces + WlanGetAvailableNetworkList + WlanQueryInterface
+##   Linux:   nmcli device wifi list / nmcli device show (fallback: iw/iwlist)
+##   macOS:   airport -s / airport -I
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.wifi.list_networks
+  displayName: List WiFi Networks
+  version: 1.0.0
+  description: >
+    Scans for visible WiFi networks and reports each network's SSID,
+    signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
+    network type or channel, and BSSID or connection status.
+    On Windows uses WlanGetAvailableNetworkList, on Linux uses
+    nmcli device wifi list, on macOS uses the airport utility.
+  tags: [wifi, network, wireless, inventory, security]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: wifi
+    action: list_networks
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: ssid
+        type: string
+      - name: signal
+        type: string
+      - name: security
+        type: string
+      - name: channel_or_type
+        type: string
+      - name: bssid_or_connected
+        type: string
+
+  readablePayload: "Scan visible WiFi networks"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [wifi]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.wifi.connected
+  displayName: Current WiFi Connection
+  version: 1.0.0
+  description: >
+    Reports information about the currently connected WiFi network,
+    including SSID, signal strength, security type, BSSID, and the
+    wireless interface or channel. On Windows uses WlanQueryInterface,
+    on Linux uses nmcli or iwconfig, on macOS uses airport -I.
+    Returns "Not connected" if no WiFi connection is active.
+  tags: [wifi, network, wireless, connectivity, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: wifi
+    action: connected
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: ssid
+        type: string
+      - name: signal
+        type: string
+      - name: security
+        type: string
+      - name: bssid
+        type: string
+      - name: interface_or_channel
+        type: string
+
+  readablePayload: "Get current WiFi connection info"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [wifi]
+
+status:
+  phase: active

@@ -130,6 +130,8 @@ if build_agent
     subdir('agents/plugins/registry')
     subdir('agents/plugins/wmi')
     subdir('agents/plugins/tar')
+    subdir('agents/plugins/wifi')
+    subdir('agents/plugins/wol')
   endif
 endif
 

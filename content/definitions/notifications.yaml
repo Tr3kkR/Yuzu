@@ -1,0 +1,193 @@
+## Notification Management Definitions
+## Server-side notification system for operator alerts.
+## These are server-only operations (no agent plugin required).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.notifications.list
+  displayName: List Notifications
+  version: 1.0.0
+  description: >
+    Returns server-side notifications for the authenticated operator.
+    By default only unread, non-dismissed notifications are returned.
+    Pass all=true to include read and dismissed notifications.
+  tags: [notifications, server, alerts, ui]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: notifications.list
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      all:
+        type: string
+        displayName: Include All
+        description: >
+          Set to "true" to include read and dismissed notifications.
+          Default is "false" (unread only).
+        validation:
+          enum: ["true", "false", ""]
+      limit:
+        type: string
+        displayName: Result Limit
+        description: Maximum notifications to return. Default 50.
+        validation:
+          pattern: "^[0-9]+$"
+      offset:
+        type: string
+        displayName: Offset
+        description: Pagination offset. Default 0.
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: id
+        type: int64
+      - name: timestamp
+        type: int64
+      - name: level
+        type: string
+      - name: title
+        type: string
+      - name: message
+        type: string
+      - name: read
+        type: bool
+      - name: dismissed
+        type: bool
+
+  readablePayload: "List notifications (all=${all})"
+
+  gather:
+    ttlSeconds: 10
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.notifications.mark_read
+  displayName: Mark Notification Read
+  version: 1.0.0
+  description: >
+    Marks a specific notification as read by its ID.
+  tags: [notifications, server, ui]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: notifications.mark_read
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      id:
+        type: string
+        displayName: Notification ID
+        description: The integer ID of the notification to mark as read.
+        required: true
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Mark notification ${id} as read"
+
+  gather:
+    ttlSeconds: 5
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.notifications.dismiss
+  displayName: Dismiss Notification
+  version: 1.0.0
+  description: >
+    Dismisses a notification (soft-delete). The notification will no longer
+    appear in the default unread list but remains in the database for auditing.
+  tags: [notifications, server, ui]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: _server
+    action: notifications.dismiss
+    concurrency: global
+
+  parameters:
+    type: object
+    properties:
+      id:
+        type: string
+        displayName: Notification ID
+        description: The integer ID of the notification to dismiss.
+        required: true
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Dismiss notification ${id}"
+
+  gather:
+    ttlSeconds: 5
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+
+status:
+  phase: active

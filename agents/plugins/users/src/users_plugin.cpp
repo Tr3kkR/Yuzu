@@ -2,10 +2,13 @@
  * users_plugin.cpp — User accounts plugin for Yuzu
  *
  * Actions:
- *   "logged_on"    — Lists currently logged-on users.
- *   "sessions"     — Lists active interactive sessions.
- *   "local_users"  — Enumerates local user accounts.
- *   "local_admins" — Lists members of the local Administrators group.
+ *   "logged_on"       — Lists currently logged-on users.
+ *   "sessions"        — Lists active interactive sessions.
+ *   "local_users"     — Enumerates local user accounts.
+ *   "local_admins"    — Lists members of the local Administrators group.
+ *   "group_members"   — Lists members of a specified local group.
+ *   "primary_user"    — Identifies the primary user (most frequent login).
+ *   "session_history" — Shows historical login/logout session records.
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   key|field1|field2|...
@@ -16,6 +19,7 @@
 #include <array>
 #include <cstdio>
 #include <format>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -49,25 +53,47 @@
 
 namespace {
 
-// ── subprocess helper (Linux / macOS) ──────────────────────────────────────
+// ── input validation ──────────────────────────────────────────────────────
 
-#if defined(__linux__) || defined(__APPLE__)
+/// Validate that a string contains only safe characters for use in shell commands.
+/// Allows: [a-zA-Z0-9._-] — rejects anything with shell metacharacters.
+bool is_safe_identifier(std::string_view s) {
+    if (s.empty())
+        return false;
+    for (char c : s) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '.' || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ── subprocess helper (all platforms) ──────────────────────────────────────
+
 std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd, "r");
+#else
     FILE* pipe = popen(cmd, "r");
+#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
+#ifdef _WIN32
+    _pclose(pipe);
+#else
     pclose(pipe);
+#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
     return result;
 }
-#endif
 
 #ifdef _WIN32
 // Convert a wide string to UTF-8
@@ -372,18 +398,46 @@ int do_local_users(yuzu::CommandContext& ctx) {
             if (user.starts_with("_"))
                 continue;
 
+            // Validate username before using in shell commands
+            if (!is_safe_identifier(user))
+                continue;
+
             // Check if account is enabled
             auto shell = run_command(
-                std::format("dscl . -read /Users/{} UserShell 2>/dev/null | awk '{{print $2}}'",
-                            user)
-                    .c_str());
-            bool enabled = shell.find("false") == std::string::npos &&
-                           shell.find("nologin") == std::string::npos;
+                std::format("dscl . -read /Users/{} UserShell 2>/dev/null", user).c_str());
+            // Extract second field (the shell path) without piping to awk
+            bool enabled = true;
+            {
+                auto sp = shell.find(' ');
+                if (sp != std::string::npos) {
+                    auto shell_path = shell.substr(sp + 1);
+                    while (!shell_path.empty() && shell_path.front() == ' ')
+                        shell_path.erase(shell_path.begin());
+                    enabled = shell_path.find("false") == std::string::npos &&
+                              shell_path.find("nologin") == std::string::npos;
+                }
+            }
 
-            auto desc = run_command(
-                std::format("dscl . -read /Users/{} RealName 2>/dev/null | tail -1 | sed 's/^ //'",
-                            user)
-                    .c_str());
+            auto desc_raw = run_command(
+                std::format("dscl . -read /Users/{} RealName 2>/dev/null", user).c_str());
+            // Extract real name: skip first line ("RealName:"), trim leading space
+            std::string desc;
+            {
+                auto nl = desc_raw.find('\n');
+                if (nl != std::string::npos) {
+                    desc = desc_raw.substr(nl + 1);
+                    while (!desc.empty() && desc.front() == ' ')
+                        desc.erase(desc.begin());
+                } else {
+                    // Single-line: strip "RealName: " prefix
+                    auto colon2 = desc_raw.find(':');
+                    if (colon2 != std::string::npos) {
+                        desc = desc_raw.substr(colon2 + 1);
+                        while (!desc.empty() && desc.front() == ' ')
+                            desc.erase(desc.begin());
+                    }
+                }
+            }
 
             ctx.write_output(std::format("local_user|{}|{}|unknown|{}", user,
                                          enabled ? "true" : "false", desc.empty() ? "-" : desc));
@@ -515,6 +569,512 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── group_members action ──────────────────────────────────────────────────
+
+int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
+    auto group_name = params.get("group");
+    if (group_name.empty()) {
+        ctx.write_output("group_member|error|Missing required parameter: group");
+        return 1;
+    }
+
+    // Validate group_name to prevent command injection on platforms that use shell commands
+    if (!is_safe_identifier(group_name)) {
+        ctx.write_output(std::format("group_member|error|Invalid group name: {}", group_name));
+        return 1;
+    }
+
+#ifdef __linux__
+    struct group* grp = getgrnam(std::string(group_name).c_str());
+    if (!grp) {
+        ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
+        return 1;
+    }
+    for (char** member = grp->gr_mem; *member; ++member) {
+        ctx.write_output(std::format("group_member|{}|{}|user", *member, group_name));
+    }
+
+    // Also check if any user has this as their primary group (GID match)
+    std::ifstream passwd("/etc/passwd");
+    if (passwd) {
+        std::string line;
+        while (std::getline(passwd, line)) {
+            std::istringstream ls(line);
+            std::string user, x, uid_s, gid_s;
+            std::getline(ls, user, ':');
+            std::getline(ls, x, ':');
+            std::getline(ls, uid_s, ':');
+            std::getline(ls, gid_s, ':');
+            int gid = 0;
+            try {
+                gid = std::stoi(gid_s);
+            } catch (...) {}
+            if (gid == static_cast<int>(grp->gr_gid)) {
+                // Check if already listed as explicit member
+                bool already_listed = false;
+                for (char** member = grp->gr_mem; *member; ++member) {
+                    if (user == *member) {
+                        already_listed = true;
+                        break;
+                    }
+                }
+                if (!already_listed) {
+                    ctx.write_output(
+                        std::format("group_member|{}|{}|primary_group", user, group_name));
+                }
+            }
+        }
+    }
+
+#elif defined(__APPLE__)
+    auto dscl_out = run_command(
+        std::format("dscl . -read /Groups/{} GroupMembership 2>/dev/null", group_name).c_str());
+    if (!dscl_out.empty()) {
+        auto colon = dscl_out.find(':');
+        if (colon != std::string::npos) {
+            auto members_str = dscl_out.substr(colon + 1);
+            std::istringstream ss(members_str);
+            std::string member;
+            while (ss >> member) {
+                ctx.write_output(
+                    std::format("group_member|{}|{}|user", member, group_name));
+            }
+        }
+    } else {
+        ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
+        return 1;
+    }
+
+#elif defined(_WIN32)
+    // Convert group name to wide string
+    std::wstring wgroup(group_name.begin(), group_name.end());
+
+    LPLOCALGROUP_MEMBERS_INFO_2 buf = nullptr;
+    DWORD entries_read = 0;
+    DWORD total_entries = 0;
+    DWORD_PTR resume = 0;
+
+    NET_API_STATUS status = NetLocalGroupGetMembers(
+        nullptr, wgroup.c_str(), 2, reinterpret_cast<LPBYTE*>(&buf), MAX_PREFERRED_LENGTH,
+        &entries_read, &total_entries, &resume);
+
+    if (status == NERR_Success || status == ERROR_MORE_DATA) {
+        for (DWORD i = 0; i < entries_read; ++i) {
+            auto& m = buf[i];
+            auto name = wide_to_utf8(m.lgrmi2_domainandname);
+
+            const char* type_str = "unknown";
+            switch (m.lgrmi2_sidusage) {
+            case SidTypeUser:
+                type_str = "user";
+                break;
+            case SidTypeGroup:
+                type_str = "group";
+                break;
+            case SidTypeWellKnownGroup:
+                type_str = "well_known_group";
+                break;
+            case SidTypeAlias:
+                type_str = "alias";
+                break;
+            default:
+                break;
+            }
+
+            // Split domain\name
+            std::string member_name = name;
+            auto backslash = name.find('\\');
+            if (backslash != std::string::npos) {
+                member_name = name.substr(backslash + 1);
+            }
+
+            ctx.write_output(
+                std::format("group_member|{}|{}|{}", member_name, group_name, type_str));
+        }
+        NetApiBufferFree(buf);
+    } else if (status == NERR_GroupNotFound || status == ERROR_NO_SUCH_ALIAS) {
+        ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
+        return 1;
+    } else {
+        ctx.write_output(std::format("group_member|error|Failed to query group: {}", group_name));
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+// ── primary_user action ──────────────────────────────────────────────────
+
+int do_primary_user(yuzu::CommandContext& ctx) {
+#ifdef __linux__
+    // Parse 'last' output to find most-frequent interactive login
+    auto last_out = run_command("last -F 2>/dev/null | head -200");
+    if (!last_out.empty()) {
+        std::map<std::string, int> login_counts;
+        std::istringstream ss(last_out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (line.empty() || line.starts_with("reboot") || line.starts_with("wtmp"))
+                continue;
+            std::istringstream ls(line);
+            std::string user;
+            ls >> user;
+            if (user.empty() || user == "reboot" || user == "wtmp")
+                continue;
+            login_counts[user]++;
+        }
+
+        // Find the user with most logins
+        std::string primary;
+        int max_count = 0;
+        for (const auto& [user, count] : login_counts) {
+            if (count > max_count) {
+                max_count = count;
+                primary = user;
+            }
+        }
+
+        if (!primary.empty()) {
+            ctx.write_output(std::format("primary_user|{}|{}|last", primary, max_count));
+        } else {
+            ctx.write_output("primary_user|unknown|0|no login records");
+        }
+    } else {
+        ctx.write_output("primary_user|unknown|0|last command failed");
+    }
+
+#elif defined(__APPLE__)
+    // macOS: use 'last' command similarly
+    auto last_out = run_command("last 2>/dev/null | head -200");
+    if (!last_out.empty()) {
+        std::map<std::string, int> login_counts;
+        std::istringstream ss(last_out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (line.empty() || line.starts_with("reboot") || line.starts_with("wtmp") ||
+                line.starts_with("shutdown"))
+                continue;
+            std::istringstream ls(line);
+            std::string user;
+            ls >> user;
+            if (user.empty() || user == "reboot" || user == "wtmp" || user == "shutdown")
+                continue;
+            login_counts[user]++;
+        }
+
+        std::string primary;
+        int max_count = 0;
+        for (const auto& [user, count] : login_counts) {
+            if (count > max_count) {
+                max_count = count;
+                primary = user;
+            }
+        }
+
+        if (!primary.empty()) {
+            ctx.write_output(std::format("primary_user|{}|{}|last", primary, max_count));
+        } else {
+            ctx.write_output("primary_user|unknown|0|no login records");
+        }
+    } else {
+        ctx.write_output("primary_user|unknown|0|last command failed");
+    }
+
+#elif defined(_WIN32)
+    // Windows: query Security Event Log for logon events (Event ID 4624)
+    // Use wevtutil to extract recent logon events
+    auto evt_out = run_command(
+        "wevtutil qe Security /q:\"*[System[EventID=4624]]\" /c:200 /f:text /rd:true 2>&1");
+    if (!evt_out.empty() && evt_out.find("Access is denied") == std::string::npos) {
+        std::map<std::string, int> login_counts;
+        std::istringstream ss(evt_out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            // Look for "Account Name:" lines (skip the first one per event, which is machine$)
+            auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos)
+                continue;
+            auto trimmed = line.substr(start);
+            if (trimmed.starts_with("Account Name:")) {
+                auto name = trimmed.substr(13);
+                auto name_start = name.find_first_not_of(" \t");
+                if (name_start != std::string::npos) {
+                    name = name.substr(name_start);
+                    // Skip machine accounts (ending with $)
+                    if (!name.empty() && name.back() != '$' && name != "-" && name != "SYSTEM") {
+                        login_counts[name]++;
+                    }
+                }
+            }
+        }
+
+        std::string primary;
+        int max_count = 0;
+        for (const auto& [user, count] : login_counts) {
+            if (count > max_count) {
+                max_count = count;
+                primary = user;
+            }
+        }
+
+        if (!primary.empty()) {
+            ctx.write_output(
+                std::format("primary_user|{}|{}|event_log_4624", primary, max_count));
+        } else {
+            ctx.write_output("primary_user|unknown|0|no logon events found");
+        }
+    } else {
+        // Fallback: check user profiles in registry
+        auto reg_out = run_command(
+            "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows "
+            "NT\\CurrentVersion\\ProfileList\" /s 2>&1");
+        if (!reg_out.empty()) {
+            std::string last_user;
+            std::istringstream ss(reg_out);
+            std::string line;
+            while (std::getline(ss, line)) {
+                auto start = line.find_first_not_of(" \t");
+                if (start == std::string::npos)
+                    continue;
+                auto trimmed = line.substr(start);
+                if (trimmed.find("ProfileImagePath") != std::string::npos) {
+                    auto users_pos = trimmed.find("\\Users\\");
+                    if (users_pos != std::string::npos) {
+                        last_user = trimmed.substr(users_pos + 7);
+                        // Trim trailing whitespace
+                        while (!last_user.empty() &&
+                               (last_user.back() == '\r' || last_user.back() == ' '))
+                            last_user.pop_back();
+                    }
+                }
+            }
+            if (!last_user.empty()) {
+                ctx.write_output(
+                    std::format("primary_user|{}|0|profile_list", last_user));
+            } else {
+                ctx.write_output("primary_user|unknown|0|no profiles found");
+            }
+        } else {
+            ctx.write_output("primary_user|unknown|0|cannot query event log or registry");
+        }
+    }
+#endif
+    return 0;
+}
+
+// ── session_history action ───────────────────────────────────────────────
+
+int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
+    auto count_param = params.get("count", "50");
+    int count = 50;
+    try {
+        count = std::stoi(std::string(count_param));
+        if (count < 1 || count > 500)
+            count = 50;
+    } catch (...) {
+        count = 50;
+    }
+
+#ifdef __linux__
+    auto last_out =
+        run_command(std::format("last -F -n {} 2>/dev/null", count).c_str());
+    if (!last_out.empty()) {
+        std::istringstream ss(last_out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (line.empty() || line.starts_with("wtmp"))
+                continue;
+            // Parse 'last' output: USER TTY HOST LOGIN_TIME - LOGOUT_TIME (DURATION)
+            std::istringstream ls(line);
+            std::string user, tty, source;
+            ls >> user >> tty >> source;
+            if (user.empty() || user == "wtmp")
+                continue;
+
+            // The rest of the line contains timestamps and duration
+            std::string rest;
+            std::getline(ls, rest);
+            auto start = rest.find_first_not_of(" \t");
+            if (start != std::string::npos)
+                rest = rest.substr(start);
+
+            // Determine if still logged in
+            std::string status = "completed";
+            if (rest.find("still logged in") != std::string::npos)
+                status = "active";
+            else if (rest.find("crash") != std::string::npos)
+                status = "crash";
+
+            std::string logon_type = "console";
+            if (tty.starts_with("pts/"))
+                logon_type = "remote";
+            else if (user == "reboot")
+                logon_type = "system";
+
+            ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", user, tty, source,
+                                         logon_type, status, rest.empty() ? "-" : rest));
+        }
+    } else {
+        ctx.write_output("session_history|error|last command failed");
+    }
+
+#elif defined(__APPLE__)
+    auto last_out =
+        run_command(std::format("last -n {} 2>/dev/null", count).c_str());
+    if (!last_out.empty()) {
+        std::istringstream ss(last_out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (line.empty() || line.starts_with("wtmp"))
+                continue;
+            std::istringstream ls(line);
+            std::string user, tty, source;
+            ls >> user >> tty >> source;
+            if (user.empty() || user == "wtmp")
+                continue;
+
+            std::string rest;
+            std::getline(ls, rest);
+            auto start = rest.find_first_not_of(" \t");
+            if (start != std::string::npos)
+                rest = rest.substr(start);
+
+            std::string status = "completed";
+            if (rest.find("still logged in") != std::string::npos)
+                status = "active";
+            else if (rest.find("crash") != std::string::npos)
+                status = "crash";
+
+            std::string logon_type = "console";
+            if (tty.starts_with("ttys"))
+                logon_type = "remote";
+            else if (user == "reboot" || user == "shutdown")
+                logon_type = "system";
+
+            ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", user, tty, source,
+                                         logon_type, status, rest.empty() ? "-" : rest));
+        }
+    } else {
+        ctx.write_output("session_history|error|last command failed");
+    }
+
+#elif defined(_WIN32)
+    // Query Windows Security Event Log for logon (4624) and logoff (4634) events
+    auto logon_out = run_command(
+        std::format(
+            "wevtutil qe Security /q:\"*[System[(EventID=4624 or EventID=4634)]]\" /c:{} "
+            "/f:text /rd:true 2>&1",
+            count)
+            .c_str());
+
+    if (!logon_out.empty() && logon_out.find("Access is denied") == std::string::npos) {
+        std::istringstream ss(logon_out);
+        std::string line;
+        std::string current_event_id;
+        std::string current_time;
+        std::string current_user;
+        std::string current_logon_type;
+        std::string current_source;
+        int account_name_count = 0; // Track which "Account Name" we're on
+
+        while (std::getline(ss, line)) {
+            auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos)
+                continue;
+            auto trimmed = line.substr(start);
+
+            if (trimmed.starts_with("Event[")) {
+                // New event — emit previous if we have data
+                if (!current_user.empty() && current_user != "-" &&
+                    current_user != "SYSTEM" && !current_user.empty() &&
+                    current_user.back() != '$') {
+                    std::string event_type =
+                        (current_event_id == "4624") ? "logon" : "logoff";
+                    ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", current_user,
+                                                 event_type, current_logon_type,
+                                                 current_source.empty() ? "-" : current_source,
+                                                 current_time.empty() ? "-" : current_time,
+                                                 current_event_id));
+                }
+                current_event_id.clear();
+                current_time.clear();
+                current_user.clear();
+                current_logon_type.clear();
+                current_source.clear();
+                account_name_count = 0;
+            }
+
+            if (trimmed.starts_with("Date:")) {
+                current_time = trimmed.substr(5);
+                auto ts = current_time.find_first_not_of(" \t");
+                if (ts != std::string::npos)
+                    current_time = current_time.substr(ts);
+            } else if (trimmed.starts_with("Event ID:")) {
+                current_event_id = trimmed.substr(9);
+                auto ts = current_event_id.find_first_not_of(" \t");
+                if (ts != std::string::npos)
+                    current_event_id = current_event_id.substr(ts);
+            } else if (trimmed.starts_with("Account Name:")) {
+                account_name_count++;
+                // Second Account Name in 4624 events is the actual user
+                if (account_name_count == 2 || current_event_id == "4634") {
+                    current_user = trimmed.substr(13);
+                    auto ts = current_user.find_first_not_of(" \t");
+                    if (ts != std::string::npos)
+                        current_user = current_user.substr(ts);
+                }
+            } else if (trimmed.starts_with("Logon Type:")) {
+                auto val = trimmed.substr(11);
+                auto ts = val.find_first_not_of(" \t");
+                if (ts != std::string::npos)
+                    val = val.substr(ts);
+                // Map logon type numbers to names
+                if (val == "2")
+                    current_logon_type = "interactive";
+                else if (val == "3")
+                    current_logon_type = "network";
+                else if (val == "4")
+                    current_logon_type = "batch";
+                else if (val == "5")
+                    current_logon_type = "service";
+                else if (val == "7")
+                    current_logon_type = "unlock";
+                else if (val == "8")
+                    current_logon_type = "network_cleartext";
+                else if (val == "9")
+                    current_logon_type = "new_credentials";
+                else if (val == "10")
+                    current_logon_type = "remote_interactive";
+                else if (val == "11")
+                    current_logon_type = "cached_interactive";
+                else
+                    current_logon_type = val;
+            } else if (trimmed.starts_with("Source Network Address:")) {
+                current_source = trimmed.substr(23);
+                auto ts = current_source.find_first_not_of(" \t");
+                if (ts != std::string::npos)
+                    current_source = current_source.substr(ts);
+            }
+        }
+
+        // Emit last event
+        if (!current_user.empty() && current_user != "-" && current_user != "SYSTEM" &&
+            current_user.back() != '$') {
+            std::string event_type = (current_event_id == "4624") ? "logon" : "logoff";
+            ctx.write_output(std::format("session_history|{}|{}|{}|{}|{}|{}", current_user,
+                                         event_type, current_logon_type,
+                                         current_source.empty() ? "-" : current_source,
+                                         current_time.empty() ? "-" : current_time,
+                                         current_event_id));
+        }
+    } else {
+        ctx.write_output("session_history|error|Cannot access Security event log (requires "
+                         "elevated privileges)");
+    }
+#endif
+    return 0;
+}
+
 } // namespace
 
 class UsersPlugin final : public yuzu::Plugin {
@@ -522,12 +1082,14 @@ public:
     std::string_view name() const noexcept override { return "users"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Reports logged-on users, sessions, local accounts, and admin group members";
+        return "Reports logged-on users, sessions, local accounts, admin group members, "
+               "group membership, primary user, and session history";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"logged_on", "sessions", "local_users", "local_admins",
-                                     nullptr};
+        static const char* acts[] = {"logged_on",    "sessions",        "local_users",
+                                     "local_admins", "group_members",   "primary_user",
+                                     "session_history", nullptr};
         return acts;
     }
 
@@ -536,7 +1098,7 @@ public:
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params /*params*/) override {
+                yuzu::Params params) override {
         if (action == "logged_on")
             return do_logged_on(ctx);
         if (action == "sessions")
@@ -545,6 +1107,12 @@ public:
             return do_local_users(ctx);
         if (action == "local_admins")
             return do_local_admins(ctx);
+        if (action == "group_members")
+            return do_group_members(ctx, params);
+        if (action == "primary_user")
+            return do_primary_user(ctx);
+        if (action == "session_history")
+            return do_session_history(ctx, params);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

@@ -1,0 +1,497 @@
+## Workflow & Product Pack Management Definitions
+## Server-side instruction definitions for workflow primitives (7.14)
+## and product pack management (7.9).
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.list
+  displayName: List Workflows
+  version: 1.0.0
+  description: >
+    Lists all workflows registered in the workflow engine, with their
+    step definitions, condition expressions, retry configuration, and
+    foreach expansion settings.
+  tags: [workflow, orchestration, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.list
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Filter workflows by name (substring match)
+      limit:
+        type: integer
+        description: Maximum number of results
+        default: 100
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: description
+        type: string
+      - name: step_count
+        type: int32
+      - name: created_at
+        type: datetime
+      - name: updated_at
+        type: datetime
+
+  readablePayload: "List all workflows"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.create
+  displayName: Create Workflow
+  version: 1.0.0
+  description: >
+    Creates a new workflow from a YAML definition. The YAML must contain
+    a steps section with one or more instruction references. Each step
+    can optionally include condition expressions, retry configuration,
+    foreach expansion, and failure handling policies.
+  tags: [workflow, orchestration, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.create
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [yaml_source]
+    properties:
+      yaml_source:
+        type: string
+        description: >
+          Complete YAML source for the Workflow definition. Must include
+          a steps section with at least one step referencing an instruction ID.
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Create workflow from YAML"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.get
+  displayName: Get Workflow Detail
+  version: 1.0.0
+  description: >
+    Returns the full detail of a workflow including all step definitions,
+    the original YAML source, and metadata.
+  tags: [workflow, orchestration, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.get
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [workflow_id]
+    properties:
+      workflow_id:
+        type: string
+        description: The ID of the workflow to retrieve
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: description
+        type: string
+      - name: yaml_source
+        type: clob
+      - name: steps
+        type: string
+      - name: created_at
+        type: datetime
+      - name: updated_at
+        type: datetime
+
+  readablePayload: "Get workflow '${workflow_id}'"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.delete
+  displayName: Delete Workflow
+  version: 1.0.0
+  description: >
+    Permanently deletes a workflow and all associated step definitions.
+    Existing execution history is preserved for audit purposes.
+    This action cannot be undone.
+  tags: [workflow, orchestration, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.delete
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [workflow_id]
+    properties:
+      workflow_id:
+        type: string
+        description: The ID of the workflow to delete
+
+  result:
+    columns:
+      - name: deleted
+        type: bool
+
+  readablePayload: "Delete workflow '${workflow_id}'"
+
+  approval:
+    mode: always
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.execute
+  displayName: Execute Workflow
+  version: 1.0.0
+  description: >
+    Starts a workflow execution against a set of target agents. Steps
+    are executed sequentially. Each step dispatches an instruction to
+    the target agents and waits for results. Steps with conditions are
+    evaluated against the previous step's output. Steps with foreach
+    expand into multiple dispatches per result item.
+  tags: [workflow, orchestration, execution]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.execute
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [workflow_id, agent_ids]
+    properties:
+      workflow_id:
+        type: string
+        description: The ID of the workflow to execute
+      agent_ids:
+        type: array
+        description: Array of agent IDs to target
+        items:
+          type: string
+
+  result:
+    columns:
+      - name: execution_id
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Execute workflow '${workflow_id}'"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.workflow.execution_status
+  displayName: Get Workflow Execution Status
+  version: 1.0.0
+  description: >
+    Returns the current status of a workflow execution including
+    per-step results, timing data, retry attempt counts, and overall
+    completion status.
+  tags: [workflow, orchestration, reporting]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: workflow.execution_status
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [execution_id]
+    properties:
+      execution_id:
+        type: string
+        description: The execution ID to query
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: workflow_id
+        type: string
+      - name: status
+        type: string
+      - name: current_step
+        type: int32
+      - name: started_at
+        type: datetime
+      - name: completed_at
+        type: datetime
+      - name: steps
+        type: string
+
+  readablePayload: "Get execution status '${execution_id}'"
+
+  gather:
+    ttlSeconds: 5
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.product_pack.list
+  displayName: List Product Packs
+  version: 1.0.0
+  description: >
+    Lists all installed product packs with their metadata, version
+    numbers, and contained item counts.
+  tags: [product-pack, content, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: product_pack.list
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Filter packs by name (substring match)
+      limit:
+        type: integer
+        description: Maximum number of results
+        default: 100
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: description
+        type: string
+      - name: item_count
+        type: int32
+      - name: installed_at
+        type: datetime
+
+  readablePayload: "List all product packs"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.product_pack.install
+  displayName: Install Product Pack
+  version: 1.0.0
+  description: >
+    Installs a product pack from a multi-document YAML bundle. The
+    bundle contains a ProductPack metadata document plus one or more
+    content documents (InstructionDefinition, PolicyFragment, Policy,
+    Workflow). Each content document is delegated to the appropriate
+    store for creation.
+  tags: [product-pack, content, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: product_pack.install
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [yaml_source]
+    properties:
+      yaml_source:
+        type: string
+        description: >
+          Multi-document YAML bundle. Must contain at least one content
+          document. Optionally includes a ProductPack metadata document.
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: status
+        type: string
+
+  readablePayload: "Install product pack from YAML bundle"
+
+  approval:
+    mode: role-gated
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.product_pack.get
+  displayName: Get Product Pack Detail
+  version: 1.0.0
+  description: >
+    Returns full detail of an installed product pack including all
+    contained items with their kinds, IDs, and names.
+  tags: [product-pack, content, management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: product_pack.get
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [pack_id]
+    properties:
+      pack_id:
+        type: string
+        description: The ID of the product pack to retrieve
+
+  result:
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: version
+        type: string
+      - name: description
+        type: string
+      - name: yaml_source
+        type: clob
+      - name: items
+        type: string
+      - name: installed_at
+        type: datetime
+
+  readablePayload: "Get product pack '${pack_id}'"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: server.product_pack.uninstall
+  displayName: Uninstall Product Pack
+  version: 1.0.0
+  description: >
+    Uninstalls a product pack, removing all contained content items
+    (instruction definitions, policy fragments, policies, workflows)
+    from their respective stores. This action cannot be undone.
+  tags: [product-pack, content, management]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: server
+    action: product_pack.uninstall
+    concurrency: per-definition
+
+  parameters:
+    type: object
+    required: [pack_id]
+    properties:
+      pack_id:
+        type: string
+        description: The ID of the product pack to uninstall
+
+  result:
+    columns:
+      - name: status
+        type: string
+
+  readablePayload: "Uninstall product pack '${pack_id}'"
+
+  approval:
+    mode: always

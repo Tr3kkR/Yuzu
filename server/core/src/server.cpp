@@ -18,8 +18,10 @@
 #include "instruction_store.hpp"
 #include "management.grpc.pb.h"
 #include "management_group_store.hpp"
+#include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
@@ -31,6 +33,8 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
+#include "webhook_store.hpp"
+#include "workflow_engine.hpp"
 
 #include <grpc/grpc_security_constants.h>
 #include <grpcpp/grpcpp.h>
@@ -606,6 +610,8 @@ public:
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
+    void set_notification_store(NotificationStore* store) { notification_store_ = store; }
+    void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override {
@@ -765,6 +771,24 @@ public:
             }
             ae.payload = {{"plugins", plugins_list}};
             analytics_store_->emit(std::move(ae));
+        }
+
+        // Create notification for agent enrollment
+        if (notification_store_ && notification_store_->is_open()) {
+            notification_store_->create(
+                "success", "Agent Enrolled",
+                "Agent " + info.agent_id() + " (" + info.hostname() + ") enrolled successfully");
+        }
+
+        // Fire webhook for agent enrollment
+        if (webhook_store_ && webhook_store_->is_open()) {
+            nlohmann::json payload = {{"event", "agent.registered"},
+                                      {"agent_id", info.agent_id()},
+                                      {"hostname", info.hostname()},
+                                      {"os", info.platform().os()},
+                                      {"arch", info.platform().arch()},
+                                      {"agent_version", info.agent_version()}};
+            webhook_store_->fire_event("agent.registered", payload.dump());
         }
 
         // Sync agent-reported tags to persistent TagStore
@@ -988,6 +1012,30 @@ public:
                         ae.payload["error_message"] = resp.error().message();
                     }
                     analytics_store_->emit(std::move(ae));
+                }
+
+                // Create notification on execution failure
+                if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
+                    notification_store_->is_open()) {
+                    std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+                    notification_store_->create(
+                        "error", "Execution Failed",
+                        "Command " + resp.command_id() + " on agent " + agent_id +
+                            " failed: " + err_msg);
+                }
+
+                // Fire webhook on execution completion
+                if (webhook_store_ && webhook_store_->is_open()) {
+                    nlohmann::json wh_payload = {
+                        {"event", "execution.completed"},
+                        {"command_id", resp.command_id()},
+                        {"agent_id", agent_id},
+                        {"status", status_str},
+                        {"exit_code", resp.exit_code()}};
+                    if (resp.has_error()) {
+                        wh_payload["error"] = resp.error().message();
+                    }
+                    webhook_store_->fire_event("execution.completed", wh_payload.dump());
                 }
 
                 // Publish total round-trip and clean up timing maps
@@ -1243,6 +1291,8 @@ private:
     AnalyticsEventStore* analytics_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
+    NotificationStore* notification_store_{nullptr};
+    WebhookStore* webhook_store_{nullptr};
 };
 
 // -- ManagementServiceImpl ----------------------------------------------------
@@ -1682,6 +1732,10 @@ public:
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
             agent_service_.set_analytics_store(analytics_store_.get());
+        if (notification_store_)
+            agent_service_.set_notification_store(notification_store_.get());
+        if (webhook_store_)
+            agent_service_.set_webhook_store(webhook_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -1768,6 +1822,34 @@ public:
         {
             auto props_db = cfg_.auth_config_path.parent_path() / "custom-properties.db";
             custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
+        }
+
+        // Phase 7: Workflow Engine
+        {
+            auto wf_db = cfg_.auth_config_path.parent_path() / "workflows.db";
+            workflow_engine_ = std::make_unique<WorkflowEngine>(wf_db);
+            if (workflow_engine_ && workflow_engine_->is_open()) {
+                spdlog::info("WorkflowEngine initialized at {}", wf_db.string());
+            }
+        }
+
+        // Phase 7: Product Pack Store
+        {
+            auto pack_db = cfg_.auth_config_path.parent_path() / "product-packs.db";
+            product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
+            if (product_pack_store_ && product_pack_store_->is_open()) {
+                spdlog::info("ProductPackStore initialized at {}", pack_db.string());
+            }
+        }
+
+        // Notification & Webhook stores
+        {
+            auto notif_db = cfg_.auth_config_path.parent_path() / "notifications.db";
+            notification_store_ = std::make_unique<NotificationStore>(notif_db);
+        }
+        {
+            auto webhook_db = cfg_.auth_config_path.parent_path() / "webhooks.db";
+            webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
         }
     }
 
@@ -7658,6 +7740,676 @@ private:
                     "application/json");
             });
 
+        // -- Workflow Engine API (Phase 7) -------------------------------------------
+
+        // GET /api/workflows — list all workflows
+        web_server_->Get("/api/workflows",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine_ || !workflow_engine_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    return;
+                }
+
+                WorkflowQuery q;
+                if (req.has_param("name"))
+                    q.name_filter = req.get_param_value("name");
+                try {
+                    if (req.has_param("limit"))
+                        q.limit = std::stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    return;
+                }
+
+                auto workflows = workflow_engine_->list_workflows(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& w : workflows) {
+                    nlohmann::json steps_arr = nlohmann::json::array();
+                    for (const auto& s : w.steps) {
+                        steps_arr.push_back({{"index", s.index},
+                                             {"instruction_id", s.instruction_id},
+                                             {"label", s.label},
+                                             {"condition", s.condition},
+                                             {"retry_count", s.retry_count},
+                                             {"foreach", s.foreach_source},
+                                             {"on_failure", s.on_failure}});
+                    }
+                    arr.push_back({{"id", w.id},
+                                   {"name", w.name},
+                                   {"description", w.description},
+                                   {"steps", steps_arr},
+                                   {"step_count", w.steps.size()},
+                                   {"created_at", w.created_at},
+                                   {"updated_at", w.updated_at}});
+                }
+                res.set_content(
+                    nlohmann::json({{"workflows", arr}, {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // POST /api/workflows — create workflow from YAML
+        web_server_->Post("/api/workflows",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Write"))
+                    return;
+                if (!workflow_engine_ || !workflow_engine_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    return;
+                }
+
+                std::string yaml_source;
+                if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
+                    try {
+                        auto j = nlohmann::json::parse(req.body);
+                        yaml_source = j.value("yaml_source", "");
+                    } catch (const std::exception& e) {
+                        res.status = 400;
+                        res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                        return;
+                    }
+                } else {
+                    yaml_source = req.body;
+                }
+
+                auto result = workflow_engine_->create_workflow(yaml_source);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "workflow.create", "success", "workflow", *result);
+                emit_event("workflow.created", req, {}, {{"workflow_id", *result}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Workflow created","level":"success"}})");
+                res.status = 201;
+                res.set_content(nlohmann::json({{"id", *result}, {"status", "created"}}).dump(),
+                                "application/json");
+            });
+
+        // GET /api/workflows/:id — get workflow detail
+        web_server_->Get(R"(/api/workflows/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                auto workflow = workflow_engine_->get_workflow(id);
+                if (!workflow) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"workflow not found"})", "application/json");
+                    return;
+                }
+
+                nlohmann::json steps_arr = nlohmann::json::array();
+                for (const auto& s : workflow->steps) {
+                    steps_arr.push_back({{"index", s.index},
+                                         {"instruction_id", s.instruction_id},
+                                         {"label", s.label},
+                                         {"condition", s.condition},
+                                         {"retry_count", s.retry_count},
+                                         {"retry_delay_seconds", s.retry_delay_seconds},
+                                         {"foreach", s.foreach_source},
+                                         {"on_failure", s.on_failure}});
+                }
+
+                res.set_content(
+                    nlohmann::json({{"id", workflow->id},
+                                    {"name", workflow->name},
+                                    {"description", workflow->description},
+                                    {"yaml_source", workflow->yaml_source},
+                                    {"steps", steps_arr},
+                                    {"created_at", workflow->created_at},
+                                    {"updated_at", workflow->updated_at}})
+                        .dump(),
+                    "application/json");
+            });
+
+        // DELETE /api/workflows/:id — delete workflow
+        web_server_->Delete(R"(/api/workflows/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Delete"))
+                    return;
+                if (!workflow_engine_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                bool deleted = workflow_engine_->delete_workflow(id);
+                if (deleted) {
+                    audit_log(req, "workflow.delete", "success", "workflow", id);
+                    emit_event("workflow.deleted", req, {}, {{"workflow_id", id}});
+                    res.set_header("HX-Trigger",
+                        R"({"showToast":{"message":"Workflow deleted","level":"success"}})");
+                }
+                res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            });
+
+        // POST /api/workflows/:id/execute — execute workflow against agents
+        web_server_->Post(R"(/api/workflows/([^/]+)/execute)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Execute"))
+                    return;
+                if (!workflow_engine_ || !workflow_engine_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    return;
+                }
+
+                auto workflow_id = req.matches[1].str();
+
+                // Parse agent_ids from request body
+                std::vector<std::string> agent_ids;
+                try {
+                    auto j = nlohmann::json::parse(req.body);
+                    if (j.contains("agent_ids") && j["agent_ids"].is_array()) {
+                        for (const auto& aid : j["agent_ids"])
+                            agent_ids.push_back(aid.get<std::string>());
+                    }
+                } catch (const std::exception& e) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                    return;
+                }
+
+                if (agent_ids.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"agent_ids array is required"})", "application/json");
+                    return;
+                }
+
+                // Create a dispatch function that uses the existing command dispatch
+                auto dispatch_fn = [](const std::string& instruction_id,
+                                      const std::string& agent_ids_json,
+                                      const std::string& parameters_json)
+                    -> std::expected<std::string, std::string> {
+                    // In a production system this would dispatch via the gRPC
+                    // CommandRequest mechanism. For now, return a placeholder
+                    // result that the execution can track.
+                    return nlohmann::json({{"status", "dispatched"},
+                                           {"instruction_id", instruction_id},
+                                           {"agents", nlohmann::json::parse(agent_ids_json, nullptr, false)},
+                                           {"parameters", nlohmann::json::parse(parameters_json, nullptr, false)}})
+                        .dump();
+                };
+
+                // Condition evaluator using compliance_eval
+                auto condition_fn = [](const std::string& expression,
+                                       const std::map<std::string, std::string>& fields) -> bool {
+                    return evaluate_compliance(expression, fields);
+                };
+
+                auto result = workflow_engine_->execute(
+                    workflow_id, agent_ids, dispatch_fn, condition_fn);
+
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "workflow.execute", "success", "workflow", workflow_id,
+                          "execution_id=" + *result);
+                emit_event("workflow.executed", req, {},
+                           {{"workflow_id", workflow_id}, {"execution_id", *result}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Workflow execution started","level":"success"}})");
+                res.status = 202;
+                res.set_content(
+                    nlohmann::json({{"execution_id", *result}, {"status", "running"}}).dump(),
+                    "application/json");
+            });
+
+        // GET /api/workflow-executions/:id — get execution status
+        web_server_->Get(R"(/api/workflow-executions/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                auto exec = workflow_engine_->get_execution(id);
+                if (!exec) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"execution not found"})", "application/json");
+                    return;
+                }
+
+                nlohmann::json steps_arr = nlohmann::json::array();
+                for (const auto& sr : exec->step_results) {
+                    steps_arr.push_back({{"step_index", sr.step_index},
+                                         {"instruction_id", sr.instruction_id},
+                                         {"status", sr.status},
+                                         {"result", nlohmann::json::parse(sr.result_json, nullptr, false)},
+                                         {"started_at", sr.started_at},
+                                         {"completed_at", sr.completed_at},
+                                         {"attempt", sr.attempt}});
+                }
+
+                res.set_content(
+                    nlohmann::json({{"id", exec->id},
+                                    {"workflow_id", exec->workflow_id},
+                                    {"status", exec->status},
+                                    {"agent_ids", nlohmann::json::parse(exec->agent_ids_json, nullptr, false)},
+                                    {"current_step", exec->current_step},
+                                    {"started_at", exec->started_at},
+                                    {"completed_at", exec->completed_at},
+                                    {"steps", steps_arr}})
+                        .dump(),
+                    "application/json");
+            });
+
+        // -- Product Pack API (Phase 7) -------------------------------------------
+
+        // GET /api/product-packs — list installed product packs
+        web_server_->Get("/api/product-packs",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store_ || !product_pack_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"product pack store not available"})", "application/json");
+                    return;
+                }
+
+                ProductPackQuery q;
+                if (req.has_param("name"))
+                    q.name_filter = req.get_param_value("name");
+                try {
+                    if (req.has_param("limit"))
+                        q.limit = std::stoi(req.get_param_value("limit"));
+                } catch (const std::exception&) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    return;
+                }
+
+                auto packs = product_pack_store_->list(q);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& p : packs) {
+                    nlohmann::json items_arr = nlohmann::json::array();
+                    for (const auto& item : p.items) {
+                        items_arr.push_back({{"kind", item.kind},
+                                             {"item_id", item.item_id},
+                                             {"name", item.name}});
+                    }
+                    arr.push_back({{"id", p.id},
+                                   {"name", p.name},
+                                   {"version", p.version},
+                                   {"description", p.description},
+                                   {"item_count", p.items.size()},
+                                   {"items", items_arr},
+                                   {"installed_at", p.installed_at}});
+                }
+                res.set_content(
+                    nlohmann::json({{"product_packs", arr}, {"count", arr.size()}}).dump(),
+                    "application/json");
+            });
+
+        // POST /api/product-packs — install product pack from YAML bundle
+        web_server_->Post("/api/product-packs",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "ProductPack", "Write"))
+                    return;
+                if (!product_pack_store_ || !product_pack_store_->is_open()) {
+                    res.status = 503;
+                    res.set_content(R"({"error":"product pack store not available"})", "application/json");
+                    return;
+                }
+
+                std::string yaml_bundle;
+                if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
+                    try {
+                        auto j = nlohmann::json::parse(req.body);
+                        yaml_bundle = j.value("yaml_source", "");
+                    } catch (const std::exception& e) {
+                        res.status = 400;
+                        res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                        return;
+                    }
+                } else {
+                    yaml_bundle = req.body;
+                }
+
+                // Install callback: delegate each document to the appropriate store
+                auto install_fn = [this](const std::string& kind,
+                                         const std::string& yaml_source)
+                    -> std::expected<std::string, std::string> {
+                    if (kind == "InstructionDefinition") {
+                        if (!instruction_store_ || !instruction_store_->is_open())
+                            return std::unexpected("instruction store not available");
+                        // Parse YAML into InstructionDefinition and create
+                        InstructionDefinition def;
+                        def.name = ProductPackStore::extract_yaml_value(yaml_source, "displayName");
+                        if (def.name.empty())
+                            def.name = ProductPackStore::extract_yaml_value(yaml_source, "name");
+                        def.version = ProductPackStore::extract_yaml_value(yaml_source, "version");
+                        if (def.version.empty()) def.version = "1.0.0";
+                        def.type = ProductPackStore::extract_yaml_value(yaml_source, "type");
+                        if (def.type.empty()) def.type = "question";
+                        def.plugin = ProductPackStore::extract_yaml_value(yaml_source, "plugin");
+                        def.action = ProductPackStore::extract_yaml_value(yaml_source, "action");
+                        def.description = ProductPackStore::extract_yaml_value(yaml_source, "description");
+                        def.yaml_source = yaml_source;
+                        def.platforms = ProductPackStore::extract_yaml_value(yaml_source, "platforms");
+                        def.approval_mode = ProductPackStore::extract_yaml_value(yaml_source, "mode");
+                        if (def.approval_mode.empty()) def.approval_mode = "auto";
+                        return instruction_store_->create_definition(def);
+                    } else if (kind == "PolicyFragment") {
+                        if (!policy_store_ || !policy_store_->is_open())
+                            return std::unexpected("policy store not available");
+                        return policy_store_->create_fragment(yaml_source);
+                    } else if (kind == "Policy") {
+                        if (!policy_store_ || !policy_store_->is_open())
+                            return std::unexpected("policy store not available");
+                        return policy_store_->create_policy(yaml_source);
+                    } else if (kind == "Workflow") {
+                        if (!workflow_engine_ || !workflow_engine_->is_open())
+                            return std::unexpected("workflow engine not available");
+                        return workflow_engine_->create_workflow(yaml_source);
+                    } else {
+                        return std::unexpected("unsupported kind: " + kind);
+                    }
+                };
+
+                auto result = product_pack_store_->install(yaml_bundle, install_fn);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "product_pack.install", "success", "product_pack", *result);
+                emit_event("product_pack.installed", req, {}, {{"pack_id", *result}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Product pack installed","level":"success"}})");
+                res.status = 201;
+                res.set_content(nlohmann::json({{"id", *result}, {"status", "installed"}}).dump(),
+                                "application/json");
+            });
+
+        // GET /api/product-packs/:id — get product pack detail
+        web_server_->Get(R"(/api/product-packs/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "ProductPack", "Read"))
+                    return;
+                if (!product_pack_store_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+                auto pack = product_pack_store_->get(id);
+                if (!pack) {
+                    res.status = 404;
+                    res.set_content(R"({"error":"product pack not found"})", "application/json");
+                    return;
+                }
+
+                nlohmann::json items_arr = nlohmann::json::array();
+                for (const auto& item : pack->items) {
+                    items_arr.push_back({{"kind", item.kind},
+                                         {"item_id", item.item_id},
+                                         {"name", item.name},
+                                         {"yaml_source", item.yaml_source}});
+                }
+
+                res.set_content(
+                    nlohmann::json({{"id", pack->id},
+                                    {"name", pack->name},
+                                    {"version", pack->version},
+                                    {"description", pack->description},
+                                    {"yaml_source", pack->yaml_source},
+                                    {"items", items_arr},
+                                    {"installed_at", pack->installed_at}})
+                        .dump(),
+                    "application/json");
+            });
+
+        // DELETE /api/product-packs/:id — uninstall product pack
+        web_server_->Delete(R"(/api/product-packs/([^/]+))",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_permission(req, res, "ProductPack", "Delete"))
+                    return;
+                if (!product_pack_store_) {
+                    res.status = 503;
+                    return;
+                }
+
+                auto id = req.matches[1].str();
+
+                // Uninstall callback: delegate to the appropriate store
+                auto uninstall_fn = [this](const std::string& kind,
+                                           const std::string& item_id) -> bool {
+                    if (kind == "InstructionDefinition") {
+                        return instruction_store_ && instruction_store_->delete_definition(item_id);
+                    } else if (kind == "PolicyFragment") {
+                        return policy_store_ && policy_store_->delete_fragment(item_id);
+                    } else if (kind == "Policy") {
+                        return policy_store_ && policy_store_->delete_policy(item_id);
+                    } else if (kind == "Workflow") {
+                        return workflow_engine_ && workflow_engine_->delete_workflow(item_id);
+                    }
+                    return false;
+                };
+
+                auto result = product_pack_store_->uninstall(id, uninstall_fn);
+                if (!result) {
+                    res.status = 400;
+                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                    return;
+                }
+                audit_log(req, "product_pack.uninstall", "success", "product_pack", id);
+                emit_event("product_pack.uninstalled", req, {}, {{"pack_id", id}});
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"Product pack uninstalled","level":"success"}})");
+                res.set_content(R"({"status":"uninstalled"})", "application/json");
+            });
+
+        // -- Notification REST endpoints ----------------------------------------
+
+        // GET /api/notifications — list unread notifications
+        web_server_->Get("/api/notifications",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             if (!notification_store_ || !notification_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"notification store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+                             bool all = req.get_param_value("all") == "true";
+                             int limit = 50;
+                             int offset = 0;
+                             auto limit_str = req.get_param_value("limit");
+                             auto offset_str = req.get_param_value("offset");
+                             if (!limit_str.empty()) {
+                                 try { limit = std::stoi(limit_str); } catch (...) {}
+                             }
+                             if (!offset_str.empty()) {
+                                 try { offset = std::stoi(offset_str); } catch (...) {}
+                             }
+
+                             auto notifications =
+                                 all ? notification_store_->list_all(limit, offset)
+                                     : notification_store_->list_unread(limit);
+                             auto count = notification_store_->count_unread();
+
+                             nlohmann::json arr = nlohmann::json::array();
+                             for (const auto& n : notifications) {
+                                 arr.push_back({{"id", n.id},
+                                                {"timestamp", n.timestamp},
+                                                {"level", n.level},
+                                                {"title", n.title},
+                                                {"message", n.message},
+                                                {"read", n.read},
+                                                {"dismissed", n.dismissed}});
+                             }
+                             nlohmann::json result = {{"notifications", arr},
+                                                      {"unread_count", count}};
+                             res.set_content(result.dump(), "application/json");
+                         });
+
+        // POST /api/notifications/:id/read — mark notification as read
+        web_server_->Post(R"(/api/notifications/(\d+)/read)",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Infrastructure", "Write"))
+                                  return;
+                              if (!notification_store_) {
+                                  res.status = 503;
+                                  return;
+                              }
+                              auto id = std::stoll(req.matches[1].str());
+                              notification_store_->mark_read(id);
+                              res.set_content(R"({"status":"ok"})", "application/json");
+                          });
+
+        // POST /api/notifications/:id/dismiss — dismiss notification
+        web_server_->Post(R"(/api/notifications/(\d+)/dismiss)",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Infrastructure", "Write"))
+                                  return;
+                              if (!notification_store_) {
+                                  res.status = 503;
+                                  return;
+                              }
+                              auto id = std::stoll(req.matches[1].str());
+                              notification_store_->dismiss(id);
+                              audit_log(req, "notification.dismiss", "success", "notification",
+                                        std::to_string(id));
+                              res.set_content(R"({"status":"ok"})", "application/json");
+                          });
+
+        // -- Webhook REST endpoints ---------------------------------------------
+
+        // GET /api/webhooks — list all webhooks
+        web_server_->Get("/api/webhooks",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             if (!webhook_store_ || !webhook_store_->is_open()) {
+                                 res.status = 503;
+                                 res.set_content(R"({"error":"webhook store unavailable"})",
+                                                 "application/json");
+                                 return;
+                             }
+                             auto webhooks = webhook_store_->list();
+                             nlohmann::json arr = nlohmann::json::array();
+                             for (const auto& w : webhooks) {
+                                 arr.push_back({{"id", w.id},
+                                                {"url", w.url},
+                                                {"event_types", w.event_types},
+                                                {"enabled", w.enabled},
+                                                {"created_at", w.created_at}});
+                                 // Intentionally omit secret from list response
+                             }
+                             res.set_content(nlohmann::json({{"webhooks", arr}}).dump(),
+                                             "application/json");
+                         });
+
+        // POST /api/webhooks — create a new webhook
+        web_server_->Post("/api/webhooks",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_permission(req, res, "Infrastructure", "Write"))
+                                  return;
+                              if (!webhook_store_ || !webhook_store_->is_open()) {
+                                  res.status = 503;
+                                  res.set_content(R"({"error":"webhook store unavailable"})",
+                                                  "application/json");
+                                  return;
+                              }
+                              nlohmann::json body;
+                              try {
+                                  body = nlohmann::json::parse(req.body);
+                              } catch (...) {
+                                  res.status = 400;
+                                  res.set_content(R"({"error":"invalid JSON"})", "application/json");
+                                  return;
+                              }
+                              auto url = body.value("url", "");
+                              if (url.empty()) {
+                                  res.status = 400;
+                                  res.set_content(R"({"error":"url is required"})",
+                                                  "application/json");
+                                  return;
+                              }
+                              auto event_types = body.value("event_types", "*");
+                              auto secret = body.value("secret", "");
+                              auto enabled = body.value("enabled", true);
+
+                              auto id = webhook_store_->create_webhook(url, event_types, secret,
+                                                                       enabled);
+                              audit_log(req, "webhook.create", "success", "webhook",
+                                        std::to_string(id));
+                              emit_event("webhook.created", req, {},
+                                         {{"webhook_id", id}, {"url", url}});
+                              res.set_content(
+                                  nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
+                                  "application/json");
+                          });
+
+        // DELETE /api/webhooks/:id — delete a webhook
+        web_server_->Delete(R"(/api/webhooks/(\d+))",
+                            [this](const httplib::Request& req, httplib::Response& res) {
+                                if (!require_permission(req, res, "Infrastructure", "Write"))
+                                    return;
+                                if (!webhook_store_) {
+                                    res.status = 503;
+                                    return;
+                                }
+                                auto id = std::stoll(req.matches[1].str());
+                                if (webhook_store_->delete_webhook(id)) {
+                                    audit_log(req, "webhook.delete", "success", "webhook",
+                                              std::to_string(id));
+                                    res.set_content(R"({"status":"deleted"})", "application/json");
+                                } else {
+                                    res.status = 404;
+                                    res.set_content(R"({"error":"webhook not found"})",
+                                                    "application/json");
+                                }
+                            });
+
+        // GET /api/webhooks/:id/deliveries — get delivery history
+        web_server_->Get(R"(/api/webhooks/(\d+)/deliveries)",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_permission(req, res, "Infrastructure", "Read"))
+                                 return;
+                             if (!webhook_store_) {
+                                 res.status = 503;
+                                 return;
+                             }
+                             auto webhook_id = std::stoll(req.matches[1].str());
+                             int limit = 50;
+                             auto limit_str = req.get_param_value("limit");
+                             if (!limit_str.empty()) {
+                                 try { limit = std::stoi(limit_str); } catch (...) {}
+                             }
+                             auto deliveries = webhook_store_->get_deliveries(webhook_id, limit);
+                             nlohmann::json arr = nlohmann::json::array();
+                             for (const auto& d : deliveries) {
+                                 arr.push_back({{"id", d.id},
+                                                {"webhook_id", d.webhook_id},
+                                                {"event_type", d.event_type},
+                                                {"payload", d.payload},
+                                                {"status_code", d.status_code},
+                                                {"delivered_at", d.delivered_at},
+                                                {"error", d.error}});
+                             }
+                             res.set_content(nlohmann::json({{"deliveries", arr}}).dump(),
+                                             "application/json");
+                         });
+
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
         rest_api_v1_ = std::make_unique<RestApiV1>();
@@ -7870,10 +8622,16 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
 
-    // Phase 7: Runtime config, custom properties, health monitoring
+    // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
+    std::unique_ptr<WorkflowEngine> workflow_engine_;
+    std::unique_ptr<ProductPackStore> product_pack_store_;
     std::chrono::steady_clock::time_point server_start_time_{std::chrono::steady_clock::now()};
+
+    // Notification & Webhook stores
+    std::unique_ptr<NotificationStore> notification_store_;
+    std::unique_ptr<WebhookStore> webhook_store_;
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;

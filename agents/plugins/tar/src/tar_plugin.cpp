@@ -205,6 +205,8 @@ public:
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        plugin_ctx_ = ctx.raw();
+
         // Determine data directory
         auto data_dir = ctx.get_config("agent.data_dir");
         std::string db_dir;
@@ -276,6 +278,7 @@ public:
     }
 
 private:
+    YuzuPluginContext* plugin_ctx_{nullptr};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_;     // Protects the state read-diff-write sequence in collect methods
     int64_t last_purge_time_{0};
@@ -584,7 +587,7 @@ private:
 
         // Re-register triggers with new intervals if changed
         if (fast_secs > 0 || slow_secs > 0) {
-            yuzu::PluginContext pctx{g_ctx_};
+            yuzu::PluginContext pctx{plugin_ctx_};
             if (fast_secs > 0) {
                 pctx.unregister_trigger("tar.fast");
                 auto cfg = std::format(R"({{"interval_seconds":{},"plugin":"tar","action":"collect_fast"}})", fast_secs);
