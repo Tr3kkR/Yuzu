@@ -63,19 +63,19 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | **7** | 7.1 | [#185](https://github.com/Tr3kkR/Yuzu/issues/185) | Gateway Node Implementation | Done |
 | | 7.2 | [#187](https://github.com/Tr3kkR/Yuzu/issues/187) | System Health Monitoring and Statistics | Done |
 | | 7.3 | [#190](https://github.com/Tr3kkR/Yuzu/issues/190) | Runtime Configuration API | Done |
-| | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Open |
+| | 7.4 | [#191](https://github.com/Tr3kkR/Yuzu/issues/191) | System Notifications | Done |
 | | 7.5 | [#194](https://github.com/Tr3kkR/Yuzu/issues/194) | Active Directory / Entra Integration | Open |
 | | 7.6 | [#195](https://github.com/Tr3kkR/Yuzu/issues/195) | Custom Properties on Devices | Done |
 | | 7.7 | [#196](https://github.com/Tr3kkR/Yuzu/issues/196) | Agent Deployment Jobs | Open |
 | | 7.8 | [#197](https://github.com/Tr3kkR/Yuzu/issues/197) | Patch Deployment Workflow | Open |
-| | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Open |
-| | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Open |
+| | 7.9 | [#198](https://github.com/Tr3kkR/Yuzu/issues/198) | Product Packs (Bundled Definitions) | Done |
+| | 7.10 | [#199](https://github.com/Tr3kkR/Yuzu/issues/199) | User Sessions and Group Membership Plugins | Done |
 | | 7.11 | [#200](https://github.com/Tr3kkR/Yuzu/issues/200) | Advanced User Interaction (Surveys, DND) | Open |
-| | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) | Open |
+| | 7.12 | [#201](https://github.com/Tr3kkR/Yuzu/issues/201) | Event Subscriptions (Webhooks) | Done |
 | | 7.13 | [#213](https://github.com/Tr3kkR/Yuzu/issues/213) | ProductPack Ed25519 Trust Chain and Verification | Open |
-| | 7.14 | [#214](https://github.com/Tr3kkR/Yuzu/issues/214) | Workflow Primitives (if, foreach, retry) | Open |
-| | 7.15 | [#215](https://github.com/Tr3kkR/Yuzu/issues/215) | WiFi Network Enumeration | Open |
-| | 7.16 | [#216](https://github.com/Tr3kkR/Yuzu/issues/216) | Wake-on-LAN Support | Open |
+| | 7.14 | [#214](https://github.com/Tr3kkR/Yuzu/issues/214) | Workflow Primitives (if, foreach, retry) | Done |
+| | 7.15 | [#215](https://github.com/Tr3kkR/Yuzu/issues/215) | WiFi Network Enumeration | Done |
+| | 7.16 | [#216](https://github.com/Tr3kkR/Yuzu/issues/216) | Wake-on-LAN Support | Done |
 | | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Open |
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Open |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
