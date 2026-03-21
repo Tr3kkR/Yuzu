@@ -129,6 +129,7 @@ if build_agent
     subdir('agents/plugins/content_dist')
     subdir('agents/plugins/registry')
     subdir('agents/plugins/wmi')
+    subdir('agents/plugins/tar')
   endif
 endif
 

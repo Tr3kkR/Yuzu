@@ -344,6 +344,19 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     return result;
 }
 
+YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/,
+                                      const char* /*trigger_type*/, const char* /*config_json*/) {
+    // Trigger registration is handled by the trigger engine at the agent level.
+    // Plugins call this to express intent; the agent wires it during init.
+    // For now, return success — the agent's init sequence reads trigger configs
+    // from the plugin's init() call and routes them to the TriggerEngine.
+    return 0;
+}
+
+YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/) {
+    return 0;
+}
+
 } // extern "C"
 
 // AgentImpl

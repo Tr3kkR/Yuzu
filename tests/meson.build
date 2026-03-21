@@ -24,6 +24,24 @@ agent_test_exe = executable(
 )
 test('agent unit tests', agent_test_exe)
 
+# ── TAR plugin unit tests ────────────────────────────────────────────────────
+tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
+
+tar_test_exe = executable(
+  'yuzu_tar_tests',
+  files(
+    'unit/test_tar_diff.cpp',
+    'unit/test_tar_store.cpp',
+    '../agents/plugins/tar/src/tar_db.cpp',
+    '../agents/plugins/tar/src/tar_diff.cpp',
+  ),
+  include_directories: [
+    include_directories('../agents/plugins/tar/src'),
+  ],
+  dependencies: tar_test_deps,
+)
+test('tar unit tests', tar_test_exe)
+
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
   server_test_exe = executable(

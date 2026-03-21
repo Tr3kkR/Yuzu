@@ -1,0 +1,462 @@
+## Timeline Activity Record (TAR) Definitions
+## Continuous system state change tracking -- processes, network, services, users.
+## Plugin: tar | Actions: status, query, snapshot, export, configure, collect_fast, collect_slow
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.status
+  displayName: TAR Status
+  version: 1.0.0
+  description: >
+    Returns the current status of the TAR database including record count,
+    oldest and newest event timestamps, database size on disk, and the
+    configured retention period. Use this to verify TAR is collecting data
+    and to monitor disk usage.
+  tags: [tar, timeline, monitoring, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: record_count
+        type: int64
+      - name: oldest_timestamp
+        type: int64
+      - name: newest_timestamp
+        type: int64
+      - name: db_size_bytes
+        type: int64
+      - name: retention_days
+        type: int32
+
+  readablePayload: "Get TAR database status"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.query
+  displayName: Query TAR Events
+  version: 1.0.0
+  description: >
+    Queries the TAR event database for system activity records within a
+    time range. Events include process starts/stops, network connections
+    opened/closed, service state changes, and user logins/logouts. Results
+    are pipe-delimited: timestamp|event_type|event_action|snapshot_id|detail_json.
+    The detail_json field contains a JSON object with type-specific fields:
+
+    Process events: {"pid":N, "ppid":N, "name":"...", "cmdline":"...", "user":"..."}
+    Network events: {"proto":"tcp", "local_addr":"...", "local_port":N, "remote_addr":"...", "remote_port":N, "state":"...", "pid":N}
+    Service events: {"name":"...", "display_name":"...", "status":"...", "startup_type":"..."}
+    User events: {"user":"...", "domain":"...", "logon_type":"...", "session_id":"..."}
+  tags: [tar, timeline, query, forensics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: query
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      from:
+        type: string
+        displayName: Start Time
+        description: >
+          Start of the query time range as Unix epoch seconds.
+          Defaults to 0 (beginning of time).
+      to:
+        type: string
+        displayName: End Time
+        description: >
+          End of the query time range as Unix epoch seconds.
+          Defaults to the current time.
+      type:
+        type: string
+        displayName: Event Type Filter
+        description: >
+          Filter results by event type. Valid values: process, network,
+          service, user. Leave empty to return all types.
+        validation:
+          enum: [process, network, service, user, ""]
+      limit:
+        type: string
+        displayName: Result Limit
+        description: >
+          Maximum number of events to return. Default 1000, max 10000.
+        validation:
+          pattern: "^[0-9]+$"
+
+  result:
+    columns:
+      - name: timestamp
+        type: int64
+      - name: event_type
+        type: string
+      - name: event_action
+        type: string
+      - name: snapshot_id
+        type: int64
+      - name: detail_json
+        type: clob
+
+  readablePayload: "Query TAR events from ${from} to ${to} type=${type}"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.snapshot
+  displayName: TAR Force Snapshot
+  version: 1.0.0
+  description: >
+    Forces an immediate full snapshot of all four TAR collectors (processes,
+    network connections, services, user sessions). Computes diffs against
+    the previous state and records any detected changes. Useful before
+    maintenance windows or incident investigations.
+  tags: [tar, timeline, snapshot, forensics]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: snapshot
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: events_recorded
+        type: int32
+
+  readablePayload: "Force immediate TAR snapshot"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.export
+  displayName: Export TAR Events as JSON
+  version: 1.0.0
+  description: >
+    Exports TAR events as a JSON array for integration with external
+    analytics tools (Splunk, ClickHouse, ELK). Each event object includes
+    id, timestamp, event_type, event_action, snapshot_id, and a nested
+    detail object with type-specific fields.
+  tags: [tar, timeline, export, analytics, integration]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: export
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      from:
+        type: string
+        displayName: Start Time
+        description: Start of export range as Unix epoch seconds.
+      to:
+        type: string
+        displayName: End Time
+        description: End of export range as Unix epoch seconds.
+      type:
+        type: string
+        displayName: Event Type Filter
+        description: Filter by event type (process, network, service, user).
+      limit:
+        type: string
+        displayName: Result Limit
+        description: Maximum events to export. Default 1000, max 10000.
+
+  result:
+    columns:
+      - name: json_output
+        type: clob
+
+  readablePayload: "Export TAR events as JSON"
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.configure
+  displayName: Configure TAR
+  version: 1.0.0
+  description: >
+    Updates TAR plugin configuration. Changes take effect on the next
+    collection cycle. Configurable settings include data retention period,
+    collection intervals, and command-line redaction patterns for sensitive
+    data protection.
+  tags: [tar, timeline, configuration, security]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: configure
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      retention_days:
+        type: string
+        displayName: Retention Days
+        description: >
+          Number of days to retain TAR events before automatic purging.
+          Valid range: 1-365. Default: 7.
+        validation:
+          pattern: "^[0-9]+$"
+      fast_interval:
+        type: string
+        displayName: Fast Collection Interval (seconds)
+        description: >
+          Interval in seconds for process and network collection.
+          Valid range: 10-3600. Default: 60.
+        validation:
+          pattern: "^[0-9]+$"
+      slow_interval:
+        type: string
+        displayName: Slow Collection Interval (seconds)
+        description: >
+          Interval in seconds for service and user session collection.
+          Valid range: 30-7200. Default: 300.
+        validation:
+          pattern: "^[0-9]+$"
+      redaction_patterns:
+        type: string
+        displayName: Redaction Patterns
+        description: >
+          JSON array of glob patterns for command-line redaction. Any
+          process command line matching a pattern has its cmdline replaced
+          with "[REDACTED by TAR]". Default patterns: ["*password*",
+          "*secret*", "*token*", "*api_key*", "*credential*"].
+
+  result:
+    columns:
+      - name: key
+        type: string
+      - name: value
+        type: string
+
+  readablePayload: "Configure TAR settings"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.collect_fast
+  displayName: TAR Fast Collection
+  version: 1.0.0
+  description: >
+    Internal trigger-driven action that collects process and network
+    connection snapshots, computes diffs against previous state, and
+    records change events. Runs automatically every 60 seconds by default.
+    Not typically invoked manually.
+  tags: [tar, timeline, internal, processes, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: collect_fast
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: events_recorded
+        type: int32
+
+  readablePayload: "Run TAR fast collection (processes + network)"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.collect_slow
+  displayName: TAR Slow Collection
+  version: 1.0.0
+  description: >
+    Internal trigger-driven action that collects service and user session
+    snapshots, computes diffs against previous state, and records change
+    events. Also checks if purge is due and removes expired records.
+    Runs automatically every 300 seconds by default. Not typically invoked
+    manually.
+  tags: [tar, timeline, internal, services, users]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: collect_slow
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: events_recorded
+        type: int32
+
+  readablePayload: "Run TAR slow collection (services + users)"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active

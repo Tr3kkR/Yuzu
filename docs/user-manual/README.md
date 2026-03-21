@@ -25,6 +25,7 @@ All `curl` examples assume a running Yuzu server at `http://localhost:8080` and 
 | [Server Administration](server-administration.md) | Configuration, TLS, user management, first-run setup, and backup |
 | [REST API Reference](rest-api-reference.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
+| [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 
 ---
 
