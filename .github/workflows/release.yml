@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write  # Required for cosign keyless signing
 
 env:
   MESON_VERSION: "1.9.2"
@@ -484,6 +485,17 @@ jobs:
           sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign SHA256SUMS (keyless)
+        run: |
+          cd artifacts
+          cosign sign-blob --yes \
+            --oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS --bundle SHA256SUMS.bundle
+          echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+
       - name: Determine if prerelease
         id: prerelease
         run: |
@@ -556,6 +568,15 @@ jobs:
           sha256sum -c SHA256SUMS
           \`\`\`
 
+          ### Verify signature (cosign)
+
+          \`\`\`bash
+          cosign verify-blob --bundle SHA256SUMS.bundle \\
+            --certificate-identity-regexp '.*' \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            SHA256SUMS
+          \`\`\`
+
           ### Quick start
 
           \`\`\`bash
@@ -587,4 +608,5 @@ jobs:
             artifacts/yuzu-linux-arm64.tar.gz \
             artifacts/yuzu-windows-x64.zip \
             artifacts/yuzu-macos-arm64.tar.gz \
-            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS \
+            artifacts/SHA256SUMS.bundle

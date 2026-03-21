@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+COMPONENT="${DPKG_MAINTSCRIPT_PACKAGE:-yuzu-server}"
+
+case "$1" in
+    remove|purge)
+        if [[ "$COMPONENT" == "yuzu-server" ]]; then
+            SVC_NAME="yuzu-server"
+        else
+            SVC_NAME="yuzu-agent"
+        fi
+
+        if [ -d /run/systemd/system ]; then
+            systemctl stop "${SVC_NAME}.service" || true
+            systemctl disable "${SVC_NAME}.service" || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -126,7 +126,72 @@ int main(int argc, char* argv[]) {
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
 
+    // Windows service management
+    bool install_service = false;
+    bool remove_service = false;
+    app.add_flag("--install-service", install_service, "Install as Windows service and exit");
+    app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
+
     CLI11_PARSE(app, argc, argv);
+
+#ifdef _WIN32
+    if (install_service || remove_service) {
+        SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+        if (!scm) {
+            std::cerr << "Failed to open SCM (run as administrator)\n";
+            return EXIT_FAILURE;
+        }
+        if (install_service) {
+            wchar_t exe_path[MAX_PATH];
+            GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+            SC_HANDLE svc = CreateServiceW(scm, L"YuzuAgent", L"Yuzu Agent",
+                                           SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                                           SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                                           exe_path, nullptr, nullptr, nullptr, nullptr, nullptr);
+            if (svc) {
+                SERVICE_DESCRIPTIONW desc;
+                desc.lpDescription =
+                    const_cast<wchar_t*>(L"Yuzu endpoint management agent");
+                ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+                SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
+                ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
+                SC_ACTION actions[3] = {
+                    {SC_ACTION_RESTART, 60000},
+                    {SC_ACTION_RESTART, 60000},
+                    {SC_ACTION_RESTART, 60000}};
+                SERVICE_FAILURE_ACTIONSW failure = {};
+                failure.dwResetPeriod = 86400;
+                failure.cActions = 3;
+                failure.lpsaActions = actions;
+                ChangeServiceConfig2W(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &failure);
+                CloseServiceHandle(svc);
+                std::cout << "Service 'YuzuAgent' installed successfully\n";
+            } else {
+                auto err = GetLastError();
+                std::cerr << (err == ERROR_SERVICE_EXISTS ? "Service already exists\n"
+                                                          : "Failed to create service\n");
+                CloseServiceHandle(scm);
+                return EXIT_FAILURE;
+            }
+        }
+        if (remove_service) {
+            SC_HANDLE svc = OpenServiceW(scm, L"YuzuAgent", DELETE | SERVICE_STOP);
+            if (svc) {
+                SERVICE_STATUS status;
+                ControlService(svc, SERVICE_CONTROL_STOP, &status);
+                DeleteService(svc) ? std::cout << "Service removed\n"
+                                   : std::cerr << "Failed to delete service\n";
+                CloseServiceHandle(svc);
+            } else {
+                std::cerr << "Service not found\n";
+                CloseServiceHandle(scm);
+                return EXIT_FAILURE;
+            }
+        }
+        CloseServiceHandle(scm);
+        return EXIT_SUCCESS;
+    }
+#endif
 
     cfg.update_check_interval = std::chrono::seconds(update_interval_sec);
 

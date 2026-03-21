@@ -1,0 +1,23 @@
+Source: yuzu
+Section: admin
+Priority: optional
+Maintainer: Yuzu Team <noreply@yuzu.io>
+Build-Depends: debhelper (>= 13), meson (>= 1.0), g++ (>= 13), cmake
+Standards-Version: 4.6.2
+Homepage: https://github.com/Tr3kkR/Yuzu
+
+Package: yuzu-server
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: Yuzu endpoint management server
+ Enterprise endpoint management platform — server component.
+ Provides the web dashboard, REST API, gRPC agent service,
+ instruction engine, policy engine, and all server-side stores.
+
+Package: yuzu-agent
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: Yuzu endpoint management agent
+ Enterprise endpoint management platform — agent component.
+ Runs on managed endpoints with plugin architecture for
+ system queries, actions, and compliance monitoring.

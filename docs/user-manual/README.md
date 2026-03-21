@@ -27,6 +27,16 @@ All `curl` examples assume a running Yuzu server at `http://localhost:8080` and 
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
+| [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, and production hardening |
+
+### Operations Guides
+
+| Section | Description |
+|---|---|
+| [Troubleshooting](../operations/troubleshooting.md) | Common issues, log diagnosis, and resolution steps |
+| [Disaster Recovery](../operations/disaster-recovery.md) | Backup strategy, restore procedures, and failover architecture |
+| [Certificate Renewal](../operations/certificate-renewal.md) | TLS certificate lifecycle, rotation, and automated renewal |
+| [Capacity Planning](../operations/capacity-planning.md) | Server sizing, storage growth, network bandwidth, and scaling patterns |
 
 ---
 

@@ -1,0 +1,43 @@
+#!/bin/bash
+set -e
+
+# Shared postinst for yuzu-server and yuzu-agent packages.
+# Called with package name via dpkg trigger or directly.
+
+COMPONENT="${DPKG_MAINTSCRIPT_PACKAGE:-yuzu-server}"
+
+case "$1" in
+    configure)
+        if [[ "$COMPONENT" == "yuzu-server" ]]; then
+            SVC_USER="yuzu"
+            SVC_NAME="yuzu-server"
+            DATA_DIR="/var/lib/yuzu"
+        else
+            SVC_USER="yuzu-agent"
+            SVC_NAME="yuzu-agent"
+            DATA_DIR="/var/lib/yuzu-agent"
+        fi
+
+        # Create system user
+        if ! getent passwd "$SVC_USER" >/dev/null 2>&1; then
+            adduser --system --group --home "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
+        fi
+
+        # Create directories
+        install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
+        install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
+
+        if [[ "$COMPONENT" == "yuzu-server" ]]; then
+            install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
+        fi
+
+        # Enable systemd service
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+            systemctl enable "${SVC_NAME}.service" || true
+            echo "$SVC_NAME installed. Start with: systemctl start $SVC_NAME"
+        fi
+        ;;
+esac
+
+exit 0
