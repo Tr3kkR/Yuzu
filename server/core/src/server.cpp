@@ -6003,7 +6003,7 @@ private:
             });
 
             detail::EventBus* bus = &event_bus_;
-            res.set_content_provider(
+            res.set_chunked_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
                     return detail::sse_content_provider(sink_state, offset, sink);
