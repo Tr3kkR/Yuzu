@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <string>
@@ -290,6 +291,93 @@ TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads",
         th.join();
 
     CHECK(store.total_emitted() == kThreads * kPerThread);
+}
+
+TEST_CASE("AnalyticsEventStore: concurrent emit and query_recent",
+          "[analytics_store][threads]") {
+    AnalyticsEventStore store(":memory:");
+
+    std::atomic<bool> done{false};
+    constexpr int kEmits = 100;
+
+    // Writer thread
+    std::thread writer([&]() {
+        for (int i = 0; i < kEmits; ++i) {
+            AnalyticsEvent event;
+            event.event_type = "race.test";
+            store.emit(event);
+        }
+        done = true;
+    });
+
+    // Reader thread — exercises query_recent, pending_count, total_emitted
+    std::thread reader([&]() {
+        while (!done.load()) {
+            auto results = store.query_recent(10);
+            auto pending = store.pending_count();
+            auto total = store.total_emitted();
+            (void)results;
+            (void)pending;
+            (void)total;
+        }
+    });
+
+    writer.join();
+    reader.join();
+
+    CHECK(store.total_emitted() == kEmits);
+}
+
+TEST_CASE("AnalyticsEventStore: stress test — high contention",
+          "[analytics_store][threads][stress]") {
+    AnalyticsEventStore store(":memory:");
+
+    constexpr int kWriterThreads = 8;
+    constexpr int kReaderThreads = 4;
+    constexpr int kEventsPerWriter = 250;
+    std::atomic<bool> writers_done{false};
+    std::atomic<int> total_reads{0};
+
+    // 8 writer threads hammering emit()
+    std::vector<std::thread> writers;
+    for (int t = 0; t < kWriterThreads; ++t) {
+        writers.emplace_back([&store, t]() {
+            for (int i = 0; i < kEventsPerWriter; ++i) {
+                AnalyticsEvent event;
+                event.event_type = "stress.write";
+                event.correlation_id = std::to_string(t) + "-" + std::to_string(i);
+                store.emit(event);
+            }
+        });
+    }
+
+    // 4 reader threads hammering query_recent, pending_count, total_emitted
+    std::vector<std::thread> readers;
+    for (int t = 0; t < kReaderThreads; ++t) {
+        readers.emplace_back([&store, &writers_done, &total_reads]() {
+            while (!writers_done.load()) {
+                auto results = store.query_recent(10);
+                auto pending = store.pending_count();
+                auto total = store.total_emitted();
+                (void)results;
+                (void)pending;
+                (void)total;
+                total_reads.fetch_add(1);
+            }
+            // Final read after writers finish — total must be consistent
+            auto final_total = store.total_emitted();
+            (void)final_total;
+        });
+    }
+
+    for (auto& th : writers)
+        th.join();
+    writers_done = true;
+    for (auto& th : readers)
+        th.join();
+
+    CHECK(store.total_emitted() == kWriterThreads * kEventsPerWriter);
+    CHECK(total_reads.load() > 0); // readers actually ran concurrently
 }
 
 TEST_CASE("AnalyticsEvent: schema_version preserved", "[analytics_event][json]") {

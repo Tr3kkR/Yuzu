@@ -13,6 +13,13 @@ protoc = find_program('protoc',
   dirs: _protoc_extra_dirs,
   required: true,
 )
+
+# Log protoc version for build reproducibility
+_protoc_ver = run_command(protoc, '--version', check: false)
+if _protoc_ver.returncode() == 0
+  message('protoc version: ' + _protoc_ver.stdout().strip())
+endif
+
 grpc_cpp_plugin = find_program('grpc_cpp_plugin',
   dirs: _grpc_extra_dirs,
   required: true,

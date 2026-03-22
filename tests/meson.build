@@ -87,3 +87,12 @@ if build_server
   )
   test('server unit tests', server_test_exe, timeout: 120)
 endif
+
+# ── Proto codegen tests ────────────────────────────────────────────────────
+_python3_test = find_program('python3', 'python')
+test('proto gen_proto version check',
+  _python3_test,
+  args: [files('test_gen_proto_version.py')],
+  suite: 'proto',
+  timeout: 30,
+)

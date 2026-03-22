@@ -34,6 +34,7 @@ AnalyticsEventStore::~AnalyticsEventStore() {
 }
 
 bool AnalyticsEventStore::is_open() const {
+    std::lock_guard lock(mu_);
     return db_ != nullptr;
 }
 
@@ -82,6 +83,7 @@ void AnalyticsEventStore::emit(AnalyticsEvent event) {
 }
 
 std::vector<AnalyticsEvent> AnalyticsEventStore::query_recent(int limit) const {
+    std::lock_guard lock(mu_);
     std::vector<AnalyticsEvent> results;
     if (!db_)
         return results;
@@ -107,6 +109,7 @@ std::vector<AnalyticsEvent> AnalyticsEventStore::query_recent(int limit) const {
 }
 
 std::size_t AnalyticsEventStore::pending_count() const {
+    std::lock_guard lock(mu_);
     if (!db_)
         return 0;
     sqlite3_stmt* stmt = nullptr;
@@ -121,6 +124,7 @@ std::size_t AnalyticsEventStore::pending_count() const {
 }
 
 std::size_t AnalyticsEventStore::total_emitted() const {
+    std::lock_guard lock(mu_);
     if (!db_)
         return 0;
     sqlite3_stmt* stmt = nullptr;
@@ -190,6 +194,7 @@ void AnalyticsEventStore::run_drain() {
 }
 
 void AnalyticsEventStore::drain_batch() {
+    std::lock_guard lock(mu_);
     if (!db_)
         return;
 
@@ -224,7 +229,6 @@ void AnalyticsEventStore::drain_batch() {
     // Send to all sinks
     bool all_ok = true;
     {
-        std::lock_guard lock(mu_);
         for (auto& sink : sinks_) {
             if (!sink->send(events)) {
                 spdlog::warn("AnalyticsEventStore: sink '{}' failed for batch of {}", sink->name(),
@@ -232,7 +236,7 @@ void AnalyticsEventStore::drain_batch() {
                 all_ok = false;
             }
         }
-    }
+    }  // (sinks_ iteration — covered by outer lock)
 
     // Mark as drained only if all sinks succeeded.
     // Note: ids originate from the prior SELECT's integer PRIMARY KEY column (not user input),
