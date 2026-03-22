@@ -74,7 +74,7 @@ int64_t NotificationStore::create(const std::string& level, const std::string& t
     if (!db_)
         return -1;
 
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
 
@@ -143,7 +143,7 @@ std::vector<Notification> NotificationStore::list_all(int limit, int offset) con
         return results;
 
     const char* sql = "SELECT id, timestamp, level, title, message, read, dismissed "
-                      "FROM notifications ORDER BY timestamp DESC LIMIT ? OFFSET ?";
+                      "FROM notifications ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return results;

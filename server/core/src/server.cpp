@@ -481,6 +481,31 @@ struct SseSinkState {
     std::size_t sub_id = 0;
 };
 
+// -- SSE helpers --------------------------------------------------------------
+
+// Format an SSE message.  The SSE spec requires every line of a multi-line
+// data field to carry its own "data: " prefix; the browser's EventSource
+// parser re-joins them with '\n'.  Without this, embedded newlines in agent
+// output cause silent truncation — only the first line reaches the browser.
+std::string format_sse(const SseEvent& ev) {
+    std::string out;
+    out += "event: ";
+    out += ev.event_type;
+    out += '\n';
+    std::string_view d{ev.data};
+    std::size_t pos = 0;
+    while (pos <= d.size()) {
+        auto nl = d.find('\n', pos);
+        out += "data: ";
+        out.append(d.substr(pos, (nl == std::string_view::npos ? d.size() : nl) - pos));
+        out += '\n';
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    out += '\n'; // blank line terminates the event
+    return out;
+}
+
 // -- SSE content provider callback --------------------------------------------
 
 bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*offset*/,
@@ -495,7 +520,7 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
 
     while (!state->queue.empty()) {
         auto& ev = state->queue.front();
-        std::string sse = "event: " + ev.event_type + "\ndata: " + ev.data + "\n\n";
+        std::string sse = format_sse(ev);
         if (!sink.write(sse.data(), sse.size())) {
             return false;
         }
@@ -4762,14 +4787,12 @@ private:
             std::string type;
             std::string content;
 
-            if (req.form.has_field("type")) {
-                type = req.form.get_field("type");
-            } else if (req.has_param("type")) {
+            if (req.has_param("type")) {
                 type = req.get_param_value("type");
             }
 
-            if (req.form.has_file("file")) {
-                content = req.form.get_file("file").content;
+            if (req.has_file("file")) {
+                content = req.get_file_value("file").content;
             }
 
             if (type.empty() || content.empty()) {
@@ -5311,22 +5334,22 @@ private:
             }
 
             std::string platform, arch, rollout_s, mandatory_s;
-            if (req.form.has_field("platform"))
-                platform = req.form.get_field("platform");
-            if (req.form.has_field("arch"))
-                arch = req.form.get_field("arch");
-            if (req.form.has_field("rollout_pct"))
-                rollout_s = req.form.get_field("rollout_pct");
-            if (req.form.has_field("mandatory"))
-                mandatory_s = req.form.get_field("mandatory");
+            if (req.has_param("platform"))
+                platform = req.get_param_value("platform");
+            if (req.has_param("arch"))
+                arch = req.get_param_value("arch");
+            if (req.has_param("rollout_pct"))
+                rollout_s = req.get_param_value("rollout_pct");
+            if (req.has_param("mandatory"))
+                mandatory_s = req.get_param_value("mandatory");
 
-            if (!req.form.has_file("file")) {
+            if (!req.has_file("file")) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">No file uploaded.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
-            const auto& uploaded = req.form.get_file("file");
+            auto uploaded = req.get_file_value("file");
             if (uploaded.content.empty()) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">Empty file.</span>",

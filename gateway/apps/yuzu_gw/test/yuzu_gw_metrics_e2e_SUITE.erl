@@ -50,21 +50,29 @@ end_per_suite(_Config) ->
     ok.
 
 init_per_testcase(_TC, Config) ->
+    catch meck:unload(grpcbox_client),
     meck:new(grpcbox_client, [non_strict, no_link]),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
+    catch meck:unload(telemetry),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    [{upstream_pid, Pid} | Config].
+    catch meck:unload(yuzu_gw_heartbeat_buffer),
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined -> ok;
+        OldHB -> catch gen_server:stop(OldHB, shutdown, 5000), timer:sleep(50)
+    end,
+    {ok, Pid} = yuzu_gw_heartbeat_buffer:start_link(),
+    [{hb_pid, Pid} | Config].
 
 end_per_testcase(_TC, Config) ->
-    Pid = proplists:get_value(upstream_pid, Config),
-    unlink(Pid),
-    exit(Pid, shutdown),
+    Pid = proplists:get_value(hb_pid, Config),
+    catch unlink(Pid),
+    catch exit(Pid, shutdown),
     timer:sleep(50),
-    meck:unload([grpcbox_client, telemetry]),
+    catch meck:unload(grpcbox_client),
+    catch meck:unload(telemetry),
     ok.
 
 %%%===================================================================
@@ -82,7 +90,7 @@ heartbeat_tags_flow_through_batch(_Config) ->
         <<"yuzu.agent_version">> => <<"0.3.0">>,
         <<"yuzu.healthy">> => <<"1">>
     }),
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
     %% Set up mock to capture the BatchHeartbeat request.
@@ -97,7 +105,7 @@ heartbeat_tags_flow_through_batch(_Config) ->
     end),
 
     %% Flush.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     receive
         {batch_req, Req} ->
             HBs = maps:get(heartbeats, Req, []),
@@ -118,7 +126,7 @@ multiple_agents_tags_in_single_batch(_Config) ->
             <<"yuzu.os">> => Os,
             <<"yuzu.healthy">> => <<"1">>
         }),
-        yuzu_gw_upstream:queue_heartbeat(HB)
+        yuzu_gw_heartbeat_buffer:queue_heartbeat(HB)
     end, [{<<"a1">>, <<"linux">>},
           {<<"a2">>, <<"windows">>},
           {<<"a3">>, <<"darwin">>}]),
@@ -134,7 +142,7 @@ multiple_agents_tags_in_single_batch(_Config) ->
         end
     end),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     receive
         {batch_req, Req} ->
             HBs = maps:get(heartbeats, Req, []),
@@ -151,7 +159,7 @@ multiple_agents_tags_in_single_batch(_Config) ->
 heartbeat_without_tags_is_valid(_Config) ->
     %% Queue a heartbeat with empty status_tags.
     HB = #{session_id => <<"sess-empty">>, status_tags => #{}},
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
     Self = self(),
@@ -164,7 +172,7 @@ heartbeat_without_tags_is_valid(_Config) ->
         end
     end),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     receive
         {batch_req, Req} ->
             HBs = maps:get(heartbeats, Req, []),
@@ -179,14 +187,14 @@ tags_survive_batch_retry(_Config) ->
         <<"yuzu.os">> => <<"linux">>,
         <<"yuzu.uptime_s">> => <<"100">>
     }),
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
     %% Make first flush fail.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     %% Now make flush succeed and capture.
@@ -201,7 +209,7 @@ tags_survive_batch_retry(_Config) ->
         end
     end),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     receive
         {batch_req, Req} ->
             HBs = maps:get(heartbeats, Req, []),

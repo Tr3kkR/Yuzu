@@ -17,7 +17,6 @@
 #include "tag_store.hpp"
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <optional>
@@ -50,21 +49,6 @@ public:
                          TagPushFn tag_push_fn = {},
                          InventoryStore* inventory_store = nullptr,
                          ProductPackStore* product_pack_store = nullptr);
-
-private:
-    // JSON envelope helpers
-    static nlohmann::json ok_response(const nlohmann::json& data);
-    static nlohmann::json error_response(const std::string& message, int code = 0);
-    static nlohmann::json list_response(const nlohmann::json& data, int64_t total,
-                                        int64_t start = 0, int64_t page_size = 50);
-
-    // CORS helper — adds CORS headers to a response for /api/v1/* routes.
-    // Reflects the request Origin instead of using wildcard (*) to enforce
-    // same-origin policy.
-    static void add_cors_headers(httplib::Response& res, const httplib::Request& req);
-
-    // OpenAPI 3.0 spec generator
-    static std::string generate_openapi_spec();
 };
 
 } // namespace yuzu::server

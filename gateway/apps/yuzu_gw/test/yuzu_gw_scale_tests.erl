@@ -274,15 +274,15 @@ heartbeat_batch_scale() ->
     end),
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, N),
-    case whereis(yuzu_gw_upstream) of
-        undefined -> {ok, _} = yuzu_gw_upstream:start_link();
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined -> {ok, _} = yuzu_gw_heartbeat_buffer:start_link();
         _ -> ok
     end,
 
     %% Queue N heartbeats as fast as possible.
     {TimeUs, _} = timer:tc(fun() ->
         lists:foreach(fun(I) ->
-            yuzu_gw_upstream:queue_heartbeat(#{session_id => integer_to_binary(I)})
+            yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => integer_to_binary(I)})
         end, lists:seq(1, N))
     end),
 
@@ -300,7 +300,7 @@ heartbeat_batch_scale() ->
                 {ok, #{acknowledged_count => length(HBs)}, #{}}
         end
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(200),
 
     %% Verify that the batch contained all N heartbeats.

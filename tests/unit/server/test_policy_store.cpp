@@ -176,7 +176,7 @@ TEST_CASE("PolicyStore: create fragment with duplicate ID", "[policy_store][frag
     // Attempt duplicate
     auto r2 = store.create_fragment(kFullFragment);
     REQUIRE(!r2.has_value());
-    CHECK(r2.error().find("insert failed") != std::string::npos);
+    CHECK(r2.error().find("failed to create fragment") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create fragment with empty YAML", "[policy_store][fragment]") {

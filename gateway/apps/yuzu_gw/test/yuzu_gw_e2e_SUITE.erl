@@ -351,6 +351,12 @@ start_gateway_processes() ->
             unlink(UpPid);
         _ -> ok
     end,
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined ->
+            {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
+            unlink(HBPid);
+        _ -> ok
+    end,
     case whereis(yuzu_gw_router) of
         undefined ->
             {ok, RouterPid} = yuzu_gw_router:start_link(),

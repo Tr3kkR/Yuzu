@@ -137,8 +137,9 @@ init_per_suite(Config) ->
 
     %% Install a global upstream mock for all non-upstream-group tests.
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
+    meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
-    meck:expect(yuzu_gw_upstream, queue_heartbeat, fun(_) -> ok end),
+    meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
@@ -164,16 +165,33 @@ end_per_suite(_Config) ->
 init_per_group(upstream, Config) ->
     %% Temporarily unload the global upstream mock so we can start the real process.
     catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(yuzu_gw_heartbeat_buffer),
+    %% Stop any leftover processes from prior suites.
+    case whereis(yuzu_gw_upstream) of
+        undefined -> ok;
+        OldPid ->
+            catch unlink(OldPid),
+            catch gen_server:stop(OldPid, shutdown, 5000),
+            timer:sleep(100)
+    end,
     %% Mock grpcbox for upstream tests.
+    catch meck:unload(grpcbox_channel),
+    catch meck:unload(grpcbox_client),
     meck:new(grpcbox_channel, [non_strict, no_link]),
     meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, mock_channel} end),
     meck:new(grpcbox_client, [non_strict, no_link]),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    %% Start real upstream process (unlink so it doesn't die with CT process).
+    %% Start real upstream and heartbeat buffer (unlink so they outlive CT process).
     {ok, Pid} = yuzu_gw_upstream:start_link(),
     unlink(Pid),
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined ->
+            {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
+            unlink(HBPid);
+        _ -> ok
+    end,
     [{upstream_pid, Pid} | Config];
 
 init_per_group(_Group, Config) ->
@@ -192,9 +210,11 @@ end_per_group(upstream, Config) ->
     catch meck:unload(grpcbox_client),
     %% Reinstall the global upstream mock for subsequent groups.
     catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(yuzu_gw_heartbeat_buffer),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
+    meck:new(yuzu_gw_heartbeat_buffer, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
-    meck:expect(yuzu_gw_upstream, queue_heartbeat, fun(_) -> ok end),
+    meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
     meck:expect(yuzu_gw_upstream, proxy_register, fun(_) ->
         {ok, #{session_id => <<"test-session">>}}
     end),
@@ -268,7 +288,7 @@ agent_register_via_service(_Config) ->
 agent_heartbeat_batching(_Config) ->
     BatchRef = make_ref(),
     Self = self(),
-    meck:expect(yuzu_gw_upstream, queue_heartbeat, fun(HbReq) ->
+    meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(HbReq) ->
         Self ! {heartbeat_queued, BatchRef, HbReq},
         ok
     end),
@@ -522,13 +542,13 @@ upstream_batch_heartbeat_flush(Config) ->
 
     %% Queue heartbeats.
     lists:foreach(fun(I) ->
-        yuzu_gw_upstream:queue_heartbeat(#{session_id => integer_to_binary(I)})
+        yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => integer_to_binary(I)})
     end, lists:seq(1, 5)),
 
     timer:sleep(50),
 
     %% Trigger flush.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(150),
 
     %% Verify batch was sent.
@@ -674,7 +694,7 @@ upstream_disconnect_recovery(_Config) ->
         Self ! {notify_called, Ref},
         ok
     end),
-    meck:expect(yuzu_gw_upstream, queue_heartbeat, fun(_) -> ok end),
+    meck:expect(yuzu_gw_heartbeat_buffer, queue_heartbeat, fun(_) -> ok end),
 
     %% Start an agent.
     AgentId = <<"recovery-agent-1">>,

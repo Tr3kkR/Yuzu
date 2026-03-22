@@ -129,6 +129,9 @@ extern const char* const kDashboardIndexHtml =
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       max-width: 300px;
     }
+    .result-detail td {
+      white-space: normal; overflow: visible; max-width: none;
+    }
     tbody tr:hover { background: rgba(88,166,255,0.06); }
     .col-agent {
       font-family: var(--mono); font-size: 0.7rem;
@@ -903,7 +906,7 @@ extern const char* const kDashboardIndexHtml =
       evtSource = new EventSource('/events');
 
       evtSource.addEventListener('output', function(e) {
-        /* Format: agent_id|plugin|data... */
+        /* Format: agent_id|plugin|data...  (data may contain \n for batched output) */
         var sep1 = e.data.indexOf('|');
         if (sep1 < 0) return;
         var sep2 = e.data.indexOf('|', sep1 + 1);
@@ -911,59 +914,67 @@ extern const char* const kDashboardIndexHtml =
 
         var agentId = e.data.substring(0, sep1);
         var plugin  = e.data.substring(sep1 + 1, sep2);
-        var payload = e.data.substring(sep2 + 1);
+        var rawPayload = e.data.substring(sep2 + 1);
         var agentName = agentDisplayName(agentId);
 
-        if (plugin === 'chargen') {
-          addRow([agentName, payload]);
-        } else if (plugin === 'procfetch') {
-          /* pid|name|path|sha1 */
-          var parts = payload.split('|');
-          if (parts.length >= 4) {
-            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'),
-                    parts[2].replace(/\\\|/g,'|'), parts[3]]);
+        /* Agent batches multiple write_output() calls joined by \n.
+           Process each line as an independent record. */
+        var payloads = rawPayload.split('\n');
+        for (var pi = 0; pi < payloads.length; pi++) {
+          var payload = payloads[pi];
+          if (!payload) continue;
+
+          if (plugin === 'chargen') {
+            addRow([agentName, payload]);
+          } else if (plugin === 'procfetch') {
+            /* pid|name|path|sha1 */
+            var parts = payload.split('|');
+            if (parts.length >= 4) {
+              addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'),
+                      parts[2].replace(/\\\|/g,'|'), parts[3]]);
+            } else {
+              addRow([agentName, payload]);
+            }
+          } else if (plugin === 'netstat') {
+            /* proto|local_addr|local_port|remote_addr|remote_port|state|pid */
+            var parts = payload.split('|');
+            if (parts.length >= 7) {
+              addRow([agentName, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]]);
+            } else {
+              addRow([agentName, payload]);
+            }
+          } else if (plugin === 'sockwho') {
+            /* pid|name|path|proto|local_addr|local_port|remote_addr|remote_port|state */
+            var parts = payload.split('|');
+            if (parts.length >= 9) {
+              addRow([agentName, parts[0],
+                      parts[1].replace(/\\\|/g,'|'),
+                      parts[2].replace(/\\\|/g,'|'),
+                      parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
+            } else {
+              addRow([agentName, payload]);
+            }
+          } else if (plugin === 'vuln_scan') {
+            /* severity|category|title|detail */
+            var parts = payload.split('|');
+            if (parts.length >= 4) {
+              addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
+            } else if (parts.length >= 2) {
+              addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
+            } else {
+              addRow([agentName, payload, '', '', '']);
+            }
+          } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
+            /* key|value */
+            var parts = payload.split('|');
+            if (parts.length >= 2) {
+              addRow([agentName, parts[0], parts.slice(1).join('|')]);
+            } else {
+              addRow([agentName, payload, '']);
+            }
           } else {
             addRow([agentName, payload]);
           }
-        } else if (plugin === 'netstat') {
-          /* proto|local_addr|local_port|remote_addr|remote_port|state|pid */
-          var parts = payload.split('|');
-          if (parts.length >= 7) {
-            addRow([agentName, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]]);
-          } else {
-            addRow([agentName, payload]);
-          }
-        } else if (plugin === 'sockwho') {
-          /* pid|name|path|proto|local_addr|local_port|remote_addr|remote_port|state */
-          var parts = payload.split('|');
-          if (parts.length >= 9) {
-            addRow([agentName, parts[0],
-                    parts[1].replace(/\\\|/g,'|'),
-                    parts[2].replace(/\\\|/g,'|'),
-                    parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
-          } else {
-            addRow([agentName, payload]);
-          }
-        } else if (plugin === 'vuln_scan') {
-          /* severity|category|title|detail */
-          var parts = payload.split('|');
-          if (parts.length >= 4) {
-            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
-          } else if (parts.length >= 2) {
-            addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
-          } else {
-            addRow([agentName, payload, '', '', '']);
-          }
-        } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
-          /* key|value */
-          var parts = payload.split('|');
-          if (parts.length >= 2) {
-            addRow([agentName, parts[0], parts.slice(1).join('|')]);
-          } else {
-            addRow([agentName, payload, '']);
-          }
-        } else {
-          addRow([agentName, payload]);
         }
       });
 

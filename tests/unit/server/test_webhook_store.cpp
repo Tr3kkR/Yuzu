@@ -31,7 +31,7 @@ TEST_CASE("WebhookStore: create and list webhook", "[webhook_store]") {
     REQUIRE(hooks.size() == 1);
     CHECK(hooks[0].url == "https://example.com/hook");
     CHECK(hooks[0].event_types == "agent.registered");
-    CHECK(hooks[0].secret == "secret123");
+    CHECK(hooks[0].secret.empty());  // list() redacts secrets by design
     CHECK(hooks[0].enabled == true);
     CHECK(hooks[0].id == id);
 }

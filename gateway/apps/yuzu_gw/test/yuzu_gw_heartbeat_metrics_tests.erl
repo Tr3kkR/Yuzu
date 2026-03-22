@@ -38,7 +38,7 @@ setup() ->
     %% Use a long interval so flushes don't happen automatically during tests.
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
+    {ok, Pid} = yuzu_gw_heartbeat_buffer:start_link(),
     Pid.
 
 cleanup(Pid) ->
@@ -73,7 +73,7 @@ drain_buffer() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     meck:reset(grpcbox_client).
 
@@ -103,11 +103,11 @@ tags_preserved() ->
     mock_batch_success(),
 
     HB = make_heartbeat(<<"s1">>, linux_tags()),
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
     %% Trigger flush.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Batches = batch_requests(),
@@ -145,12 +145,12 @@ multi_agent_tags() ->
         <<"yuzu.uptime_s">> => <<"600">>
     }),
 
-    yuzu_gw_upstream:queue_heartbeat(HB1),
-    yuzu_gw_upstream:queue_heartbeat(HB2),
-    yuzu_gw_upstream:queue_heartbeat(HB3),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB1),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB2),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB3),
     timer:sleep(20),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Batches = batch_requests(),
@@ -172,22 +172,22 @@ tags_survive_failure() ->
     %% Queue heartbeats with tags.
     HB1 = make_heartbeat(<<"fail1">>, #{<<"yuzu.os">> => <<"linux">>, <<"yuzu.healthy">> => <<"1">>}),
     HB2 = make_heartbeat(<<"fail2">>, #{<<"yuzu.os">> => <<"windows">>, <<"yuzu.healthy">> => <<"0">>}),
-    yuzu_gw_upstream:queue_heartbeat(HB1),
-    yuzu_gw_upstream:queue_heartbeat(HB2),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB1),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB2),
     timer:sleep(20),
 
     %% Make flush fail.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     %% Now make flush succeed and retry.
     meck:reset(grpcbox_client),
     mock_batch_success(),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Batches = batch_requests(),
@@ -208,10 +208,10 @@ empty_tags_valid() ->
     mock_batch_success(),
 
     HB = make_heartbeat(<<"empty-tags">>, #{}),
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Batches = batch_requests(),
@@ -228,10 +228,10 @@ tags_are_maps() ->
 
     Tags = linux_tags(),
     HB = make_heartbeat(<<"map-check">>, Tags),
-    yuzu_gw_upstream:queue_heartbeat(HB),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(HB),
     timer:sleep(20),
 
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Batches = batch_requests(),

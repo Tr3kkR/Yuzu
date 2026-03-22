@@ -64,6 +64,12 @@ init_per_suite(Config) ->
             unlink(UpPid);
         _ -> ok
     end,
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined ->
+            {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
+            unlink(HBPid);
+        _ -> ok
+    end,
     case whereis(yuzu_gw_router) of
         undefined ->
             {ok, RouterPid} = yuzu_gw_router:start_link(),
@@ -154,7 +160,7 @@ heartbeat_batching_verification(_Config) ->
     lists:foreach(fun(I) ->
         AgentId = iolist_to_binary(io_lib:format("hb-agent-~4..0B", [I])),
         lists:foreach(fun(_) ->
-            yuzu_gw_upstream:queue_heartbeat(#{
+            yuzu_gw_heartbeat_buffer:queue_heartbeat(#{
                 agent_id  => AgentId,
                 timestamp => #{seconds => erlang:system_time(second)}
             })
@@ -224,7 +230,7 @@ command_roundtrip_latency(_Config) ->
 agent_disconnect_propagation(_Config) ->
     ct:pal("--- agent_disconnect_propagation ---"),
 
-    StreamHandler = spawn_link(fun() -> stream_handler_loop(self()) end),
+    StreamHandler = spawn(fun() -> stream_handler_loop(self()) end),
     AgentId = <<"disconnect-agent">>,
     AgentArgs = #{
         agent_id   => AgentId,
@@ -258,9 +264,9 @@ agent_disconnect_propagation(_Config) ->
 gateway_restart_resilience(_Config) ->
     ct:pal("--- gateway_restart_resilience ---"),
 
-    %% Register a test agent.
+    %% Register a test agent (spawn, not spawn_link — we will kill it).
     AgentId = <<"resilience-agent">>,
-    Pid1 = spawn_link(fun agent_loop/0),
+    Pid1 = spawn(fun agent_loop/0),
     ok = yuzu_gw_registry:register_agent(AgentId, Pid1, <<"sess1">>, [<<"p1">>], <<>>),
     ?assertMatch({ok, _}, yuzu_gw_registry:lookup(AgentId)),
     ct:pal("Agent registered pre-restart"),
@@ -271,16 +277,20 @@ gateway_restart_resilience(_Config) ->
         yuzu_gw_registry:lookup(AgentId) =:= error
     end, 5000),
 
-    %% Stop and restart the upstream module.
+    %% Stop and restart the upstream and heartbeat buffer modules.
+    catch gen_server:stop(yuzu_gw_heartbeat_buffer),
     catch gen_server:stop(yuzu_gw_upstream),
     timer:sleep(100),
 
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 1000),
-    {ok, _} = yuzu_gw_upstream:start_link(),
-    ct:pal("Upstream restarted"),
+    {ok, UpPid2} = yuzu_gw_upstream:start_link(),
+    unlink(UpPid2),
+    {ok, HBPid2} = yuzu_gw_heartbeat_buffer:start_link(),
+    unlink(HBPid2),
+    ct:pal("Upstream and heartbeat buffer restarted"),
 
-    %% Re-register agent.
-    Pid2 = spawn_link(fun agent_loop/0),
+    %% Re-register agent (spawn, not spawn_link — we will kill it).
+    Pid2 = spawn(fun agent_loop/0),
     ok = yuzu_gw_registry:register_agent(AgentId, Pid2, <<"sess2">>, [<<"p1">>], <<>>),
     ?assertMatch({ok, Pid2}, yuzu_gw_registry:lookup(AgentId)),
 

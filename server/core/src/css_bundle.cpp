@@ -256,7 +256,7 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .detail-label { color: var(--muted); font-weight: 600; font-size: var(--text-sm);
                 white-space: nowrap; }
 .detail-value { font-family: var(--font-mono); font-size: var(--text-sm);
-                word-break: break-all; color: var(--fg); }
+                word-break: break-all; color: var(--fg); white-space: pre-wrap; }
 
 /* Table density modes */
 .data-table.compact td, table.compact td { padding: 2px var(--sp-2); font-size: var(--text-xs); }

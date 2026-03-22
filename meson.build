@@ -63,13 +63,22 @@ build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
-grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], required: true)
-protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: true)
+grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], required: false)
+if not grpcpp_dep.found()
+  grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
+endif
+protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: false)
+if not protobuf_dep.found()
+  protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
+endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
 cli11_dep       = dependency('CLI11',         required: true)
-httplib_dep     = dependency('httplib',   required: true)
+httplib_dep     = dependency('httplib', required: false)
+if not httplib_dep.found()
+  httplib_dep   = dependency('cpp-httplib', required: true)
+endif
 sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'], required: true)
 
 # macOS frameworks needed by gRPC, abseil, and cpp-httplib

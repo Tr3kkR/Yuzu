@@ -49,12 +49,15 @@ setup() ->
     %% Use a long interval so flushes don't happen automatically during tests.
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 5),
-    {ok, Pid} = yuzu_gw_upstream:start_link(),
-    Pid.
+    {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
+    {ok, UpPid} = yuzu_gw_upstream:start_link(),
+    {HBPid, UpPid}.
 
-cleanup(Pid) ->
-    unlink(Pid),
-    exit(Pid, shutdown),
+cleanup({HBPid, UpPid}) ->
+    catch unlink(HBPid),
+    catch unlink(UpPid),
+    catch exit(HBPid, shutdown),
+    catch exit(UpPid, shutdown),
     timer:sleep(50),
     meck:unload([grpcbox_client, telemetry]),
     ok.
@@ -65,9 +68,9 @@ cleanup(Pid) ->
 
 heartbeats_batched() ->
     %% Queue several heartbeats.
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"s1">>}),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"s2">>}),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"s3">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"s1">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"s2">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"s3">>}),
     %% No RPC should have been called yet (interval is 10 minutes).
     timer:sleep(50),
     %% The unary mock records calls. Check that BatchHeartbeat was NOT called.
@@ -81,7 +84,7 @@ flush_sends_batch() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     %% Now reset and set up the real assertion mock.
     meck:reset(grpcbox_client),
@@ -94,11 +97,11 @@ flush_sends_batch() ->
         end
     end),
     %% Queue exactly 2 heartbeats.
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"f1">>}),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"f2">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"f1">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"f2">>}),
     timer:sleep(20),
     %% Trigger flush manually.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
     %% Check that BatchHeartbeat was called with exactly 2 heartbeats.
     Calls = meck:history(grpcbox_client),
@@ -112,7 +115,7 @@ flush_sends_batch() ->
 empty_flush_no_rpc() ->
     meck:reset(grpcbox_client),
     %% Flush with empty buffer — just reschedules the timer.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     %% No RPC calls should have been made.
     Calls = meck:history(grpcbox_client),
@@ -166,21 +169,21 @@ buffer_retained_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     meck:reset(grpcbox_client),
 
     %% Queue 3 heartbeats.
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"r1">>}),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"r2">>}),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"r3">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r1">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r2">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r3">>}),
     timer:sleep(20),
 
     %% Make flush fail.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     %% Now make flush succeed and add one more heartbeat.
@@ -193,11 +196,11 @@ buffer_retained_on_failure() ->
                 {ok, #{acknowledged_count => length(HBs)}, #{}}
         end
     end),
-    yuzu_gw_upstream:queue_heartbeat(#{session_id => <<"r4">>}),
+    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r4">>}),
     timer:sleep(20),
 
     %% Trigger flush — should include all 4 heartbeats (3 retained + 1 new).
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Calls = meck:history(grpcbox_client),
@@ -213,13 +216,13 @@ buffer_cap_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(50),
     meck:reset(grpcbox_client),
 
     %% Queue 10 heartbeats (exceeds cap of 5).
     lists:foreach(fun(I) ->
-        yuzu_gw_upstream:queue_heartbeat(#{session_id => integer_to_binary(I)})
+        yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => integer_to_binary(I)})
     end, lists:seq(1, 10)),
     timer:sleep(20),
 
@@ -227,7 +230,7 @@ buffer_cap_on_failure() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {error, connection_refused}
     end),
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     %% Now make flush succeed.
@@ -242,7 +245,7 @@ buffer_cap_on_failure() ->
     end),
 
     %% Trigger flush — should include at most 5 (capped) heartbeats.
-    whereis(yuzu_gw_upstream) ! flush_heartbeats,
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
     timer:sleep(100),
 
     Calls = meck:history(grpcbox_client),
