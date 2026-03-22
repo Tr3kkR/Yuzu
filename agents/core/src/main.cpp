@@ -28,6 +28,10 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_diag_init)() = diag_befo
 #include <filesystem>
 #include <format>
 #include <memory>
+#ifdef _WIN32
+#include <windows.h>
+#include <winsvc.h>
+#endif
 #include <string>
 
 static std::atomic<yuzu::agent::Agent*> g_agent{nullptr};

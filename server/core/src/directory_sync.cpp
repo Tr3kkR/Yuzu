@@ -12,6 +12,7 @@
 // clang-format off
 #include <windows.h>
 #include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 // clang-format on
 #endif
 

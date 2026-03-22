@@ -32,6 +32,7 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #else
 #include <openssl/evp.h>
 #include <sys/types.h>

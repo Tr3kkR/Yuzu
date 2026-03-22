@@ -27,6 +27,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 namespace yuzu::tar {

@@ -1,11 +1,5 @@
 tar_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep, sqlite3_dep, nlohmann_dep]
-
-if host_machine.system() == 'windows'
-  tar_deps += cxx.find_library('advapi32')
-  tar_deps += cxx.find_library('iphlpapi')
-  tar_deps += cxx.find_library('ws2_32')
-  tar_deps += cxx.find_library('wtsapi32')
-endif
+# Windows: advapi32, iphlpapi, ws2_32, wtsapi32 linked via #pragma comment(lib) in source
 
 shared_library(
   'tar',

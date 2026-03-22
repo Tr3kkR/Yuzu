@@ -1,12 +1,5 @@
 interaction_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
-
-# Windows needs shell32 for Shell_NotifyIconW
-if host_machine.system() == 'windows'
-  interaction_deps += [
-    meson.get_compiler('cpp').find_library('shell32'),
-    meson.get_compiler('cpp').find_library('user32'),
-  ]
-endif
+# Windows: shell32.lib, user32.lib linked via #pragma comment(lib) in source
 
 shared_library(
   'interaction',

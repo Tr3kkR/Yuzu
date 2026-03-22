@@ -45,6 +45,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #include <charconv>
 #include <tlhelp32.h>
 #endif

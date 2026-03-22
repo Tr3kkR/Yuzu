@@ -52,6 +52,8 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 #include <windns.h>
 #elif defined(__linux__)
 #include <arpa/inet.h>

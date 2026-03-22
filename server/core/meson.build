@@ -1,8 +1,7 @@
 # Platform-specific crypto for auth module
+# Windows: bcrypt.lib, winhttp.lib linked via #pragma comment(lib) in source
 if host_machine.system() == 'windows'
-  bcrypt_dep = cxx.find_library('bcrypt')
-  winhttp_dep = cxx.find_library('winhttp')
-  auth_crypto_deps = [bcrypt_dep, winhttp_dep]
+  auth_crypto_deps = []
 else
   openssl_dep = dependency('openssl', required: true)
   auth_crypto_deps = [openssl_dep]
@@ -82,6 +81,9 @@ yuzu_server_core_lib = static_library(
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/rest_api_v1.cpp',
+    'src/rest_api_v1_groups.cpp',
+    'src/rest_api_v1_security.cpp',
+    'src/rest_api_v1_data.cpp',
     'src/compliance_ui.cpp',
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',

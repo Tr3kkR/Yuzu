@@ -1,8 +1,5 @@
 msi_packages_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
-
-if host_machine.system() == 'windows'
-  msi_packages_deps += cxx.find_library('msi')
-endif
+# Windows: msi.lib linked via #pragma comment(lib) in source
 
 shared_library(
   'msi_packages',

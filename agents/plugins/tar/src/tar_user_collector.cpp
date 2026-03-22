@@ -37,6 +37,7 @@
 #endif
 #include <windows.h>
 #include <wtsapi32.h>
+#pragma comment(lib, "wtsapi32.lib")
 #endif
 
 namespace yuzu::tar {

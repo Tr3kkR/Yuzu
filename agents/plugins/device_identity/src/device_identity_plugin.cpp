@@ -34,6 +34,8 @@
 #include <windows.h>
 #include <lm.h>       // NetGetJoinInformation, NetApiBufferFree
 #include <security.h> // GetComputerObjectNameA
+#pragma comment(lib, "netapi32.lib")
+#pragma comment(lib, "secur32.lib")
 #endif
 
 namespace {

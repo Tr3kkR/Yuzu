@@ -167,10 +167,10 @@ struct PluginContextImpl {
     std::string plugin_name;               // set per-plugin during init/execute for KV namespacing
 };
 
-// Per-command output is buffered and flushed in a single gRPC Write instead of
-// issuing one Write per line. This reduces serialized gRPC writes from N-per-
-// command to 1-per-command for most plugins.
-static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
+// Per-command output is buffered and flushed in batches to reduce gRPC writes.
+// Flush triggers: size threshold OR time threshold (whichever comes first).
+static constexpr size_t kOutputFlushThreshold = 64 * 1024;                          // 64 KB
+static constexpr auto kOutputFlushInterval = std::chrono::milliseconds(200);        // 200 ms
 
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
@@ -179,9 +179,10 @@ struct CommandContextImpl {
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
 
-    // Buffered output — flushed once after execute(), or when buffer exceeds threshold
+    // Buffered output — flushed on size threshold, time threshold, or after execute()
     std::vector<std::string> output_buffer;
     size_t output_buffer_bytes{0};
+    std::chrono::steady_clock::time_point last_flush_time{std::chrono::steady_clock::now()};
     std::mutex buf_mu;
 
     void append_output(const char* text) {
@@ -189,7 +190,8 @@ struct CommandContextImpl {
         size_t len = std::strlen(text);
         output_buffer.emplace_back(text, len);
         output_buffer_bytes += len;
-        if (output_buffer_bytes >= kOutputFlushThreshold) {
+        if (output_buffer_bytes >= kOutputFlushThreshold ||
+            std::chrono::steady_clock::now() - last_flush_time >= kOutputFlushInterval) {
             flush_output_locked();
         }
     }
@@ -214,6 +216,7 @@ private:
         }
         output_buffer.clear();
         output_buffer_bytes = 0;
+        last_flush_time = std::chrono::steady_clock::now();
 
         pb::CommandResponse resp;
         resp.set_command_id(command_id);

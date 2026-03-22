@@ -1,8 +1,6 @@
 # Platform-specific crypto dependencies for certificate store access
+# Windows: crypt32.lib linked via #pragma comment(lib) in source
 cert_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
-if host_machine.system() == 'windows'
-  cert_deps += cxx.find_library('crypt32')
-endif
 
 shared_library(
   'certificates',

@@ -439,37 +439,7 @@ extern const char* const kDashboardIndexHtml =
       xhr.send();
     }
 
-    /* ── Column schemas per plugin ────────────────────────── */
-    var columnSchemas = {
-      'chargen':   ['Agent', 'Output'],
-      'procfetch': ['Agent', 'PID', 'Name', 'Path', 'SHA-1'],
-      'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
-      'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
-      'status':            ['Agent', 'Key', 'Value'],
-      'device_identity':   ['Agent', 'Key', 'Value'],
-      'os_info':           ['Agent', 'Key', 'Value'],
-      'hardware':          ['Agent', 'Key', 'Value'],
-      'users':             ['Agent', 'Key', 'Value'],
-      'installed_apps':    ['Agent', 'Key', 'Value'],
-      'msi_packages':     ['Agent', 'Key', 'Value'],
-      'network_config':   ['Agent', 'Key', 'Value'],
-      'diagnostics':      ['Agent', 'Key', 'Value'],
-      'agent_actions':    ['Agent', 'Key', 'Value'],
-      'processes':        ['Agent', 'Key', 'Value'],
-      'services':         ['Agent', 'Key', 'Value'],
-      'filesystem':       ['Agent', 'Key', 'Value'],
-      'network_diag':     ['Agent', 'Key', 'Value'],
-      'network_actions':  ['Agent', 'Key', 'Value'],
-      'firewall':         ['Agent', 'Key', 'Value'],
-      'antivirus':        ['Agent', 'Key', 'Value'],
-      'bitlocker':        ['Agent', 'Key', 'Value'],
-      'windows_updates':  ['Agent', 'Key', 'Value'],
-      'event_logs':       ['Agent', 'Key', 'Value'],
-      'sccm':             ['Agent', 'Key', 'Value'],
-      'script_exec':      ['Agent', 'Key', 'Value'],
-      'software_actions': ['Agent', 'Key', 'Value'],
-      'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
-    };
+    /* Column schemas now rendered server-side via output-columns SSE event */
 )HTM"
     // Part 3: Helpers and table management
     R"HTM(
@@ -718,9 +688,7 @@ extern const char* const kDashboardIndexHtml =
 
       currentInstruction = raw;
 
-      /* Set up columns for this plugin */
-      var schema = columnSchemas[mapped.plugin] || ['Agent', 'Output'];
-      setColumns(schema);
+      /* Clear previous results — column headers arrive via output-columns SSE event */
       clearResults();
 
       /* Determine target agent IDs */
@@ -903,68 +871,21 @@ extern const char* const kDashboardIndexHtml =
       evtSource = new EventSource('/events');
 
       evtSource.addEventListener('output', function(e) {
-        /* Format: agent_id|plugin|data... */
-        var sep1 = e.data.indexOf('|');
-        if (sep1 < 0) return;
-        var sep2 = e.data.indexOf('|', sep1 + 1);
-        if (sep2 < 0) return;
+        /* Server sends pre-rendered HTML <tr> fragments */
+        var er = document.getElementById('empty-row');
+        if (er) er.remove();
+        var tbody = document.getElementById('results-tbody');
+        tbody.insertAdjacentHTML('beforeend', e.data);
+        /* Count inserted data rows (not detail rows) */
+        var inserted = e.data.split('result-row').length - 1;
+        rowCount += inserted;
+        document.getElementById('row-count').textContent = rowCount.toLocaleString();
+        var wrap = document.querySelector('.table-wrap');
+        wrap.scrollTop = wrap.scrollHeight;
+      });
 
-        var agentId = e.data.substring(0, sep1);
-        var plugin  = e.data.substring(sep1 + 1, sep2);
-        var payload = e.data.substring(sep2 + 1);
-        var agentName = agentDisplayName(agentId);
-
-        if (plugin === 'chargen') {
-          addRow([agentName, payload]);
-        } else if (plugin === 'procfetch') {
-          /* pid|name|path|sha1 */
-          var parts = payload.split('|');
-          if (parts.length >= 4) {
-            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'),
-                    parts[2].replace(/\\\|/g,'|'), parts[3]]);
-          } else {
-            addRow([agentName, payload]);
-          }
-        } else if (plugin === 'netstat') {
-          /* proto|local_addr|local_port|remote_addr|remote_port|state|pid */
-          var parts = payload.split('|');
-          if (parts.length >= 7) {
-            addRow([agentName, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]]);
-          } else {
-            addRow([agentName, payload]);
-          }
-        } else if (plugin === 'sockwho') {
-          /* pid|name|path|proto|local_addr|local_port|remote_addr|remote_port|state */
-          var parts = payload.split('|');
-          if (parts.length >= 9) {
-            addRow([agentName, parts[0],
-                    parts[1].replace(/\\\|/g,'|'),
-                    parts[2].replace(/\\\|/g,'|'),
-                    parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
-          } else {
-            addRow([agentName, payload]);
-          }
-        } else if (plugin === 'vuln_scan') {
-          /* severity|category|title|detail */
-          var parts = payload.split('|');
-          if (parts.length >= 4) {
-            addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
-          } else if (parts.length >= 2) {
-            addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
-          } else {
-            addRow([agentName, payload, '', '', '']);
-          }
-        } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
-          /* key|value */
-          var parts = payload.split('|');
-          if (parts.length >= 2) {
-            addRow([agentName, parts[0], parts.slice(1).join('|')]);
-          } else {
-            addRow([agentName, payload, '']);
-          }
-        } else {
-          addRow([agentName, payload]);
-        }
+      evtSource.addEventListener('output-columns', function(e) {
+        document.getElementById('results-thead').innerHTML = e.data;
       });
 
       evtSource.addEventListener('command-status', function(e) {

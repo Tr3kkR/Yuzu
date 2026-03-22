@@ -1,9 +1,5 @@
 ioc_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
-
-if host_machine.system() == 'windows'
-  ioc_deps += cxx.find_library('iphlpapi')
-  ioc_deps += cxx.find_library('ws2_32')
-endif
+# Windows: ws2_32.lib, iphlpapi.lib linked via #pragma comment(lib) in source
 
 shared_library(
   'ioc',

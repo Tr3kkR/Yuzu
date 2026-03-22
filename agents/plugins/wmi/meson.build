@@ -1,7 +1,5 @@
 wmi_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
-if host_machine.system() == 'windows'
-  wmi_deps += [cxx.find_library('wbemuuid'), cxx.find_library('ole32'), cxx.find_library('oleaut32')]
-endif
+# Windows: wbemuuid.lib, ole32.lib, oleaut32.lib linked via #pragma comment(lib) in source
 
 shared_library(
   'wmi',

@@ -495,7 +495,15 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
 
     while (!state->queue.empty()) {
         auto& ev = state->queue.front();
-        std::string sse = "event: " + ev.event_type + "\ndata: " + ev.data + "\n\n";
+        // SSE spec: multi-line data needs "data: " prefix on each line
+        std::string sse = "event: " + ev.event_type + "\ndata: ";
+        for (auto ch : ev.data) {
+            if (ch == '\n')
+                sse += "\ndata: ";
+            else
+                sse += ch;
+        }
+        sse += "\n\n";
         if (!sink.write(sse.data(), sse.size())) {
             return false;
         }
@@ -610,6 +618,164 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
 };
+
+// -- Server-side SSE row rendering (free functions, used by both
+//    AgentServiceImpl and ServerImpl) ─────────────────────────────────────────
+
+inline std::string sse_html_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&#39;"; break;
+        default: out += c;
+        }
+    }
+    return out;
+}
+
+struct ColumnSchema {
+    std::vector<std::string> headers;
+};
+
+inline const ColumnSchema& get_column_schema(const std::string& plugin) {
+    static const std::unordered_map<std::string, ColumnSchema> schemas = {
+        {"chargen",   {{"Agent", "Output"}}},
+        {"procfetch", {{"Agent", "PID", "Name", "Path", "SHA-1"}}},
+        {"netstat",   {{"Agent", "Proto", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State", "PID"}}},
+        {"sockwho",   {{"Agent", "PID", "Name", "Path", "Proto", "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}}},
+        {"vuln_scan", {{"Agent", "Severity", "Category", "Title", "Detail"}}},
+    };
+    static const ColumnSchema kv_schema{{"Agent", "Key", "Value"}};
+    static const ColumnSchema fallback{{"Agent", "Output"}};
+    static const std::unordered_set<std::string> kv_plugins = {
+        "status", "device_identity", "os_info", "hardware", "users",
+        "installed_apps", "msi_packages", "network_config", "diagnostics",
+        "agent_actions", "processes", "services", "filesystem",
+        "network_diag", "network_actions", "firewall", "antivirus",
+        "bitlocker", "windows_updates", "event_logs", "sccm",
+        "script_exec", "software_actions"
+    };
+    auto it = schemas.find(plugin);
+    if (it != schemas.end()) return it->second;
+    if (kv_plugins.contains(plugin)) return kv_schema;
+    return fallback;
+}
+
+inline std::string render_column_headers(const std::string& plugin) {
+    const auto& schema = get_column_schema(plugin);
+    std::string html = "<tr>";
+    for (size_t i = 0; i < schema.headers.size(); ++i) {
+        if (i == 0)
+            html += "<th class=\"col-agent\">";
+        else
+            html += "<th>";
+        html += sse_html_escape(schema.headers[i]) + "</th>";
+    }
+    html += "</tr>";
+    return html;
+}
+
+inline std::vector<std::string> split_pipe(const std::string& s) {
+    std::vector<std::string> parts;
+    std::string cur;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') {
+            cur += '|';
+            ++i;
+        } else if (s[i] == '|') {
+            parts.push_back(std::move(cur));
+            cur.clear();
+        } else {
+            cur += s[i];
+        }
+    }
+    parts.push_back(std::move(cur));
+    return parts;
+}
+
+inline std::string render_output_row(const std::string& agent_name,
+                                     const std::string& plugin,
+                                     const std::string& line) {
+    const auto& schema = get_column_schema(plugin);
+
+    std::vector<std::string> cells;
+    if (plugin == "chargen") {
+        cells = {line};
+    } else if (plugin == "procfetch") {
+        auto parts = split_pipe(line);
+        if (parts.size() >= 4)
+            cells = {parts[0], parts[1], parts[2], parts[3]};
+        else
+            cells = {line};
+    } else if (plugin == "netstat") {
+        auto parts = split_pipe(line);
+        if (parts.size() >= 7)
+            cells = {parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]};
+        else
+            cells = {line};
+    } else if (plugin == "sockwho") {
+        auto parts = split_pipe(line);
+        if (parts.size() >= 9)
+            cells = {parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]};
+        else
+            cells = {line};
+    } else if (plugin == "vuln_scan") {
+        auto parts = split_pipe(line);
+        if (parts.size() >= 4) {
+            std::string detail_text;
+            for (size_t i = 3; i < parts.size(); ++i) {
+                if (i > 3) detail_text += '|';
+                detail_text += parts[i];
+            }
+            cells = {parts[0], parts[1], parts[2], detail_text};
+        } else if (parts.size() >= 2) {
+            std::string rest;
+            for (size_t i = 1; i < parts.size(); ++i) {
+                if (i > 1) rest += '|';
+                rest += parts[i];
+            }
+            cells = {parts[0], rest, "", ""};
+        } else {
+            cells = {line, "", "", ""};
+        }
+    } else {
+        auto sep = line.find('|');
+        if (sep != std::string::npos)
+            cells = {line.substr(0, sep), line.substr(sep + 1)};
+        else
+            cells = {line, ""};
+    }
+
+    auto esc_agent = sse_html_escape(agent_name);
+
+    std::string html = "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">";
+    html += "<td class=\"col-agent\" title=\"" + esc_agent + "\">" + esc_agent + "</td>";
+    for (const auto& cell : cells) {
+        auto esc = sse_html_escape(cell);
+        html += "<td title=\"" + esc + "\">" + esc + "</td>";
+    }
+    html += "</tr>";
+
+    auto col_count = schema.headers.size();
+    html += "<tr class=\"result-detail\"><td colspan=\"" + std::to_string(col_count) +
+            "\"><div class=\"detail-content\">";
+    html += "<div class=\"detail-label\">Agent</div>";
+    html += "<div class=\"detail-value\">" + esc_agent + "</div>";
+    for (size_t i = 0; i < cells.size(); ++i) {
+        std::string label = (i + 1 < col_count) ? schema.headers[i + 1]
+                                                 : "Column " + std::to_string(i + 2);
+        html += "<div class=\"detail-label\">" + sse_html_escape(label) + "</div>";
+        html += "<div class=\"detail-value\">" + sse_html_escape(cells[i]) + "</div>";
+    }
+    html += "</div></td></tr>";
+
+    return html;
+}
 
 // -- AgentServiceImpl ---------------------------------------------------------
 
@@ -972,8 +1138,10 @@ public:
                 // Determine the plugin from command_id prefix (format: plugin-timestamp)
                 std::string plugin = extract_plugin(resp.command_id());
 
-                // Publish as generic output event: agent_id|plugin|data
-                bus_.publish("output", agent_id + "|" + plugin + "|" + resp.output());
+                // Publish pre-rendered HTML rows as SSE event
+                auto html_rows = render_output_rows(agent_id, plugin, resp.output());
+                if (!html_rows.empty())
+                    bus_.publish("output", html_rows);
 
                 // Store streaming response
                 if (response_store_) {
@@ -1191,6 +1359,42 @@ private:
             return command_id.substr(0, dash);
         }
         return command_id;
+    }
+
+    // Render all output lines (possibly multi-line from buffered output) as HTML rows.
+    std::string render_output_rows(const std::string& agent_id,
+                                   const std::string& plugin,
+                                   const std::string& output) {
+        std::string agent_name;
+        auto session = registry_.get_session(agent_id);
+        if (session && !session->hostname.empty())
+            agent_name = session->hostname;
+        else if (agent_id.size() > 12)
+            agent_name = agent_id.substr(0, 12);
+        else
+            agent_name = agent_id.empty() ? "?" : agent_id;
+
+        std::string html;
+        std::string::size_type pos = 0;
+        while (pos < output.size()) {
+            auto nl = output.find('\n', pos);
+            std::string line;
+            if (nl != std::string::npos) {
+                line = output.substr(pos, nl - pos);
+                pos = nl + 1;
+            } else {
+                line = output.substr(pos);
+                pos = output.size();
+            }
+            if (line.empty()) continue;
+            html += render_output_row(agent_name, plugin, line);
+        }
+
+        if (html.empty() && !output.empty()) {
+            html = render_output_row(agent_name, plugin, output);
+        }
+
+        return html;
     }
 
     // ── OTA Update RPCs ─────────────────────────────────────────────────────
@@ -5697,6 +5901,10 @@ private:
                                 "application/json");
                 return;
             }
+
+            // Publish column headers so dashboard updates thead
+            event_bus_.publish("output-columns",
+                               detail::render_column_headers(plugin));
 
             metrics_.counter("yuzu_commands_dispatched_total").increment();
             spdlog::info("Command dispatched: {}:{} → {} agent(s)", plugin, action, sent);

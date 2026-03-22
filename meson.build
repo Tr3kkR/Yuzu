@@ -147,8 +147,9 @@ if build_tests
 endif
 
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
+build_gateway = get_option('build_gateway')
 _rebar3 = find_program('rebar3', required: false)
-if _rebar3.found()
+if build_gateway and _rebar3.found()
   _gw_src = meson.project_source_root() / 'gateway'
   _gw_build_script = meson.project_source_root() / 'scripts' / 'build_gateway.py'
   # rebar3 must run from inside the gateway/ directory.

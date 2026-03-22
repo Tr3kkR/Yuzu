@@ -44,6 +44,8 @@
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
 #endif
 
 namespace {

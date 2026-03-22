@@ -16,7 +16,7 @@ _VS_ROOT="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
 _VS_INSTALLER="/c/Program Files (x86)/Microsoft Visual Studio/Installer"
 _VC_TOOLS="${_VS_ROOT}/VC/Tools/MSVC/${_MSVC_VER}"
 _WIN_SDK="/c/Program Files (x86)/Windows Kits/10"
-_VCPKG="/c/vcpkg"
+_VCPKG="/c/Users/natha/vcpkg"
 _PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _CMAKE_DIR="/c/Program Files/CMake/bin"
 _PYTHON_DIR="/c/Python314"
@@ -34,7 +34,7 @@ export VSCMD_VER="17.14.27"
 # ── Temp directories (Windows-native paths for non-MSYS2 tools like rebar3) ──
 # MSYS2 sets TMP=/tmp which native Windows programs interpret as \\tmp\\ (UNC),
 # causing rebar3 fetches to fail when moving downloaded dependencies.
-export TMP="C:\\Users\\${USER}\\AppData\\Local\\Temp"
+export TMP="C:\\Users\\${USER:-${USERNAME}}\\AppData\\Local\\Temp"
 export TEMP="$TMP"
 
 # ── CMake / build config ─────────────────────────────────────────────────────
@@ -42,8 +42,8 @@ export CMAKE_GENERATOR="Ninja"
 export CMAKE_BUILD_TYPE="Debug"
 
 # ── vcpkg ─────────────────────────────────────────────────────────────────────
-export VCPKG_ROOT="C:\\vcpkg"
-export CMAKE_TOOLCHAIN_FILE="C:\\vcpkg\\scripts\\buildsystems\\vcpkg.cmake"
+export VCPKG_ROOT="C:\\Users\\natha\\vcpkg"
+export CMAKE_TOOLCHAIN_FILE="C:\\Users\\natha\\vcpkg\\scripts\\buildsystems\\vcpkg.cmake"
 export VCPKG_DEFAULT_TRIPLET="x64-windows"
 
 # ── INCLUDE paths for cl.exe (Windows backslash format — cl.exe is native) ───
@@ -76,8 +76,11 @@ _NEW_PATH+="${_VS_ROOT}/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja:"
 _NEW_PATH+="${_PYTHON_DIR}:"
 _NEW_PATH+="${_MESON_DIR}:"
 _NEW_PATH+="${_VCPKG}:"
-_NEW_PATH+="${_PROJECT_ROOT}/vcpkg_installed/x64-windows/tools/protobuf:"
-_NEW_PATH+="${_PROJECT_ROOT}/vcpkg_installed/x64-windows/tools/grpc:"
+_NEW_PATH+="${_VCPKG}/installed/x64-windows/tools/protobuf:"
+_NEW_PATH+="${_VCPKG}/installed/x64-windows/tools/grpc:"
+_NEW_PATH+="/c/erlang/OTP:"
+_NEW_PATH+="/c/erlang/OTP/bin:"
+_NEW_PATH+="/c/erlang/OTP/erts-16.0/bin:"
 _NEW_PATH+="${_WIN_SDK}/bin/${_SDK_VER}/x64:"
 
 export PATH="${_NEW_PATH}${PATH}"
@@ -105,6 +108,8 @@ _check vcpkg
 _check protoc
 _check grpc_cpp_plugin
 _check rc.exe
+_check erlc
+_check rebar3
 echo ""
 echo "  VCPKG_ROOT=$VCPKG_ROOT"
 echo "  CMAKE_GENERATOR=$CMAKE_GENERATOR"
