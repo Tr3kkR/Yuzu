@@ -4388,6 +4388,10 @@ private:
         web_server_ = std::make_unique<httplib::Server>();
 #endif
 
+        // Disable Nagle — SSE events are small and must reach the browser
+        // immediately, not wait 200ms for the TCP send buffer to coalesce.
+        web_server_->set_tcp_nodelay(true);
+
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
