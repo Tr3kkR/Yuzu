@@ -2059,6 +2059,16 @@ public:
     }
 
     void stop() noexcept override {
+        // Guard against re-entrant calls from repeated signals.
+        // The signal handler calls stop() directly, so a second Ctrl+C
+        // re-enters stop() on a different thread while the first is still
+        // joining threads — causing "Resource deadlock avoided".
+        bool expected = false;
+        if (!stop_entered_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel)) {
+            return;  // Another thread is already running stop()
+        }
+
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
 
@@ -9389,6 +9399,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> stop_entered_{false};
     std::atomic<bool> draining_{false};
 
     // Rate limiting
