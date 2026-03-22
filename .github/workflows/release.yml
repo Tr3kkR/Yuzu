@@ -258,6 +258,59 @@ jobs:
           & ./builddir/yuzu-agent.exe --help
         continue-on-error: true
 
+      - name: Sign binaries (Authenticode)
+        if: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
+        env:
+          WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          # Decode the PFX certificate from base64 secret
+          $certPath = "${{ runner.temp }}\signing-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
+
+          # Find signtool.exe from the Windows SDK
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $signtool) {
+            Write-Error "signtool.exe not found"
+            exit 1
+          }
+          Write-Host "Using signtool: $signtool"
+
+          # Collect all EXE and DLL files to sign
+          $filesToSign = @()
+          $filesToSign += Get-ChildItem builddir -Filter "yuzu-server.exe"
+          $filesToSign += Get-ChildItem builddir -Filter "yuzu-agent.exe"
+          $filesToSign += Get-ChildItem builddir -Filter "yuzu_agent_core.dll" -Recurse
+          $filesToSign += Get-ChildItem builddir/agents/plugins -Filter "*.dll" -Recurse
+
+          foreach ($file in $filesToSign) {
+            Write-Host "Signing: $($file.FullName)"
+            & $signtool sign `
+              /f $certPath `
+              /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
+              /fd sha256 `
+              /tr http://timestamp.digicert.com `
+              /td sha256 `
+              /d "Yuzu Endpoint Management" `
+              $file.FullName
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to sign $($file.Name)"
+              exit 1
+            }
+
+            # Verify signature
+            & $signtool verify /pa /v $file.FullName
+          }
+
+          # Clean up certificate
+          Remove-Item $certPath -Force
+
       - name: Package archive
         shell: pwsh
         run: |
@@ -354,6 +407,97 @@ jobs:
         run: |
           ./builddir/yuzu-server --help || true
           ./builddir/yuzu-agent --help || true
+
+      - name: Sign binaries (codesign)
+        if: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+        env:
+          MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          # Create a temporary keychain for signing
+          KEYCHAIN_PATH="${RUNNER_TEMP}/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 1800 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Import the Developer ID certificate
+          CERT_PATH="${RUNNER_TEMP}/signing-cert.p12"
+          echo "${MACOS_SIGNING_CERT}" | base64 --decode > "${CERT_PATH}"
+          security import "${CERT_PATH}" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "${MACOS_SIGNING_CERT_PASSWORD}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          # Allow codesign to access the keychain without UI prompt
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          # Add temporary keychain to the search list
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" $(security list-keychains -d user | tr -d '"')
+
+          # Sign all binaries and dylibs with hardened runtime
+          IDENTITY="${MACOS_SIGNING_IDENTITY}"
+          for binary in builddir/yuzu-server builddir/yuzu-agent; do
+            echo "Signing: ${binary}"
+            codesign --force --options runtime \
+              --sign "${IDENTITY}" \
+              --timestamp \
+              "${binary}"
+            codesign --verify --verbose "${binary}"
+          done
+
+          # Sign dylibs
+          find builddir -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
+            echo "Signing: ${dylib}"
+            codesign --force --options runtime \
+              --sign "${IDENTITY}" \
+              --timestamp \
+              "${dylib}"
+          done
+
+          # Clean up certificate file
+          rm -f "${CERT_PATH}"
+
+      - name: Notarize binaries
+        if: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
+        env:
+          MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          # Create a ZIP of the signed binaries for notarization submission
+          NOTARIZE_ZIP="${RUNNER_TEMP}/yuzu-notarize.zip"
+          zip -j "${NOTARIZE_ZIP}" \
+            builddir/yuzu-server \
+            builddir/yuzu-agent
+
+          # Add dylibs to the notarization payload
+          find builddir -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
+
+          # Submit for notarization and wait for result
+          echo "Submitting for Apple notarization..."
+          xcrun notarytool submit "${NOTARIZE_ZIP}" \
+            --apple-id "${MACOS_NOTARIZATION_APPLE_ID}" \
+            --password "${MACOS_NOTARIZATION_PASSWORD}" \
+            --team-id "${MACOS_NOTARIZATION_TEAM_ID}" \
+            --wait \
+            --timeout 15m
+
+          echo "Notarization complete"
+          rm -f "${NOTARIZE_ZIP}"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/signing.keychain-db"
+          if [ -f "${KEYCHAIN_PATH}" ]; then
+            security delete-keychain "${KEYCHAIN_PATH}" 2>/dev/null || true
+          fi
 
       - name: Package archive
         run: |
