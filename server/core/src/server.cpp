@@ -2124,10 +2124,15 @@ public:
             shared_instr_db_ = nullptr;
         }
 
+        // Shutdown with a deadline — without one, Shutdown() waits
+        // indefinitely for all RPCs to finish.  The Subscribe RPC is a
+        // long-lived bidirectional stream that never completes on its own,
+        // so a bare Shutdown() hangs forever.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
         if (agent_server_)
-            agent_server_->Shutdown();
+            agent_server_->Shutdown(deadline);
         if (mgmt_server_)
-            mgmt_server_->Shutdown();
+            mgmt_server_->Shutdown(deadline);
     }
 
 private:
