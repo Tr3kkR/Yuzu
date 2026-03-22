@@ -1581,6 +1581,13 @@ public:
         return grpc::Status::OK;
     }
 
+    // -- Status accessors for dashboard -----------------------------------------
+
+    std::size_t session_count() const {
+        std::lock_guard lock(sessions_mu_);
+        return gateway_sessions_.size();
+    }
+
 private:
     AgentRegistry& registry_;
     EventBus& bus_;
@@ -1592,7 +1599,7 @@ private:
     InventoryStore* inventory_store_{nullptr};
 
     // Map of gateway session_id → agent_id for validation.
-    std::mutex sessions_mu_;
+    mutable std::mutex sessions_mu_;
     std::unordered_map<std::string, std::string> gateway_sessions_;
 };
 
@@ -2630,6 +2637,50 @@ private:
 
     // -- HTML fragment renderers for HTMX Settings page -------------------------
 
+    // -- Server Configuration fragment ----------------------------------------
+
+    std::string render_server_config_fragment() {
+        std::string html;
+
+        html += "<table class=\"user-table\" style=\"font-size:0.8rem\">"
+                "<thead><tr><th>Setting</th><th>Value</th></tr></thead>"
+                "<tbody>";
+
+        // Network listeners
+        html += "<tr><td>Agent gRPC Address</td><td><code>" +
+                html_escape(cfg_.listen_address) + "</code></td></tr>";
+        html += "<tr><td>Management gRPC Address</td><td><code>" +
+                html_escape(cfg_.management_address) + "</code></td></tr>";
+        html += "<tr><td>Web UI Address</td><td><code>" +
+                html_escape(cfg_.web_address) + "</code></td></tr>";
+        html += "<tr><td>Web UI Port</td><td><code>" +
+                std::to_string(cfg_.web_port) + "</code></td></tr>";
+
+        // Session management
+        html += "<tr><td>Session Timeout</td><td><code>" +
+                std::to_string(cfg_.session_timeout.count()) + "s</code></td></tr>";
+        html += "<tr><td>Max Agents</td><td><code>" +
+                std::to_string(cfg_.max_agents) + "</code></td></tr>";
+
+        // Authentication
+        std::string auth_path_str = cfg_.auth_config_path.empty()
+            ? std::string("(default)")
+            : html_escape(cfg_.auth_config_path.string());
+        html += "<tr><td>Auth Config Path</td><td><span class=\"file-name\">" +
+                auth_path_str + "</span></td></tr>";
+
+        // Rate limiting
+        html += "<tr><td>API Rate Limit</td><td><code>" +
+                std::to_string(cfg_.rate_limit) + "</code> req/s per IP</td></tr>";
+        html += "<tr><td>Login Rate Limit</td><td><code>" +
+                std::to_string(cfg_.login_rate_limit) + "</code> req/s per IP</td></tr>";
+
+        html += "</tbody></table>";
+        return html;
+    }
+
+    // -- TLS fragment ---------------------------------------------------------
+
     std::string render_tls_fragment() {
         std::string checked = cfg_.tls_enabled ? " checked" : "";
         std::string status_color = cfg_.tls_enabled ? "#3fb950" : "#f85149";
@@ -2643,7 +2694,7 @@ private:
         std::string ca_name =
             cfg_.tls_ca_cert.empty() ? "No file" : html_escape(cfg_.tls_ca_cert.string());
 
-        return "<form id=\"tls-form\">"
+        std::string html = "<form id=\"tls-form\">"
                "<div class=\"form-row\">"
                "  <label>gRPC mTLS</label>"
                "  <label class=\"toggle\">"
@@ -2721,8 +2772,41 @@ private:
                "    </div>"
                "  </div>"
                "</div>"
-               "</form>"
-               "<div class=\"feedback\" id=\"tls-feedback\"></div>";
+               "</form>";
+
+        // One-way TLS
+        std::string owt_color = cfg_.allow_one_way_tls ? "#f0883e" : "#8b949e";
+        std::string owt_text = cfg_.allow_one_way_tls ? "Enabled (no client cert required)" : "Disabled (mTLS enforced)";
+        html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
+                "  <label>One-Way TLS</label>"
+                "  <span style=\"font-size:0.8rem;color:" + owt_color + "\">" + owt_text + "</span>"
+                "</div>";
+
+        // Management TLS overrides
+        std::string mgmt_cert = cfg_.mgmt_tls_server_cert.empty() ? "Using agent TLS" : html_escape(cfg_.mgmt_tls_server_cert.string());
+        std::string mgmt_key = cfg_.mgmt_tls_server_key.empty() ? "Using agent TLS" : html_escape(cfg_.mgmt_tls_server_key.string());
+        std::string mgmt_ca = cfg_.mgmt_tls_ca_cert.empty() ? "Using agent TLS" : html_escape(cfg_.mgmt_tls_ca_cert.string());
+
+        html += "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
+                "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+                "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
+                "Management Listener TLS Override</div>"
+                "<div class=\"form-row\">"
+                "  <label>Mgmt Certificate</label>"
+                "  <span class=\"file-name\">" + mgmt_cert + "</span>"
+                "</div>"
+                "<div class=\"form-row\">"
+                "  <label>Mgmt Private Key</label>"
+                "  <span class=\"file-name\">" + mgmt_key + "</span>"
+                "</div>"
+                "<div class=\"form-row\">"
+                "  <label>Mgmt CA Cert</label>"
+                "  <span class=\"file-name\">" + mgmt_ca + "</span>"
+                "</div>"
+                "</div>";
+
+        html += "<div class=\"feedback\" id=\"tls-feedback\"></div>";
+        return html;
     }
 
     std::string render_users_fragment() {
@@ -3455,13 +3539,32 @@ private:
     // -- OTA Updates fragment renderer ----------------------------------------
 
     std::string render_updates_fragment() {
+        std::string html;
+
+        // Show OTA config values
+        std::string ota_color = cfg_.ota_enabled ? "#3fb950" : "#484f58";
+        std::string ota_text = cfg_.ota_enabled ? "Enabled" : "Disabled";
+        html += "<div class=\"form-row\">"
+                "  <label>OTA Updates</label>"
+                "  <span style=\"font-size:0.8rem;color:" + ota_color + ";font-weight:600\">" +
+                ota_text + "</span>"
+                "</div>";
+
+        std::string update_dir_str = cfg_.update_dir.empty()
+            ? std::string("(default)")
+            : html_escape(cfg_.update_dir.string());
+        html += "<div class=\"form-row\" style=\"margin-bottom:1rem\">"
+                "  <label>Update Directory</label>"
+                "  <span class=\"file-name\">" + update_dir_str + "</span>"
+                "</div>";
+
         if (!update_registry_) {
-            return "<span style=\"color:#484f58\">OTA updates are disabled "
-                   "(start server with <code>--ota-enabled</code>).</span>";
+            html += "<span style=\"color:#484f58\">OTA updates are disabled "
+                    "(start server with <code>--ota-enabled</code>).</span>";
+            return html;
         }
 
         auto packages = update_registry_->list_packages();
-        std::string html;
 
         // Fleet version summary
         {
@@ -3589,6 +3692,327 @@ private:
             "<button class=\"btn btn-primary\" type=\"submit\">Upload</button>"
             "</form></div>"
             "<div class=\"feedback\" id=\"updates-feedback\"></div>";
+
+        return html;
+    }
+
+    // -- Gateway fragment renderer --------------------------------------------
+
+    std::string render_gateway_fragment() {
+        bool enabled = gateway_service_ != nullptr;
+        std::string status_color = enabled ? "#3fb950" : "#484f58";
+        std::string status_text = enabled ? "Enabled" : "Disabled";
+
+        std::string html;
+
+        // Status row
+        html += "<div class=\"form-row\">"
+                "  <label>Upstream Service</label>"
+                "  <span style=\"font-size:0.8rem;color:" + status_color + ";font-weight:600\">" +
+                status_text + "</span>"
+                "</div>";
+
+        if (enabled) {
+            // Address
+            html += "<div class=\"form-row\">"
+                    "  <label>Listen Address</label>"
+                    "  <code style=\"font-size:0.8rem\">" +
+                    html_escape(cfg_.gateway_upstream_address) +
+                    "</code>"
+                    "</div>";
+
+            // Gateway mode
+            html += "<div class=\"form-row\">"
+                    "  <label>Gateway Mode</label>"
+                    "  <span style=\"font-size:0.8rem;color:" +
+                    std::string(cfg_.gateway_mode ? "#3fb950" : "#8b949e") + "\">" +
+                    (cfg_.gateway_mode ? "Active" : "Inactive") +
+                    "</span>"
+                    "</div>";
+
+            // Active sessions
+            auto count = gateway_service_->session_count();
+            html += "<div class=\"form-row\">"
+                    "  <label>Active Sessions</label>"
+                    "  <span style=\"font-size:0.8rem\">" + std::to_string(count) +
+                    " agent" + (count != 1 ? "s" : "") + " via gateway</span>"
+                    "</div>";
+        } else {
+            html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+                    "The gateway upstream service is not running. Start the server with "
+                    "<code>--gateway-upstream 0.0.0.0:50055</code> to enable it.</p>";
+        }
+
+        // Environment variable reference
+        html += "<div style=\"margin-top:1rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
+                "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+                "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
+                "Erlang Gateway Environment Variables</div>"
+                "<table class=\"user-table\" style=\"font-size:0.75rem\">"
+                "<thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead>"
+                "<tbody>"
+                "<tr><td><code>YUZU_GW_UPSTREAM_ADDR</code></td>"
+                "    <td>C++ server hostname</td><td><code>127.0.0.1</code></td></tr>"
+                "<tr><td><code>YUZU_GW_UPSTREAM_PORT</code></td>"
+                "    <td>C++ server port</td><td><code>50055</code></td></tr>"
+                "<tr><td><code>YUZU_GW_AGENT_PORT</code></td>"
+                "    <td>Agent-facing listener port</td><td><code>50051</code></td></tr>"
+                "<tr><td><code>YUZU_GW_MGMT_PORT</code></td>"
+                "    <td>Management listener port</td><td><code>50052</code></td></tr>"
+                "<tr><td><code>YUZU_GW_TLS_ENABLED</code></td>"
+                "    <td>TLS master switch</td><td><code>auto</code></td></tr>"
+                "<tr><td><code>YUZU_GW_TLS_CERTFILE</code></td>"
+                "    <td>Gateway certificate path</td><td>&mdash;</td></tr>"
+                "<tr><td><code>YUZU_GW_TLS_KEYFILE</code></td>"
+                "    <td>Gateway private key path</td><td>&mdash;</td></tr>"
+                "<tr><td><code>YUZU_GW_TLS_CACERTFILE</code></td>"
+                "    <td>CA certificate bundle</td><td>&mdash;</td></tr>"
+                "<tr><td><code>YUZU_GW_PROMETHEUS_PORT</code></td>"
+                "    <td>Prometheus metrics port</td><td><code>9568</code></td></tr>"
+                "<tr><td><code>YUZU_GW_HEALTH_PORT</code></td>"
+                "    <td>Health endpoint port</td><td><code>8080</code></td></tr>"
+                "</tbody></table>"
+                "</div>";
+
+        return html;
+    }
+
+    // -- HTTPS Dashboard fragment renderer ------------------------------------
+
+    std::string render_https_fragment() {
+        std::string html;
+
+        std::string status_color = cfg_.https_enabled ? "#3fb950" : "#484f58";
+        std::string status_text = cfg_.https_enabled ? "Enabled" : "Disabled";
+
+        html += "<div class=\"form-row\">"
+                "  <label>HTTPS</label>"
+                "  <span style=\"font-size:0.8rem;color:" + status_color + ";font-weight:600\">" +
+                status_text + "</span>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>HTTPS Port</label>"
+                "  <code style=\"font-size:0.8rem\">" + std::to_string(cfg_.https_port) + "</code>"
+                "</div>";
+
+        std::string https_cert = cfg_.https_cert_path.empty() ? "Not configured" : html_escape(cfg_.https_cert_path.string());
+        std::string https_key = cfg_.https_key_path.empty() ? "Not configured" : html_escape(cfg_.https_key_path.string());
+
+        html += "<div class=\"form-row\">"
+                "  <label>Certificate</label>"
+                "  <span class=\"file-name\">" + https_cert + "</span>"
+                "</div>";
+        html += "<div class=\"form-row\">"
+                "  <label>Private Key</label>"
+                "  <span class=\"file-name\">" + https_key + "</span>"
+                "</div>";
+
+        std::string redir_color = cfg_.https_redirect ? "#3fb950" : "#8b949e";
+        std::string redir_text = cfg_.https_redirect ? "Enabled" : "Disabled";
+        html += "<div class=\"form-row\">"
+                "  <label>HTTP Redirect</label>"
+                "  <span style=\"font-size:0.8rem;color:" + redir_color + "\">" + redir_text + "</span>"
+                "</div>";
+
+        if (!cfg_.https_enabled) {
+            html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+                    "Start the server with <code>--https --https-cert &lt;path&gt; --https-key &lt;path&gt;</code> to enable.</p>";
+        }
+
+        return html;
+    }
+
+    // -- Analytics fragment renderer ------------------------------------------
+
+    std::string render_analytics_fragment() {
+        std::string html;
+
+        std::string status_color = cfg_.analytics_enabled ? "#3fb950" : "#484f58";
+        std::string status_text = cfg_.analytics_enabled ? "Enabled" : "Disabled";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Analytics</label>"
+                "  <span style=\"font-size:0.8rem;color:" + status_color + ";font-weight:600\">" +
+                status_text + "</span>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Drain Interval</label>"
+                "  <code style=\"font-size:0.8rem\">" +
+                std::to_string(cfg_.analytics_drain_interval_seconds) + "s</code>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Batch Size</label>"
+                "  <code style=\"font-size:0.8rem\">" +
+                std::to_string(cfg_.analytics_batch_size) + "</code>"
+                "</div>";
+
+        // ClickHouse
+        bool ch_configured = !cfg_.clickhouse_url.empty();
+        std::string ch_color = ch_configured ? "#3fb950" : "#484f58";
+        std::string ch_text = ch_configured ? html_escape(cfg_.clickhouse_url) : "Not configured";
+
+        html += "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
+                "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
+                "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
+                "ClickHouse Integration</div>";
+        html += "<div class=\"form-row\">"
+                "  <label>URL</label>"
+                "  <span style=\"font-size:0.8rem;color:" + ch_color + "\">" + ch_text + "</span>"
+                "</div>";
+        if (ch_configured) {
+            html += "<div class=\"form-row\">"
+                    "  <label>Database</label>"
+                    "  <code style=\"font-size:0.8rem\">" + html_escape(cfg_.clickhouse_database) + "</code>"
+                    "</div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Table</label>"
+                    "  <code style=\"font-size:0.8rem\">" + html_escape(cfg_.clickhouse_table) + "</code>"
+                    "</div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Username</label>"
+                    "  <code style=\"font-size:0.8rem\">" +
+                    (cfg_.clickhouse_username.empty() ? std::string("(default)") : html_escape(cfg_.clickhouse_username)) +
+                    "</code></div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Password</label>"
+                    "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
+                    (cfg_.clickhouse_password.empty() ? std::string("(not set)") : std::string("********")) +
+                    "</span></div>";
+        }
+        html += "</div>";
+
+        // JSONL export
+        std::string jsonl_path = cfg_.analytics_jsonl_path.empty() ? "Not configured" : html_escape(cfg_.analytics_jsonl_path.string());
+        html += "<div class=\"form-row\" style=\"margin-top:0.5rem\">"
+                "  <label>JSONL Export</label>"
+                "  <span class=\"file-name\">" + jsonl_path + "</span>"
+                "</div>";
+
+        return html;
+    }
+
+    // -- Data Retention fragment renderer -------------------------------------
+
+    std::string render_data_retention_fragment() {
+        std::string html;
+
+        html += "<div class=\"form-row\">"
+                "  <label>Response Data</label>"
+                "  <code style=\"font-size:0.8rem\">" +
+                std::to_string(cfg_.response_retention_days) + " days</code>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Audit Logs</label>"
+                "  <code style=\"font-size:0.8rem\">" +
+                std::to_string(cfg_.audit_retention_days) + " days</code>"
+                "</div>";
+
+        return html;
+    }
+
+    // -- Vulnerability Management (NVD) fragment renderer ---------------------
+
+    std::string render_nvd_fragment() {
+        std::string html;
+
+        std::string status_color = cfg_.nvd_sync_enabled ? "#3fb950" : "#484f58";
+        std::string status_text = cfg_.nvd_sync_enabled ? "Enabled" : "Disabled";
+
+        html += "<div class=\"form-row\">"
+                "  <label>NVD Sync</label>"
+                "  <span style=\"font-size:0.8rem;color:" + status_color + ";font-weight:600\">" +
+                status_text + "</span>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Sync Interval</label>"
+                "  <code style=\"font-size:0.8rem\">" +
+                std::to_string(cfg_.nvd_sync_interval.count() / 3600) + " hours</code>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>API Key</label>"
+                "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
+                (cfg_.nvd_api_key.empty() ? std::string("Not configured (lower rate limits)") : std::string("Configured")) +
+                "</span></div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>HTTP Proxy</label>"
+                "  <span style=\"font-size:0.8rem\">" +
+                (cfg_.nvd_proxy.empty() ? std::string("<span style=\"color:#8b949e\">None</span>") : std::string("<code>") + html_escape(cfg_.nvd_proxy) + "</code>") +
+                "</span></div>";
+
+        if (!cfg_.nvd_sync_enabled) {
+            html += "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.5rem\">"
+                    "Start the server without <code>--no-nvd-sync</code> to enable CVE feed synchronization.</p>";
+        }
+
+        return html;
+    }
+
+    // -- Directory / OIDC fragment renderer ------------------------------------
+
+    std::string render_directory_fragment() {
+        std::string html;
+
+        bool oidc_configured = !cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty();
+
+        if (oidc_configured) {
+            html += "<div class=\"form-row\">"
+                    "  <label>OIDC Status</label>"
+                    "  <span style=\"font-size:0.8rem;color:#3fb950;font-weight:600\">Configured</span>"
+                    "</div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Issuer</label>"
+                    "  <code style=\"font-size:0.75rem;word-break:break-all\">" + html_escape(cfg_.oidc_issuer) + "</code>"
+                    "</div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Client ID</label>"
+                    "  <code style=\"font-size:0.75rem\">" + html_escape(cfg_.oidc_client_id) + "</code>"
+                    "</div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Client Secret</label>"
+                    "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
+                    (cfg_.oidc_client_secret.empty() ? std::string("Not set") : std::string("********")) +
+                    "</span></div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Redirect URI</label>"
+                    "  <code style=\"font-size:0.75rem\">" +
+                    (cfg_.oidc_redirect_uri.empty() ? std::string("(auto-computed)") : html_escape(cfg_.oidc_redirect_uri)) +
+                    "</code></div>";
+            html += "<div class=\"form-row\">"
+                    "  <label>Admin Group ID</label>"
+                    "  <code style=\"font-size:0.75rem\">" +
+                    (cfg_.oidc_admin_group.empty() ? std::string("(not set)") : html_escape(cfg_.oidc_admin_group)) +
+                    "</code></div>";
+        } else {
+            html += "<div style=\"opacity:0.5\">"
+                    "<div class=\"form-row\">"
+                    "  <label>Auth Source</label>"
+                    "  <select disabled>"
+                    "    <option>Local accounts</option>"
+                    "    <option>Active Directory</option>"
+                    "    <option>Microsoft Entra ID</option>"
+                    "  </select>"
+                    "</div>"
+                    "<div class=\"form-row\">"
+                    "  <label>Inherit roles from</label>"
+                    "  <select disabled>"
+                    "    <option>Manual assignment</option>"
+                    "    <option>AD Security Groups</option>"
+                    "    <option>Entra Roles</option>"
+                    "  </select>"
+                    "</div>"
+                    "</div>"
+                    "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.75rem\">"
+                    "OIDC SSO is not configured. Use <code>--oidc-issuer</code> and "
+                    "<code>--oidc-client-id</code> to enable. "
+                    "AD/Entra directory integration is planned for a future release.</p>";
+        }
 
         return html;
     }
@@ -5319,6 +5743,59 @@ private:
                              if (!require_admin(req, res))
                                  return;
                              res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/gateway",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_gateway_fragment(), "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/server-config",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_server_config_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/https",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_https_fragment(), "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/analytics",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_analytics_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/data-retention",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_data_retention_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/nvd",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_nvd_fragment(), "text/html; charset=utf-8");
+                         });
+
+        web_server_->Get("/fragments/settings/directory",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_directory_fragment(),
+                                             "text/html; charset=utf-8");
                          });
 
         // Upload new update package

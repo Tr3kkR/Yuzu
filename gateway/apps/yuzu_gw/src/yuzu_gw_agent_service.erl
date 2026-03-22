@@ -121,10 +121,9 @@ subscribe(Ref, State) ->
 %% Subscribe stream loop: relay messages between grpcbox and the agent process.
 %%
 %% Backpressure: before writing a command to the HTTP/2 stream, we check
-%% our own message queue length. If it exceeds the threshold (1000), we
-%% emit a telemetry event and skip the send to prevent unbounded mailbox
-%% growth under load.
--define(BACKPRESSURE_THRESHOLD, 1000).
+%% our own message queue length. If it exceeds the threshold (configurable
+%% via backpressure_threshold, default 1000), we emit a telemetry event
+%% and skip the send to prevent unbounded mailbox growth under load.
 
 stream_loop(Ref, State, AgentPid) ->
     receive
@@ -157,8 +156,9 @@ stream_loop(Ref, State, AgentPid) ->
 
 %% @doc Check if our message queue is too deep; emit telemetry if so.
 check_backpressure() ->
+    Threshold = application:get_env(yuzu_gw, backpressure_threshold, 1000),
     case process_info(self(), message_queue_len) of
-        {message_queue_len, Len} when Len > ?BACKPRESSURE_THRESHOLD ->
+        {message_queue_len, Len} when Len > Threshold ->
             telemetry:execute([yuzu, gw, stream, backpressure],
                               #{queue_len => Len},
                               #{stream_pid => self()}),

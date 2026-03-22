@@ -32,6 +32,7 @@
     %% Upstream (C++ server)
     [yuzu, gw, upstream, rpc_latency],
     [yuzu, gw, upstream, rpc_error],
+    [yuzu, gw, upstream, circuit_state],
 
     %% Cluster
     [yuzu, gw, cluster, node_up],
@@ -110,6 +111,10 @@ handle_event([yuzu, gw, upstream, rpc_error], #{count := N}, Meta, _Config) ->
     Code = maps:get(code, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_upstream_rpc_errors_total, [RpcName, Code], N);
 
+handle_event([yuzu, gw, upstream, circuit_state], #{count := N}, Meta, _Config) ->
+    State = maps:get(state, Meta, <<"unknown">>),
+    prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [State], N);
+
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_cluster_events_total, [<<"node_up">>, Node], 1);
@@ -166,6 +171,10 @@ declare_metrics() ->
         {name, yuzu_gw_upstream_rpc_errors_total},
         {labels, [rpc_name, code]},
         {help, "Upstream RPC errors by method and status code"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_upstream_circuit_transitions_total},
+        {labels, [state]},
+        {help, "Circuit breaker state transitions (closed, open, half_open)"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_cluster_events_total},
         {labels, [event, node]},

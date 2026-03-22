@@ -194,6 +194,23 @@ extern const char* const kSettingsHtml =
 
   <div class="content">
 
+    <!-- ── Server Configuration ───────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Server Configuration</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Network listeners, session limits, and rate limiting.
+          These values are set at server startup via CLI flags or environment variables.
+        </p>
+        <div id="server-config-section"
+             hx-get="/fragments/settings/server-config"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── TLS Configuration ─────────────────────────────── -->
     <div class="section">
       <div class="section-header">TLS / mTLS Configuration</div>
@@ -201,6 +218,22 @@ extern const char* const kSettingsHtml =
         <!-- TLS fragment loaded via HTMX on page load -->
         <div id="tls-section"
              hx-get="/fragments/settings/tls"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── HTTPS Dashboard ────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">HTTPS Dashboard</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          TLS termination for the web dashboard and REST API.
+        </p>
+        <div id="https-section"
+             hx-get="/fragments/settings/https"
              hx-trigger="load"
              hx-swap="innerHTML">
           <span style="color:#484f58">Loading...</span>
@@ -311,6 +344,71 @@ extern const char* const kSettingsHtml =
 
 )HTM"
     R"HTM(
+    <!-- ── Gateway ────────────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Gateway</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          The Erlang/OTP gateway node sits between agents and this server,
+          providing connection multiplexing, heartbeat batching, and circuit breaker protection.
+        </p>
+        <div id="gateway-section"
+             hx-get="/fragments/settings/gateway"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Analytics & Telemetry ─────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Analytics &amp; Telemetry</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Event collection, ClickHouse integration, and JSONL export.
+        </p>
+        <div id="analytics-section"
+             hx-get="/fragments/settings/analytics"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Data Retention ─────────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Data Retention</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Retention policies for response data and audit logs.
+        </p>
+        <div id="data-retention-section"
+             hx-get="/fragments/settings/data-retention"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Vulnerability Management ───────────────────────── -->
+    <div class="section">
+      <div class="section-header">Vulnerability Management</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          NVD CVE feed synchronization for vulnerability scanning.
+        </p>
+        <div id="nvd-section"
+             hx-get="/fragments/settings/nvd"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Management Groups ──────────────────────────────── -->
     <div class="section">
       <div class="section-header">Management Groups</div>
@@ -344,31 +442,16 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
-    <!-- ── Directory Integration (coming soon) ───────────── -->
-    <div class="section coming-soon">
-      <span class="coming-soon-badge">COMING SOON</span>
-      <div class="section-header">Directory Integration</div>
+    <!-- ── Directory Integration / OIDC SSO ──────────────── -->
+    <div class="section">
+      <div class="section-header">Directory Integration / OIDC SSO</div>
       <div class="section-body">
-        <div class="form-row">
-          <label>Auth Source</label>
-          <select disabled>
-            <option>Local accounts</option>
-            <option>Active Directory</option>
-            <option>Microsoft Entra ID</option>
-          </select>
+        <div id="directory-section"
+             hx-get="/fragments/settings/directory"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
         </div>
-        <div class="form-row">
-          <label>Inherit roles from</label>
-          <select disabled>
-            <option>Manual assignment</option>
-            <option>AD Security Groups</option>
-            <option>Entra Roles</option>
-          </select>
-        </div>
-        <p style="font-size:0.75rem;color:#8b949e;margin-top:0.75rem">
-          Domain-joined and non-domain-joined machines will both be supported.
-          Agents report domain membership via the <code>device_identity</code> plugin.
-        </p>
       </div>
     </div>
 
