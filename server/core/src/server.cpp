@@ -4896,19 +4896,16 @@ private:
                     res.set_content(R"({"error":{"code":404,"message":"OIDC not configured"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
-                // Use configured redirect URI (from --oidc-redirect-uri or auto-computed).
-                // Falling back to Host header is a security risk (Host header manipulation).
-                std::string redirect_uri = cfg_.oidc_redirect_uri;
-                if (redirect_uri.empty()) {
-                    auto host = req.get_header_value("Host");
-                    if (!host.empty()) {
-                        spdlog::warn("OIDC redirect_uri derived from Host header — set "
-                                     "--oidc-redirect-uri for production deployments");
-                        auto scheme = cfg_.https_enabled ? "https" : "http";
-                        redirect_uri = std::string(scheme) + "://" + host + "/auth/callback";
-                    }
+                // Use the configured redirect URI only — never derive from the
+                // Host header, which can be manipulated for phishing attacks (M3).
+                if (cfg_.oidc_redirect_uri.empty()) {
+                    res.status = 500;
+                    res.set_content(R"({"error":{"code":500,"message":"OIDC redirect_uri not configured — set --oidc-redirect-uri or YUZU_OIDC_REDIRECT_URI"},"meta":{"api_version":"v1"}})",
+                                    "application/json");
+                    spdlog::error("OIDC auth flow blocked: redirect_uri not configured");
+                    return;
                 }
-                auto auth_url = oidc_provider_->start_auth_flow(redirect_uri);
+                auto auth_url = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
                 res.set_redirect(auth_url);
             });
 

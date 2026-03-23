@@ -47,6 +47,7 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -373,8 +374,9 @@ public:
     void run() override {
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
 
-        // 1. Load plugins
-        auto scan = PluginLoader::scan(cfg_.plugin_dir);
+        // 1. Load plugins (with optional allowlist verification)
+        auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
+        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist);
 
         // Collect successfully loaded handles first (before init)
         std::vector<PluginHandle> candidates;
@@ -831,11 +833,40 @@ public:
             }
 
             // 5. Read commands from server and dispatch to plugins
+            dedup_current_.clear();  // Fresh dedup sets per connection
+            dedup_previous_.clear();
             bool update_verified = false;
             pb::CommandRequest cmd;
             while (stream->Read(&cmd)) {
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+
+                // Command replay protection: reject duplicate command_ids
+                if (cmd.command_id().empty()) {
+                    spdlog::warn("Received command with empty command_id — replay "
+                                 "protection cannot apply");
+                } else {
+                    if (dedup_current_.count(cmd.command_id()) ||
+                        dedup_previous_.count(cmd.command_id())) {
+                        spdlog::warn("Replay detected: duplicate command_id={} — rejecting",
+                                     cmd.command_id());
+                        pb::CommandResponse replay_resp;
+                        replay_resp.set_command_id(cmd.command_id());
+                        replay_resp.set_status(pb::CommandResponse::REJECTED);
+                        replay_resp.set_output("command replay rejected: duplicate command_id");
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(replay_resp, grpc::WriteOptions());
+                        continue;
+                    }
+                    // Double-buffer rotation: when current fills, discard previous,
+                    // swap current → previous, start fresh current.
+                    if (dedup_current_.size() >= kMaxDedupEntries) {
+                        spdlog::debug("Dedup buffer rotation ({} entries)", kMaxDedupEntries);
+                        dedup_previous_ = std::move(dedup_current_);
+                        dedup_current_.clear();
+                    }
+                    dedup_current_.insert(cmd.command_id());
+                }
 
                 // Write health marker after first successful read (OTA rollback guard)
                 if (!update_verified) {
@@ -1059,6 +1090,15 @@ private:
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;
+
+    // M8: Command replay protection — double-buffer dedup of command IDs.
+    // Two sets: "current" and "previous". When current fills, previous is
+    // discarded, current becomes previous, and a fresh current starts.
+    // Both sets are checked for duplicates, so recently-seen IDs are always
+    // protected. Cleared on each reconnect.
+    static constexpr size_t kMaxDedupEntries = 5000;
+    std::unordered_set<std::string> dedup_current_;
+    std::unordered_set<std::string> dedup_previous_;
 };
 
 // Factory

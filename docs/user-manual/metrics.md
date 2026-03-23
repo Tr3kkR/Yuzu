@@ -312,6 +312,29 @@ groups:
           summary: "Yuzu server p95 latency above 2 seconds"
 ```
 
+## Security considerations
+
+### Fleet metadata in metrics labels
+
+The `/metrics` endpoint exposes aggregated fleet composition data through gauge metrics:
+
+| Metric | Labels | Information exposed |
+|---|---|---|
+| `yuzu_fleet_agents_by_os` | `os` | OS distribution (windows, linux, darwin counts) |
+| `yuzu_fleet_agents_by_arch` | `arch` | CPU architecture distribution (x64, arm64 counts) |
+| `yuzu_fleet_agents_by_version` | `version` | Agent version inventory |
+
+This data reveals your fleet's attack surface to anyone who can reach the metrics endpoint. An attacker who learns that 80% of your fleet runs Windows x64 with agent v0.4.2 can target known vulnerabilities for that specific combination.
+
+**Mitigations (in order of preference):**
+
+1. **Keep the default** — remote `/metrics` access requires authentication. Localhost is always open for co-located Prometheus.
+2. **Restrict network access** — if Prometheus scrapes remotely, use firewall rules or a reverse proxy with authentication in front of the metrics endpoint.
+3. **Use `--metrics-no-auth` with caution** — only enable unauthenticated remote access when the metrics endpoint is on a trusted monitoring network, not exposed to the general corporate network or internet.
+4. **API token auth** — when available (Phase 3), create a dedicated metrics-scraper API token with read-only scope.
+
+> **Default posture:** The server binds to `127.0.0.1` and requires auth for remote `/metrics` access. No action is needed if you scrape from localhost.
+
 ## Planned features
 
 | Feature | Roadmap | Description |

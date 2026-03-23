@@ -23,6 +23,7 @@ Plugins are organized by functional category. The **Platforms** column uses: **W
 13. [Windows Depth](#windows-depth)
 14. [Stub Plugins (Planned)](#stub-plugins-planned)
 15. [Plugin Architecture](#plugin-architecture)
+16. [Plugin Allowlist](#plugin-allowlist)
 
 ---
 
@@ -695,11 +696,44 @@ A **C++23 CRTP wrapper** (`sdk/include/yuzu/plugin.hpp`) provides ergonomic C++ 
 
 ### Plugin Lifecycle
 
-1. The agent scans its plugin directory at startup.
+1. The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified **before loading** (see [Plugin Allowlist](#plugin-allowlist) below).
 2. Each shared library (`.dll` on Windows, `.so` on Linux, `.dylib` on macOS) is loaded dynamically.
 3. The agent calls the plugin's `init` function, passing a context with configuration and callbacks.
 4. When the server sends an instruction targeting a plugin action, the agent dispatches it to the correct plugin.
 5. The plugin executes the action and returns results via the output callback.
+
+### Plugin Allowlist
+
+The agent can verify plugin shared libraries against a SHA-256 allowlist before loading them. This prevents loading of tampered or unauthorized plugins.
+
+**Configuration:**
+
+```bash
+yuzu-agent --plugin-allowlist /etc/yuzu/plugin-allowlist.txt
+# or via environment variable:
+YUZU_PLUGIN_ALLOWLIST=/etc/yuzu/plugin-allowlist.txt yuzu-agent
+```
+
+**Allowlist file format** (compatible with `sha256sum` output):
+
+```
+a1b2c3d4e5f6...  libhardware.so
+f6e5d4c3b2a1...  libnetwork_info.so
+9876543210ab...  libos_info.so
+```
+
+Generate the allowlist from your verified plugin builds:
+
+```bash
+sha256sum /opt/yuzu/plugins/*.so > /etc/yuzu/plugin-allowlist.txt
+```
+
+**Behavior:**
+
+- If `--plugin-allowlist` is not set, all plugins in the plugin directory are loaded (default).
+- If set, only plugins listed in the allowlist file are loaded, and only if their hash matches.
+- Plugins not in the allowlist or with a hash mismatch are logged as errors and skipped.
+- The allowlist is checked **before** `dlopen`/`LoadLibrary`, so tampered binaries never execute code.
 
 ### Output Format
 

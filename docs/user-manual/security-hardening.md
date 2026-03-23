@@ -168,6 +168,32 @@ Audit events include: `timestamp`, `principal`, `action`, `target_type`, `target
   - Windows: BitLocker on the data volume
   - Docker: encrypted volumes
 
+## Plugin Allowlist
+
+In production, verify plugin binaries against a SHA-256 allowlist to prevent loading of tampered or unauthorized code:
+
+```bash
+# Generate allowlist from verified builds
+sha256sum /opt/yuzu/plugins/*.so > /etc/yuzu/plugin-allowlist.txt
+chmod 600 /etc/yuzu/plugin-allowlist.txt
+
+# Start agent with allowlist enforcement
+yuzu-agent --plugin-allowlist /etc/yuzu/plugin-allowlist.txt
+```
+
+Plugins not listed or with a hash mismatch are rejected before any code executes. See [Plugin Allowlist](agent-plugins.md#plugin-allowlist) for details.
+
+## Command Replay Protection
+
+The agent tracks recently-executed `command_id` values per connection and rejects duplicates. This prevents replay attacks where a captured command is retransmitted to re-execute actions.
+
+- The dedup set is reset on each reconnect (new Subscribe stream).
+- Uses a double-buffer strategy with 5,000 entries per buffer (10,000 total). When the current buffer fills, the previous buffer is discarded and the current becomes the previous — recently-seen IDs are always protected.
+- Replayed commands receive a `REJECTED` response with reason `"command replay rejected: duplicate command_id"`.
+- The server generates unique `command_id` values per invocation, so legitimate commands are never affected.
+
+No additional configuration is required — replay protection is always active.
+
 ## OIDC Hardening
 
 When using OIDC/Entra ID:

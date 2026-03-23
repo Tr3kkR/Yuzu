@@ -117,6 +117,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--log-max-files", log_max_files, "Max rotated log files (default: 5)")
         ->default_val(5)
         ->envname("YUZU_LOG_MAX_FILES");
+    app.add_option("--plugin-allowlist", cfg.plugin_allowlist,
+                   "Path to sha256sum-format allowlist file for plugin verification")
+        ->envname("YUZU_PLUGIN_ALLOWLIST");
     app.add_flag("--no-auto-update", "Disable OTA auto-updates")->each([&cfg](const std::string&) {
         cfg.auto_update = false;
     });
