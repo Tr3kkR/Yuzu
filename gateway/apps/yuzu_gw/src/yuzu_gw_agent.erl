@@ -31,7 +31,7 @@
          disconnect/1]).
 
 %% gen_statem callbacks
--export([callback_mode/0, init/1, terminate/3]).
+-export([callback_mode/0, init/1, terminate/3, code_change/4]).
 -export([connecting/3, streaming/3, disconnected/3]).
 
 -record(data, {
@@ -145,6 +145,9 @@ connecting(cast, {dispatch, _CommandReq, {ReplyTo, FanoutRef}}, Data) ->
 connecting({call, From}, get_info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, format_info(Data, connecting)}}]};
 
+connecting({call, From}, pending_count, _Data) ->
+    {keep_state_and_data, [{reply, From, 0}]};
+
 connecting(info, stream_closed, Data) ->
     {next_state, disconnected, Data};
 
@@ -196,9 +199,11 @@ streaming(info, {stream_data, ResponseFrame}, Data) ->
                 0                  -> Pending;  %% proto enum value
                 _FinalStatus       ->
                     Duration = erlang:monotonic_time(millisecond) - DispatchedAt,
+                    Plugin = maps:get(<<"plugin">>, ResponseFrame,
+                                      maps:get(plugin, ResponseFrame, <<"unknown">>)),
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
-                                      #{agent_id => AgentId, status => Status}),
+                                      #{agent_id => AgentId, plugin => Plugin, status => Status}),
                     %% Notify router so it can complete the fanout.
                     case whereis(yuzu_gw_router) of
                         undefined  -> ok;
@@ -227,6 +232,9 @@ streaming(info, {'DOWN', MonRef, process, _Pid, _Reason},
 
 streaming({call, From}, get_info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, format_info(Data, streaming)}}]};
+
+streaming({call, From}, pending_count, #data{pending = Pending}) ->
+    {keep_state_and_data, [{reply, From, maps:size(Pending)}]};
 
 streaming(cast, disconnect, Data) ->
     #data{stream_pid = StreamPid} = Data,
@@ -258,6 +266,9 @@ terminate(normal, _State, _Data) ->
 terminate(_Reason, _State, Data) ->
     do_cleanup(Data),
     ok.
+
+code_change(_OldVsn, State, Data, _Extra) ->
+    {ok, State, Data}.
 
 %%%===================================================================
 %%% Internal functions

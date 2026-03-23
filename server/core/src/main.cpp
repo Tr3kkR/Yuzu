@@ -189,6 +189,15 @@ int main(int argc, char* argv[]) {
     app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
 
+    // Certificate hot-reload options
+    app.add_flag("--no-cert-reload", "Disable automatic certificate hot-reload")
+        ->each([&cfg](const std::string&) { cfg.cert_reload_enabled = false; })
+        ->envname("YUZU_NO_CERT_RELOAD");
+    app.add_option("--cert-reload-interval", cfg.cert_reload_interval_seconds,
+                   "Certificate reload polling interval in seconds (default: 60)")
+        ->default_val(60)
+        ->envname("YUZU_CERT_RELOAD_INTERVAL");
+
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
                    "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)")

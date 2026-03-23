@@ -64,6 +64,7 @@ required.
 | `api_token.revoke` | ApiToken | An API token is revoked |
 | `quarantine.enable` | Security | A device is placed in quarantine |
 | `quarantine.disable` | Security | A device is released from quarantine |
+| `cert.reload` | TlsCertificate | Certificate hot-reload attempted; detail contains outcome (success or failure reason) |
 
 ## REST API
 

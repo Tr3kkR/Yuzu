@@ -57,6 +57,7 @@ All Yuzu metrics follow a consistent naming scheme.
 | Prefix | Source | Examples |
 |---|---|---|
 | `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
+| `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
 | `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
 
 ## Labels

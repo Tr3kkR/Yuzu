@@ -38,6 +38,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
 | `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--no-cert-reload` | off | Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: `YUZU_NO_CERT_RELOAD`. |
+| `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. Env: `YUZU_METRICS_NO_AUTH`. |
 | `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. |
@@ -54,6 +56,16 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 # HTTPS with certificate files (default mode)
 ./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key
+
+# HTTPS with custom cert reload interval (30 seconds)
+./yuzu-server --https-cert /etc/yuzu/server.crt \
+  --https-key /etc/yuzu/server.key \
+  --cert-reload-interval 30
+
+# HTTPS with cert reload disabled
+./yuzu-server --https-cert /etc/yuzu/server.crt \
+  --https-key /etc/yuzu/server.key \
+  --no-cert-reload
 
 # HTTPS with OIDC SSO
 ./yuzu-server --https-cert /etc/yuzu/server.crt \
@@ -141,6 +153,50 @@ HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server sta
 - The private key must not be password-protected.
 - On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
+
+### Certificate Hot-Reload
+
+The server automatically detects when HTTPS certificate or key files change on disk and hot-swaps the SSL context **without requiring a restart**. This enables zero-downtime certificate rotation, including automated renewal via ACME/certbot.
+
+**How it works:**
+
+1. The server polls the cert and key file modification times at a configurable interval (default: 60 seconds).
+2. When a change is detected, the new files are validated:
+   - PEM format is parseable
+   - Certificate and private key match
+   - Key file permissions are secure (Unix: not group/others-readable)
+   - Files are not empty and not larger than 1 MB
+3. If validation passes, the SSL context is updated atomically. New connections use the new certificate; existing connections are unaffected.
+4. If validation fails, the current certificate is preserved and an error is logged.
+
+**Configuration:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--no-cert-reload` | off | Disable automatic hot-reload. Env: `YUZU_NO_CERT_RELOAD`. |
+| `--cert-reload-interval` | `60` | Polling interval in seconds. Minimum: 10s. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
+
+**Best practice for atomic file replacement:**
+
+```bash
+# Write to temp files first, then move atomically
+cp new-cert.pem /etc/yuzu/certs/server.crt.tmp
+cp new-key.pem /etc/yuzu/certs/server.key.tmp
+chmod 600 /etc/yuzu/certs/server.key.tmp
+mv /etc/yuzu/certs/server.crt.tmp /etc/yuzu/certs/server.crt
+mv /etc/yuzu/certs/server.key.tmp /etc/yuzu/certs/server.key
+```
+
+**Observability:**
+
+- Log messages: `cert-reload: certificate hot-reloaded successfully` or `cert-reload: ... failed`
+- Audit events: action `cert.reload` with result `success` or `failure`
+- Metrics: `yuzu_server_cert_reloads_total` (counter), `yuzu_server_cert_reload_failures_total` (counter)
+
+**Limitations:**
+
+- **HTTPS only.** gRPC mTLS certificate hot-reload is not supported. Rotating gRPC certificates still requires a server restart.
+- The server logs a warning at startup if gRPC TLS is enabled with cert reload: *"gRPC TLS certificate hot-reload is not yet supported."*
 
 ---
 

@@ -144,8 +144,16 @@ stream_loop(Ref, State, AgentPid) ->
                 ok ->
                     grpcbox_stream:send(Cmd, State),
                     stream_loop(Ref, State, AgentPid);
-                backpressure ->
-                    %% Drop this command — the agent process will see a timeout.
+                {backpressure, QueueLen} ->
+                    %% H13: Log and count dropped commands instead of dropping silently.
+                    CmdId = maps:get(<<"command_id">>, Cmd,
+                                     maps:get(command_id, Cmd, <<"unknown">>)),
+                    logger:warning("Backpressure: dropping command ~s (queue_len=~B)",
+                                   [CmdId, QueueLen]),
+                    telemetry:execute([yuzu, gw, stream, command_dropped],
+                                      #{count => 1},
+                                      #{stream_pid => self(), queue_len => QueueLen,
+                                        command_id => CmdId}),
                     stream_loop(Ref, State, AgentPid)
             end;
 
@@ -162,7 +170,7 @@ check_backpressure() ->
             telemetry:execute([yuzu, gw, stream, backpressure],
                               #{queue_len => Len},
                               #{stream_pid => self()}),
-            backpressure;
+            {backpressure, Len};
         _ ->
             ok
     end.

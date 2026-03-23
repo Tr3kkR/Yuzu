@@ -21,10 +21,10 @@
 -include_lib("grpcbox/include/grpcbox.hrl").
 
 %% API
--export([start_link/0, queue_heartbeat/1]).
+-export([start_link/0, queue_heartbeat/1, flush_sync/0]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_MAX_HB_BUFFER, 10000).
@@ -49,6 +49,11 @@ start_link() ->
 queue_heartbeat(HeartbeatReq) ->
     gen_server:cast(?SERVER, {queue_heartbeat, HeartbeatReq}).
 
+%% @doc Flush the heartbeat buffer synchronously. Blocks until done.
+-spec flush_sync() -> ok | {error, term()}.
+flush_sync() ->
+    gen_server:call(?SERVER, flush_sync, 5000).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -70,6 +75,25 @@ init([]) ->
         max_buf  = MaxBuf
     }}.
 
+handle_call(flush_sync, _From, #state{buffer = []} = State) ->
+    %% Nothing to flush.
+    {reply, ok, State};
+handle_call(flush_sync, _From, #state{buffer = Buf, buf_len = BufLen,
+                                       timer = TRef, interval = Interval} = State) ->
+    %% Cancel the pending timer and flush immediately.
+    _ = erlang:cancel_timer(TRef),
+    BatchReq = #{
+        heartbeats   => lists:reverse(Buf),
+        gateway_node => atom_to_binary(node(), utf8)
+    },
+    Result = do_flush(BatchReq, BufLen),
+    NewTRef = erlang:send_after(Interval, self(), flush),
+    case Result of
+        ok ->
+            {reply, ok, State#state{buffer = [], buf_len = 0, timer = NewTRef}};
+        {error, Reason} ->
+            {reply, {error, Reason}, State#state{timer = NewTRef}}
+    end;
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -115,6 +139,9 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
 %%%===================================================================
 %%% Internal

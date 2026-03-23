@@ -13,6 +13,8 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include "cert_reloader.hpp"
+#include "file_utils.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -1844,43 +1846,7 @@ private:
     std::unordered_map<std::string, std::string> gateway_sessions_;
 };
 
-// -- File-reading helper ------------------------------------------------------
-
-std::string read_file_contents(const std::filesystem::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f)
-        return {};
-    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-}
-
-/// Validate that a private key file is not readable by group or others (Unix).
-/// Returns true if permissions are acceptable or on Windows (ACL-based).
-[[nodiscard]] bool validate_key_file_permissions(const std::filesystem::path& key_path,
-                                                 std::string_view label) {
-#ifdef _WIN32
-    // Windows uses ACLs, not POSIX mode bits. Log advisory and proceed.
-    spdlog::debug("{}: skipping Unix permission check on Windows for {}", label,
-                  key_path.string());
-    return true;
-#else
-    std::error_code ec;
-    auto perms = std::filesystem::status(key_path, ec).permissions();
-    if (ec) {
-        spdlog::error("{}: cannot stat key file {}: {}", label, key_path.string(), ec.message());
-        return false;
-    }
-    using fp = std::filesystem::perms;
-    auto bad = perms & (fp::group_read | fp::group_write | fp::group_exec | fp::others_read |
-                        fp::others_write | fp::others_exec);
-    if (bad != fp::none) {
-        spdlog::error("{}: private key {} has overly permissive file permissions. "
-                      "Run: chmod 600 {}",
-                      label, key_path.string(), key_path.string());
-        return false;
-    }
-    return true;
-#endif
-}
+// read_file_contents() and validate_key_file_permissions() live in file_utils.hpp
 
 } // namespace detail
 
@@ -1926,6 +1892,10 @@ public:
                          "Total members across all management groups", "gauge");
         metrics_.describe("yuzu_heartbeats_received_total", "Total heartbeats received from agents",
                           "counter");
+        metrics_.describe("yuzu_server_cert_reloads_total",
+                          "Total successful certificate hot-reloads", "gauge");
+        metrics_.describe("yuzu_server_cert_reload_failures_total",
+                          "Total failed certificate hot-reload attempts", "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -2310,6 +2280,26 @@ public:
 
         start_web_server();
 
+        // Start certificate hot-reload watcher
+        if (cfg_.cert_reload_enabled && cfg_.https_enabled && web_server_) {
+            CertReloader::Params reload_params;
+            reload_params.cert_path = cfg_.https_cert_path;
+            reload_params.key_path = cfg_.https_key_path;
+            reload_params.interval = std::chrono::seconds(cfg_.cert_reload_interval_seconds);
+            reload_params.web_server = web_server_.get();
+            reload_params.audit_store = audit_store_ ? audit_store_.get() : nullptr;
+            cert_reloader_ = std::make_unique<CertReloader>(std::move(reload_params));
+            cert_reloader_->start();
+            spdlog::info("Certificate hot-reload enabled (interval={}s)",
+                         cfg_.cert_reload_interval_seconds);
+        } else if (cfg_.https_enabled && !cfg_.cert_reload_enabled) {
+            spdlog::info("Certificate hot-reload disabled via --no-cert-reload");
+        }
+        if (cfg_.cert_reload_enabled && cfg_.tls_enabled) {
+            spdlog::warn("gRPC TLS certificate hot-reload is not yet supported; "
+                          "gRPC listeners will use the certificates loaded at startup");
+        }
+
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
@@ -2321,6 +2311,13 @@ public:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // Publish cert reload counters to Prometheus
+                if (cert_reloader_) {
+                    metrics_.gauge("yuzu_server_cert_reloads_total")
+                        .set(static_cast<double>(cert_reloader_->reload_count()));
+                    metrics_.gauge("yuzu_server_cert_reload_failures_total")
+                        .set(static_cast<double>(cert_reloader_->failure_count()));
+                }
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
@@ -2371,6 +2368,12 @@ public:
             response_store_->stop_cleanup();
         if (audit_store_)
             audit_store_->stop_cleanup();
+
+        // Stop cert reloader before web server (it holds a pointer to web_server_)
+        if (cert_reloader_) {
+            cert_reloader_->stop();
+            cert_reloader_.reset();
+        }
 
         if (redirect_server_) {
             redirect_server_->stop();
@@ -9787,6 +9790,9 @@ private:
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;
     std::thread redirect_thread_;
+
+    // Certificate hot-reload
+    std::unique_ptr<CertReloader> cert_reloader_;
 
     // OIDC SSO
     std::unique_ptr<oidc::OidcProvider> oidc_provider_;

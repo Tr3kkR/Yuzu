@@ -34,6 +34,10 @@ groups:
 
 ## Server Certificate Renewal
 
+### HTTPS Certificate (zero-downtime)
+
+The server automatically detects when HTTPS cert/key files change on disk and hot-reloads the SSL context. **No restart is needed** for HTTPS certificate rotation.
+
 ```bash
 # 1. Generate new CSR with the same key (or generate a new key)
 openssl req -new -key server.key -out server-new.csr \
@@ -44,10 +48,22 @@ openssl x509 -req -in server-new.csr -CA ca.crt -CAkey ca.key \
   -CAcreateserial -out server-new.crt -days 365 -sha256 \
   -extfile server-ext.cnf
 
-# 3. Replace the certificate
-cp server-new.crt /etc/yuzu/certs/server.crt
+# 3. Replace the certificate (atomic move for safety)
+cp server-new.crt /etc/yuzu/certs/server.crt.tmp
+chmod 644 /etc/yuzu/certs/server.crt.tmp
+mv /etc/yuzu/certs/server.crt.tmp /etc/yuzu/certs/server.crt
+```
 
-# 4. Restart the server
+The server detects the file change within the polling interval (default: 60 seconds) and hot-swaps the certificate. Check the server log for `cert-reload: certificate hot-reloaded successfully`.
+
+**Downtime:** None. Hot-reload is automatic. Disable with `--no-cert-reload` if you prefer manual restarts.
+
+### gRPC mTLS Certificate (requires restart)
+
+gRPC TLS certificate hot-reload is **not supported**. After replacing gRPC cert/key files, restart the server:
+
+```bash
+# Replace gRPC cert files, then:
 systemctl restart yuzu-server
 ```
 
@@ -109,12 +125,15 @@ When the CA certificate itself expires:
 For the HTTPS dashboard certificate (not gRPC mTLS), use certbot:
 
 ```bash
-certbot certonly --standalone -d yuzu.example.com \
-  --deploy-hook "systemctl restart yuzu-server"
+certbot certonly --standalone -d yuzu.example.com
 ```
 
 Configure the server to use the ACME certificate:
 ```bash
-yuzu-server --https --https-cert /etc/letsencrypt/live/yuzu.example.com/fullchain.pem \
+yuzu-server --https-cert /etc/letsencrypt/live/yuzu.example.com/fullchain.pem \
   --https-key /etc/letsencrypt/live/yuzu.example.com/privkey.pem
 ```
+
+With certificate hot-reload enabled (default), certbot renewals are picked up automatically — **no deploy hook or restart needed**. The server detects the file change within the polling interval and hot-swaps the certificate.
+
+> **Note:** If you prefer explicit control, add `--deploy-hook "systemctl restart yuzu-server"` to the certbot command and disable hot-reload with `--no-cert-reload`.

@@ -1,0 +1,51 @@
+%% Application upgrade file for yuzu_gw.
+%%
+%% Defines module-level instructions for hot-code upgrades between
+%% versions. Erlang's release handler uses this to upgrade a running
+%% node without restart.
+%%
+%% See: https://www.erlang.org/doc/design_principles/appup_cookbook
+
+{"0.2.0",
+ %% Upgrade from 0.1.0 → 0.2.0
+ [{"0.1.0",
+   [
+     %% Load stateless dependencies first (telemetry, proto used by stateful modules)
+     {load_module, yuzu_gw_telemetry},
+     {load_module, yuzu_gw_proto},
+     {load_module, yuzu_gw_health},
+     {load_module, yuzu_gw_app},
+     {load_module, yuzu_gw_sup},
+     {load_module, yuzu_gw_agent_sup},
+     {load_module, yuzu_gw_agent_service},
+     {load_module, yuzu_gw_mgmt_service},
+
+     %% Stateful processes — trigger code_change.
+     %% yuzu_gw_agent uses soft_purge to avoid killing active agent processes.
+     {update, yuzu_gw_agent, {advanced, []}, soft_purge, soft_purge, []},
+     {update, yuzu_gw_heartbeat_buffer, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_upstream, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_registry, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_router, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_gauge, {advanced, []}, brutal_purge, soft_purge, []}
+   ]}],
+ %% Downgrade from 0.2.0 → 0.1.0
+ [{"0.1.0",
+   [
+     {load_module, yuzu_gw_telemetry},
+     {load_module, yuzu_gw_proto},
+     {load_module, yuzu_gw_health},
+     {load_module, yuzu_gw_app},
+     {load_module, yuzu_gw_sup},
+     {load_module, yuzu_gw_agent_sup},
+     {load_module, yuzu_gw_agent_service},
+     {load_module, yuzu_gw_mgmt_service},
+
+     {update, yuzu_gw_agent, {advanced, []}, soft_purge, soft_purge, []},
+     {update, yuzu_gw_heartbeat_buffer, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_upstream, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_registry, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_router, {advanced, []}, brutal_purge, soft_purge, []},
+     {update, yuzu_gw_gauge, {advanced, []}, brutal_purge, soft_purge, []}
+   ]}]
+}.

@@ -47,14 +47,59 @@ start(_StartType, _StartArgs) ->
     yuzu_gw_sup:start_link().
 
 stop(_State) ->
-    logger:info("Gateway shutting down — flushing heartbeat buffer"),
-    %% Flush any pending heartbeats before supervisor tears down children.
-    try yuzu_gw_heartbeat_buffer:queue_heartbeat(flush_sentinel)
-    catch _:_ -> ok
+    logger:info("Gateway shutting down — entering drain phase"),
+
+    %% 1. Stop accepting new commands via the router.
+    case whereis(yuzu_gw_router) of
+        undefined -> ok;
+        RouterPid ->
+            logger:info("Notifying router to stop accepting new commands"),
+            RouterPid ! drain,
+            ok
     end,
-    %% Give a brief grace period for in-flight RPCs.
-    timer:sleep(500),
+
+    %% 2. Wait for in-flight commands to complete (up to 10 seconds).
+    DrainDeadline = erlang:monotonic_time(second) + 10,
+    drain_pending(DrainDeadline),
+
+    %% 3. Flush heartbeat buffer synchronously.
+    logger:info("Flushing heartbeat buffer"),
+    try yuzu_gw_heartbeat_buffer:flush_sync()
+    catch _:_ ->
+        %% Fallback: best-effort async flush.
+        try yuzu_gw_heartbeat_buffer:queue_heartbeat(flush_sentinel)
+        catch _:_ -> ok
+        end,
+        timer:sleep(500)
+    end,
+
+    logger:info("Gateway shutdown complete"),
     ok.
+
+%% @private Wait for pending commands to drain or until deadline.
+drain_pending(Deadline) ->
+    Now = erlang:monotonic_time(second),
+    case Now >= Deadline of
+        true ->
+            logger:warning("Drain deadline reached — proceeding with shutdown");
+        false ->
+            %% Check if any agent processes still have pending commands.
+            %% pg:get_members may fail if pg is already shutting down.
+            Agents = try pg:get_members(yuzu_gw, all_agents) catch _:_ -> [] end,
+            HasPending = lists:any(fun(Pid) ->
+                try gen_statem:call(Pid, pending_count, 1000) > 0
+                catch _:_ -> false
+                end
+            end, Agents),
+            case HasPending of
+                false ->
+                    logger:info("All in-flight commands drained");
+                true ->
+                    logger:info("Draining: waiting for in-flight commands..."),
+                    timer:sleep(1000),
+                    drain_pending(Deadline)
+            end
+    end.
 
 %%--------------------------------------------------------------------
 %% Environment variable overrides for container deployment

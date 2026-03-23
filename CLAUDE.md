@@ -309,6 +309,7 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 - **Private key permission validation** — Server refuses to start if TLS private key files are group/others-readable on Unix. Uses `std::filesystem::perms` check. Skipped on Windows.
 - **CORS on all API endpoints** — CORS headers applied via `set_post_routing_handler` for all `/api/` paths.
 - **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.
+- **Certificate hot-reload** — HTTPS cert/key PEM files are polled for changes (default 60s interval) and hot-swapped without server restart. Validates PEM parse, cert/key match, and key file permissions before applying. gRPC TLS reload not supported. CLI: `--no-cert-reload`, `--cert-reload-interval`. Audit action: `cert.reload`. Metrics: `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total`.
 
 ### Planned (see roadmap)
 - **Granular RBAC** — Principals, roles, securable types, per-operation permissions (Phase 3)

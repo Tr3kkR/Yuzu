@@ -59,6 +59,10 @@ struct Config {
     std::filesystem::path https_key_path;
     bool https_redirect{true}; // HTTP→HTTPS 301 redirect
 
+    // Certificate hot-reload
+    bool cert_reload_enabled{true};       // Auto-reload when cert/key files change on disk
+    int cert_reload_interval_seconds{60}; // Polling interval in seconds
+
     // OIDC SSO
     std::string oidc_issuer;        // e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
     std::string oidc_client_id;     // App registration client ID

@@ -27,6 +27,7 @@
 
     %% Stream health
     [yuzu, gw, stream, backpressure],
+    [yuzu, gw, stream, command_dropped],
     [yuzu, gw, stream, write_error],
 
     %% Upstream (C++ server)
@@ -99,6 +100,9 @@ handle_event([yuzu, gw, command, fanout], #{target_count := T, dispatched := D},
 handle_event([yuzu, gw, stream, backpressure], #{queue_len := Q}, _Meta, _Config) ->
     prometheus_histogram:observe(yuzu_gw_stream_queue_len_distribution, [], Q);
 
+handle_event([yuzu, gw, stream, command_dropped], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_commands_dropped_backpressure_total, [], N);
+
 handle_event([yuzu, gw, stream, write_error], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_stream_write_errors_total, [], N);
 
@@ -163,6 +167,10 @@ declare_metrics() ->
         {name, yuzu_gw_commands_timed_out_total},
         {labels, []},
         {help, "Total commands that timed out"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_commands_dropped_backpressure_total},
+        {labels, []},
+        {help, "Total commands dropped due to backpressure"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_stream_write_errors_total},
         {labels, []},
