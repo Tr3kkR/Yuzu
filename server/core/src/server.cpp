@@ -4918,11 +4918,24 @@ private:
         web_server_->set_post_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res) {
                 // CORS headers for all /api/ responses (H6)
+                // Only reflect Origin if it matches the server's own origin
+                // to prevent credentialed cross-origin attacks.
                 if (req.path.starts_with("/api/")) {
                     auto origin = req.get_header_value("Origin");
                     if (!origin.empty()) {
-                        res.set_header("Access-Control-Allow-Origin", origin);
-                        res.set_header("Access-Control-Allow-Credentials", "true");
+                        auto scheme = cfg_.https_enabled ? "https" : "http";
+                        auto port = cfg_.https_enabled ? cfg_.https_port : cfg_.web_port;
+                        auto self_origin =
+                            std::format("{}://{}:{}", scheme, cfg_.web_address, port);
+                        auto localhost_origin =
+                            std::format("{}://localhost:{}", scheme, port);
+                        auto loopback_origin =
+                            std::format("{}://127.0.0.1:{}", scheme, port);
+                        if (origin == self_origin || origin == localhost_origin ||
+                            origin == loopback_origin) {
+                            res.set_header("Access-Control-Allow-Origin", origin);
+                            res.set_header("Access-Control-Allow-Credentials", "true");
+                        }
                     }
                     res.set_header("Access-Control-Allow-Methods",
                                    "GET, POST, PUT, DELETE, OPTIONS");

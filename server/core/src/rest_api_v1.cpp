@@ -116,8 +116,13 @@ std::string ok_json(std::string_view data_json) {
 
 std::string error_json(std::string_view message, int code = 0) {
     JObj j;
-    j.add("error", message).raw("meta", R"({"api_version":"v1"})");
-    if (code != 0) j.add("code", code);
+    if (code != 0) {
+        auto err = JObj().add("code", code).add("message", message).str();
+        j.raw("error", err);
+    } else {
+        j.add("error", message);
+    }
+    j.raw("meta", R"({"api_version":"v1"})");
     return j.str();
 }
 
@@ -359,8 +364,9 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     spdlog::info("REST API v1: registering routes");
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
-    svr.Options(R"(/api/v1/.*)", [](const httplib::Request& req, httplib::Response& res) {
-        add_cors_headers(res, req);
+    // Actual CORS headers are added by the post-routing handler in server.cpp
+    // with origin allowlist validation.
+    svr.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.status = 204;
     });
 

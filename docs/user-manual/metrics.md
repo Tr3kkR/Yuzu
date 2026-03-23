@@ -10,8 +10,10 @@ monitoring tools.
 ### GET /metrics
 
 Returns all server and connected-agent metrics in Prometheus exposition format.
-This endpoint does **not** require authentication --- it is exempted from the
-auth middleware so that Prometheus can scrape it without session cookies.
+Localhost requests (`127.0.0.1`, `::1`) are always unauthenticated for
+Prometheus scraping. Remote requests require authentication by default. Use
+`--metrics-no-auth` (env: `YUZU_METRICS_NO_AUTH`) to allow unauthenticated
+remote access for external monitoring infrastructure.
 
 ```bash
 curl -s 'http://localhost:8080/metrics'
@@ -83,8 +85,9 @@ sub-millisecond local operations through multi-second network calls.
 
 ## Prometheus scrape configuration
 
-Add Yuzu to your Prometheus `prometheus.yml`. The `/metrics` endpoint is
-unauthenticated, so no credentials are needed:
+Add Yuzu to your Prometheus `prometheus.yml`. For local scrapers, no
+credentials are needed. Remote scrapers need `--metrics-no-auth` on the
+server or must provide authentication:
 
 ```yaml
 scrape_configs:
