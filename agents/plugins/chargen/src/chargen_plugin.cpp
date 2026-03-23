@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <format>
 #include <mutex>
 #include <string>
@@ -78,12 +79,18 @@ public:
 private:
     struct Session {
         std::atomic<bool> running{true};
+        std::mutex mu;
+        std::condition_variable cv;
     };
 
     std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
 
     int start_chargen(yuzu::CommandContext& ctx, yuzu::Params params) {
+        // Stop any existing session first — ensures at most one worker thread
+        // is consumed, so chargen_stop always has a free pool thread to run on.
+        stop_all();
+
         // Rate: milliseconds between lines (default 100ms = 10 lines/sec)
         auto rate_str = params.get("rate_ms", "100");
         int rate_ms = 100;
@@ -97,7 +104,6 @@ private:
         auto session = std::make_shared<Session>();
         {
             std::lock_guard lock(mu_);
-            // Use a simple key; only one chargen session at a time.
             sessions_["active"] = session;
         }
 
@@ -110,7 +116,10 @@ private:
             // RFC 864: each successive line starts one character position later.
             offset = (offset + 1) % kCharRange;
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(rate_ms));
+            // Wait on CV instead of sleep — stop_all() wakes instantly.
+            std::unique_lock lk(session->mu);
+            session->cv.wait_for(lk, std::chrono::milliseconds(rate_ms),
+                                 [&] { return !session->running.load(std::memory_order_acquire); });
         }
 
         ctx.write_output("chargen session ended");
@@ -121,6 +130,7 @@ private:
         std::lock_guard lock(mu_);
         for (auto& [key, session] : sessions_) {
             session->running.store(false, std::memory_order_release);
+            session->cv.notify_all();
         }
         sessions_.clear();
     }
