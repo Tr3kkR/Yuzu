@@ -12,6 +12,7 @@ extern const char* const kDashboardIndexHtml =
   <title>Yuzu — Dashboard</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
   <style>
     body {
       display: flex; flex-direction: column; height: 100vh;
@@ -373,15 +374,20 @@ extern const char* const kDashboardIndexHtml =
         <span id="density-label">Comfortable</span>
       </button>
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap" hx-ext="sse" sse-connect="/events">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
-        <tbody id="results-tbody">
+        <tbody id="results-tbody" sse-swap="output" hx-swap="beforeend">
           <tr id="empty-row"><td colspan="1" class="empty-state">
             Type an instruction above and press <strong>Send</strong> to execute.
           </td></tr>
         </tbody>
       </table>
+      <!-- Hidden sinks: HTMX processes OOB swaps from these event types -->
+      <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
+      <div sse-swap="timing" hx-swap="none" style="display:none"></div>
+      <div sse-swap="agent-online" hx-swap="none" style="display:none"></div>
+      <div sse-swap="agent-offline" hx-swap="none" style="display:none"></div>
     </div>
   </div>
 
@@ -410,7 +416,6 @@ extern const char* const kDashboardIndexHtml =
     var rowCount = 0;
     var currentInstruction = '';
     var agents = {};   // agent_id -> { hostname, os, arch }
-    var evtSource = null;
     var commandHistory = [];  // { cmd, scope, timestamp }
 
     /* ── Instruction mapping (built dynamically from /api/help) ── */
@@ -442,37 +447,7 @@ extern const char* const kDashboardIndexHtml =
       xhr.send();
     }
 
-    /* ── Column schemas per plugin ────────────────────────── */
-    var columnSchemas = {
-      'chargen':   ['Agent', 'Output'],
-      'procfetch': ['Agent', 'PID', 'Name', 'Path', 'SHA-1'],
-      'netstat':   ['Agent', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State', 'PID'],
-      'sockwho':   ['Agent', 'PID', 'Name', 'Path', 'Proto', 'Local Addr', 'Local Port', 'Remote Addr', 'Remote Port', 'State'],
-      'status':            ['Agent', 'Key', 'Value'],
-      'device_identity':   ['Agent', 'Key', 'Value'],
-      'os_info':           ['Agent', 'Key', 'Value'],
-      'hardware':          ['Agent', 'Key', 'Value'],
-      'users':             ['Agent', 'Key', 'Value'],
-      'installed_apps':    ['Agent', 'Key', 'Value'],
-      'msi_packages':     ['Agent', 'Key', 'Value'],
-      'network_config':   ['Agent', 'Key', 'Value'],
-      'diagnostics':      ['Agent', 'Key', 'Value'],
-      'agent_actions':    ['Agent', 'Key', 'Value'],
-      'processes':        ['Agent', 'Key', 'Value'],
-      'services':         ['Agent', 'Key', 'Value'],
-      'filesystem':       ['Agent', 'Key', 'Value'],
-      'network_diag':     ['Agent', 'Key', 'Value'],
-      'network_actions':  ['Agent', 'Key', 'Value'],
-      'firewall':         ['Agent', 'Key', 'Value'],
-      'antivirus':        ['Agent', 'Key', 'Value'],
-      'bitlocker':        ['Agent', 'Key', 'Value'],
-      'windows_updates':  ['Agent', 'Key', 'Value'],
-      'event_logs':       ['Agent', 'Key', 'Value'],
-      'sccm':             ['Agent', 'Key', 'Value'],
-      'script_exec':      ['Agent', 'Key', 'Value'],
-      'software_actions': ['Agent', 'Key', 'Value'],
-      'vuln_scan':        ['Agent', 'Severity', 'Category', 'Title', 'Detail']
-    };
+    /* Column schemas moved server-side — server renders <tr> HTML via SSE */
 )HTM"
     // Part 3: Helpers and table management
     R"HTM(
@@ -721,9 +696,6 @@ extern const char* const kDashboardIndexHtml =
 
       currentInstruction = raw;
 
-      /* Set up columns for this plugin */
-      var schema = columnSchemas[mapped.plugin] || ['Agent', 'Output'];
-      setColumns(schema);
       clearResults();
 
       /* Determine target agent IDs */
@@ -750,6 +722,10 @@ extern const char* const kDashboardIndexHtml =
           document.getElementById('result-context').textContent = raw + ' → scope: ' + scopeLabel;
           try {
             var rj = JSON.parse(xhr.responseText);
+            /* Server returns thead_html for this plugin's column schema */
+            if (rj.thead_html) {
+              document.getElementById('results-thead').innerHTML = rj.thead_html;
+            }
             showToast('Command sent to ' + (rj.agents_reached || '?') + ' agent(s)', 'success');
           } catch(_) { showToast('Command sent', 'success'); }
         } else {
@@ -898,120 +874,32 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 )HTM"
-    // Part 4: SSE + menu JavaScript
+    // Part 4: HTMX SSE event handling + menu JavaScript
     R"HTM(
-    /* ── SSE ──────────────────────────────────────────────── */
-    function connectSSE() {
-      if (evtSource) evtSource.close();
-      evtSource = new EventSource('/events');
-
-      evtSource.addEventListener('output', function(e) {
-        /* Format: agent_id|plugin|data...  (data may contain \n for batched output) */
-        var sep1 = e.data.indexOf('|');
-        if (sep1 < 0) return;
-        var sep2 = e.data.indexOf('|', sep1 + 1);
-        if (sep2 < 0) return;
-
-        var agentId = e.data.substring(0, sep1);
-        var plugin  = e.data.substring(sep1 + 1, sep2);
-        var rawPayload = e.data.substring(sep2 + 1);
-        var agentName = agentDisplayName(agentId);
-
-        /* Agent batches multiple write_output() calls joined by \n.
-           Process each line as an independent record. */
-        var payloads = rawPayload.split('\n');
-        for (var pi = 0; pi < payloads.length; pi++) {
-          var payload = payloads[pi];
-          if (!payload) continue;
-
-          if (plugin === 'chargen') {
-            addRow([agentName, payload]);
-          } else if (plugin === 'procfetch') {
-            /* pid|name|path|sha1 */
-            var parts = payload.split('|');
-            if (parts.length >= 4) {
-              addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'),
-                      parts[2].replace(/\\\|/g,'|'), parts[3]]);
-            } else {
-              addRow([agentName, payload]);
-            }
-          } else if (plugin === 'netstat') {
-            /* proto|local_addr|local_port|remote_addr|remote_port|state|pid */
-            var parts = payload.split('|');
-            if (parts.length >= 7) {
-              addRow([agentName, parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]]);
-            } else {
-              addRow([agentName, payload]);
-            }
-          } else if (plugin === 'sockwho') {
-            /* pid|name|path|proto|local_addr|local_port|remote_addr|remote_port|state */
-            var parts = payload.split('|');
-            if (parts.length >= 9) {
-              addRow([agentName, parts[0],
-                      parts[1].replace(/\\\|/g,'|'),
-                      parts[2].replace(/\\\|/g,'|'),
-                      parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]]);
-            } else {
-              addRow([agentName, payload]);
-            }
-          } else if (plugin === 'vuln_scan') {
-            /* severity|category|title|detail */
-            var parts = payload.split('|');
-            if (parts.length >= 4) {
-              addRow([agentName, parts[0], parts[1].replace(/\\\|/g,'|'), parts[2].replace(/\\\|/g,'|'), parts.slice(3).join('|').replace(/\\\|/g,'|')]);
-            } else if (parts.length >= 2) {
-              addRow([agentName, parts[0], parts.slice(1).join('|'), '', '']);
-            } else {
-              addRow([agentName, payload, '', '', '']);
-            }
-          } else if (['status','device_identity','os_info','hardware','users','installed_apps','msi_packages','network_config','diagnostics','agent_actions','processes','services','filesystem','network_diag','network_actions','firewall','antivirus','bitlocker','windows_updates','event_logs','sccm','script_exec','software_actions'].indexOf(plugin) >= 0) {
-            /* key|value */
-            var parts = payload.split('|');
-            if (parts.length >= 2) {
-              addRow([agentName, parts[0], parts.slice(1).join('|')]);
-            } else {
-              addRow([agentName, payload, '']);
-            }
-          } else {
-            addRow([agentName, payload]);
-          }
-        }
-      });
-
-      evtSource.addEventListener('command-status', function(e) {
-        /* Format: command_id|status */
-        var parts = e.data.split('|');
-        if (parts.length < 2) return;
-        var status = parts[1];
-        if (status === 'done')  setBadge('done');
-        if (status === 'error') setBadge('error');
-      });
-
-      evtSource.addEventListener('agent-online', function(e) {
+    /* ── HTMX SSE event hooks ────────────────────────────── */
+    /* Row counting + auto-scroll when HTMX swaps output rows */
+    document.body.addEventListener('htmx:sseBeforeMessage', function(e) {
+      if (e.detail.type === 'output') {
+        /* Remove empty-row placeholder */
+        var er = document.getElementById('empty-row');
+        if (er) er.remove();
+      }
+      /* agent-online / agent-offline: refresh agent list */
+      if (e.detail.type === 'agent-online' || e.detail.type === 'agent-offline') {
         refreshAgentList();
         loadHelp();
-      });
-
-      evtSource.addEventListener('agent-offline', function(e) {
-        refreshAgentList();
-        loadHelp();
-      });
-
-      evtSource.addEventListener('timing', function(e) {
-        var parts = e.data.split('|');
-        if (parts.length < 3) return;
-        var kv   = parts[1];
-        var type = parts[2];
-        var eqIdx = kv.indexOf('=');
-        var ms = eqIdx >= 0 ? kv.substring(eqIdx + 1) : kv;
-
-        if (type === 'first_data')   document.getElementById('stat-network').textContent = ms + ' ms';
-        if (type === 'agent_total')  document.getElementById('stat-agent').textContent = ms + ' ms';
-        if (type === 'complete')     document.getElementById('stat-total').textContent = ms + ' ms';
-      });
-
-      evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
-    }
+      }
+    });
+    document.body.addEventListener('htmx:sseMessage', function(e) {
+      if (e.detail.type === 'output') {
+        /* Count new result-row elements added by this swap */
+        rowCount = document.querySelectorAll('#results-tbody .result-row').length;
+        document.getElementById('row-count').textContent = rowCount.toLocaleString();
+        /* Auto-scroll to bottom */
+        var wrap = document.querySelector('.table-wrap');
+        setTimeout(function() { wrap.scrollTop = wrap.scrollHeight; }, 0);
+      }
+    });
 
     /* ── About modal ─────────────────────────────────────── */
     function showAbout() {

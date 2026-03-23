@@ -308,6 +308,15 @@ public:
         return !agents_.empty();
     }
 
+    std::string display_name(const std::string& agent_id) const {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it != agents_.end() && !it->second->hostname.empty())
+            return it->second->hostname;
+        if (agent_id.size() > 12) return agent_id.substr(0, 12);
+        return agent_id;
+    }
+
     // Build JSON array of all agents for the web UI.
     std::string to_json() const {
         std::lock_guard lock(mu_);
@@ -473,6 +482,22 @@ private:
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
 
+inline std::string html_escape(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        case '\'': out += "&#39;"; break;
+        default: out += c;
+        }
+    }
+    return out;
+}
+
 struct SseSinkState {
     std::mutex mu;
     std::condition_variable cv;
@@ -511,7 +536,10 @@ std::string format_sse(const SseEvent& ev) {
 bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*offset*/,
                           httplib::DataSink& sink) {
     std::unique_lock<std::mutex> lk(state->mu);
-    state->cv.wait_for(lk, std::chrono::seconds(15),
+    // Keep the interval well under httplib's Keep-Alive timeout (5s)
+    // to prevent the browser from closing the SSE connection due to
+    // inactivity.
+    state->cv.wait_for(lk, std::chrono::seconds(3),
                        [&state] { return !state->queue.empty() || state->closed.load(); });
 
     if (state->closed.load()) {
@@ -973,8 +1001,13 @@ public:
             if (resp.status() == pb::CommandResponse::RUNNING) {
                 // Intercept __timing__ metadata
                 if (resp.output().starts_with("__timing__|")) {
+                    // Extract exec_ms=N from "__timing__|exec_ms=123"
                     auto payload = resp.output().substr(11);
-                    bus_.publish("timing", resp.command_id() + "|" + payload + "|agent_total");
+                    auto eq = payload.find('=');
+                    auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
+                    bus_.publish("timing",
+                        "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                        html_escape(ms) + " ms</strong>");
                     continue;
                 }
 
@@ -988,8 +1021,9 @@ public:
                             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                                std::chrono::steady_clock::now() - it->second)
                                                .count();
-                            bus_.publish("timing", resp.command_id() + "|first_data_ms=" +
-                                                       std::to_string(elapsed) + "|first_data");
+                            bus_.publish("timing",
+                                "<strong id=\"stat-network\" hx-swap-oob=\"true\">" +
+                                std::to_string(elapsed) + " ms</strong>");
                         }
                     }
                 }
@@ -997,8 +1031,8 @@ public:
                 // Determine the plugin from command_id prefix (format: plugin-timestamp)
                 std::string plugin = extract_plugin(resp.command_id());
 
-                // Publish as generic output event: agent_id|plugin|data
-                bus_.publish("output", agent_id + "|" + plugin + "|" + resp.output());
+                // Publish pre-rendered HTML rows for HTMX SSE swap
+                bus_.publish("output", render_output_rows(agent_id, plugin, resp.output()));
 
                 // Store streaming response
                 if (response_store_) {
@@ -1041,7 +1075,13 @@ public:
                     (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
                 metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}})
                     .increment();
-                bus_.publish("command-status", resp.command_id() + "|" + status_str);
+                {
+                    std::string badge_cls = (status_str == "done") ? "badge-done" : "badge-error";
+                    std::string badge_text = (status_str == "done") ? "DONE" : "ERROR";
+                    bus_.publish("command-status",
+                        "<span id=\"status-badge\" class=\"" + badge_cls +
+                        "\" hx-swap-oob=\"true\">" + badge_text + "</span>");
+                }
 
                 if (analytics_store_) {
                     AnalyticsEvent ae;
@@ -1093,8 +1133,9 @@ public:
                                             .count();
                         metrics_.histogram("yuzu_command_duration_seconds")
                             .observe(static_cast<double>(total_ms) / 1000.0);
-                        bus_.publish("timing", resp.command_id() + "|total_ms=" +
-                                                   std::to_string(total_ms) + "|complete");
+                        bus_.publish("timing",
+                            "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
+                            std::to_string(total_ms) + " ms</strong>");
                         cmd_send_times_.erase(it);
                     }
                     cmd_first_seen_.erase(resp.command_id());
@@ -1216,6 +1257,145 @@ private:
             return command_id.substr(0, dash);
         }
         return command_id;
+    }
+
+public:
+    // ── Server-rendered SSE row helpers ──────────────────────────────────────
+
+    static inline const std::vector<std::string> kDefaultColumns{"Agent", "Output"};
+
+    static const std::vector<std::string>& columns_for_plugin(const std::string& plugin) {
+        static const std::unordered_map<std::string, std::vector<std::string>> kSchemas{
+            {"chargen",          {"Agent", "Output"}},
+            {"procfetch",        {"Agent", "PID", "Name", "Path", "SHA-1"}},
+            {"netstat",          {"Agent", "Proto", "Local Addr", "Local Port",
+                                  "Remote Addr", "Remote Port", "State", "PID"}},
+            {"sockwho",          {"Agent", "PID", "Name", "Path", "Proto",
+                                  "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}},
+            {"vuln_scan",        {"Agent", "Severity", "Category", "Title", "Detail"}},
+        };
+        // key|value schema plugins
+        static const std::vector<std::string> kKeyValue{"Agent", "Key", "Value"};
+        static const std::unordered_set<std::string> kKeyValuePlugins{
+            "status", "device_identity", "os_info", "hardware", "users",
+            "installed_apps", "msi_packages", "network_config", "diagnostics",
+            "agent_actions", "processes", "services", "filesystem",
+            "network_diag", "network_actions", "firewall", "antivirus",
+            "bitlocker", "windows_updates", "event_logs", "sccm",
+            "script_exec", "software_actions"};
+
+        auto it = kSchemas.find(plugin);
+        if (it != kSchemas.end()) return it->second;
+        if (kKeyValuePlugins.contains(plugin)) return kKeyValue;
+        return kDefaultColumns;
+    }
+
+    static std::string thead_for_plugin(const std::string& plugin) {
+        auto& cols = columns_for_plugin(plugin);
+        std::string html = "<tr>";
+        for (size_t i = 0; i < cols.size(); ++i) {
+            html += (i == 0) ? "<th class=\"col-agent\">" : "<th>";
+            html += html_escape(cols[i]);
+            html += "</th>";
+        }
+        html += "</tr>";
+        return html;
+    }
+
+    // Split one pipe-delimited line into table cells using the plugin schema.
+    static std::vector<std::string> split_fields(const std::string& plugin,
+                                                  const std::string& line) {
+        // vuln_scan: severity|category|title|detail (4+ fields, last is remainder)
+        if (plugin == "vuln_scan") {
+            std::vector<std::string> parts;
+            size_t pos = 0;
+            for (int i = 0; i < 3; ++i) {
+                auto p = line.find('|', pos);
+                if (p == std::string::npos) { parts.push_back(line.substr(pos)); return parts; }
+                parts.push_back(line.substr(pos, p - pos));
+                pos = p + 1;
+            }
+            parts.push_back(line.substr(pos)); // remainder = detail
+            return parts;
+        }
+        // key|value plugins: split into exactly 2 (key, rest)
+        auto& cols = columns_for_plugin(plugin);
+        if (cols.size() == 3) { // Agent + Key + Value
+            auto sep = line.find('|');
+            if (sep != std::string::npos)
+                return {line.substr(0, sep), line.substr(sep + 1)};
+            return {line, ""};
+        }
+        // Default: split on all pipes
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        while (pos < line.size()) {
+            auto p = line.find('|', pos);
+            if (p == std::string::npos) { parts.push_back(line.substr(pos)); break; }
+            parts.push_back(line.substr(pos, p - pos));
+            pos = p + 1;
+        }
+        return parts;
+    }
+
+    // Render <tr> pair (data row + detail drawer) for one output line.
+    static std::string render_row(const std::string& agent_name,
+                                   const std::string& plugin,
+                                   const std::string& line,
+                                   const std::vector<std::string>& col_names) {
+        auto fields = split_fields(plugin, line);
+
+        // Build cells: agent_name + fields
+        std::vector<std::string> cells;
+        cells.reserve(fields.size() + 1);
+        cells.push_back(agent_name);
+        for (auto& f : fields) cells.push_back(f);
+
+        // Data row
+        std::string html = "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">";
+        for (size_t i = 0; i < cells.size(); ++i) {
+            auto esc = html_escape(cells[i]);
+            html += (i == 0) ? "<td class=\"col-agent\" title=\"" : "<td title=\"";
+            html += esc;
+            html += "\">";
+            html += esc;
+            html += "</td>";
+        }
+        html += "</tr>";
+
+        // Detail drawer
+        html += "<tr class=\"result-detail\"><td colspan=\"";
+        html += std::to_string(cells.size());
+        html += "\"><div class=\"detail-content\">";
+        for (size_t i = 0; i < cells.size(); ++i) {
+            auto label = (i < col_names.size()) ? col_names[i]
+                                                 : ("Column " + std::to_string(i + 1));
+            html += "<div class=\"detail-label\">" + html_escape(label) + "</div>";
+            html += "<div class=\"detail-value\">" + html_escape(cells[i]) + "</div>";
+        }
+        html += "</div></td></tr>";
+        return html;
+    }
+
+    // Render all rows for a RUNNING response's output (may contain \n-separated lines).
+    std::string render_output_rows(const std::string& agent_id,
+                                    const std::string& plugin,
+                                    const std::string& raw_output) {
+        auto agent_name = registry_.display_name(agent_id);
+        auto& col_names = columns_for_plugin(plugin);
+
+        std::string html;
+        size_t pos = 0;
+        while (pos < raw_output.size()) {
+            auto nl = raw_output.find('\n', pos);
+            std::string line = (nl == std::string::npos)
+                                   ? raw_output.substr(pos)
+                                   : raw_output.substr(pos, nl - pos);
+            if (!line.empty())
+                html += render_row(agent_name, plugin, line, col_names);
+            pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
+        }
+        return html;
     }
 
     // ── OTA Update RPCs ─────────────────────────────────────────────────────
@@ -4392,6 +4572,11 @@ private:
         // immediately, not wait 200ms for the TCP send buffer to coalesce.
         web_server_->set_tcp_nodelay(true);
 
+        // SSE connections are long-lived; the default 5s keep-alive timeout
+        // causes browsers to close idle EventSource connections prematurely.
+        web_server_->set_keep_alive_timeout(120);
+        web_server_->set_keep_alive_max_count(std::numeric_limits<size_t>::max());
+
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
@@ -6231,7 +6416,10 @@ private:
                 " agent(s)\",\"level\":\"success\"}}");
             res.set_content(
                 nlohmann::json(
-                    {{"status", "sent"}, {"command_id", command_id}, {"agents_reached", sent}})
+                    {{"status", "sent"},
+                     {"command_id", command_id},
+                     {"agents_reached", sent},
+                     {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
         });
