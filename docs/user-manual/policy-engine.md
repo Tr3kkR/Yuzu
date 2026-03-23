@@ -124,6 +124,8 @@ Triggers are stored per-policy with type-specific JSON configuration:
 | `registry` | `{"hive": "HKLM", "key": "SOFTWARE\\..."}` |
 | `startup` | `{}` |
 
+> **Trigger limit:** The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API.
+
 ### Management Group Bindings
 
 Policies can be scoped to specific management groups. When a policy is bound

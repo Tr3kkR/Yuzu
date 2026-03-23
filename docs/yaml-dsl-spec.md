@@ -1469,3 +1469,14 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.stats` | `tar` | Y | Y | Y | Verified |
 | `tar.purge` | `tar` | Y | Y | Y | Verified |
 | `tar.configure` | `tar` | Y | Y | Y | Verified |
+
+### 14.16 Test and Debug
+
+| Primitive | Backing Plugin | Win | Linux | macOS | Status |
+|---|---|:---:|:---:|:---:|---|
+| `testing.chargen.start` | `chargen` | Y | Y | Y | Verified |
+| `testing.chargen.stop` | `chargen` | Y | Y | Y | Verified |
+
+**`testing.chargen.start`** -- Start an RFC 864 character generator session for throughput benchmarking. Generates a continuous stream of printable ASCII characters to measure agent-to-server data-plane performance.
+
+**`testing.chargen.stop`** -- Stop all running chargen sessions on the target device.

@@ -43,11 +43,10 @@ void TriggerEngine::register_trigger(TriggerConfig config) {
                      trigger_type_to_string(config.type));
         *it = std::move(config);
     } else {
-        // L8: Enforce maximum trigger count to prevent resource exhaustion
-        constexpr size_t kMaxTriggers = 500;
-        if (triggers_.size() >= kMaxTriggers) {
+        // Enforce maximum trigger count to prevent resource exhaustion
+        if (triggers_.size() >= max_triggers_) {
             spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached",
-                         config.id, kMaxTriggers);
+                         config.id, max_triggers_);
             return;
         }
         spdlog::info("Trigger '{}' registered (type={}, plugin={}, action={})", config.id,
@@ -68,7 +67,16 @@ void TriggerEngine::unregister_trigger(const std::string& id) {
     }
 }
 
-void TriggerEngine::set_dispatch(DispatchFn fn) { dispatch_ = std::move(fn); }
+void TriggerEngine::set_dispatch(DispatchFn fn) {
+    std::lock_guard lock(mu_);
+    dispatch_ = std::move(fn);
+}
+
+void TriggerEngine::set_max_triggers(size_t limit) {
+    std::lock_guard lock(mu_);
+    max_triggers_ = limit;
+    spdlog::info("TriggerEngine: max triggers set to {}", limit);
+}
 
 void TriggerEngine::start() {
     if (running_.exchange(true)) {

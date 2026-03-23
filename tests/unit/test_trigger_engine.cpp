@@ -718,3 +718,136 @@ TEST_CASE("TriggerConfig: default values", "[trigger_engine][config]") {
     CHECK(cfg.debounce_seconds == 0);
     CHECK(cfg.parameters.empty());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Trigger cap enforcement (M14 — configurable max_triggers)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("TriggerEngine: kDefaultMaxTriggers constant", "[trigger_engine][cap]") {
+    CHECK(TriggerEngine::kDefaultMaxTriggers == 2000);
+}
+
+TEST_CASE("TriggerEngine: registration rejected at max_triggers cap", "[trigger_engine][cap]") {
+    TriggerEngine engine;
+    engine.set_max_triggers(5);
+
+    for (int i = 0; i < 5; ++i) {
+        TriggerConfig cfg;
+        cfg.id = "t-" + std::to_string(i);
+        cfg.type = TriggerType::Interval;
+        cfg.plugin = "p";
+        cfg.action = "a";
+        cfg.interval_seconds = 60;
+        engine.register_trigger(cfg);
+    }
+    REQUIRE(engine.trigger_count() == 5);
+
+    // 6th trigger should be rejected
+    TriggerConfig overflow;
+    overflow.id = "t-overflow";
+    overflow.type = TriggerType::Interval;
+    overflow.plugin = "p";
+    overflow.action = "a";
+    overflow.interval_seconds = 60;
+    engine.register_trigger(overflow);
+
+    CHECK(engine.trigger_count() == 5); // still 5
+}
+
+TEST_CASE("TriggerEngine: replacement at cap still works", "[trigger_engine][cap]") {
+    TriggerEngine engine;
+    engine.set_max_triggers(3);
+
+    for (int i = 0; i < 3; ++i) {
+        TriggerConfig cfg;
+        cfg.id = "t-" + std::to_string(i);
+        cfg.type = TriggerType::Interval;
+        cfg.plugin = "old";
+        cfg.action = "a";
+        cfg.interval_seconds = 60;
+        engine.register_trigger(cfg);
+    }
+    REQUIRE(engine.trigger_count() == 3);
+
+    // Replace existing trigger at the cap — should succeed
+    TriggerConfig replacement;
+    replacement.id = "t-1"; // existing ID
+    replacement.type = TriggerType::AgentStartup;
+    replacement.plugin = "new";
+    replacement.action = "b";
+    engine.register_trigger(replacement);
+
+    CHECK(engine.trigger_count() == 3); // still 3, replaced not added
+}
+
+TEST_CASE("TriggerEngine: set_max_triggers changes effective cap", "[trigger_engine][cap]") {
+    TriggerEngine engine;
+    engine.set_max_triggers(2);
+
+    TriggerConfig c1;
+    c1.id = "a";
+    c1.type = TriggerType::Interval;
+    c1.plugin = "p";
+    c1.action = "act";
+    c1.interval_seconds = 60;
+
+    TriggerConfig c2;
+    c2.id = "b";
+    c2.type = TriggerType::Interval;
+    c2.plugin = "p";
+    c2.action = "act";
+    c2.interval_seconds = 60;
+
+    TriggerConfig c3;
+    c3.id = "c";
+    c3.type = TriggerType::Interval;
+    c3.plugin = "p";
+    c3.action = "act";
+    c3.interval_seconds = 60;
+
+    engine.register_trigger(c1);
+    engine.register_trigger(c2);
+    engine.register_trigger(c3); // rejected: cap is 2
+    CHECK(engine.trigger_count() == 2);
+
+    // Raise the cap
+    engine.set_max_triggers(10);
+    engine.register_trigger(c3); // now succeeds
+    CHECK(engine.trigger_count() == 3);
+}
+
+TEST_CASE("TriggerEngine: unregister frees slot under cap", "[trigger_engine][cap]") {
+    TriggerEngine engine;
+    engine.set_max_triggers(2);
+
+    TriggerConfig c1;
+    c1.id = "a";
+    c1.type = TriggerType::Interval;
+    c1.plugin = "p";
+    c1.action = "act";
+    c1.interval_seconds = 60;
+
+    TriggerConfig c2;
+    c2.id = "b";
+    c2.type = TriggerType::Interval;
+    c2.plugin = "p";
+    c2.action = "act";
+    c2.interval_seconds = 60;
+
+    engine.register_trigger(c1);
+    engine.register_trigger(c2);
+    REQUIRE(engine.trigger_count() == 2);
+
+    // Remove one — new registration should succeed
+    engine.unregister_trigger("a");
+    CHECK(engine.trigger_count() == 1);
+
+    TriggerConfig c3;
+    c3.id = "c";
+    c3.type = TriggerType::Interval;
+    c3.plugin = "p";
+    c3.action = "act";
+    c3.interval_seconds = 60;
+    engine.register_trigger(c3);
+    CHECK(engine.trigger_count() == 2);
+}

@@ -90,6 +90,8 @@ The server stores its configuration in files located in the **same directory as 
 
 > **Backup recommendation:** Back up all three `.cfg` files regularly. Losing `yuzu-server.cfg` requires re-running first-run setup. Losing `enrollment-tokens.cfg` invalidates all issued tokens. Losing `pending-agents.cfg` loses the pending approval queue (agents will re-register on next heartbeat).
 
+> **File permissions (Unix):** On Unix systems, the server automatically sets file permissions to `0600` (owner-only read/write) on `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` after every write. This protects credential hashes and enrollment tokens from being read by other users on the system. No manual `chmod` is required for these files.
+
 ---
 
 ## First-Run Setup

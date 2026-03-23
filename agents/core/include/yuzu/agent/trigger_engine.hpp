@@ -90,6 +90,9 @@ struct TriggerConfig {
  */
 class YUZU_EXPORT TriggerEngine {
 public:
+    /// Default maximum number of registered triggers (configurable via set_max_triggers).
+    static constexpr size_t kDefaultMaxTriggers = 2000;
+
     /// Callback type for dispatching triggered actions.
     using DispatchFn = std::function<void(const std::string& plugin,
                                           const std::string& action,
@@ -109,6 +112,9 @@ public:
 
     /// Set the callback invoked when a trigger fires.
     void set_dispatch(DispatchFn fn);
+
+    /// Set the maximum number of triggers allowed (default: kDefaultMaxTriggers).
+    void set_max_triggers(size_t limit);
 
     /// Start all monitoring loops. Fires AgentStartup triggers immediately.
     void start();
@@ -146,6 +152,7 @@ private:
     std::atomic<bool> running_{false};
     std::vector<std::thread> workers_;
     DispatchFn dispatch_;
+    size_t max_triggers_ = kDefaultMaxTriggers;
 
     // File watch state: trigger_id -> last known mtime
     std::map<std::string, std::filesystem::file_time_type> file_mtimes_;

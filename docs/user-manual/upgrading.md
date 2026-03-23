@@ -7,6 +7,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
 |---|---|---|---|
 | 0.1.x | 0.1.0 | 0.1.0 | Initial release family |
+| 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 

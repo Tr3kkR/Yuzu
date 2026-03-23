@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.1.0',
+  version: '0.5.0',
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
@@ -29,8 +29,16 @@ else
     '-std=c++23',             # override c++20 default to get C++23 on GCC/Clang
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
+    '-fstack-protector-strong',
     language: 'cpp',
   )
+  # FORTIFY_SOURCE requires optimisation; only enable for release builds.
+  # Undef first to avoid -Wmacro-redefined on distros that set it in system headers.
+  if get_option('buildtype') != 'debug'
+    add_project_arguments('-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=2', language: 'cpp')
+  endif
+  # Full RELRO + immediate binding — makes GOT/PLT read-only after load.
+  add_project_link_arguments('-Wl,-z,relro,-z,now', language: 'cpp')
   if cxx.get_id() == 'clang'
     add_project_arguments('-Wno-gnu-zero-variadic-macro-arguments', language: 'cpp')
   endif
@@ -55,6 +63,16 @@ version_conf.set('PROJECT_VERSION_PATCH', meson.project_version().split('.')[2])
 version_conf.set('YUZU_BUILD_NUMBER', yuzu_build_number)
 version_conf.set('YUZU_GIT_COMMIT_HASH', yuzu_git_commit_hash)
 version_conf.set('PROJECT_VERSION', meson.project_version())
+
+# ── Git-derived version tag ──────────────────────────────────────────────────
+# Produces a header that is rebuilt whenever HEAD changes, so the version
+# string always reflects the current commit (e.g. v0.5.0-42-gabcdef).
+vcs_tag(
+  input:   'sdk/include/yuzu/git_version.hpp.in',
+  output:  'git_version.hpp',
+  command: git.found() ? [git, 'describe', '--tags', '--always', '--dirty'] : ['echo', 'v' + meson.project_version()],
+  fallback: 'v' + meson.project_version(),
+)
 
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')

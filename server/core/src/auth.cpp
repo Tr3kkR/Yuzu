@@ -20,6 +20,7 @@
 #else
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <sys/stat.h>  // umask()
 #endif
 
 namespace yuzu::server::auth {
@@ -210,7 +211,15 @@ bool AuthManager::save_config() const {
         }
     }
 
+#ifndef _WIN32
+    // Set restrictive umask so the file is created with 0600 from the start,
+    // closing the TOCTOU window where it could be world-readable.
+    mode_t old_mask = umask(0077);
+#endif
     std::ofstream f(cfg_path_, std::ios::trunc);
+#ifndef _WIN32
+    umask(old_mask);
+#endif
     if (!f.is_open()) {
         spdlog::error("Cannot write config file {}", cfg_path_.string());
         return false;
@@ -224,6 +233,18 @@ bool AuthManager::save_config() const {
         f << entry.username << ':' << role_to_string(entry.role) << ':' << entry.salt_hex << ':'
           << entry.hash_hex << '\n';
     }
+    f.close();
+
+#ifndef _WIN32
+    // Belt-and-suspenders: ensure 0600 even if the file pre-existed with looser perms.
+    std::error_code perm_ec;
+    std::filesystem::permissions(cfg_path_,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, perm_ec);
+    if (perm_ec) {
+        spdlog::warn("Failed to set permissions on {}: {}", cfg_path_.string(), perm_ec.message());
+    }
+#endif
 
     spdlog::info("Saved {} user(s) to {}", users_.size(), cfg_path_.string());
     return true;
@@ -655,7 +676,13 @@ bool AuthManager::save_tokens() const {
 
     std::shared_lock lock(mu_);
 
+#ifndef _WIN32
+    mode_t old_mask = umask(0077);
+#endif
     std::ofstream f(path, std::ios::trunc);
+#ifndef _WIN32
+    umask(old_mask);
+#endif
     if (!f.is_open()) {
         spdlog::error("Cannot write enrollment tokens to {}", path.string());
         return false;
@@ -679,6 +706,18 @@ bool AuthManager::save_tokens() const {
           << et.use_count << ':' << created_epoch << ':' << expires_epoch << ':'
           << (et.revoked ? '1' : '0') << '\n';
     }
+    f.close();
+
+#ifndef _WIN32
+    // Restrict token file to owner-only (0600) — contains token hashes.
+    std::error_code perm_ec;
+    std::filesystem::permissions(path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, perm_ec);
+    if (perm_ec) {
+        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
+    }
+#endif
 
     return true;
 }
@@ -839,7 +878,13 @@ bool AuthManager::save_pending() const {
 
     std::shared_lock lock(mu_);
 
+#ifndef _WIN32
+    mode_t old_mask = umask(0077);
+#endif
     std::ofstream f(path, std::ios::trunc);
+#ifndef _WIN32
+    umask(old_mask);
+#endif
     if (!f.is_open()) {
         spdlog::error("Cannot write pending agents to {}", path.string());
         return false;
@@ -856,6 +901,18 @@ bool AuthManager::save_pending() const {
         f << pa.agent_id << ':' << pa.hostname << ':' << pa.os << ':' << pa.arch << ':'
           << pa.agent_version << ':' << epoch << ':' << pending_status_to_string(pa.status) << '\n';
     }
+    f.close();
+
+#ifndef _WIN32
+    // Restrict pending-agents file to owner-only (0600).
+    std::error_code perm_ec;
+    std::filesystem::permissions(path,
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, perm_ec);
+    if (perm_ec) {
+        spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
+    }
+#endif
 
     return true;
 }

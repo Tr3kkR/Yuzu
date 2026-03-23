@@ -1,0 +1,112 @@
+## Chargen Plugin Definitions
+## RFC 864 character generator — streams rotating ASCII lines for
+## testing/benchmarking network throughput and command pipeline capacity.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: testing.chargen.start
+  displayName: Start Character Generator
+  version: 1.0.0
+  description: >
+    Starts an RFC 864 character generator session. Produces continuous
+    72-character lines of rotating printable ASCII (characters 32-126).
+    Each successive line starts one character position later. Output is
+    streamed back as CommandResponse messages, one line per message.
+    Useful for benchmarking network throughput and command pipeline
+    capacity. Only one session runs at a time — starting a new session
+    stops any existing one.
+  tags: [testing, benchmark, network, chargen]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: chargen
+    action: chargen_start
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      rate_ms:
+        type: int32
+        description: >
+          Milliseconds between output lines. Default 100 (10 lines/sec).
+          Minimum 1.
+        default: 100
+
+  result:
+    columns:
+      - name: output
+        type: string
+
+  readablePayload: "Start chargen (rate={{rate_ms}}ms)"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: manual
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [chargen]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: testing.chargen.stop
+  displayName: Stop Character Generator
+  version: 1.0.0
+  description: >
+    Stops all running chargen sessions on the target device. Returns a
+    confirmation message once all sessions have been terminated.
+  tags: [testing, benchmark, network, chargen]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: chargen
+    action: chargen_stop
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: output
+        type: string
+
+  readablePayload: "Stop chargen"
+
+  gather:
+    ttlSeconds: 0
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [chargen]
+
+status:
+  phase: active

@@ -10,7 +10,7 @@ extern const char* const kComplianceHtml =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu — Compliance</title>
   <link rel="stylesheet" href="/static/yuzu.css">
-  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
   <style>
     body { min-height: 100vh; }
 

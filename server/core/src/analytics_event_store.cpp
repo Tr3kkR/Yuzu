@@ -102,7 +102,11 @@ std::vector<AnalyticsEvent> AnalyticsEventStore::query_recent(int limit) const {
         try {
             auto j = nlohmann::json::parse(reinterpret_cast<const char*>(text));
             results.push_back(j.get<AnalyticsEvent>());
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            spdlog::error("AnalyticsEventStore::query_recent: failed to parse event JSON: {}", e.what());
+        } catch (...) {
+            spdlog::error("AnalyticsEventStore::query_recent: unexpected non-std exception parsing event JSON");
+        }
     }
     sqlite3_finalize(stmt);
     return results;
@@ -219,7 +223,11 @@ void AnalyticsEventStore::drain_batch() {
             auto j = nlohmann::json::parse(reinterpret_cast<const char*>(text));
             events.push_back(j.get<AnalyticsEvent>());
             ids.push_back(id);
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            spdlog::error("AnalyticsEventStore::drain_batch: failed to parse event JSON: {}", e.what());
+        } catch (...) {
+            spdlog::error("AnalyticsEventStore::drain_batch: unexpected non-std exception parsing event JSON");
+        }
     }
     sqlite3_finalize(stmt);
 
