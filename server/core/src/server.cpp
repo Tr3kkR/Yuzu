@@ -551,16 +551,16 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
     while (!state->queue.empty()) {
         auto& ev = state->queue.front();
         std::string sse = format_sse(ev);
-        // httplib's SocketStream::write() is a single send() call — no
-        // retry loop.  A large payload (e.g. 38 KB of sockwho rows) can
-        // cause a partial write when the TCP send buffer is full, which
-        // httplib treats as a fatal error and kills the SSE connection.
-        // Write in <=8 KB slices to stay within typical send buffer limits.
+        // httplib's chunked provider assembles each sink.write() into a
+        // single HTTP chunk frame (hex-size + CRLF + data + CRLF) and
+        // flushes it in one send() call — the browser processes each chunk
+        // eagerly.  Write in <=8 KB slices to stay within typical TCP send
+        // buffer limits and avoid partial-write failures.
         const char* p = sse.data();
         size_t rem = sse.size();
-        constexpr size_t kMaxChunk = 8192;
+        constexpr size_t kMaxSlice = 8192;
         while (rem > 0) {
-            auto n = std::min(rem, kMaxChunk);
+            auto n = std::min(rem, kMaxSlice);
             if (!sink.write(p, n)) return false;
             p += n;
             rem -= n;
@@ -6274,7 +6274,13 @@ private:
             });
 
             detail::EventBus* bus = &event_bus_;
-            res.set_content_provider(
+            // Use chunked content provider so httplib sends each sink.write()
+            // as a complete HTTP chunk in a single send() call.  The browser
+            // processes each chunk eagerly (no buffering of raw streams).
+            // Note: httplib's chunked loop sets data_available = (l > 0) on
+            // every write.  Our provider never writes 0 bytes (always at
+            // least a 14-byte keepalive), so the loop runs indefinitely.
+            res.set_chunked_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
                     return detail::sse_content_provider(sink_state, offset, sink);
