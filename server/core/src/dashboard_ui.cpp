@@ -12,6 +12,7 @@ extern const char* const kDashboardIndexHtml =
   <title>Yuzu — Dashboard</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
   <style>
     body {
       display: flex; flex-direction: column; height: 100vh;
@@ -373,15 +374,22 @@ extern const char* const kDashboardIndexHtml =
         <span id="density-label">Comfortable</span>
       </button>
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap" hx-ext="sse" sse-connect="/events">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
-        <tbody id="results-tbody">
+        <tbody id="results-tbody" sse-swap="output" hx-swap="beforeend show:bottom">
           <tr id="empty-row"><td colspan="1" class="empty-state">
             Type an instruction above and press <strong>Send</strong> to execute.
           </td></tr>
         </tbody>
       </table>
+      <!-- Hidden sinks for OOB swap events -->
+      <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
+      <div sse-swap="timing" hx-swap="none" style="display:none"></div>
+      <div sse-swap="agent-online" hx-swap="none" style="display:none"
+           hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
+      <div sse-swap="agent-offline" hx-swap="none" style="display:none"
+           hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
     </div>
   </div>
 
@@ -390,15 +398,21 @@ extern const char* const kDashboardIndexHtml =
     <div class="scope-header">
       Scope <span class="scope-count" id="agent-count">0 agents</span>
     </div>
-    <div class="scope-list" id="scope-list">
-      <div class="scope-item selected" data-agent-id="__all__" onclick="selectScope(this)">
-        <span class="scope-item-name scope-item-all">All Agents</span>
-        <span class="scope-item-meta">Broadcast to every connected agent</span>
-      </div>
+    <div class="scope-list" id="scope-list"
+         hx-get="/fragments/scope-list"
+         hx-trigger="load, every 5s, agentChanged from:body"
+         hx-swap="innerHTML"
+         hx-vals="js:{selected: selectedScope || '__all__'}"
+         hx-on::after-swap="var d=this.querySelector('#scope-data'); if(d){agents=JSON.parse(d.dataset.agents);cmdPalette.agentsCache=null;}">
     </div>
   </div>
 
   <footer>Yuzu Server &mdash; Dashboard <span style="float:right;color:var(--subtle)">Press <kbd style="display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:18px;padding:0 4px;background:var(--bg);border:1px solid var(--border);border-radius:3px;font-size:0.6rem;font-family:var(--font-sans);color:var(--muted)">Ctrl+K</kbd> to search</span></footer>
+
+  <!-- HTMX-driven data loaders (no JS fetch calls) -->
+  <div id="help-loader" hx-get="/api/help" hx-trigger="load, agentChanged from:body"
+       hx-swap="none" style="display:none"
+       hx-on::after-request="if(event.detail.successful) buildInstructionMap(JSON.parse(event.detail.xhr.responseText));"></div>
 
   </div><!-- /.dashboard-grid -->
 )HTM"
@@ -428,17 +442,6 @@ extern const char* const kDashboardIndexHtml =
           instructionMap[p.name + ' ' + p.actions[j]] = { plugin: p.name, action: p.actions[j] };
         }
       }
-    }
-
-    function loadHelp() {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/help');
-      xhr.onload = function() {
-        if (xhr.status === 200) {
-          buildInstructionMap(JSON.parse(xhr.responseText));
-        }
-      };
-      xhr.send();
     }
 
     /* Column schemas moved server-side — server renders <tr> HTML via SSE */
@@ -580,49 +583,9 @@ extern const char* const kDashboardIndexHtml =
       selectedScope = el.getAttribute('data-agent-id');
     }
 
-    function refreshAgentList() {
-      var xhr = new XMLHttpRequest();
-      xhr.open('GET', '/api/agents');
-      xhr.onload = function() {
-        if (xhr.status !== 200) return;
-        var list = JSON.parse(xhr.responseText);
-        agents = {};
-        for (var i = 0; i < list.length; i++) {
-          agents[list[i].agent_id] = list[i];
-        }
-        renderAgentList();
-      };
-      xhr.send();
-    }
-
-    function renderAgentList() {
-      var container = document.getElementById('scope-list');
-      var prevSelected = selectedScope;
-
-      /* Keep the "All" item, rebuild the rest */
-      var html = '<div class="scope-item' + (prevSelected === '__all__' ? ' selected' : '') +
-                 '" data-agent-id="__all__" onclick="selectScope(this)">' +
-                 '<span class="scope-item-name scope-item-all">All Agents</span>' +
-                 '<span class="scope-item-meta">Broadcast to every connected agent</span></div>';
-
-      var ids = Object.keys(agents).sort();
-      for (var i = 0; i < ids.length; i++) {
-        var a = agents[ids[i]];
-        var sel = prevSelected === ids[i] ? ' selected' : '';
-        html += '<div class="scope-item' + sel + '" data-agent-id="' + escapeHtml(ids[i]) +
-                '" onclick="selectScope(this)">' +
-                '<span class="scope-item-name"><span class="online-dot"></span>' +
-                escapeHtml(a.hostname || ids[i]) + '</span>' +
-                '<span class="scope-item-meta">' +
-                escapeHtml(ids[i].substring(0, 12)) + ' · ' +
-                escapeHtml(a.os || '?') + '/' + escapeHtml(a.arch || '?') +
-                (a.agent_version ? ' · v' + escapeHtml(a.agent_version) : '') +
-                '</span></div>';
-      }
-
-      container.innerHTML = html;
-      document.getElementById('agent-count').textContent = ids.length + ' agent' + (ids.length !== 1 ? 's' : '');
-    }
+    /* refreshAgentList / renderAgentList removed — scope panel is now
+       HTMX-polled via hx-get="/fragments/scope-list" every 5 s,
+       with immediate refresh on agentChanged events from SSE. */
 
     function agentDisplayName(agentId) {
       var a = agents[agentId];
@@ -868,47 +831,11 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 )HTM"
-    // Part 4: SSE (server-rendered HTML swap) + menu JavaScript
+    // Part 4: HTMX SSE event hooks + menu JavaScript
     R"HTM(
-    /* ── SSE — server renders HTML, browser just swaps it in ── */
-    var evtSource = null;
-    function connectSSE() {
-      if (evtSource) evtSource.close();
-      evtSource = new EventSource('/events');
-
-      evtSource.addEventListener('output', function(e) {
-        var er = document.getElementById('empty-row');
-        if (er) er.remove();
-        document.getElementById('results-tbody').insertAdjacentHTML('beforeend', e.data);
-        rowCount = document.querySelectorAll('#results-tbody .result-row').length;
-        document.getElementById('row-count').textContent = rowCount.toLocaleString();
-        var wrap = document.querySelector('.table-wrap');
-        wrap.scrollTop = wrap.scrollHeight;
-      });
-
-      /* Server sends complete replacement elements for badge and stats */
-      evtSource.addEventListener('command-status', function(e) {
-        var el = document.getElementById('status-badge');
-        if (el) el.outerHTML = e.data;
-      });
-      evtSource.addEventListener('timing', function(e) {
-        var tmp = document.createElement('div');
-        tmp.innerHTML = e.data;
-        var el = tmp.firstElementChild;
-        if (el && el.id) {
-          var target = document.getElementById(el.id);
-          if (target) target.outerHTML = e.data;
-        }
-      });
-      evtSource.addEventListener('agent-online', function() {
-        refreshAgentList(); loadHelp();
-      });
-      evtSource.addEventListener('agent-offline', function() {
-        refreshAgentList(); loadHelp();
-      });
-
-      evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
-    }
+    /* SSE output rows, row counting, auto-scroll, empty-state removal,
+       agent-online/offline → all handled by server OOB swaps + HTMX
+       attributes.  No JS event listeners needed. */
 
     /* ── About modal ─────────────────────────────────────── */
     function showAbout() {
@@ -1256,19 +1183,11 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 
-    /* Invalidate agent cache when agent list refreshes */
-    var origRenderAgentList = renderAgentList;
-    renderAgentList = function() {
-      origRenderAgentList();
-      cmdPalette.agentsCache = null;
-    };
-
     /* ── Init ─────────────────────────────────────────────── */
-    connectSSE();
-    refreshAgentList();
-    setInterval(refreshAgentList, 5000);
+    /* Agent list, help data, and user info are loaded by HTMX
+       attributes (hx-trigger="load") — no JS init calls needed
+       except loadUserInfo which updates body data-role. */
     loadUserInfo();
-    loadHelp();
   </script>
   <div id="toast-container" class="toast-container"></div>
 </body>

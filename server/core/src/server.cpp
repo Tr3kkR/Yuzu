@@ -77,6 +77,7 @@
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -323,8 +324,8 @@ public:
         return agent_id;
     }
 
-    // Build JSON array of all agents for the web UI.
-    std::string to_json() const {
+    // Build JSON array of all agents for the web UI (structured).
+    nlohmann::json to_json_obj() const {
         std::lock_guard lock(mu_);
 
         nlohmann::json arr = nlohmann::json::array();
@@ -335,8 +336,11 @@ public:
                            {"arch", s->arch},
                            {"agent_version", s->agent_version}});
         }
-        return arr.dump();
+        return arr;
     }
+
+    // Build JSON array as a serialized string.
+    std::string to_json() const { return to_json_obj().dump(); }
 
     // Build help catalog: deduplicated plugin metadata across all agents.
     std::string help_json() const {
@@ -565,7 +569,10 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
     }
 
     const char* keepalive = ": keepalive\n\n";
-    sink.write(keepalive, std::strlen(keepalive));
+    if (!sink.write(keepalive, std::strlen(keepalive))) {
+        spdlog::debug("SSE keepalive write failed (client disconnected)");
+        return false;
+    }
     return true;
 }
 
@@ -1040,10 +1047,9 @@ public:
                 // Determine the plugin from command_id prefix (format: plugin-timestamp)
                 std::string plugin = extract_plugin(resp.command_id());
 
-                // Publish pre-rendered HTML rows for HTMX SSE swap
-                auto html_rows = render_output_rows(agent_id, plugin, resp.output());
-                if (!html_rows.empty())
-                    bus_.publish("output", html_rows);
+                // Publish each row as its own SSE event — small events
+                // stream reliably; giant events (500KB+) stall browsers.
+                publish_output_rows(agent_id, plugin, resp.output());
 
                 // Store streaming response
                 if (response_store_) {
@@ -1178,6 +1184,7 @@ public:
     void record_send_time(const std::string& command_id) {
         std::lock_guard lock(cmd_times_mu_);
         cmd_send_times_[command_id] = std::chrono::steady_clock::now();
+        output_row_count_.store(0, std::memory_order_relaxed);
     }
 
 private:
@@ -1411,29 +1418,40 @@ public:
         return html;
     }
 
-    // Render all rows for a RUNNING response's output (may contain \n-separated lines).
-    std::string render_output_rows(const std::string& agent_id,
-                                    const std::string& plugin,
-                                    const std::string& raw_output) {
-        if (raw_output.empty()) return {};
+    // render_output_rows removed — publish_output_rows emits one SSE
+    // event per row for reliable browser streaming.
 
+    // Publish each output line as its own SSE event for reliable streaming.
+    // Each event includes OOB swaps for the row counter and empty-state removal
+    // so the browser needs zero JS to keep the UI in sync.
+    void publish_output_rows(const std::string& agent_id,
+                              const std::string& plugin,
+                              const std::string& raw_output) {
+        if (raw_output.empty()) return;
         auto agent_name = registry_.display_name(agent_id);
         auto& col_names = columns_for_plugin(plugin);
-
-        std::string html;
         size_t pos = 0;
         while (pos < raw_output.size()) {
             auto nl = raw_output.find('\n', pos);
             std::string line = (nl == std::string::npos)
                                    ? raw_output.substr(pos)
                                    : raw_output.substr(pos, nl - pos);
-            // Strip \r from Windows line endings
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty())
-                html += render_row(agent_name, plugin, line, col_names);
+            if (!line.empty()) {
+                // fetch_add returns pre-increment value; +1 gives 1-based row number
+                auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+                auto html = render_row(agent_name, plugin, line, col_names);
+                // OOB: live row count
+                html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
+                html += std::to_string(count);
+                html += "</span>";
+                // OOB: remove empty-state placeholder on first row only
+                if (count == 1)
+                    html += "<tr id=\"empty-row\" hx-swap-oob=\"delete\"></tr>";
+                bus_.publish("output", html);
+            }
             pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
         }
-        return html;
     }
 
     // ── OTA Update RPCs ─────────────────────────────────────────────────────
@@ -1546,6 +1564,11 @@ public:
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
+    // Best-effort row counter for the dashboard UI.  Reset on new command
+    // dispatch.  Under concurrent commands the count may briefly glitch
+    // (acceptable for a single-user dashboard; per-command counters would
+    // add unnecessary complexity).
+    std::atomic<size_t> output_row_count_{0};
     bool require_client_identity_{false};
     bool gateway_mode_{false};
     UpdateRegistry* update_registry_{nullptr};
@@ -2812,6 +2835,27 @@ private:
             return false;
         }
         return true;
+    }
+
+    /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
+    nlohmann::json get_visible_agents_json(const std::string& username) {
+        auto agents = registry_.to_json_obj();
+        if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
+            bool global_read =
+                rbac_store_->check_permission(username, "Infrastructure", "Read");
+            if (!global_read) {
+                auto visible = mgmt_group_store_->get_visible_agents(username);
+                std::set<std::string> visible_set(visible.begin(), visible.end());
+                nlohmann::json filtered = nlohmann::json::array();
+                for (const auto& a : agents) {
+                    if (a.contains("agent_id") &&
+                        visible_set.count(a["agent_id"].get<std::string>()))
+                        filtered.push_back(a);
+                }
+                return filtered;
+            }
+        }
+        return agents;
     }
 
     /// Auto-create a dynamic management group for a service tag value.
@@ -6245,34 +6289,77 @@ private:
         web_server_->Get("/api/agents", [this](const httplib::Request& req, httplib::Response& res) {
             if (!require_permission(req, res, "Infrastructure", "Read"))
                 return;
-
             auto session = require_auth(req, res);
-            auto full_json = registry_.to_json();
+            if (!session) return;
+            res.set_content(get_visible_agents_json(session->username).dump(),
+                            "application/json");
+        });
 
-            // If RBAC is enabled, filter to visible agents for non-global-admins
-            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-                bool global_read =
-                    rbac_store_->check_permission(session->username, "Infrastructure", "Read");
-                if (!global_read) {
-                    auto visible = mgmt_group_store_->get_visible_agents(session->username);
-                    std::set<std::string> visible_set(visible.begin(), visible.end());
-                    try {
-                        auto arr = nlohmann::json::parse(full_json);
-                        nlohmann::json filtered = nlohmann::json::array();
-                        for (const auto& a : arr) {
-                            if (a.contains("agent_id") &&
-                                visible_set.count(a["agent_id"].get<std::string>()))
-                                filtered.push_back(a);
-                        }
-                        res.set_content(filtered.dump(), "application/json");
-                        return;
-                    } catch (...) {
-                        // Fall through to unfiltered
-                    }
-                }
+        // -- Scope panel fragment (HTMX polling) --------------------------------
+
+        web_server_->Get("/fragments/scope-list", [this](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            auto session = require_auth(req, res);
+            if (!session) return;
+
+            std::string selected = req.get_param_value("selected");
+            if (selected.empty()) selected = "__all__";
+
+            auto agents_arr = get_visible_agents_json(session->username);
+
+            // Sort by agent_id
+            std::sort(agents_arr.begin(), agents_arr.end(),
+                      [](const nlohmann::json& a, const nlohmann::json& b) {
+                          return a.value("agent_id", "") < b.value("agent_id", "");
+                      });
+
+            std::string html;
+            html.reserve(agents_arr.size() * 400 + 2048);
+
+            // "All Agents" item
+            html += "<div class=\"scope-item";
+            if (selected == "__all__") html += " selected";
+            html += "\" data-agent-id=\"__all__\" onclick=\"selectScope(this)\">"
+                    "<span class=\"scope-item-name scope-item-all\">All Agents</span>"
+                    "<span class=\"scope-item-meta\">Broadcast to every connected agent</span>"
+                    "</div>";
+
+            // Individual agents
+            for (const auto& a : agents_arr) {
+                auto id = a.value("agent_id", "");
+                auto hostname = a.value("hostname", "");
+                auto os = a.value("os", "?");
+                auto arch = a.value("arch", "?");
+                auto version = a.value("agent_version", "");
+                auto short_id = (id.size() > 12) ? id.substr(0, 12) : id;
+
+                html += "<div class=\"scope-item";
+                if (selected == id) html += " selected";
+                html += "\" data-agent-id=\"" + html_escape(id) +
+                        "\" onclick=\"selectScope(this)\">"
+                        "<span class=\"scope-item-name\"><span class=\"online-dot\"></span>" +
+                        html_escape(hostname.empty() ? id : hostname) +
+                        "</span><span class=\"scope-item-meta\">" +
+                        html_escape(short_id) + " &middot; " +
+                        html_escape(os) + "/" + html_escape(arch) +
+                        (version.empty() ? "" : " &middot; v" + html_escape(version)) +
+                        "</span></div>";
             }
 
-            res.set_content(full_json, "application/json");
+            // OOB: agent count badge
+            auto count = agents_arr.size();
+            html += "<span id=\"agent-count\" hx-swap-oob=\"true\">" +
+                    std::to_string(count) + " agent" +
+                    (count != 1u ? "s" : "") + "</span>";
+
+            // Hidden data carrier — bridges agent JSON to client-side JS state
+            html += "<div id=\"scope-data\" data-agents=\"" +
+                    html_escape(agents_arr.dump()) +
+                    "\" style=\"display:none\"></div>";
+
+            res.set_content(html, "text/html");
         });
 
         web_server_->Get("/api/help", [this](const httplib::Request& req, httplib::Response& res) {
