@@ -1255,7 +1255,6 @@ extern const char* const kDashboardIndexHtml =
     };
 
     /* ── Init ─────────────────────────────────────────────── */
-    connectSSE();
     refreshAgentList();
     setInterval(refreshAgentList, 5000);
     loadUserInfo();

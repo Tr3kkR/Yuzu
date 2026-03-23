@@ -13,6 +13,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -482,21 +483,9 @@ private:
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
 
-inline std::string html_escape(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        switch (c) {
-        case '&': out += "&amp;"; break;
-        case '<': out += "&lt;"; break;
-        case '>': out += "&gt;"; break;
-        case '"': out += "&quot;"; break;
-        case '\'': out += "&#39;"; break;
-        default: out += c;
-        }
-    }
-    return out;
-}
+// html_escape is provided by web_utils.hpp in namespace yuzu::server.
+// Bring it into the detail namespace so AgentServiceImpl can use it unqualified.
+using yuzu::server::html_escape;
 
 struct SseSinkState {
     std::mutex mu;
@@ -518,14 +507,18 @@ std::string format_sse(const SseEvent& ev) {
     out += ev.event_type;
     out += '\n';
     std::string_view d{ev.data};
-    std::size_t pos = 0;
-    while (pos <= d.size()) {
-        auto nl = d.find('\n', pos);
-        out += "data: ";
-        out.append(d.substr(pos, (nl == std::string_view::npos ? d.size() : nl) - pos));
-        out += '\n';
-        if (nl == std::string_view::npos) break;
-        pos = nl + 1;
+    if (d.empty()) {
+        out += "data: \n";
+    } else {
+        std::size_t pos = 0;
+        while (pos < d.size()) {
+            auto nl = d.find('\n', pos);
+            out += "data: ";
+            out.append(d.substr(pos, (nl == std::string_view::npos ? d.size() : nl) - pos));
+            out += '\n';
+            if (nl == std::string_view::npos) break;
+            pos = nl + 1;
+        }
     }
     out += '\n'; // blank line terminates the event
     return out;
@@ -1032,7 +1025,9 @@ public:
                 std::string plugin = extract_plugin(resp.command_id());
 
                 // Publish pre-rendered HTML rows for HTMX SSE swap
-                bus_.publish("output", render_output_rows(agent_id, plugin, resp.output()));
+                auto html_rows = render_output_rows(agent_id, plugin, resp.output());
+                if (!html_rows.empty())
+                    bus_.publish("output", html_rows);
 
                 // Store streaming response
                 if (response_store_) {
@@ -1302,7 +1297,30 @@ public:
         return html;
     }
 
+    // Find the next unescaped pipe ('|' not preceded by '\\').
+    static size_t find_unescaped_pipe(const std::string& s, size_t pos) {
+        while (pos < s.size()) {
+            auto p = s.find('|', pos);
+            if (p == std::string::npos) return std::string::npos;
+            if (p > 0 && s[p - 1] == '\\') { pos = p + 1; continue; }
+            return p;
+        }
+        return std::string::npos;
+    }
+
+    // Unescape \\| → | in a field value.
+    static std::string unescape_pipes(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') continue;
+            out += s[i];
+        }
+        return out;
+    }
+
     // Split one pipe-delimited line into table cells using the plugin schema.
+    // Respects \| escape sequences emitted by plugins (procfetch, sockwho, vuln_scan, ioc).
     static std::vector<std::string> split_fields(const std::string& plugin,
                                                   const std::string& line) {
         // vuln_scan: severity|category|title|detail (4+ fields, last is remainder)
@@ -1310,29 +1328,29 @@ public:
             std::vector<std::string> parts;
             size_t pos = 0;
             for (int i = 0; i < 3; ++i) {
-                auto p = line.find('|', pos);
-                if (p == std::string::npos) { parts.push_back(line.substr(pos)); return parts; }
-                parts.push_back(line.substr(pos, p - pos));
+                auto p = find_unescaped_pipe(line, pos);
+                if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); return parts; }
+                parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
                 pos = p + 1;
             }
-            parts.push_back(line.substr(pos)); // remainder = detail
+            parts.push_back(unescape_pipes(line.substr(pos))); // remainder = detail
             return parts;
         }
         // key|value plugins: split into exactly 2 (key, rest)
         auto& cols = columns_for_plugin(plugin);
         if (cols.size() == 3) { // Agent + Key + Value
-            auto sep = line.find('|');
+            auto sep = find_unescaped_pipe(line, 0);
             if (sep != std::string::npos)
-                return {line.substr(0, sep), line.substr(sep + 1)};
-            return {line, ""};
+                return {unescape_pipes(line.substr(0, sep)), unescape_pipes(line.substr(sep + 1))};
+            return {unescape_pipes(line), ""};
         }
         // Default: split on all pipes
         std::vector<std::string> parts;
         size_t pos = 0;
-        while (pos < line.size()) {
-            auto p = line.find('|', pos);
-            if (p == std::string::npos) { parts.push_back(line.substr(pos)); break; }
-            parts.push_back(line.substr(pos, p - pos));
+        while (pos <= line.size()) {
+            auto p = find_unescaped_pipe(line, pos);
+            if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); break; }
+            parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
             pos = p + 1;
         }
         return parts;
@@ -1381,6 +1399,8 @@ public:
     std::string render_output_rows(const std::string& agent_id,
                                     const std::string& plugin,
                                     const std::string& raw_output) {
+        if (raw_output.empty()) return {};
+
         auto agent_name = registry_.display_name(agent_id);
         auto& col_names = columns_for_plugin(plugin);
 
@@ -1391,6 +1411,8 @@ public:
             std::string line = (nl == std::string::npos)
                                    ? raw_output.substr(pos)
                                    : raw_output.substr(pos, nl - pos);
+            // Strip \r from Windows line endings
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             if (!line.empty())
                 html += render_row(agent_name, plugin, line, col_names);
             pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
