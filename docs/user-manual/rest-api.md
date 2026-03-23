@@ -91,12 +91,15 @@ All REST API v1 responses use a standard JSON envelope.
 
 ```json
 {
-  "error": "human-readable message",
+  "error": {
+    "code": 503,
+    "message": "human-readable message"
+  },
   "meta": { "api_version": "v1" }
 }
 ```
 
-HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable.
+HTTP status codes follow standard conventions: `200` for success, `201` for resource creation, `400` for bad requests, `401` for unauthenticated, `403` for forbidden, `404` for not found, `503` for service unavailable. All error responses include the structured error envelope shown above, with the `code` field matching the HTTP status.
 
 ---
 

@@ -303,13 +303,18 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
 - **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
 - **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+- **HTTPS by default** — `https_enabled` defaults to `true`. Operators must provide `--https-cert` and `--https-key`, or use `--no-https` for development. The `--https` flag was replaced with `--no-https`.
+- **Secure bind default** — Web UI binds to `127.0.0.1` by default (not `0.0.0.0`). A startup warning is logged if overridden to all interfaces.
+- **Metrics auth** — `/metrics` allows unauthenticated access from localhost only. Remote access requires authentication. `--metrics-no-auth` overrides for monitoring infrastructure.
+- **Private key permission validation** — Server refuses to start if TLS private key files are group/others-readable on Unix. Uses `std::filesystem::perms` check. Skipped on Windows.
+- **CORS on all API endpoints** — CORS headers applied via `set_post_routing_handler` for all `/api/` paths.
+- **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.
 
 ### Planned (see roadmap)
 - **Granular RBAC** — Principals, roles, securable types, per-operation permissions (Phase 3)
 - **OIDC SSO** — Replace stub with real OIDC flow (Phase 3)
 - **API tokens** — Bearer token auth for automation (Phase 3)
 - **AD/Entra integration** — Import users/groups from directory (Phase 7)
-- **HTTPS for dashboard** — TLS termination (Phase 0)
 
 Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 

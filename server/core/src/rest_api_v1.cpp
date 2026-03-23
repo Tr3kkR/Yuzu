@@ -365,8 +365,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
-    svr.Get("/api/v1/openapi.json", [](const httplib::Request& req, httplib::Response& res) {
-        add_cors_headers(res, req);
+    svr.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(openapi_spec(), "application/json");
     });
 
@@ -406,6 +405,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!mgmt_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -433,6 +433,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         if (!mgmt_store) {
             res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
             return;
         }
 
@@ -471,6 +472,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!mgmt_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -511,6 +513,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!mgmt_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -583,6 +586,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!mgmt_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -604,6 +608,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
                      return;
                  }
 
@@ -629,6 +634,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!mgmt_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -648,6 +654,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!mgmt_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -673,6 +680,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!mgmt_store || !rbac_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -748,6 +756,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!mgmt_store || !rbac_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -795,6 +804,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!token_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -827,6 +837,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         if (!token_store) {
             res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
             return;
         }
 
@@ -895,6 +906,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         if (!token_store) {
             res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
             return;
         }
 
@@ -917,6 +929,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!quarantine_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -941,6 +954,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         if (!quarantine_store) {
             res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
             return;
         }
 
@@ -970,6 +984,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!quarantine_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -992,6 +1007,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!rbac_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1014,6 +1030,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!rbac_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1036,6 +1053,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         if (!rbac_store) {
             res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
             return;
         }
 
@@ -1075,6 +1093,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!tag_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1097,6 +1116,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!tag_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1120,6 +1140,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!tag_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1160,6 +1181,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 return;
             if (!tag_store) {
                 res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
                 return;
             }
 
@@ -1183,6 +1205,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!instruction_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1211,6 +1234,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 if (!audit_store) {
                     res.status = 503;
+                    res.set_content(error_json("service unavailable", 503), "application/json");
                     return;
                 }
 
@@ -1247,7 +1271,6 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     svr.Get("/api/v1/inventory/tables",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                add_cors_headers(res, req);
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
@@ -1270,7 +1293,6 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     svr.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                add_cors_headers(res, req);
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
@@ -1305,7 +1327,6 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     svr.Post("/api/v1/inventory/query",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                 add_cors_headers(res, req);
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return;
                  if (!inventory_store || !inventory_store->is_open()) {

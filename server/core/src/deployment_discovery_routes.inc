@@ -7,6 +7,7 @@
                                  return;
                              if (!deployment_store_) {
                                  res.status = 503;
+                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                  return;
                              }
                              auto jobs = deployment_store_->list_jobs();
@@ -33,6 +34,7 @@
                                   return;
                               if (!deployment_store_) {
                                   res.status = 503;
+                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
                               auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -87,6 +89,7 @@
                                  return;
                              if (!deployment_store_) {
                                  res.status = 503;
+                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                  return;
                              }
                              auto id = req.matches[1].str();
@@ -118,6 +121,7 @@
                                     return;
                                 if (!deployment_store_) {
                                     res.status = 503;
+                                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                     return;
                                 }
                                 auto id = req.matches[1].str();
@@ -144,6 +148,7 @@
                                   return;
                               if (!discovery_store_) {
                                   res.status = 503;
+                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
                               auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -191,6 +196,7 @@
                                  return;
                              if (!discovery_store_) {
                                  res.status = 503;
+                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                  return;
                              }
                              auto subnet = req.get_param_value("subnet");

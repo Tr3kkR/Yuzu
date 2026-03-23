@@ -16,11 +16,13 @@ using namespace yuzu::server;
 
 TEST_CASE("HTTPS config: defaults", "[https][config]") {
     Config cfg;
-    CHECK(cfg.https_enabled == false);
+    CHECK(cfg.https_enabled == true);  // H2: HTTPS enabled by default
     CHECK(cfg.https_port == 8443);
     CHECK(cfg.https_redirect == true);
     CHECK(cfg.https_cert_path.empty());
     CHECK(cfg.https_key_path.empty());
+    CHECK(cfg.web_address == "127.0.0.1");  // H1: localhost by default
+    CHECK(cfg.metrics_require_auth == true); // H3: metrics auth by default
 }
 
 TEST_CASE("HTTPS config: enabled with paths", "[https][config]") {

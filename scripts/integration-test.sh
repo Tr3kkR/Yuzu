@@ -259,6 +259,7 @@ log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_POR
     --listen "127.0.0.1:$SERVER_AGENT_PORT" \
     --management "127.0.0.1:$SERVER_MGMT_PORT" \
     --web-port "$SERVER_WEB_PORT" \
+    --no-https \
     --gateway-mode \
     --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
     $TLS_SERVER_FLAGS \

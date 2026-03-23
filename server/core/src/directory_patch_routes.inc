@@ -7,7 +7,7 @@
                     return;
                 if (!directory_sync_ || !directory_sync_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"directory sync not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"directory sync not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -86,7 +86,7 @@
                     return;
                 if (!directory_sync_ || !directory_sync_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"directory sync not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"directory sync not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -121,7 +121,7 @@
                     return;
                 if (!directory_sync_ || !directory_sync_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"directory sync not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"directory sync not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -156,7 +156,7 @@
                     return;
                 if (!directory_sync_ || !directory_sync_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"directory sync not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"directory sync not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -216,7 +216,7 @@
                     return;
                 if (!patch_manager_ || !patch_manager_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"patch manager not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"patch manager not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -269,7 +269,7 @@
                     return;
                 if (!patch_manager_ || !patch_manager_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"patch manager not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"patch manager not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -336,7 +336,7 @@
                     return;
                 if (!patch_manager_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"patch manager not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"patch manager not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -380,7 +380,7 @@
                     return;
                 if (!patch_manager_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"patch manager not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"patch manager not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -419,7 +419,7 @@
                     return;
                 if (!patch_manager_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"patch manager not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"patch manager not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 

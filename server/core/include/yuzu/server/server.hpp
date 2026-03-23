@@ -14,7 +14,7 @@ namespace yuzu::server {
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
-    std::string web_address{"0.0.0.0"};              // HTMX web UI bind address
+    std::string web_address{"127.0.0.1"};             // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
     bool tls_enabled{true};
@@ -53,7 +53,7 @@ struct Config {
     bool ota_enabled{true}; // Master switch for OTA updates
 
     // HTTPS for web dashboard
-    bool https_enabled{false};
+    bool https_enabled{true};
     int https_port{8443};
     std::filesystem::path https_cert_path;
     std::filesystem::path https_key_path;
@@ -82,6 +82,9 @@ struct Config {
     std::string clickhouse_username;
     std::string clickhouse_password;
     std::filesystem::path analytics_jsonl_path; // empty = disabled
+
+    // Metrics
+    bool metrics_require_auth{true}; // Require auth for remote /metrics access
 
     // Rate limiting
     int rate_limit{100};      // Max API requests/second per IP

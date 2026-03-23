@@ -138,6 +138,12 @@ int main(int argc, char* argv[]) {
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
 
+    // Metrics auth
+    app.add_flag("--metrics-no-auth",
+                 "Allow unauthenticated /metrics access from any source")
+        ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
+        ->envname("YUZU_METRICS_NO_AUTH");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;
@@ -170,9 +176,9 @@ int main(int argc, char* argv[]) {
     });
 
     // HTTPS web dashboard options
-    app.add_flag("--https", "Enable HTTPS for the web dashboard")->each([&cfg](const std::string&) {
-        cfg.https_enabled = true;
-    });
+    app.add_flag("--no-https", "Disable HTTPS (insecure, for development only)")
+        ->each([&cfg](const std::string&) { cfg.https_enabled = false; })
+        ->envname("YUZU_NO_HTTPS");
     app.add_option("--https-port", cfg.https_port, "HTTPS port (default: 8443)")
         ->default_val(8443)
         ->envname("YUZU_HTTPS_PORT");

@@ -1853,6 +1853,35 @@ std::string read_file_contents(const std::filesystem::path& p) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
+/// Validate that a private key file is not readable by group or others (Unix).
+/// Returns true if permissions are acceptable or on Windows (ACL-based).
+[[nodiscard]] bool validate_key_file_permissions(const std::filesystem::path& key_path,
+                                                 std::string_view label) {
+#ifdef _WIN32
+    // Windows uses ACLs, not POSIX mode bits. Log advisory and proceed.
+    spdlog::debug("{}: skipping Unix permission check on Windows for {}", label,
+                  key_path.string());
+    return true;
+#else
+    std::error_code ec;
+    auto perms = std::filesystem::status(key_path, ec).permissions();
+    if (ec) {
+        spdlog::error("{}: cannot stat key file {}: {}", label, key_path.string(), ec.message());
+        return false;
+    }
+    using fp = std::filesystem::perms;
+    auto bad = perms & (fp::group_read | fp::group_write | fp::group_exec | fp::others_read |
+                        fp::others_write | fp::others_exec);
+    if (bad != fp::none) {
+        spdlog::error("{}: private key {} has overly permissive file permissions. "
+                      "Run: chmod 600 {}",
+                      label, key_path.string(), key_path.string());
+        return false;
+    }
+    return true;
+#endif
+}
+
 } // namespace detail
 
 // -- ServerImpl ---------------------------------------------------------------
@@ -2389,6 +2418,10 @@ private:
             return nullptr;
         }
 
+        if (!detail::validate_key_file_permissions(key_path, listener_name)) {
+            return nullptr;
+        }
+
         auto cert = detail::read_file_contents(cert_path);
         auto key = detail::read_file_contents(key_path);
         if (cert.empty() || key.empty()) {
@@ -2699,7 +2732,7 @@ private:
         }
 
         res.status = 401;
-        res.set_content(R"({"error":"unauthorized"})", "application/json");
+        res.set_content(R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})", "application/json");
         return std::nullopt;
     }
 
@@ -2709,7 +2742,7 @@ private:
             return false;
         if (session->role != auth::Role::admin) {
             res.status = 403;
-            res.set_content(R"({"error":"admin role required"})", "application/json");
+            res.set_content(R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})", "application/json");
             return false;
         }
         return true;
@@ -2727,7 +2760,7 @@ private:
         if (!session->token_scope_service.empty()) {
             if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
                 res.status = 403;
-                res.set_content(R"({"error":"service-scoped tokens require RBAC to be enabled"})",
+                res.set_content(R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
                                 "application/json");
                 return false;
             }
@@ -2761,7 +2794,7 @@ private:
         // Legacy fallback: write/delete/execute/approve require admin
         if (operation != "Read" && session->role != auth::Role::admin) {
             res.status = 403;
-            res.set_content(R"({"error":"admin role required"})", "application/json");
+            res.set_content(R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})", "application/json");
             return false;
         }
         return true;
@@ -2780,7 +2813,7 @@ private:
         if (!session->token_scope_service.empty()) {
             if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
                 res.status = 403;
-                res.set_content(R"({"error":"service-scoped tokens require RBAC to be enabled"})",
+                res.set_content(R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
                                 "application/json");
                 return false;
             }
@@ -2831,7 +2864,7 @@ private:
         // Legacy fallback: write/delete/execute/approve require admin
         if (operation != "Read" && session->role != auth::Role::admin) {
             res.status = 403;
-            res.set_content(R"({"error":"admin role required"})", "application/json");
+            res.set_content(R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})", "application/json");
             return false;
         }
         return true;
@@ -4624,7 +4657,9 @@ private:
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled) {
             if (cfg_.https_cert_path.empty() || cfg_.https_key_path.empty()) {
-                spdlog::error("HTTPS enabled but --https-cert and --https-key are required");
+                spdlog::error("HTTPS is enabled by default but --https-cert and --https-key "
+                              "are required. Provide certificate paths or use --no-https "
+                              "for development.");
                 return;
             }
             if (!std::filesystem::exists(cfg_.https_cert_path)) {
@@ -4635,17 +4670,25 @@ private:
                 spdlog::error("HTTPS key not found: {}", cfg_.https_key_path.string());
                 return;
             }
+            if (!detail::validate_key_file_permissions(cfg_.https_key_path, "HTTPS")) {
+                spdlog::error("Fix key file permissions before starting with HTTPS");
+                return;
+            }
             web_server_ = std::make_unique<httplib::SSLServer>(
                 cfg_.https_cert_path.string().c_str(), cfg_.https_key_path.string().c_str());
             spdlog::info("HTTPS enabled on port {} (cert: {}, key: {})", cfg_.https_port,
                          cfg_.https_cert_path.string(), cfg_.https_key_path.string());
         } else {
+            spdlog::warn("HTTPS disabled via --no-https. Dashboard traffic is unencrypted.");
             web_server_ = std::make_unique<httplib::Server>();
         }
 #else
         if (cfg_.https_enabled) {
             spdlog::warn(
                 "HTTPS requested but OpenSSL support not compiled in; falling back to HTTP");
+        }
+        if (!cfg_.https_enabled) {
+            spdlog::warn("HTTPS disabled via --no-https. Dashboard traffic is unencrypted.");
         }
         web_server_ = std::make_unique<httplib::Server>();
 #endif
@@ -4674,7 +4717,7 @@ private:
                 if (!limiter.allow(req.remote_addr)) {
                     res.status = 429;
                     res.set_header("Retry-After", "1");
-                    res.set_content(R"({"error":"rate limit exceeded"})", "application/json");
+                    res.set_content(R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})", "application/json");
                     return httplib::Server::HandlerResponse::Handled;
                 }
 
@@ -4686,9 +4729,12 @@ private:
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
-                // /metrics: allow unauthenticated from localhost only (Prometheus scraping)
+                // /metrics: localhost always unauthenticated; remote depends on config
                 if (req.path == "/metrics") {
                     if (req.remote_addr == "127.0.0.1" || req.remote_addr == "::1") {
+                        return httplib::Server::HandlerResponse::Unhandled;
+                    }
+                    if (!cfg_.metrics_require_auth) {
                         return httplib::Server::HandlerResponse::Unhandled;
                     }
                     // Remote callers fall through to normal auth check below
@@ -4718,7 +4764,7 @@ private:
                     // API calls get 401, pages get redirect
                     if (req.path.starts_with("/api/") || req.path == "/events") {
                         res.status = 401;
-                        res.set_content(R"({"error":"unauthorized"})", "application/json");
+                        res.set_content(R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})", "application/json");
                     } else {
                         res.set_redirect("/login");
                     }
@@ -4747,7 +4793,7 @@ private:
             auto token = auth_mgr_.authenticate(username, password);
             if (!token) {
                 res.status = 401;
-                res.set_content(R"({"error":"Invalid username or password"})", "application/json");
+                res.set_content(R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})", "application/json");
                 audit_log(req, "auth.login_failed", "failure", "user", username);
                 emit_event("auth.login_failed", req,
                            {{"source_ip", req.remote_addr}, {"username", username}}, {},
@@ -4781,7 +4827,7 @@ private:
             "/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
                 if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
                     res.status = 404;
-                    res.set_content(R"({"error":"OIDC not configured"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"OIDC not configured"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 // Use configured redirect URI (from --oidc-redirect-uri or auto-computed).
@@ -4868,9 +4914,23 @@ private:
             res.set_redirect("/");
         });
 
-        // -- HTTP metrics (post-routing handler) --------------------------------
+        // -- HTTP metrics + CORS (post-routing handler) --------------------------
         web_server_->set_post_routing_handler(
             [this](const httplib::Request& req, httplib::Response& res) {
+                // CORS headers for all /api/ responses (H6)
+                if (req.path.starts_with("/api/")) {
+                    auto origin = req.get_header_value("Origin");
+                    if (!origin.empty()) {
+                        res.set_header("Access-Control-Allow-Origin", origin);
+                        res.set_header("Access-Control-Allow-Credentials", "true");
+                    }
+                    res.set_header("Access-Control-Allow-Methods",
+                                   "GET, POST, PUT, DELETE, OPTIONS");
+                    res.set_header("Access-Control-Allow-Headers",
+                                   "Content-Type, Authorization, X-Yuzu-Token");
+                    res.set_header("Access-Control-Max-Age", "86400");
+                }
+
                 metrics_
                     .counter("yuzu_http_requests_total",
                              {{"method", req.method}, {"status", std::to_string(res.status)}})
@@ -5108,7 +5168,7 @@ private:
                                  return;
                              if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"runtime config store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5122,13 +5182,13 @@ private:
                                                                      : j["value"].dump();
                                  else {
                                      res.status = 400;
-                                     res.set_content(R"({"error":"missing 'value' in request body"})",
+                                     res.set_content(R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
                                                      "application/json");
                                      return;
                                  }
                              } catch (...) {
                                  res.status = 400;
-                                 res.set_content(R"({"error":"invalid JSON body"})",
+                                 res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5181,7 +5241,7 @@ private:
                                  return;
                              if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5207,7 +5267,7 @@ private:
                                  return;
                              if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5224,7 +5284,7 @@ private:
                                                                      : j["value"].dump();
                                  else {
                                      res.status = 400;
-                                     res.set_content(R"({"error":"missing 'value' in request body"})",
+                                     res.set_content(R"({"error":{"code":400,"message":"missing 'value' in request body"},"meta":{"api_version":"v1"}})",
                                                      "application/json");
                                      return;
                                  }
@@ -5232,7 +5292,7 @@ private:
                                      type = j["type"].get<std::string>();
                              } catch (...) {
                                  res.status = 400;
-                                 res.set_content(R"({"error":"invalid JSON body"})",
+                                 res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5266,7 +5326,7 @@ private:
                                     !custom_properties_store_->is_open()) {
                                     res.status = 503;
                                     res.set_content(
-                                        R"({"error":"custom properties store unavailable"})",
+                                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
                                         "application/json");
                                     return;
                                 }
@@ -5278,7 +5338,7 @@ private:
                                     custom_properties_store_->delete_property(agent_id, key);
                                 if (!deleted) {
                                     res.status = 404;
-                                    res.set_content(R"({"error":"property not found"})",
+                                    res.set_content(R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
                                                     "application/json");
                                     return;
                                 }
@@ -5298,7 +5358,7 @@ private:
                                  return;
                              if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"custom properties store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -5325,7 +5385,7 @@ private:
                                   !custom_properties_store_->is_open()) {
                                   res.status = 503;
                                   res.set_content(
-                                      R"({"error":"custom properties store unavailable"})",
+                                      R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
                                       "application/json");
                                   return;
                               }
@@ -5340,14 +5400,14 @@ private:
                                   schema.validation_regex = j.value("validation_regex", "");
                               } catch (...) {
                                   res.status = 400;
-                                  res.set_content(R"({"error":"invalid JSON body"})",
+                                  res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})",
                                                   "application/json");
                                   return;
                               }
 
                               if (schema.key.empty()) {
                                   res.status = 400;
-                                  res.set_content(R"({"error":"'key' is required"})",
+                                  res.set_content(R"({"error":{"code":400,"message":"'key' is required"},"meta":{"api_version":"v1"}})",
                                                   "application/json");
                                   return;
                               }
@@ -5635,7 +5695,7 @@ private:
                     ttl_hours = std::stoi(ttl_s);
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -5685,13 +5745,13 @@ private:
                     ttl_hours = std::stoi(ttl_s);
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
             if (count < 1 || count > 10000) {
                 res.status = 400;
-                res.set_content(R"({"error":"count must be 1-10000"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"count must be 1-10000"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6402,7 +6462,7 @@ private:
                     return;
                 if (!nvd_sync_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"NVD sync not enabled"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"NVD sync not enabled"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 // Run sync in a detached thread so we don't block the HTTP response
@@ -6416,7 +6476,7 @@ private:
                 return;
             if (!nvd_db_ || !nvd_db_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"NVD database not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"NVD database not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
             // Parse inventory: array of {name, version} or pipe-delimited lines
@@ -6434,7 +6494,7 @@ private:
                 }
             } catch (...) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid JSON body"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid JSON body"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6464,7 +6524,7 @@ private:
 
             if (plugin.empty() || action.empty()) {
                 res.status = 400;
-                res.set_content("{\"error\":\"plugin and action are required\"}",
+                res.set_content(R"({"error":{"code":400,"message":"plugin and action are required"},"meta":{"api_version":"v1"}})",
                                 "application/json");
                 return;
             }
@@ -6475,7 +6535,7 @@ private:
 
             if (!registry_.has_any()) {
                 res.status = 503;
-                res.set_content("{\"error\":\"no agent connected\"}", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6528,7 +6588,7 @@ private:
 
             if (sent == 0) {
                 res.status = 503;
-                res.set_content("{\"error\":\"failed to send command to any agent\"}",
+                res.set_content(R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
                                 "application/json");
                 return;
             }
@@ -6605,7 +6665,7 @@ private:
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"response store not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6641,7 +6701,7 @@ private:
                     filter.until = std::stoll(req.get_param_value("until"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6673,7 +6733,7 @@ private:
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"response store not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6693,7 +6753,7 @@ private:
                     q.limit = 10000; // higher default for exports
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6743,13 +6803,13 @@ private:
             auto instruction_id = req.matches[1].str();
             if (instruction_id.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":"instruction_id required"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"instruction_id required"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
             if (!response_store_ || !response_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"response store not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"response store not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6769,7 +6829,7 @@ private:
                     q.offset = std::stoi(req.get_param_value("offset"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6796,7 +6856,7 @@ private:
 
             if (!audit_store_ || !audit_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"audit store not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"audit store not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6820,7 +6880,7 @@ private:
                     q.offset = std::stoi(req.get_param_value("offset"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6853,14 +6913,14 @@ private:
 
             if (!tag_store_ || !tag_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"tag store not available"})", "application/json");
+                res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
             auto agent_id = req.get_param_value("agent_id");
             if (agent_id.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":"agent_id parameter required"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"agent_id parameter required"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -6882,7 +6942,7 @@ private:
                     return;
                 if (!tag_store_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -6892,13 +6952,13 @@ private:
 
                 if (agent_id.empty() || key.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
                 if (!TagStore::validate_key(key)) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid tag key"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid tag key"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -6924,7 +6984,7 @@ private:
                     return;
                 if (!tag_store_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -6933,7 +6993,7 @@ private:
 
                 if (agent_id.empty() || key.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"agent_id and key required"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -6953,7 +7013,7 @@ private:
                     return;
                 if (!tag_store_) {
                     res.status = 503;
-                    res.set_content(R"({"error":"tag store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"tag store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -6962,7 +7022,7 @@ private:
 
                 if (key.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"key required"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"key required"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7029,7 +7089,7 @@ private:
                 auto csv = data_export::json_array_to_csv(req.body);
                 if (csv.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid JSON array"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
@@ -7044,7 +7104,7 @@ private:
                 return;
             if (!instruction_store_ || !instruction_store_->is_open()) {
                 res.status = 503;
-                res.set_content(R"({"error":"instruction store not available"})",
+                res.set_content(R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
                                 "application/json");
                 return;
             }
@@ -7065,7 +7125,7 @@ private:
                     q.limit = std::stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7094,6 +7154,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7145,6 +7206,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7152,7 +7214,7 @@ private:
             auto def = instruction_store_->get_definition(id);
             if (!def) {
                 res.status = 404;
-                res.set_content(R"({"error":"not found"})", "application/json");
+                res.set_content(R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7180,6 +7242,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7221,6 +7284,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7241,6 +7305,7 @@ private:
                                  return;
                              if (!instruction_store_) {
                                  res.status = 503;
+                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                  return;
                              }
 
@@ -7255,6 +7320,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7279,6 +7345,7 @@ private:
                     return;
                 if (!instruction_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7300,6 +7367,7 @@ private:
                     return;
                 if (!instruction_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7324,6 +7392,7 @@ private:
                 return;
             if (!instruction_store_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7340,6 +7409,7 @@ private:
                     return;
                 if (!execution_tracker_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7353,7 +7423,7 @@ private:
                         q.limit = std::stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7382,6 +7452,7 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7389,7 +7460,7 @@ private:
             auto exec = execution_tracker_->get_execution(id);
             if (!exec) {
                 res.status = 404;
-                res.set_content(R"({"error":"not found"})", "application/json");
+                res.set_content(R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7417,6 +7488,7 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7439,6 +7511,7 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7463,6 +7536,7 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7495,6 +7569,7 @@ private:
                                   return;
                               if (!execution_tracker_) {
                                   res.status = 503;
+                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
 
@@ -7518,6 +7593,7 @@ private:
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7539,6 +7615,7 @@ private:
                     return;
                 if (!schedule_engine_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7569,6 +7646,7 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7613,6 +7691,7 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7632,6 +7711,7 @@ private:
                 return;
             if (!schedule_engine_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7650,6 +7730,7 @@ private:
                     return;
                 if (!approval_manager_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -7693,6 +7774,7 @@ private:
                 return;
             if (!approval_manager_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -7722,6 +7804,7 @@ private:
                 return;
             if (!approval_manager_) {
                 res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -8244,7 +8327,7 @@ private:
                 auto expression = extract_json_string(req.body, "expression");
                 if (expression.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"expression required"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8267,7 +8350,7 @@ private:
             auto expression = extract_json_string(req.body, "expression");
             if (expression.empty()) {
                 res.status = 400;
-                res.set_content(R"({"error":"expression required"})", "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -8295,7 +8378,7 @@ private:
                     return;
                 if (!policy_store_ || !policy_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"policy store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8307,7 +8390,7 @@ private:
                         q.limit = std::stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8336,7 +8419,7 @@ private:
                     return;
                 if (!policy_store_ || !policy_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"policy store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8375,6 +8458,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8394,7 +8478,7 @@ private:
                     return;
                 if (!policy_store_ || !policy_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"policy store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8410,7 +8494,7 @@ private:
                         q.limit = std::stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8452,7 +8536,7 @@ private:
                     return;
                 if (!policy_store_ || !policy_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"policy store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8492,6 +8576,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8499,7 +8584,7 @@ private:
                 auto policy = policy_store_->get_policy(id);
                 if (!policy) {
                     res.status = 404;
-                    res.set_content(R"({"error":"policy not found"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8547,6 +8632,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8568,6 +8654,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8592,6 +8679,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8616,6 +8704,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8642,6 +8731,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8667,6 +8757,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8690,6 +8781,7 @@ private:
                     return;
                 if (!policy_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8728,7 +8820,7 @@ private:
                     return;
                 if (!workflow_engine_ || !workflow_engine_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8740,7 +8832,7 @@ private:
                         q.limit = std::stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8777,7 +8869,7 @@ private:
                     return;
                 if (!workflow_engine_ || !workflow_engine_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8817,6 +8909,7 @@ private:
                     return;
                 if (!workflow_engine_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8824,7 +8917,7 @@ private:
                 auto workflow = workflow_engine_->get_workflow(id);
                 if (!workflow) {
                     res.status = 404;
-                    res.set_content(R"({"error":"workflow not found"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"workflow not found"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8859,6 +8952,7 @@ private:
                     return;
                 if (!workflow_engine_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8880,7 +8974,7 @@ private:
                     return;
                 if (!workflow_engine_ || !workflow_engine_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"workflow engine not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8902,7 +8996,7 @@ private:
 
                 if (agent_ids.empty()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"agent_ids array is required"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"agent_ids array is required"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8954,6 +9048,7 @@ private:
                     return;
                 if (!workflow_engine_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8961,7 +9056,7 @@ private:
                 auto exec = workflow_engine_->get_execution(id);
                 if (!exec) {
                     res.status = 404;
-                    res.set_content(R"({"error":"execution not found"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -8998,7 +9093,7 @@ private:
                     return;
                 if (!product_pack_store_ || !product_pack_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"product pack store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9010,7 +9105,7 @@ private:
                         q.limit = std::stoi(req.get_param_value("limit"));
                 } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid numeric query parameter"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9044,7 +9139,7 @@ private:
                     return;
                 if (!product_pack_store_ || !product_pack_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"product pack store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9125,6 +9220,7 @@ private:
                     return;
                 if (!product_pack_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9132,7 +9228,7 @@ private:
                 auto pack = product_pack_store_->get(id);
                 if (!pack) {
                     res.status = 404;
-                    res.set_content(R"({"error":"product pack not found"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9164,6 +9260,7 @@ private:
                     return;
                 if (!product_pack_store_) {
                     res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
 
@@ -9206,7 +9303,7 @@ private:
                     return;
                 if (!inventory_store_ || !inventory_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 auto tables = inventory_store_->list_tables();
@@ -9227,7 +9324,7 @@ private:
                     return;
                 if (!inventory_store_ || !inventory_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 auto agent_id = req.matches[1].str();
@@ -9235,7 +9332,7 @@ private:
                 auto record = inventory_store_->get(agent_id, plugin);
                 if (!record) {
                     res.status = 404;
-                    res.set_content(R"({"error":"no inventory data found"})", "application/json");
+                    res.set_content(R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 nlohmann::json data_obj;
@@ -9258,13 +9355,13 @@ private:
                     return;
                 if (!inventory_store_ || !inventory_store_->is_open()) {
                     res.status = 503;
-                    res.set_content(R"({"error":"inventory store not available"})", "application/json");
+                    res.set_content(R"({"error":{"code":503,"message":"inventory store not available"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 auto body = nlohmann::json::parse(req.body, nullptr, false);
                 if (body.is_discarded()) {
                     res.status = 400;
-                    res.set_content(R"({"error":"invalid JSON"})", "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
                 InventoryQuery q;
@@ -9299,7 +9396,7 @@ private:
                                  return;
                              if (!notification_store_ || !notification_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"notification store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"notification store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -9342,6 +9439,7 @@ private:
                                   return;
                               if (!notification_store_) {
                                   res.status = 503;
+                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
                               auto id = std::stoll(req.matches[1].str());
@@ -9356,6 +9454,7 @@ private:
                                   return;
                               if (!notification_store_) {
                                   res.status = 503;
+                                  res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
                               auto id = std::stoll(req.matches[1].str());
@@ -9374,7 +9473,7 @@ private:
                                  return;
                              if (!webhook_store_ || !webhook_store_->is_open()) {
                                  res.status = 503;
-                                 res.set_content(R"({"error":"webhook store unavailable"})",
+                                 res.set_content(R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
                                                  "application/json");
                                  return;
                              }
@@ -9399,7 +9498,7 @@ private:
                                   return;
                               if (!webhook_store_ || !webhook_store_->is_open()) {
                                   res.status = 503;
-                                  res.set_content(R"({"error":"webhook store unavailable"})",
+                                  res.set_content(R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
                                                   "application/json");
                                   return;
                               }
@@ -9408,13 +9507,13 @@ private:
                                   body = nlohmann::json::parse(req.body);
                               } catch (...) {
                                   res.status = 400;
-                                  res.set_content(R"({"error":"invalid JSON"})", "application/json");
+                                  res.set_content(R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})", "application/json");
                                   return;
                               }
                               auto url = body.value("url", "");
                               if (url.empty()) {
                                   res.status = 400;
-                                  res.set_content(R"({"error":"url is required"})",
+                                  res.set_content(R"({"error":{"code":400,"message":"url is required"},"meta":{"api_version":"v1"}})",
                                                   "application/json");
                                   return;
                               }
@@ -9440,6 +9539,7 @@ private:
                                     return;
                                 if (!webhook_store_) {
                                     res.status = 503;
+                                    res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                     return;
                                 }
                                 auto id = std::stoll(req.matches[1].str());
@@ -9449,7 +9549,7 @@ private:
                                     res.set_content(R"({"status":"deleted"})", "application/json");
                                 } else {
                                     res.status = 404;
-                                    res.set_content(R"({"error":"webhook not found"})",
+                                    res.set_content(R"({"error":{"code":404,"message":"webhook not found"},"meta":{"api_version":"v1"}})",
                                                     "application/json");
                                 }
                             });
@@ -9461,6 +9561,7 @@ private:
                                  return;
                              if (!webhook_store_) {
                                  res.status = 503;
+                                 res.set_content(R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})", "application/json");
                                  return;
                              }
                              auto webhook_id = std::stoll(req.matches[1].str());
@@ -9524,6 +9625,12 @@ private:
 
         // -- Listen -----------------------------------------------------------
 
+        if (cfg_.web_address == "0.0.0.0" || cfg_.web_address == "::") {
+            spdlog::warn("Web UI bound to all interfaces ({}). Consider restricting "
+                         "to 127.0.0.1 in production.",
+                         cfg_.web_address);
+        }
+
         int listen_port = cfg_.web_port;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         if (cfg_.https_enabled) {
@@ -9584,7 +9691,7 @@ private:
                                 httplib::Response& res) {
         if (!registry_.has_any()) {
             res.status = 503;
-            res.set_content("{\"error\":\"no agent connected\"}", "application/json");
+            res.set_content(R"({"error":{"code":503,"message":"no agent connected"},"meta":{"api_version":"v1"}})", "application/json");
             return;
         }
 
@@ -9601,7 +9708,7 @@ private:
 
         if (sent == 0) {
             res.status = 503;
-            res.set_content("{\"error\":\"failed to send command\"}", "application/json");
+            res.set_content(R"({"error":{"code":503,"message":"failed to send command"},"meta":{"api_version":"v1"}})", "application/json");
             return;
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");

@@ -33,11 +33,12 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the default location next to the binary. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
-| `--https` | off | Enable HTTPS for the dashboard. Requires `--https-cert` and `--https-key`. |
-| `--https-port` | `8443` | HTTPS listen port (used when `--https` is enabled). |
-| `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. |
-| `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. |
+| `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
+| `--https-port` | `8443` | HTTPS listen port. |
+| `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
+| `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
 | `--no-https-redirect` | off | When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected. |
+| `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. Env: `YUZU_METRICS_NO_AUTH`. |
 | `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. |
@@ -47,17 +48,15 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 ### Example
 
 ```bash
-# HTTP only (development)
-./yuzu-server --web-port 8080
+# HTTP only (development — HTTPS is on by default, must opt out)
+./yuzu-server --no-https --web-port 8080
 
-# HTTPS with certificate files
-./yuzu-server --https --https-port 8443 \
-  --https-cert /etc/yuzu/server.crt \
+# HTTPS with certificate files (default mode)
+./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key
 
 # HTTPS with OIDC SSO
-./yuzu-server --https --https-port 8443 \
-  --https-cert /etc/yuzu/server.crt \
+./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key \
   --oidc-issuer "https://login.microsoftonline.com/YOUR_TENANT/v2.0" \
   --oidc-client-id "YOUR_CLIENT_ID" \
@@ -126,7 +125,7 @@ TLS can be configured at startup via CLI flags or at runtime through the Setting
 
 ### Via CLI Flags
 
-Pass `--https`, `--https-cert`, and `--https-key` at server startup. See [Server CLI Flags](#server-cli-flags).
+HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server startup. Use `--no-https` for development without TLS. See [Server CLI Flags](#server-cli-flags).
 
 ### Via Settings Page
 
@@ -140,6 +139,7 @@ Pass `--https`, `--https-cert`, and `--https-key` at server startup. See [Server
 - Format: PEM-encoded.
 - The certificate file may contain the full chain (leaf + intermediates).
 - The private key must not be password-protected.
+- On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: `chmod 600 /path/to/key.pem`.
 - For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.
 
 ---
