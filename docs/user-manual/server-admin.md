@@ -17,10 +17,12 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 9. [RBAC Management](#rbac-management)
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
-12. [Retention Settings](#retention-settings)
-13. [Settings API Reference](#settings-api-reference)
-14. [Deployment](#deployment)
-15. [Planned Features](#planned-features)
+12. [Data Storage and Encryption](#data-storage-and-encryption)
+13. [Retention Settings](#retention-settings)
+14. [Settings API Reference](#settings-api-reference)
+15. [Deployment](#deployment)
+16. [Windows Service Installation](#windows-service-installation)
+17. [Planned Features](#planned-features)
 
 ---
 
@@ -374,6 +376,28 @@ OIDC-authenticated users are mapped to Yuzu roles based on claims or group membe
 
 ---
 
+## Data Storage and Encryption
+
+Yuzu stores persistent data in SQLite databases, including the response store, analytics event store, audit log, and RBAC store. These database files reside in the server's working directory alongside the binary.
+
+> **Important: SQLite databases are not encrypted at rest.** The `.db` files contain query results, audit logs, and agent metadata in plaintext on disk. Any user or process with read access to the filesystem can read this data.
+
+### Protecting Data at Rest
+
+Operators must use full-disk encryption to protect Yuzu data at rest:
+
+| Platform | Recommended Solution | Notes |
+|---|---|---|
+| Linux | dm-crypt / LUKS | Encrypt the partition or volume where Yuzu data resides. Most distributions support LUKS during OS installation. |
+| Windows | BitLocker | Enable BitLocker on the drive containing the Yuzu server directory. Requires TPM or startup key. |
+| macOS | FileVault | Enable FileVault in System Settings. Encrypts the entire startup volume. |
+
+For containerized deployments (Docker Compose), ensure the host volume backing `server-data` is on an encrypted filesystem.
+
+> **Planned:** A future `--encrypt-db` option will add application-level SQLite encryption using SQLCipher, providing defense-in-depth independent of disk encryption. Track progress in the roadmap (Phase 7).
+
+---
+
 ## Retention Settings
 
 The server applies retention policies to stored data to manage disk usage. Retention values are set via CLI flags at startup.
@@ -558,6 +582,79 @@ bash scripts/start-stack.sh          # start all components
 bash scripts/start-stack.sh stop     # kill all components
 bash scripts/start-stack.sh status   # show running processes and ports
 ```
+
+---
+
+## Windows Service Installation
+
+On Windows, Yuzu server and agent can be installed as Windows services for automatic startup and recovery. A native Windows service wrapper is planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager).
+
+### Using sc.exe
+
+```cmd
+REM Create the Yuzu server service
+sc.exe create YuzuServer binPath= "C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key" start= auto DisplayName= "Yuzu Server"
+
+REM Create the Yuzu agent service
+sc.exe create YuzuAgent binPath= "C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50054" start= auto DisplayName= "Yuzu Agent"
+
+REM Set startup type to automatic (delayed start, recommended)
+sc.exe config YuzuServer start= delayed-auto
+sc.exe config YuzuAgent start= delayed-auto
+
+REM Configure recovery: restart on first, second, and subsequent failures
+sc.exe failure YuzuServer reset= 86400 actions= restart/5000/restart/10000/restart/30000
+sc.exe failure YuzuAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
+
+REM Start the services
+sc.exe start YuzuServer
+sc.exe start YuzuAgent
+
+REM Stop the services
+sc.exe stop YuzuServer
+sc.exe stop YuzuAgent
+```
+
+> **Note:** With `sc.exe`, spaces after `=` are required (e.g., `start= auto`, not `start=auto`). This is a quirk of the `sc.exe` command parser.
+
+### Using NSSM
+
+[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog.
+
+```cmd
+REM Install services
+nssm install YuzuServer "C:\Yuzu\yuzu-server.exe"
+nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
+
+REM Set arguments
+nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
+nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50054"
+
+REM Configure startup and recovery
+nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START
+nssm set YuzuAgent Start SERVICE_DELAYED_AUTO_START
+
+REM Configure stdout/stderr logging
+nssm set YuzuServer AppStdout "C:\Yuzu\logs\server-stdout.log"
+nssm set YuzuServer AppStderr "C:\Yuzu\logs\server-stderr.log"
+nssm set YuzuAgent AppStdout "C:\Yuzu\logs\agent-stdout.log"
+nssm set YuzuAgent AppStderr "C:\Yuzu\logs\agent-stderr.log"
+
+REM Start the services
+nssm start YuzuServer
+nssm start YuzuAgent
+```
+
+### Service Account
+
+For production deployments, create a dedicated service account with minimal permissions rather than running as `LocalSystem`:
+
+1. Create a local user account (e.g., `YuzuSvc`) with no interactive logon rights.
+2. Grant the account read/write access to the Yuzu installation directory and data directory only.
+3. Assign the "Log on as a service" right via Local Security Policy (`secpol.msc`).
+4. Configure the service to run as this account: `sc.exe config YuzuServer obj= ".\YuzuSvc" password= "PASSWORD"`.
+
+> **Planned:** A native Windows service wrapper (`yuzu-server --install-service`) is planned for a future release, which will handle service registration, recovery configuration, and Event Log integration automatically.
 
 ---
 

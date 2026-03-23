@@ -1,0 +1,166 @@
+groups:
+  - name: yuzu-fleet
+    rules:
+      - alert: YuzuAgentDisconnected
+        expr: |
+          (time() - yuzu_agents_last_heartbeat_timestamp_seconds) > 120
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent_id }} has not sent a heartbeat"
+          description: >-
+            Agent {{ $labels.agent_id }} ({{ $labels.hostname }}) has not sent
+            a heartbeat for more than 2 minutes. The agent may be offline,
+            network-partitioned, or experiencing a hang.
+          runbook_url: "https://docs.yuzu.io/runbooks/agent-disconnected"
+
+      - alert: YuzuAgentFleetDrop
+        expr: |
+          yuzu_agents_connected < (yuzu_agents_connected offset 5m) * 0.8
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fleet agent count dropped by more than 20%"
+          description: >-
+            The number of connected agents has dropped by more than 20% in the
+            last 5 minutes. This may indicate a network outage, server issue,
+            or mass agent failure.
+
+  - name: yuzu-commands
+    rules:
+      - alert: YuzuHighCommandFailureRate
+        expr: |
+          (
+            sum(rate(yuzu_commands_completed_total{status="error"}[5m]))
+            /
+            sum(rate(yuzu_commands_completed_total[5m]))
+          ) > 0.10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command failure rate exceeds 10%"
+          description: >-
+            More than 10% of commands have failed in the last 5 minutes.
+            Current failure rate: {{ $value | humanizePercentage }}.
+            Investigate plugin errors and agent connectivity.
+
+      - alert: YuzuHighCommandLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(yuzu_commands_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command p99 latency exceeds 10 seconds"
+          description: >-
+            The 99th percentile command duration has exceeded 10 seconds for
+            the last 5 minutes. Current p99: {{ $value | humanizeDuration }}.
+            This may indicate slow plugins, network congestion, or overloaded agents.
+
+  - name: yuzu-gateway
+    rules:
+      - alert: YuzuGatewayConnectionDrops
+        expr: |
+          rate(yuzu_gw_agent_connections_total[5m]) > 0
+          and
+          yuzu_gw_agent_connections_active < (yuzu_gw_agent_connections_active offset 5m) * 0.7
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway agent connections dropped significantly"
+          description: >-
+            The Erlang gateway has lost more than 30% of its active agent
+            connections in the last 5 minutes. Check gateway logs and network
+            connectivity between agents and the gateway node.
+
+      - alert: YuzuGatewayBackpressure
+        expr: |
+          rate(yuzu_gw_backpressure_events_total[5m]) > 0.5
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway experiencing backpressure events"
+          description: >-
+            The gateway is generating backpressure events, indicating agent
+            send buffers are full. This may cause command delivery delays.
+            Consider scaling the gateway or reducing command dispatch rate.
+
+  - name: yuzu-tls
+    rules:
+      - alert: YuzuCertificateExpiringSoon
+        expr: |
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server TLS certificate expires in less than 7 days"
+          description: >-
+            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
+            Renew the certificate and place the new PEM files at the configured
+            path. If certificate hot-reload is enabled, the server will pick up
+            the new files automatically.
+
+      - alert: YuzuCertificateExpiryCritical
+        expr: |
+          yuzu_server_cert_expiry_timestamp_seconds - time() < 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Yuzu server TLS certificate expires in less than 24 hours"
+          description: >-
+            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
+            Immediate action required to prevent service disruption.
+
+      - alert: YuzuCertReloadFailures
+        expr: |
+          rate(yuzu_server_cert_reload_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate hot-reload is failing"
+          description: >-
+            Certificate hot-reload has failed at least once in the last 5
+            minutes. The server is still using the previous valid certificate.
+            Check that the new PEM files are valid, the cert and key match,
+            and file permissions are correct (chmod 600 on Unix).
+
+  - name: yuzu-storage
+    rules:
+      - alert: YuzuResponseStoreWriteFailures
+        expr: |
+          rate(yuzu_server_response_store_write_failures_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Response store write failures detected"
+          description: >-
+            The response store (SQLite) is failing to write command results.
+            This means instruction responses are being lost. Check disk space,
+            filesystem permissions, and SQLite WAL file health. The database
+            file may be locked or corrupted.
+
+      - alert: YuzuResponseStoreWriteFailureRate
+        expr: |
+          (
+            rate(yuzu_server_response_store_write_failures_total[5m])
+            /
+            rate(yuzu_server_response_store_writes_total[5m])
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response store write failure rate exceeds 1%"
+          description: >-
+            More than 1% of response store writes are failing. Current failure
+            rate: {{ $value | humanizePercentage }}. Investigate disk health
+            and SQLite database integrity.

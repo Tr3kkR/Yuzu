@@ -2,8 +2,41 @@
 
 This document covers every HTTP endpoint exposed by the Yuzu server. Endpoints are grouped by functional area.
 
+---
+
+## API Versioning
+
+The Yuzu REST API uses path-based versioning. Understanding the distinction between versioned and legacy endpoints is important for building stable integrations.
+
+### Versioned API (`/api/v1/`)
+
+All endpoints under the `/api/v1/` prefix are the **stable, versioned API**. These endpoints:
+
+- Use the standard JSON envelope (`data`, `error`, `meta`, `pagination` fields)
+- Return `"api_version": "v1"` in the `meta` object of every response
+- Follow consistent error handling with structured error objects
+- Are the recommended integration target for all new automation and tooling
+- Will maintain backward compatibility within the v1 version; breaking changes will increment to v2
+
+### Legacy API (`/api/` without version prefix)
+
+Endpoints under `/api/` without the `v1` prefix are **legacy endpoints** that predate the versioned API. These endpoints:
+
+- Remain available for backward compatibility
+- Do **not** use the standard v1 JSON envelope
+- May return inconsistent error formats
+- Are **deprecated** and will be removed in a future major release
+- Should be migrated to their v1 equivalents where available
+
+### Migration Guidance
+
+When writing new integrations, always use `/api/v1/` endpoints. If you have existing scripts using legacy endpoints, plan to migrate them to v1 equivalents. The [Legacy API Endpoints](#legacy-api-endpoints) section below documents each legacy endpoint and notes where a v1 replacement exists.
+
+---
+
 ## Table of Contents
 
+- [API Versioning](#api-versioning)
 - [Authentication](#authentication)
 - [JSON Envelope](#json-envelope)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)

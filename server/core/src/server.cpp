@@ -198,7 +198,14 @@ struct AgentSession {
 
     // Stream pointer — valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
+    grpc::ServerContext* server_context = nullptr; // for timeout cancellation
     std::mutex stream_mu;
+
+    // Last activity timestamp — updated on Subscribe reads and Heartbeats.
+    // Atomic to avoid acquiring the registry mutex on every stream Read.
+    std::atomic<int64_t> last_activity_epoch_ms{
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()};
 };
 
 // -- Agent registry -----------------------------------------------------------
@@ -242,12 +249,18 @@ public:
     }
 
     void set_stream(const std::string& agent_id,
-                    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) {
+                    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
+                    grpc::ServerContext* context = nullptr) {
         std::lock_guard lock(mu_);
         auto it = agents_.find(agent_id);
         if (it != agents_.end()) {
             std::lock_guard slock(it->second->stream_mu);
             it->second->stream = stream;
+            it->second->server_context = context;
+            it->second->last_activity_epoch_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
         }
     }
 
@@ -263,6 +276,52 @@ public:
         {
             std::lock_guard slock(session->stream_mu);
             session->stream = nullptr;
+            session->server_context = nullptr;
+        }
+    }
+
+    /// Update last_activity timestamp for an agent (called on heartbeat + subscribe reads).
+    /// Lock-free: last_activity_epoch_ms is atomic, so no mutex needed.
+    void touch_activity(const std::string& agent_id) {
+        std::shared_ptr<AgentSession> session;
+        {
+            std::lock_guard lock(mu_);
+            auto it = agents_.find(agent_id);
+            if (it == agents_.end()) return;
+            session = it->second;
+        }
+        session->last_activity_epoch_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+    }
+
+    /// Cancel Subscribe streams for agents that haven't heartbeated within the timeout.
+    void reap_stale_sessions(std::chrono::seconds timeout) {
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count();
+
+        // Collect shared_ptrs (not raw pointers) to keep sessions alive during TryCancel.
+        std::vector<std::pair<std::string, std::shared_ptr<AgentSession>>> stale;
+        {
+            std::lock_guard lock(mu_);
+            for (auto& [id, session] : agents_) {
+                auto last = session->last_activity_epoch_ms.load(std::memory_order_relaxed);
+                if ((now_ms - last) > timeout_ms) {
+                    stale.emplace_back(id, session);
+                }
+            }
+        }
+
+        for (auto& [id, session] : stale) {
+            // Acquire stream_mu and re-check context is still valid before cancelling.
+            std::lock_guard slock(session->stream_mu);
+            if (session->server_context) {
+                spdlog::warn("Session timeout: cancelling Subscribe stream for agent {} "
+                             "(no activity for >{}s)", id, timeout.count());
+                session->server_context->TryCancel();
+            }
         }
     }
 
@@ -940,10 +999,11 @@ public:
             return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
         }
 
-        // Store health snapshot
+        // Store health snapshot and update session activity timestamp
         if (health_store_) {
             health_store_->upsert(agent_id, request->status_tags());
         }
+        registry_.touch_activity(agent_id);
         metrics_.counter("yuzu_heartbeats_received_total", {{"via", "direct"}}).increment();
 
         response->set_acknowledged(true);
@@ -1000,7 +1060,7 @@ public:
         }
 
         spdlog::info("Agent subscribe stream opened for {}", agent_id);
-        registry_.set_stream(agent_id, stream);
+        registry_.set_stream(agent_id, stream, context);
         registry_.map_session(session_id, agent_id);
 
         auto subscribe_start = std::chrono::steady_clock::now();
@@ -1016,6 +1076,7 @@ public:
         // Read loop — process responses from the agent
         pb::CommandResponse resp;
         while (stream->Read(&resp)) {
+            registry_.touch_activity(agent_id);
             if (resp.status() == pb::CommandResponse::RUNNING) {
                 // Intercept __timing__ metadata
                 if (resp.output().starts_with("__timing__|")) {
@@ -2311,6 +2372,8 @@ public:
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                // Reap Subscribe streams for agents that missed heartbeats
+                registry_.reap_stale_sessions(cfg_.session_timeout);
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {
                     metrics_.gauge("yuzu_server_cert_reloads_total")

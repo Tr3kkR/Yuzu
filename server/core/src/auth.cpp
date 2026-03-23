@@ -164,7 +164,23 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
             // Trim
             while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
                 line.pop_back();
-            if (line.empty() || line[0] == '#')
+            if (line.empty())
+                continue;
+            // Parse version header (e.g. "# Version: 1")
+            if (line.starts_with("# Version: ")) {
+                try {
+                    int ver = std::stoi(line.substr(11));
+                    if (ver != 1) {
+                        spdlog::error("Unsupported config file version {} in {}", ver, cfg_path.string());
+                        return false;
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::error("Malformed version line in {}: {}", cfg_path.string(), e.what());
+                    return false;
+                }
+                continue;
+            }
+            if (line[0] == '#')
                 continue;
 
             // Format: username:role:salt_hex:hash_hex
@@ -226,6 +242,7 @@ bool AuthManager::save_config() const {
     }
 
     f << "# Yuzu Server Configuration\n";
+    f << "# Version: 1\n";
     f << "# Format: username:role:salt:hash\n";
     f << "# DO NOT EDIT — managed by yuzu-server\n\n";
 
@@ -689,6 +706,7 @@ bool AuthManager::save_tokens() const {
     }
 
     f << "# Yuzu Enrollment Tokens\n";
+    f << "# Version: 1\n";
     f << "# Format: "
          "token_id:token_hash:label:max_uses:use_count:created_epoch:expires_epoch:revoked\n\n";
 
@@ -736,7 +754,22 @@ bool AuthManager::load_tokens() {
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
             line.pop_back();
-        if (line.empty() || line[0] == '#')
+        if (line.empty())
+            continue;
+        if (line.starts_with("# Version: ")) {
+            try {
+                int ver = std::stoi(line.substr(11));
+                if (ver != 1) {
+                    spdlog::error("Unsupported enrollment-tokens.cfg version {}", ver);
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("Malformed version line in enrollment-tokens.cfg: {}", e.what());
+                return false;
+            }
+            continue;
+        }
+        if (line[0] == '#')
             continue;
 
         std::istringstream ss(line);
@@ -891,6 +924,7 @@ bool AuthManager::save_pending() const {
     }
 
     f << "# Yuzu Pending Agents\n";
+    f << "# Version: 1\n";
     f << "# Format: agent_id:hostname:os:arch:version:requested_epoch:status\n\n";
 
     for (const auto& [id, pa] : pending_agents_) {
@@ -931,7 +965,22 @@ bool AuthManager::load_pending() {
     while (std::getline(f, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
             line.pop_back();
-        if (line.empty() || line[0] == '#')
+        if (line.empty())
+            continue;
+        if (line.starts_with("# Version: ")) {
+            try {
+                int ver = std::stoi(line.substr(11));
+                if (ver != 1) {
+                    spdlog::error("Unsupported pending-agents.cfg version {}", ver);
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("Malformed version line in pending-agents.cfg: {}", e.what());
+                return false;
+            }
+            continue;
+        }
+        if (line[0] == '#')
             continue;
 
         std::istringstream ss(line);
