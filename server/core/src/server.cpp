@@ -163,8 +163,13 @@ public:
         }
     }
 
+    std::size_t listener_count() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return listeners_.size();
+    }
+
 private:
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::size_t next_id_ = 0;
     std::unordered_map<std::size_t, Listener> listeners_;
 };
@@ -542,8 +547,19 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
     while (!state->queue.empty()) {
         auto& ev = state->queue.front();
         std::string sse = format_sse(ev);
-        if (!sink.write(sse.data(), sse.size())) {
-            return false;
+        // httplib's SocketStream::write() is a single send() call — no
+        // retry loop.  A large payload (e.g. 38 KB of sockwho rows) can
+        // cause a partial write when the TCP send buffer is full, which
+        // httplib treats as a fatal error and kills the SSE connection.
+        // Write in <=8 KB slices to stay within typical send buffer limits.
+        const char* p = sse.data();
+        size_t rem = sse.size();
+        constexpr size_t kMaxChunk = 8192;
+        while (rem > 0) {
+            auto n = std::min(rem, kMaxChunk);
+            if (!sink.write(p, n)) return false;
+            p += n;
+            rem -= n;
         }
         state->queue.pop_front();
     }
@@ -6214,7 +6230,7 @@ private:
             });
 
             detail::EventBus* bus = &event_bus_;
-            res.set_chunked_content_provider(
+            res.set_content_provider(
                 "text/event-stream",
                 [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
                     return detail::sse_content_provider(sink_state, offset, sink);

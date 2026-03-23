@@ -12,7 +12,6 @@ extern const char* const kDashboardIndexHtml =
   <title>Yuzu — Dashboard</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
   <style>
     body {
       display: flex; flex-direction: column; height: 100vh;
@@ -374,20 +373,15 @@ extern const char* const kDashboardIndexHtml =
         <span id="density-label">Comfortable</span>
       </button>
     </div>
-    <div class="table-wrap" hx-ext="sse" sse-connect="/events">
+    <div class="table-wrap">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
-        <tbody id="results-tbody" sse-swap="output" hx-swap="beforeend">
+        <tbody id="results-tbody">
           <tr id="empty-row"><td colspan="1" class="empty-state">
             Type an instruction above and press <strong>Send</strong> to execute.
           </td></tr>
         </tbody>
       </table>
-      <!-- Hidden sinks: HTMX processes OOB swaps from these event types -->
-      <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
-      <div sse-swap="timing" hx-swap="none" style="display:none"></div>
-      <div sse-swap="agent-online" hx-swap="none" style="display:none"></div>
-      <div sse-swap="agent-offline" hx-swap="none" style="display:none"></div>
     </div>
   </div>
 
@@ -874,32 +868,47 @@ extern const char* const kDashboardIndexHtml =
       }
     });
 )HTM"
-    // Part 4: HTMX SSE event handling + menu JavaScript
+    // Part 4: SSE (server-rendered HTML swap) + menu JavaScript
     R"HTM(
-    /* ── HTMX SSE event hooks ────────────────────────────── */
-    /* Row counting + auto-scroll when HTMX swaps output rows */
-    document.body.addEventListener('htmx:sseBeforeMessage', function(e) {
-      if (e.detail.type === 'output') {
-        /* Remove empty-row placeholder */
+    /* ── SSE — server renders HTML, browser just swaps it in ── */
+    var evtSource = null;
+    function connectSSE() {
+      if (evtSource) evtSource.close();
+      evtSource = new EventSource('/events');
+
+      evtSource.addEventListener('output', function(e) {
         var er = document.getElementById('empty-row');
         if (er) er.remove();
-      }
-      /* agent-online / agent-offline: refresh agent list */
-      if (e.detail.type === 'agent-online' || e.detail.type === 'agent-offline') {
-        refreshAgentList();
-        loadHelp();
-      }
-    });
-    document.body.addEventListener('htmx:sseMessage', function(e) {
-      if (e.detail.type === 'output') {
-        /* Count new result-row elements added by this swap */
+        document.getElementById('results-tbody').insertAdjacentHTML('beforeend', e.data);
         rowCount = document.querySelectorAll('#results-tbody .result-row').length;
         document.getElementById('row-count').textContent = rowCount.toLocaleString();
-        /* Auto-scroll to bottom */
         var wrap = document.querySelector('.table-wrap');
-        setTimeout(function() { wrap.scrollTop = wrap.scrollHeight; }, 0);
-      }
-    });
+        wrap.scrollTop = wrap.scrollHeight;
+      });
+
+      /* Server sends complete replacement elements for badge and stats */
+      evtSource.addEventListener('command-status', function(e) {
+        var el = document.getElementById('status-badge');
+        if (el) el.outerHTML = e.data;
+      });
+      evtSource.addEventListener('timing', function(e) {
+        var tmp = document.createElement('div');
+        tmp.innerHTML = e.data;
+        var el = tmp.firstElementChild;
+        if (el && el.id) {
+          var target = document.getElementById(el.id);
+          if (target) target.outerHTML = e.data;
+        }
+      });
+      evtSource.addEventListener('agent-online', function() {
+        refreshAgentList(); loadHelp();
+      });
+      evtSource.addEventListener('agent-offline', function() {
+        refreshAgentList(); loadHelp();
+      });
+
+      evtSource.onerror = function() { setTimeout(connectSSE, 2000); };
+    }
 
     /* ── About modal ─────────────────────────────────────── */
     function showAbout() {
@@ -1255,6 +1264,7 @@ extern const char* const kDashboardIndexHtml =
     };
 
     /* ── Init ─────────────────────────────────────────────── */
+    connectSSE();
     refreshAgentList();
     setInterval(refreshAgentList, 5000);
     loadUserInfo();
