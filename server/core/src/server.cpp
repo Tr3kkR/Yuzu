@@ -5847,8 +5847,8 @@ private:
                 type = req.get_param_value("type");
             }
 
-            if (req.has_file("file")) {
-                content = req.get_file_value("file").content;
+            if (req.form.has_file("file")) {
+                content = req.form.get_file("file").content;
             }
 
             if (type.empty() || content.empty()) {
@@ -6452,13 +6452,13 @@ private:
             if (req.has_param("mandatory"))
                 mandatory_s = req.get_param_value("mandatory");
 
-            if (!req.has_file("file")) {
+            if (!req.form.has_file("file")) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">No file uploaded.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
-            auto uploaded = req.get_file_value("file");
+            auto uploaded = req.form.get_file("file");
             if (uploaded.content.empty()) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">Empty file.</span>",

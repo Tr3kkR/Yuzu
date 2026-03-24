@@ -15,7 +15,7 @@ concurrency:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -80,9 +80,6 @@ jobs:
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18' }}
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
         with:
@@ -90,19 +87,42 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-
+            vcpkg-x64-linux-${{ matrix.compiler }}-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -112,8 +132,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: sccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
-          CXX: sccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache' || '' }} ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache' || '' }} ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
         run: |
           meson setup builddir \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
@@ -130,7 +150,7 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
   # ── Windows (MSVC) ─────────────────────────────────────────────────────
   windows:
@@ -154,15 +174,26 @@ jobs:
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        shell: bash
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -178,6 +209,17 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Register vcpkg NuGet source
+        run: |
+          $nuget = & "${{ github.workspace }}/vcpkg/vcpkg.exe" fetch nuget | Select-Object -Last 1
+          & $nuget sources add `
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" `
+            -storepasswordincleartext `
+            -name "GitHub" `
+            -username "Tr3kkR" `
+            -password "${{ secrets.GITHUB_TOKEN }}"
+          if ($LASTEXITCODE -ne 0) { Write-Host "NuGet source may already exist — continuing" }
+
       - name: Install vcpkg packages
         run: |
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
@@ -186,8 +228,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: sccache cl
-          CXX: sccache cl
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cl' || 'cl' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cl' || 'cl' }}
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
@@ -203,7 +245,7 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
@@ -226,15 +268,25 @@ jobs:
           brew install cmake ninja pipx
           pipx install meson==${{ env.MESON_VERSION }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -250,6 +302,16 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
+
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -258,8 +320,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: sccache cc
-          CXX: sccache c++
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cc' || 'cc' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache c++' || 'c++' }}
         run: |
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
@@ -276,7 +338,7 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
   # ── ARM64 Linux cross-compile ──────────────────────────────────────────
   arm64-cross:
@@ -292,14 +354,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build \
+            cmake ninja-build g++ \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             pkg-config curl zip unzip tar \
             python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -307,6 +366,19 @@ jobs:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -322,6 +394,16 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
+
       - name: Install vcpkg packages (cross)
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -330,8 +412,8 @@ jobs:
 
       - name: Configure (Meson cross)
         env:
-          CC: sccache aarch64-linux-gnu-gcc
-          CXX: sccache aarch64-linux-gnu-g++
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc' || 'gcc' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++' || 'g++' }}
         run: |
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
@@ -343,7 +425,7 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: sccache --show-stats || true
 
   # ── Sanitizers (ASan + UBSan) — main/dev push only ────────────────────
   sanitize-asan:
@@ -354,6 +436,7 @@ jobs:
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+      SCCACHE_C_CUSTOM_CACHE_NAMESPACE: "asan"
 
     steps:
       - uses: actions/checkout@v6
@@ -368,9 +451,6 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
         with:
@@ -378,19 +458,42 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -400,8 +503,8 @@ jobs:
 
       - name: Configure (Meson + ASan/UBSan)
         env:
-          CC: sccache gcc-13
-          CXX: sccache g++-13
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc-13' || 'gcc-13' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++-13' || 'g++-13' }}
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -416,6 +519,10 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   # ── Sanitizers (TSan) — main/dev push only ─────────────────────────────
   sanitize-tsan:
     name: "Sanitizers (TSan)"
@@ -424,6 +531,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+      SCCACHE_C_CUSTOM_CACHE_NAMESPACE: "tsan"
 
     steps:
       - uses: actions/checkout@v6
@@ -438,9 +546,6 @@ jobs:
             pkg-config curl zip unzip tar python3-pip
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
         with:
@@ -448,19 +553,42 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+
+      - name: Validate sccache
+        id: sccache_check
+        run: |
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::sccache unavailable — building without cache"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -470,8 +598,8 @@ jobs:
 
       - name: Configure (Meson + TSan)
         env:
-          CC: sccache gcc-13
-          CXX: sccache g++-13
+          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc-13' || 'gcc-13' }}
+          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++-13' || 'g++-13' }}
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -485,6 +613,10 @@ jobs:
 
       - name: Test
         run: meson test -C builddir --print-errorlogs
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   # ── Coverage — main/dev push only, after Linux passes ─────────────────
   coverage:
@@ -517,15 +649,25 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Register vcpkg NuGet source
+        run: |
+          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
+            sources add \
+            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "Tr3kkR" \
+            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
