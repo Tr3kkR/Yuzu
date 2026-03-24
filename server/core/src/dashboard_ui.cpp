@@ -384,8 +384,8 @@ extern const char* const kDashboardIndexHtml =
         </tbody>
       </table>
       <!-- Hidden sinks for OOB swap events -->
-      <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
-      <div sse-swap="timing" hx-swap="none" style="display:none"></div>
+      <div sse-swap="command-status" hx-swap="innerHTML" style="display:none"></div>
+      <div sse-swap="timing" hx-swap="innerHTML" style="display:none"></div>
       <div sse-swap="agent-online" hx-swap="none" style="display:none"
            hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
       <div sse-swap="agent-offline" hx-swap="none" style="display:none"
@@ -675,7 +675,7 @@ extern const char* const kDashboardIndexHtml =
       xhr.setRequestHeader('Content-Type', 'application/json');
       xhr.onload = function() {
         if (xhr.status === 200) {
-          setBadge('running');
+          /* Badge transitions via SSE command-status events (RUNNING → DONE/ERROR) */
           document.getElementById('result-context').textContent = raw + ' → scope: ' + scopeLabel;
           try {
             var rj = JSON.parse(xhr.responseText);
@@ -689,8 +689,9 @@ extern const char* const kDashboardIndexHtml =
           setBadge('error');
           try {
             var err = JSON.parse(xhr.responseText);
-            document.getElementById('result-context').textContent = err.error || 'Command failed';
-            showToast(err.error || 'Command failed', 'error');
+            var emsg = (err.error && err.error.message) ? err.error.message : 'Command failed';
+            document.getElementById('result-context').textContent = emsg;
+            showToast(emsg, 'error');
           } catch(e) {
             document.getElementById('result-context').textContent = 'Command failed (HTTP ' + xhr.status + ')';
             showToast('Command failed (HTTP ' + xhr.status + ')', 'error');

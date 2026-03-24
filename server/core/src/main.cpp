@@ -113,6 +113,9 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_GATEWAY_UPSTREAM");
     app.add_flag("--gateway-mode", "Enable gateway mode (relax peer-mismatch in Subscribe)")
         ->each([&cfg](const std::string&) { cfg.gateway_mode = true; });
+    app.add_option("--gateway-command-addr", cfg.gateway_command_address,
+                   "Gateway ManagementService address for command forwarding (host:port)")
+        ->envname("YUZU_GATEWAY_COMMAND_ADDR");
     app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
         ->default_val(10000)
         ->envname("YUZU_MAX_AGENTS");

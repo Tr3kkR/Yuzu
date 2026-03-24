@@ -27,7 +27,7 @@
 %% SendCommand — fan out to agents, stream responses back
 %%--------------------------------------------------------------------
 
-send_command(Request, #{stream := StreamRef} = _Ctx) ->
+send_command(Request, Stream) ->
     AgentIds = maps:get(agent_ids, Request,
                         maps:get(<<"agent_ids">>, Request, [])),
     CommandReq = maps:get(command, Request,
@@ -39,7 +39,7 @@ send_command(Request, #{stream := StreamRef} = _Ctx) ->
     case yuzu_gw_router:send_command(AgentIds, CommandReq, Opts) of
         {ok, FanoutRef} ->
             %% Stream responses back to the operator as they arrive.
-            stream_responses(StreamRef, FanoutRef);
+            stream_responses(Stream, FanoutRef);
 
         {error, Reason} ->
             {error, #{status => 13,
@@ -111,12 +111,12 @@ get_agent(Request, Ctx) ->
 %% WatchEvents — stream agent lifecycle events
 %%--------------------------------------------------------------------
 
-watch_events(Request, #{stream := StreamRef} = _Ctx) ->
+watch_events(Request, Stream) ->
     FilterIds = maps:get(agent_ids, Request,
                          maps:get(<<"agent_ids">>, Request, [])),
     %% Join the watcher group so agent processes can find us.
     pg:join(yuzu_gw, event_watchers, self()),
-    watch_event_loop(StreamRef, FilterIds).
+    watch_event_loop(Stream, FilterIds).
 
 %%--------------------------------------------------------------------
 %% QueryInventory — return agents connected to this gateway instance
@@ -160,7 +160,7 @@ query_inventory(Request, Ctx) ->
 
 %% Loop receiving agent lifecycle events and streaming them to the operator.
 %% FilterIds = [] means all agents; otherwise only matching agent_ids are sent.
-watch_event_loop(StreamRef, FilterIds) ->
+watch_event_loop(Stream, FilterIds) ->
     receive
         {agent_event, #{agent_id := AgentId} = Event} ->
             ShouldSend = case FilterIds of
@@ -168,17 +168,16 @@ watch_event_loop(StreamRef, FilterIds) ->
                 Ids -> lists:member(AgentId, Ids)
             end,
             case ShouldSend of
-                true  -> grpcbox_stream:send(StreamRef, Event);
+                true  -> grpcbox_stream:send(Event, Stream);
                 false -> ok
             end,
-            watch_event_loop(StreamRef, FilterIds);
+            watch_event_loop(Stream, FilterIds);
         stop_watching ->
             pg:leave(yuzu_gw, event_watchers, self()),
-            grpcbox_stream:send_trailing(StreamRef, #{})
+            ok
     after 86400000 ->
-        %% 24-hour safety timeout.
         pg:leave(yuzu_gw, event_watchers, self()),
-        grpcbox_stream:send_trailing(StreamRef, #{})
+        ok
     end.
 
 %% Encode an agent summary (from the ETS-derived map) as a JSON binary.
@@ -222,12 +221,13 @@ json_escape_chars(<<C, Rest/binary>>, Acc) ->
     json_escape_chars(Rest, <<Acc/binary, C>>).
 
 %% Stream command responses back to the operator until fanout completes.
-stream_responses(StreamRef, FanoutRef) ->
+%% grpcbox server-streaming: send(Message, State), stream ends on process exit.
+stream_responses(Stream, FanoutRef) ->
     receive
         {command_response, FanoutRef, AgentId, Response} ->
             Msg = #{agent_id => AgentId, response => Response},
-            grpcbox_stream:send(StreamRef, Msg),
-            stream_responses(StreamRef, FanoutRef);
+            grpcbox_stream:send(Msg, Stream),
+            stream_responses(Stream, FanoutRef);
 
         {command_error, FanoutRef, AgentId, Reason} ->
             ErrorResp = #{agent_id => AgentId,
@@ -236,14 +236,13 @@ stream_responses(StreamRef, FanoutRef) ->
                                         output     => iolist_to_binary(
                                             io_lib:format("~p", [Reason])),
                                         exit_code  => -1}},
-            grpcbox_stream:send(StreamRef, ErrorResp),
-            stream_responses(StreamRef, FanoutRef);
+            grpcbox_stream:send(ErrorResp, Stream),
+            stream_responses(Stream, FanoutRef);
 
         {fanout_complete, FanoutRef, _Summary} ->
-            grpcbox_stream:send_trailing(StreamRef, #{}),
+            %% Normal return — grpcbox auto-sends end_stream on process exit.
             ok
     after 600000 ->
         %% Safety timeout: 10 minutes max per fanout.
-        grpcbox_stream:send_trailing(StreamRef, #{<<"grpc-message">> => <<"Fanout timed out">>}),
-        ok
+        grpcbox_stream:error(<<"4">>, <<"Fanout timed out">>)
     end.

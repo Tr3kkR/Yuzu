@@ -39,6 +39,7 @@ struct Config {
 
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
+    std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
 
     // NVD CVE feed

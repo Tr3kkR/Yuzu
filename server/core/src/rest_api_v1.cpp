@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -1159,6 +1160,14 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 auto agent_id = body.value("agent_id", "");
                 auto key = body.value("key", "");
                 auto value = body.value("value", "");
+
+                // Normalize category keys to lowercase for consistent lookups
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+                for (auto cat : {"role", "environment", "location", "service"}) {
+                    if (lower_key == cat) { key = lower_key; break; }
+                }
 
                 if (agent_id.empty() || key.empty()) {
                     res.status = 400;

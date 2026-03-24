@@ -195,6 +195,7 @@ struct AgentSession {
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
     std::unordered_map<std::string, std::string> scopable_tags;
+    std::string gateway_node;  // Non-empty if agent is connected via gateway
 
     // Stream pointer — valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -335,7 +336,16 @@ public:
         spdlog::info("Agent removed: id={}", agent_id);
     }
 
+    void set_gateway_node(const std::string& agent_id, const std::string& node) {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it != agents_.end()) {
+            it->second->gateway_node = node;
+        }
+    }
+
     // Send a command to a specific agent. Returns false if agent not found or write failed.
+    // For gateway agents (no local stream), adds to gateway_pending and returns true.
     bool send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {
         std::shared_ptr<AgentSession> session;
         {
@@ -346,9 +356,15 @@ public:
             session = it->second;
         }
         std::lock_guard slock(session->stream_mu);
-        if (!session->stream)
-            return false;
-        return session->stream->Write(cmd, grpc::WriteOptions());
+        if (session->stream)
+            return session->stream->Write(cmd, grpc::WriteOptions());
+        // Gateway agent — no local stream but agent is registered
+        if (!session->gateway_node.empty()) {
+            std::lock_guard glock(gw_pending_mu_);
+            gw_pending_.push_back({agent_id, cmd});
+            return true;
+        }
+        return false;
     }
 
     // Send command to all connected agents. Returns count of agents sent to.
@@ -366,9 +382,25 @@ public:
             std::lock_guard slock(s->stream_mu);
             if (s->stream && s->stream->Write(cmd, grpc::WriteOptions())) {
                 ++count;
+            } else if (!s->gateway_node.empty()) {
+                std::lock_guard glock(gw_pending_mu_);
+                gw_pending_.push_back({s->agent_id, cmd});
+                ++count;
             }
         }
         return count;
+    }
+
+    struct GatewayPendingCmd {
+        std::string agent_id;
+        pb::CommandRequest cmd;
+    };
+
+    std::vector<GatewayPendingCmd> drain_gateway_pending() {
+        std::lock_guard lock(gw_pending_mu_);
+        auto result = std::move(gw_pending_);
+        gw_pending_.clear();
+        return result;
     }
 
     bool has_any() const {
@@ -549,6 +581,8 @@ private:
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
+    std::mutex gw_pending_mu_;
+    std::vector<GatewayPendingCmd> gw_pending_;
 };
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
@@ -1160,7 +1194,7 @@ public:
                     std::string badge_text = (status_str == "done") ? "DONE" : "ERROR";
                     bus_.publish("command-status",
                         "<span id=\"status-badge\" class=\"" + badge_cls +
-                        "\" hx-swap-oob=\"true\">" + badge_text + "</span>");
+                        "\" hx-swap-oob=\"outerHTML\">" + badge_text + "</span>");
                 }
 
                 if (analytics_store_) {
@@ -1248,6 +1282,146 @@ public:
         std::lock_guard lock(cmd_times_mu_);
         cmd_send_times_[command_id] = std::chrono::steady_clock::now();
         output_row_count_.store(0, std::memory_order_relaxed);
+    }
+
+    // Process a CommandResponse forwarded from the gateway.
+    // Mirrors the Subscribe read loop logic for SSE, storage, analytics.
+    void process_gateway_response(const std::string& agent_id,
+                                   const pb::CommandResponse& resp) {
+        if (resp.status() == pb::CommandResponse::RUNNING) {
+            // Intercept __timing__ metadata
+            if (resp.output().starts_with("__timing__|")) {
+                auto payload = resp.output().substr(11);
+                auto eq = payload.find('=');
+                auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
+                bus_.publish("timing",
+                    "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                    html_escape(ms) + " ms</strong>");
+                return;
+            }
+
+            // Track first response for server-side latency
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                if (!cmd_first_seen_.contains(resp.command_id())) {
+                    cmd_first_seen_.insert(resp.command_id());
+                    auto it = cmd_send_times_.find(resp.command_id());
+                    if (it != cmd_send_times_.end()) {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now() - it->second)
+                                           .count();
+                        bus_.publish("timing",
+                            "<strong id=\"stat-network\" hx-swap-oob=\"true\">" +
+                            std::to_string(elapsed) + " ms</strong>");
+                    }
+                }
+            }
+
+            std::string plugin = extract_plugin(resp.command_id());
+            publish_output_rows(agent_id, plugin, resp.output());
+
+            if (response_store_) {
+                StoredResponse sr;
+                sr.instruction_id = resp.command_id();
+                sr.agent_id = agent_id;
+                sr.status = static_cast<int>(resp.status());
+                sr.output = resp.output();
+                response_store_->store(sr);
+            }
+
+            if (analytics_store_) {
+                AnalyticsEvent ae;
+                ae.event_type = "command.response";
+                ae.agent_id = agent_id;
+                ae.plugin = plugin;
+                ae.correlation_id = resp.command_id();
+                ae.payload = {{"output_bytes", resp.output().size()}};
+                analytics_store_->emit(std::move(ae));
+            }
+        } else {
+            spdlog::info("[gateway] Command {} completed: status={}, exit_code={}",
+                         resp.command_id(), static_cast<int>(resp.status()), resp.exit_code());
+
+            if (response_store_) {
+                StoredResponse sr;
+                sr.instruction_id = resp.command_id();
+                sr.agent_id = agent_id;
+                sr.status = static_cast<int>(resp.status());
+                sr.output = resp.output();
+                if (resp.has_error()) {
+                    sr.error_detail = resp.error().message();
+                }
+                response_store_->store(sr);
+            }
+
+            std::string status_str =
+                (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+            metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}})
+                .increment();
+            {
+                std::string badge_cls = (status_str == "done") ? "badge-done" : "badge-error";
+                std::string badge_text = (status_str == "done") ? "DONE" : "ERROR";
+                bus_.publish("command-status",
+                    "<span id=\"status-badge\" class=\"" + badge_cls +
+                    "\" hx-swap-oob=\"outerHTML\">" + badge_text + "</span>");
+            }
+
+            if (analytics_store_) {
+                AnalyticsEvent ae;
+                ae.event_type = "command.completed";
+                ae.agent_id = agent_id;
+                ae.plugin = extract_plugin(resp.command_id());
+                ae.correlation_id = resp.command_id();
+                ae.severity = (resp.status() == pb::CommandResponse::SUCCESS)
+                                  ? Severity::kInfo
+                                  : Severity::kError;
+                ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
+                if (resp.has_error()) {
+                    ae.payload["error_message"] = resp.error().message();
+                }
+                analytics_store_->emit(std::move(ae));
+            }
+
+            if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
+                notification_store_->is_open()) {
+                std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+                notification_store_->create(
+                    "error", "Execution Failed",
+                    "Command " + resp.command_id() + " on agent " + agent_id +
+                        " failed: " + err_msg);
+            }
+
+            if (webhook_store_ && webhook_store_->is_open()) {
+                nlohmann::json wh_payload = {
+                    {"event", "execution.completed"},
+                    {"command_id", resp.command_id()},
+                    {"agent_id", agent_id},
+                    {"status", status_str},
+                    {"exit_code", resp.exit_code()}};
+                if (resp.has_error()) {
+                    wh_payload["error"] = resp.error().message();
+                }
+                webhook_store_->fire_event("execution.completed", wh_payload.dump());
+            }
+
+            // Publish total round-trip and clean up timing maps
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                auto it = cmd_send_times_.find(resp.command_id());
+                if (it != cmd_send_times_.end()) {
+                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - it->second)
+                                        .count();
+                    metrics_.histogram("yuzu_command_duration_seconds")
+                        .observe(static_cast<double>(total_ms) / 1000.0);
+                    bus_.publish("timing",
+                        "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
+                        std::to_string(total_ms) + " ms</strong>");
+                    cmd_send_times_.erase(it);
+                }
+                cmd_first_seen_.erase(resp.command_id());
+            }
+        }
     }
 
 private:
@@ -1859,6 +2033,7 @@ public:
             // The gateway now owns the Subscribe stream for this agent.
             // We don't have a local stream pointer, so we mark stream as null
             // but keep the agent registered (it was registered in ProxyRegister).
+            registry_.set_gateway_node(agent_id, request->gateway_node());
             spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}'", agent_id,
                          request->gateway_node());
             break;
@@ -1965,6 +2140,14 @@ public:
         if (!cfg_.gateway_upstream_address.empty()) {
             gateway_service_ = std::make_unique<detail::GatewayUpstreamServiceImpl>(
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
+        }
+
+        // Create gateway management client for command forwarding
+        if (!cfg_.gateway_command_address.empty()) {
+            gw_mgmt_channel_ = grpc::CreateChannel(
+                cfg_.gateway_command_address, grpc::InsecureChannelCredentials());
+            gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
+            spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
         }
 
         // Load auto-approve policies
@@ -2986,6 +3169,32 @@ private:
         }
     }
 
+    /// Forward any commands queued for gateway-connected agents.
+    void forward_gateway_pending() {
+        auto gw_pending = registry_.drain_gateway_pending();
+        if (!gw_pending.empty() && gw_mgmt_stub_) {
+            for (auto& gp : gw_pending) {
+                auto* stub = gw_mgmt_stub_.get();
+                auto* svc = &agent_service_;
+                std::thread([stub, svc, gp = std::move(gp)]() {
+                    ::yuzu::server::v1::SendCommandRequest req;
+                    req.add_agent_ids(gp.agent_id);
+                    *req.mutable_command() = gp.cmd;
+                    req.set_timeout_seconds(300);
+
+                    grpc::ClientContext ctx;
+                    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(300));
+                    auto reader = stub->SendCommand(&ctx, req);
+
+                    ::yuzu::server::v1::SendCommandResponse resp;
+                    while (reader->Read(&resp)) {
+                        svc->process_gateway_response(resp.agent_id(), resp.response());
+                    }
+                }).detach();
+            }
+        }
+    }
+
     /// Push structured tag state to an agent via the asset_tags plugin.
     void push_asset_tags_to_agent(const std::string& agent_id) {
         if (!tag_store_)
@@ -3008,6 +3217,7 @@ private:
 
         if (registry_.send_to(agent_id, cmd)) {
             spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
+            forward_gateway_pending();
         }
     }
 
@@ -6662,6 +6872,9 @@ private:
                 }
             }
 
+            // Forward commands queued for gateway agents
+            forward_gateway_pending();
+
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(R"({"error":{"code":503,"message":"failed to send command to any agent"},"meta":{"api_version":"v1"}})",
@@ -6670,6 +6883,9 @@ private:
             }
 
             metrics_.counter("yuzu_commands_dispatched_total").increment();
+            event_bus_.publish("command-status",
+                "<span id=\"status-badge\" class=\"badge-running\""
+                " hx-swap-oob=\"outerHTML\">RUNNING</span>");
             spdlog::info("Command dispatched: {}:{} → {} agent(s)", plugin, action, sent);
             audit_log(req, "command.dispatch", "success", "command", command_id,
                       plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
@@ -7042,10 +7258,16 @@ private:
                 if (key == "service")
                     ensure_service_management_group(value);
                 // Push updated tags to agent if a structured category changed
-                for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == key) {
-                        push_asset_tags_to_agent(agent_id);
-                        break;
+                // Case-insensitive: API may receive "Role" but kCategoryKeys are lowercase
+                {
+                    std::string lower_key = key;
+                    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                        [](unsigned char c) { return std::tolower(c); });
+                    for (auto cat_key : kCategoryKeys) {
+                        if (cat_key == lower_key) {
+                            push_asset_tags_to_agent(agent_id);
+                            break;
+                        }
                     }
                 }
                 audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
@@ -9689,8 +9911,12 @@ private:
             },
             [this](const std::string& agent_id, const std::string& key) {
                 // Push asset tags to agent when a structured category changes
+                // Case-insensitive match: API may receive "Role" but kCategoryKeys are lowercase
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
                 for (auto cat_key : kCategoryKeys) {
-                    if (cat_key == key) {
+                    if (cat_key == lower_key) {
                         push_asset_tags_to_agent(agent_id);
                         break;
                     }
@@ -9841,6 +10067,8 @@ private:
     detail::AgentServiceImpl agent_service_;
     detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
+    std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
+    std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<grpc::Server> agent_server_;
     std::unique_ptr<grpc::Server> mgmt_server_;
