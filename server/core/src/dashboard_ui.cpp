@@ -384,8 +384,10 @@ extern const char* const kDashboardIndexHtml =
         </tbody>
       </table>
       <!-- Hidden sinks for OOB swap events -->
-      <div sse-swap="command-status" hx-swap="innerHTML" style="display:none"></div>
-      <div sse-swap="timing" hx-swap="innerHTML" style="display:none"></div>
+      <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
+      <div sse-swap="timing" hx-swap="none" style="display:none"></div>
+      <div sse-swap="heartbeat" hx-swap="none" style="display:none"
+           hx-on:htmx:sse-message="clearTimeout(window._ht);window._ht=setTimeout(function(){var w=document.querySelector('[sse-connect]');if(w){w.removeAttribute('sse-connect');setTimeout(function(){w.setAttribute('sse-connect','/events');htmx.process(w)},100)}},10000)"></div>
       <div sse-swap="agent-online" hx-swap="none" style="display:none"
            hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
       <div sse-swap="agent-offline" hx-swap="none" style="display:none"
@@ -675,7 +677,7 @@ extern const char* const kDashboardIndexHtml =
       xhr.setRequestHeader('Content-Type', 'application/json');
       xhr.onload = function() {
         if (xhr.status === 200) {
-          /* Badge transitions via SSE command-status events (RUNNING → DONE/ERROR) */
+          setBadge('running');
           document.getElementById('result-context').textContent = raw + ' → scope: ' + scopeLabel;
           try {
             var rj = JSON.parse(xhr.responseText);

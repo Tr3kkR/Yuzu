@@ -663,9 +663,9 @@ bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*o
         state->queue.pop_front();
     }
 
-    const char* keepalive = ": keepalive\n\n";
+    const char* keepalive = "event: heartbeat\ndata: \n\n";
     if (!sink.write(keepalive, std::strlen(keepalive))) {
-        spdlog::debug("SSE keepalive write failed (client disconnected)");
+        spdlog::debug("SSE heartbeat write failed (client disconnected)");
         return false;
     }
     return true;
