@@ -62,6 +62,16 @@
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <httplib.h>
+
+// httplib compat: v0.18+ moved file upload helpers to req.form (MultipartFormData)
+#if defined(CPPHTTPLIB_VERSION) && CPPHTTPLIB_VERSION_NUM >= 0x001200
+  #define YUZU_REQ_HAS_FILE(req, name)  (req).form.has_file(name)
+  #define YUZU_REQ_GET_FILE(req, name)  (req).form.get_file(name)
+#else
+  #define YUZU_REQ_HAS_FILE(req, name)  (req).has_file(name)
+  #define YUZU_REQ_GET_FILE(req, name)  (req).get_file_value(name)
+#endif
+
 #include <nlohmann/json.hpp>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -5847,8 +5857,8 @@ private:
                 type = req.get_param_value("type");
             }
 
-            if (req.form.has_file("file")) {
-                content = req.form.get_file("file").content;
+            if (YUZU_REQ_HAS_FILE(req, "file")) {
+                content = YUZU_REQ_GET_FILE(req, "file").content;
             }
 
             if (type.empty() || content.empty()) {
@@ -6452,13 +6462,13 @@ private:
             if (req.has_param("mandatory"))
                 mandatory_s = req.get_param_value("mandatory");
 
-            if (!req.form.has_file("file")) {
+            if (!YUZU_REQ_HAS_FILE(req, "file")) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">No file uploaded.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
-            auto uploaded = req.form.get_file("file");
+            auto uploaded = YUZU_REQ_GET_FILE(req, "file");
             if (uploaded.content.empty()) {
                 res.status = 400;
                 res.set_content("<span class=\"feedback-error\">Empty file.</span>",
