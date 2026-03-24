@@ -418,6 +418,15 @@ extern const char* const kDashboardIndexHtml =
        hx-swap="none" style="display:none"
        hx-on::after-request="if(event.detail.successful) buildInstructionMap(JSON.parse(event.detail.xhr.responseText));"></div>
 
+  <!-- Declarative help trigger — fires on loadHelp event, reads filter from input -->
+  <div id="help-trigger" style="display:none"
+       hx-get="/api/help/html"
+       hx-target="#results-tbody"
+       hx-swap="innerHTML settle:0ms"
+       hx-trigger="loadHelp from:body"
+       hx-vals="js:{filter: (document.getElementById('instr-input').value.replace(/^help\\s*/i,'') || '').trim().toLowerCase()}">
+  </div>
+
   </div><!-- /.dashboard-grid -->
 )HTM"
     // Part 2: JavaScript
@@ -600,12 +609,10 @@ extern const char* const kDashboardIndexHtml =
     }
 
     /* ── Send instruction ─────────────────────────────────── */
-    function showHelp(query) {
-      var filter = query.replace(/^help\s*/i, '').trim().toLowerCase();
+    function showHelp() {
       clearResults();
       setBadge('idle');
-      var url = '/api/help/html' + (filter ? '?filter=' + encodeURIComponent(filter) : '');
-      htmx.ajax('GET', url, { target: '#results-tbody', swap: 'innerHTML settle:0ms' });
+      document.body.dispatchEvent(new Event('loadHelp'));
     }
 
 )HTM"
@@ -616,9 +623,9 @@ extern const char* const kDashboardIndexHtml =
       if (!raw) return;
       closeAC();
 
-      /* Built-in help command */
+      /* Built-in help command — triggers declarative HTMX element */
       if (raw === 'help' || raw.startsWith('help ')) {
-        showHelp(raw);
+        showHelp();
         return;
       }
 
