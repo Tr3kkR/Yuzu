@@ -44,6 +44,25 @@ std::string gen_id() {
     return std::string(buf, 32);
 }
 
+std::string base64_encode(const std::string& input) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((input.size() + 2) / 3) * 4);
+    for (std::size_t i = 0; i < input.size(); i += 3) {
+        uint32_t n = static_cast<uint8_t>(input[i]) << 16;
+        if (i + 1 < input.size())
+            n |= static_cast<uint8_t>(input[i + 1]) << 8;
+        if (i + 2 < input.size())
+            n |= static_cast<uint8_t>(input[i + 2]);
+        out += kAlphabet[(n >> 18) & 0x3F];
+        out += kAlphabet[(n >> 12) & 0x3F];
+        out += (i + 1 < input.size()) ? kAlphabet[(n >> 6) & 0x3F] : '=';
+        out += (i + 2 < input.size()) ? kAlphabet[n & 0x3F] : '=';
+    }
+    return out;
+}
+
 std::string url_encode(const std::string& value) {
     std::string escaped;
     escaped.reserve(value.size() * 2);
@@ -297,28 +316,22 @@ DirectorySync::http_get(const std::string& url, const std::string& bearer_token)
 
 // ── OAuth2 client credentials flow ──────────────────────────────────────────
 //
-// Per RFC 6749 Section 2.3.1, the client secret is sent in the request body
-// for the client_credentials grant type. This is standard OAuth2 behavior.
-// SECURITY: The token endpoint MUST be accessed over HTTPS to protect the
-// client secret in transit. Both WinHTTP and httplib paths below enforce this
-// by connecting to https://login.microsoftonline.com.
+// Per RFC 6749 Section 2.3.1, confidential clients SHOULD authenticate via
+// HTTP Basic (Authorization header) rather than sending client_secret in the
+// POST body.  SECURITY: The token endpoint MUST be accessed over HTTPS.
 
 std::expected<std::string, std::string>
 DirectorySync::acquire_token(const EntraConfig& config) {
     auto token_url = "https://login.microsoftonline.com/" + config.tenant_id +
                      "/oauth2/v2.0/token";
 
-    // Make a mutable copy of the secret so we can zero it after use
-    std::string secret_copy = config.client_secret;
-
     std::string form_body =
         "grant_type=client_credentials"
-        "&client_id=" + url_encode(config.client_id) +
-        "&client_secret=" + url_encode(secret_copy) +
         "&scope=" + url_encode("https://graph.microsoft.com/.default");
 
-    // Zero the secret copy now that it has been encoded into the form body
-    std::fill(secret_copy.begin(), secret_copy.end(), '\0');
+    // RFC 6749 §2.3.1: use HTTP Basic auth for client credentials
+    auto credentials = base64_encode(config.client_id + ":" + config.client_secret);
+    std::string auth_value = "Basic " + credentials;
 
     spdlog::info("DirectorySync: acquiring token from {}", token_url);
 
@@ -360,6 +373,12 @@ DirectorySync::acquire_token(const EntraConfig& config) {
         WinHttpCloseHandle(session);
         return std::unexpected("WinHTTP: WinHttpOpenRequest failed");
     }
+
+    // Add HTTP Basic auth header
+    std::string auth_hdr = "Authorization: " + auth_value;
+    std::wstring wauth(auth_hdr.begin(), auth_hdr.end());
+    WinHttpAddRequestHeaders(request, wauth.c_str(), static_cast<DWORD>(wauth.size()),
+                             WINHTTP_ADDREQ_FLAG_ADD);
 
     const wchar_t* content_type = L"Content-Type: application/x-www-form-urlencoded";
     BOOL ok = WinHttpSendRequest(request, content_type, -1L,
@@ -418,7 +437,8 @@ DirectorySync::acquire_token(const EntraConfig& config) {
     // but set explicitly for clarity)
     client.enable_server_certificate_verification(true);
 
-    auto result = client.Post(p, form_body, "application/x-www-form-urlencoded");
+    httplib::Headers headers{{"Authorization", auth_value}};
+    auto result = client.Post(p, headers, form_body, "application/x-www-form-urlencoded");
     if (!result) {
         return std::unexpected("token request failed: " +
                                httplib::to_string(result.error()));
@@ -431,9 +451,8 @@ DirectorySync::acquire_token(const EntraConfig& config) {
     std::string response_body = result->body;
 #endif
 
-    // Zero the form body containing the client secret now that the request is complete
-    std::fill(form_body.begin(), form_body.end(), '\0');
-    form_body.clear();
+    // Zero credentials (secret was in the auth header, not the body, but wipe defensively)
+    std::fill(credentials.begin(), credentials.end(), '\0');
 
     // Parse token response
     nlohmann::json j;

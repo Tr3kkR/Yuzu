@@ -51,7 +51,7 @@ services:
 
   # ── Prometheus ──────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
     ports:
       - "9090:9090"
     volumes:
@@ -61,7 +61,7 @@ services:
 
   # ── Grafana ─────────────────────────────────────────────────────────
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
     ports:
       - "3000:3000"
     environment:

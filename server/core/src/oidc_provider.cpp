@@ -23,6 +23,27 @@
 
 namespace yuzu::server::oidc {
 
+// ── Base64 for HTTP Basic auth ───────────────────────────────────────────────
+
+static std::string base64_encode(const std::string& input) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((input.size() + 2) / 3) * 4);
+    for (std::size_t i = 0; i < input.size(); i += 3) {
+        uint32_t n = static_cast<uint8_t>(input[i]) << 16;
+        if (i + 1 < input.size())
+            n |= static_cast<uint8_t>(input[i + 1]) << 8;
+        if (i + 2 < input.size())
+            n |= static_cast<uint8_t>(input[i + 2]);
+        out += kAlphabet[(n >> 18) & 0x3F];
+        out += kAlphabet[(n >> 12) & 0x3F];
+        out += (i + 1 < input.size()) ? kAlphabet[(n >> 6) & 0x3F] : '=';
+        out += (i + 2 < input.size()) ? kAlphabet[n & 0x3F] : '=';
+    }
+    return out;
+}
+
 // ── Platform crypto (file-local) ─────────────────────────────────────────────
 
 static std::vector<uint8_t> random_bytes(std::size_t n) {
@@ -259,7 +280,8 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
 // ── WinHTTP helper (Windows only) ────────────────────────────────────────────
 
 #ifdef _WIN32
-static std::string winhttp_post(const std::string& url, const std::string& form_body) {
+static std::string winhttp_post(const std::string& url, const std::string& form_body,
+                                const std::string& auth_header = {}) {
     // Parse URL into components
     // Expected: https://host/path
     std::wstring wurl(url.begin(), url.end());
@@ -299,6 +321,13 @@ static std::string winhttp_post(const std::string& url, const std::string& form_
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
         return {};
+    }
+
+    // Add Authorization header if provided (HTTP Basic auth for client credentials)
+    if (!auth_header.empty()) {
+        std::wstring wauth(auth_header.begin(), auth_header.end());
+        WinHttpAddRequestHeaders(request, wauth.c_str(), static_cast<DWORD>(wauth.size()),
+                                 WINHTTP_ADDREQ_FLAG_ADD);
     }
 
     const wchar_t* content_type = L"Content-Type: application/x-www-form-urlencoded";
@@ -351,10 +380,19 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     std::string form_body = "grant_type=authorization_code"
                             "&code=" +
                             url_encode(code) + "&redirect_uri=" + url_encode(redirect_uri) +
-                            "&client_id=" + url_encode(config_.client_id) +
                             "&code_verifier=" + url_encode(code_verifier);
-    if (!config_.client_secret.empty())
-        form_body += "&client_secret=" + url_encode(config_.client_secret);
+
+    // RFC 6749 §2.3.1: confidential clients SHOULD use HTTP Basic auth
+    // instead of sending client_secret in the POST body.
+    std::string auth_header;
+    if (!config_.client_secret.empty()) {
+        auto credentials =
+            base64_encode(config_.client_id + ":" + config_.client_secret);
+        auth_header = "Authorization: Basic " + credentials;
+    } else {
+        // Public client: include client_id in body (no secret)
+        form_body += "&client_id=" + url_encode(config_.client_id);
+    }
 
     spdlog::info("OIDC token exchange: endpoint={} redirect_uri={}", config_.token_endpoint,
                  redirect_uri);
@@ -363,7 +401,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 
 #ifdef _WIN32
     // Use WinHTTP on Windows — httplib's OpenSSL client fails from handler threads.
-    response_body = winhttp_post(config_.token_endpoint, form_body);
+    response_body = winhttp_post(config_.token_endpoint, form_body, auth_header);
     if (response_body.empty()) {
         spdlog::error("OIDC token exchange: WinHTTP POST failed");
         return std::unexpected("token endpoint request failed (WinHTTP)");
@@ -387,7 +425,11 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     httplib::Client client(scheme + host);
     client.set_connection_timeout(10);
     client.set_read_timeout(15);
-    auto result = client.Post(path, form_body, "application/x-www-form-urlencoded");
+    httplib::Headers headers;
+    if (!auth_header.empty())
+        headers.emplace("Authorization", "Basic " +
+            base64_encode(config_.client_id + ":" + config_.client_secret));
+    auto result = client.Post(path, headers, form_body, "application/x-www-form-urlencoded");
     if (!result) {
         spdlog::error("OIDC token exchange: httplib failed: {}",
                       httplib::to_string(result.error()));

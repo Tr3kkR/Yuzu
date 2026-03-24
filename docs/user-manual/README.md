@@ -40,6 +40,18 @@ All `curl` examples assume a running Yuzu server at `http://localhost:8080` and 
 
 ---
 
+## Supported Platforms
+
+| Platform | Architecture | Server | Agent | Gateway |
+|----------|-------------|--------|-------|---------|
+| Linux | x64 (amd64) | Yes | Yes | Yes |
+| Linux | ARM64 (aarch64) | Cross-compiled | Cross-compiled | Yes |
+| Windows | x64 | Yes | Yes | -- |
+| macOS | ARM64 (Apple Silicon) | Yes | Yes | -- |
+| macOS | x64 (Intel) | Not supported | Not supported | -- |
+
+> **Note:** macOS Intel (x64) builds are not currently produced or tested. Only Apple Silicon (ARM64) Macs running macOS 14+ are supported. If you require macOS Intel support, please open an issue.
+
 ## Quick Start
 
 1. **Start the server** -- run `yuzu-server` with a configuration file or accept interactive first-run setup.

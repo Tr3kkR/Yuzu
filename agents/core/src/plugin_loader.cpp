@@ -204,6 +204,11 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
                                   "," + std::to_string(YUZU_PLUGIN_ABI_VERSION) + "]"});
     }
 
+    // ABI v3+ includes sdk_version for diagnostics
+    const char* sdk_ver = (desc->abi_version >= 3 && desc->sdk_version) ? desc->sdk_version : "unknown";
+    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={})", desc->name, desc->version,
+                 desc->abi_version, sdk_ver);
+
     PluginHandle ph;
     ph.handle_ = handle;
     ph.descriptor_ = desc;

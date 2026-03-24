@@ -25,7 +25,13 @@ extern "C" {
 
 /* ── Version ────────────────────────────────────────────────────────────────── */
 
-#define YUZU_PLUGIN_ABI_VERSION 2
+#define YUZU_PLUGIN_ABI_VERSION 3
+
+/**
+ * Compile-time SDK version string embedded in every plugin descriptor.
+ * The agent logs this at load time for diagnostics.
+ */
+#define YUZU_PLUGIN_SDK_VERSION "0.1.0"
 
 /**
  * Plugins compiled against ABI version 1 are still loadable.
@@ -98,6 +104,12 @@ typedef struct {
 
     /** Dispatches an action to this plugin. */
     YuzuCommandHandler execute;
+
+    /**
+     * SDK version string the plugin was compiled against (ABI v3+).
+     * Null for plugins compiled with ABI version < 3.
+     */
+    const char* sdk_version;
 
 } YuzuPluginDescriptor;
 

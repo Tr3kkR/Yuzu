@@ -3,7 +3,7 @@
 # Run:    docker run -p 50051:50051 -p 9568:9568 yuzu-gateway
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM erlang:27-alpine AS builder
+FROM erlang:27-alpine@sha256:fc946258810fbcc5cc2a39fa0dfa041d7467d00bd3b07b5fbe8493b6c657f611 AS builder
 
 RUN apk add --no-cache git
 
@@ -12,7 +12,7 @@ COPY gateway/ .
 RUN rebar3 as prod release
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM alpine:3.20
+FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && adduser -D -s /sbin/nologin yuzu-gw

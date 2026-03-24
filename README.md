@@ -112,7 +112,7 @@ Response data is typed (bool, int32, int64, string, datetime, CLOB) and schemati
 | Web UI | HTMX + server-rendered HTML | No JavaScript framework. Server renders fragments. Minimal client complexity. |
 | Storage | SQLite (embedded) | Zero-config, single-file, fast. Agent uses it for KV storage and identity. Server uses it for responses, audit, and config. |
 | Auth | PBKDF2 + RBAC + OIDC | Session cookies for browsers, API tokens for automation, OIDC for enterprise SSO. |
-| Platforms | Windows, Linux, macOS, ARM | Enterprise + edge coverage. Cross-compiled from CI. |
+| Platforms | Windows, Linux, macOS (ARM64), ARM | Enterprise + edge coverage. Cross-compiled from CI. macOS Intel (x64) is not currently built or tested — only Apple Silicon (ARM64) is supported. |
 
 ## Project Layout
 

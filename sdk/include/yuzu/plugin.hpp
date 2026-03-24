@@ -399,6 +399,7 @@ private:
         .init = _yuzu_init_,                                                                       \
         .shutdown = _yuzu_shutdown_,                                                               \
         .execute = _yuzu_execute_,                                                                 \
+        .sdk_version = YUZU_PLUGIN_SDK_VERSION,                                                    \
     };                                                                                             \
                                                                                                    \
     extern "C" YUZU_PLUGIN_API const YuzuPluginDescriptor* yuzu_plugin_descriptor(void) {          \

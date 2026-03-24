@@ -36,6 +36,23 @@ jobs:
   #           | grep -v '\.pb\.' \
   #           | xargs clang-format-18 --dry-run --Werror
 
+  # ── Proto backward-compatibility ───────────────────────────────────────
+  proto-compat:
+    name: "Proto backward-compat"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need history so buf can compare against the merge base
+          fetch-depth: 0
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.50.0"
+      - name: Lint protos
+        run: buf lint proto
+      - name: Check backward compatibility
+        run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
   # ── Linux (GCC + Clang) ────────────────────────────────────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
