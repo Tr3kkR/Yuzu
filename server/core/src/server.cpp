@@ -445,6 +445,202 @@ public:
     // Build JSON array as a serialized string.
     std::string to_json() const { return to_json_obj().dump(); }
 
+    // Per-action description map: "plugin.action" → human-readable description.
+    // Kept server-side so agents don't need proto changes to report action help.
+    static const std::unordered_map<std::string, std::string>& action_descriptions() {
+        static const std::unordered_map<std::string, std::string> m = {
+            // example
+            {"example.ping",            "Returns a 'pong' response"},
+            {"example.echo",            "Echoes back the supplied message parameter"},
+            // status
+            {"status.version",          "Agent version, build number, and git commit hash"},
+            {"status.info",             "Platform OS, architecture, and hostname"},
+            {"status.health",           "Uptime, current timestamp, and memory RSS"},
+            {"status.plugins",          "Installed plugins with version and description"},
+            {"status.modules",          "Loaded modules with version and status"},
+            {"status.connection",       "Server address, TLS status, debug and verbose settings"},
+            {"status.switch",           "Switch address, session ID, connected since, reconnect count"},
+            {"status.config",           "Full agent configuration dump"},
+            // processes
+            {"processes.list",          "Enumerate all running processes (PID and name)"},
+            {"processes.query",         "Filter processes by case-insensitive name match"},
+            // hardware
+            {"hardware.manufacturer",   "System manufacturer string"},
+            {"hardware.model",          "System model / product name"},
+            {"hardware.bios",           "BIOS/UEFI vendor, version, and release date"},
+            {"hardware.processors",     "Installed CPUs with model, cores, threads, clock speed"},
+            {"hardware.memory",         "Installed memory modules (DIMMs) with size and type"},
+            {"hardware.disks",          "Physical disk drives with size and media type"},
+            // os_info
+            {"os_info.os_name",         "Full OS product name"},
+            {"os_info.os_version",      "OS version string"},
+            {"os_info.os_build",        "OS build identifier"},
+            {"os_info.os_arch",         "CPU architecture"},
+            {"os_info.uptime",          "System uptime in seconds and human-readable form"},
+            // services
+            {"services.list",           "Installed services with name, status, and startup type"},
+            {"services.running",        "Only currently running services"},
+            {"services.set_start_mode", "Change a service's startup type (automatic/manual/disabled)"},
+            // users
+            {"users.logged_on",         "Currently logged-on users"},
+            {"users.sessions",          "Active interactive sessions"},
+            {"users.local_users",       "Enumerate local user accounts"},
+            {"users.local_admins",      "Members of the local Administrators group"},
+            {"users.group_members",     "Members of a specified local group"},
+            {"users.primary_user",      "Primary user (most frequent login)"},
+            {"users.session_history",   "Historical login/logout session records"},
+            // tags
+            {"tags.set",                "Set a tag key-value pair"},
+            {"tags.get",                "Get a tag value by key"},
+            {"tags.get_all",            "Get all tags"},
+            {"tags.delete",             "Delete a tag by key"},
+            {"tags.check",              "Check if a tag key exists"},
+            {"tags.clear",              "Clear all tags"},
+            {"tags.count",              "Count total tags"},
+            // registry
+            {"registry.get_value",      "Read a Windows registry value"},
+            {"registry.set_value",      "Write a Windows registry value"},
+            {"registry.delete_value",   "Delete a Windows registry value"},
+            {"registry.delete_key",     "Delete a Windows registry key"},
+            {"registry.key_exists",     "Check if a registry key exists"},
+            {"registry.enumerate_keys", "List subkeys under a registry key"},
+            {"registry.enumerate_values","List values in a registry key"},
+            {"registry.get_user_value", "Get a registry value for a specific user SID"},
+            // filesystem
+            {"filesystem.exists",       "Check if a path exists, report type and size"},
+            {"filesystem.list_dir",     "List directory contents (max 1000 entries)"},
+            {"filesystem.file_hash",    "Compute SHA-256 (or SHA-1) hash of a file"},
+            {"filesystem.create_temp",  "Create a secure temporary file (owner-only permissions)"},
+            {"filesystem.create_temp_dir","Create a secure temporary directory (owner-only permissions)"},
+            // content_dist
+            {"content_dist.stage",      "Download a file to staging directory with hash verification"},
+            {"content_dist.execute_staged","Execute a previously staged file"},
+            {"content_dist.list_staged", "List files in the staging directory"},
+            {"content_dist.cleanup",    "Remove staged files older than N hours"},
+            // script_exec
+            {"script_exec.exec",        "Execute a command with arguments (no shell interpretation)"},
+            {"script_exec.powershell",  "Run a PowerShell script (Windows only)"},
+            {"script_exec.bash",        "Run a bash script (Linux/macOS only)"},
+            // windows_updates
+            {"windows_updates.installed","List recently installed updates or packages"},
+            {"windows_updates.missing", "List available updates or packages not yet installed"},
+            // agent_logging
+            {"agent_logging.get_log",   "Return the last N lines of the agent log file"},
+            {"agent_logging.get_key_files","List important agent files with sizes and modification times"},
+            // installed_apps
+            {"installed_apps.list",     "List all installed applications"},
+            {"installed_apps.query",    "Search for an application by name (partial match)"},
+            // network_config
+            {"network_config.adapters", "Network adapters with MAC, speed, and status"},
+            {"network_config.ip_addresses","Assigned IP addresses with subnet and gateway"},
+            {"network_config.dns_servers","Configured DNS servers per adapter"},
+            {"network_config.proxy",    "System proxy configuration"},
+            // network_actions
+            {"network_actions.flush_dns","Flush the DNS resolver cache"},
+            {"network_actions.ping",    "Ping a host (params: host, count)"},
+            // netstat
+            {"netstat.netstat_list",    "Active TCP/UDP connections and listening sockets with owning PID"},
+            // device_identity
+            {"device_identity.device_name","Machine hostname"},
+            {"device_identity.domain",  "DNS/AD domain and join status"},
+            {"device_identity.ou",      "Active Directory organizational unit path"},
+            // discovery
+            {"discovery.scan_subnet",   "ARP scan + ping sweep of a subnet to find live hosts"},
+            // firewall
+            {"firewall.state",          "Firewall state per profile/backend"},
+            {"firewall.rules",          "List firewall rules (summary)"},
+            // certificates
+            {"certificates.list",       "List certificates in system stores"},
+            {"certificates.details",    "Get details for a certificate by thumbprint"},
+            {"certificates.delete",     "Delete a certificate by thumbprint from a given store"},
+            // event_logs
+            {"event_logs.errors",       "Recent error events from a specified log"},
+            {"event_logs.query",        "Search events by keyword"},
+            // wmi
+            {"wmi.query",              "Run a WQL SELECT query"},
+            {"wmi.get_instance",       "Get all properties of a WMI class instance"},
+            // bitlocker
+            {"bitlocker.state",        "BitLocker / LUKS / FileVault status per volume"},
+            // antivirus
+            {"antivirus.products",     "List installed antivirus products"},
+            {"antivirus.status",       "Windows Defender detailed status"},
+            // http_client
+            {"http_client.download",   "Download a file from URL with optional hash verification"},
+            {"http_client.get",        "HTTP GET a URL, return status and body"},
+            {"http_client.head",       "HTTP HEAD a URL, return status and headers"},
+            // chargen
+            {"chargen.chargen_start",  "Begin generating rotating ASCII character lines (RFC 864)"},
+            {"chargen.chargen_stop",   "Stop all running chargen sessions"},
+            // ioc
+            {"ioc.check",             "Check indicators of compromise against local endpoint state"},
+            // quarantine
+            {"quarantine.quarantine",  "Isolate device from network, whitelisting management server"},
+            {"quarantine.unquarantine","Remove quarantine firewall rules and restore network access"},
+            {"quarantine.status",      "Check whether quarantine rules are currently active"},
+            {"quarantine.whitelist",   "Add or remove IPs from an active quarantine whitelist"},
+            // agent_actions
+            {"agent_actions.set_log_level","Change the spdlog log level at runtime"},
+            {"agent_actions.info",     "Return agent runtime info from config context"},
+            // software_actions
+            {"software_actions.list_upgradable","List packages/apps that can be upgraded (read-only)"},
+            {"software_actions.installed_count","Quick count of installed packages or apps"},
+            // network_diag
+            {"network_diag.listening",  "List listening TCP ports"},
+            {"network_diag.connections","List established TCP connections"},
+            // msi_packages
+            {"msi_packages.list",       "List all installed MSI packages"},
+            {"msi_packages.product_codes","Compact list of installed MSI product code GUIDs"},
+            // sccm
+            {"sccm.client_version",     "Check if SCCM client is installed and report version"},
+            {"sccm.site",              "Get SCCM site assignment info"},
+            // storage
+            {"storage.set",            "Store a key-value pair in persistent storage"},
+            {"storage.get",            "Retrieve a value by key from persistent storage"},
+            {"storage.delete",         "Delete a key from persistent storage"},
+            {"storage.list",           "List keys matching a prefix"},
+            {"storage.clear",          "Delete all keys for this plugin"},
+            // interaction
+            {"interaction.notify",     "Show a desktop notification/toast message"},
+            {"interaction.message_box","Show a modal message dialog, return button clicked"},
+            {"interaction.input",      "Show a text input dialog, return entered text"},
+            {"interaction.survey",     "Show a multi-question survey form, collect responses"},
+            {"interaction.set_dnd",    "Enable or disable Do Not Disturb mode"},
+            // asset_tags
+            {"asset_tags.sync",        "Push current structured tags from server; detect changes"},
+            {"asset_tags.status",      "Report locally cached tags and sync metadata"},
+            {"asset_tags.get",         "Get a specific structured tag value by category key"},
+            {"asset_tags.changes",     "Report the change log (what changed and when)"},
+            // procfetch
+            {"procfetch.procfetch_fetch","Enumerate processes with PID, name, path, and SHA-1 hash"},
+            // sockwho
+            {"sockwho.sockwho_list",   "Map open sockets to owning processes (PID, name, path)"},
+            // wol
+            {"wol.wake",              "Send a Wake-on-LAN magic packet to a MAC address"},
+            {"wol.check",             "Ping a host to verify it responded to WoL wake"},
+            // vuln_scan
+            {"vuln_scan.scan",        "Full vulnerability scan (CVE + configuration checks)"},
+            {"vuln_scan.cve_scan",    "CVE-only: match installed software against known CVEs"},
+            {"vuln_scan.config_scan", "Configuration and compliance checks only"},
+            {"vuln_scan.summary",     "Quick severity counts from a full vulnerability scan"},
+            // wifi
+            {"wifi.list_networks",    "Scan for visible WiFi networks (SSID, signal, security)"},
+            {"wifi.connected",        "Currently connected WiFi network info"},
+            // diagnostics
+            {"diagnostics.log_level", "Read current agent log level from config"},
+            {"diagnostics.certificates","List TLS certificate paths and whether they exist"},
+            {"diagnostics.connection_info","Server address, TLS, session, channel state, latency, uptime"},
+            // tar (Timeline Activity Record)
+            {"tar.status",            "Current TAR collection status, event counts, and DB size"},
+            {"tar.query",             "Query recorded timeline events by type and time range"},
+            {"tar.snapshot",          "Trigger an immediate full-state snapshot"},
+            {"tar.export",            "Export timeline events as structured data"},
+            {"tar.configure",         "Update TAR collection intervals and retention settings"},
+            {"tar.collect_fast",      "Run fast collectors (processes + network connections)"},
+            {"tar.collect_slow",      "Run slow collectors (services + users + installed apps)"},
+        };
+        return m;
+    }
+
     // Build help catalog: deduplicated plugin metadata across all agents.
     std::string help_json() const {
         std::lock_guard lock(mu_);
@@ -468,6 +664,7 @@ public:
         std::ranges::sort(
             sorted, [](const PluginMeta* a, const PluginMeta* b) { return a->name < b->name; });
 
+        const auto& descs = action_descriptions();
         nlohmann::json plugins_arr = nlohmann::json::array();
         nlohmann::json commands_arr = nlohmann::json::array();
 
@@ -476,7 +673,17 @@ public:
             pj["name"] = pm->name;
             pj["version"] = pm->version;
             pj["description"] = pm->description;
-            pj["actions"] = pm->actions;
+
+            // Build actions as objects with name + description
+            nlohmann::json actions_arr = nlohmann::json::array();
+            for (const auto& act : pm->actions) {
+                nlohmann::json aj;
+                aj["name"] = act;
+                auto it = descs.find(pm->name + "." + act);
+                aj["description"] = it != descs.end() ? it->second : "";
+                actions_arr.push_back(std::move(aj));
+            }
+            pj["actions"] = std::move(actions_arr);
 
             plugins_arr.push_back(std::move(pj));
 
@@ -488,6 +695,248 @@ public:
         }
 
         return nlohmann::json({{"plugins", plugins_arr}, {"commands", commands_arr}}).dump();
+    }
+
+    // Render help table as HTML fragment (thead + tbody rows).
+    // Optional filter narrows to a single plugin.
+    std::string help_html(std::string_view filter = "") const {
+        std::lock_guard lock(mu_);
+
+        std::unordered_map<std::string, const PluginMeta*> best;
+        for (const auto& s : agents_ | std::views::values)
+            for (const auto& pm : s->plugin_meta) {
+                auto it = best.find(pm.name);
+                if (it == best.end() || pm.actions.size() > it->second->actions.size())
+                    best[pm.name] = &pm;
+            }
+
+        std::vector<const PluginMeta*> sorted;
+        sorted.reserve(best.size());
+        for (const auto* pm : best | std::views::values)
+            sorted.push_back(pm);
+        std::ranges::sort(sorted, [](const PluginMeta* a, const PluginMeta* b) {
+            return a->name < b->name;
+        });
+
+        if (!filter.empty()) {
+            std::erase_if(sorted, [&](const PluginMeta* pm) { return pm->name != filter; });
+        }
+
+        const auto& descs = action_descriptions();
+        auto esc = [](std::string_view s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                switch (c) {
+                    case '&':  out += "&amp;";  break;
+                    case '<':  out += "&lt;";   break;
+                    case '>':  out += "&gt;";   break;
+                    case '"':  out += "&quot;";  break;
+                    default:   out += c;
+                }
+            }
+            return out;
+        };
+
+        std::string html;
+        int row_count = 0;
+
+        for (const auto* pm : sorted) {
+            if (pm->actions.empty()) {
+                html += "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
+                        "<td class=\"col-agent\" title=\"" + esc(pm->name) + "\">" + esc(pm->name) + "</td>"
+                        "<td title=\"\u2014\">\u2014</td>"
+                        "<td title=\"" + esc(pm->description) + "\">" + esc(pm->description) + "</td></tr>"
+                        "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
+                        "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" + esc(pm->name) + "</div>"
+                        "<div class=\"detail-label\">Action</div><div class=\"detail-value\">\u2014</div>"
+                        "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" + esc(pm->description) + "</div>"
+                        "</div></td></tr>";
+                ++row_count;
+            } else {
+                for (const auto& act : pm->actions) {
+                    auto key = pm->name + "." + act;
+                    auto it = descs.find(key);
+                    std::string desc = it != descs.end() ? it->second : "";
+                    html += "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">"
+                            "<td class=\"col-agent\" title=\"" + esc(pm->name) + "\">" + esc(pm->name) + "</td>"
+                            "<td title=\"" + esc(act) + "\">" + esc(act) + "</td>"
+                            "<td title=\"" + esc(desc) + "\">" + esc(desc) + "</td></tr>"
+                            "<tr class=\"result-detail\"><td colspan=\"3\"><div class=\"detail-content\">"
+                            "<div class=\"detail-label\">Plugin</div><div class=\"detail-value\">" + esc(pm->name) + "</div>"
+                            "<div class=\"detail-label\">Action</div><div class=\"detail-value\">" + esc(act) + "</div>"
+                            "<div class=\"detail-label\">Description</div><div class=\"detail-value\">" + esc(desc) + "</div>"
+                            "</div></td></tr>";
+                    ++row_count;
+                }
+            }
+        }
+
+        // Wrap: context span + thead + tbody in a single OOB-capable response
+        std::string context = filter.empty() ? "help \u2014 all plugins"
+                                             : "help " + std::string(filter);
+        std::string result;
+        result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" style=\"font-size:0.75rem;color:#8b949e\">"
+                  + esc(context) + "</span>";
+        result += "<tr id=\"help-thead-row\" hx-swap-oob=\"innerHTML:#results-thead\">"
+                  "<th class=\"col-agent\">Plugin</th><th>Action</th><th>Description</th></tr>";
+        result += "<span id=\"help-row-count\" hx-swap-oob=\"innerHTML:#row-count\">"
+                  + std::to_string(row_count) + "</span>";
+        result += html;
+        return result;
+    }
+
+    // Render autocomplete dropdown items as HTML.
+    std::string autocomplete_html(std::string_view query) const {
+        std::lock_guard lock(mu_);
+
+        std::string q{query};
+        std::ranges::transform(q, q.begin(), ::tolower);
+
+        std::unordered_map<std::string, const PluginMeta*> best;
+        for (const auto& s : agents_ | std::views::values)
+            for (const auto& pm : s->plugin_meta) {
+                auto it = best.find(pm.name);
+                if (it == best.end() || pm.actions.size() > it->second->actions.size())
+                    best[pm.name] = &pm;
+            }
+
+        const auto& descs = action_descriptions();
+        auto esc = [](std::string_view s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                switch (c) {
+                    case '&':  out += "&amp;";  break;
+                    case '<':  out += "&lt;";   break;
+                    case '>':  out += "&gt;";   break;
+                    case '"':  out += "&quot;";  break;
+                    default:   out += c;
+                }
+            }
+            return out;
+        };
+
+        // Build sorted command list with descriptions
+        struct CmdEntry { std::string cmd; std::string desc; };
+        std::vector<CmdEntry> all_cmds;
+
+        // "help" pseudo-command
+        all_cmds.push_back({"help", "List all plugins and actions"});
+
+        for (const auto& [name, pm] : best) {
+            all_cmds.push_back({pm->name, pm->description});
+            for (const auto& act : pm->actions) {
+                auto key = pm->name + "." + act;
+                auto it = descs.find(key);
+                all_cmds.push_back({pm->name + " " + act,
+                                    it != descs.end() ? it->second : pm->description});
+            }
+        }
+
+        // Filter by prefix
+        std::vector<const CmdEntry*> matches;
+        for (const auto& e : all_cmds) {
+            if (e.cmd.starts_with(q) && e.cmd != q)
+                matches.push_back(&e);
+        }
+        std::ranges::sort(matches, [](const CmdEntry* a, const CmdEntry* b) {
+            return a->cmd < b->cmd;
+        });
+        if (matches.size() > 15) matches.resize(15);
+
+        std::string html;
+        for (const auto* m : matches) {
+            html += "<div class=\"ac-item\" data-cmd=\"" + esc(m->cmd) + "\">"
+                    "<span>" + esc(m->cmd) + "</span>";
+            if (!m->desc.empty())
+                html += "<span class=\"ac-desc\">" + esc(m->desc) + "</span>";
+            html += "</div>";
+        }
+        return html;
+    }
+
+    // Render command palette instruction results as HTML.
+    std::string palette_html(std::string_view query) const {
+        std::lock_guard lock(mu_);
+
+        std::string q{query};
+        std::ranges::transform(q, q.begin(), ::tolower);
+
+        std::unordered_map<std::string, const PluginMeta*> best;
+        for (const auto& s : agents_ | std::views::values)
+            for (const auto& pm : s->plugin_meta) {
+                auto it = best.find(pm.name);
+                if (it == best.end() || pm.actions.size() > it->second->actions.size())
+                    best[pm.name] = &pm;
+            }
+
+        const auto& descs = action_descriptions();
+        auto esc = [](std::string_view s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                switch (c) {
+                    case '&':  out += "&amp;";  break;
+                    case '<':  out += "&lt;";   break;
+                    case '>':  out += "&gt;";   break;
+                    case '"':  out += "&quot;";  break;
+                    default:   out += c;
+                }
+            }
+            return out;
+        };
+
+        struct Entry { std::string name; std::string desc; std::string plugin; std::string action; };
+        std::vector<Entry> results;
+        std::unordered_set<std::string> seen_plugins;
+
+        for (const auto& [pname, pm] : best) {
+            for (const auto& act : pm->actions) {
+                auto key = pm->name + "." + act;
+                auto it = descs.find(key);
+                std::string desc = it != descs.end() ? it->second : pm->description;
+                std::string full = pm->name + " " + act;
+                std::string full_lower = full;
+                std::ranges::transform(full_lower, full_lower.begin(), ::tolower);
+                std::string desc_lower = desc;
+                std::ranges::transform(desc_lower, desc_lower.begin(), ::tolower);
+                if (full_lower.find(q) != std::string::npos || desc_lower.find(q) != std::string::npos) {
+                    results.push_back({full, desc, pm->name, act});
+                    seen_plugins.insert(pm->name);
+                }
+            }
+            // Also match just plugin name
+            std::string pname_lower = pm->name;
+            std::ranges::transform(pname_lower, pname_lower.begin(), ::tolower);
+            if (pname_lower.find(q) != std::string::npos && !pm->actions.empty()
+                && !seen_plugins.contains(pm->name)) {
+                auto& first_act = pm->actions.front();
+                auto key = pm->name + "." + first_act;
+                auto it = descs.find(key);
+                std::string desc = it != descs.end() ? it->second : pm->description;
+                results.push_back({pm->name + " " + first_act, desc, pm->name, first_act});
+            }
+        }
+
+        std::ranges::sort(results, [](const Entry& a, const Entry& b) { return a.name < b.name; });
+        if (results.size() > 8) results.resize(8);
+
+        std::string html;
+        if (!results.empty()) {
+            html += "<div class=\"cmd-section-header\">Instructions</div>";
+        }
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& r = results[i];
+            html += "<div class=\"cmd-result\" data-index=\"" + std::to_string(i) + "\""
+                    " data-type=\"instruction\" data-plugin=\"" + esc(r.plugin) + "\""
+                    " data-action=\"" + esc(r.action) + "\">"
+                    "<span class=\"cmd-result-name\">" + esc(r.name) + "</span>"
+                    "<span class=\"cmd-result-desc\">" + esc(r.desc) + "</span>"
+                    "<span class=\"cmd-result-type badge badge-info\">Instruction</span>"
+                    "</div>";
+        }
+        return html;
     }
 
     // Get list of all agent IDs.
@@ -6728,6 +7177,35 @@ private:
             if (!require_permission(req, res, "Infrastructure", "Read"))
                 return;
             res.set_content(registry_.help_json(), "application/json");
+        });
+
+        // Help table HTML fragment (HTMX)
+        web_server_->Get("/api/help/html", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            std::string filter;
+            if (req.has_param("filter")) filter = req.get_param_value("filter");
+            res.set_content(registry_.help_html(filter), "text/html");
+        });
+
+        // Autocomplete HTML fragment (HTMX)
+        web_server_->Get("/api/help/autocomplete", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            std::string q;
+            if (req.has_param("q")) q = req.get_param_value("q");
+            if (q.empty()) { res.set_content("", "text/html"); return; }
+            res.set_content(registry_.autocomplete_html(q), "text/html");
+        });
+
+        // Command palette instruction search HTML fragment (HTMX)
+        web_server_->Get("/api/help/palette", [this](const httplib::Request& req, httplib::Response& res) {
+            if (!require_permission(req, res, "Infrastructure", "Read"))
+                return;
+            std::string q;
+            if (req.has_param("q")) q = req.get_param_value("q");
+            if (q.empty()) { res.set_content("", "text/html"); return; }
+            res.set_content(registry_.palette_html(q), "text/html");
         });
 
         // -- NVD CVE feed endpoints -------------------------------------------

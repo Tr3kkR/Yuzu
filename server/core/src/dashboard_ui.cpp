@@ -294,7 +294,9 @@ extern const char* const kDashboardIndexHtml =
     <label>Instruction</label>
     <div class="instr-wrap">
       <input type="text" id="instr-input" placeholder="Type a command or 'help'..."
-             autocomplete="off" spellcheck="false">
+             autocomplete="off" spellcheck="false"
+             name="q" hx-get="/api/help/autocomplete" hx-trigger="input changed delay:150ms"
+             hx-target="#ac-list" hx-swap="innerHTML">
       <div class="ac-list" id="ac-list"></div>
     </div>
     <button id="btn-send" onclick="sendInstruction()">Send</button>
@@ -438,10 +440,11 @@ extern const char* const kDashboardIndexHtml =
       for (var i = 0; i < data.plugins.length; i++) {
         var p = data.plugins[i];
         if (p.actions.length > 0) {
-          instructionMap[p.name] = { plugin: p.name, action: p.actions[0] };
+          instructionMap[p.name] = { plugin: p.name, action: p.actions[0].name || p.actions[0] };
         }
         for (var j = 0; j < p.actions.length; j++) {
-          instructionMap[p.name + ' ' + p.actions[j]] = { plugin: p.name, action: p.actions[j] };
+          var aName = p.actions[j].name || p.actions[j];
+          instructionMap[p.name + ' ' + aName] = { plugin: p.name, action: aName };
         }
       }
     }
@@ -598,37 +601,11 @@ extern const char* const kDashboardIndexHtml =
 
     /* ── Send instruction ─────────────────────────────────── */
     function showHelp(query) {
-      var plugins = helpData.plugins;
-      if (!plugins || plugins.length === 0) {
-        document.getElementById('result-context').textContent = 'No agents connected — help unavailable.';
-        setBadge('error');
-        return;
-      }
-      /* Filter to a specific plugin if requested */
       var filter = query.replace(/^help\s*/i, '').trim().toLowerCase();
-      if (filter) {
-        plugins = plugins.filter(function(p) { return p.name === filter; });
-        if (plugins.length === 0) {
-          document.getElementById('result-context').textContent = 'Unknown plugin: "' + filter + '"';
-          setBadge('error');
-          return;
-        }
-      }
-      setColumns(['Plugin', 'Action', 'Description']);
       clearResults();
-      document.getElementById('result-context').textContent = filter ? 'help ' + filter : 'help — all plugins';
       setBadge('idle');
-      for (var i = 0; i < plugins.length; i++) {
-        var p = plugins[i];
-        if (p.actions.length === 0) {
-          addRow([p.name, '\u2014', p.description]);
-        } else {
-          for (var j = 0; j < p.actions.length; j++) {
-            addRow([p.name, p.actions[j], j === 0 ? p.description : '']);
-          }
-        }
-      }
-      document.getElementById('row-count').textContent = rowCount;
+      var url = '/api/help/html' + (filter ? '?filter=' + encodeURIComponent(filter) : '');
+      htmx.ajax('GET', url, { target: '#results-tbody', swap: 'innerHTML settle:0ms' });
     }
 
 )HTM"
@@ -759,51 +736,34 @@ extern const char* const kDashboardIndexHtml =
       document.getElementById('instr-input').focus();
     }
 
-    function updateAC() {
-      var input = document.getElementById('instr-input');
-      var q = input.value.trim().toLowerCase();
+    /* Autocomplete is now HTMX-driven: input hx-get="/api/help/autocomplete"
+       renders server-side HTML into #ac-list. We just manage open/close and clicks. */
+    function onAcResponse() {
       var list = document.getElementById('ac-list');
-      list.innerHTML = '';
       acSel = -1;
-      if (!q) { closeAC(); return; }
-
-      /* Build description lookup */
-      var descMap = {};
-      for (var i = 0; i < helpData.plugins.length; i++) {
-        descMap[helpData.plugins[i].name] = helpData.plugins[i].description;
+      if (list.children.length > 0) {
+        list.classList.add('open');
+      } else {
+        closeAC();
       }
-
-      /* Filter commands — prefix match */
-      var cmds = helpData.commands || Object.keys(instructionMap);
-      var matches = [];
-      for (var i = 0; i < cmds.length; i++) {
-        if (cmds[i].indexOf(q) === 0 && cmds[i] !== q) matches.push(cmds[i]);
-      }
-      /* Also add 'help' if it matches */
-      if ('help'.indexOf(q) === 0 && q !== 'help') matches.unshift('help');
-
-      if (matches.length === 0) { closeAC(); return; }
-      if (matches.length > 15) matches.length = 15;
-
-      for (var i = 0; i < matches.length; i++) {
-        var div = document.createElement('div');
-        div.className = 'ac-item';
-        var plugin = matches[i].split(' ')[0];
-        var desc = descMap[plugin] || '';
-        div.innerHTML = '<span>' + escapeHtml(matches[i]) + '</span>' +
-          (desc ? '<span class="ac-desc">' + escapeHtml(desc) + '</span>' : '');
-        div.setAttribute('data-cmd', matches[i]);
-        div.addEventListener('mousedown', function(ev) {
-          ev.preventDefault();
-          acSelect(this.getAttribute('data-cmd'));
-        });
-        list.appendChild(div);
-      }
-      list.classList.add('open');
     }
+    /* Listen for HTMX swap completion on the autocomplete list */
+    document.getElementById('ac-list').addEventListener('htmx:afterSwap', onAcResponse);
+
+    /* Event-delegated click handler for server-rendered ac-items */
+    document.getElementById('ac-list').addEventListener('mousedown', function(ev) {
+      var item = ev.target.closest('.ac-item');
+      if (item) {
+        ev.preventDefault();
+        acSelect(item.getAttribute('data-cmd'));
+      }
+    });
 
     var instrInput = document.getElementById('instr-input');
-    instrInput.addEventListener('input', updateAC);
+    /* Close autocomplete when input is empty */
+    instrInput.addEventListener('input', function() {
+      if (!instrInput.value.trim()) closeAC();
+    });
     instrInput.addEventListener('blur', function() { setTimeout(closeAC, 150); });
     instrInput.addEventListener('keydown', function(e) {
       var list = document.getElementById('ac-list');
@@ -973,15 +933,17 @@ extern const char* const kDashboardIndexHtml =
           for (var i = 0; i < helpData.plugins.length; i++) {
             var p = helpData.plugins[i];
             for (var j = 0; j < p.actions.length; j++) {
-              var fullName = p.name + ' ' + p.actions[j];
-              var desc = p.description || '';
-              if (fullName.toLowerCase().indexOf(q) >= 0 || desc.toLowerCase().indexOf(q) >= 0) {
+              var a = p.actions[j];
+              var aName = a.name || a;
+              var aDesc = a.description || p.description || '';
+              var fullName = p.name + ' ' + aName;
+              if (fullName.toLowerCase().indexOf(q) >= 0 || aDesc.toLowerCase().indexOf(q) >= 0) {
                 instrResults.push({
-                  name: p.name + ' ' + p.actions[j],
-                  desc: desc,
+                  name: fullName,
+                  desc: aDesc,
                   type: 'Instruction',
                   plugin: p.name,
-                  action: p.actions[j]
+                  action: aName
                 });
               }
             }
@@ -992,12 +954,13 @@ extern const char* const kDashboardIndexHtml =
                 if (instrResults[k].plugin === p.name) { already = true; break; }
               }
               if (!already) {
+                var a0 = p.actions[0];
                 instrResults.push({
-                  name: p.name + ' ' + p.actions[0],
-                  desc: p.description || '',
+                  name: p.name + ' ' + (a0.name || a0),
+                  desc: a0.description || p.description || '',
                   type: 'Instruction',
                   plugin: p.name,
-                  action: p.actions[0]
+                  action: a0.name || a0
                 });
               }
             }
