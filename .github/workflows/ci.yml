@@ -15,7 +15,7 @@ concurrency:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;nuget,GitHub,readwrite"
+  VCPKG_BINARY_SOURCES: "clear"
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
@@ -114,15 +114,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -209,17 +200,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          $nuget = & "${{ github.workspace }}/vcpkg/vcpkg.exe" fetch nuget | Select-Object -Last 1
-          & $nuget sources add `
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" `
-            -storepasswordincleartext `
-            -name "GitHub" `
-            -username "Tr3kkR" `
-            -password "${{ secrets.GITHUB_TOKEN }}"
-          if ($LASTEXITCODE -ne 0) { Write-Host "NuGet source may already exist — continuing" }
-
       - name: Install vcpkg packages
         run: |
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
@@ -302,15 +282,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -394,15 +365,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages (cross)
         run: |
@@ -485,15 +447,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -580,15 +533,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
@@ -659,15 +603,6 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Register vcpkg NuGet source
-        run: |
-          mono $(${VCPKG_ROOT:-${{ github.workspace }}/vcpkg}/vcpkg fetch nuget | tail -n1) \
-            sources add \
-            -source "https://nuget.pkg.github.com/Tr3kkR/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "Tr3kkR" \
-            -password "${{ secrets.GITHUB_TOKEN }}" || true
 
       - name: Install vcpkg packages
         run: |
