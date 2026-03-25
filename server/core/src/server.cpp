@@ -46,6 +46,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "mcp_jsonrpc.hpp"
 #include "mcp_server.hpp"
 #include "rest_api_v1.hpp"
 #include "runtime_config_store.hpp"
@@ -4982,6 +4983,67 @@ private:
         return html;
     }
 
+    // -- MCP (AI Integration) fragment renderer --------------------------------
+
+    std::string render_mcp_fragment() {
+        std::string html;
+        bool mcp_enabled = !cfg_.mcp_disable;
+
+        std::string status_color = mcp_enabled ? "#3fb950" : "#484f58";
+        std::string status_text = mcp_enabled ? "Enabled" : "Disabled";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Status</label>"
+                "  <span style=\"font-size:0.8rem;color:" + status_color + ";font-weight:600\">" +
+                status_text + "</span>"
+                "</div>";
+
+        html += "<div class=\"form-row\">"
+                "  <label>Endpoint</label>"
+                "  <code style=\"font-size:0.8rem\">POST /mcp/v1/</code>"
+                "</div>";
+
+        // MCP Enabled toggle
+        std::string enabled_checked = mcp_enabled ? " checked" : "";
+        html += "<form hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\" hx-swap=\"innerHTML\">"
+                "<div class=\"form-row\">"
+                "  <label>MCP Enabled</label>"
+                "  <label class=\"toggle\">"
+                "    <input type=\"hidden\" name=\"enabled\" value=\"false\">"
+                "    <input type=\"checkbox\" name=\"enabled\" value=\"true\"" +
+                enabled_checked + " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
+                " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
+                "    <span class=\"slider\"></span>"
+                "  </label>"
+                "</div>";
+
+        // Read-Only Mode toggle
+        std::string readonly_checked = cfg_.mcp_read_only ? " checked" : "";
+        std::string readonly_color = cfg_.mcp_read_only ? "#d29922" : "#484f58";
+        std::string readonly_text = cfg_.mcp_read_only ? "Read-Only" : "Full Access";
+        html += "<div class=\"form-row\">"
+                "  <label>Access Mode</label>"
+                "  <label class=\"toggle\">"
+                "    <input type=\"hidden\" name=\"read_only\" value=\"false\">"
+                "    <input type=\"checkbox\" name=\"read_only\" value=\"true\"" +
+                readonly_checked + " hx-post=\"/api/settings/mcp\" hx-target=\"#mcp-section\""
+                " hx-swap=\"innerHTML\" hx-include=\"closest form\">"
+                "    <span class=\"slider\"></span>"
+                "  </label>"
+                "  <span style=\"font-size:0.75rem;color:" + readonly_color +
+                ";margin-left:0.5rem\">" + readonly_text + "</span>"
+                "</div>";
+
+        html += "</form>";
+
+        html += "<p style=\"font-size:0.7rem;color:#484f58;margin-top:0.75rem\">"
+                "MCP authentication uses API Tokens with the MCP tier. "
+                "Create tokens in the API Tokens section above."
+                "</p>";
+
+        return html;
+    }
+
     // -- Vulnerability Management (NVD) fragment renderer ---------------------
 
     std::string render_nvd_fragment() {
@@ -6896,6 +6958,34 @@ private:
                              res.set_content(render_data_retention_fragment(),
                                              "text/html; charset=utf-8");
                          });
+
+        web_server_->Get("/fragments/settings/mcp",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             if (!require_admin(req, res))
+                                 return;
+                             res.set_content(render_mcp_fragment(),
+                                             "text/html; charset=utf-8");
+                         });
+
+        web_server_->Post("/api/settings/mcp",
+                          [this](const httplib::Request& req, httplib::Response& res) {
+                              if (!require_admin(req, res))
+                                  return;
+                              auto enabled_val = extract_form_value(req.body, "enabled");
+                              auto read_only_val = extract_form_value(req.body, "read_only");
+                              cfg_.mcp_disable = (enabled_val != "true");
+                              cfg_.mcp_read_only = (read_only_val == "true");
+                              spdlog::info("MCP settings changed: enabled={}, read_only={}",
+                                           !cfg_.mcp_disable, cfg_.mcp_read_only);
+                              audit_log(req, "settings.mcp", "success", "MCP",
+                                        "mcp_settings",
+                                        "enabled=" + std::string(!cfg_.mcp_disable ? "true" : "false") +
+                                        ", read_only=" + std::string(cfg_.mcp_read_only ? "true" : "false"));
+                              res.set_header("HX-Trigger",
+                                  R"({"showToast":{"message":"MCP settings saved","level":"success"}})");
+                              res.set_content(render_mcp_fragment(),
+                                              "text/html; charset=utf-8");
+                          });
 
         web_server_->Get("/fragments/settings/nvd",
                          [this](const httplib::Request& req, httplib::Response& res) {
@@ -10438,7 +10528,16 @@ private:
 
         // -- Register MCP server routes ----------------------------------------
 
-        if (!cfg_.mcp_disable) {
+        if (cfg_.mcp_disable) {
+            // C8: Return a proper JSON-RPC error instead of a generic 404
+            web_server_->Post("/mcp/v1/", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Content-Type", "application/json");
+                res.set_content(
+                    mcp::error_response_null(mcp::kMcpDisabled,
+                                             "MCP is disabled on this server"),
+                    "application/json");
+            });
+        } else {
             mcp_server_ = std::make_unique<mcp::McpServer>();
             mcp_server_->register_routes(
                 *web_server_,

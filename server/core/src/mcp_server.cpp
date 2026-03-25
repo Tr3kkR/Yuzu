@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace yuzu::server::mcp {
 namespace {
@@ -206,6 +208,55 @@ static const ToolDef kTools[] = {
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
+
+// ── Phase 2 write tools (blocked by read_only_mode) ───────────────────────
+// These tool names will perform Write/Execute/Delete operations when they are
+// implemented in Phase 2. The read_only_mode guard rejects them proactively.
+static const std::unordered_set<std::string> kWriteTools = {
+    "set_tag", "delete_tag", "execute_instruction",
+    "approve_request", "reject_request", "quarantine_device",
+};
+
+// ── Tool → (securable_type, operation) mapping for generic policy checks ──
+// Every tool declares its securable type and operation so that tier_allows()
+// and requires_approval() can be evaluated generically before dispatch.
+struct ToolSecurity {
+    const char* securable_type;
+    const char* operation;
+};
+
+static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
+    // Phase 1 read-only tools
+    {"list_agents",            {"Infrastructure",          "Read"}},
+    {"get_agent_details",      {"Infrastructure",          "Read"}},
+    {"query_audit_log",        {"AuditLog",                "Read"}},
+    {"list_definitions",       {"InstructionDefinition",   "Read"}},
+    {"get_definition",         {"InstructionDefinition",   "Read"}},
+    {"query_responses",        {"Response",                "Read"}},
+    {"aggregate_responses",    {"Response",                "Read"}},
+    {"query_inventory",        {"Infrastructure",          "Read"}},
+    {"list_inventory_tables",  {"Infrastructure",          "Read"}},
+    {"get_agent_inventory",    {"Infrastructure",          "Read"}},
+    {"get_tags",               {"Tag",                     "Read"}},
+    {"search_agents_by_tag",   {"Tag",                     "Read"}},
+    {"list_policies",          {"Policy",                  "Read"}},
+    {"get_compliance_summary", {"Policy",                  "Read"}},
+    {"get_fleet_compliance",   {"Policy",                  "Read"}},
+    {"list_management_groups", {"ManagementGroup",         "Read"}},
+    {"get_execution_status",   {"Execution",               "Read"}},
+    {"list_executions",        {"Execution",               "Read"}},
+    {"list_schedules",         {"Schedule",                "Read"}},
+    {"validate_scope",         {"Infrastructure",          "Read"}},
+    {"preview_scope_targets",  {"Infrastructure",          "Read"}},
+    {"list_pending_approvals", {"Approval",                "Read"}},
+    // Phase 2 write tools (not yet implemented, but security metadata is pre-registered)
+    {"set_tag",                {"Tag",                     "Write"}},
+    {"delete_tag",             {"Tag",                     "Delete"}},
+    {"execute_instruction",    {"Execution",               "Execute"}},
+    {"approve_request",        {"Approval",                "Write"}},
+    {"reject_request",         {"Approval",                "Write"}},
+    {"quarantine_device",      {"Security",                "Write"}},
+};
 
 // ── Resource definitions ──────────────────────────────────────────────────
 
@@ -473,6 +524,62 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             auto mcp_audit = [&](const std::string& result_status, const std::string& detail = {}) {
                 audit_fn(req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
+
+            // ── C7: read_only_mode enforcement ──────────────────────────
+            // When the server is in read-only mode, reject any tool that
+            // performs a Write/Execute/Delete operation.
+            if (read_only_mode && kWriteTools.contains(tool_name)) {
+                mcp_audit("denied", "read-only mode");
+                res.set_content(error_response(id, kTierDenied, "MCP is in read-only mode"),
+                                "application/json");
+                return;
+            }
+
+            // ── C8: Generic tier + approval checks via kToolSecurity ────
+            // Look up the tool's (securable_type, operation) pair and run
+            // tier_allows() / requires_approval() generically.  This fires
+            // for EVERY tool so Phase 2 write tools get policy enforcement
+            // the moment they are registered in kToolSecurity.
+            auto sec_it = kToolSecurity.find(tool_name);
+            if (sec_it != kToolSecurity.end()) {
+                const auto& [sec_type, sec_op] = sec_it->second;
+
+                if (!tier_allows(tier, sec_type, sec_op)) {
+                    mcp_audit("denied", "tier=" + std::string(tier));
+                    res.set_content(error_response(id, kTierDenied,
+                                   "MCP tier does not allow this operation"),
+                                   "application/json");
+                    return;
+                }
+
+                if (requires_approval(tier, sec_type, sec_op)) {
+                    if (!approval_manager) {
+                        res.set_content(error_response(id, kInternalError,
+                                       "Approval manager unavailable"),
+                                       "application/json");
+                        return;
+                    }
+                    auto approval_result = approval_manager->submit(
+                        tool_name, session->username,
+                        "MCP tool call: " + tool_name);
+                    if (approval_result) {
+                        auto body = JObj()
+                            .add("status", "pending_approval")
+                            .add("approval_id", *approval_result)
+                            .add("message",
+                                 "This operation requires admin approval before execution")
+                            .str();
+                        res.set_content(success_response(id, body), "application/json");
+                        mcp_audit("pending_approval", "approval_id=" + *approval_result);
+                    } else {
+                        res.set_content(error_response(id, kInternalError,
+                                       approval_result.error()),
+                                       "application/json");
+                        mcp_audit("failure", "approval submit error");
+                    }
+                    return;
+                }
+            }
 
             // ── list_agents ───────────────────────────────────────────────
             if (tool_name == "list_agents") {

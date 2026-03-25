@@ -48,6 +48,8 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-client-secret` | *(none)* | OIDC client secret. |
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. |
+| `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
+| `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 
 ### Example
 
@@ -68,6 +70,16 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 ./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key \
   --no-cert-reload
+
+# MCP disabled (air-gapped environment)
+./yuzu-server --https-cert /etc/yuzu/server.crt \
+  --https-key /etc/yuzu/server.key \
+  --mcp-disable
+
+# MCP read-only mode (AI can query but not execute)
+./yuzu-server --https-cert /etc/yuzu/server.crt \
+  --https-key /etc/yuzu/server.key \
+  --mcp-read-only
 
 # HTTPS with OIDC SSO
 ./yuzu-server --https-cert /etc/yuzu/server.crt \

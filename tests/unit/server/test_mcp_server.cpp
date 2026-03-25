@@ -1,8 +1,13 @@
 /**
- * test_mcp_server.cpp — Unit tests for MCP (Model Context Protocol) server
+ * test_mcp_server.cpp — Unit + integration tests for MCP (Model Context Protocol) server
  *
- * Covers: JSON-RPC parsing, MCP tier policy, MCP tool dispatch, MCP token
- * integration with ApiTokenStore, audit trail for MCP operations.
+ * Unit tests cover: JSON-RPC parsing, MCP tier policy, MCP tool dispatch,
+ * MCP token integration with ApiTokenStore, audit trail for MCP operations.
+ *
+ * Integration tests (bottom of file) cover: full HTTP dispatch through McpServer
+ * with an httplib::Server on a random port, mock callbacks, real HTTP POST
+ * requests with JSON-RPC payloads, and response verification.  Addresses
+ * CRITICAL C6: "No integration test through HTTP dispatch."
  */
 
 #include "mcp_jsonrpc.hpp"
@@ -447,4 +452,597 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
     auto events = store.query(aq);
     REQUIRE(events.size() >= 1);
     CHECK(events[0].action == "mcp.list_agents");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Integration tests — full HTTP dispatch through McpServer
+//
+// Addresses CRITICAL C6: "No integration test through HTTP dispatch —
+// 0 of 22 tools tested end-to-end."
+//
+// Each test starts an httplib::Server on a random port, registers MCP routes
+// with mock callbacks, sends actual HTTP POST requests with JSON-RPC payloads,
+// and verifies the responses.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "mcp_server.hpp"
+
+#include <httplib.h>
+
+#include <atomic>
+#include <thread>
+#include <vector>
+
+namespace {
+
+/// RAII test fixture that starts an httplib::Server with MCP routes and
+/// mock callbacks.  Automatically stops the server on destruction.
+struct McpTestServer {
+    httplib::Server svr;
+    std::thread server_thread;
+    int port{0};
+
+    // Mock state
+    std::string mock_tier;           // MCP tier for mock auth
+    bool mock_auth_enabled{true};    // false -> auth_fn returns nullopt (401)
+    std::vector<std::string> audit_log; // records "action|result" pairs
+
+    yuzu::server::mcp::McpServer mcp;
+
+    void start(const std::string& tier = "") {
+        mock_tier = tier;
+
+        // Mock auth: returns a session with the configured tier (or nullopt)
+        auto auth_fn = [this](const httplib::Request& /*req*/,
+                              httplib::Response& res)
+            -> std::optional<yuzu::server::auth::Session> {
+            if (!mock_auth_enabled) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return std::nullopt;
+            }
+            yuzu::server::auth::Session s;
+            s.username = "test-user";
+            s.role = yuzu::server::auth::Role::admin;
+            s.mcp_tier = mock_tier;
+            return s;
+        };
+
+        // Mock permission: always allow
+        auto perm_fn = [](const httplib::Request&, httplib::Response&,
+                          const std::string& /*securable_type*/,
+                          const std::string& /*operation*/) -> bool {
+            return true;
+        };
+
+        // Mock audit: record calls
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& /*target_type*/,
+                               const std::string& /*target_id*/,
+                               const std::string& /*detail*/) {
+            audit_log.push_back(action + "|" + result);
+        };
+
+        // Mock agents: return two test agents
+        auto agents_fn = []() -> nlohmann::json {
+            return nlohmann::json::array({
+                {{"agent_id", "agent-001"}, {"hostname", "web-01"}, {"os", "linux"},
+                 {"arch", "x64"}, {"agent_version", "0.1.3"}},
+                {{"agent_id", "agent-002"}, {"hostname", "db-01"}, {"os", "windows"},
+                 {"arch", "x64"}, {"agent_version", "0.1.3"}}
+            });
+        };
+
+        // Register routes with nullptr for stores we don't need in basic tests
+        mcp.register_routes(svr, auth_fn, perm_fn, audit_fn, agents_fn,
+                            /*rbac_store=*/nullptr,
+                            /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr,
+                            /*response_store=*/nullptr,
+                            /*audit_store=*/nullptr,
+                            /*tag_store=*/nullptr,
+                            /*inventory_store=*/nullptr,
+                            /*policy_store=*/nullptr,
+                            /*mgmt_store=*/nullptr,
+                            /*approval_manager=*/nullptr,
+                            /*schedule_engine=*/nullptr,
+                            /*read_only_mode=*/false);
+
+        // Bind to a random available port
+        port = svr.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+
+        // Start listening in a background thread
+        server_thread = std::thread([this]() { svr.listen_after_bind(); });
+
+        // Wait for server to be ready (poll with short sleeps)
+        for (int i = 0; i < 100; ++i) {
+            if (svr.is_running()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(svr.is_running());
+    }
+
+    ~McpTestServer() {
+        svr.stop();
+        if (server_thread.joinable())
+            server_thread.join();
+    }
+
+    /// Send a JSON-RPC request body and return the result.
+    httplib::Result call(const std::string& json_body) {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_connection_timeout(5);
+        cli.set_read_timeout(5);
+        return cli.Post("/mcp/v1/", json_body, "application/json");
+    }
+};
+
+} // namespace
+
+// ── 1. initialize handshake ─────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: initialize handshake", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["jsonrpc"] == "2.0");
+    CHECK(body["id"] == 1);
+    REQUIRE(body.contains("result"));
+
+    auto& result = body["result"];
+    CHECK(result.contains("serverInfo"));
+    CHECK(result["serverInfo"]["name"] == "yuzu-server");
+    CHECK(result.contains("protocolVersion"));
+    CHECK(result.contains("capabilities"));
+    CHECK(result["capabilities"].contains("tools"));
+    CHECK(result["capabilities"].contains("resources"));
+    CHECK(result["capabilities"].contains("prompts"));
+}
+
+// ── 2. ping ─────────────────────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"ping","id":2})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["jsonrpc"] == "2.0");
+    CHECK(body["id"] == 2);
+    CHECK(body["result"].empty()); // {}
+}
+
+// ── 3. tools/list — verify 22 tools ─────────────────────────────────────────
+
+TEST_CASE("MCP Integration: tools/list returns 22 tools", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":3})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& result = body["result"];
+    REQUIRE(result.contains("tools"));
+    auto& tools = result["tools"];
+    REQUIRE(tools.is_array());
+    CHECK(tools.size() == 22);
+
+    // Verify each tool has required fields
+    for (const auto& tool : tools) {
+        CHECK(tool.contains("name"));
+        CHECK(tool["name"].is_string());
+        CHECK(tool.contains("inputSchema"));
+        CHECK(tool["inputSchema"].is_object());
+        CHECK(tool["inputSchema"].contains("type"));
+    }
+
+    // Spot-check specific tool names are present
+    std::vector<std::string> expected_names = {
+        "list_agents", "get_agent_details", "query_audit_log",
+        "list_definitions", "get_definition", "query_responses",
+        "validate_scope", "preview_scope_targets", "list_pending_approvals"
+    };
+    for (const auto& name : expected_names) {
+        bool found = false;
+        for (const auto& tool : tools) {
+            if (tool["name"] == name) { found = true; break; }
+        }
+        CHECK(found);
+    }
+}
+
+// ── 4. tools/call with list_agents — verify mock agent data ─────────────────
+
+TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["jsonrpc"] == "2.0");
+    CHECK(body["id"] == 4);
+    REQUIRE(body.contains("result"));
+
+    auto& result = body["result"];
+    REQUIRE(result.contains("content"));
+    REQUIRE(result["content"].is_array());
+    REQUIRE(result["content"].size() >= 1);
+
+    // The content[0].text is a JSON-encoded array of agents
+    auto& content_item = result["content"][0];
+    CHECK(content_item["type"] == "text");
+    auto agents = nlohmann::json::parse(content_item["text"].get<std::string>());
+    REQUIRE(agents.is_array());
+    CHECK(agents.size() == 2);
+    CHECK(agents[0]["agent_id"] == "agent-001");
+    CHECK(agents[0]["hostname"] == "web-01");
+    CHECK(agents[1]["agent_id"] == "agent-002");
+    CHECK(agents[1]["os"] == "windows");
+
+    // Verify audit was recorded
+    REQUIRE(ts.audit_log.size() >= 1);
+    CHECK(ts.audit_log.back() == "mcp.list_agents|success");
+}
+
+// ── 5. tools/call with unknown tool — kMethodNotFound ───────────────────────
+
+TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"nonexistent_tool"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["jsonrpc"] == "2.0");
+    CHECK(body["id"] == 5);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kMethodNotFound);
+    CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") != std::string::npos);
+    CHECK(!body.contains("result"));
+}
+
+// ── 6. Tier denied — readonly tier blocks a read on a tool that needs stores ─
+
+TEST_CASE("MCP Integration: tier denied for unknown tier", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start("bogus_tier");
+
+    // With a bogus tier, tier_allows() returns false for everything
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+}
+
+// ── 7. Unauthenticated — auth_fn returns nullopt, verify 401 ────────────────
+
+TEST_CASE("MCP Integration: unauthenticated returns 401", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+    ts.mock_auth_enabled = false;
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"ping","id":7})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+}
+
+// ── 8. Notification (no id) — verify 204 response ──────────────────────────
+
+TEST_CASE("MCP Integration: notification returns 204", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    // A JSON-RPC notification has no "id" field
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"notifications/initialized"})");
+    REQUIRE(res);
+    CHECK(res->status == 204);
+}
+
+// ── 9. Invalid JSON — verify parse error ────────────────────────────────────
+
+TEST_CASE("MCP Integration: invalid JSON returns parse error", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call("{not valid json at all!}}}");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["jsonrpc"] == "2.0");
+    CHECK(body["id"].is_null());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kParseError);
+}
+
+// ── 10. resources/list — verify resource count ──────────────────────────────
+
+TEST_CASE("MCP Integration: resources/list returns 3 resources", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"resources/list","id":10})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& result = body["result"];
+    REQUIRE(result.contains("resources"));
+    auto& resources = result["resources"];
+    REQUIRE(resources.is_array());
+    CHECK(resources.size() == 3);
+
+    // Each resource should have uri, name, description, mimeType
+    for (const auto& r : resources) {
+        CHECK(r.contains("uri"));
+        CHECK(r.contains("name"));
+        CHECK(r.contains("description"));
+        CHECK(r.contains("mimeType"));
+    }
+}
+
+// ── 11. Unknown method — verify kMethodNotFound ─────────────────────────────
+
+TEST_CASE("MCP Integration: unknown method returns MethodNotFound", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"completions/list","id":11})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kMethodNotFound);
+    CHECK(body["error"]["message"].get<std::string>().find("completions/list") != std::string::npos);
+}
+
+// ── 12. readonly tier allows list_agents (read) ─────────────────────────────
+
+TEST_CASE("MCP Integration: readonly tier allows read tools", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"list_agents"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    // Should succeed — readonly can read Infrastructure
+    REQUIRE(body.contains("result"));
+    CHECK(!body.contains("error"));
+}
+
+// ── 13. prompts/list — verify prompt count ──────────────────────────────────
+
+TEST_CASE("MCP Integration: prompts/list returns prompts", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"prompts/list","id":13})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& result = body["result"];
+    REQUIRE(result.contains("prompts"));
+    auto& prompts = result["prompts"];
+    REQUIRE(prompts.is_array());
+    CHECK(prompts.size() == 4);
+
+    // Check each prompt has name, description, arguments
+    for (const auto& p : prompts) {
+        CHECK(p.contains("name"));
+        CHECK(p.contains("description"));
+        CHECK(p.contains("arguments"));
+    }
+}
+
+// ── 14. validate_scope tool via HTTP ────────────────────────────────────────
+
+TEST_CASE("MCP Integration: tools/call validate_scope", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    // Valid scope expression
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"validate_scope","arguments":{"expression":"os == \"linux\""}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["valid"] == true);
+}
+
+// ── 15. validate_scope with invalid expression ──────────────────────────────
+
+TEST_CASE("MCP Integration: tools/call validate_scope invalid expression", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":15,"params":{"name":"validate_scope","arguments":{"expression":"==== broken"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["valid"] == false);
+    CHECK(text.contains("error"));
+}
+
+// ── 16. Missing jsonrpc version field through HTTP ──────────────────────────
+
+TEST_CASE("MCP Integration: missing jsonrpc field returns InvalidRequest", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"method":"ping","id":16})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidRequest);
+}
+
+// ── 17. String id preserved in response ─────────────────────────────────────
+
+TEST_CASE("MCP Integration: string id preserved in response", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"ping","id":"request-abc-123"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["id"] == "request-abc-123");
+}
+
+// ── 18. Content-Type header is application/json ─────────────────────────────
+
+TEST_CASE("MCP Integration: response Content-Type is application/json", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"ping","id":18})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // httplib normalizes header names to lowercase
+    auto ct = res->get_header_value("Content-Type");
+    CHECK(ct.find("application/json") != std::string::npos);
+}
+
+// ── 19. get_agent_details via HTTP ──────────────────────────────────────────
+
+TEST_CASE("MCP Integration: tools/call get_agent_details", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":19,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["agent_id"] == "agent-001");
+    CHECK(text["hostname"] == "web-01");
+    CHECK(text["os"] == "linux");
+}
+
+// ── 20. get_agent_details with unknown agent ────────────────────────────────
+
+TEST_CASE("MCP Integration: tools/call get_agent_details unknown agent", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"get_agent_details","arguments":{"agent_id":"no-such-agent"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("no-such-agent") != std::string::npos);
+}
+
+// ── 21. preview_scope_targets via HTTP ──────────────────────────────────────
+
+TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"preview_scope_targets","arguments":{"expression":"os == \"linux\""}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["expression"] == "os == \"linux\"");
+    CHECK(text["matched_count"] == 1);
+    REQUIRE(text["matched_agents"].is_array());
+    CHECK(text["matched_agents"][0] == "agent-001");
+}
+
+// ── 22. Multiple sequential requests on same server ─────────────────────────
+
+TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    // Request 1: initialize
+    auto r1 = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":100})");
+    REQUIRE(r1);
+    CHECK(r1->status == 200);
+    auto b1 = nlohmann::json::parse(r1->body);
+    CHECK(b1.contains("result"));
+
+    // Request 2: ping
+    auto r2 = ts.call(R"({"jsonrpc":"2.0","method":"ping","id":101})");
+    REQUIRE(r2);
+    CHECK(r2->status == 200);
+
+    // Request 3: tools/list
+    auto r3 = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":102})");
+    REQUIRE(r3);
+    CHECK(r3->status == 200);
+    auto b3 = nlohmann::json::parse(r3->body);
+    CHECK(b3["result"]["tools"].size() == 22);
+
+    // Request 4: tools/call
+    auto r4 = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":103,"params":{"name":"list_agents"}})");
+    REQUIRE(r4);
+    CHECK(r4->status == 200);
+    auto b4 = nlohmann::json::parse(r4->body);
+    CHECK(b4.contains("result"));
 }

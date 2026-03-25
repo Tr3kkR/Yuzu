@@ -393,6 +393,22 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── MCP (AI Integration) ────────────────────────── -->
+    <div class="section">
+      <div class="section-header">MCP (AI Integration)</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+          Model Context Protocol endpoint for AI-driven fleet management. MCP allows AI models to query agents, check compliance, and manage your fleet through a secure JSON-RPC interface.
+        </p>
+        <div id="mcp-section"
+             hx-get="/fragments/settings/mcp"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color:#484f58">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Vulnerability Management ───────────────────────── -->
     <div class="section">
       <div class="section-header">Vulnerability Management</div>

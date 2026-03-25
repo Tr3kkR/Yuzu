@@ -27,6 +27,7 @@ All `curl` examples assume a running Yuzu server at `http://localhost:8080` and 
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
+| [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
 | [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, and production hardening |
 
 ### Operations Guides
