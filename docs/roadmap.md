@@ -79,6 +79,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.17 | [#217](https://github.com/Tr3kkR/Yuzu/issues/217) | Inventory Table Enumeration and Item Lookup | Done |
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
+| | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
 
 ## Current Status
 
@@ -91,8 +92,8 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 4: Agent Infrastructure | 8 | 0 | 8 | 100% |
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
-| 7: Scale & Integration | 19 | 0 | 19 | 100% |
-| **Total** | **71** | **0** | **71** | **100%** |
+| 7: Scale & Integration | 20 | 0 | 20 | 100% |
+| **Total** | **72** | **0** | **72** | **100%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -870,6 +871,14 @@ Discover unmanaged endpoints via agent-assisted subnet scanning (ARP, mDNS, ICMP
 
 **Files:** New `agents/plugins/discovery/`, new `server/core/src/device_discovery.cpp`, `server/core/src/server.cpp`
 
+### Issue 7.20: MCP Server (Model Context Protocol) Phase 1 :white_check_mark:
+**Capabilities:** 24.8, 24.9, 24.10 | **Scope:** Server | **Status:** Done
+**Depends on:** 3.3, 3.5
+
+Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status and investigate endpoints. Phase 1 delivers 22 read-only tools, 3 resources, and 4 prompts. Three authorization tiers (readonly, operator, supervised) enforced before RBAC. MCP tokens use the existing API token system with an `mcp_tier` column and mandatory expiration (max 90 days). Kill switch: `--mcp-disable`, `--mcp-read-only`. Settings UI section with enable/disable and read-only toggles. Audit logging on every tool call (`action: "mcp.<tool_name>"`).
+
+**Files:** `server/core/src/mcp_server.hpp`, `server/core/src/mcp_server.cpp`, `server/core/src/mcp_jsonrpc.hpp`, `server/core/src/mcp_policy.hpp`, `server/core/src/server.cpp`, `server/core/src/settings_ui.cpp`
+
 ---
 
 ## Future Phase (T3 Items — Not Scheduled)
@@ -948,7 +957,8 @@ Phase 7 (Scale & Integration)
   ├── 7.9 Product Packs ── requires Phase 2.1 (Instruction Definitions)
   ├── 7.13 Pack Trust Chain ── requires 7.9 Product Packs
   ├── 7.14 Workflows ────── requires 2.5 Hierarchies + 2.12 Result Envelope
-  └── 7.18 Device Discovery ── complements 7.7 Agent Deployment Jobs
+  ├── 7.18 Device Discovery ── complements 7.7 Agent Deployment Jobs
+  └── 7.20 MCP Server ──────── requires 3.3 API Tokens + 3.5 REST API
 ```
 
 ---
@@ -985,9 +995,9 @@ For maximum value delivery, interleave phases based on dependencies:
 | 4: Agent Infrastructure | 7 | 14 |
 | 5: Policy Engine | 4 | 6 |
 | 6: Windows Depth | 6 | 13 |
-| 7: Scale & Integration | 12 | 21 |
-| **Total** | **56** | **95** |
+| 7: Scale & Integration | 13 | 24 |
+| **Total** | **57** | **98** |
 
-Plus 19 future-tier items tracked but not scheduled = **114 of 139** capabilities addressed.
+Plus 19 future-tier items tracked but not scheduled = **117 of 142** capabilities addressed.
 
 The remaining 25 capabilities are covered by existing "Done" implementations that need no further work.

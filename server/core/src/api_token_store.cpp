@@ -152,6 +152,12 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
         return std::unexpected("service-scoped tokens must have an expiration time");
     if (!mcp_tier.empty() && expires_at <= 0)
         return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
+    if (!mcp_tier.empty() && expires_at > 0) {
+        auto now = now_epoch();
+        constexpr int64_t k90Days = 90 * 24 * 3600;
+        if (expires_at - now > k90Days)
+            return std::unexpected("MCP token TTL cannot exceed 90 days");
+    }
 
     auto raw = generate_raw_token();
     auto hash = sha256_hex(raw);

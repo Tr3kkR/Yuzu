@@ -267,6 +267,77 @@ Returns `200 OK` with:
 
 Returns `404` if the token ID is not found.
 
+## MCP Tokens
+
+MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier` field that controls what the token holder can do through the MCP endpoint (`POST /mcp/v1/`). MCP tokens enable AI models and automation tools to interact with Yuzu's fleet management capabilities via JSON-RPC 2.0.
+
+### Authorization Tiers
+
+| Tier | Access |
+|---|---|
+| `readonly` | Read-only tools only (list agents, query audit log, check compliance, etc.) |
+| `operator` | Read-only tools + tag writes + auto-approved instruction executions |
+| `supervised` | All operations, but destructive actions require admin approval via the approval workflow |
+
+Tier enforcement happens *before* RBAC checks. Even if RBAC would permit an operation, the MCP tier can restrict it.
+
+### Creating an MCP Token
+
+MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular API tokens, with the addition of the `mcp_tier` field. MCP tokens **require** an expiration date, with a maximum lifetime of 90 days.
+
+```bash
+curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "claude-desktop-readonly",
+    "mcp_tier": "readonly",
+    "expires_at": 1750185000
+  }'
+```
+
+```json
+{
+  "data": {
+    "token": "yuzu_Ab3xK9m2...",
+    "name": "claude-desktop-readonly"
+  },
+  "meta": {
+    "api_version": "v1"
+  }
+}
+```
+
+The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.
+
+MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.
+
+### Using an MCP Token
+
+Pass the token in the `Authorization` header when making JSON-RPC 2.0 requests to the MCP endpoint:
+
+```bash
+curl -s -X POST http://localhost:8080/mcp/v1/ \
+  -H "Authorization: Bearer yuzu_Ab3xK9m2..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": { "name": "list_agents", "arguments": {} },
+    "id": 1
+  }'
+```
+
+### Server-Side Kill Switches
+
+| Flag | Description |
+|---|---|
+| `--mcp-disable` | Reject all requests to `/mcp/v1/` with an error response |
+| `--mcp-read-only` | Allow only read-only MCP tools regardless of the token's tier |
+
+### Audit
+
+Every MCP tool invocation is logged as an audit event with `action: "mcp.<tool_name>"` and includes the `mcp_tool` field on the `AuditEvent` record.
+
 ## API Reference Summary
 
 | Method | Endpoint | Auth required | Description |
@@ -279,6 +350,7 @@ Returns `404` if the token ID is not found.
 | `POST` | `/api/v1/tokens` | RBAC `ApiToken:Write` | Create a new API token |
 | `GET` | `/api/v1/tokens` | RBAC `ApiToken:Read` | List tokens owned by the authenticated user |
 | `DELETE` | `/api/v1/tokens/{id}` | RBAC `ApiToken:Delete` | Revoke (soft-delete) an API token |
+| `POST` | `/mcp/v1/` | Bearer token with MCP tier | MCP JSON-RPC 2.0 endpoint (22 read-only tools, 3 resources, 4 prompts) |
 
 ## Planned Features
 

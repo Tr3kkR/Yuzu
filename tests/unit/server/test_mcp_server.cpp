@@ -282,6 +282,23 @@ TEST_CASE("MCP Token: list includes mcp_tier", "[mcp][token]") {
     CHECK(mcp_count == 2);
 }
 
+TEST_CASE("MCP Token: 90-day max TTL enforced", "[mcp][token]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    // 91 days from now should be rejected
+    auto expires_91d = now_epoch() + 91 * 24 * 3600;
+    auto raw = store.create_token("Too Long MCP", "admin", expires_91d, "", "readonly");
+    CHECK(!raw.has_value());
+    CHECK(raw.error().find("90 days") != std::string::npos);
+
+    // 89 days from now should be accepted
+    auto expires_89d = now_epoch() + 89 * 24 * 3600;
+    auto raw_ok = store.create_token("OK MCP", "admin", expires_89d, "", "readonly");
+    CHECK(raw_ok.has_value());
+}
+
 // ── MCP audit event field ─────────────────────────────────────────────────
 
 TEST_CASE("MCP Audit: mcp_tool field on AuditEvent", "[mcp][audit]") {

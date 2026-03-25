@@ -4066,13 +4066,13 @@ private:
 
         auto tokens = api_token_store_->list_tokens();
         std::string html = "<table class=\"user-table\">"
-                           "  <thead><tr><th>ID</th><th>Name</th><th>Owner</th>"
+                           "  <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Owner</th>"
                            "  <th>Created</th><th>Expires</th><th>Last Used</th>"
                            "  <th>Status</th><th></th></tr></thead>"
                            "  <tbody>";
 
         if (tokens.empty()) {
-            html += "<tr><td colspan=\"8\" style=\"color:#484f58\">No API tokens created</td></tr>";
+            html += "<tr><td colspan=\"9\" style=\"color:#484f58\">No API tokens created</td></tr>";
         } else {
             auto now = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -4095,10 +4095,18 @@ private:
                     status_txt = "Active";
                 }
 
+                // Determine type badge
+                std::string type_text = t.mcp_tier.empty() ? "API" : "MCP";
+                std::string type_detail = t.mcp_tier.empty() ? "" : " (" + html_escape(t.mcp_tier) + ")";
+                std::string type_color = t.mcp_tier.empty() ? "#484f58" : "#8957e5";
+
                 html += "<tr><td><code>" + html_escape(t.token_id) +
                         "</code></td>"
                         "<td>" +
                         html_escape(t.name) +
+                        "</td>"
+                        "<td><span class=\"role-badge\" style=\"background:" + type_color + ";color:#fff\">" +
+                        type_text + "</span>" + type_detail +
                         "</td>"
                         "<td>" +
                         html_escape(t.principal_id) +
@@ -4145,6 +4153,15 @@ private:
                 "    <label>TTL (hours)</label>"
                 "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
                 "style=\"width:80px\">"
+                "  </div>"
+                "  <div class=\"mini-field\">"
+                "    <label>MCP Tier</label>"
+                "    <select name=\"mcp_tier\" style=\"width:120px\">"
+                "      <option value=\"\">(none — API)</option>"
+                "      <option value=\"readonly\">readonly</option>"
+                "      <option value=\"operator\">operator</option>"
+                "      <option value=\"supervised\">supervised</option>"
+                "    </select>"
                 "  </div>"
                 "  <button class=\"btn btn-primary\" type=\"submit\">Create Token</button>"
                 "</form>"
@@ -5037,9 +5054,28 @@ private:
         html += "</form>";
 
         html += "<p style=\"font-size:0.7rem;color:#484f58;margin-top:0.75rem\">"
-                "MCP authentication uses API Tokens with the MCP tier. "
-                "Create tokens in the API Tokens section above."
+                "MCP authentication uses API Tokens with an MCP tier. "
+                "Create tokens in the <strong>API Tokens</strong> section above — "
+                "select an MCP tier (readonly, operator, or supervised) from the dropdown."
                 "</p>";
+
+        // Connection quick-start
+        std::string proto = cfg_.https_enabled ? "https" : "http";
+        std::string host = cfg_.web_address == "0.0.0.0" ? "localhost" : cfg_.web_address;
+        auto port = cfg_.https_enabled ? cfg_.https_port : cfg_.web_port;
+        std::string url = proto + "://" + host + ":" + std::to_string(port) + "/mcp/v1/";
+
+        html += "<div style=\"margin-top:0.75rem;padding:0.75rem;background:#0d1117;"
+                "border:1px solid var(--border);border-radius:0.3rem\">"
+                "  <div style=\"font-size:0.7rem;color:#8b949e;margin-bottom:0.3rem;"
+                "font-weight:600\">MCP CLIENT CONNECTION</div>"
+                "  <div style=\"font-size:0.75rem;margin-bottom:0.3rem\">"
+                "    Endpoint: <code>" + html_escape(url) + "</code></div>"
+                "  <div style=\"font-size:0.7rem;color:#484f58\">"
+                "    Transport: HTTP + JSON-RPC 2.0 &nbsp;|&nbsp; "
+                "    Auth: <code>Authorization: Bearer &lt;mcp-token&gt;</code>"
+                "  </div>"
+                "</div>";
 
         return html;
     }
@@ -5581,8 +5617,9 @@ private:
                 }
 
                 if (!session) {
-                    // API calls get 401, pages get redirect
-                    if (req.path.starts_with("/api/") || req.path == "/events") {
+                    // API calls and MCP endpoint get 401 JSON, pages get redirect
+                    if (req.path.starts_with("/api/") || req.path == "/events" ||
+                        req.path.starts_with("/mcp/")) {
                         res.status = 401;
                         res.set_content(R"({"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}})", "application/json");
                     } else {
@@ -6607,10 +6644,19 @@ private:
 
             auto name = extract_form_value(req.body, "name");
             auto ttl_s = extract_form_value(req.body, "ttl_hours");
+            auto mcp_tier = extract_form_value(req.body, "mcp_tier");
 
             if (name.empty()) {
                 res.set_content(
                     "<span class=\"feedback-error\">Token name is required.</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            // Validate MCP tier value
+            if (!mcp_tier.empty() && mcp_tier != "readonly" && mcp_tier != "operator" && mcp_tier != "supervised") {
+                res.set_content(
+                    "<span class=\"feedback-error\">Invalid MCP tier. Must be readonly, operator, or supervised.</span>",
                     "text/html; charset=utf-8");
                 return;
             }
@@ -6633,7 +6679,7 @@ private:
                 }
             }
 
-            auto result = api_token_store_->create_token(name, session->username, expires_at);
+            auto result = api_token_store_->create_token(name, session->username, expires_at, {}, mcp_tier);
             if (!result) {
                 res.set_content(
                     "<span class=\"feedback-error\">" + html_escape(result.error()) + "</span>",

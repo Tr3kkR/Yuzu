@@ -28,10 +28,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [====================----------]   57/84 done   (68%)
+Advanced     [======================--------]   60/87 done   (69%)
 Future       [===-----------------------------]   2/22 done   (9%)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================--------]   92/139 done  (66%)
+Overall      [=======================-------]   96/142 done  (68%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -53,14 +53,14 @@ Overall      [======================--------]   92/139 done  (66%)
 | 15. Inventory & Data Collection | 5 | 2 | 0 | 3 |
 | 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 9 | 5 | 0 | 4 |
+| 18. Auth & Authorization | 9 | 6 | 0 | 3 |
 | 19. Device & Group Mgmt | 7 | 3 | 0 | 4 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 2 | 0 | 3 |
 | 22. System & Infrastructure | 8 | 0 | 2 | 6 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
-| 24. Integration & Extensibility | 7 | 3 | 1 | 3 |
-| **TOTAL** | **139** | **92** | **4** | **43** |
+| 24. Integration & Extensibility | 10 | 6 | 1 | 3 |
+| **TOTAL** | **142** | **96** | **4** | **42** |
 
 ---
 
@@ -764,11 +764,9 @@ Not implemented. Role applies to specific device groups only.
 
 Settings page has greyed-out AD/Entra section. Import users/groups, inherit roles from domain groups.
 
-### 18.7 Token-Based API Authentication :x: `T2`
+### 18.7 Token-Based API Authentication :white_check_mark: `T2`
 
-Web UI uses session cookies only.
-
-> **Need:** API tokens for automation and external integration.
+`ApiTokenStore` with SQLite backend. Tokens generated via `POST /api/v1/tokens` with optional expiry. Auth via `Authorization: Bearer` header or `X-Yuzu-Token` header. RBAC permissions: `ApiToken:Read`, `ApiToken:Write`, `ApiToken:Delete`. Tokens support optional `mcp_tier` field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.
 
 ### 18.8 Device Authorization Tokens :x: `T2`
 
@@ -967,6 +965,18 @@ Not implemented. CSV, JSON export of inventory and responses.
 ### 24.7 SDK Libraries for External Integrations :x: `T3`
 
 Not implemented. Client libraries wrapping the management API for third-party integration.
+
+### 24.8 MCP Server (Model Context Protocol) :white_check_mark: `T2`
+
+Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status, check compliance, and investigate agents. Phase 1: 22 read-only tools (`list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`), 3 resources (`yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`), 4 prompts (`fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`).
+
+### 24.9 MCP Authorization Tiers :white_check_mark: `T2`
+
+Three-tier authorization model enforced before RBAC: `readonly` (read-only tools), `operator` (+ tag writes, auto-approved executions), `supervised` (all operations via approval workflow). MCP tokens use existing API token system with `mcp_tier` column. Mandatory expiration (max 90 days). Kill switch: `--mcp-disable` rejects all MCP requests, `--mcp-read-only` blocks non-read tools.
+
+### 24.10 MCP Settings UI :white_check_mark: `T2`
+
+Settings page section for MCP configuration: enable/disable toggle, read-only mode toggle. API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
 
 ---
 

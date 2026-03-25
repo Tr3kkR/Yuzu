@@ -71,6 +71,7 @@ When writing new integrations, always use `/api/v1/` endpoints. If you have exis
   - [Tags (Legacy)](#tags-legacy)
   - [Analytics and NVD](#analytics-and-nvd)
   - [SSE Event Stream](#sse-event-stream)
+- [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
 - [Health](#health)
 - [Metrics](#metrics)
@@ -556,14 +557,16 @@ Create a new API token. The raw token is returned in the response and is never s
 ```json
 {
   "name": "CI Pipeline Token",
-  "expires_at": 1742385600
+  "expires_at": 1742385600,
+  "mcp_tier": "readonly"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | Yes | Human-readable label |
-| `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. |
+| `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
+| `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
 **Response (201):**
 
@@ -2057,6 +2060,124 @@ data: {"agent_id":"agent-01","hostname":"web-server-01"}
 event: command_response
 data: {"agent_id":"agent-01","command_id":"cmd-abc","status":"COMPLETED"}
 ```
+
+---
+
+## MCP (Model Context Protocol)
+
+The MCP endpoint enables AI models and automation tools to interact with Yuzu via JSON-RPC 2.0. Authentication is via Bearer token with an MCP tier. See [Authentication > MCP Tokens](authentication.md#mcp-tokens) for token creation details.
+
+#### `POST /mcp/v1/`
+
+JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
+
+**Permission:** Bearer token with `mcp_tier` set (readonly, operator, or supervised). The tier determines which tools are accessible, enforced before RBAC.
+
+**Request body (tool call):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "list_agents",
+    "arguments": {}
+  },
+  "id": 1
+}
+```
+
+**Response (success):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "[{\"agent_id\":\"abc-123\",\"hostname\":\"workstation-01\",\"os\":\"windows\",\"status\":\"online\"}]"
+      }
+    ]
+  },
+  "id": 1
+}
+```
+
+**Response (error):**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32001,
+    "message": "MCP is disabled on this server"
+  },
+  "id": 1
+}
+```
+
+**Available methods:**
+
+| Method | Description |
+|---|---|
+| `tools/list` | List available MCP tools for the current tier |
+| `tools/call` | Invoke an MCP tool by name with arguments |
+| `resources/list` | List available MCP resources |
+| `resources/read` | Read an MCP resource by URI |
+| `prompts/list` | List available MCP prompts |
+| `prompts/get` | Get a prompt template by name |
+
+**Phase 1 tools (22 read-only):**
+
+| Tool | Description |
+|---|---|
+| `list_agents` | List connected agents with status |
+| `get_agent_details` | Detailed info for a specific agent |
+| `query_audit_log` | Search audit events with filters |
+| `list_definitions` | List instruction definitions |
+| `get_definition` | Get a specific instruction definition |
+| `query_responses` | Query instruction responses |
+| `aggregate_responses` | Aggregate response data |
+| `query_inventory` | Query inventory data with filters |
+| `list_inventory_tables` | List available inventory tables |
+| `get_agent_inventory` | Get inventory for a specific agent |
+| `get_tags` | Get tags for a device |
+| `search_agents_by_tag` | Find agents matching tag criteria |
+| `list_policies` | List all policies |
+| `get_compliance_summary` | Compliance summary for a device |
+| `get_fleet_compliance` | Fleet-wide compliance overview |
+| `list_management_groups` | List management groups |
+| `get_execution_status` | Status of a specific execution |
+| `list_executions` | List recent executions |
+| `list_schedules` | List instruction schedules |
+| `validate_scope` | Validate a scope expression |
+| `preview_scope_targets` | Preview which agents match a scope |
+| `list_pending_approvals` | List pending approval requests |
+
+**Resources:**
+
+| URI | Description |
+|---|---|
+| `yuzu://server/health` | Server health status |
+| `yuzu://compliance/fleet` | Fleet-wide compliance data |
+| `yuzu://audit/recent` | Recent audit events |
+
+**Prompts:**
+
+| Name | Description |
+|---|---|
+| `fleet_overview` | Generate a fleet status overview |
+| `investigate_agent` | Investigate a specific agent |
+| `compliance_report` | Generate a compliance report |
+| `audit_investigation` | Investigate audit trail activity |
+
+**Server-side controls:**
+
+| CLI Flag | Effect |
+|---|---|
+| `--mcp-disable` | Reject all `/mcp/v1/` requests |
+| `--mcp-read-only` | Allow only read-only tools regardless of token tier |
 
 ---
 

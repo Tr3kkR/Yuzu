@@ -520,6 +520,14 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             // MCP tier check — applied before RBAC
             auto& tier = session->mcp_tier;
 
+            // Lazy-cached agent registry — fetched at most once per request.
+            // Avoids copy-by-value on every tool call (H14).
+            std::optional<nlohmann::json> cached_agents;
+            auto get_agents = [&]() -> const nlohmann::json& {
+                if (!cached_agents) cached_agents = agents_fn();
+                return *cached_agents;
+            };
+
             // Audit helper
             auto mcp_audit = [&](const std::string& result_status, const std::string& detail = {}) {
                 audit_fn(req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
@@ -588,7 +596,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read")) return;
-                auto agents = agents_fn();
+                const auto& agents = get_agents();
                 JArr arr;
                 for (const auto& a : agents) {
                     arr.add(JObj()
@@ -617,7 +625,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 }
                 // Find agent in registry
-                auto agents = agents_fn();
+                const auto& agents = get_agents();
                 JObj agent_obj;
                 bool found = false;
                 for (const auto& a : agents) {
@@ -1208,7 +1216,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     return;
                 }
                 // Evaluate against all agents
-                auto agents = agents_fn();
+                const auto& agents = get_agents();
                 JArr matching;
                 for (const auto& a : agents) {
                     auto agent_id = a.value("agent_id", "");
@@ -1218,9 +1226,9 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     attrs["hostname"] = a.value("hostname", "");
                     attrs["agent_version"] = a.value("agent_version", "");
                     if (tag_store) {
-                        auto tags = tag_store->get_all_tags(agent_id);
-                        for (const auto& t : tags)
-                            attrs["tag:" + t.key] = t.value;
+                        auto tag_map = tag_store->get_tag_map(agent_id);
+                        for (const auto& [k, v] : tag_map)
+                            attrs["tag:" + k] = v;
                     }
                     auto resolver = [&](std::string_view attr) -> std::string {
                         auto it = attrs.find(std::string(attr));
