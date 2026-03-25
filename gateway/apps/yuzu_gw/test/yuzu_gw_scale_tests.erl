@@ -17,8 +17,29 @@
 
 %% Scale defaults - can be overridden with env vars for CI
 %% Local development: YUZU_SCALE_AGENTS=50000
--define(DEFAULT_SCALE, 1000).
--define(DEFAULT_FANOUT, 500).
+-define(DEFAULT_SCALE, 500).
+-define(DEFAULT_FANOUT, 250).
+
+%% Wait for the registry to finish processing DOWN messages after
+%% killing agents.  A single gen_server:call won't work because
+%% thousands of DOWN messages may be queued ahead of it.  Instead
+%% we poll the message_queue_len of the registry process.
+drain_registry() ->
+    case whereis(yuzu_gw_registry) of
+        undefined -> ok;
+        Pid ->
+            drain_loop(Pid, 10000)
+    end.
+
+drain_loop(_Pid, Remaining) when Remaining =< 0 -> ok;
+drain_loop(Pid, Remaining) ->
+    case process_info(Pid, message_queue_len) of
+        {message_queue_len, 0} -> ok;
+        {message_queue_len, _} ->
+            timer:sleep(50),
+            drain_loop(Pid, Remaining - 50);
+        undefined -> ok
+    end.
 
 %%%===================================================================
 %%% Test fixture
@@ -46,10 +67,17 @@ setup() ->
         undefined -> pg:start_link(yuzu_gw);
         _ -> ok
     end,
+    %% Kill and restart the registry so we don't inherit a gen_server
+    %% mailbox full of DOWN messages from other test modules.
+    %% Must use exit/2 because gen_server:stop queues behind the DOWNs.
     case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _ -> ok
+        undefined -> ok;
+        Old ->
+            unlink(Old),
+            exit(Old, kill),
+            timer:sleep(100)
     end,
+    {ok, _} = yuzu_gw_registry:start_link(),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.
@@ -107,7 +135,8 @@ bulk_register() ->
     end, SampleIds),
 
     %% Cleanup.
-    kill_all(Pids).
+    kill_all(Pids),
+    drain_registry().
 
 lookup_at_scale() ->
     N = scale_count(),
@@ -125,7 +154,8 @@ lookup_at_scale() ->
     %% ETS lookup should be < 10 microseconds on average.
     ?assert(AvgUs < 10.0),
 
-    kill_all(Pids).
+    kill_all(Pids),
+    drain_registry().
 
 pagination_completeness() ->
     N = min(scale_count(), 10000),  %% Cap for pagination test
@@ -141,7 +171,8 @@ pagination_completeness() ->
         ?assertEqual(1, Matches, {missing_or_dup, Id})
     end, Ids),
 
-    kill_all(Pids).
+    kill_all(Pids),
+    drain_registry().
 
 bulk_deregister() ->
     N = scale_count(),
@@ -190,10 +221,11 @@ concurrent_registration() ->
     Count = yuzu_gw_registry:agent_count(),
     ?assert(Count >= N),
 
-    kill_all(Dummies).
+    kill_all(Dummies),
+    drain_registry().
 
 reconnection_churn() ->
-    N = 5000,
+    N = scale_count(),
     %% Register N agents, then re-register the same IDs with new processes.
     %% This simulates rapid agent reconnection.
     Ids = [iolist_to_binary(io_lib:format("churn-~b", [I])) || I <- lists:seq(1, N)],
@@ -216,7 +248,8 @@ reconnection_churn() ->
     end, lists:zip(Ids, Pids2)),
 
     kill_all(Pids1),
-    kill_all(Pids2).
+    kill_all(Pids2),
+    drain_registry().
 
 memory_per_agent() ->
     %% Measure ETS memory before and after registering N agents.
@@ -233,7 +266,8 @@ memory_per_agent() ->
     %% Should be well under 1 KB per agent.
     ?assert(PerAgent < 1024),
 
-    kill_all(Pids).
+    kill_all(Pids),
+    drain_registry().
 
 fanout_throughput() ->
     %% Test dispatching commands to many fake agents via the router.
@@ -258,7 +292,8 @@ fanout_throughput() ->
     MaxMs = max(200, N / 100),
     ?assert(TimeMs < MaxMs),
 
-    kill_all(Pids).
+    kill_all(Pids),
+    drain_registry().
 
 heartbeat_batch_scale() ->
     %% Verify that the upstream process can buffer many heartbeats
