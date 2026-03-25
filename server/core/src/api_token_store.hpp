@@ -20,6 +20,7 @@ struct ApiToken {
     std::string name;          // Human-readable label
     std::string principal_id;  // Username who created it
     std::string scope_service; // Non-empty = scoped to this IT service (change window token)
+    std::string mcp_tier;      // "readonly", "operator", "supervised", or "" (not MCP)
     int64_t created_at{0};
     int64_t expires_at{0}; // 0 = never
     int64_t last_used_at{0};
@@ -38,9 +39,10 @@ public:
 
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
+    /// If mcp_tier is non-empty, the token is an MCP token with the given tier.
     std::expected<std::string, std::string>
     create_token(const std::string& name, const std::string& principal_id, int64_t expires_at = 0,
-                 const std::string& scope_service = {});
+                 const std::string& scope_service = {}, const std::string& mcp_tier = {});
 
     /// Validate a raw Bearer token. Returns the ApiToken if valid and not expired/revoked.
     std::optional<ApiToken> validate_token(const std::string& raw_token);

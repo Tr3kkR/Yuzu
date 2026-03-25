@@ -94,6 +94,10 @@ struct Config {
     // Rate limiting
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
+
+    // MCP (Model Context Protocol) server
+    bool mcp_disable{false};    // Kill switch: reject all MCP requests
+    bool mcp_read_only{false};  // Restrict MCP to read-only tools only
 };
 
 /**

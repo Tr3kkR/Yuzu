@@ -25,7 +25,8 @@ struct AuditEvent {
     std::string source_ip;
     std::string user_agent;
     std::string session_id;
-    std::string result; // "success", "failure", "denied"
+    std::string result;    // "success", "failure", "denied"
+    std::string mcp_tool;  // MCP tool name if action was MCP-initiated (empty otherwise)
 };
 
 struct AuditQuery {

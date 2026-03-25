@@ -81,3 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 - Wave 8: Release hardening (schema migrations, env var config, rate limiting, log rotation, health endpoints)
+- MCP (Model Context Protocol) server embedded at `/mcp/v1/` with JSON-RPC 2.0 transport
+- 22 read-only MCP tools: list_agents, get_agent_details, query_audit_log, list_definitions, get_definition, query_responses, aggregate_responses, query_inventory, list_inventory_tables, get_agent_inventory, get_tags, search_agents_by_tag, list_policies, get_compliance_summary, get_fleet_compliance, list_management_groups, get_execution_status, list_executions, list_schedules, validate_scope, preview_scope_targets, list_pending_approvals
+- 5 MCP resources: yuzu://server/health, yuzu://agents/{id}, yuzu://definitions/{id}, yuzu://compliance/fleet, yuzu://audit/recent
+- 4 MCP prompts: fleet_overview, investigate_agent, compliance_report, audit_investigation
+- Three-tier MCP authorization model (readonly, operator, supervised) enforced before RBAC
+- MCP token support via existing API token system with mandatory expiration (max 90 days)
+- `--mcp-disable` kill switch and `--mcp-read-only` mode CLI flags (+ YUZU_MCP_DISABLE / YUZU_MCP_READ_ONLY env vars)
+- Audit trail integration for all MCP tool calls with `mcp_tool` field on AuditEvent
+- MCP unit tests covering JSON-RPC parsing, tier policy, token integration, and store interactions

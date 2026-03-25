@@ -92,7 +92,7 @@ endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true)
 nlohmann_dep    = dependency('nlohmann_json', required: true)
-cli11_dep       = dependency('CLI11',         required: true)
+cli11_dep       = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'], required: true)
 httplib_dep     = dependency('httplib', required: false)
 if not httplib_dep.found()
   httplib_dep   = dependency('cpp-httplib', required: true)

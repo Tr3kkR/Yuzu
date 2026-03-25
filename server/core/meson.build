@@ -81,6 +81,7 @@ yuzu_server_core_lib = static_library(
     'src/policy_store.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
+    'src/mcp_server.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_ui.cpp',
     'src/compliance_eval.cpp',

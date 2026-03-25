@@ -24,9 +24,10 @@ struct Session {
     std::string username;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"};    // "local", "oidc", or "api_token"
+    std::string auth_source{"local"};    // "local", "oidc", "api_token", or "mcp_token"
     std::string oidc_sub;                // OIDC subject claim (empty for local auth)
     std::string token_scope_service;     // Non-empty = token scoped to this service
+    std::string mcp_tier;                // "readonly", "operator", "supervised", or "" (not MCP)
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────

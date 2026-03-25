@@ -147,6 +147,14 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
         ->envname("YUZU_METRICS_NO_AUTH");
 
+    // MCP (Model Context Protocol) server
+    app.add_flag("--mcp-disable", cfg.mcp_disable,
+                 "Disable MCP endpoint entirely (rejects all /mcp/v1/ requests)")
+        ->envname("YUZU_MCP_DISABLE");
+    app.add_flag("--mcp-read-only", cfg.mcp_read_only,
+                 "Restrict MCP to read-only tools only (no write/execute)")
+        ->envname("YUZU_MCP_READ_ONLY");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;

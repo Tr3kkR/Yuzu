@@ -46,6 +46,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "mcp_server.hpp"
 #include "rest_api_v1.hpp"
 #include "runtime_config_store.hpp"
 #include "schedule_engine.hpp"
@@ -63,13 +64,34 @@
 #include <grpcpp/health_check_service_interface.h>
 #include <httplib.h>
 
-// httplib compat: v0.18+ moved file upload helpers to req.form (MultipartFormData)
-#if defined(CPPHTTPLIB_VERSION) && CPPHTTPLIB_VERSION_NUM >= 0x001200
-  #define YUZU_REQ_HAS_FILE(req, name)  (req).form.has_file(name)
-  #define YUZU_REQ_GET_FILE(req, name)  (req).form.get_file(name)
-#else
-  #define YUZU_REQ_HAS_FILE(req, name)  (req).has_file(name)
-  #define YUZU_REQ_GET_FILE(req, name)  (req).get_file_value(name)
+// httplib compat: v0.18+ moved file upload helpers to req.form (MultipartFormData).
+// CPPHTTPLIB_VERSION_NUM changed from int to string in v0.37+, so we detect via
+// the presence of the Request::form member instead of a preprocessor version check.
+#if __has_include(<httplib.h>)
+  // httplib 0.18+ has req.form.has_file(); older versions have req.has_file().
+  // We detect at compile time: if Request::form exists, use the new API.
+  namespace yuzu::detail {
+    template<typename T, typename = void>
+    struct has_form_member : std::false_type {};
+    template<typename T>
+    struct has_form_member<T, std::void_t<decltype(std::declval<T>().form)>> : std::true_type {};
+  }
+  template<typename Req>
+  bool yuzu_req_has_file(const Req& req, const std::string& name) {
+      if constexpr (yuzu::detail::has_form_member<Req>::value)
+          return req.form.has_file(name);
+      else
+          return req.has_file(name);
+  }
+  template<typename Req>
+  auto yuzu_req_get_file(const Req& req, const std::string& name) {
+      if constexpr (yuzu::detail::has_form_member<Req>::value)
+          return req.form.get_file(name);
+      else
+          return req.get_file_value(name);
+  }
+  #define YUZU_REQ_HAS_FILE(req, name)  yuzu_req_has_file(req, name)
+  #define YUZU_REQ_GET_FILE(req, name)  yuzu_req_get_file(req, name)
 #endif
 
 #include <nlohmann/json.hpp>
@@ -3403,8 +3425,9 @@ private:
     auth::Session synthesize_token_session(const ApiToken& api_token) {
         auth::Session synth;
         synth.username = api_token.principal_id;
-        synth.auth_source = "api_token";
+        synth.auth_source = api_token.mcp_tier.empty() ? "api_token" : "mcp_token";
         synth.token_scope_service = api_token.scope_service;
+        synth.mcp_tier = api_token.mcp_tier;
 
         // Resolve the creator's actual legacy role (not unconditional admin)
         auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
@@ -10413,6 +10436,31 @@ private:
             inventory_store_.get(),
             product_pack_store_.get());
 
+        // -- Register MCP server routes ----------------------------------------
+
+        if (!cfg_.mcp_disable) {
+            mcp_server_ = std::make_unique<mcp::McpServer>();
+            mcp_server_->register_routes(
+                *web_server_,
+                [this](const httplib::Request& req, httplib::Response& res)
+                    -> std::optional<auth::Session> { return require_auth(req, res); },
+                [this](const httplib::Request& req, httplib::Response& res, const std::string& type,
+                       const std::string& op) -> bool {
+                    return require_permission(req, res, type, op);
+                },
+                [this](const httplib::Request& req, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail) {
+                    audit_log(req, action, result, target_type, target_id, detail);
+                },
+                [this]() { return registry_.to_json_obj(); },
+                rbac_store_.get(), instruction_store_.get(), execution_tracker_.get(),
+                response_store_.get(), audit_store_.get(), tag_store_.get(),
+                inventory_store_.get(), policy_store_.get(), mgmt_group_store_.get(),
+                approval_manager_.get(), schedule_engine_.get(),
+                cfg_.mcp_read_only);
+        }
+
         // -- Listen -----------------------------------------------------------
 
         if (cfg_.web_address == "0.0.0.0" || cfg_.web_address == "::") {
@@ -10602,6 +10650,7 @@ private:
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
+    std::unique_ptr<mcp::McpServer> mcp_server_;
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
