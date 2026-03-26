@@ -224,6 +224,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
                    "Entra group object ID that maps to admin role")
         ->envname("YUZU_OIDC_ADMIN_GROUP");
+    app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
+                 "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
+        ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,

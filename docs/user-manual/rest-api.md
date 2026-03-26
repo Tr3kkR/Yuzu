@@ -1770,6 +1770,8 @@ Get the status of a running or completed workflow execution, including per-step 
 
 - **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
 
+> **Note:** Reboot orchestration requires the Yuzu agent to run with root (Linux/macOS) or Administrator (Windows) privileges. If the agent lacks these privileges, the reboot command will fail silently; the patch installation itself will still succeed.
+
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
@@ -2268,18 +2270,17 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "pending": 3
   },
   "stores": {
-    "response_store": "ok",
-    "audit_store": "ok",
-    "tag_store": "ok",
-    "policy_store": "ok",
-    "custom_properties_store": "ok"
+    "responses": "ok",
+    "audit": "ok",
+    "instructions": "ok",
+    "policies": "ok"
   },
   "executions": {
     "in_flight": 5,
     "completed_last_hour": 120,
     "failed_last_hour": 2
   },
-  "version": "0.9.0"
+  "version": "0.1.0"
 }
 ```
 
@@ -2296,6 +2297,32 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `version` | string | Server binary version |
 
 The endpoint returns HTTP `200` when healthy and HTTP `503` when degraded.
+
+**Authenticated response:**
+
+When the request includes a valid session cookie, `Authorization: Bearer <token>`, or `X-Yuzu-Token` header, the response includes an additional `system` object with process health telemetry:
+
+```json
+{
+  "system": {
+    "cpu_percent": 12.5,
+    "memory_rss_bytes": 134217728,
+    "memory_vss_bytes": 536870912,
+    "grpc_connections": 42,
+    "command_queue_depth": 5
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `system.cpu_percent` | float | Server process CPU usage percentage |
+| `system.memory_rss_bytes` | integer | Resident set size in bytes |
+| `system.memory_vss_bytes` | integer | Virtual memory size in bytes |
+| `system.grpc_connections` | integer | Number of connected agent gRPC streams |
+| `system.command_queue_depth` | integer | Number of in-flight command executions |
+
+This object is omitted for unauthenticated callers to avoid exposing process internals.
 
 ---
 
@@ -2341,5 +2368,32 @@ yuzu_server_management_groups_total 5
 # TYPE yuzu_server_group_members_total gauge
 yuzu_server_group_members_total 42
 ```
+
+**Process health metrics:**
+
+```
+# HELP yuzu_server_cpu_usage_percent Server process CPU usage percentage
+# TYPE yuzu_server_cpu_usage_percent gauge
+yuzu_server_cpu_usage_percent 12.5
+
+# HELP yuzu_server_memory_bytes Server process memory usage in bytes
+# TYPE yuzu_server_memory_bytes gauge
+yuzu_server_memory_bytes{type="rss"} 134217728
+yuzu_server_memory_bytes{type="vss"} 536870912
+
+# HELP yuzu_server_open_connections Number of connected gRPC agent streams
+# TYPE yuzu_server_open_connections gauge
+yuzu_server_open_connections 42
+
+# HELP yuzu_server_command_queue_depth Number of in-flight command executions
+# TYPE yuzu_server_command_queue_depth gauge
+yuzu_server_command_queue_depth 5
+
+# HELP yuzu_server_uptime_seconds Server process uptime in seconds
+# TYPE yuzu_server_uptime_seconds gauge
+yuzu_server_uptime_seconds 86400
+```
+
+> **Note:** Process health metrics (CPU, memory, connections, queue depth) are exposed on `/metrics` for all callers. When `--metrics-no-auth` is enabled, this data is accessible to unauthenticated remote clients.
 
 All server metrics use the `yuzu_server_` prefix. Standard labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.

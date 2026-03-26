@@ -81,6 +81,8 @@ if build_server
       'unit/server/test_rate_limiter.cpp',
       'unit/server/test_cert_reloader.cpp',
       'unit/server/test_mcp_server.cpp',
+      'unit/server/test_process_health.cpp',
+      'unit/server/test_patch_manager.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

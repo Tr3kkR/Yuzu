@@ -26,7 +26,7 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 }
 
 std::string gen_id() {
-    static std::mt19937_64 rng(std::random_device{}());
+    thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist;
     auto hi = dist(rng);
     auto lo = dist(rng);
@@ -289,6 +289,19 @@ PatchManager::deploy_patch(const std::string& kb_id,
                            const std::string& created_by,
                            int reboot_delay_seconds,
                            int64_t reboot_at) {
+    return deploy_patch({kb_id, agent_ids, reboot_if_needed, created_by,
+                         reboot_delay_seconds, reboot_at});
+}
+
+std::expected<std::string, std::string>
+PatchManager::deploy_patch(const DeploymentRequest& req) {
+    const auto& kb_id = req.kb_id;
+    const auto& agent_ids = req.agent_ids;
+    bool reboot_if_needed = req.reboot_if_needed;
+    const auto& created_by = req.created_by;
+    int reboot_delay_seconds = req.reboot_delay_seconds;
+    int64_t reboot_at = req.reboot_at;
+
     if (kb_id.empty())
         return std::unexpected("kb_id is required");
 
@@ -393,6 +406,14 @@ PatchManager::execute_deployment(const std::string& deployment_id,
     if (!dispatch_fn)
         return std::unexpected("no dispatch function provided");
 
+    // Defense-in-depth: validate kb_id format before constructing shell commands
+    static const std::regex kb_re(R"(^KB\d{4,10}$)");
+    if (!std::regex_match(depl->kb_id, kb_re)) {
+        spdlog::error("PatchManager: deployment {} has invalid kb_id '{}'",
+                       deployment_id, depl->kb_id);
+        return std::unexpected("invalid kb_id format");
+    }
+
     update_deployment_status(deployment_id, "scanning");
 
     // Workflow for each target:
@@ -401,6 +422,9 @@ PatchManager::execute_deployment(const std::string& deployment_id,
     // Step 3: Verify installation (windows_updates.installed)
     // Step 4: Reboot if needed (script_exec.run with reboot command)
 
+    // TODO: Parallelize target dispatch (thread pool or std::async with
+    // concurrency limit) before wiring to REST API. Sequential dispatch
+    // does not scale beyond ~10 targets.
     for (const auto& target : depl->targets) {
         if (target.status == "completed" || target.status == "failed")
             continue;
@@ -452,32 +476,38 @@ PatchManager::execute_deployment(const std::string& deployment_id,
                 {"reboot", depl->reboot_if_needed}
             };
 
-            // Use script_exec to run Windows Update installation
-            // The script will search for and install the specified KB
-            std::string install_script;
-#ifdef _WIN32
-            install_script =
-                "$criteria = 'IsInstalled=0 and Type=\\'Software\\'';"
-                "$searcher = (New-Object -ComObject Microsoft.Update.Searcher);"
-                "$results = $searcher.Search($criteria);"
-                "foreach ($update in $results.Updates) {"
-                "  if ($update.Title -match '" + depl->kb_id + "') {"
-                "    $collection = New-Object -ComObject Microsoft.Update.UpdateColl;"
-                "    $collection.Add($update);"
-                "    $installer = New-Object -ComObject Microsoft.Update.Installer;"
-                "    $installer.Updates = $collection;"
-                "    $result = $installer.Install();"
-                "    Write-Output \"Install result: $($result.ResultCode)\";"
-                "  }"
-                "}";
-#else
-            install_script = "echo 'Windows Update installation not supported on this platform'";
-#endif
-            nlohmann::json exec_params = {
-                {"command", "powershell"},
-                {"args", "-NoProfile -ExecutionPolicy Bypass -Command \"" + install_script + "\""},
-                {"timeout", "600"}
-            };
+            // Use script_exec to run installation — select script by agent OS at
+            // runtime (not server compile-time) so a Linux server can deploy
+            // Windows patches to Windows agents.
+            std::string agent_os = os_lookup ? os_lookup(agent_id) : "";
+            nlohmann::json exec_params;
+            if (agent_os == "windows") {
+                std::string install_script =
+                    "$criteria = 'IsInstalled=0 and Type=\\'Software\\'';"
+                    "$searcher = (New-Object -ComObject Microsoft.Update.Searcher);"
+                    "$results = $searcher.Search($criteria);"
+                    "foreach ($update in $results.Updates) {"
+                    "  if ($update.Title -match '" + depl->kb_id + "') {"
+                    "    $collection = New-Object -ComObject Microsoft.Update.UpdateColl;"
+                    "    $collection.Add($update);"
+                    "    $installer = New-Object -ComObject Microsoft.Update.Installer;"
+                    "    $installer.Updates = $collection;"
+                    "    $result = $installer.Install();"
+                    "    Write-Output \"Install result: $($result.ResultCode)\";"
+                    "  }"
+                    "}";
+                exec_params = {
+                    {"command", "powershell"},
+                    {"args", "-NoProfile -ExecutionPolicy Bypass -Command \"" + install_script + "\""},
+                    {"timeout", "600"}
+                };
+            } else {
+                exec_params = {
+                    {"command", "echo"},
+                    {"args", "Windows Update installation not supported on this platform"},
+                    {"timeout", "30"}
+                };
+            }
 
             auto result = dispatch_fn("device.script_exec.run",
                                       agent_id, exec_params.dump());
@@ -525,12 +555,16 @@ PatchManager::execute_deployment(const std::string& deployment_id,
 
         // Step 4: Reboot orchestration — notify user, then cross-platform reboot
         if (depl->reboot_if_needed) {
-            // Compute effective delay
+            // Compute effective delay — clamp int64_t BEFORE static_cast<int>
+            // to prevent overflow when reboot_at is far in the future.
             int delay_seconds = depl->reboot_delay_seconds;
             if (depl->reboot_at > 0) {
                 auto now_ts = now_epoch();
-                if (depl->reboot_at > now_ts)
-                    delay_seconds = static_cast<int>(depl->reboot_at - now_ts);
+                if (depl->reboot_at > now_ts) {
+                    int64_t diff = depl->reboot_at - now_ts;
+                    delay_seconds = static_cast<int>(
+                        std::clamp(diff, int64_t{60}, int64_t{86400}));
+                }
             }
             delay_seconds = std::clamp(delay_seconds, 60, 86400);
 
@@ -553,11 +587,18 @@ PatchManager::execute_deployment(const std::string& deployment_id,
                 spdlog::info("PatchManager: notification failed for {} (headless?): {}",
                              agent_id, notify_result.error());
             }
+            // Audit: reboot notification dispatched
+            // TODO: Wire AuditStore when execute_deployment is connected to routes
+            spdlog::info("PatchManager: audit: deployment={} agent={} action=reboot.notify delay={}s notify_ok={}",
+                         deployment_id, agent_id, delay_seconds, notify_result.has_value());
 
             // 4b: Cross-platform reboot command
             std::string os = os_lookup ? os_lookup(agent_id) : "";
             if (os.empty()) {
                 spdlog::warn("PatchManager: os_lookup not provided for {}, skipping reboot", agent_id);
+                update_target_status(deployment_id, agent_id, "completed",
+                                     "reboot skipped: unknown OS");
+                continue; // Skip reboot dispatch — target already marked completed
             }
             nlohmann::json reboot_params;
             if (os == "linux" || os == "darwin") {
@@ -581,6 +622,8 @@ PatchManager::execute_deployment(const std::string& deployment_id,
             if (!reboot_params.empty()) {
                 auto result = dispatch_fn("device.script_exec.run",
                                           agent_id, reboot_params.dump());
+                spdlog::info("PatchManager: audit: deployment={} agent={} action=reboot.command os={} delay={}s success={}",
+                             deployment_id, agent_id, os, delay_seconds, result.has_value());
                 if (!result) {
                     spdlog::warn("PatchManager: reboot command failed for {}: {}",
                                  agent_id, result.error());

@@ -85,6 +85,16 @@ using PatchDispatchFn = std::function<std::expected<std::string, std::string>(
 // Returns the OS string ("windows", "linux", "darwin") for an agent.
 using AgentOsLookupFn = std::function<std::string(const std::string& agent_id)>;
 
+/// Request struct for creating a patch deployment.
+struct DeploymentRequest {
+    std::string kb_id;                      // KB identifier (e.g., "KB5034441")
+    std::vector<std::string> agent_ids;     // Target agent IDs
+    bool reboot_if_needed{false};           // Reboot agents after patching
+    std::string created_by;                 // Principal who initiated
+    int reboot_delay_seconds{300};          // Countdown before reboot (clamped to 60-86400)
+    int64_t reboot_at{0};                   // Optional epoch timestamp for scheduled reboot (0 = use delay)
+};
+
 // ── PatchManager ─────────────────────────────────────────────────────────────
 
 class PatchManager {
@@ -116,6 +126,10 @@ public:
 
     /// Create a new patch deployment targeting specific agents.
     /// The deployment orchestrates: scan -> download -> install -> verify -> reboot.
+    std::expected<std::string, std::string>
+    deploy_patch(const DeploymentRequest& req);
+
+    // Overload preserved for backward compatibility — delegates to struct form.
     std::expected<std::string, std::string>
     deploy_patch(const std::string& kb_id,
                  const std::vector<std::string>& agent_ids,

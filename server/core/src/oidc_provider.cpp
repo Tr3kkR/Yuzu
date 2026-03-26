@@ -428,7 +428,7 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     auto client = std::make_unique<httplib::Client>(scheme + host);
     client->set_connection_timeout(10);
     client->set_read_timeout(15);
-    client->enable_server_certificate_verification(false);
+    client->enable_server_certificate_verification(!config_.skip_tls_verify);
     httplib::Headers headers;
     if (!auth_header.empty())
         headers.emplace("Authorization", "Basic " +
@@ -480,13 +480,17 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 
 OidcProvider::OidcProvider(OidcConfig config)
     : config_(std::move(config)), exchange_script_path_(config_.exchange_script) {
-    // Fetch OIDC discovery document to get the real endpoints.
-    // Skip discovery if endpoints are already configured, or if neither
-    // redirect_uri nor authorization_endpoint is set (validate-only usage,
-    // e.g. unit tests that only call validate_claims / parse_id_token).
-    if (!config_.authorization_endpoint.empty() || config_.redirect_uri.empty()) {
-        if (!config_.authorization_endpoint.empty())
-            spdlog::info("OidcProvider: using pre-configured endpoints, skipping discovery");
+    // Skip discovery if endpoints are already configured (common for Entra
+    // where we derive endpoints from the issuer pattern).
+    if (!config_.authorization_endpoint.empty()) {
+        spdlog::info("OidcProvider: using pre-configured endpoints, skipping discovery");
+        spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
+        return;
+    }
+    // Skip discovery for validate-only usage (unit tests that only call
+    // validate_claims / parse_id_token — no redirect_uri means no flow).
+    if (config_.redirect_uri.empty()) {
+        spdlog::info("OidcProvider: no redirect_uri configured, skipping discovery (validate-only)");
         spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
         return;
     }
@@ -516,7 +520,7 @@ OidcProvider::OidcProvider(OidcConfig config)
         auto client = std::make_unique<httplib::Client>(scheme + host);
         client->set_connection_timeout(5);
         client->set_read_timeout(5);
-        client->enable_server_certificate_verification(false);
+        client->enable_server_certificate_verification(!config_.skip_tls_verify);
 
         auto result = client->Get(path);
 

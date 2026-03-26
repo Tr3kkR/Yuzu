@@ -332,7 +332,8 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     {
         bool found = false;
         auto running = run_command("uname -r");
-        auto latest = run_command("ls /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1");
+        // Use ls -t (sort by mtime) instead of sort -V for portability (busybox/Alpine)
+        auto latest = run_command("ls -t /boot/vmlinuz-* 2>/dev/null | head -1");
         if (!latest.empty()) {
             // Strip "vmlinuz-" prefix and path
             auto pos = latest.rfind("vmlinuz-");
@@ -362,6 +363,9 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
     // Check: softwareupdate -l output containing "restart"
+    // NOTE: softwareupdate -l contacts Apple servers and may take 30-120s.
+    // run_command() uses popen() with no timeout — may block on headless/offline Macs.
+    // TODO: Consider timeout wrapper or checking /Library/Updates/ for cached state.
     {
         bool found = false;
         auto lines = run_command_lines("softwareupdate -l 2>/dev/null");
@@ -381,7 +385,7 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     }
 
 #else
-    ctx.write_output("error|platform not supported");
+    ctx.write_output("error|false|platform not supported");
     return 0;
 #endif
 

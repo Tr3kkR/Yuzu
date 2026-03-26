@@ -92,6 +92,11 @@ void ExecutionTracker::create_tables() {
         );
     )";
     sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
+
+    // Index for status-based queries (used every 15s for metrics)
+    sqlite3_exec(db_,
+        "CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);",
+        nullptr, nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------

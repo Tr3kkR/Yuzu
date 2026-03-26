@@ -18,6 +18,7 @@ struct OidcConfig {
     std::string token_endpoint;
     std::string exchange_script; // Path to oidc_token_exchange.py
     std::string admin_group_id;  // Entra group ID that maps to admin role
+    bool skip_tls_verify{false}; // Disable TLS cert verification (insecure, dev only)
 
     bool is_enabled() const { return !issuer.empty() && !client_id.empty(); }
 };

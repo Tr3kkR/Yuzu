@@ -370,7 +370,7 @@ Can execute scripts, but no managed software deployment workflow.
 
 `windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
 
-### 8.2 Pending Update Detection :white_check_mark: `T1`
+### 8.2 Pending Reboot Detection :white_check_mark: `T1`
 
 `windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
 Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),

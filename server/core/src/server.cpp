@@ -2656,6 +2656,9 @@ public:
             oidc_cfg.client_secret = cfg_.oidc_client_secret;
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
+            oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            if (cfg_.oidc_skip_tls_verify)
+                spdlog::warn("OIDC TLS certificate verification DISABLED — do not use in production");
             // Fallback endpoints for Entra ID — OidcProvider constructor will
             // override from the OIDC discovery document if reachable.
             // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
