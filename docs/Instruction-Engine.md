@@ -59,7 +59,7 @@ This document is the architectural blueprint for that work.
 | **TagStore** | `tag_store.hpp` | **Real** | SQLite-backed. `DeviceTag` with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). `agents_with_tag` for scope queries. |
 | **Instruction UI** | `instruction_ui.cpp` | **Real** | HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via `hx-get`. Dark theme consistent with dashboard. |
 
-**Overall progress:** 44/139 capabilities done (32%). Phases 0, 1, and 2 complete. Phase 2 business logic fully implemented.
+**Overall progress:** 96/142 capabilities done (68%). All 7 phases complete (72/72 issues). Instruction engine fully implemented.
 
 ---
 
@@ -1449,5 +1449,5 @@ This document is grounded in the following implementation files:
 | `sdk/include/yuzu/plugin.h` | Plugin ABI v1, command handler signature |
 | `proto/yuzu/agent/v1/agent.proto` | CommandRequest/Response, RegisterRequest, AgentInfo |
 | `proto/yuzu/common/v1/common.proto` | ScopeExpression, ErrorDetail, Platform, PluginInfo |
-| `docs/capability-map.md` | 139 capabilities, 30 done (22%) |
-| `docs/roadmap.md` | 56 issues across 7 phases |
+| `docs/capability-map.md` | 142 capabilities, 96 done (68%) |
+| `docs/roadmap.md` | 72 issues across 7 phases (all complete) |

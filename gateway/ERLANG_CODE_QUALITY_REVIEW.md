@@ -1,5 +1,7 @@
 # Erlang Code Quality Review (current branch)
 
+> **2026-03-26 Delta:** The RC sprint (commits `4bdae88`, `73b1d65`, `c8f74fc`) addressed gateway findings C1-C3 and H12-H16 from the RC assessment. Specific resolutions: TLS for upstream gRPC (finding 1 context), health endpoints added, circuit breaker with backoff, command duration metrics now calculated (finding 6), pg:start_link safety (finding 7), graceful shutdown, and .appup files. Findings 2 (persistent_term), 3 (unbounded spawn), 4 (error tuple shape), and 5 (hostname field) should be re-evaluated against current code.
+
 ## Scope
 Reviewed all Erlang modules under `apps/yuzu_gw/src` for architecture, OTP usage, correctness risks, and operability.
 

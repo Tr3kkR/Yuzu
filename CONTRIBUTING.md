@@ -22,8 +22,26 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the target feature se
 
 - `feature/<short-description>` for new functionality
 - `fix/<short-description>` for bug fixes
+- `fix/<finding-id>-<short-description>` for RC sprint findings (e.g., `fix/C1-gateway-tls`)
 
 Branch from `main`. Keep branches focused on a single change.
+
+## Erlang Gateway
+
+The gateway (`gateway/`) is a standalone rebar3 project using Erlang/OTP. See `docs/erlang-gateway-blueprint.md` for the architecture.
+
+- Run EUnit tests: `cd gateway && rebar3 eunit`
+- Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test`
+- Always pass `--dir apps/yuzu_gw/test` with `--suite` flags
+- Review all Erlang changes with the erlang-dev agent (`.claude/agents/erlang-dev.md`)
+
+## MCP Server
+
+The MCP server is embedded in the C++ server at `POST /mcp/v1/`. Changes to MCP tools, resources, or prompts are in `server/core/src/mcp_server.hpp` / `mcp_server.cpp`. Tests are in `tests/unit/server/test_mcp_server.cpp`.
+
+## Governance
+
+All code changes follow mandatory governance gates defined in `CLAUDE.md`. In summary: change summary, security + docs deep-dive, domain-triggered review, all findings addressed before merge. See the Agent Team section in CLAUDE.md for the full workflow.
 
 ## Pull Request Process
 

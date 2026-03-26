@@ -208,6 +208,32 @@ integration-test:
       run: ./scripts/integration-test.sh --agents 5
 ```
 
+## Gateway Python Test Suite
+
+The `test_gateway.py` script (`scripts/test_gateway.py` or `gateway/test_gateway.py`) provides a Python-based gateway test harness that cleans stale beam files and runs a minimized performance suite suitable for CI:
+
+```bash
+python3 test_gateway.py
+```
+
+This was added to complement the shell-based integration test with more granular gateway-specific validation.
+
+## MCP Integration Testing
+
+The MCP server is tested at the unit level via `tests/unit/server/test_mcp_server.cpp` (JSON-RPC parsing, tier policy, token integration, tool dispatch). For manual integration testing:
+
+```bash
+# Create an MCP token
+curl -X POST http://localhost:8080/api/v1/tokens \
+  -H "Cookie: $COOKIE" \
+  -d '{"name":"mcp-test","mcp_tier":"readonly","expires_in_days":7}'
+
+# Call MCP endpoint
+curl -X POST http://localhost:8080/mcp/v1/ \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_agents","arguments":{}},"id":1}'
+```
+
 ## Adding New Tests
 
 ### Shell tests

@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Agent
 - Plugin architecture with stable C ABI (version 2, min 1) and C++ CRTP wrapper
-- 29 plugins: hardware, network, security, filesystem, registry, WMI, WiFi, WoL, and more
+- 44 plugins: hardware, network, security, filesystem, registry, WMI, WiFi, WoL, and more
 - Trigger engine: interval, file_change, service_status, event_log, registry_change, startup
 - Agent-side key-value storage (SQLite-backed, per-plugin namespaces)
 - HTTP client plugin (cpp-httplib, no shell) with SSRF protection
@@ -90,3 +90,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--mcp-disable` kill switch and `--mcp-read-only` mode CLI flags (+ YUZU_MCP_DISABLE / YUZU_MCP_READ_ONLY env vars)
 - Audit trail integration for all MCP tool calls with `mcp_tool` field on AuditEvent
 - MCP unit tests covering JSON-RPC parsing, tier policy, token integration, and store interactions
+
+### Fixed (RC Sprint — 52 findings resolved)
+
+#### Security (CRITICAL + HIGH)
+- Gateway now uses TLS for upstream gRPC connections (was plaintext)
+- Gateway health/readiness endpoints (`/healthz`, gRPC Health Check)
+- Gateway circuit breaker with exponential backoff for upstream failures
+- AnalyticsEventStore thread safety — mutex protection on query methods
+- Proto codegen reproducibility — protoc version validation
+- Web UI binds to `127.0.0.1` by default (was `0.0.0.0`)
+- HTTPS enabled by default — operators must provide cert/key or use `--no-https`
+- `/metrics` requires authentication for remote access (localhost exempt, `--metrics-no-auth` override)
+- Private key file permission validation on Unix (refuses group/others-readable)
+- Certificate hot-reload with PEM validation, cert/key match, and permission checks
+- CORS headers on all `/api/` endpoints via `set_post_routing_handler`
+
+#### Server
+- REST API unit test suite (previously 0 tests for 1,355 LOC, 31+ endpoints)
+- JSON error envelope on all error responses: `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}`
+- Health probe contract: `/livez` and `/readyz` return `{"status":"..."}`
+
+#### Gateway
+- Command duration metrics (was hard-coded to 0)
+- Backpressure alerting for agent send buffer
+- grpcbox dependency pinned
+- Graceful shutdown with in-flight command draining
+- .appup files for hot code upgrades
+
+#### Build & Packaging
+- Binary signing for Windows (Authenticode) and macOS (codesign + notarization)
+- Sanitizer CI jobs (ASan+UBSan, TSan)
+- Release workflow artifact validation with SHA256 checksums
+- deb/rpm package integration
+- Docker health checks in all 3 Dockerfiles
+- Docker base images pinned to sha256 digests
+- buf lint + breaking change CI job for proto compatibility
+
+#### Agent & Plugins
+- Agent UUID generation uses CSPRNG (RAND_bytes/BCryptGenRandom, was Mersenne Twister)
+- Plugin ABI runtime version check — sdk_version field, ABI v3
+- OIDC client secret moved to Authorization: Basic header (RFC 6749 §2.3.1)
+
+#### Build Hardening
+- Compiler hardening flags: `_FORTIFY_SOURCE=2`, `-fstack-protector-strong`, full RELRO, PIE
+- MSVC `/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT` for ASLR + DEP
+
+#### Documentation
+- macOS x64 limitation documented in README and user manual
+- cliff.toml added for git-cliff changelog automation

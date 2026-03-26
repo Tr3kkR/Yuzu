@@ -2,7 +2,7 @@
 
 Yuzu is an enterprise endpoint management platform -- a single control plane for querying, commanding, patching, and enforcing compliance on Windows, Linux, and macOS fleets in real time. This manual covers day-to-day operations for administrators and operators.
 
-All `curl` examples assume a running Yuzu server at `http://localhost:8080` and an active admin session cookie in `$COOKIE`. Replace with your session token or API token as appropriate.
+All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HTTPS is enabled by default) and an active admin session cookie in `$COOKIE`. Replace with your session token or API token as appropriate. For development without TLS, start the server with `--no-https`.
 
 ---
 
@@ -66,4 +66,4 @@ All `curl` examples assume a running Yuzu server at `http://localhost:8080` and 
 - [Architecture Overview](../architecture.md) -- system design and component interactions
 - [YAML DSL Specification](../yaml-dsl-spec.md) -- formal spec for instruction definitions
 - [Roadmap](../roadmap.md) -- planned features and issue tracking
-- [Capability Map](../capability-map.md) -- 139 capabilities across 7 phases
+- [Capability Map](../capability-map.md) -- 142 capabilities across 24 domains

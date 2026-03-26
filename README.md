@@ -10,7 +10,8 @@ Yuzu gives operations and security teams a single control plane to query, comman
 - **Command orchestration** — Dispatch actions (restart a service, kill a process, deploy a package) to one device or an entire fleet, with approval workflows and scheduling.
 - **Continuous compliance** — Define desired-state policies ("BitLocker must be enabled") that agents evaluate locally on triggers (file change, service crash, interval) and auto-remediate.
 - **Security response** — Quarantine compromised devices, check indicators of compromise, inventory certificates, and collect forensic data.
-- **Plugin extensibility** — A stable C ABI means plugins can be written in any language that produces a shared library. 29 plugins ship out of the box covering hardware, network, security, software, and more.
+- **Plugin extensibility** — A stable C ABI means plugins can be written in any language that produces a shared library. 44 plugins ship out of the box covering hardware, network, security, software, and more.
+- **AI integration** — An embedded MCP (Model Context Protocol) server exposes 22 tools for AI-driven fleet querying, compliance reporting, and supervised command execution.
 
 ## Instruction Engine
 
@@ -119,7 +120,7 @@ Response data is typed (bool, int32, int64, string, datetime, CLOB) and schemati
 ```
 Yuzu/
 ├── agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
-├── agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
+├── agents/plugins/           44 plugins (hardware, network, security, filesystem, etc.)
 ├── server/core/              Server daemon (sessions, auth, dashboard, REST API)
 ├── gateway/                  Erlang/OTP gateway node (standalone rebar3 project)
 ├── sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
@@ -141,7 +142,7 @@ Yuzu/
 
 - Meson 1.9.2, Ninja
 - CMake (required by Meson's cmake dependency method)
-- C++23 compiler: GCC 13+, Clang 17+, MSVC 19.38+, or Apple Clang 15+
+- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
 
 ### Quick Start
@@ -211,7 +212,7 @@ Open `http://localhost:8080` for the web dashboard.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.
 
-See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (139 capabilities across 24 domains).
+See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (142 capabilities across 24 domains).
 
 ## License
 

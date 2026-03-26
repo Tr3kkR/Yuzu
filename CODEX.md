@@ -8,9 +8,10 @@ The goal is to build a complete endpoint management platform — real-time query
 
 ## Architecture
 
-- **Server** (`server/core/`): gRPC service + HTMX web dashboard + REST API. Manages agent sessions, dispatches commands, stores responses, evaluates policies, handles auth/RBAC.
-- **Agent** (`agents/core/`): Connects to server via gRPC. Loads plugins from a directory. Executes commands. Reports inventory. Evaluates local policy rules via trigger engine.
-- **Plugins** (`agents/plugins/*/`): Shared libraries with a stable C ABI (`sdk/include/yuzu/plugin.h`). Each plugin exports a descriptor with init/shutdown/execute callbacks.
+- **Server** (`server/core/`): gRPC service + HTMX web dashboard + REST API v1 (70+ endpoints). Manages agent sessions, dispatches commands, stores responses, evaluates policies, handles auth/RBAC. Includes MCP (Model Context Protocol) server for AI integration.
+- **Agent** (`agents/core/`): Connects to server via gRPC. Loads plugins from a directory. Executes commands. Reports inventory. Evaluates local policy rules via trigger engine. KV storage, content staging, desktop interaction.
+- **Plugins** (`agents/plugins/*/`): 44 shared-library plugins with a stable C ABI (`sdk/include/yuzu/plugin.h`). Covers hardware, network, security, filesystem, registry, WMI, processes, services, and more.
+- **Gateway** (`gateway/`): Erlang/OTP gateway node with process-per-agent supervision, heartbeat batching, consistent hash ring, and Prometheus metrics.
 - **Proto** (`proto/`): Protobuf definitions are the source of truth for the wire protocol. Three services: AgentService, ManagementService, GatewayUpstream.
 - **SDK** (`sdk/`): Stable C ABI in `plugin.h`, ergonomic C++23 wrapper in `plugin.hpp` using CRTP.
 
@@ -52,7 +53,7 @@ When adding/removing source files, update `meson.build` in the affected director
 
 ## Development Roadmap
 
-The project follows a phased roadmap (`docs/roadmap.md`) with 56 GitHub issues across 7 phases:
+The project follows a phased roadmap (`docs/roadmap.md`) with 72 GitHub issues across 7 phases (all complete):
 
 1. **Phase 0**: Foundation — HTTPS, OTA agent updates, SDK utilities
 2. **Phase 1**: Server data infrastructure — response store, audit, tags, scope engine
@@ -74,7 +75,7 @@ All metrics are Prometheus-compatible with `yuzu_` prefix and consistent labels.
 ## Working in This Repo
 
 - Check `docs/roadmap.md` for the current plan and issue dependencies
-- Check `docs/capability-map.md` for the target feature set (139 capabilities)
+- Check `docs/capability-map.md` for the target feature set (142 capabilities, 96 done)
 - Check `docs/architecture.md` for component interaction details
 - Run `meson compile -C builddir` to verify changes compile
 - Run `meson test -C builddir` to run tests (requires `-Dbuild_tests=true`)

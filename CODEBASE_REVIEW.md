@@ -1,5 +1,10 @@
 # Yuzu Codebase and Branch Review
 
+> **SUPERSEDED (2026-03-26):** This review was written against an early snapshot of the codebase (~15% complete, single branch, CMake+Meson dual build). The project has since completed all 7 roadmap phases, 72 issues, and a 52-finding RC hardening sprint. For current assessments see:
+> - `SECURITY_REVIEW.md` — Security posture (refreshed 2026-03-26)
+> - `Release-Candidate.local.MD` — RC readiness with 52 findings (all resolved)
+> - `docs/roadmap.md` — Current roadmap status (72/72 = 100%)
+
 ## Branch Inventory
 
 `git branch -a` and `git for-each-ref` show a single local branch (`work`) and no remote-tracking branches in this checkout. This limits cross-branch comparison to the current branch state only.

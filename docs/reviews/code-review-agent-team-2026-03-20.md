@@ -1,5 +1,7 @@
 # Code Review Agent Team Report (2026-03-20)
 
+> **2026-03-26 Delta:** Many findings from this review were addressed during the RC sprint (2026-03-22 to 2026-03-24). Key commits: `4bdae88` (8 CRITICALs — docs, Settings UI, enforcement, tests), `73b1d65` (14 HIGHs from this review), `47aa65d` (MCP server). Findings S2 (metrics auth), F1 (log path), and F2 (token session) were specifically addressed. See `Release-Candidate.local.MD` for the full 52-finding resolution status.
+
 ## Agent Team Composition
 
 To review this repository thoroughly, I assembled a five-agent review team with explicit scopes:

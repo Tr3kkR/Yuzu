@@ -1,15 +1,15 @@
 # Test Coverage Tracking
 
-Last updated: 2026-03-20
+Last updated: 2026-03-26
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 10 files | Active |
-| Server unit tests | `yuzu_server_tests` | 13 files | Active (requires `build_server=true`) |
+| Agent unit tests | `yuzu_agent_tests` | 14 files | Active |
+| Server unit tests | `yuzu_server_tests` | 34 files | Active (requires `build_server=true`) |
 
-**Totals:** 628 test cases, 12,176 assertions, all passing.
+**Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
 
 Run all tests: `meson test -C builddir --print-errorlogs`
 
@@ -31,6 +31,10 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 | `test_kv_store.cpp` | KV storage | Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases) |
 | `test_trigger_engine.cpp` | Trigger engine | Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases) |
 | `test_new_plugins.cpp` | Plugin runtime | Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases) |
+| `test_metrics.cpp` | Prometheus metrics | Metric registration, counter/gauge/histogram operations, label handling |
+| `test_metrics_perf.cpp` | Metrics performance | High-throughput metric emission, contention under concurrent writers |
+| `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
+| `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
 
 ### Untested Agent Components
 
@@ -91,6 +95,27 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_policy_store.cpp` | Policy store | Policy CRUD, fragment binding, scope expression storage, enable/disable, management group association, trigger configuration, input parameters, cascade delete (42 cases) |
 | `test_compliance_eval.cpp` | Compliance evaluator | Status transitions (compliant/non_compliant/unknown/fixing/error), per-agent tracking, fleet summary aggregation, cache invalidation, policy-scoped queries, auto-remediation triggers (35 cases) |
 | `test_custom_properties_store.cpp` | Custom properties | Property CRUD, schema validation, allowed-value enforcement, type checking, required-property compliance, scope engine integration via `props.` prefix, bulk operations (34 cases) |
+| `test_mcp_server.cpp` | MCP server | JSON-RPC parsing, tier policy enforcement, token integration, tool dispatch, store interactions |
+| `test_api_token_store.cpp` | API token store | Token CRUD, expiration, MCP tier assignment |
+| `test_agent_health_store.cpp` | Agent health store | Health status tracking, query, TTL |
+| `test_analytics_event.cpp` | Analytics events | Event creation, serialization, drain integration |
+| `test_approval_manager.cpp` | Approval manager | Approval CRUD, status transitions, role-gated approvals |
+| `test_cert_reloader.cpp` | Certificate reloader | PEM reload, validation, permission checks, hot-swap |
+| `test_concurrency_manager.cpp` | Concurrency manager | 5 enforcement modes, lock/release |
+| `test_error_codes.cpp` | Error taxonomy | Error code ranges (1xxx-4xxx), message formatting |
+| `test_execution_tracker.cpp` | Execution tracker | Progress tracking, per-agent status, completion |
+| `test_instruction_store.cpp` | Instruction store | Definition CRUD, YAML persistence, denormalized queries |
+| `test_legacy_shim.cpp` | Legacy command shim | Raw command-to-instruction translation |
+| `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |
+| `test_migration_runner.cpp` | Schema migrations | Migration execution, version tracking |
+| `test_notification_store.cpp` | Notifications | In-app notification CRUD, read/unread status |
+| `test_oidc_provider.cpp` | OIDC SSO | PKCE flow, JWT validation, group claim parsing |
+| `test_quarantine_store.cpp` | Quarantine | Device quarantine/release, network isolation state |
+| `test_rate_limiter.cpp` | Rate limiting | Token bucket, per-IP/per-token limits |
+| `test_rbac_store.cpp` | RBAC store | Role CRUD, permission assignment, deny-override logic |
+| `test_result_envelope.cpp` | Result envelope | Structured response formatting |
+| `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
+| `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |
 
 ### Untested Server Components
 
@@ -100,8 +125,6 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | **AgentRegistry** | Depends on gRPC protobuf types | Medium |
 | **AgentServiceImpl** (Register/Subscribe) | Requires mock gRPC streams | Low |
 | **GatewayUpstreamServiceImpl** | Requires mock gRPC streams | Low |
-| **NvdClient** (HTTP) | Requires mock HTTP client | Low |
-| **NvdSyncManager** | Background thread orchestration | Low |
 | **HTML fragment renderers** | Output is fragile HTML strings | Very Low |
 | **Web route handlers** | Requires full httplib mock | Low |
 | **TLS credential loading** | Requires filesystem + certs | Low |

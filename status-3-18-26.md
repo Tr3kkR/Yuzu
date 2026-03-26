@@ -1,5 +1,7 @@
 # Yuzu Status Assessment — 2026-03-18
 
+> **HISTORICAL SNAPSHOT (2026-03-18).** This assessment is outdated. At the time of writing, Phases 3-7 were marked "not started" and capability completion was 32%. As of 2026-03-26, all 72 roadmap issues are done (100%) and capability completion is 68% (96/142). See `docs/roadmap.md` for current status.
+
 ## Overall Numbers
 
 | | Done | Open | Total |

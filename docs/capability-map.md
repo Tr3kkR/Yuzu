@@ -1014,7 +1014,7 @@ Settings page section for MCP configuration: enable/disable toggle, read-only mo
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**29 plugins** -- 24 cross-platform, 3 Windows-only, 2 test/debug.
+**44 plugins** -- covering hardware, network, security, filesystem, registry, WMI, and more. Includes cross-platform, Windows-only, and test/debug plugins.
 
 ---
 

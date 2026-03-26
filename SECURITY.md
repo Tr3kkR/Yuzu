@@ -27,9 +27,9 @@ If you discover a security vulnerability in Yuzu, please report it responsibly:
 
 ## Security Hardening Tracking
 
-Security hardening work is tracked in the roadmap issue index (`docs/roadmap.md`), including:
-- **#146** HTTPS for Web Dashboard
-- **#154** Granular RBAC System
-- **#157** Token-Based API Authentication
+All planned security features are implemented:
+- **#146** HTTPS for Web Dashboard — **Done** (HTTPS enabled by default, cert hot-reload)
+- **#154** Granular RBAC System — **Done** (6 roles, 14 securable types, per-operation permissions)
+- **#157** Token-Based API Authentication — **Done** (Bearer token, X-Yuzu-Token, MCP tokens)
 
-For implementation status details and code-level findings, see `SECURITY_REVIEW.md`.
+A 52-finding RC security sprint was completed 2026-03-24, addressing 7 CRITICAL, 16 HIGH, 22 MEDIUM, and 7 LOW findings. See `SECURITY_REVIEW.md` for code-level findings and `Release-Candidate.local.MD` for the full assessment.

@@ -13,6 +13,10 @@ This document describes how Yuzu's components interact, the data flows between t
 │  │  Services   │  │  API + HTMX  │  │  Manager     │  │  /metrics   │ │
 │  │             │  │  Dashboard   │  │  (RBAC)      │  │             │ │
 │  └──────┬──────┘  └──────┬───────┘  └──────┬───────┘  └─────────────┘ │
+│                   ┌──────────────┐                                      │
+│                   │  MCP Server  │  (JSON-RPC 2.0, AI tool use)        │
+│                   │  /mcp/v1/    │                                      │
+│                   └──────────────┘                                      │
 │         │                │                  │                           │
 │  ┌──────▼──────────────────▼──────────────────▼───────────────────────┐ │
 │  │                     Server Core                                    │ │

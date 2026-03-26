@@ -117,17 +117,17 @@ The YAML DSL uses `apiVersion: yuzu.io/v1alpha1` and supports 6 `kind` values: `
 
 ## Development Roadmap
 
-The full roadmap is in `docs/roadmap.md` with 71 issues across 7 phases. The capability map (`docs/capability-map.md`) tracks 139 capabilities. Current progress: 92/139 done (66%).
+The full roadmap is in `docs/roadmap.md` with 72 issues across 7 phases (all complete). The capability map (`docs/capability-map.md`) tracks 142 capabilities. Current progress: 96/142 done (68%).
 
-**Phase execution order:**
+**Phase execution order (all complete):**
 0. Foundation completion (HTTPS, OTA updates, SDK utilities) — **Done**
 1. Server data infrastructure (response store, audit, tags, scope engine) — **Done**
-2. Instruction system (definitions, sets, scheduling, approvals, workflows)
-3. Security & RBAC (granular permissions, management groups, OIDC, REST API)
-4. Agent infrastructure (KV storage, triggers, content distribution, user interaction)
-5. Policy engine (rules, deployment, compliance dashboard)
-6. Windows depth (registry, WMI, per-user operations)
-7. Scale & integration (gateway, health monitoring, AD/Entra, patches, webhooks)
+2. Instruction system (definitions, sets, scheduling, approvals, workflows) — **Done**
+3. Security & RBAC (granular permissions, management groups, OIDC, REST API) — **Done**
+4. Agent infrastructure (KV storage, triggers, content distribution, user interaction) — **Done**
+5. Policy engine (rules, deployment, compliance dashboard) — **Done**
+6. Windows depth (registry, WMI, per-user operations) — **Done**
+7. Scale & integration (gateway, health monitoring, AD/Entra, patches, webhooks) — **Done**
 
 When working on any issue, check the roadmap for dependencies and the capability map for context on what we're building toward.
 
@@ -186,7 +186,7 @@ Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by v
 ## Project layout
 ```
 agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
-agents/plugins/           29 plugins (hardware, network, security, filesystem, etc.)
+agents/plugins/           44 plugins (hardware, network, security, filesystem, etc.)
 server/core/              Server daemon (sessions, auth, dashboard, REST API, policy engine)
 gateway/                  Erlang/OTP gateway node (standalone rebar3 project, see docs/erlang-gateway-blueprint.md)
 sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
@@ -311,11 +311,11 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 - **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.
 - **Certificate hot-reload** — HTTPS cert/key PEM files are polled for changes (default 60s interval) and hot-swapped without server restart. Validates PEM parse, cert/key match, and key file permissions before applying. gRPC TLS reload not supported. CLI: `--no-cert-reload`, `--cert-reload-interval`. Audit action: `cert.reload`. Metrics: `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total`.
 
-### Planned (see roadmap)
-- **Granular RBAC** — Principals, roles, securable types, per-operation permissions (Phase 3)
-- **OIDC SSO** — Replace stub with real OIDC flow (Phase 3)
-- **API tokens** — Bearer token auth for automation (Phase 3)
-- **AD/Entra integration** — Import users/groups from directory (Phase 7)
+### Also Implemented (Phase 3 + Phase 7)
+- **Granular RBAC** — 6 roles, 14 securable types, per-operation permissions, deny-override logic.
+- **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
+- **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens with mandatory expiration.
+- **AD/Entra integration** — Microsoft Graph API for user/group import.
 
 ## MCP (Model Context Protocol) Server
 
