@@ -48,6 +48,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-client-secret` | *(none)* | OIDC client secret. |
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. |
+| `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 
@@ -142,8 +143,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. |
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO | *(configured via CLI flags)* | Configure OpenID Connect single sign-on with an external identity provider. OIDC is configured at startup via CLI flags; there is no Settings page fragment for runtime configuration. |
-| Directory Integration | *(planned -- no fragment yet)* | AD/Entra ID user and group sync. *(Coming soon -- UI stub only.)* |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
 
 ---
 
@@ -374,6 +374,8 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 | Client ID | `--oidc-client-id` | Application (client) ID from your identity provider. |
 | Client Secret | `--oidc-client-secret` | Client secret for the confidential client flow. |
 | Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. |
+| Admin Group | `--oidc-admin-group` | Entra ID group object ID that maps to the admin role. |
+| Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 
 ### Identity Provider Setup
 
@@ -441,7 +443,13 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `POST` | `/api/settings/tls` | Update TLS settings (enable/disable, port). |
 | `POST` | `/api/settings/cert-upload` | Upload PEM certificate and key files (multipart form). |
 | `POST` | `/api/settings/cert-paste` | Paste PEM certificate content (form-encoded). |
-| `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). |
+
+### OIDC / Directory
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/settings/directory` | Render the OIDC/Directory configuration fragment (HTMX). |
+| `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). Persisted to runtime config. |
 | `POST` | `/api/settings/oidc/test` | Test OIDC discovery endpoint connectivity. |
 
 ### Users

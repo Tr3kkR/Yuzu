@@ -15,6 +15,12 @@ static const std::vector<std::string> kAllowedKeys = {
     "audit_retention_days",    // days to keep audit events
     "auto_approve_enabled",    // "true" or "false"
     "log_level",               // trace|debug|info|warn|error
+    "oidc_issuer",             // OIDC issuer URL
+    "oidc_client_id",          // OIDC client ID
+    "oidc_client_secret",      // OIDC client secret (encrypted at rest via SQLite)
+    "oidc_redirect_uri",       // OIDC redirect URI
+    "oidc_admin_group",        // OIDC admin group ID
+    "oidc_skip_tls_verify",    // "true" or "false"
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {

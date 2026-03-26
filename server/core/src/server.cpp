@@ -112,6 +112,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <ranges>
 #include <set>
 #include <string>
@@ -5625,6 +5626,19 @@ private:
                 } catch (...) {}
             }
             // auto_approve_enabled is read dynamically, no startup action needed
+            // OIDC settings — runtime-configurable via Settings UI
+            else if (e.key == "oidc_issuer" && !e.value.empty())
+                cfg_.oidc_issuer = e.value;
+            else if (e.key == "oidc_client_id" && !e.value.empty())
+                cfg_.oidc_client_id = e.value;
+            else if (e.key == "oidc_client_secret" && !e.value.empty())
+                cfg_.oidc_client_secret = e.value;
+            else if (e.key == "oidc_redirect_uri")
+                cfg_.oidc_redirect_uri = e.value;
+            else if (e.key == "oidc_admin_group")
+                cfg_.oidc_admin_group = e.value;
+            else if (e.key == "oidc_skip_tls_verify")
+                cfg_.oidc_skip_tls_verify = (e.value == "true");
         }
     }
 
@@ -5776,6 +5790,7 @@ private:
         web_server_->Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
             std::string html(kLoginHtml);
             // Inject OIDC enablement flag into the page
+            std::shared_lock oidc_lock(oidc_mu_);
             if (oidc_provider_ && oidc_provider_->is_enabled()) {
                 auto pos = html.find("/*OIDC_CONFIG*/");
                 if (pos != std::string::npos)
@@ -5823,6 +5838,7 @@ private:
         // -- OIDC SSO endpoints -----------------------------------------------
         web_server_->Get(
             "/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
+                std::shared_lock oidc_lock(oidc_mu_);
                 if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
                     res.status = 404;
                     res.set_content(R"({"error":{"code":404,"message":"OIDC not configured"},"meta":{"api_version":"v1"}})", "application/json");
@@ -5843,6 +5859,7 @@ private:
 
         web_server_->Get("/auth/callback", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
+            std::shared_lock oidc_lock(oidc_mu_);
             if (!oidc_provider_) {
                 res.status = 404;
                 res.set_content("OIDC not configured", "text/plain");
@@ -6669,7 +6686,18 @@ private:
             else if (type == "ca")
                 cfg_.tls_ca_cert = out_path;
 
+            // Set restrictive permissions for private key files
+#ifndef _WIN32
+            if (type == "key") {
+                std::filesystem::permissions(out_path,
+                    std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                    std::filesystem::perm_options::replace);
+            }
+#endif
+
             spdlog::info("Certificate uploaded: {} → {}", type, out_path.string());
+            audit_log(req, "cert.upload", "success", "Certificate", type, "");
+
             // Re-render TLS section to show new file paths
             res.set_header("HX-Retarget", "#tls-section");
             res.set_header("HX-Trigger",
@@ -6694,12 +6722,23 @@ private:
                 return;
             }
 
-            // Basic PEM validation
-            if (content.find("-----BEGIN") == std::string::npos) {
+            // Size limit (64 KB — typical cert chains are under 10 KB)
+            if (content.size() > 65536) {
                 res.status = 400;
                 res.set_header("HX-Retarget", "#tls-section");
                 res.set_content(
-                    "<span class=\"feedback-error\">Invalid PEM: must start with -----BEGIN.</span>",
+                    "<span class=\"feedback-error\">PEM content too large (max 64 KB).</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            // PEM validation: must contain -----BEGIN and matching -----END
+            if (content.find("-----BEGIN") == std::string::npos ||
+                content.find("-----END") == std::string::npos) {
+                res.status = 400;
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content(
+                    "<span class=\"feedback-error\">Invalid PEM: must contain -----BEGIN and -----END markers.</span>",
                     "text/html; charset=utf-8");
                 return;
             }
@@ -6791,77 +6830,86 @@ private:
                 // Validate required fields
                 if (issuer.empty() || client_id.empty()) {
                     res.status = 400;
-                    res.set_content(
-                        render_directory_fragment() +
-                        "<script>document.getElementById('oidc-feedback')."
-                        "className='feedback feedback-error';"
-                        "document.getElementById('oidc-feedback').textContent='"
-                        "Issuer URL and Client ID are required.';</script>",
-                        "text/html; charset=utf-8");
+                    auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
+                    res.set_content(html, "text/html; charset=utf-8");
                     return;
                 }
 
-                // Update cfg_ fields
-                cfg_.oidc_issuer = issuer;
-                cfg_.oidc_client_id = client_id;
-                // Only overwrite secret if user provided a new one
-                if (!client_secret.empty())
-                    cfg_.oidc_client_secret = client_secret;
-                cfg_.oidc_redirect_uri = redirect_uri;
-                cfg_.oidc_admin_group = admin_group;
-                cfg_.oidc_skip_tls_verify = (skip_tls_verify == "true");
+                // Resolve effective client secret (keep existing if not provided)
+                auto effective_secret = client_secret.empty() ? cfg_.oidc_client_secret : client_secret;
+                bool skip_tls = (skip_tls_verify == "true");
 
-                // Reinitialize OIDC provider
+                // Build OIDC config and try to initialize BEFORE mutating cfg_
+                std::unique_ptr<oidc::OidcProvider> new_provider;
                 try {
                     oidc::OidcConfig oidc_cfg;
-                    oidc_cfg.issuer = cfg_.oidc_issuer;
-                    oidc_cfg.client_id = cfg_.oidc_client_id;
-                    oidc_cfg.client_secret = cfg_.oidc_client_secret;
-                    oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
-                    oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
-                    oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
-                    if (cfg_.oidc_skip_tls_verify)
+                    oidc_cfg.issuer = issuer;
+                    oidc_cfg.client_id = client_id;
+                    oidc_cfg.client_secret = effective_secret;
+                    oidc_cfg.redirect_uri = redirect_uri;
+                    oidc_cfg.admin_group_id = admin_group;
+                    oidc_cfg.skip_tls_verify = skip_tls;
+                    if (skip_tls)
                         spdlog::warn("OIDC TLS certificate verification DISABLED — do not use in production");
 
                     // Compute endpoints from issuer (Entra v2.0 pattern)
-                    auto iss = cfg_.oidc_issuer;
-                    auto v2_pos = iss.rfind("/v2.0");
+                    auto v2_pos = issuer.rfind("/v2.0");
                     if (v2_pos != std::string::npos) {
-                        auto base = iss.substr(0, v2_pos);
+                        auto base = issuer.substr(0, v2_pos);
                         oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
                         oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
                     } else {
-                        oidc_cfg.authorization_endpoint = iss + "/authorize";
-                        oidc_cfg.token_endpoint = iss + "/token";
+                        oidc_cfg.authorization_endpoint = issuer + "/authorize";
+                        oidc_cfg.token_endpoint = issuer + "/token";
                     }
 
                     // Locate token exchange helper script
-                    auto script_dir =
-                        std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
-                        "scripts" / "oidc_token_exchange.py";
                     auto src_script =
                         std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
                     if (std::filesystem::exists(src_script))
                         oidc_cfg.exchange_script = src_script.string();
-                    else if (std::filesystem::exists(script_dir))
-                        oidc_cfg.exchange_script = script_dir.string();
 
-                    oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
-                    spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", cfg_.oidc_issuer);
+                    new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
                 } catch (const std::exception& e) {
                     spdlog::error("OIDC provider reinit failed: {}", e.what());
                     res.status = 500;
-                    res.set_content(
-                        render_directory_fragment() +
-                        "<script>document.getElementById('oidc-feedback')."
-                        "className='feedback feedback-error';"
-                        "document.getElementById('oidc-feedback').textContent='"
-                        "OIDC init failed: " + html_escape(e.what()) + "';</script>",
-                        "text/html; charset=utf-8");
+                    auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">OIDC init failed: " + html_escape(e.what()) + "</div>";
+                    res.set_content(html, "text/html; charset=utf-8");
                     return;
                 }
 
-                audit_log(req, "oidc.configure", "success", "OidcConfig", cfg_.oidc_issuer, "");
+                // Success — now atomically update cfg_ and provider under exclusive lock
+                {
+                    std::unique_lock lock(oidc_mu_);
+                    cfg_.oidc_issuer = issuer;
+                    cfg_.oidc_client_id = client_id;
+                    cfg_.oidc_client_secret = effective_secret;
+                    cfg_.oidc_redirect_uri = redirect_uri;
+                    cfg_.oidc_admin_group = admin_group;
+                    cfg_.oidc_skip_tls_verify = skip_tls;
+                    oidc_provider_ = std::move(new_provider);
+                }
+                spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
+
+                // Persist to RuntimeConfigStore so config survives restart
+                if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                    auto who = "admin"; // Settings UI requires admin
+                    auto session = require_auth(req, res);
+                    if (session) who = session->username.c_str();
+                    runtime_config_store_->set("oidc_issuer", issuer, who);
+                    runtime_config_store_->set("oidc_client_id", client_id, who);
+                    if (!client_secret.empty())
+                        runtime_config_store_->set("oidc_client_secret", client_secret, who);
+                    runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who);
+                    runtime_config_store_->set("oidc_admin_group", admin_group, who);
+                    runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who);
+                }
+
+                audit_log(req, "oidc.configure", "success", "OidcConfig", issuer, "");
 
                 res.set_header("HX-Trigger",
                     R"({"showToast":{"message":"OIDC configuration saved","level":"success"}})");
@@ -6893,6 +6941,8 @@ private:
                 if (!discovery_url.ends_with("/"))
                     discovery_url += "/";
                 discovery_url += ".well-known/openid-configuration";
+
+                audit_log(req, "oidc.test", "attempt", "OidcConfig", issuer, "");
 
                 try {
                     // Parse URL for httplib
@@ -11236,7 +11286,8 @@ private:
     // Certificate hot-reload
     std::unique_ptr<CertReloader> cert_reloader_;
 
-    // OIDC SSO
+    // OIDC SSO — protected by oidc_mu_ for thread-safe reinit from Settings UI
+    mutable std::shared_mutex oidc_mu_;
     std::unique_ptr<oidc::OidcProvider> oidc_provider_;
 
     // NVD CVE feed
