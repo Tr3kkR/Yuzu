@@ -330,6 +330,7 @@ Plugins for software inventory, Windows-specific package management, update stat
 |---|---|
 | `installed` | List installed updates/hotfixes with KB number, date, and type. |
 | `missing` | List updates that are available but not yet installed. |
+| `pending_reboot` | Detect whether the endpoint requires a reboot after updates. Checks Windows registry keys, Linux reboot-required file and kernel version, macOS softwareupdate restart flag. |
 
 ### software_actions
 

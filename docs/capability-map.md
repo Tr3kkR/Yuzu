@@ -28,10 +28,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [===========================---]   90/101 done  (89%)
-Future       [=============================---]  27/50 done  (54%)
+Advanced     [===========================---]   92/101 done  (91%)
+Future       [=============================---]  28/50 done  (56%)
 ─────────────────────────────────────────────────────────────────
-Overall      [===========================---]  150/184 done  (82%)
+Overall      [============================---]  153/184 done  (83%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -43,7 +43,7 @@ Overall      [===========================---]  150/184 done  (82%)
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
 | 7. Software & App Mgmt | 6 | 5 | 0 | 1 |
-| 8. Patch & Update Mgmt | 9 | 5 | 2 | 2 |
+| 8. Patch & Update Mgmt | 9 | 7 | 0 | 2 |
 | 9. Security & Compliance | 10 | 9 | 0 | 1 |
 | 10. File System Operations | 15 | 10 | 0 | 5 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
@@ -57,10 +57,10 @@ Overall      [===========================---]  150/184 done  (82%)
 | 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 4 | 0 | 1 |
-| 22. System & Infrastructure | 8 | 3 | 1 | 4 |
+| 22. System & Infrastructure | 8 | 4 | 0 | 4 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
-| **TOTAL** | **184** | **150** | **3** | **31** |
+| **TOTAL** | **184** | **153** | **0** | **31** |
 
 ---
 
@@ -368,15 +368,14 @@ Can execute scripts, but no managed software deployment workflow.
 
 ### 8.1 Installed Update Enumeration :white_check_mark: `T1`
 
-`windows_updates` plugin.
+`windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
 
-> **Gap:** Windows only; no Linux/macOS package update tracking.
+### 8.2 Pending Update Detection :white_check_mark: `T1`
 
-### 8.2 Pending Update Detection :large_orange_diamond: `T1`
-
-`windows_updates` reports pending updates.
-
-> **Gap:** No cross-platform equivalent. No tracking of updates pending reboot.
+`windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
+Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
+Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
+macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.
 
 ### 8.3 Patch Deployment :white_check_mark: `T2`
 
@@ -390,11 +389,9 @@ Can execute scripts, but no managed software deployment workflow.
 
 `PatchInfo` stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing counts. `get_missing_patches()` and `get_installed_patches()` support severity and agent filtering.
 
-### 8.6 Reboot Management (Post-Patch) :large_orange_diamond: `T2`
+### 8.6 Reboot Management (Post-Patch) :white_check_mark: `T2`
 
-`PatchDeployment` supports `reboot_if_needed` flag passed through `deploy_patch()`. The flag is stored and propagated to deployment targets.
-
-> **Gap:** No scheduled reboot with user notification or countdown. Reboot is a simple flag, not a full reboot orchestration workflow.
+Full reboot orchestration in `PatchManager::execute_deployment()`. Configurable `reboot_delay_seconds` (default 300, clamped [60, 86400]) and optional `reboot_at` epoch timestamp for maintenance windows. Pre-reboot user notification via `device.interaction.notify` (best-effort). Cross-platform reboot commands: Windows `shutdown /r /t N /c`, Linux/macOS `shutdown -r +N`. Target status lifecycle includes `"rebooting"` state. REST API accepts `reboot_delay_seconds` and `reboot_at` in `POST /api/patches/deploy`.
 
 ### 8.7 Update Summary and Compliance Reporting :white_check_mark: `T2`
 
@@ -876,11 +873,9 @@ Not implemented. Configure which events generate notifications.
 
 *Monitoring, licensing, configuration, and multi-node scaling.*
 
-### 22.1 System Health Monitoring :large_orange_diamond: `T2`
+### 22.1 System Health Monitoring :white_check_mark: `T2`
 
-Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics.
-
-> **Gap:** No CPU, memory, connection count, or queue depth monitoring. No system health dashboard.
+Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
 
 ### 22.2 System Topology View :x: `T2`
 

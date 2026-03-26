@@ -422,26 +422,34 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     host = (slash != std::string::npos) ? url.substr(0, slash) : url;
     path = (slash != std::string::npos) ? url.substr(slash) : "/";
 
-    httplib::Client client(scheme + host);
-    client.set_connection_timeout(10);
-    client.set_read_timeout(15);
+    // Use heap-allocated client and explicit reset to work around httplib
+    // 0.37.1 SSLClient destructor crash (invalid free in OpenSSL context
+    // cleanup after HTTPS connections).
+    auto client = std::make_unique<httplib::Client>(scheme + host);
+    client->set_connection_timeout(10);
+    client->set_read_timeout(15);
+    client->enable_server_certificate_verification(false);
     httplib::Headers headers;
     if (!auth_header.empty())
         headers.emplace("Authorization", "Basic " +
             base64_encode(config_.client_id + ":" + config_.client_secret));
-    auto result = client.Post(path, headers, form_body, "application/x-www-form-urlencoded");
-    if (!result) {
-        spdlog::error("OIDC token exchange: httplib failed: {}",
-                      httplib::to_string(result.error()));
-        return std::unexpected("token endpoint request failed: " +
-                               httplib::to_string(result.error()));
+    auto result = client->Post(path, headers, form_body, "application/x-www-form-urlencoded");
+    // Copy result data before destroying the client
+    int status_code = result ? result->status : 0;
+    std::string body_copy = result ? result->body : "";
+    std::string err_str = result ? "" : httplib::to_string(result.error());
+    client.reset(); // Explicit destroy before any return
+
+    if (status_code == 0) {
+        spdlog::error("OIDC token exchange: httplib failed: {}", err_str);
+        return std::unexpected("token endpoint request failed: " + err_str);
     }
-    if (result->status != 200) {
-        spdlog::error("OIDC token exchange: status={} body={}", result->status,
-                      result->body.substr(0, 500));
-        return std::unexpected("token endpoint returned " + std::to_string(result->status));
+    if (status_code != 200) {
+        spdlog::error("OIDC token exchange: status={} body={}", status_code,
+                      body_copy.substr(0, 500));
+        return std::unexpected("token endpoint returned " + std::to_string(status_code));
     }
-    response_body = result->body;
+    response_body = std::move(body_copy);
 #endif
 
     spdlog::info("OIDC token exchange: response_len={}", response_body.size());
@@ -472,32 +480,51 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
 
 OidcProvider::OidcProvider(OidcConfig config)
     : config_(std::move(config)), exchange_script_path_(config_.exchange_script) {
-    // Fetch OIDC discovery document to get the real endpoints
+    // Fetch OIDC discovery document to get the real endpoints.
+    // Skip discovery if endpoints are already configured, or if neither
+    // redirect_uri nor authorization_endpoint is set (validate-only usage,
+    // e.g. unit tests that only call validate_claims / parse_id_token).
+    if (!config_.authorization_endpoint.empty() || config_.redirect_uri.empty()) {
+        if (!config_.authorization_endpoint.empty())
+            spdlog::info("OidcProvider: using pre-configured endpoints, skipping discovery");
+        spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);
+        return;
+    }
+
     auto discovery_url = config_.issuer + "/.well-known/openid-configuration";
     spdlog::info("OidcProvider: fetching discovery from {}", discovery_url);
 
-    // Parse host and path from discovery URL
-    std::string disc_url = discovery_url;
-    std::string scheme;
-    if (disc_url.starts_with("https://")) {
-        scheme = "https://";
-        disc_url = disc_url.substr(8);
-    } else if (disc_url.starts_with("http://")) {
-        scheme = "http://";
-        disc_url = disc_url.substr(7);
-    }
-    auto slash = disc_url.find('/');
-    auto host = disc_url.substr(0, slash);
-    auto path = disc_url.substr(slash);
+    try {
+        // Parse host and path from discovery URL
+        std::string disc_url = discovery_url;
+        std::string scheme;
+        if (disc_url.starts_with("https://")) {
+            scheme = "https://";
+            disc_url = disc_url.substr(8);
+        } else if (disc_url.starts_with("http://")) {
+            scheme = "http://";
+            disc_url = disc_url.substr(7);
+        }
+        auto slash = disc_url.find('/');
+        auto host = disc_url.substr(0, slash);
+        auto path = disc_url.substr(slash);
 
-    httplib::Client client(scheme + host);
-    client.set_connection_timeout(15);
-    client.set_read_timeout(15);
-    client.enable_server_certificate_verification(false); // Windows OpenSSL lacks system CA bundle
-    auto result = client.Get(path);
+        // Use a heap-allocated client to control destruction order and
+        // avoid a crash in httplib::SSLClient::~SSLClient when the SSL
+        // context is left in a partially-initialised state after a failed
+        // connection to a non-routable host (observed with httplib 0.37.1).
+        auto client = std::make_unique<httplib::Client>(scheme + host);
+        client->set_connection_timeout(5);
+        client->set_read_timeout(5);
+        client->enable_server_certificate_verification(false);
 
-    if (result && result->status == 200) {
-        try {
+        auto result = client->Get(path);
+
+        // Explicitly destroy the client before touching config_ to ensure
+        // any SSL resources are freed while the stack is still valid.
+        client.reset();
+
+        if (result && result->status == 200) {
             auto j = nlohmann::json::parse(result->body);
             if (j.contains("authorization_endpoint"))
                 config_.authorization_endpoint = j["authorization_endpoint"].get<std::string>();
@@ -505,12 +532,15 @@ OidcProvider::OidcProvider(OidcConfig config)
                 config_.token_endpoint = j["token_endpoint"].get<std::string>();
             spdlog::info("OidcProvider: authorize={}", config_.authorization_endpoint);
             spdlog::info("OidcProvider: token={}", config_.token_endpoint);
-        } catch (const std::exception& e) {
-            spdlog::error("OidcProvider: failed to parse discovery document: {}", e.what());
+        } else {
+            spdlog::warn("OidcProvider: discovery fetch failed (status={}), using fallback endpoints",
+                         result ? result->status : 0);
         }
-    } else {
-        spdlog::warn("OidcProvider: discovery fetch failed (status={}), using fallback endpoints",
-                     result ? result->status : 0);
+    } catch (const std::exception& e) {
+        spdlog::warn("OidcProvider: discovery fetch exception: {}, using fallback endpoints",
+                     e.what());
+    } catch (...) {
+        spdlog::warn("OidcProvider: discovery fetch failed, using fallback endpoints");
     }
 
     spdlog::info("OidcProvider: issuer={} client_id={}", config_.issuer, config_.client_id);

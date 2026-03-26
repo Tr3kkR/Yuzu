@@ -134,6 +134,14 @@ void PatchManager::create_tables() {
         spdlog::error("PatchManager: create_tables failed: {}", err ? err : "unknown");
         sqlite3_free(err);
     }
+
+    // Schema migration: add reboot orchestration columns (idempotent)
+    sqlite3_exec(db_,
+        "ALTER TABLE patch_deployments ADD COLUMN reboot_delay_seconds INTEGER NOT NULL DEFAULT 300;",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
+        "ALTER TABLE patch_deployments ADD COLUMN reboot_at INTEGER NOT NULL DEFAULT 0;",
+        nullptr, nullptr, nullptr);
 }
 
 std::string PatchManager::generate_id() const {
@@ -278,7 +286,9 @@ std::expected<std::string, std::string>
 PatchManager::deploy_patch(const std::string& kb_id,
                            const std::vector<std::string>& agent_ids,
                            bool reboot_if_needed,
-                           const std::string& created_by) {
+                           const std::string& created_by,
+                           int reboot_delay_seconds,
+                           int64_t reboot_at) {
     if (kb_id.empty())
         return std::unexpected("kb_id is required");
 
@@ -315,21 +325,27 @@ PatchManager::deploy_patch(const std::string& kb_id,
     {
         const char* sql = R"(
             INSERT INTO patch_deployments
-                (id, kb_id, title, status, created_by, reboot_needed, created_at, total_targets)
-            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                (id, kb_id, title, status, created_by, reboot_needed,
+                 reboot_delay_seconds, reboot_at, created_at, total_targets)
+            VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
         )";
 
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
             return std::unexpected("failed to create deployment");
 
+        // Clamp delay to [60, 86400]
+        reboot_delay_seconds = std::clamp(reboot_delay_seconds, 60, 86400);
+
         sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, kb_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, title.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 4, created_by.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(stmt, 5, reboot_if_needed ? 1 : 0);
-        sqlite3_bind_int64(stmt, 6, now);
-        sqlite3_bind_int(stmt, 7, static_cast<int>(agent_ids.size()));
+        sqlite3_bind_int(stmt, 6, reboot_delay_seconds);
+        sqlite3_bind_int64(stmt, 7, reboot_at);
+        sqlite3_bind_int64(stmt, 8, now);
+        sqlite3_bind_int(stmt, 9, static_cast<int>(agent_ids.size()));
 
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             sqlite3_finalize(stmt);
@@ -365,7 +381,8 @@ PatchManager::deploy_patch(const std::string& kb_id,
 
 std::expected<void, std::string>
 PatchManager::execute_deployment(const std::string& deployment_id,
-                                 PatchDispatchFn dispatch_fn) {
+                                 PatchDispatchFn dispatch_fn,
+                                 AgentOsLookupFn os_lookup) {
     auto depl = get_deployment(deployment_id);
     if (!depl)
         return std::unexpected("deployment not found");
@@ -506,20 +523,69 @@ PatchManager::execute_deployment(const std::string& deployment_id,
             }
         }
 
-        // Step 4: Reboot if needed
+        // Step 4: Reboot orchestration — notify user, then cross-platform reboot
         if (depl->reboot_if_needed) {
-            nlohmann::json reboot_params = {
-                {"command", "shutdown"},
-                {"args", "/r /t 60 /c \"Yuzu patch deployment: rebooting after " +
-                         depl->kb_id + "\""},
-                {"timeout", "30"}
+            // Compute effective delay
+            int delay_seconds = depl->reboot_delay_seconds;
+            if (depl->reboot_at > 0) {
+                auto now_ts = now_epoch();
+                if (depl->reboot_at > now_ts)
+                    delay_seconds = static_cast<int>(depl->reboot_at - now_ts);
+            }
+            delay_seconds = std::clamp(delay_seconds, 60, 86400);
+
+            update_target_status(deployment_id, agent_id, "rebooting");
+
+            // 4a: Notify user (best-effort)
+            int delay_minutes = delay_seconds / 60;
+            if (delay_minutes < 1) delay_minutes = 1;
+            nlohmann::json notify_params = {
+                {"title", "System Reboot"},
+                {"message", "Your computer will restart in " +
+                            std::to_string(delay_minutes) +
+                            " minutes for security updates (" +
+                            depl->kb_id + ")."},
+                {"type", "warning"}
             };
-            auto result = dispatch_fn("device.script_exec.run",
-                                      agent_id, reboot_params.dump());
-            if (!result) {
-                spdlog::warn("PatchManager: reboot command failed for {}: {}",
-                             agent_id, result.error());
-                // Don't mark as failed — patch was installed successfully
+            auto notify_result = dispatch_fn("device.interaction.notify",
+                                             agent_id, notify_params.dump());
+            if (!notify_result) {
+                spdlog::info("PatchManager: notification failed for {} (headless?): {}",
+                             agent_id, notify_result.error());
+            }
+
+            // 4b: Cross-platform reboot command
+            std::string os = os_lookup ? os_lookup(agent_id) : "";
+            if (os.empty()) {
+                spdlog::warn("PatchManager: os_lookup not provided for {}, skipping reboot", agent_id);
+            }
+            nlohmann::json reboot_params;
+            if (os == "linux" || os == "darwin") {
+                int delay_minutes_cmd = std::max(1, delay_seconds / 60);
+                reboot_params = {
+                    {"command", "shutdown"},
+                    {"args", "-r +" + std::to_string(delay_minutes_cmd) +
+                             " \"Yuzu: rebooting after " + depl->kb_id + "\""},
+                    {"timeout", "30"}
+                };
+            } else if (os == "windows") {
+                reboot_params = {
+                    {"command", "shutdown"},
+                    {"args", "/r /t " + std::to_string(delay_seconds) +
+                             " /c \"Yuzu patch deployment: rebooting after " +
+                             depl->kb_id + "\""},
+                    {"timeout", "30"}
+                };
+            }
+            // Only dispatch if we have a valid OS-specific command
+            if (!reboot_params.empty()) {
+                auto result = dispatch_fn("device.script_exec.run",
+                                          agent_id, reboot_params.dump());
+                if (!result) {
+                    spdlog::warn("PatchManager: reboot command failed for {}: {}",
+                                 agent_id, result.error());
+                    // Don't mark as failed — patch was installed successfully
+                }
             }
         }
 
@@ -538,7 +604,8 @@ std::optional<PatchDeployment> PatchManager::get_deployment(const std::string& i
 
     const char* sql = R"(
         SELECT id, kb_id, title, status, created_by, reboot_needed,
-               created_at, completed_at, total_targets, completed_targets, failed_targets
+               created_at, completed_at, total_targets, completed_targets, failed_targets,
+               reboot_delay_seconds, reboot_at
         FROM patch_deployments WHERE id = ?
     )";
 
@@ -565,6 +632,8 @@ std::optional<PatchDeployment> PatchManager::get_deployment(const std::string& i
     d.total_targets = sqlite3_column_int(stmt, 8);
     d.completed_targets = sqlite3_column_int(stmt, 9);
     d.failed_targets = sqlite3_column_int(stmt, 10);
+    d.reboot_delay_seconds = sqlite3_column_int(stmt, 11);
+    d.reboot_at = sqlite3_column_int64(stmt, 12);
     sqlite3_finalize(stmt);
 
     // Load targets
@@ -598,7 +667,8 @@ std::vector<PatchDeployment> PatchManager::list_deployments(int limit) const {
 
     const char* sql = R"(
         SELECT id, kb_id, title, status, created_by, reboot_needed,
-               created_at, completed_at, total_targets, completed_targets, failed_targets
+               created_at, completed_at, total_targets, completed_targets, failed_targets,
+               reboot_delay_seconds, reboot_at
         FROM patch_deployments
         ORDER BY created_at DESC
         LIMIT ?
@@ -624,6 +694,8 @@ std::vector<PatchDeployment> PatchManager::list_deployments(int limit) const {
         d.total_targets = sqlite3_column_int(stmt, 8);
         d.completed_targets = sqlite3_column_int(stmt, 9);
         d.failed_targets = sqlite3_column_int(stmt, 10);
+        d.reboot_delay_seconds = sqlite3_column_int(stmt, 11);
+        d.reboot_at = sqlite3_column_int64(stmt, 12);
         result.push_back(std::move(d));
     }
 
@@ -650,7 +722,7 @@ PatchManager::cancel_deployment(const std::string& id) {
     const char* sql = R"(
         UPDATE patch_deployment_targets
         SET status = 'cancelled', completed_at = ?
-        WHERE deployment_id = ? AND status IN ('pending', 'scanning', 'downloading')
+        WHERE deployment_id = ? AND status IN ('pending', 'scanning', 'downloading', 'installing', 'verifying', 'rebooting')
     )";
 
     sqlite3_stmt* stmt = nullptr;

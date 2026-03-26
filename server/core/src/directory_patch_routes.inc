@@ -304,12 +304,31 @@
                 }
 
                 bool reboot = body.value("reboot_if_needed", false);
+                int reboot_delay = body.value("reboot_delay_seconds", 300);
+                int64_t reboot_at = body.value("reboot_at", static_cast<int64_t>(0));
+
+                // Validate reboot_delay range
+                reboot_delay = std::clamp(reboot_delay, 60, 86400);
+
+                // Validate reboot_at: must be 0 (disabled) or in the future
+                if (reboot_at != 0) {
+                    auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(
+                                      std::chrono::system_clock::now().time_since_epoch()).count();
+                    if (reboot_at < now_ts) {
+                        res.status = 400;
+                        res.set_content(R"({"error":{"code":400,"message":"reboot_at must be in the future or 0"},"meta":{"api_version":"v1"}})",
+                                        "application/json");
+                        return;
+                    }
+                }
+
                 std::string created_by = "unknown";
                 auto session = require_auth(req, res);
                 if (session)
                     created_by = session->username;
 
-                auto depl_result = patch_manager_->deploy_patch(kb_id, agent_ids, reboot, created_by);
+                auto depl_result = patch_manager_->deploy_patch(
+                    kb_id, agent_ids, reboot, created_by, reboot_delay, reboot_at);
                 if (!depl_result) {
                     res.status = 400;
                     res.set_content(nlohmann::json({{"error", depl_result.error()}}).dump(),
@@ -364,6 +383,8 @@
                     {"status", depl->status},
                     {"created_by", depl->created_by},
                     {"reboot_if_needed", depl->reboot_if_needed},
+                    {"reboot_delay_seconds", depl->reboot_delay_seconds},
+                    {"reboot_at", depl->reboot_at},
                     {"created_at", depl->created_at},
                     {"completed_at", depl->completed_at},
                     {"total_targets", depl->total_targets},

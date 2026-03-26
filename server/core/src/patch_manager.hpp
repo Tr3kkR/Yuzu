@@ -41,7 +41,7 @@ enum class DeploymentStatus {
 struct PatchDeploymentTarget {
     std::string agent_id;
     std::string status;    // "pending", "scanning", "downloading", "installing",
-                           // "verifying", "completed", "failed", "skipped"
+                           // "verifying", "rebooting", "completed", "failed", "skipped"
     std::string error;     // Error message if failed
     int64_t started_at{0};
     int64_t completed_at{0};
@@ -54,6 +54,8 @@ struct PatchDeployment {
     std::string status;     // Overall status
     std::string created_by; // Principal who initiated the deployment
     bool reboot_if_needed{false};
+    int reboot_delay_seconds{300};  // Countdown before reboot (default 5 min)
+    int64_t reboot_at{0};           // Optional epoch timestamp for scheduled reboot (0 = use delay)
     int64_t created_at{0};
     int64_t completed_at{0};
     int total_targets{0};
@@ -79,6 +81,9 @@ using PatchDispatchFn = std::function<std::expected<std::string, std::string>(
     const std::string& instruction_id,
     const std::string& agent_id,
     const std::string& parameters_json)>;
+
+// Returns the OS string ("windows", "linux", "darwin") for an agent.
+using AgentOsLookupFn = std::function<std::string(const std::string& agent_id)>;
 
 // ── PatchManager ─────────────────────────────────────────────────────────────
 
@@ -115,13 +120,17 @@ public:
     deploy_patch(const std::string& kb_id,
                  const std::vector<std::string>& agent_ids,
                  bool reboot_if_needed,
-                 const std::string& created_by);
+                 const std::string& created_by,
+                 int reboot_delay_seconds = 300,
+                 int64_t reboot_at = 0);
 
     /// Execute the deployment workflow using the provided dispatch callback.
-    /// This runs through the steps: check -> install -> verify for each target.
+    /// This runs through the steps: check -> install -> verify -> reboot for each target.
+    /// If os_lookup is provided, the reboot command is adapted for the agent's OS.
     std::expected<void, std::string>
     execute_deployment(const std::string& deployment_id,
-                       PatchDispatchFn dispatch_fn);
+                       PatchDispatchFn dispatch_fn,
+                       AgentOsLookupFn os_lookup = {});
 
     /// Get deployment details including per-target status.
     std::optional<PatchDeployment> get_deployment(const std::string& id) const;

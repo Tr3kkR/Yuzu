@@ -2,19 +2,23 @@
  * windows_updates_plugin.cpp — Windows updates / package updates plugin for Yuzu
  *
  * Actions:
- *   "installed" — List recently installed updates/packages.
- *   "missing"   — List available updates/packages that can be installed.
+ *   "installed"      — List recently installed updates/packages.
+ *   "missing"        — List available updates/packages that can be installed.
+ *   "pending_reboot" — Detect if the endpoint requires a reboot after updates.
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   update|kb_id|description|date
  *   package|name|version
  *   available|title|severity
+ *   source_name|true/false|detail          (per-check rows)
+ *   reboot_required|true/false|reasons    (summary row)
  */
 
 #include <yuzu/plugin.hpp>
 
 #include <array>
 #include <cstdio>
+#include <filesystem>
 #include <format>
 #include <string>
 #include <string_view>
@@ -253,6 +257,146 @@ int do_missing(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── pending reboot action ─────────────────────────────────────────────────
+
+int do_pending_reboot(yuzu::CommandContext& ctx) {
+    std::vector<std::string> reasons;
+
+#ifdef _WIN32
+    // Check 1: Windows Update RebootRequired registry key
+    {
+        HKEY hkey = nullptr;
+        bool found = (RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            R"(SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired)",
+            0, KEY_READ, &hkey) == ERROR_SUCCESS);
+        if (found) {
+            RegCloseKey(hkey);
+            reasons.push_back("windows_update_reboot");
+        }
+        ctx.write_output(std::format("windows_update_reboot|{}|{}",
+                                     found ? "true" : "false",
+                                     found ? "Registry key exists" : ""));
+    }
+
+    // Check 2: Component Based Servicing RebootPending
+    {
+        HKEY hkey = nullptr;
+        bool found = (RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            R"(SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending)",
+            0, KEY_READ, &hkey) == ERROR_SUCCESS);
+        if (found) {
+            RegCloseKey(hkey);
+            reasons.push_back("cbs_reboot");
+        }
+        ctx.write_output(std::format("cbs_reboot|{}|{}",
+                                     found ? "true" : "false",
+                                     found ? "Registry key exists" : ""));
+    }
+
+    // Check 3: Pending file rename operations
+    {
+        HKEY hkey = nullptr;
+        bool found = false;
+        if (RegOpenKeyExA(
+                HKEY_LOCAL_MACHINE,
+                R"(SYSTEM\CurrentControlSet\Control\Session Manager)",
+                0, KEY_READ, &hkey) == ERROR_SUCCESS) {
+            DWORD size = 0;
+            if (RegQueryValueExA(hkey, "PendingFileRenameOperations", nullptr,
+                                 nullptr, nullptr, &size) == ERROR_SUCCESS && size > 0) {
+                found = true;
+                reasons.push_back("pending_file_rename");
+            }
+            RegCloseKey(hkey);
+        }
+        ctx.write_output(std::format("pending_file_rename|{}|{}",
+                                     found ? "true" : "false",
+                                     found ? "Non-empty value" : ""));
+    }
+
+#elif defined(__linux__)
+    // Check 1: /var/run/reboot-required (Debian/Ubuntu)
+    {
+        std::error_code ec;
+        bool found = std::filesystem::exists("/var/run/reboot-required", ec);
+        if (found)
+            reasons.push_back("reboot_required_file");
+        ctx.write_output(std::format("reboot_required_file|{}|{}",
+                                     found ? "true" : "false",
+                                     found ? "/var/run/reboot-required exists" : ""));
+    }
+
+    // Check 2: Running kernel vs installed kernel mismatch
+    {
+        bool found = false;
+        auto running = run_command("uname -r");
+        auto latest = run_command("ls /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1");
+        if (!latest.empty()) {
+            // Strip "vmlinuz-" prefix and path
+            auto pos = latest.rfind("vmlinuz-");
+            if (pos != std::string::npos) {
+                auto installed = latest.substr(pos + 8);
+                if (!running.empty() && !installed.empty() && running != installed) {
+                    found = true;
+                    reasons.push_back("kernel_mismatch");
+                }
+                ctx.write_output(std::format("kernel_mismatch|{}|running={} installed={}",
+                                             found ? "true" : "false", running, installed));
+            }
+        }
+        if (latest.empty()) {
+            // Fallback: needs-restarting (RHEL/CentOS/Fedora)
+            auto output = run_command("needs-restarting -r 2>&1");
+            bool needs = output.find("Reboot is required") != std::string::npos;
+            if (needs) {
+                found = true;
+                reasons.push_back("needs_restarting");
+            }
+            ctx.write_output(std::format("needs_restarting|{}|{}",
+                                         needs ? "true" : "false",
+                                         needs ? "needs-restarting reports reboot required" : ""));
+        }
+    }
+
+#elif defined(__APPLE__)
+    // Check: softwareupdate -l output containing "restart"
+    {
+        bool found = false;
+        auto lines = run_command_lines("softwareupdate -l 2>/dev/null");
+        for (const auto& line : lines) {
+            // Case-insensitive search for "restart"
+            std::string lower = line;
+            for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lower.find("restart") != std::string::npos) {
+                found = true;
+                reasons.push_back("softwareupdate_restart");
+                break;
+            }
+        }
+        ctx.write_output(std::format("softwareupdate_restart|{}|{}",
+                                     found ? "true" : "false",
+                                     found ? "Update requires restart" : ""));
+    }
+
+#else
+    ctx.write_output("error|platform not supported");
+    return 0;
+#endif
+
+    // Summary line
+    bool any = !reasons.empty();
+    std::string reason_str;
+    for (size_t i = 0; i < reasons.size(); ++i) {
+        if (i > 0) reason_str += ',';
+        reason_str += reasons[i];
+    }
+    ctx.write_output(std::format("reboot_required|{}|{}",
+                                 any ? "true" : "false", reason_str));
+    return 0;
+}
+
 } // namespace
 
 class WindowsUpdatesPlugin final : public yuzu::Plugin {
@@ -260,11 +404,11 @@ public:
     std::string_view name() const noexcept override { return "windows_updates"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Lists installed and available OS updates/packages";
+        return "Lists installed, available, and pending-reboot OS updates/packages";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"installed", "missing", nullptr};
+        static const char* acts[] = {"installed", "missing", "pending_reboot", nullptr};
         return acts;
     }
 
@@ -278,6 +422,8 @@ public:
             return do_installed(ctx);
         if (action == "missing")
             return do_missing(ctx);
+        if (action == "pending_reboot")
+            return do_pending_reboot(ctx);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

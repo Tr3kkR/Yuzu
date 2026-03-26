@@ -1748,6 +1748,43 @@ Get the status of a running or completed workflow execution, including per-step 
 
 ---
 
+### Patch Management
+
+**`GET /api/patches`** — Query missing/installed patches.
+
+- **Permission:** `Patch:Read`
+- **Query params:** `agent_id`, `severity`, `status`, `limit` (default 100)
+
+**`POST /api/patches/deploy`** — Create a patch deployment targeting specific agents.
+
+- **Permission:** `Patch:Write`
+- **Request body:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `kb_id` | string | Yes | — | KB identifier (format: `KBnnnnnnn`) |
+| `agent_ids` | string[] | Yes | — | Target agent IDs |
+| `reboot_if_needed` | bool | No | `false` | Reboot agents after patching |
+| `reboot_delay_seconds` | int | No | `300` | Seconds to wait before reboot (clamped to 60–86400). A desktop notification warns the user before reboot. |
+| `reboot_at` | int64 | No | `0` | Optional epoch timestamp for scheduled reboot. Must be in the future. `0` = use delay instead. |
+
+- **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
+
+**`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
+
+- **Permission:** `Patch:Read`
+- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` (pending, scanning, downloading, installing, verifying, rebooting, completed, failed, skipped, cancelled).
+
+**`GET /api/patches/deployments`** — List deployments (paginated, default limit 50).
+
+- **Permission:** `Patch:Read`
+
+**`POST /api/patches/deployments/:id/cancel`** — Cancel a pending/running deployment.
+
+- **Permission:** `Patch:Write`
+
+---
+
 ## Legacy API Endpoints
 
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.

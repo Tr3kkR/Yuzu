@@ -1348,7 +1348,8 @@ This section enumerates the stable builtin primitives that content authors targe
 | `software.install` | content staging | Y | Y | Y | Planned |
 | `software.update` | pkg adapter | Y | Y | Y | Proposed |
 | `software.sccm.query` | `sccm` | Y | - | - | Verified |
-| `patch.inventory` | `windows_updates` | Y | - | - | Verified |
+| `patch.inventory` | `windows_updates` | Y | Y | Y | Verified |
+| `patch.pending_reboot` | `windows_updates` | Y | Y | Y | Verified |
 | `patch.install` | `patch` | Y | Y | Y | Planned |
 | `patch.scan` | `vuln_scan` | Y | Y | Y | Verified |
 

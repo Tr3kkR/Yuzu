@@ -58,6 +58,7 @@
 #include "workflow_engine.hpp"
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
+#include "process_health.hpp"
 #include "rate_limiter.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -2614,6 +2615,17 @@ public:
                           "Total successful certificate hot-reloads", "gauge");
         metrics_.describe("yuzu_server_cert_reload_failures_total",
                           "Total failed certificate hot-reload attempts", "gauge");
+        // Process health metrics (capability 22.1)
+        metrics_.describe("yuzu_server_cpu_usage_percent",
+                          "Server process CPU usage percentage", "gauge");
+        metrics_.describe("yuzu_server_memory_bytes",
+                          "Server process memory usage in bytes", "gauge");
+        metrics_.describe("yuzu_server_open_connections",
+                          "Number of connected gRPC agent streams", "gauge");
+        metrics_.describe("yuzu_server_command_queue_depth",
+                          "Number of in-flight command executions", "gauge");
+        metrics_.describe("yuzu_server_uptime_seconds",
+                          "Server process uptime in seconds", "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -3045,6 +3057,26 @@ public:
                         .set(static_cast<double>(cert_reloader_->reload_count()));
                     metrics_.gauge("yuzu_server_cert_reload_failures_total")
                         .set(static_cast<double>(cert_reloader_->failure_count()));
+                }
+                // Process health sampling (22.1)
+                {
+                    auto ph = process_health_sampler_.sample();
+                    metrics_.gauge("yuzu_server_cpu_usage_percent").set(ph.cpu_percent);
+                    metrics_.gauge("yuzu_server_memory_bytes", {{"type", "rss"}})
+                        .set(static_cast<double>(ph.memory_rss_bytes));
+                    metrics_.gauge("yuzu_server_memory_bytes", {{"type", "vss"}})
+                        .set(static_cast<double>(ph.memory_vss_bytes));
+                    metrics_.gauge("yuzu_server_open_connections")
+                        .set(static_cast<double>(registry_.agent_count()));
+                    auto queue_depth = execution_tracker_
+                        ? static_cast<double>(
+                              execution_tracker_->query_executions({.status = "running"}).size())
+                        : 0.0;
+                    metrics_.gauge("yuzu_server_command_queue_depth").set(queue_depth);
+                    auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - server_start_time_).count();
+                    metrics_.gauge("yuzu_server_uptime_seconds")
+                        .set(static_cast<double>(uptime_s));
                 }
             }
             spdlog::info("Fleet health recomputation thread stopped");
@@ -5817,7 +5849,7 @@ private:
         });
 
         // -- Health endpoint (7.2) ------------------------------------------------
-        web_server_->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        web_server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
             auto now = std::chrono::steady_clock::now();
             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
                                   now - server_start_time_)
@@ -5879,6 +5911,37 @@ private:
                   {"completed_last_hour", completed_last_hour},
                   {"failed_last_hour", failed_last_hour}}},
                 {"version", "0.1.0"}};
+
+            // Process health (22.1) — only include for authenticated requests
+            // to avoid leaking process internals to unauthenticated callers.
+            // Check auth without returning 401 (health probe must stay open).
+            bool is_authenticated = false;
+            {
+                auto ck = extract_session_cookie(req);
+                if (auth_mgr_.validate_session(ck))
+                    is_authenticated = true;
+                if (!is_authenticated) {
+                    auto ah = req.get_header_value("Authorization");
+                    if (ah.size() > 7 && ah.substr(0, 7) == "Bearer " && api_token_store_) {
+                        if (api_token_store_->validate_token(ah.substr(7)))
+                            is_authenticated = true;
+                    }
+                }
+                if (!is_authenticated) {
+                    auto xh = req.get_header_value("X-Yuzu-Token");
+                    if (!xh.empty() && api_token_store_ && api_token_store_->validate_token(xh))
+                        is_authenticated = true;
+                }
+            }
+            if (is_authenticated) {
+                auto ph = process_health_sampler_.sample();
+                health["system"] = {
+                    {"cpu_percent", ph.cpu_percent},
+                    {"memory_rss_bytes", static_cast<int64_t>(ph.memory_rss_bytes)},
+                    {"memory_vss_bytes", static_cast<int64_t>(ph.memory_vss_bytes)},
+                    {"grpc_connections", static_cast<int>(online)},
+                    {"command_queue_depth", in_flight}};
+            }
 
             res.set_content(health.dump(), "application/json");
         });
@@ -5947,6 +6010,12 @@ private:
 
                              auto online = registry_.agent_count();
 
+                             // Process health for dashboard
+                             auto ph = process_health_sampler_.sample();
+                             auto rss_mb = ph.memory_rss_bytes / (1024 * 1024);
+                             char cpu_buf[16];
+                             std::snprintf(cpu_buf, sizeof(cpu_buf), "%.1f", ph.cpu_percent);
+
                              // Only render the strip if there are issues
                              if (all_ok && in_flight == 0) {
                                  // Minimal healthy summary
@@ -5959,6 +6028,8 @@ private:
                                      "<span>Server healthy</span>"
                                      "<span>Uptime: " + uptime_str + "</span>"
                                      "<span>Agents online: " + std::to_string(online) + "</span>"
+                                     "<span>CPU: " + std::string(cpu_buf) + "%</span>"
+                                     "<span>Mem: " + std::to_string(rss_mb) + " MB</span>"
                                      "</div>";
                                  res.set_content(html, "text/html; charset=utf-8");
                                  return;
@@ -5983,6 +6054,8 @@ private:
 
                              html += "<span>Uptime: " + uptime_str + "</span>";
                              html += "<span>Agents: " + std::to_string(online) + "</span>";
+                             html += "<span>CPU: " + std::string(cpu_buf) + "%</span>";
+                             html += "<span>Mem: " + std::to_string(rss_mb) + " MB</span>";
                              if (in_flight > 0)
                                  html += "<span>In-flight: " + std::to_string(in_flight) + "</span>";
 
@@ -10803,6 +10876,7 @@ private:
     std::unique_ptr<WorkflowEngine> workflow_engine_;
     std::unique_ptr<ProductPackStore> product_pack_store_;
     std::chrono::steady_clock::time_point server_start_time_{std::chrono::steady_clock::now()};
+    detail::ProcessHealthSampler process_health_sampler_;
 
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
