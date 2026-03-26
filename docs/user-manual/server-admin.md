@@ -159,7 +159,7 @@ HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server sta
 
 1. Navigate to **Settings > TLS Configuration**.
 2. Toggle **Enable HTTPS**.
-3. Upload PEM-encoded certificate and private key files using the upload form.
+3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
 4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.
 
 ### Certificate Requirements
@@ -440,6 +440,9 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/fragments/settings/tls` | Render the TLS configuration fragment (HTMX). |
 | `POST` | `/api/settings/tls` | Update TLS settings (enable/disable, port). |
 | `POST` | `/api/settings/cert-upload` | Upload PEM certificate and key files (multipart form). |
+| `POST` | `/api/settings/cert-paste` | Paste PEM certificate content (form-encoded). |
+| `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). |
+| `POST` | `/api/settings/oidc/test` | Test OIDC discovery endpoint connectivity. |
 
 ### Users
 

@@ -3833,6 +3833,27 @@ private:
                cert_name +
                "</span>"
                "      </form>"
+               "      <div style=\"margin-top:0.5rem\">"
+               "        <button type=\"button\" class=\"btn btn-secondary\" "
+               "          onclick=\"var t=document.getElementById('paste-cert'); "
+               "                   t.style.display=t.style.display==='none'?'block':'none'\">"
+               "          Paste PEM</button>"
+               "        <div id=\"paste-cert\" style=\"display:none;margin-top:0.5rem\">"
+               "          <form hx-post=\"/api/settings/cert-paste\" "
+               "                hx-target=\"#tls-section\" hx-swap=\"innerHTML\">"
+               "            <input type=\"hidden\" name=\"type\" value=\"cert\">"
+               "            <textarea name=\"content\" "
+               "              style=\"width:100%;min-height:150px;font-family:monospace;"
+               "                     font-size:0.75rem;background:var(--bg);color:var(--fg);"
+               "                     border:1px solid var(--border);border-radius:4px;"
+               "                     padding:0.5rem;resize:vertical\" "
+               "              placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
+               "-----END CERTIFICATE-----\"></textarea>"
+               "            <button type=\"submit\" class=\"btn btn-primary\" "
+               "              style=\"margin-top:0.5rem\">Save</button>"
+               "          </form>"
+               "        </div>"
+               "      </div>"
                "    </div>"
                "  </div>"
                "  <div class=\"form-row\">"
@@ -3853,6 +3874,27 @@ private:
                key_name +
                "</span>"
                "      </form>"
+               "      <div style=\"margin-top:0.5rem\">"
+               "        <button type=\"button\" class=\"btn btn-secondary\" "
+               "          onclick=\"var t=document.getElementById('paste-key'); "
+               "                   t.style.display=t.style.display==='none'?'block':'none'\">"
+               "          Paste PEM</button>"
+               "        <div id=\"paste-key\" style=\"display:none;margin-top:0.5rem\">"
+               "          <form hx-post=\"/api/settings/cert-paste\" "
+               "                hx-target=\"#tls-section\" hx-swap=\"innerHTML\">"
+               "            <input type=\"hidden\" name=\"type\" value=\"key\">"
+               "            <textarea name=\"content\" "
+               "              style=\"width:100%;min-height:150px;font-family:monospace;"
+               "                     font-size:0.75rem;background:var(--bg);color:var(--fg);"
+               "                     border:1px solid var(--border);border-radius:4px;"
+               "                     padding:0.5rem;resize:vertical\" "
+               "              placeholder=\"-----BEGIN PRIVATE KEY-----&#10;...paste PEM content...&#10;"
+               "-----END PRIVATE KEY-----\"></textarea>"
+               "            <button type=\"submit\" class=\"btn btn-primary\" "
+               "              style=\"margin-top:0.5rem\">Save</button>"
+               "          </form>"
+               "        </div>"
+               "      </div>"
                "    </div>"
                "  </div>"
                "  <div class=\"form-row\">"
@@ -3873,6 +3915,27 @@ private:
                ca_name +
                "</span>"
                "      </form>"
+               "      <div style=\"margin-top:0.5rem\">"
+               "        <button type=\"button\" class=\"btn btn-secondary\" "
+               "          onclick=\"var t=document.getElementById('paste-ca'); "
+               "                   t.style.display=t.style.display==='none'?'block':'none'\">"
+               "          Paste PEM</button>"
+               "        <div id=\"paste-ca\" style=\"display:none;margin-top:0.5rem\">"
+               "          <form hx-post=\"/api/settings/cert-paste\" "
+               "                hx-target=\"#tls-section\" hx-swap=\"innerHTML\">"
+               "            <input type=\"hidden\" name=\"type\" value=\"ca\">"
+               "            <textarea name=\"content\" "
+               "              style=\"width:100%;min-height:150px;font-family:monospace;"
+               "                     font-size:0.75rem;background:var(--bg);color:var(--fg);"
+               "                     border:1px solid var(--border);border-radius:4px;"
+               "                     padding:0.5rem;resize:vertical\" "
+               "              placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
+               "-----END CERTIFICATE-----\"></textarea>"
+               "            <button type=\"submit\" class=\"btn btn-primary\" "
+               "              style=\"margin-top:0.5rem\">Save</button>"
+               "          </form>"
+               "        </div>"
+               "      </div>"
                "    </div>"
                "  </div>"
                "</div>"
@@ -5162,58 +5225,101 @@ private:
 
         bool oidc_configured = !cfg_.oidc_issuer.empty() && !cfg_.oidc_client_id.empty();
 
+        // Status badge
         if (oidc_configured) {
-            html += "<div class=\"form-row\">"
-                    "  <label>OIDC Status</label>"
-                    "  <span style=\"font-size:0.8rem;color:#3fb950;font-weight:600\">Configured</span>"
+            html += "<div style=\"margin-bottom:1rem\">"
+                    "  <span style=\"font-size:0.75rem;background:#238636;color:#fff;"
+                    "padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">"
+                    "Configured</span>"
                     "</div>";
-            html += "<div class=\"form-row\">"
-                    "  <label>Issuer</label>"
-                    "  <code style=\"font-size:0.75rem;word-break:break-all\">" + html_escape(cfg_.oidc_issuer) + "</code>"
-                    "</div>";
-            html += "<div class=\"form-row\">"
-                    "  <label>Client ID</label>"
-                    "  <code style=\"font-size:0.75rem\">" + html_escape(cfg_.oidc_client_id) + "</code>"
-                    "</div>";
-            html += "<div class=\"form-row\">"
-                    "  <label>Client Secret</label>"
-                    "  <span style=\"font-size:0.8rem;color:#8b949e\">" +
-                    (cfg_.oidc_client_secret.empty() ? std::string("Not set") : std::string("********")) +
-                    "</span></div>";
-            html += "<div class=\"form-row\">"
-                    "  <label>Redirect URI</label>"
-                    "  <code style=\"font-size:0.75rem\">" +
-                    (cfg_.oidc_redirect_uri.empty() ? std::string("(auto-computed)") : html_escape(cfg_.oidc_redirect_uri)) +
-                    "</code></div>";
-            html += "<div class=\"form-row\">"
-                    "  <label>Admin Group ID</label>"
-                    "  <code style=\"font-size:0.75rem\">" +
-                    (cfg_.oidc_admin_group.empty() ? std::string("(not set)") : html_escape(cfg_.oidc_admin_group)) +
-                    "</code></div>";
         } else {
-            html += "<div style=\"opacity:0.5\">"
-                    "<div class=\"form-row\">"
-                    "  <label>Auth Source</label>"
-                    "  <select disabled>"
-                    "    <option>Local accounts</option>"
-                    "    <option>Active Directory</option>"
-                    "    <option>Microsoft Entra ID</option>"
-                    "  </select>"
-                    "</div>"
-                    "<div class=\"form-row\">"
-                    "  <label>Inherit roles from</label>"
-                    "  <select disabled>"
-                    "    <option>Manual assignment</option>"
-                    "    <option>AD Security Groups</option>"
-                    "    <option>Entra Roles</option>"
-                    "  </select>"
-                    "</div>"
-                    "</div>"
-                    "<p style=\"font-size:0.75rem;color:#8b949e;margin-top:0.75rem\">"
-                    "OIDC SSO is not configured. Use <code>--oidc-issuer</code> and "
-                    "<code>--oidc-client-id</code> to enable. "
-                    "AD/Entra directory integration is planned for a future release.</p>";
+            html += "<div style=\"margin-bottom:1rem\">"
+                    "  <span style=\"font-size:0.75rem;background:#9e6a03;color:#fff;"
+                    "padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">"
+                    "Not configured</span>"
+                    "</div>";
         }
+
+        // Editable OIDC form
+        html += "<form hx-post=\"/api/settings/oidc\" "
+                "hx-target=\"#directory-section\" hx-swap=\"innerHTML\">";
+
+        // Issuer URL
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Issuer URL</label>"
+                "  <input type=\"text\" name=\"issuer\" "
+                "value=\"" + html_escape(cfg_.oidc_issuer) + "\" "
+                "placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\" "
+                "style=\"flex:1;min-width:0\">"
+                "</div>";
+
+        // Client ID
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Client ID</label>"
+                "  <input type=\"text\" name=\"client_id\" "
+                "value=\"" + html_escape(cfg_.oidc_client_id) + "\" "
+                "placeholder=\"Application (client) ID from Azure portal\" "
+                "style=\"flex:1;min-width:0\">"
+                "</div>";
+
+        // Client Secret (password field — show placeholder if already set)
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Client Secret</label>"
+                "  <input type=\"password\" name=\"client_secret\" "
+                "value=\"\" "
+                "placeholder=\"" +
+                (cfg_.oidc_client_secret.empty()
+                     ? std::string("Client secret value")
+                     : std::string("********")) +
+                "\" "
+                "style=\"flex:1;min-width:0\">"
+                "</div>";
+
+        // Redirect URI
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Redirect URI</label>"
+                "  <input type=\"text\" name=\"redirect_uri\" "
+                "value=\"" + html_escape(cfg_.oidc_redirect_uri) + "\" "
+                "placeholder=\"(auto-computed from web address)\" "
+                "style=\"flex:1;min-width:0\">"
+                "</div>";
+
+        // Admin Group ID
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Admin Group ID</label>"
+                "  <input type=\"text\" name=\"admin_group\" "
+                "value=\"" + html_escape(cfg_.oidc_admin_group) + "\" "
+                "placeholder=\"Entra group object ID for admin role mapping\" "
+                "style=\"flex:1;min-width:0\">"
+                "</div>";
+
+        // Skip TLS Verify (toggle checkbox)
+        std::string tls_checked = cfg_.oidc_skip_tls_verify ? " checked" : "";
+        html += "<div class=\"form-row\">"
+                "  <label style=\"min-width:140px\">Skip TLS Verify</label>"
+                "  <label class=\"toggle\">"
+                "    <input type=\"checkbox\" name=\"skip_tls_verify\" value=\"true\"" +
+                tls_checked +
+                ">"
+                "    <span class=\"slider\"></span>"
+                "  </label>"
+                "  <span style=\"font-size:0.7rem;color:#f85149;margin-left:0.5rem\">"
+                "Insecure — dev only</span>"
+                "</div>";
+
+        // Buttons row
+        html += "<div style=\"margin-top:1rem;display:flex;gap:0.75rem;align-items:center\">"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Save OIDC Configuration</button>"
+                "  <button class=\"btn btn-secondary\" type=\"button\" "
+                "hx-post=\"/api/settings/oidc/test\" "
+                "hx-target=\"#oidc-feedback\" hx-swap=\"innerHTML\" "
+                "hx-include=\"closest form\">Test Connection</button>"
+                "</div>";
+
+        html += "</form>";
+
+        // Feedback div
+        html += "<div class=\"feedback\" id=\"oidc-feedback\"></div>";
 
         return html;
     }
@@ -6570,6 +6676,297 @@ private:
                 R"({"showToast":{"message":"Certificate uploaded","level":"success"}})");
             res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
         });
+
+        // -- Settings API: Paste PEM content (admin only, HTMX) ----------------
+        web_server_->Post("/api/settings/cert-paste", [this](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            if (!require_admin(req, res))
+                return;
+
+            auto type = extract_form_value(req.body, "type");
+            auto content = extract_form_value(req.body, "content");
+
+            if (type.empty() || content.empty()) {
+                res.status = 400;
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content("<span class=\"feedback-error\">Type and PEM content are required.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+
+            // Basic PEM validation
+            if (content.find("-----BEGIN") == std::string::npos) {
+                res.status = 400;
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content(
+                    "<span class=\"feedback-error\">Invalid PEM: must start with -----BEGIN.</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            // Normalize line endings: strip \r so we always write \n
+            std::erase(content, '\r');
+
+            // Determine output filename
+            std::string out_name;
+            if (type == "cert")
+                out_name = "server.pem";
+            else if (type == "key")
+                out_name = "server-key.pem";
+            else if (type == "ca")
+                out_name = "ca.pem";
+            else {
+                res.status = 400;
+                res.set_header("HX-Retarget", "#tls-section");
+                res.set_content(
+                    "<span class=\"feedback-error\">Type must be cert, key, or ca.</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            // Ensure cert dir exists
+            auto cert_dir = auth::default_cert_dir();
+            std::error_code ec;
+            std::filesystem::create_directories(cert_dir, ec);
+            if (ec) {
+                res.status = 500;
+                res.set_content(
+                    "<span class=\"feedback-error\">Cannot create cert directory.</span>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+
+            auto out_path = cert_dir / out_name;
+            {
+                std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                if (!f.is_open()) {
+                    res.status = 500;
+                    res.set_content("<span class=\"feedback-error\">Cannot write cert file.</span>",
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                f.write(content.data(), static_cast<std::streamsize>(content.size()));
+            }
+
+            // Set restrictive permissions for private key files
+#ifndef _WIN32
+            if (type == "key") {
+                std::filesystem::permissions(out_path,
+                    std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                    std::filesystem::perm_options::replace);
+            }
+#endif
+
+            // Update config
+            if (type == "cert")
+                cfg_.tls_server_cert = out_path;
+            else if (type == "key")
+                cfg_.tls_server_key = out_path;
+            else if (type == "ca")
+                cfg_.tls_ca_cert = out_path;
+
+            spdlog::info("Certificate pasted: {} → {}", type, out_path.string());
+            audit_log(req, "cert.paste", "success", "Certificate", type, "");
+
+            // Re-render TLS section to show new file paths
+            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Trigger",
+                R"({"showToast":{"message":"Certificate saved from paste","level":"success"}})");
+            res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
+        });
+
+        // -- Settings API: OIDC configuration (admin only, HTMX) ---------------
+        web_server_->Post(
+            "/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res))
+                    return;
+
+                auto issuer = extract_form_value(req.body, "issuer");
+                auto client_id = extract_form_value(req.body, "client_id");
+                auto client_secret = extract_form_value(req.body, "client_secret");
+                auto redirect_uri = extract_form_value(req.body, "redirect_uri");
+                auto admin_group = extract_form_value(req.body, "admin_group");
+                auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
+
+                // Validate required fields
+                if (issuer.empty() || client_id.empty()) {
+                    res.status = 400;
+                    res.set_content(
+                        render_directory_fragment() +
+                        "<script>document.getElementById('oidc-feedback')."
+                        "className='feedback feedback-error';"
+                        "document.getElementById('oidc-feedback').textContent='"
+                        "Issuer URL and Client ID are required.';</script>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+
+                // Update cfg_ fields
+                cfg_.oidc_issuer = issuer;
+                cfg_.oidc_client_id = client_id;
+                // Only overwrite secret if user provided a new one
+                if (!client_secret.empty())
+                    cfg_.oidc_client_secret = client_secret;
+                cfg_.oidc_redirect_uri = redirect_uri;
+                cfg_.oidc_admin_group = admin_group;
+                cfg_.oidc_skip_tls_verify = (skip_tls_verify == "true");
+
+                // Reinitialize OIDC provider
+                try {
+                    oidc::OidcConfig oidc_cfg;
+                    oidc_cfg.issuer = cfg_.oidc_issuer;
+                    oidc_cfg.client_id = cfg_.oidc_client_id;
+                    oidc_cfg.client_secret = cfg_.oidc_client_secret;
+                    oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
+                    oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
+                    oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+                    if (cfg_.oidc_skip_tls_verify)
+                        spdlog::warn("OIDC TLS certificate verification DISABLED — do not use in production");
+
+                    // Compute endpoints from issuer (Entra v2.0 pattern)
+                    auto iss = cfg_.oidc_issuer;
+                    auto v2_pos = iss.rfind("/v2.0");
+                    if (v2_pos != std::string::npos) {
+                        auto base = iss.substr(0, v2_pos);
+                        oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
+                        oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
+                    } else {
+                        oidc_cfg.authorization_endpoint = iss + "/authorize";
+                        oidc_cfg.token_endpoint = iss + "/token";
+                    }
+
+                    // Locate token exchange helper script
+                    auto script_dir =
+                        std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
+                        "scripts" / "oidc_token_exchange.py";
+                    auto src_script =
+                        std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
+                    if (std::filesystem::exists(src_script))
+                        oidc_cfg.exchange_script = src_script.string();
+                    else if (std::filesystem::exists(script_dir))
+                        oidc_cfg.exchange_script = script_dir.string();
+
+                    oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
+                    spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", cfg_.oidc_issuer);
+                } catch (const std::exception& e) {
+                    spdlog::error("OIDC provider reinit failed: {}", e.what());
+                    res.status = 500;
+                    res.set_content(
+                        render_directory_fragment() +
+                        "<script>document.getElementById('oidc-feedback')."
+                        "className='feedback feedback-error';"
+                        "document.getElementById('oidc-feedback').textContent='"
+                        "OIDC init failed: " + html_escape(e.what()) + "';</script>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+
+                audit_log(req, "oidc.configure", "success", "OidcConfig", cfg_.oidc_issuer, "");
+
+                res.set_header("HX-Trigger",
+                    R"({"showToast":{"message":"OIDC configuration saved","level":"success"}})");
+                res.set_content(render_directory_fragment(), "text/html; charset=utf-8");
+            });
+
+        // -- Settings API: OIDC test connection (admin only, HTMX) --------------
+        web_server_->Post(
+            "/api/settings/oidc/test", [this](const httplib::Request& req, httplib::Response& res) {
+                if (!require_admin(req, res))
+                    return;
+
+                auto issuer = extract_form_value(req.body, "issuer");
+                auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
+                bool skip_tls = (skip_tls_str == "true") || cfg_.oidc_skip_tls_verify;
+
+                // Use form value if provided, otherwise use current cfg
+                if (issuer.empty())
+                    issuer = cfg_.oidc_issuer;
+
+                if (issuer.empty()) {
+                    res.set_content(
+                        "<span class=\"feedback-error\">Enter an Issuer URL first.</span>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+
+                auto discovery_url = issuer;
+                if (!discovery_url.ends_with("/"))
+                    discovery_url += "/";
+                discovery_url += ".well-known/openid-configuration";
+
+                try {
+                    // Parse URL for httplib
+                    std::string url = discovery_url;
+                    std::string scheme;
+                    if (url.starts_with("https://")) {
+                        scheme = "https://";
+                        url = url.substr(8);
+                    } else if (url.starts_with("http://")) {
+                        scheme = "http://";
+                        url = url.substr(7);
+                    } else {
+                        res.set_content(
+                            "<span class=\"feedback-error\">Invalid issuer URL scheme (must be http or https).</span>",
+                            "text/html; charset=utf-8");
+                        return;
+                    }
+                    auto slash = url.find('/');
+                    auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
+                    auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
+
+                    // Heap-allocated client to avoid httplib SSLClient destructor issues
+                    auto client = std::make_unique<httplib::Client>(scheme + host);
+                    client->set_connection_timeout(10);
+                    client->set_read_timeout(10);
+                    client->enable_server_certificate_verification(!skip_tls);
+
+                    auto result = client->Get(path);
+
+                    // Copy result before destroying the client
+                    int status_code = result ? result->status : 0;
+                    std::string body_copy = result ? result->body : "";
+                    std::string err_str = result ? "" : httplib::to_string(result.error());
+                    client.reset(); // Explicit destroy before any return
+
+                    if (status_code == 200) {
+                        // Verify it looks like a valid discovery document
+                        auto j = nlohmann::json::parse(body_copy);
+                        std::string auth_ep = j.value("authorization_endpoint", "");
+                        std::string token_ep = j.value("token_endpoint", "");
+                        if (!auth_ep.empty() && !token_ep.empty()) {
+                            res.set_content(
+                                "<span class=\"feedback-ok\" style=\"color:#3fb950;font-size:0.8rem\">"
+                                "Connected &#x2014; discovered authorization and token endpoints</span>",
+                                "text/html; charset=utf-8");
+                        } else {
+                            res.set_content(
+                                "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                                "Discovery succeeded but missing authorization/token endpoints.</span>",
+                                "text/html; charset=utf-8");
+                        }
+                    } else if (status_code == 0) {
+                        res.set_content(
+                            "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                            "Discovery failed: " + html_escape(err_str) + "</span>",
+                            "text/html; charset=utf-8");
+                    } else {
+                        res.set_content(
+                            "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                            "Discovery failed: HTTP " + std::to_string(status_code) + "</span>",
+                            "text/html; charset=utf-8");
+                    }
+                } catch (const nlohmann::json::exception& e) {
+                    res.set_content(
+                        "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                        "Discovery response is not valid JSON: " + html_escape(e.what()) + "</span>",
+                        "text/html; charset=utf-8");
+                } catch (const std::exception& e) {
+                    res.set_content(
+                        "<span class=\"feedback-error\" style=\"color:#f85149;font-size:0.8rem\">"
+                        "Discovery failed: " + html_escape(e.what()) + "</span>",
+                        "text/html; charset=utf-8");
+                }
+            });
 
         // -- Settings API: User management (admin only, HTMX) ------------------
         web_server_->Post(

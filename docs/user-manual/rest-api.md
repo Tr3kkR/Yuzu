@@ -1787,6 +1787,53 @@ Get the status of a running or completed workflow execution, including per-step 
 
 ---
 
+### Settings — OIDC Configuration
+
+**`POST /api/settings/oidc`** — Save OIDC / Entra ID SSO configuration.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `issuer` | string | Yes | OIDC issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
+| `client_id` | string | Yes | Application (client) ID from Azure portal |
+| `client_secret` | string | No | Client secret value. If empty and a secret already exists, the existing secret is preserved. |
+| `redirect_uri` | string | No | Callback URL. If empty, auto-computed from web address/port. |
+| `admin_group` | string | No | Entra group object ID for admin role mapping |
+| `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
+
+- **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration. No server restart required.
+
+**`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):** `issuer`, `skip_tls_verify`
+- **Response:** HTML feedback span — green on success, red on failure with specific error.
+
+### Settings — Certificate Management
+
+**`POST /api/settings/cert-upload`** — Upload PEM certificate file.
+
+- **Permission:** Admin only
+- **Request body (multipart/form-data):** `type` (cert|key|ca), `file` (.pem/.crt/.cer)
+
+**`POST /api/settings/cert-paste`** — Paste PEM certificate content.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | `cert` (server certificate), `key` (private key), or `ca` (CA certificate) |
+| `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
+
+- **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
+- **Effect:** Writes PEM content to the server cert directory. Key files are set to 0600 permissions. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+
+---
+
 ## Legacy API Endpoints
 
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.

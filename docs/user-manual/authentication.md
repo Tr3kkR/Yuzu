@@ -99,6 +99,14 @@ Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been test
 
 ### Server Configuration
 
+OIDC can be configured in two ways:
+
+**Option 1: Dashboard Settings (recommended)**
+
+Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery, then "Save OIDC Configuration". Changes take effect immediately — no server restart required.
+
+**Option 2: CLI flags**
+
 | Flag | Description |
 |---|---|
 | `--oidc-issuer` | Issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
@@ -106,6 +114,7 @@ Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been test
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
 | `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
 | `--oidc-admin-group` | Entra group object ID that maps to the admin role |
+| `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 Example startup:
 
