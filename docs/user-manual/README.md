@@ -10,7 +10,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 
 | Section | Description |
 |---|---|
-| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, and device lifecycle |
+| [Device Management](device-management.md) | Agent enrollment (3-tier), heartbeat, identity, OTA updates, custom properties, device discovery, and deployment jobs |
 | [Authentication](authentication.md) | Login, session management, mTLS, and Windows certificate store integration |
 | [RBAC](rbac.md) | Role-based access control -- principals, roles, securable types, per-operation permissions |
 | [Asset Tagging](../asset-tagging-guide.md) | Structured tags (role, environment, location, service), categories, and tag compliance |
@@ -28,7 +28,24 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
-| [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, and production hardening |
+| [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, quarantine, IOC checking, certificate inventory, and production hardening |
+
+### Feature Guides (Inline)
+
+The following features are documented within the files listed above:
+
+| Feature | Location | Description |
+|---|---|---|
+| Custom Device Properties | [Device Management](device-management.md#custom-device-properties) | Typed key-value properties on devices with schema validation and scope integration |
+| Device Discovery | [Device Management](device-management.md#device-discovery) | Subnet scanning to find unmanaged devices |
+| Deployment Jobs | [Device Management](device-management.md#deployment-jobs) | Push agent installation to discovered endpoints |
+| Device Quarantine | [Security Hardening](security-hardening.md#device-quarantine) | Network isolation for compromised devices |
+| IOC Checking | [Security Hardening](security-hardening.md#ioc-checking) | Indicator of Compromise scanning for threat hunting |
+| Certificate Inventory | [Security Hardening](security-hardening.md#certificate-inventory) | System certificate enumeration, inspection, and deletion |
+| WiFi & WoL | [Agent Plugins](agent-plugins.md#wifi) | WiFi network scanning and Wake-on-LAN magic packets |
+| Patch Management | [REST API](rest-api-reference.md) | Patch deployment, status tracking, and fleet compliance (via `PatchManager`) |
+| Webhooks | [REST API](rest-api-reference.md) | Event-driven HTTP notifications to external systems |
+| Product Packs | [REST API](rest-api-reference.md) | Signed YAML bundles containing definitions, policies, and templates |
 
 ### Operations Guides
 
@@ -66,4 +83,4 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 - [Architecture Overview](../architecture.md) -- system design and component interactions
 - [YAML DSL Specification](../yaml-dsl-spec.md) -- formal spec for instruction definitions
 - [Roadmap](../roadmap.md) -- planned features and issue tracking
-- [Capability Map](../capability-map.md) -- 142 capabilities across 24 domains
+- [Capability Map](../capability-map.md) -- 184 capabilities across 24 domains

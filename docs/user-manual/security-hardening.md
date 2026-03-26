@@ -194,6 +194,93 @@ The agent tracks recently-executed `command_id` values per connection and reject
 
 No additional configuration is required — replay protection is always active.
 
+## Device Quarantine
+
+The `quarantine` agent plugin isolates compromised or suspicious devices by blocking all network traffic except the Yuzu server connection. This allows continued management while preventing lateral movement.
+
+### Quarantining a Device
+
+Execute the `quarantine` action from the `quarantine` plugin:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "quarantine.quarantine",
+    "scope": "agent_id == \"compromised-agent-id\""
+  }'
+```
+
+The plugin blocks all network traffic except communication with the Yuzu server using platform-native firewalling: `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS.
+
+### Checking Quarantine Status
+
+```bash
+# Execute quarantine.status to check if an agent is isolated
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "quarantine.status",
+    "scope": "agent_id == \"agent-id\""
+  }'
+```
+
+### Releasing a Device
+
+Execute the `unquarantine` action to remove quarantine rules and restore normal network access. You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before releasing.
+
+## IOC Checking
+
+The `ioc` plugin supports Indicator of Compromise checking for threat hunting. Execute the `check` action with one or more indicator types to scan an endpoint for signs of compromise.
+
+### Supported Indicator Types
+
+| Type | Description |
+|---|---|
+| `ip_addresses` | Check active TCP/UDP connections against known-bad IPs |
+| `domains` | Check DNS cache and hosts file against known-bad domains |
+| `file_hashes` | Scan specified paths for files matching known-bad SHA-256 hashes |
+| `file_paths` | Check for the existence of specific suspicious file paths |
+| `ports` | Check for processes listening on suspicious ports |
+
+### Running an IOC Check
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "ioc.check",
+    "parameters": {
+      "ip_addresses": ["203.0.113.50", "198.51.100.23"],
+      "file_hashes": ["e3b0c44298fc1c149afbf4c8996fb924..."],
+      "ports": ["4444", "5555"]
+    },
+    "scope": "tag:env == \"production\""
+  }'
+```
+
+IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
+
+## Certificate Inventory
+
+The `certificates` plugin enumerates certificates in system stores for compliance auditing, expiration monitoring, and security review.
+
+### Listing Certificates
+
+Execute the `certificates.list` action to get all certificates with subject, issuer, thumbprint, and expiry date. Use `certificates.details` with a thumbprint parameter for full certificate details including key usage, serial number, and chain information.
+
+### Certificate Deletion
+
+Execute the `certificates.delete` action with a thumbprint parameter to remove a certificate from the system store. This is useful for revoking compromised certificates or cleaning up expired entries.
+
+Platform implementations:
+- **Windows:** CryptoAPI (`CertOpenStore`, `CertEnumCertificatesInStore`)
+- **Linux:** PEM files in `/etc/ssl/certs/`
+- **macOS:** `security find-certificate` CLI
+
 ## OIDC Hardening
 
 When using OIDC/Entra ID:

@@ -387,16 +387,132 @@ Unless noted, these endpoints accept form-encoded parameters and return HTML fra
 
 ---
 
-## Planned Features
+## Custom Device Properties
 
-### Agent Deployment Jobs (Phase 7.7)
+Administrators can define typed key-value properties on devices beyond the built-in identity fields and structured tags. Properties support four types: `string`, `int`, `bool`, and `datetime`.
 
-_Not yet implemented._ Server-initiated installer push to deploy the Yuzu agent to new endpoints without manual installation. Will support WinRM, SSH, and GPO-based deployment strategies.
+### Property Schemas
 
-### Device Discovery (Phase 7.18)
+Before setting properties, define a schema to enforce type and validation rules.
 
-_Not yet implemented._ Automated discovery of unmanaged devices via subnet scanning, Active Directory computer object import, and DHCP lease table import. Discovered devices will appear in a "discovered but unenrolled" list with one-click deployment.
+**Create a schema:**
 
-### Custom Device Properties (Phase 7.6)
+```bash
+curl -s -X POST http://localhost:8080/api/v1/custom-properties/schemas \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "key": "asset_owner",
+    "type": "string",
+    "description": "Department or individual responsible for this device",
+    "validation_regex": "^[a-zA-Z0-9_ -]{1,128}$"
+  }'
+```
 
-_Not yet implemented._ Administrator-defined key/value properties attached to devices beyond the built-in identity fields and structured tags. Will support typed properties (string, integer, date) with validation rules and scope engine integration.
+Supported types: `string`, `int`, `bool`, `datetime`. Key names must be 1-64 characters matching `[a-zA-Z0-9_.-:]`. Values are limited to 1024 bytes.
+
+### Setting Properties
+
+```bash
+curl -s -X PUT http://localhost:8080/api/v1/devices/agent-001/properties/asset_owner \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "IT Operations"}'
+```
+
+### Using Properties in Scope Expressions
+
+Custom properties are available in scope expressions using the `props.<key>` syntax:
+
+```
+props.asset_owner == "IT Operations" AND ostype == "windows"
+```
+
+---
+
+## Device Discovery
+
+Discover unmanaged devices on your network using the `discovery` agent plugin and server-side discovery store.
+
+### Running a Subnet Scan
+
+Execute the `scan_subnet` action from the `discovery` plugin against an agent on the target subnet:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/executions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition_id": "discovery.scan_subnet",
+    "parameters": {"subnet": "192.168.1.0/24"},
+    "scope": "agent_id == \"agent-on-target-subnet\""
+  }'
+```
+
+The plugin performs an ARP scan and ping sweep, returning discovered hosts with IP address, MAC address, resolved hostname, and whether the host is already managed by Yuzu.
+
+### Viewing Discovered Devices
+
+```bash
+curl -s http://localhost:8080/api/v1/discovery \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Marking a Device as Managed
+
+When a discovered device is enrolled, link it to the enrolled agent:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/discovery/{device_id}/mark-managed \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "a3f1c9e2-7b4d-..."}'
+```
+
+---
+
+## Deployment Jobs
+
+Deploy the Yuzu agent to discovered or known endpoints without manual installation. Deployment jobs target hosts by IP address and support multiple deployment methods.
+
+### Creating a Deployment Job
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/deployment-jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Deploy to office subnet",
+    "targets": ["192.168.1.10", "192.168.1.11", "192.168.1.12"],
+    "method": "ssh",
+    "os": "linux"
+  }'
+```
+
+Supported deployment methods: `ssh`, `group_policy`, `manual`.
+
+### Job Lifecycle
+
+Jobs progress through the following states:
+
+| State | Description |
+|---|---|
+| `pending` | Job created, not yet started |
+| `running` | Deployment in progress |
+| `completed` | All targets successfully deployed |
+| `failed` | One or more targets failed |
+| `cancelled` | Job was cancelled by an administrator |
+
+### Monitoring Job Status
+
+```bash
+curl -s http://localhost:8080/api/v1/deployment-jobs/{job_id} \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Cancelling a Job
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/deployment-jobs/{job_id}/cancel \
+  -H "Authorization: Bearer $TOKEN"
+```

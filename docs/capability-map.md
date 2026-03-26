@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 1.2 | **Date:** 2026-03-20 | **Status:** Draft
+**Version:** 2.0 | **Date:** 2026-03-26 | **Status:** Draft
 
 ---
 
@@ -28,10 +28,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [======================--------]   60/87 done   (69%)
-Future       [===-----------------------------]   2/22 done   (9%)
+Advanced     [===========================---]   90/101 done  (89%)
+Future       [=============================---]  27/50 done  (54%)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================-------]   96/142 done  (68%)
+Overall      [===========================---]  150/184 done  (82%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -39,28 +39,28 @@ Overall      [=======================-------]   96/142 done  (68%)
 | 1. Agent Lifecycle | 9 | 8 | 0 | 1 |
 | 2. Command Execution | 13 | 13 | 0 | 0 |
 | 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
-| 4. Network Info & Discovery | 11 | 6 | 0 | 5 |
+| 4. Network Info & Discovery | 11 | 9 | 0 | 2 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
-| 6. User & Session Mgmt | 5 | 1 | 0 | 4 |
+| 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
 | 7. Software & App Mgmt | 6 | 5 | 0 | 1 |
-| 8. Patch & Update Mgmt | 9 | 1 | 1 | 7 |
-| 9. Security & Compliance | 10 | 5 | 0 | 5 |
-| 10. File System Operations | 15 | 7 | 0 | 8 |
+| 8. Patch & Update Mgmt | 9 | 5 | 2 | 2 |
+| 9. Security & Compliance | 10 | 9 | 0 | 1 |
+| 10. File System Operations | 15 | 10 | 0 | 5 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
 | 12. Registry & System Config | 7 | 7 | 0 | 0 |
 | 13. Content Distribution | 5 | 4 | 0 | 1 |
 | 14. User Interaction | 6 | 3 | 0 | 3 |
-| 15. Inventory & Data Collection | 5 | 2 | 0 | 3 |
+| 15. Inventory & Data Collection | 5 | 3 | 0 | 2 |
 | 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 9 | 6 | 0 | 3 |
-| 19. Device & Group Mgmt | 7 | 3 | 0 | 4 |
+| 18. Auth & Authorization | 9 | 8 | 0 | 1 |
+| 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
-| 21. Notifications & Audit | 5 | 2 | 0 | 3 |
-| 22. System & Infrastructure | 8 | 0 | 2 | 6 |
+| 21. Notifications & Audit | 5 | 4 | 0 | 1 |
+| 22. System & Infrastructure | 8 | 3 | 1 | 4 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
-| 24. Integration & Extensibility | 10 | 6 | 1 | 3 |
-| **TOTAL** | **142** | **96** | **4** | **42** |
+| 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
+| **TOTAL** | **184** | **150** | **3** | **31** |
 
 ---
 
@@ -250,13 +250,13 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 `network_actions` plugin has flush DNS. `dns_cache` action in `network_config` plugin dumps DNS cache (Windows: `DnsGetCacheDataTable` via dnsapi.dll, Linux: systemd-resolved query).
 
-### 4.6 WiFi Network Enumeration :x: `T2`
+### 4.6 WiFi Network Enumeration :white_check_mark: `T2`
 
-Not implemented. Need to enumerate available WiFi networks with signal strength and security type.
+`wifi` plugin (cross-platform). `list_networks` scans for visible WiFi networks with SSID, signal strength, security type, channel, and BSSID. `connected` reports the currently connected network. Windows: WlanAPI, Linux: nmcli, macOS: airport.
 
-### 4.7 Wake-on-LAN :x: `T2`
+### 4.7 Wake-on-LAN :white_check_mark: `T2`
 
-Not implemented. Requires server-side or peer-originated magic packet.
+`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` pings the host to verify wake. Windows: Winsock2, Linux/macOS: POSIX sockets.
 
 ### 4.8 Network Diagnostics :white_check_mark: `T1`
 
@@ -266,9 +266,9 @@ Not implemented. Requires server-side or peer-originated magic packet.
 
 Not implemented. Legacy reverse lookup on IP addresses.
 
-### 4.10 ARP Scanning (Subnet Discovery) :x: `T3`
+### 4.10 ARP Scanning (Subnet Discovery) :white_check_mark: `T3`
 
-Not implemented. Active scanning to retrieve physical addresses for network discovery.
+`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.
 
 ### 4.11 Port Scanning :x: `T3`
 
@@ -312,21 +312,21 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 `users` plugin (cross-platform).
 
-### 6.2 Primary User Determination :x: `T2`
+### 6.2 Primary User Determination :white_check_mark: `T2`
 
-Not implemented. Requires heuristic (most frequent login, console owner).
+`users` plugin `primary_user` action. Identifies primary user via most-frequent-login heuristic. Linux: parses `last` output. macOS: parses `last` output. Windows: queries Event Log 4624 logon events, falls back to registry ProfileList.
 
-### 6.3 Local Group Membership :x: `T2`
+### 6.3 Local Group Membership :white_check_mark: `T2`
 
-Not implemented. Enumerate members of local groups (Administrators, Remote Desktop Users, etc.).
+`users` plugin `local_admins` action lists Administrators group members. `group_members` action enumerates members of any specified local group. Linux: parses `/etc/group` + checks sudo/wheel. Windows: NetLocalGroupGetMembers API. macOS: dscl.
 
-### 6.4 User Connection History :x: `T2`
+### 6.4 User Connection History :white_check_mark: `T2`
 
-Not implemented. Login/logout audit trail including RDP/Terminal Services history.
+`users` plugin `session_history` action. Historical login/logout records with configurable count (default 50). Cross-platform: parses `last` (Linux/macOS), Windows Event Log logon/logoff events.
 
-### 6.5 Active Session Enumeration :x: `T2`
+### 6.5 Active Session Enumeration :white_check_mark: `T2`
 
-Not implemented. RDP, console, and SSH sessions with state.
+`users` plugin `sessions` action. Lists active interactive sessions (console, RDP, SSH) with user, session type, login time, and state. Cross-platform.
 
 ---
 
@@ -378,25 +378,27 @@ Can execute scripts, but no managed software deployment workflow.
 
 > **Gap:** No cross-platform equivalent. No tracking of updates pending reboot.
 
-### 8.3 Patch Deployment :x: `T2`
+### 8.3 Patch Deployment :white_check_mark: `T2`
 
-Not implemented. Need server-orchestrated patch install (download + install) with reboot control.
+`PatchManager` (794 LOC) with `deploy_patch()` orchestration: scan → download → install → verify → optional reboot. Per-target status tracking (pending, scanning, downloading, installing, verifying, completed, failed, skipped). REST endpoints for deployment CRUD and cancellation.
 
-### 8.4 Patch Status Tracking :x: `T2`
+### 8.4 Patch Status Tracking :white_check_mark: `T2`
 
-Not implemented. Per-device patch compliance state and deployment status tracking.
+`PatchManager` tracks per-device deployment status via `PatchDeploymentTarget`. Per-agent status, error messages, start/complete timestamps. `recalculate_deployment_progress()` maintains aggregate counts. Queryable via REST API.
 
-### 8.5 Patch Metadata Retrieval :x: `T2`
+### 8.5 Patch Metadata Retrieval :white_check_mark: `T2`
 
-Not implemented. KB article details, severity, and supersedence chain.
+`PatchInfo` stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing counts. `get_missing_patches()` and `get_installed_patches()` support severity and agent filtering.
 
-### 8.6 Reboot Management (Post-Patch) :x: `T2`
+### 8.6 Reboot Management (Post-Patch) :large_orange_diamond: `T2`
 
-Not implemented. Scheduled/forced reboot with user notification.
+`PatchDeployment` supports `reboot_if_needed` flag passed through `deploy_patch()`. The flag is stored and propagated to deployment targets.
 
-### 8.7 Update Summary and Compliance Reporting :x: `T2`
+> **Gap:** No scheduled reboot with user notification or countdown. Reboot is a simple flag, not a full reboot orchestration workflow.
 
-Not implemented. Fleet-wide patch compliance dashboard.
+### 8.7 Update Summary and Compliance Reporting :white_check_mark: `T2`
+
+`PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status. Deployment tracking with aggregate progress.
 
 ### 8.8 Patch Connectivity Testing :x: `T2`
 
@@ -434,23 +436,21 @@ Not implemented. Event emission for SIEM/compliance integration.
 
 `event_logs` plugin (cross-platform).
 
-### 9.6 Device Quarantine (Network Isolation) :x: `T2`
+### 9.6 Device Quarantine (Network Isolation) :white_check_mark: `T2`
 
-Not implemented. Disable networking except management channel.
+`quarantine` plugin (cross-platform). `quarantine` action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed `YuzuQuarantine_`). `unquarantine` removes rules and restores access. `status` checks active quarantine state. `whitelist` adds/removes IPs from active quarantine.
 
-> **Need:** Quarantine/unquarantine with whitelist management for incident response.
+### 9.7 Indicator of Compromise (IOC) Checking :white_check_mark: `T2`
 
-### 9.7 Indicator of Compromise (IOC) Checking :x: `T2`
+`ioc` plugin with `check` action. Matches indicators against local endpoint state: `ip_addresses` checked against active TCP/UDP connections, `domains` against DNS cache, `file_hashes` (SHA-256) against files on disk, `file_paths` for existence, `ports` for listening services. Cross-platform: Windows (GetExtendedTcpTable, DnsGetCacheDataTable), Linux (/proc/net/tcp), macOS (lsof).
 
-Not implemented. Hash/IP/domain IOC matching against local state.
+### 9.8 Certificate Inventory (Get/Delete) :white_check_mark: `T2`
 
-### 9.8 Certificate Inventory (Get/Delete) :x: `T2`
+`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: security find-certificate.
 
-Agent reads certs from Windows cert store for mTLS, but no general-purpose cert enumeration or management.
+### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
-### 9.9 Quarantine Status Tracking :x: `T2`
-
-Not implemented. Server-side quarantine state, history, and whitelist management.
+`QuarantineStore` (SQLite backend). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
 
 ### 9.10 Application Whitelisting :x: `T3`
 
@@ -486,13 +486,13 @@ Not implemented. Modify allow/block lists on endpoint security products.
 
 `filesystem` plugin.
 
-### 10.7 File Permissions Inspection :x: `T2`
+### 10.7 File Permissions Inspection :white_check_mark: `T2`
 
-Not implemented. ACL/permission enumeration.
+`filesystem` plugin `get_acl` action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: POSIX `stat()` permissions (owner, group, other, special bits).
 
-### 10.8 Digital Signature Verification :x: `T2`
+### 10.8 Digital Signature Verification :white_check_mark: `T2`
 
-Not implemented. Authenticode/codesign verification.
+`filesystem` plugin `get_signature` action. Windows: Authenticode verification via WinVerifyTrust — reports signature status (valid, invalid, unsigned, untrusted), signer name, and timestamp. Linux/macOS: returns platform-unsupported status.
 
 ### 10.9 File Version Info :x: `T2`
 
@@ -514,9 +514,9 @@ Not implemented. Integrity verification of directory trees.
 
 Not implemented. Pull files from endpoint to server for analysis.
 
-### 10.14 Find File by Size and Hash :x: `T2`
+### 10.14 Find File by Size and Hash :white_check_mark: `T2`
 
-Not implemented. Locate files matching both size and hash criteria for malware hunting.
+`filesystem` plugin `find_by_hash` action. Searches directory trees for files matching a SHA-256 hash. Used for malware hunting and file integrity verification. Recursive search with configurable root path.
 
 ### 10.15 Directory Search by Name :x: `T2`
 
@@ -650,9 +650,9 @@ Not implemented. List all active survey/question responses waiting for user inpu
 
 > **Gap:** No advanced query language (filtering, joins).
 
-### 15.3 Inventory Table Enumeration :x: `T2`
+### 15.3 Inventory Table Enumeration :white_check_mark: `T2`
 
-Not implemented. List available inventory tables and schemas.
+`InventoryStore::list_tables()` returns all distinct inventory "tables" (one per plugin) with agent count and last collection timestamp. REST API endpoint and MCP `list_inventory_tables` tool expose this data.
 
 ### 15.4 Inventory Evaluation (Item Lookup) :x: `T2`
 
@@ -752,17 +752,17 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle.
 
-### 18.4 Management-Group-Scoped Roles :x: `T2`
+### 18.4 Management-Group-Scoped Roles :white_check_mark: `T2`
 
-Not implemented. Role applies to specific device groups only.
+`ManagementGroupStore` supports group-scoped role assignments. `assign_role()` / `unassign_role()` bind principals to roles within a specific group. `get_visible_agents()` resolves which agents a user can see based on their group-scoped roles. REST endpoints at `/api/v1/management-groups/{id}/roles` (GET/POST/DELETE). RBAC integration filters agent lists to respect group-scoped visibility.
 
 ### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 
 `OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active.
 
-### 18.6 Active Directory / Entra Integration :x: `T2`
+### 18.6 Active Directory / Entra Integration :white_check_mark: `T2`
 
-Settings page has greyed-out AD/Entra section. Import users/groups, inherit roles from domain groups.
+`DirectorySync` (1013 LOC). Entra ID sync via Microsoft Graph API (OAuth2 client credentials flow). Fetches `/users` and `/groups`, stores in SQLite. Group-to-role mapping (`configure_group_role_mapping`) maps directory groups to RBAC roles. LDAP sync stub for on-prem AD (full LDAP support planned). REST API endpoints for sync trigger, status, and mapping CRUD. Settings UI section active.
 
 ### 18.7 Token-Based API Authentication :white_check_mark: `T2`
 
@@ -794,21 +794,21 @@ Not implemented. Per-instruction or per-device auth tokens.
 
 750-line recursive-descent `ScopeEngine` parser. 10 binary operators (`==`, `!=`, `LIKE`, `MATCHES`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`) plus 3 extended operators/functions (`EXISTS`, `LEN()`, `STARTSWITH()`), AND/OR/NOT combinators. `MATCHES` uses ECMAScript regex with safe error handling. Attributes: ostype, osver, hostname, arch, fqdn, `tag:*`. Target estimation via `/api/scope/estimate`.
 
-### 19.4 Hierarchical Management Groups :x: `T2`
+### 19.4 Hierarchical Management Groups :white_check_mark: `T2`
 
-Not implemented. Nested groups with membership, access scoping, and SLA sync.
+`ManagementGroupStore` with `parent_id` for nesting. `get_children()` returns direct children. `get_ancestor_ids()` / `get_descendant_ids()` traverse the hierarchy. Static membership (manual add/remove) and dynamic membership (scope expression evaluation via `refresh_dynamic_membership()`). Well-known root group. REST CRUD + hierarchy endpoints. Group-scoped role assignments for access control.
 
-### 19.5 Device Discovery (Unmanaged Endpoints) :x: `T2`
+### 19.5 Device Discovery (Unmanaged Endpoints) :white_check_mark: `T2`
 
-Not implemented. Discover endpoints not yet running the agent.
+`discovery` agent plugin (`scan_subnet` action) performs ARP scan + ping sweep of CIDR subnets. Server-side `DiscoveryStore` persists discovered devices with IP, MAC, hostname, managed status, discovering agent, and subnet. `mark_managed()` links discovered IPs to enrolled agents. REST API for listing and clearing results.
 
-### 19.6 Custom Properties on Devices :x: `T2`
+### 19.6 Custom Properties on Devices :white_check_mark: `T2`
 
-Not implemented. Extensible metadata (key-value or typed properties).
+`CustomPropertiesStore` (462 LOC). Typed key-value properties per device: string, int, bool, datetime. Schema CRUD with validation regex. Usable in scope expressions via `props.<key>`. Property validation against schemas. REST API for property and schema CRUD. Key validation (1-64 chars, `[a-zA-Z0-9_.-:]`), value limit 1024 bytes.
 
-### 19.7 Agent Deployment Jobs :x: `T2`
+### 19.7 Agent Deployment Jobs :white_check_mark: `T2`
 
-Not implemented. Server-initiated agent installer push to discovered endpoints.
+`DeploymentStore` with job management. Create deployment jobs targeting discovered hosts by IP, OS, and method (ssh, group_policy, manual). Job lifecycle: pending → running → completed/failed/cancelled. REST API for job CRUD, status updates, and cancellation.
 
 ---
 
@@ -858,13 +858,13 @@ Not implemented. Route instruction responses to external HTTP endpoints.
 
 `AuditStore` with SQLite WAL backend. Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
 
-### 21.3 System Notifications :x: `T2`
+### 21.3 System Notifications :white_check_mark: `T2`
 
-Not implemented. Alerts for system health, license, and capacity.
+`NotificationStore` (SQLite backend). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
 
-### 21.4 Event Subscriptions (Webhook / Email) :x: `T3`
+### 21.4 Event Subscriptions (Webhook / Email) :white_check_mark: `T3`
 
-Not implemented. Push events to external systems.
+`WebhookStore` (437 LOC). Register webhooks with URL, event type filter (comma-separated), and HMAC-SHA256 signing secret. Async delivery on detached threads with 10-concurrent-delivery semaphore. Delivery history with status codes and errors. `fire_event()` dispatches matching webhooks automatically. REST API for webhook CRUD and delivery log.
 
 ### 21.5 Event Source Management :x: `T3`
 
@@ -876,9 +876,11 @@ Not implemented. Configure which events generate notifications.
 
 *Monitoring, licensing, configuration, and multi-node scaling.*
 
-### 22.1 System Health Monitoring :x: `T2`
+### 22.1 System Health Monitoring :large_orange_diamond: `T2`
 
-Not implemented. CPU, memory, connection counts, queue depths.
+Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics.
+
+> **Gap:** No CPU, memory, connection count, or queue depth monitoring. No system health dashboard.
 
 ### 22.2 System Topology View :x: `T2`
 
@@ -888,17 +890,13 @@ Not implemented. Visual map of server nodes, gateways, agent counts.
 
 Not implemented. Seat count, expiry, feature entitlements.
 
-### 22.4 Platform Configuration (TTLs, Limits) :large_orange_diamond: `T2`
+### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
-Some config in `yuzu-server.cfg`.
+`RuntimeConfigStore` (219 LOC). Persistent runtime configuration overrides in SQLite. Allow-listed safe keys only (no secrets). Set/get/remove with `updated_by` attribution. Changes take effect without restart. REST API for configuration CRUD. Startup defaults overridden by stored values.
 
-> **Gap:** No runtime configuration API; requires restart.
+### 22.5 Gateway / Scale-Out Architecture :white_check_mark: `T2`
 
-### 22.5 Gateway / Scale-Out Architecture :large_orange_diamond: `T2`
-
-`gateway.proto` defines `GatewayUpstream` service with batch heartbeat, proxy register, and stream status.
-
-> **Gap:** Gateway node not yet implemented.
+Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages agent connections, `yuzu_gw_upstream` handles server-side gRPC (batch heartbeat, proxy register, command forwarding). `yuzu_gw_heartbeat_buffer` batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).
 
 ### 22.6 Statistics Dashboard :x: `T2`
 
@@ -908,9 +906,9 @@ Not implemented. High-level and detailed operational statistics.
 
 Not implemented. Distribute versioned binary resources via server.
 
-### 22.8 Product Packs (Bundled Definitions) :x: `T3`
+### 22.8 Product Packs (Bundled Definitions) :white_check_mark: `T3`
 
-Not implemented. Import/export bundles of instruction definitions, policies, and templates.
+`ProductPackStore` (680 LOC). Install multi-document YAML bundles containing InstructionDefinitions, PolicyFragments, Policies, TriggerTemplates. Ed25519 signature verification (OpenSSL on Unix, BCrypt on Windows). Install/uninstall with callback delegation to origin stores. Pack metadata, item tracking, and version management. REST API for pack CRUD.
 
 ---
 
@@ -944,19 +942,17 @@ Stable `plugin.h` C ABI with `plugin.hpp` CRTP wrapper. `YUZU_PLUGIN_EXPORT` mac
 
 `ManagementService` with list/get/send/watch/query.
 
-### 24.3 REST / HTTP Management API :large_orange_diamond: `T2`
+### 24.3 REST / HTTP Management API :white_check_mark: `T2`
 
-70+ JSON endpoints covering instructions, executions, schedules, approvals, responses, audit, tags, scope, and settings. Session cookie and OIDC auth.
-
-> **Gap:** Not yet under a versioned `/api/v1/` prefix. Needs consistent URL patterns and CORS configuration.
+70+ JSON endpoints under versioned `/api/v1/` prefix. Full CRUD for instructions, executions, schedules, approvals, responses, audit, tags, scope, management groups, policies, tokens, inventory, patches, webhooks, notifications, discovery, and custom properties. Session cookie, OIDC, and API token auth. CORS origin allowlist. OpenAPI spec at `/api/v1/openapi.json`. Consistent JSON error envelopes.
 
 ### 24.4 Consumer (External System) Registration :x: `T3`
 
 Not implemented. Register external systems to receive data feeds.
 
-### 24.5 Data Export to External Formats :x: `T2`
+### 24.5 Data Export to External Formats :white_check_mark: `T2`
 
-Not implemented. CSV, JSON export of inventory and responses.
+CSV and JSON export endpoints. RFC 4180-compliant CSV with streaming via chunked transfer encoding. Generic `json_array_to_csv` converter at `/api/export/json-to-csv`. Response data export with Content-Disposition headers. Audit log and inventory data also exportable via REST API JSON endpoints.
 
 ### 24.6 Utility Functions (JSON/Table Conversion) :white_check_mark: `T1`
 
@@ -997,6 +993,9 @@ Settings page section for MCP configuration: enable/disable toggle, read-only mo
 | sockwho | Y | Y | Y | Network |
 | network_diag | Y | Y | Y | Network |
 | network_actions | Y | Y | Y | Network |
+| wifi | Y | Y | Y | Network |
+| wol | Y | Y | Y | Network |
+| discovery | Y | Y | Y | Network |
 | installed_apps | Y | Y | Y | Software |
 | msi_packages | Y | - | - | Software |
 | windows_updates | Y | - | - | Patch |
@@ -1007,14 +1006,26 @@ Settings page section for MCP configuration: enable/disable toggle, read-only mo
 | bitlocker | Y | - | - | Security |
 | event_logs | Y | Y | Y | Security |
 | vuln_scan | Y | Y | Y | Security |
+| ioc | Y | Y | Y | Security |
+| quarantine | Y | Y | Y | Security |
+| certificates | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
+| registry | Y | - | - | System Config |
+| wmi | Y | - | - | System Config |
 | script_exec | Y | Y | Y | Execution |
+| content_dist | Y | Y | Y | Content Dist |
+| http_client | Y | Y | Y | Content Dist |
+| interaction | Y | Y | Y | User Interaction |
+| storage | Y | Y | Y | Agent KV |
+| asset_tags | Y | Y | Y | Device Mgmt |
+| agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
+| tar | Y | Y | Y | Monitoring |
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**44 plugins** -- covering hardware, network, security, filesystem, registry, WMI, and more. Includes cross-platform, Windows-only, and test/debug plugins.
+**44 plugins** — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.
 
 ---
 

@@ -181,6 +181,9 @@ Plugins for querying user accounts and active sessions.
 | `sessions` | All active sessions (console, RDP, SSH) with session ID and state. |
 | `local_users` | All local user accounts with enabled/disabled status. |
 | `local_admins` | Members of the local administrators group. |
+| `group_members` | Members of a specified local group. Parameters: `group` (group name). |
+| `primary_user` | Identifies the primary user of the device based on login frequency. Returns username, login count, and detection method. |
+| `session_history` | Historical login/logout session records. Returns username, terminal, source, login time, logout time, and duration. Parameters: `days` (optional, default 30). |
 
 ---
 
@@ -247,6 +250,44 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | `flush_dns` | Flush the local DNS resolver cache. |
 | `ping` | ICMP ping a target host and return round-trip statistics. |
+
+### wifi
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | WiFi network scanning and connection status. Uses WlanAPI on Windows, `nmcli` on Linux, and `airport` on macOS. |
+
+| Action | Description |
+|---|---|
+| `list_networks` | Scan for visible WiFi networks. Returns SSID, signal strength, security type, channel, and BSSID for each network. |
+| `connected` | Report the currently connected WiFi network including SSID, signal strength, security type, and BSSID. |
+
+### wol
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Wake-on-LAN (WoL) magic packet sender. Sends UDP broadcast packets to wake powered-off devices. Uses Winsock2 on Windows, POSIX sockets on Linux/macOS. |
+
+| Action | Description |
+|---|---|
+| `wake` | Send a Wake-on-LAN magic packet to a target MAC address. The packet contains 6 bytes of `0xFF` followed by the target MAC repeated 16 times. Parameters: `mac` (required, format `AA:BB:CC:DD:EE:FF`). |
+| `check` | Ping a host to verify it responded to a WoL wake. Parameters: `host` (required, IP address or hostname). |
+
+### discovery
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Network device discovery via ARP scan and ping sweep. Discovers hosts on a subnet and reports their IP, MAC address, hostname, and managed/unmanaged status. Input is validated to prevent command injection. |
+
+| Action | Description |
+|---|---|
+| `scan_subnet` | Scan a CIDR subnet for active hosts. Parameters: `subnet` (required, e.g., `192.168.1.0/24`). Returns IP address, MAC address, resolved hostname, and whether the device is managed by Yuzu. |
 
 ---
 
@@ -454,6 +495,9 @@ Plugins for file and directory operations.
 | `create_temp` | Create a temporary file and return its path. |
 | `create_temp_dir` | Create a temporary directory and return its path. |
 | `read` | Read a text file with line-number offsets (max 100 MB, binary detection, paginated). |
+| `get_acl` | Return the file or directory ACL permissions. On Windows, returns the SDDL security descriptor. On Linux/macOS, returns POSIX permission bits and owner/group. Parameters: `path` (required). |
+| `get_signature` | Check the Authenticode digital signature of a file (Windows only). Returns signer, timestamp, and trust status. On Linux/macOS, returns unsigned status. Parameters: `path` (required). |
+| `find_by_hash` | Search a directory tree for files matching a SHA-256 hash. Useful for threat hunting and file integrity verification. Parameters: `hash` (required, SHA-256 hex string), `path` (required, directory to search). |
 
 ---
 
@@ -680,9 +724,7 @@ The following plugins are defined in the roadmap but not yet implemented. They a
 
 | Plugin | Description | Target Phase |
 |---|---|---|
-| `wifi` | Wi-Fi scanning, profile management, and signal diagnostics. | Phase 7 (7.15) |
-| `patch` | Patch deployment, scheduling, and compliance reporting. | Phase 7 (7.8) |
-| `discovery` | Subnet scanning and network device discovery. | Phase 7 (7.18) |
+| `patch` | Patch deployment agent-side automation (scanning, downloading, installing). Server-side patch management is implemented via `PatchManager`. | Phase 7 (7.8) |
 
 ---
 

@@ -91,6 +91,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audit trail integration for all MCP tool calls with `mcp_tool` field on AuditEvent
 - MCP unit tests covering JSON-RPC parsing, tier policy, token integration, and store interactions
 
+### Changed (Capability Audit — 2026-03-26)
+
+- Capability map audited against codebase: 32 capabilities marked "not started" or "partial" were already implemented
+- Corrected total from 96/142 (68%) to **150/184 (82%)**
+- Updated per-domain summary counts and progress bars
+- Plugin coverage matrix expanded from 29 to 44 entries with all plugin categories
+
+#### Capabilities confirmed implemented (previously marked not started)
+- **Network:** WiFi scanning (4.6), Wake-on-LAN (4.7), ARP subnet discovery (4.10)
+- **User/Session:** Primary user determination (6.2), local group membership (6.3), connection history (6.4), active sessions (6.5)
+- **Patch Management:** Deployment orchestration (8.3), per-device status tracking (8.4), metadata retrieval (8.5), fleet compliance summary (8.7)
+- **Security:** Device quarantine with whitelist (9.6), IOC checking (9.7), certificate inventory (9.8), quarantine status tracking (9.9)
+- **File System:** ACL/permissions inspection (10.7), Authenticode verification (10.8), find-by-hash (10.14)
+- **Inventory:** Table enumeration (15.3)
+- **Auth:** Management-group-scoped roles (18.4), AD/Entra integration via Graph API (18.6)
+- **Device Mgmt:** Hierarchical management groups (19.4), device discovery (19.5), custom properties (19.6), deployment jobs (19.7)
+- **Notifications:** System notifications (21.3), webhook event subscriptions (21.4)
+- **Infrastructure:** Product packs with Ed25519 signing (22.8)
+
+#### Capabilities upgraded from partial to done
+- **Platform Configuration (22.4):** RuntimeConfigStore with safe-key whitelist, no-restart updates
+- **Gateway / Scale-Out (22.5):** Full Erlang/OTP gateway with circuit breaker, heartbeat batching, health endpoints
+- **REST API (24.3):** Versioned `/api/v1/` prefix, 70+ endpoints, OpenAPI spec, CORS allowlist
+- **Data Export (24.5):** CSV and JSON export endpoints with Content-Disposition headers
+
+#### Capabilities upgraded from not started to partial
+- **Reboot Management (8.6):** `reboot_if_needed` flag on patch deployments (no scheduled reboot workflow yet)
+- **System Health Monitoring (22.1):** /livez, /readyz probes + Prometheus metrics (no CPU/memory/queue monitoring yet)
+
 ### Fixed (RC Sprint — 52 findings resolved)
 
 #### Security (CRITICAL + HIGH)

@@ -117,7 +117,7 @@ The YAML DSL uses `apiVersion: yuzu.io/v1alpha1` and supports 6 `kind` values: `
 
 ## Development Roadmap
 
-The full roadmap is in `docs/roadmap.md` with 72 issues across 7 phases (all complete). The capability map (`docs/capability-map.md`) tracks 142 capabilities. Current progress: 96/142 done (68%).
+The full roadmap is in `docs/roadmap.md` with 72 issues across 7 phases (all complete). The capability map (`docs/capability-map.md`) tracks 184 capabilities. Current progress: 150/184 done (82%).
 
 **Phase execution order (all complete):**
 0. Foundation completion (HTTPS, OTA updates, SDK utilities) — **Done**
