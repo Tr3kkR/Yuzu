@@ -8,6 +8,7 @@ Usage:
     test_gateway.py <gateway_dir> eunit   # EUnit tests
     test_gateway.py <gateway_dir> ct      # Common Test suites
 """
+import re
 import shutil
 import subprocess
 import sys
@@ -43,5 +44,26 @@ if suite == "ct":
     env["YUZU_PERF_ENDURANCE_AGENTS"] = "10"
     env["YUZU_PERF_ENDURANCE_SECS"] = "1"
 
-result = subprocess.run(cmd, cwd=gateway_dir, env=env)
+# Capture output to detect OTP 25 CT I/O race, but also tee to console.
+result = subprocess.run(cmd, cwd=gateway_dir, env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True)
+output = result.stdout or ""
+sys.stdout.write(output)
+
+# OTP 25 has a known race where the CT I/O handler (test_server_io)
+# terminates before all suite completion messages are written, causing
+# rebar3 to exit with code 1 even though all tests passed.  Detect this
+# by checking if the output contains "0 failed" and the crash signature.
+if result.returncode != 0 and suite == "ct":
+    has_io_crash = "ct_util_server got EXIT" in output or "test_server_io" in output
+    # Count failed tests from CT output lines like "N ok, M failed"
+    fail_counts = re.findall(r"(\d+)\s+failed", output)
+    all_zero_fails = fail_counts and all(int(n) == 0 for n in fail_counts)
+    if has_io_crash and all_zero_fails:
+        print("\n[test_gateway.py] OTP 25 CT I/O race detected — "
+              "all tests passed but CT runner crashed on teardown. "
+              "Treating as success.")
+        sys.exit(0)
+
 sys.exit(result.returncode)

@@ -5823,7 +5823,13 @@ private:
             }
             res.set_header("Set-Cookie",
                            "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-            res.set_content(R"({"status":"ok"})", "application/json");
+            // HTMX clients get a redirect header; non-HTMX get JSON
+            if (!req.get_header_value("HX-Request").empty()) {
+                res.set_header("HX-Redirect", "/login");
+                res.set_content("", "text/plain");
+            } else {
+                res.set_content(R"({"status":"ok"})", "application/json");
+            }
         });
 
         // -- OIDC SSO endpoints -----------------------------------------------

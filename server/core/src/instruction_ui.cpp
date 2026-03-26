@@ -89,7 +89,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
   <span class="nav-spacer"></span>
   <span class="nav-user" id="nav-user"></span>
-  <button class="nav-logout" onclick="fetch('/logout',{method:'POST'}).then(function(){location='/login'})">Logout</button>
+  <button class="nav-logout" hx-post="/logout">Logout</button>
 </nav>
 <div class="context-bar" id="context-bar">
   <span class="context-role-badge" id="role-badge"></span>
