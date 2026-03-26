@@ -8,11 +8,24 @@ Usage:
     test_gateway.py <gateway_dir> eunit   # EUnit tests
     test_gateway.py <gateway_dir> ct      # Common Test suites
 """
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
+# system PATH which may still point at the distro's older OTP 25 packages).
+_extra_paths = [
+    os.path.expanduser("~/.cache/rebar3/bin"),  # rebar3 local install
+    "/usr/local/bin",                            # OTP 28 from source
+]
+_path = os.environ.get("PATH", "")
+for p in reversed(_extra_paths):
+    if os.path.isdir(p) and p not in _path:
+        _path = p + ":" + _path
+os.environ["PATH"] = _path
 
 gateway_dir = sys.argv[1]
 suite = sys.argv[2]  # "eunit" or "ct"

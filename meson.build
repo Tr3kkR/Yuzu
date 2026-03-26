@@ -191,6 +191,8 @@ if _rebar3.found()
   # ── Gateway tests (EUnit + Common Test) ──────────────────────────────
   _gw_test_script = meson.project_source_root() / 'scripts' / 'test_gateway.py'
   _python3 = find_program('python3')
+  # The test script prepends OTP 28 / rebar3 paths to PATH internally,
+  # handling the case where Meson inherits a system PATH with OTP 25.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
