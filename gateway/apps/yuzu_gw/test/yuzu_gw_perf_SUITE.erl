@@ -711,14 +711,19 @@ endurance_loop(Ids, EndTime, SampleSecs, ChurnSecs, Elapsed, Samples) ->
 churn_agents(Ids, Pct) ->
     ChurnN = max(1, length(Ids) * Pct div 100),
     ChurnIds = lists:sublist(Ids, ChurnN),
-    %% Kill old processes.
+    %% Kill old processes and wait for each to die (avoid race with
+    %% registry DOWN monitor — timer:sleep was unreliable under load).
     lists:foreach(fun(Id) ->
         case yuzu_gw_registry:lookup(Id) of
-            {ok, OldPid} -> exit(OldPid, kill);
-            error        -> ok
+            {ok, OldPid} ->
+                MRef = monitor(process, OldPid),
+                exit(OldPid, kill),
+                receive {'DOWN', MRef, process, _, _} -> ok
+                after 5000 -> ok
+                end;
+            error -> ok
         end
     end, ChurnIds),
-    timer:sleep(50),
     %% Re-register with new PIDs.
     lists:foreach(fun(Id) ->
         Pid = spawn(fun agent_loop/0),
