@@ -16,7 +16,8 @@ env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "clear"
-  SCCACHE_GHA_ENABLED: "true"
+  CCACHE_MAXSIZE: "500M"
+  CCACHE_COMPRESS: "true"
 
 jobs:
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
@@ -76,29 +77,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build pkg-config curl zip unzip tar python3-pip \
+            cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18' }}
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/ccache
+          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-
+            ccache-linux-${{ matrix.compiler }}-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -123,8 +116,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache' || '' }} ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache' || '' }} ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
+          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
+          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
         run: |
           meson setup builddir \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
@@ -139,9 +132,9 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── Windows (MSVC) ─────────────────────────────────────────────────────
   windows:
@@ -165,26 +158,20 @@ jobs:
       - name: Install Meson
         run: pip install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Install ccache
+        run: choco install ccache --yes
+
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~\AppData\Local\ccache
+          key: ccache-windows-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: |
+            ccache-windows-${{ matrix.build_type }}-
+            ccache-windows-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        shell: bash
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -208,8 +195,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cl' || 'cl' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cl' || 'cl' }}
+          CC: ccache cl
+          CXX: ccache cl
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
@@ -223,9 +210,9 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
@@ -245,28 +232,20 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja pipx
+          brew install cmake ninja ccache pipx
           pipx install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/Library/Caches/ccache
+          key: ccache-macos-${{ matrix.build_type }}-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-${{ matrix.build_type }}-
+            ccache-macos-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -291,8 +270,8 @@ jobs:
 
       - name: Configure (Meson)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache cc' || 'cc' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache c++' || 'c++' }}
+          CC: ccache cc
+          CXX: ccache c++
         run: |
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
@@ -307,9 +286,9 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── ARM64 Linux cross-compile ──────────────────────────────────────────
   arm64-cross:
@@ -328,28 +307,19 @@ jobs:
             cmake ninja-build g++ \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             pkg-config curl zip unzip tar \
-            python3-pip
+            python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/ccache
+          key: ccache-arm64-cross-${{ github.sha }}
+          restore-keys: |
+            ccache-arm64-cross-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -374,8 +344,8 @@ jobs:
 
       - name: Configure (Meson cross)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc' || 'gcc' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++' || 'g++' }}
+          CC: ccache gcc
+          CXX: ccache g++
         run: |
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
@@ -385,9 +355,9 @@ jobs:
       - name: Build
         run: meson compile -C builddir
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── Sanitizers (ASan + UBSan) — main/dev push only ────────────────────
   sanitize-asan:
@@ -398,7 +368,6 @@ jobs:
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
-      SCCACHE_C_CUSTOM_CACHE_NAMESPACE: "asan"
 
     steps:
       - uses: actions/checkout@v6
@@ -410,28 +379,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip
+            pkg-config curl zip unzip tar python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/ccache
+          key: ccache-linux-asan-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-asan-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -456,8 +416,8 @@ jobs:
 
       - name: Configure (Meson + ASan/UBSan)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc-13' || 'gcc-13' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++-13' || 'g++-13' }}
+          CC: ccache gcc-13
+          CXX: ccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -472,9 +432,9 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── Sanitizers (TSan) — main/dev push only ─────────────────────────────
   sanitize-tsan:
@@ -484,7 +444,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
-      SCCACHE_C_CUSTOM_CACHE_NAMESPACE: "tsan"
 
     steps:
       - uses: actions/checkout@v6
@@ -496,28 +455,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip
+            pkg-config curl zip unzip tar python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }}
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/ccache
+          key: ccache-linux-tsan-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-tsan-
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Validate sccache
-        id: sccache_check
-        run: |
-          if sccache --show-stats >/dev/null 2>&1; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache unavailable — building without cache"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -542,8 +492,8 @@ jobs:
 
       - name: Configure (Meson + TSan)
         env:
-          CC: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache gcc-13' || 'gcc-13' }}
-          CXX: ${{ steps.sccache_check.outputs.available == 'true' && 'sccache g++-13' || 'g++-13' }}
+          CC: ccache gcc-13
+          CXX: ccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -558,9 +508,9 @@ jobs:
       - name: Test
         run: meson test -C builddir --print-errorlogs
 
-      - name: sccache stats
+      - name: ccache stats
         if: always()
-        run: sccache --show-stats || true
+        run: ccache -s
 
   # ── Coverage — main/dev push only, after Linux passes ─────────────────
   coverage:
@@ -579,15 +529,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip
+            pkg-config curl zip unzip tar python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }} gcovr
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+      - name: Cache ccache
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: ~/.cache/ccache
+          key: ccache-linux-coverage-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-coverage-
+
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
@@ -611,6 +565,9 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + coverage)
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -649,3 +606,7 @@ jobs:
         with:
           name: coverage-report
           path: builddir/coverage-html/
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
