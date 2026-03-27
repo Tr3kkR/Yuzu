@@ -5,15 +5,18 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "device_token_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "license_store.hpp"
 #include "management_group_store.hpp"
 #include "product_pack_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "schedule_engine.hpp"
+#include "software_deployment_store.hpp"
 #include "tag_store.hpp"
 
 #include <httplib.h>
@@ -48,7 +51,10 @@ public:
                          AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
                          TagPushFn tag_push_fn = {},
                          InventoryStore* inventory_store = nullptr,
-                         ProductPackStore* product_pack_store = nullptr);
+                         ProductPackStore* product_pack_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         DeviceTokenStore* device_token_store = nullptr,
+                         LicenseStore* license_store = nullptr);
 };
 
 } // namespace yuzu::server

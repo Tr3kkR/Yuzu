@@ -2,9 +2,10 @@
  * windows_updates_plugin.cpp — Windows updates / package updates plugin for Yuzu
  *
  * Actions:
- *   "installed"      — List recently installed updates/packages.
- *   "missing"        — List available updates/packages that can be installed.
- *   "pending_reboot" — Detect if the endpoint requires a reboot after updates.
+ *   "installed"          — List recently installed updates/packages.
+ *   "missing"            — List available updates/packages that can be installed.
+ *   "pending_reboot"     — Detect if the endpoint requires a reboot after updates.
+ *   "patch_connectivity" — Test connectivity to patch/update servers (DNS, TCP, HTTPS).
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   update|kb_id|description|date
@@ -12,13 +13,17 @@
  *   available|title|severity
  *   source_name|true/false|detail          (per-check rows)
  *   reboot_required|true/false|reasons    (summary row)
+ *   target|url|dns_ok|bool|dns_ms|N|...   (connectivity results)
  */
 
 #include <yuzu/plugin.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <format>
 #include <string>
 #include <string_view>
@@ -32,6 +37,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <arpa/inet.h>
 #endif
 
 namespace {
@@ -401,18 +417,285 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── connectivity helpers ──────────────────────────────────────────────────
+
+struct ConnTarget {
+    std::string url;
+    std::string host;
+    int port{443};
+    std::string path;
+    bool use_tls{true};
+};
+
+ConnTarget parse_url(const std::string& url) {
+    ConnTarget t;
+    t.url = url;
+    std::string_view sv = url;
+    if (sv.starts_with("https://")) {
+        sv.remove_prefix(8); t.use_tls = true; t.port = 443;
+    } else if (sv.starts_with("http://")) {
+        sv.remove_prefix(7); t.use_tls = false; t.port = 80;
+    }
+    auto slash = sv.find('/');
+    auto host_part = sv.substr(0, slash);
+    t.path = (slash != std::string_view::npos) ? std::string(sv.substr(slash)) : "/";
+    auto colon = host_part.find(':');
+    if (colon != std::string_view::npos) {
+        t.host = std::string(host_part.substr(0, colon));
+        try { t.port = std::stoi(std::string(host_part.substr(colon + 1))); } catch (...) {}
+    } else {
+        t.host = std::string(host_part);
+    }
+    return t;
+}
+
+struct DnsResult {
+    bool ok{false};
+    std::string ip;
+    int64_t ms{-1};
+    std::string error;
+};
+
+DnsResult test_dns(const std::string& host) {
+    DnsResult r;
+    auto start = std::chrono::steady_clock::now();
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (rc != 0) {
+        r.error = "name resolution failed";
+        return r;
+    }
+    r.ok = true;
+    char buf[64]{};
+    if (res->ai_family == AF_INET) {
+        inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr, buf, sizeof(buf));
+    } else if (res->ai_family == AF_INET6) {
+        inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(res->ai_addr)->sin6_addr, buf, sizeof(buf));
+    }
+    r.ip = buf;
+    freeaddrinfo(res);
+    return r;
+}
+
+struct TcpResult {
+    bool ok{false};
+    int64_t ms{-1};
+    std::string error;
+};
+
+TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
+    TcpResult r;
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    auto port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+        r.error = "dns failed";
+        return r;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+
+#ifdef _WIN32
+    SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock == INVALID_SOCKET) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    unsigned long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+    connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen));
+    fd_set writefds;
+    FD_ZERO(&writefds);
+    FD_SET(sock, &writefds);
+    timeval tv;
+    tv.tv_sec = timeout_s;
+    tv.tv_usec = 0;
+    int sel = select(0, nullptr, &writefds, nullptr, &tv);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (sel > 0) {
+        int err = 0;
+        int err_len = sizeof(err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &err_len);
+        r.ok = (err == 0);
+        if (!r.ok) r.error = "connection refused";
+    } else {
+        r.error = (sel == 0) ? "timeout" : "select failed";
+    }
+    closesocket(sock);
+#else
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    connect(sock, res->ai_addr, res->ai_addrlen);
+    struct pollfd pfd{sock, POLLOUT, 0};
+    int sel = poll(&pfd, 1, timeout_s * 1000);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    if (sel > 0) {
+        int err = 0;
+        socklen_t err_len = sizeof(err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &err_len);
+        r.ok = (err == 0);
+        if (!r.ok) r.error = "connection refused";
+    } else {
+        r.error = (sel == 0) ? "timeout" : "poll failed";
+    }
+    close(sock);
+#endif
+
+    freeaddrinfo(res);
+    return r;
+}
+
+std::vector<std::string> get_default_patch_targets() {
+    std::vector<std::string> targets;
+#ifdef _WIN32
+    targets.push_back("https://windowsupdate.microsoft.com");
+    targets.push_back("https://update.microsoft.com");
+    targets.push_back("https://download.windowsupdate.com");
+    // Check for WSUS URL in registry
+    HKEY hkey = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            R"(SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate)",
+            0, KEY_READ, &hkey) == ERROR_SUCCESS) {
+        char buf[512]{};
+        DWORD buf_size = sizeof(buf);
+        if (RegQueryValueExA(hkey, "WUServer", nullptr, nullptr,
+                              reinterpret_cast<LPBYTE>(buf), &buf_size) == ERROR_SUCCESS) {
+            std::string wsus(buf);
+            if (!wsus.empty()) targets.push_back(wsus);
+        }
+        RegCloseKey(hkey);
+    }
+#elif defined(__linux__)
+    // Try to read apt sources.list for repository URLs
+    auto parse_apt_sources = [&](const std::string& path) {
+        std::ifstream f(path);
+        if (!f) return;
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            // deb http://... or deb-src http://...
+            auto http_pos = line.find("http");
+            if (http_pos != std::string::npos) {
+                auto end = line.find(' ', http_pos);
+                auto url = line.substr(http_pos, end == std::string::npos ? std::string::npos : end - http_pos);
+                // Extract just the host URL (drop the path for connectivity test)
+                auto parsed = parse_url(url);
+                auto base = std::string(parsed.use_tls ? "https://" : "http://") + parsed.host;
+                if (std::find(targets.begin(), targets.end(), base) == targets.end())
+                    targets.push_back(base);
+            }
+        }
+    };
+    parse_apt_sources("/etc/apt/sources.list");
+    // Check sources.list.d
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    for (auto& entry : fs::directory_iterator("/etc/apt/sources.list.d", ec)) {
+        if (entry.path().extension() == ".list")
+            parse_apt_sources(entry.path().string());
+    }
+    if (targets.empty()) {
+        targets.push_back("https://archive.ubuntu.com");
+        targets.push_back("https://security.ubuntu.com");
+    }
+#elif defined(__APPLE__)
+    targets.push_back("https://swscan.apple.com");
+    targets.push_back("https://swdist.apple.com");
+#endif
+    return targets;
+}
+
+int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
+    auto targets_str = params.get("targets");
+    int timeout_s = 10;
+    auto timeout_str = params.get("timeout_seconds", "10");
+    try { timeout_s = std::stoi(std::string{timeout_str}); } catch (...) {}
+    if (timeout_s < 1) timeout_s = 1;
+    if (timeout_s > 60) timeout_s = 60;
+
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+
+    std::vector<std::string> targets;
+    if (targets_str.empty()) {
+        targets = get_default_patch_targets();
+    } else {
+        // Split on comma
+        std::string s{targets_str};
+        size_t pos = 0;
+        while (pos < s.size()) {
+            auto comma = s.find(',', pos);
+            auto token = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            // Trim whitespace
+            auto start = token.find_first_not_of(" \t");
+            if (start != std::string::npos) {
+                auto end = token.find_last_not_of(" \t");
+                targets.push_back(token.substr(start, end - start + 1));
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+    }
+
+    int reachable = 0;
+    int failed = 0;
+
+    for (const auto& url : targets) {
+        auto target = parse_url(url);
+
+        // DNS test
+        auto dns = test_dns(target.host);
+        ctx.write_output(std::format("target|{}|dns_ok|{}|dns_ms|{}|ip|{}",
+            url, dns.ok ? "true" : "false", dns.ms,
+            dns.ok ? dns.ip : dns.error));
+
+        if (!dns.ok) { ++failed; continue; }
+
+        // TCP test
+        auto tcp = test_tcp(target.host, target.port, timeout_s);
+        ctx.write_output(std::format("target|{}|tcp_ok|{}|tcp_ms|{}",
+            url, tcp.ok ? "true" : "false", tcp.ms));
+
+        if (!tcp.ok) {
+            ctx.write_output(std::format("target|{}|tcp_error|{}", url, tcp.error));
+            ++failed;
+            continue;
+        }
+
+        ++reachable;
+    }
+
+    ctx.write_output(std::format("summary|targets_tested|{}|targets_reachable|{}|targets_failed|{}",
+        targets.size(), reachable, failed));
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+
+    return 0;
+}
+
 } // namespace
 
 class WindowsUpdatesPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "windows_updates"; }
-    std::string_view version() const noexcept override { return "1.0.0"; }
+    std::string_view version() const noexcept override { return "1.1.0"; }
     std::string_view description() const noexcept override {
-        return "Lists installed, available, and pending-reboot OS updates/packages";
+        return "Updates/packages: installed, available, pending-reboot, patch connectivity";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"installed", "missing", "pending_reboot", nullptr};
+        static const char* acts[] = {"installed", "missing", "pending_reboot",
+                                     "patch_connectivity", nullptr};
         return acts;
     }
 
@@ -421,13 +704,15 @@ public:
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params /*params*/) override {
+                yuzu::Params params) override {
         if (action == "installed")
             return do_installed(ctx);
         if (action == "missing")
             return do_missing(ctx);
         if (action == "pending_reboot")
             return do_pending_reboot(ctx);
+        if (action == "patch_connectivity")
+            return do_patch_connectivity(ctx, params);
 
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;

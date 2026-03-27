@@ -1,0 +1,320 @@
+## T2 Chaining Examples
+## Workflow definitions showing how to chain T2 InstructionDefinitions
+## for common multi-step operational scenarios.
+
+## ============================================================================
+## Example 1: Search for a config file, then replace a value in it
+## Use case: An operator needs to update a configuration setting across a fleet.
+## Step 1 searches for the config file, step 2 performs the replacement.
+## ============================================================================
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: workflow.config_search_and_replace
+  displayName: "Workflow: Search Config and Replace Value"
+  version: 0.4.0
+  description: >
+    Two-step workflow that first searches for lines matching a pattern in a
+    configuration file to confirm the current value, then performs a find/replace
+    operation to update it. The search step uses dry-run semantics (no changes),
+    and the replace step performs the actual modification with an atomic write.
+    Designed for configuration drift remediation.
+  tags: [workflow, filesystem, configuration, remediation, chaining]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: replace
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [config_path, old_value, new_value]
+    properties:
+      config_path:
+        type: string
+        displayName: Configuration File Path
+        description: >
+          Full path to the configuration file to update.
+          Example: "/etc/myapp/config.ini" or "C:\ProgramData\MyApp\config.ini"
+        validation:
+          maxLength: 4096
+      old_value:
+        type: string
+        displayName: Current Value (search)
+        description: >
+          The current configuration value to search for. Matched literally
+          (not regex) unless search_regex=true.
+        validation:
+          maxLength: 256
+      new_value:
+        type: string
+        displayName: New Value (replacement)
+        description: >
+          The new configuration value to replace matches with.
+      search_regex:
+        type: string
+        displayName: Use Regex
+        description: >
+          If "true", interpret old_value as a regex pattern. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: replacements_made
+        type: int32
+      - name: file_size_before
+        type: int64
+      - name: file_size_after
+        type: int64
+
+  readablePayload: "Config update: replace '${old_value}' with '${new_value}' in ${config_path}"
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+## ============================================================================
+## Example 2: Check patch connectivity, upload results to server
+## Use case: Compliance audit requires evidence of patch server reachability.
+## Step 1 tests connectivity to configured update servers. The operator then
+## uses the upload action to send diagnostic logs to the server for review.
+## ============================================================================
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: workflow.patch_connectivity_audit
+  displayName: "Workflow: Patch Connectivity Audit with Log Upload"
+  version: 1.1.0
+  description: >
+    Two-step compliance workflow. First tests connectivity to all configured
+    patch/update servers and reports DNS resolution, TCP connect latency, and
+    overall reachability. Second, uploads a local diagnostic log file to the
+    Yuzu server for centralized evidence collection. Designed for audit
+    evidence gathering during compliance checks. Chain with a PolicyFragment
+    to auto-remediate connectivity failures via network_actions.set_dns.
+  tags: [workflow, updates, patching, compliance, audit, chaining]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: windows_updates
+    action: patch_connectivity
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      targets:
+        type: string
+        displayName: Target URLs
+        description: >
+          Comma-separated list of patch server URLs to test. Leave empty
+          to use platform defaults.
+      timeout_seconds:
+        type: int32
+        displayName: Timeout (seconds)
+        description: TCP connection timeout per target.
+        default: 10
+        validation:
+          minimum: 1
+          maximum: 60
+      upload_log_path:
+        type: string
+        displayName: Diagnostic Log Path
+        description: >
+          Optional. Path to a local diagnostic log file to upload to the
+          server after the connectivity test. If provided, the log will be
+          uploaded via agent.content_dist.upload_file in a chained step.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: target
+        type: string
+      - name: dns_ok
+        type: bool
+      - name: dns_ms
+        type: int32
+      - name: tcp_ok
+        type: bool
+      - name: tcp_ms
+        type: int32
+      - name: targets_tested
+        type: int32
+      - name: targets_reachable
+        type: int32
+      - name: targets_failed
+        type: int32
+
+  readablePayload: "Patch connectivity audit (targets=${targets})"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.1.0
+    requiredPlugins: [windows_updates]
+
+status:
+  phase: active
+
+## ============================================================================
+## Example 3: Get version info, evaluate against inventory criteria
+## Use case: Compliance check ensures all endpoints run a minimum software
+## version. Step 1 retrieves the PE version of a critical executable. The
+## result feeds into an inventory evaluation condition via the scope engine.
+## ============================================================================
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: workflow.version_compliance_check
+  displayName: "Workflow: Software Version Compliance Check"
+  version: 0.4.0
+  description: >
+    Compliance workflow that retrieves the PE version information of a
+    Windows executable and evaluates it against a minimum required version.
+    Designed to be chained with inventory evaluation: the get_version_info
+    result populates inventory data, then a PolicyFragment with a
+    version_gte condition triggers remediation if the version is below
+    the threshold. On non-Windows platforms, uses the filesystem.exists
+    action as a fallback check.
+  tags: [workflow, filesystem, compliance, inventory, version, chaining]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: filesystem
+    action: get_version_info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [executable_path]
+    properties:
+      executable_path:
+        type: string
+        displayName: Executable Path
+        description: >
+          Full path to the Windows executable to check. Example:
+          "C:\Program Files\MyApp\myapp.exe"
+        validation:
+          maxLength: 4096
+      minimum_version:
+        type: string
+        displayName: Minimum Required Version
+        description: >
+          The minimum acceptable product version string (e.g. "2.5.0.0").
+          Used by downstream PolicyFragment conditions for compliance
+          evaluation. The check itself returns the raw version; the
+          comparison happens in the policy layer using version_gte.
+        validation:
+          maxLength: 64
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: file_version
+        type: string
+      - name: product_version
+        type: string
+      - name: company_name
+        type: string
+      - name: product_name
+        type: string
+      - name: file_description
+        type: string
+
+  readablePayload: "Version compliance check: ${executable_path} >= ${minimum_version}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+## ============================================================================
+## Chaining Reference:
+##
+## These workflow definitions are designed to be composed in Yuzu's
+## multi-step workflow engine. To chain them:
+##
+## 1. Config Search + Replace:
+##    Step 1: device.filesystem.search (pattern=old_value, path=config_path)
+##    Step 2: device.filesystem.replace (search=old_value, replacement=new_value)
+##    Condition: step1.total_matches > 0
+##
+## 2. Patch Connectivity + Upload:
+##    Step 1: device.windows_updates.patch_connectivity (targets=...)
+##    Step 2: agent.content_dist.upload_file (path=upload_log_path)
+##    Condition: always (evidence collection regardless of result)
+##
+## 3. Version Info + Inventory Evaluation:
+##    Step 1: device.filesystem.get_version_info (path=executable_path)
+##    PolicyFragment check: inventory.filesystem.product_version version_gte minimum_version
+##    Fix: software deployment or content_dist.stage + execute_staged
+##
+## Each workflow step references an InstructionDefinition by ID.
+## Parameter binding passes outputs from prior steps:
+##   parameters:
+##     path: "${steps.search_config.result.path}"
+##     search: "${params.old_value}"
+##
+## See docs/yaml-dsl-spec.md Section 9 (Expression Language) for
+## interpolation syntax and docs/Instruction-Engine.md for workflow
+## engine architecture.
+## ============================================================================

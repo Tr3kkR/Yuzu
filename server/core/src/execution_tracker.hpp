@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,6 +54,42 @@ struct AgentExecStatus {
     std::string error_detail;
 };
 
+// ── Execution statistics (capability 1.9) ────────────────────────────
+
+struct AgentExecutionStats {
+    std::string agent_id;
+    int64_t total_executions{0};
+    int64_t success_count{0};
+    int64_t failure_count{0};
+    double success_rate{0.0};
+    double avg_duration_seconds{0.0};
+    int64_t last_execution_at{0};
+};
+
+struct DefinitionExecutionStats {
+    std::string definition_id;
+    int64_t total_executions{0};
+    int64_t total_agents{0};
+    double success_rate{0.0};
+    double avg_duration_seconds{0.0};
+};
+
+struct FleetExecutionSummary {
+    int64_t total_executions{0};
+    int64_t executions_today{0};
+    int64_t active_agents{0};
+    double overall_success_rate{0.0};
+    double avg_duration_seconds{0.0};
+};
+
+struct ExecutionStatsQuery {
+    std::string agent_id;
+    std::string definition_id;
+    int64_t since{0};
+    int64_t until{0};
+    int limit{50};
+};
+
 class ExecutionTracker {
 public:
     explicit ExecutionTracker(sqlite3* db);
@@ -80,8 +117,14 @@ public:
 
     void mark_cancelled(const std::string& id, const std::string& user);
 
+    // Statistics (capability 1.9)
+    std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
+    std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
+    FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
+
 private:
     sqlite3* db_;
+    mutable std::recursive_mutex mtx_;
 };
 
 } // namespace yuzu::server

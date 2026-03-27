@@ -30,11 +30,13 @@
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
 #include "deployment_store.hpp"
+#include "device_token_store.hpp"
 #include "discovery_store.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "license_store.hpp"
 #include "management.grpc.pb.h"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -52,6 +54,7 @@
 #include "runtime_config_store.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
+#include "software_deployment_store.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
@@ -2952,6 +2955,20 @@ public:
             if (discovery_store_ && discovery_store_->is_open()) {
                 spdlog::info("DiscoveryStore initialized at {}", discovery_db.string());
             }
+        }
+
+        // Phase 7: Software Deployment, Device Tokens, Licensing
+        {
+            auto sw_db = cfg_.auth_config_path.parent_path() / "software-deployments.db";
+            sw_deploy_store_ = std::make_unique<SoftwareDeploymentStore>(sw_db);
+        }
+        {
+            auto dt_db = cfg_.auth_config_path.parent_path() / "device-tokens.db";
+            device_token_store_ = std::make_unique<DeviceTokenStore>(dt_db);
+        }
+        {
+            auto lic_db = cfg_.auth_config_path.parent_path() / "license.db";
+            license_store_ = std::make_unique<LicenseStore>(lic_db);
         }
     }
 
@@ -11090,7 +11107,10 @@ private:
                 }
             },
             inventory_store_.get(),
-            product_pack_store_.get());
+            product_pack_store_.get(),
+            sw_deploy_store_.get(),
+            device_token_store_.get(),
+            license_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -11340,6 +11360,9 @@ private:
     // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18)
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
+    std::unique_ptr<SoftwareDeploymentStore> sw_deploy_store_;
+    std::unique_ptr<DeviceTokenStore> device_token_store_;
+    std::unique_ptr<LicenseStore> license_store_;
 
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;

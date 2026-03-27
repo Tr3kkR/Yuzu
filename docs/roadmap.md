@@ -881,6 +881,13 @@ Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI 
 
 ---
 
+## Open Decisions
+
+| # | Issue | Topic | Status |
+|---|-------|-------|--------|
+| D1 | [#251](https://github.com/Tr3kkR/Yuzu/issues/251) | License key generation and signing strategy | **Open** — Options: signed keys (offline), license server (online), or hybrid. Blocks production use of capability 22.3. |
+| D2 | [#252](https://github.com/Tr3kkR/Yuzu/issues/252) | CEL is a custom subset, not full Common Expression Language | **Open** — Current evaluator covers basic comparisons. Full CEL (cel-cpp) needed for enterprise policy expressions. |
+
 ## Future Phase (T3 Items — Not Scheduled)
 
 These capabilities represent competitive parity with the most mature platforms. They are tracked but not scheduled into the current roadmap. Each will become a GitHub issue when prioritized.
