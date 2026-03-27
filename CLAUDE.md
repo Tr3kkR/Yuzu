@@ -45,6 +45,10 @@ Agents live in `.claude/agents/` and are invoked by name.
 |-------|------|-----------------|
 | architect | System Architect | Module boundaries, proto compat, ABI stability |
 | security-guardian | Security Engineer | Auth enforcement, crypto, input validation, audit |
+| happy-path | Happy Path Reviewer | Normal-condition correctness, logic completeness |
+| unhappy-path | Unhappy Path Reviewer | Failure-mode interrogation, risk register, chaos feeds |
+| consistency-auditor | Consistency Auditor | Cross-component state/schema/contract consistency |
+| chaos-injector | Chaos Injector | Controlled failure scenario generation from identified risks |
 | quality-engineer | QA & Test Engineer | Test coverage, fuzz targets, coverage thresholds |
 | cross-platform | Platform Compatibility | Win/Linux/macOS/ARM64 builds, OS-specific code |
 | docs-writer | Technical Writer | User manual, YAML defs, API docs, roadmap |
@@ -56,9 +60,11 @@ Agents live in `.claude/agents/` and are invoked by name.
 | release-deploy | Release & Deployment | Docker, systemd, installers, release workflow |
 | dsl-engineer | DSL & Expression Language | Scope DSL, CEL, parameter interpolation, trigger expressions, workflow primitives |
 
-**Workflow:** architect first (design) → feature agents (implement) → erlang-dev (review Erlang code) → cross-platform (compile) → security-guardian (review) → quality-engineer (test) → docs-writer (document) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
+**Workflow:** architect first (design) → feature agents (implement) → erlang-dev (review Erlang code) → cross-platform (compile) → security-guardian (review) → happy-path + unhappy-path + consistency-auditor (parallel analysis) → chaos-injector (failure scenarios) → quality-engineer (test) → docs-writer (document) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
 
 **DSL touchpoints:** dsl-engineer is invoked as a feature agent for scope targeting, policy conditions (CEL), trigger template expressions, parameter binding, workflow primitives, and any YAML DSL spec evolution.
+
+**Correctness & resilience touchpoints:** happy-path, unhappy-path, and consistency-auditor are invoked for all changes during full governance. consistency-auditor is additionally invoked when changes touch protobuf schemas, database schemas, API contracts, or cross-component state. chaos-injector runs after all three complete, synthesizing risks into executable failure scenarios. Gate 5 (chaos analysis) is skipped if gate 4 produces no findings.
 
 ### Governance
 
@@ -67,8 +73,10 @@ Agents live in `.claude/agents/` and are invoked by name.
 1. **Change Summary** — the producing agent writes a structured summary (files, what, why, interfaces affected, security surface, user-facing impact) shared with ALL agents.
 2. **Mandatory deep-dive** — security-guardian and docs-writer read every modified file for every change. Security reviews block on CRITICAL/HIGH findings. Documentation blocks if user-facing changes lack doc updates.
 3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, erlang-dev, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
-4. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
-5. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
+4. **Correctness & resilience analysis** — happy-path, unhappy-path, and consistency-auditor run in parallel. happy-path validates normal-condition correctness. unhappy-path performs systematic failure-mode interrogation and produces a risk register. consistency-auditor checks cross-component state/schema/contract consistency. All three are mandatory during full governance; consistency-auditor also triggers on schema evolution and protocol changes.
+5. **Chaos analysis** — chaos-injector ingests outputs from unhappy-path and consistency-auditor to generate controlled failure scenarios with success criteria and rollback procedures. Runs only after gate 4 completes. Skipped if gate 4 produces no findings.
+6. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
+7. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
 
 **Lesson learned:** Waves 1-4 shipped without governance and accumulated 4 CRITICAL command injection vulnerabilities, untested stores, stale docs, and performance bottlenecks. These were caught before production but should have been caught before commit.
 
