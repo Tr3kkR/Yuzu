@@ -460,18 +460,38 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
     std::unique_lock lock(mu_);
+    // Check if role is changing for an existing user
+    auto it = users_.find(username);
+    bool role_changed = it != users_.end() && it->second.role != role;
+
     UserEntry entry;
     entry.username = username;
     entry.role = role;
     entry.salt_hex = bytes_to_hex(salt);
     entry.hash_hex = hash;
     users_[username] = std::move(entry);
+
+    if (role_changed) {
+        // Invalidate sessions so the user picks up the new role on next login
+        // Prevents stale session role from granting old privileges (G4-CON-AUTH-001)
+        std::erase_if(sessions_, [&](const auto& pair) {
+            return pair.second.username == username;
+        });
+    }
     return true;
 }
 
 bool AuthManager::remove_user(const std::string& username) {
     std::unique_lock lock(mu_);
-    return users_.erase(username) > 0;
+    auto erased = users_.erase(username) > 0;
+    if (erased) {
+        // Invalidate all active sessions belonging to this user
+        // to prevent deleted users from retaining access (CHAOS-T1-001)
+        std::erase_if(sessions_, [&](const auto& pair) {
+            return pair.second.username == username;
+        });
+    }
+    return erased;
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {

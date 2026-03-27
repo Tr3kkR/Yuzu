@@ -52,7 +52,7 @@ public:
                          ManagementGroupStore* mgmt_store,
                          ApprovalManager* approval_manager,
                          ScheduleEngine* schedule_engine,
-                         bool read_only_mode = false);
+                         const bool& read_only_mode);
 };
 
 } // namespace yuzu::server::mcp
