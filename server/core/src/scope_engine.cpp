@@ -4,7 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <format>
-#include <regex>
+#include <re2/re2.h>
 #include <sstream>
 #include <string>
 
@@ -676,13 +676,13 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
         return wildcard_match(cond.value, resolved);
     case CompOp::Matches: {
         if (cond.value.size() > 256)
-            return false; // reject overly long regex patterns
-        try {
-            std::regex re(cond.value, std::regex::ECMAScript | std::regex::icase);
-            return std::regex_search(std::string(resolved), re);
-        } catch (const std::regex_error&) {
             return false;
-        }
+        // RE2 guarantees linear-time matching — immune to ReDoS (G2-SEC-D2-001)
+        RE2::Options opts;
+        opts.set_case_sensitive(false);
+        RE2 re(cond.value, opts);
+        if (!re.ok()) return false;
+        return RE2::PartialMatch(std::string(resolved), re);
     }
     case CompOp::Exists:
         return !resolved.empty();

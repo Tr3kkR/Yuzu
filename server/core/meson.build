@@ -41,6 +41,15 @@ if not sqlite3_dep.found()
 endif
 nlohmann_json_dep = dependency('nlohmann_json', required: true)
 
+# RE2 for linear-time regex (replaces std::regex to prevent ReDoS)
+re2_dep = dependency('re2', method: 'cmake', modules: ['re2::re2'], required: false)
+if not re2_dep.found()
+  re2_dep = dependency('re2', required: false)
+endif
+if not re2_dep.found()
+  re2_dep = cxx.find_library('re2')
+endif
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   files(
@@ -110,14 +119,14 @@ yuzu_server_core_lib = static_library(
   include_directories: ['include'],
   cpp_args: https_cpp_args + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
 )
 
 executable(

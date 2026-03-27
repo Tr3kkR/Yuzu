@@ -2,8 +2,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <re2/re2.h>
+
 #include <chrono>
-#include <regex>
 
 namespace yuzu::server {
 
@@ -120,15 +121,14 @@ CustomPropertiesStore::validate_against_schema(const std::string& key,
     }
     // "string" and "datetime" accept any text
 
-    // Regex validation
+    // Regex validation (RE2 for linear-time guarantees — immune to ReDoS)
     if (!validation_regex.empty()) {
-        try {
-            std::regex re(validation_regex, std::regex::ECMAScript);
-            if (!std::regex_match(value, re))
-                return std::unexpected("value does not match validation pattern for '" + key + "'");
-        } catch (const std::regex_error&) {
+        RE2 re(validation_regex, RE2::Quiet);
+        if (!re.ok()) {
             spdlog::warn("CustomPropertiesStore: invalid regex for schema key '{}': {}", key,
                          validation_regex);
+        } else if (!RE2::FullMatch(value, re)) {
+            return std::unexpected("value does not match validation pattern for '" + key + "'");
         }
     }
 
@@ -412,12 +412,9 @@ CustomPropertiesStore::upsert_schema(const CustomPropertySchema& schema) {
         if (schema.validation_regex.size() > kMaxRegexLength) {
             return std::unexpected("validation regex exceeds maximum length of 256 characters");
         }
-        try {
-            std::regex re(schema.validation_regex, std::regex::ECMAScript);
-            (void)re;
-        } catch (const std::regex_error& e) {
-            return std::unexpected(std::string("invalid validation regex: ") + e.what());
-        }
+        RE2 re(schema.validation_regex, RE2::Quiet);
+        if (!re.ok())
+            return std::unexpected(std::string("invalid validation regex: ") + re.error());
     }
 
     std::lock_guard lock(mu_);
