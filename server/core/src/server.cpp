@@ -11143,7 +11143,7 @@ private:
                 response_store_.get(), audit_store_.get(), tag_store_.get(),
                 inventory_store_.get(), policy_store_.get(), mgmt_group_store_.get(),
                 approval_manager_.get(), schedule_engine_.get(),
-                cfg_.mcp_read_only);
+                cfg_.mcp_read_only, cfg_.mcp_disable);
         }
 
         // -- Listen -----------------------------------------------------------

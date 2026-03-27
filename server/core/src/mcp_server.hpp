@@ -52,7 +52,8 @@ public:
                          ManagementGroupStore* mgmt_store,
                          ApprovalManager* approval_manager,
                          ScheduleEngine* schedule_engine,
-                         const bool& read_only_mode);
+                         const bool& read_only_mode,
+                         const bool& mcp_disabled);
 };
 
 } // namespace yuzu::server::mcp

@@ -164,6 +164,7 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
     auto token_id = hash.substr(0, 12); // Short display ID
     auto now = now_epoch();
 
+    std::unique_lock db_lock(db_mtx_);
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO api_tokens (token_id, token_hash, name, principal_id, "
@@ -215,7 +216,8 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         }
     }
 
-    // Cache miss — query SQLite
+    // Cache miss — query SQLite (lock db for the read + update sequence)
+    std::unique_lock db_lock(db_mtx_);
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,
@@ -284,6 +286,8 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
     if (!db_)
         return result;
 
+    std::shared_lock db_lock(db_mtx_);
+
     std::string sql =
         "SELECT token_id, '', name, principal_id, scope_service, created_at, expires_at, "
         "last_used_at, revoked, mcp_tier FROM api_tokens";
@@ -319,6 +323,7 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
     if (!db_)
         return false;
 
+    std::unique_lock db_lock(db_mtx_);
     // Look up the token_hash before revoking so we can invalidate the cache
     std::string token_hash;
     {
@@ -350,6 +355,7 @@ bool ApiTokenStore::delete_token(const std::string& token_id) {
     if (!db_)
         return false;
 
+    std::unique_lock db_lock(db_mtx_);
     // Look up the token_hash before deleting so we can invalidate the cache
     std::string token_hash;
     {
