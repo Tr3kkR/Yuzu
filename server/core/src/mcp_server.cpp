@@ -317,11 +317,19 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ManagementGroupStore* mgmt_store,
                                 ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine,
-                                const bool& read_only_mode) {
+                                const bool& read_only_mode,
+                                const bool& mcp_disabled) {
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
-    svr.Post("/mcp/v1/", [=, &read_only_mode](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/mcp/v1/", [=, &read_only_mode, &mcp_disabled](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Content-Type", "application/json");
+
+        // Runtime kill switch check (G4-UHP-MCP-003) — evaluated on every request
+        if (mcp_disabled) {
+            res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
+                            "application/json");
+            return;
+        }
 
         // Auth check — reuses the server's existing auth middleware pipeline
         auto session = auth_fn(req, res);

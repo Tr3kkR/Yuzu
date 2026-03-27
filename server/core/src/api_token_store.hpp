@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -58,6 +59,7 @@ public:
 
 private:
     sqlite3* db_{nullptr};
+    mutable std::shared_mutex db_mtx_; // protects all db_ access (G2-SEC-A2-002)
 
     // LRU cache for validated tokens: token_hash -> (ApiToken, expiry_time)
     struct CachedToken {

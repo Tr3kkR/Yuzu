@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,7 @@ private:
                                                        const std::string& comment);
 
     sqlite3* db_;
+    mutable std::mutex mtx_; // protects all db_ access (G4-UHP-MCP-005)
 };
 
 } // namespace yuzu::server

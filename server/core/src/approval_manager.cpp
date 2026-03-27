@@ -209,6 +209,8 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     if (reviewer.empty())
         return std::unexpected("reviewer is required");
 
+    std::lock_guard lock(mtx_);
+
     // Fetch the current approval to validate state
     sqlite3_stmt* sel = nullptr;
     if (sqlite3_prepare_v2(db_, "SELECT status, submitted_by FROM approvals WHERE id = ?", -1, &sel,
@@ -234,10 +236,10 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     if (reviewer == submitted_by)
         return std::unexpected("reviewer cannot be the same as the submitter");
 
-    // Perform the update
+    // Atomic update: WHERE status = 'pending' prevents TOCTOU double-approve (G4-UHP-MCP-005)
     const char* sql = R"(
         UPDATE approvals SET status = ?, reviewed_by = ?, reviewed_at = ?, review_comment = ?
-        WHERE id = ?
+        WHERE id = ? AND status = 'pending'
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -259,7 +261,7 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     sqlite3_finalize(stmt);
 
     if (changes == 0)
-        return std::unexpected("approval not found: " + id);
+        return std::unexpected("approval already reviewed by another user");
 
     spdlog::info("ApprovalManager: {} approval {} by {}", status, id, reviewer);
     return {};
