@@ -46,7 +46,7 @@ Agents live in `.claude/agents/` and are invoked by name.
 | architect | System Architect | Module boundaries, proto compat, ABI stability |
 | security-guardian | Security Engineer | Auth enforcement, crypto, input validation, audit |
 | happy-path | Happy Path Reviewer | Normal-condition correctness, logic completeness |
-| unhappy-path | Unhappy Path Reviewer | Failure-mode interrogation, risk register, chaos feeds |
+| unhappy-path | Unhappy Path Reviewer | Failure-mode interrogation, risk register feeding chaos-injector |
 | consistency-auditor | Consistency Auditor | Cross-component state/schema/contract consistency |
 | chaos-injector | Chaos Injector | Controlled failure scenario generation from identified risks |
 | quality-engineer | QA & Test Engineer | Test coverage, fuzz targets, coverage thresholds |
@@ -64,7 +64,7 @@ Agents live in `.claude/agents/` and are invoked by name.
 
 **DSL touchpoints:** dsl-engineer is invoked as a feature agent for scope targeting, policy conditions (CEL), trigger template expressions, parameter binding, workflow primitives, and any YAML DSL spec evolution.
 
-**Correctness & resilience touchpoints:** happy-path, unhappy-path, and consistency-auditor are invoked for all changes during full governance. consistency-auditor is additionally invoked when changes touch protobuf schemas, database schemas, API contracts, or cross-component state. chaos-injector runs after all three complete, synthesizing risks into executable failure scenarios. Gate 5 (chaos analysis) is skipped if gate 4 produces no findings.
+**Correctness & resilience touchpoints:** happy-path, unhappy-path, and consistency-auditor are invoked for all changes during full governance. consistency-auditor is additionally invoked when changes touch protobuf schemas, database schemas, API contracts, or cross-component state. chaos-injector runs after all three complete, synthesizing risks into executable failure scenarios. Gate 5 (chaos analysis) is skipped if neither unhappy-path nor consistency-auditor produce findings. Gate 4 agents run in parallel — this is a deliberate speed/completeness tradeoff; compound findings that span failure-mode and consistency domains are synthesized by chaos-injector in gate 5. The governance orchestrator should pass prior gate findings as context to gate 4 agents to avoid duplicated effort.
 
 ### Governance
 
@@ -74,9 +74,11 @@ Agents live in `.claude/agents/` and are invoked by name.
 2. **Mandatory deep-dive** — security-guardian and docs-writer read every modified file for every change. Security reviews block on CRITICAL/HIGH findings. Documentation blocks if user-facing changes lack doc updates.
 3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, erlang-dev, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
 4. **Correctness & resilience analysis** — happy-path, unhappy-path, and consistency-auditor run in parallel. happy-path validates normal-condition correctness. unhappy-path performs systematic failure-mode interrogation and produces a risk register. consistency-auditor checks cross-component state/schema/contract consistency. All three are mandatory during full governance; consistency-auditor also triggers on schema evolution and protocol changes.
-5. **Chaos analysis** — chaos-injector ingests outputs from unhappy-path and consistency-auditor to generate controlled failure scenarios with success criteria and rollback procedures. Runs only after gate 4 completes. Skipped if gate 4 produces no findings.
+5. **Chaos analysis** — chaos-injector ingests outputs from unhappy-path and consistency-auditor (plus happy-path correctness baseline as optional context) to generate controlled failure scenarios with success criteria and rollback procedures. Runs only after gate 4 completes. Skipped if neither unhappy-path nor consistency-auditor produce findings.
 6. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
 7. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
+
+**Known limitation:** The governance pipeline is convention-enforced, not automated. There are no git hooks or CI checks that verify gate completion. Discipline and peer review are the enforcement mechanism. Future improvement: add governance attestation artifacts or PR checklist requirements.
 
 **Lesson learned:** Waves 1-4 shipped without governance and accumulated 4 CRITICAL command injection vulnerabilities, untested stores, stale docs, and performance bottlenecks. These were caught before production but should have been caught before commit.
 

@@ -22,10 +22,11 @@ Invoked during:
 ## Scope
 
 - Server
-- Switch
+- Gateway
 - Agent
 - Plugins
 - Transport
+- Observability
 - Infrastructure
 
 ---
@@ -41,8 +42,9 @@ How can this system be broken in controlled, reproducible ways?
 ### Step 1 — Ingest Risks
 
 From:
-- Unhappy Path Reviewer (Risk Register)
+- Unhappy Path Reviewer (risk register — the aggregate collection of issue findings)
 - Consistency Auditor (consistency findings)
+- Happy Path Reviewer (correctness baseline — optional context for defining expected recovery behavior)
 
 ---
 
@@ -99,7 +101,10 @@ System must:
         Description of test
 
       target_component: >
-        server | switch | agent | plugin | transport
+        server | gateway | agent | plugin | transport | observability | cross-cutting
+
+      severity: [low | medium | high | critical]
+      epistemic_status: [verified | likely | speculative]
 
       fault_injection: >
         Type of failure introduced
@@ -115,6 +120,9 @@ System must:
 
       rollback: >
         How to safely stop or revert the test
+
+      source_findings: >
+        References to gate-4 finding IDs that this scenario derives from
 
 ---
 
@@ -139,7 +147,7 @@ During full governance, this agent:
 
 1. Runs as governance gate 5 (Chaos Analysis)
 2. Runs only after gate 4 (happy-path + unhappy-path + consistency-auditor) completes
-3. Skipped if gate 4 produces no findings
+3. Skipped if neither unhappy-path nor consistency-auditor produce findings
 4. Outputs feed quality-engineer for test implementation
 
 ---

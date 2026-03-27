@@ -31,7 +31,7 @@ Invoked during:
 
 - Server state
 - Agent state
-- Switch forwarding assumptions
+- Gateway forwarding assumptions
 - Protobuf schemas
 - Instruction definitions
 - Observability data
@@ -93,7 +93,7 @@ Check:
 ## Output Contract
 
     issue:
-      component: [server | switch | agent | plugin | transport | observability]
+      component: [server | gateway | agent | plugin | transport | observability | cross-cutting]
       category: [state | schema | contract]
       severity: [low | medium | high | critical]
       epistemic_status: [verified | likely | speculative]
@@ -103,6 +103,12 @@ Check:
 
       trigger_condition: >
         When inconsistency occurs.
+
+      observed_behavior: >
+        Current state or representation across components.
+
+      expected_behavior: >
+        Correct consistent state or representation.
 
       impact: >
         Effect on system correctness.
