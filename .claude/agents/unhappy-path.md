@@ -29,11 +29,11 @@ This agent is MANDATORILY invoked when:
 The agent must evaluate all relevant components:
 
 - Server (control plane, orchestration, policy engine)
-- Switch (stateless BEAM forwarding layer)
+- Gateway (stateless BEAM forwarding layer)
 - Agent (endpoint runtime, execution engine)
 - Plugins / Product Packs (instruction sets, sensors)
 - Transport layer (gRPC / protobuf / TLS)
-- Observability pipeline (ClickHouse, metrics, logs)
+- Observability pipeline (metrics, logs, downstream analytics)
 
 ---
 
@@ -77,7 +77,7 @@ For each boundary, systematically apply:
 
 For each failure:
 - Track propagation across:
-  Agent → Switch → Server → Storage
+  Agent → Gateway → Server → Storage
 - Identify:
   - Amplification
   - Masking
@@ -123,10 +123,10 @@ Each identified issue must be labelled:
 
 ---
 
-### Switch (Stateless BEAM Layer)
+### Gateway (Stateless BEAM Layer)
 
 - What happens if upstream is dead but connection is alive?
-- Does the switch detect half-open / blackholed connections?
+- Does the gateway detect half-open / blackholed connections?
 - Does it buffer, drop, or amplify traffic under load?
 - What breaks if message ordering is not preserved?
 - Can retries create message storms?
@@ -213,7 +213,7 @@ The agent MUST explicitly test for:
 ## Output Contract
 
     issue:
-      component: [server | switch | agent | plugin | transport | observability | cross-cutting]
+      component: [server | gateway | agent | plugin | transport | observability | cross-cutting]
       category: [input | state | transport | concurrency | resource | observability]
       severity: [low | medium | high | critical]
       epistemic_status: [verified | likely | speculative]
@@ -224,10 +224,10 @@ The agent MUST explicitly test for:
       trigger_condition: >
         Exact triggering conditions.
 
-      observed_or_expected_behavior: >
+      observed_behavior: >
         Current or inferred system behavior.
 
-      correct_behavior: >
+      expected_behavior: >
         Desired system behavior.
 
       blast_radius: >
@@ -265,10 +265,7 @@ During full governance, this agent:
 1. Runs as part of governance gate 4 (Correctness & Resilience Analysis)
 2. Runs after architecture parsing
 3. Runs in parallel with happy-path reviewer and consistency-auditor
-4. Feeds:
-   - Risk Register
-   - Chaos Injector (gate 5)
-   - Design Remediation Agent
+4. Produces a risk register (the aggregate collection of all issue findings from this agent) that feeds chaos-injector (gate 5)
 
 ---
 

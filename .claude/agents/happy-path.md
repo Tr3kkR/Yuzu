@@ -30,11 +30,11 @@ Invoked during:
 ## Scope
 
 - Server
-- Switch
+- Gateway
 - Agent
 - Plugins
 - Transport
-- Observability outputs
+- Observability
 
 ---
 
@@ -83,7 +83,7 @@ Does the system behave correctly when everything works as expected?
 ## Output Contract
 
     issue:
-      component: [server | switch | agent | plugin | transport | observability]
+      component: [server | gateway | agent | plugin | transport | observability | cross-cutting]
       category: [logic | correctness | completeness]
       severity: [low | medium | high | critical]
       epistemic_status: [verified | likely | speculative]
@@ -127,7 +127,7 @@ During full governance, this agent:
 
 1. Runs as part of governance gate 4 (Correctness & Resilience Analysis)
 2. Runs in parallel with unhappy-path reviewer and consistency-auditor
-3. Establishes the correctness baseline that chaos-injector (gate 5) uses to define expected recovery behavior
+3. Correctness baseline is available as optional context for chaos-injector (gate 5) when defining expected recovery behavior
 
 ---
 
