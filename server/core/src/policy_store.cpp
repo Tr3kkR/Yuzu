@@ -1,5 +1,6 @@
 #include "policy_store.hpp"
 
+#include "cel_eval.hpp"
 #include "compliance_eval.hpp"
 
 #include <nlohmann/json.hpp>
@@ -471,11 +472,13 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
 
     // M11: Validate compliance expressions before storing
     if (!check_compliance.empty()) {
+        check_compliance = cel::migrate_expression(check_compliance);
         auto err = validate_compliance_expression(check_compliance);
         if (!err.empty())
             return std::unexpected("invalid check compliance expression: " + err);
     }
     if (!post_compliance.empty()) {
+        post_compliance = cel::migrate_expression(post_compliance);
         auto err = validate_compliance_expression(post_compliance);
         if (!err.empty())
             return std::unexpected("invalid postCheck compliance expression: " + err);

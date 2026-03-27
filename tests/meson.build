@@ -9,6 +9,7 @@ agent_test_exe = executable(
     'unit/test_temp_file.cpp',
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
+    'unit/test_filesystem_actions.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
     'unit/test_metrics.cpp',
@@ -74,6 +75,7 @@ if build_server
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_compliance_eval.cpp',
+      'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
@@ -83,6 +85,12 @@ if build_server
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
+      'unit/server/test_inventory_eval.cpp',
+      'unit/server/test_execution_statistics.cpp',
+      'unit/server/test_device_token_store.cpp',
+      'unit/server/test_software_deployment_store.cpp',
+      'unit/server/test_license_store.cpp',
+      'unit/server/test_rest_api_t2.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
