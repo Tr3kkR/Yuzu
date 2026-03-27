@@ -633,10 +633,26 @@ result.total_memory_mb >= 8192
 
 ### Scenario: "Find OS version for all Windows machines that connected to https://example.com in the last 90 days"
 
-This requires a multi-step workflow:
-1. **Step 1:** Query network connections on all Windows machines
-2. **Step 2:** Filter results to find agents that connected to `example.com`
-3. **Step 3:** Execute `os_info.os_version` only on those agents
+#### Query Plan
+
+Apply the cheapest filters first to minimize work at each stage:
+
+| Step | What | Why first | Cost |
+|---|---|---|---|
+| 1 | Scope to `ostype == "windows"` | Attribute check, instant | Free (scope engine) |
+| 2 | Query TAR for network events matching `example.com` | SQLite SELECT on agent-side TAR DB | Medium (per-agent DB query) |
+| 3 | Run `os_info.os_version` on matching agents only | Only runs on the filtered set | Low (small target set) |
+
+The key insight: **use the TAR (Timeline Activity Record), not netstat.** `netstat` only shows *current* connections. The TAR continuously records network connection events (opened/closed) with timestamps, so it has 90 days of history. Each TAR network event stores both the IP and the DNS hostname (resolved at collection time):
+
+```json
+{"proto":"tcp", "local_addr":"10.0.1.5", "local_port":52341,
+ "remote_addr":"93.184.216.34", "remote_host":"example.com",
+ "remote_port":443, "state":"ESTABLISHED",
+ "pid":1234, "process_name":"chrome.exe"}
+```
+
+The `remote_host` field is resolved via reverse DNS at the moment the connection is first recorded by the TAR collector. This means hostname searches are just a string match against stored data — no DNS resolution at query time.
 
 #### Complete Python Script
 
@@ -646,6 +662,9 @@ import requests, time, json
 YUZU = "https://yuzu.example.com"
 TOKEN = "yuzu_tok_abc123..."
 HEADERS = {"X-Yuzu-Token": TOKEN, "Content-Type": "application/json"}
+
+TARGET_HOSTNAME = "example.com"
+DAYS_BACK = 90
 
 def execute(definition_id, scope="", params=None):
     r = requests.post(f"{YUZU}/api/executions", headers=HEADERS, json={
@@ -675,32 +694,49 @@ def get_responses(definition_id, exec_id=None, limit=10000):
     r.raise_for_status()
     return r.json()
 
-# ── Step 1: Get network connections from all Windows machines ────────────
-print("Step 1: Querying network connections on all Windows machines...")
-exec1 = execute("device.network.netstat_list",
-                scope='ostype == "windows"')
-summary1 = wait_for(exec1)
+# ── Step 1: Query TAR on Windows machines for network events ─────────────
+# Scope to Windows first (cheapest filter — just an attribute check).
+# Then query the TAR for network events in the last 90 days.
+since_epoch = int(time.time()) - (DAYS_BACK * 86400)
+
+print(f"Step 1: Querying TAR network events on all Windows machines (last {DAYS_BACK} days)...")
+exec1 = execute("crossplatform.tar.query",
+                scope='ostype == "windows"',
+                params={
+                    "from": str(since_epoch),
+                    "type": "network",
+                    "limit": "10000"
+                })
+summary1 = wait_for(exec1, timeout=600)
 print(f"  Received responses from {summary1['agents_responded']} agents")
 
-# ── Step 2: Filter for machines that connected to example.com ────────────
-print("Step 2: Filtering for connections to example.com...")
-responses = get_responses("device.network.netstat_list", exec1)
+# ── Step 2: Filter TAR results for connections to our target hostname ────
+# TAR stores remote_host (DNS name resolved at collection time), so this
+# is a simple string match — no DNS resolution needed at query time.
+print(f"Step 2: Filtering for connections to {TARGET_HOSTNAME}...")
+responses = get_responses("crossplatform.tar.query", exec1)
 
-# Extract unique agent IDs where remote_address contains example.com
 matching_agents = set()
 for row in responses:
-    remote = row.get("output", {}).get("remote_address", "")
-    if "example.com" in remote or "93.184.216.34" in remote:  # IP of example.com
-        matching_agents.add(row["agent_id"])
+    detail_str = row.get("output", {}).get("detail_json", "")
+    if not detail_str:
+        continue
+    try:
+        detail = json.loads(detail_str)
+        remote_host = detail.get("remote_host", "")
+        if TARGET_HOSTNAME in remote_host:
+            matching_agents.add(row["agent_id"])
+    except json.JSONDecodeError:
+        continue
 
-print(f"  Found {len(matching_agents)} machines with connections to example.com")
+print(f"  Found {len(matching_agents)} Windows machines that connected to {TARGET_HOSTNAME}")
 
 if not matching_agents:
     print("  No matching machines found. Done.")
     exit(0)
 
 # ── Step 3: Get OS version from only those machines ──────────────────────
-# Build an IN scope expression from the matching agent IDs
+# This is the lightest operation — runs only on the filtered set.
 agent_list = ", ".join(f'"{aid}"' for aid in matching_agents)
 scope_expr = f"agent_id IN ({agent_list})"
 
@@ -709,81 +745,54 @@ exec3 = execute("device.os_info.os_version", scope=scope_expr)
 summary3 = wait_for(exec3)
 
 # ── Results ──────────────────────────────────────────────────────────────
-print("\nResults:")
-print("-" * 60)
+print(f"\nWindows machines that connected to {TARGET_HOSTNAME} in the last {DAYS_BACK} days:")
+print("-" * 70)
 os_responses = get_responses("device.os_info.os_version", exec3)
 for row in os_responses:
     version = row.get("output", {}).get("os_version", "unknown")
     product = row.get("output", {}).get("os_product_version", "")
     agent = row["agent_id"]
     print(f"  {agent}: {version} ({product})")
+print(f"\nTotal: {len(os_responses)} machines")
 ```
 
-#### Alternative: Workflow YAML
+#### Why This Order Matters
 
-For recurring use, define this as a workflow:
-
-```yaml
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: workflow.url_connection_os_audit
-  displayName: "Audit OS versions for machines connecting to a URL"
-  version: 1.0.0
-spec:
-  type: question
-  platforms: [windows, linux, darwin]
-
-  execution:
-    plugin: os_info
-    action: os_version
-
-  parameters:
-    type: object
-    required: [target_url]
-    properties:
-      target_url:
-        type: string
-        displayName: Target URL / Hostname
-        description: >
-          The URL or hostname to search for in network connections.
-          Agents that have connected to this address will be targeted
-          for OS version collection in the second step.
-        validation:
-          maxLength: 2048
-
-  result:
-    columns:
-      - name: os_version
-        type: string
-      - name: os_product_version
-        type: string
-
-  readablePayload: "Get OS version for machines that connected to ${target_url}"
-
-  approval:
-    mode: auto
 ```
+All agents (e.g., 10,000)
+    │
+    ▼ scope: ostype == "windows"    ← FREE (attribute check)
+Windows agents (e.g., 6,000)
+    │
+    ▼ TAR query: network events     ← MEDIUM (SQLite SELECT per agent)
+Connected to example.com (e.g., 47)
+    │
+    ▼ os_info.os_version            ← CHEAP (47 agents, not 6,000)
+Final results (47 rows)
+```
+
+If you reversed the order and ran `os_info` on all 10,000 agents first, you'd gather 10,000 OS version responses only to discard 9,953 of them. By filtering first with the TAR, you avoid dispatching unnecessary work to thousands of agents.
 
 #### Dashboard UI Walkthrough
 
-**Manual two-step approach:**
+**Manual three-step approach:**
 
-1. **Step 1: Run netstat on Windows fleet**
-   - **Instructions > Definitions** > `device.network.netstat_list`
+1. **Step 1: Query TAR on Windows fleet**
+   - **Instructions > Definitions** > `crossplatform.tar.query`
    - Scope: `ostype == "windows"`
+   - Parameters: **Start Time** = epoch for 90 days ago (e.g., `1719500000`), **Event Type Filter** = `network`, **Result Limit** = `10000`
    - Click **Run**
 
-2. **Step 2: Review results**
-   - **Instructions > Executions** > click the netstat execution
-   - Use the browser search (Ctrl+F) to find rows containing `example.com`
+2. **Step 2: Review TAR results**
+   - **Instructions > Executions** > click the TAR query execution
+   - In the results, look at the `detail_json` column for `remote_addr` values matching the target IP (e.g., `93.184.216.34` for example.com)
    - Note the agent IDs of matching machines
 
 3. **Step 3: Run os_version on matching machines**
    - **Instructions > Definitions** > `device.os_info.os_version`
    - Scope: `agent_id IN ("agent-007", "agent-042", ...)` (paste the IDs from step 2)
    - Click **Run**
-   - Results show OS versions for only those machines
+   - Results show OS versions for only the machines that connected to the target
 
 ---
 

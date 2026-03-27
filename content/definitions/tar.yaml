@@ -76,7 +76,7 @@ metadata:
     The detail_json field contains a JSON object with type-specific fields:
 
     Process events: {"pid":N, "ppid":N, "name":"...", "cmdline":"...", "user":"..."}
-    Network events: {"proto":"tcp", "local_addr":"...", "local_port":N, "remote_addr":"...", "remote_port":N, "state":"...", "pid":N}
+    Network events: {"proto":"tcp", "local_addr":"...", "local_port":N, "remote_addr":"...", "remote_host":"...", "remote_port":N, "state":"...", "pid":N}
     Service events: {"name":"...", "display_name":"...", "status":"...", "startup_type":"..."}
     User events: {"user":"...", "domain":"...", "logon_type":"...", "session_id":"..."}
   tags: [tar, timeline, query, forensics, compliance]

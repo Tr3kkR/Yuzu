@@ -112,6 +112,67 @@ TEST_CASE("TAR diff: empty network snapshots produce no events", "[tar][diff][ne
     CHECK(events.empty());
 }
 
+TEST_CASE("TAR diff: remote_host appears in network event JSON", "[tar][diff][network]") {
+    std::vector<NetConnection> prev;
+    NetConnection nc;
+    nc.proto = "tcp";
+    nc.local_addr = "192.168.1.1";
+    nc.local_port = 54321;
+    nc.remote_addr = "93.184.216.34";
+    nc.remote_host = "example.com";
+    nc.remote_port = 443;
+    nc.state = "ESTABLISHED";
+    nc.pid = 200;
+    nc.process_name = "curl";
+    std::vector<NetConnection> curr = {nc};
+
+    auto events = compute_network_diff(prev, curr, 8000, 8);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_action == "connected");
+    CHECK(events[0].detail_json.find("\"remote_host\":\"example.com\"") != std::string::npos);
+    CHECK(events[0].detail_json.find("\"remote_addr\":\"93.184.216.34\"") != std::string::npos);
+}
+
+TEST_CASE("TAR diff: empty remote_host produces empty string in JSON", "[tar][diff][network]") {
+    std::vector<NetConnection> prev;
+    NetConnection nc;
+    nc.proto = "tcp";
+    nc.local_addr = "10.0.0.1";
+    nc.local_port = 12345;
+    nc.remote_addr = "172.16.0.1";
+    // remote_host left empty (no PTR record)
+    nc.remote_port = 80;
+    nc.state = "ESTABLISHED";
+    nc.pid = 300;
+    std::vector<NetConnection> curr = {nc};
+
+    auto events = compute_network_diff(prev, curr, 9000, 9);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].detail_json.find("\"remote_host\":\"\"") != std::string::npos);
+}
+
+TEST_CASE("TAR diff: remote_host in disconnected event", "[tar][diff][network]") {
+    NetConnection nc;
+    nc.proto = "tcp";
+    nc.local_addr = "10.0.0.1";
+    nc.local_port = 12345;
+    nc.remote_addr = "93.184.216.34";
+    nc.remote_host = "example.com";
+    nc.remote_port = 443;
+    nc.state = "ESTABLISHED";
+    nc.pid = 400;
+    std::vector<NetConnection> prev = {nc};
+    std::vector<NetConnection> curr;
+
+    auto events = compute_network_diff(prev, curr, 10000, 10);
+
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_action == "disconnected");
+    CHECK(events[0].detail_json.find("\"remote_host\":\"example.com\"") != std::string::npos);
+}
+
 // =============================================================================
 // Service diff tests
 // =============================================================================

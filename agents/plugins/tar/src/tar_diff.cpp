@@ -237,10 +237,10 @@ std::vector<TarEvent> compute_network_diff(
             ev.event_type = "network";
             ev.event_action = "connected";
             ev.detail_json = std::format(
-                R"({{"proto":"{}","local_addr":"{}","local_port":{},"remote_addr":"{}","remote_port":{},"state":"{}","pid":{},"process_name":"{}"}})",
+                R"({{"proto":"{}","local_addr":"{}","local_port":{},"remote_addr":"{}","remote_host":"{}","remote_port":{},"state":"{}","pid":{},"process_name":"{}"}})",
                 json_escape(c.proto), json_escape(c.local_addr), c.local_port,
-                json_escape(c.remote_addr), c.remote_port, json_escape(c.state), c.pid,
-                json_escape(c.process_name));
+                json_escape(c.remote_addr), json_escape(c.remote_host), c.remote_port,
+                json_escape(c.state), c.pid, json_escape(c.process_name));
             ev.snapshot_id = snapshot_id;
             events.push_back(std::move(ev));
         }
@@ -255,10 +255,10 @@ std::vector<TarEvent> compute_network_diff(
             ev.event_type = "network";
             ev.event_action = "disconnected";
             ev.detail_json = std::format(
-                R"({{"proto":"{}","local_addr":"{}","local_port":{},"remote_addr":"{}","remote_port":{},"state":"{}","pid":{},"process_name":"{}"}})",
+                R"({{"proto":"{}","local_addr":"{}","local_port":{},"remote_addr":"{}","remote_host":"{}","remote_port":{},"state":"{}","pid":{},"process_name":"{}"}})",
                 json_escape(c.proto), json_escape(c.local_addr), c.local_port,
-                json_escape(c.remote_addr), c.remote_port, json_escape(c.state), c.pid,
-                json_escape(c.process_name));
+                json_escape(c.remote_addr), json_escape(c.remote_host), c.remote_port,
+                json_escape(c.state), c.pid, json_escape(c.process_name));
             ev.snapshot_id = snapshot_id;
             events.push_back(std::move(ev));
         }
