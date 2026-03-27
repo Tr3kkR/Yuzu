@@ -132,7 +132,11 @@ void RbacStore::seed_defaults() {
                            "ManagementGroup",
                            "ApiToken",
                            "Security",
-                           "Policy"};
+                           "Policy",
+                           "DeviceToken",
+                           "SoftwareDeployment",
+                           "License",
+                           "FileRetrieval"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -297,6 +301,34 @@ void RbacStore::seed_defaults() {
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Policy', 'Execute', 'allow');",
         nullptr, nullptr, nullptr);
+    // Operator: read + execute on SoftwareDeployment
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'SoftwareDeployment', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'SoftwareDeployment', 'Execute', 'allow');",
+        nullptr, nullptr, nullptr);
+    // Operator: read on DeviceToken
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'DeviceToken', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    // Operator: read on License
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'License', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    // Operator: read + write on FileRetrieval
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'FileRetrieval', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'FileRetrieval', 'Write', 'allow');",
+        nullptr, nullptr, nullptr);
 
     // ApiTokenManager: read + write + delete on ApiToken
     const char* atm_ops[] = {"Read", "Write", "Delete"};
@@ -324,7 +356,11 @@ void RbacStore::seed_defaults() {
                                 "AuditLog",
                                 "Response",
                                 "ManagementGroup",
-                                "Policy"};
+                                "Policy",
+                                "DeviceToken",
+                                "SoftwareDeployment",
+                                "License",
+                                "FileRetrieval"};
     for (auto* t : itso_types) {
         for (auto* o : ops) {
             sqlite3_stmt* s = nullptr;
@@ -352,7 +388,11 @@ void RbacStore::seed_defaults() {
                                   "ManagementGroup",
                                   "ApiToken",
                                   "Security",
-                                  "Policy"};
+                                  "Policy",
+                                  "DeviceToken",
+                                  "SoftwareDeployment",
+                                  "License",
+                                  "FileRetrieval"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

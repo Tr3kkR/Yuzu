@@ -1,0 +1,846 @@
+## T2 Capability Definitions
+## New plugin actions added in T2: advanced filesystem operations,
+## patch connectivity testing, and content upload.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.search_dir
+  displayName: Search Directories by Name Pattern
+  version: 0.4.0
+  description: >
+    Search a directory tree for files or directories matching a name pattern.
+    Supports both glob matching (default) and regex. Walks the tree recursively
+    up to max_depth with configurable result limits. Paths are canonicalized;
+    optional base_dir restricts the search scope.
+  tags: [filesystem, search, diagnostics, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: search_dir
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [root, pattern]
+    properties:
+      root:
+        type: string
+        displayName: Root Directory
+        description: The root directory to search from.
+        validation:
+          maxLength: 4096
+      pattern:
+        type: string
+        displayName: Name Pattern
+        description: >
+          Glob pattern (default) or regex to match against entry names.
+          Examples: "*.log", "config*", "^backup-\d+$" (with regex=true).
+        validation:
+          maxLength: 256
+      regex:
+        type: string
+        displayName: Use Regex
+        description: >
+          If "true", interpret the pattern as an ECMAScript regex instead
+          of a glob. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      match_type:
+        type: string
+        displayName: Match Type
+        description: >
+          What to match: "directories" (default), "files", or "both".
+        default: "directories"
+        validation:
+          enum: ["directories", "files", "both"]
+      max_depth:
+        type: int32
+        displayName: Maximum Depth
+        description: >
+          Maximum directory recursion depth. Default: 5, max: 20.
+        default: 5
+        validation:
+          minimum: 1
+          maximum: 20
+      max_results:
+        type: int32
+        displayName: Maximum Results
+        description: >
+          Maximum number of matching entries to return. Default: 100, max: 1000.
+        default: 100
+        validation:
+          minimum: 1
+          maximum: 1000
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts the search root to paths within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: path
+        type: string
+      - name: entry_type
+        type: string
+      - name: total_matches
+        type: int32
+
+  readablePayload: "Search for ${match_type} matching '${pattern}' in ${root}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.get_version_info
+  displayName: Get PE Version Info
+  version: 0.4.0
+  description: >
+    Extract the PE (Portable Executable) version resource information from
+    a Windows executable or DLL. Returns the file version, product version,
+    company name, file description, internal name, original filename,
+    product name, and legal copyright. Windows only; returns an error on
+    Linux and macOS.
+  tags: [filesystem, windows, inventory, compliance, version]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: filesystem
+    action: get_version_info
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: >
+          The PE executable or DLL to inspect for version info.
+        validation:
+          maxLength: 4096
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: file_version
+        type: string
+      - name: product_version
+        type: string
+      - name: company_name
+        type: string
+      - name: file_description
+        type: string
+      - name: internal_name
+        type: string
+      - name: original_filename
+        type: string
+      - name: product_name
+        type: string
+      - name: legal_copyright
+        type: string
+
+  readablePayload: "Get PE version info for ${path}"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.search
+  displayName: Search File Contents
+  version: 0.4.0
+  description: >
+    Search a text file's contents for lines matching a literal string or
+    regex pattern. Returns matching line numbers and content. Supports
+    case-insensitive search, regex mode with backtracking protection, and
+    configurable maximum match count. Files larger than 100 MB are rejected.
+  tags: [filesystem, search, log-analysis, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: search
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path, pattern]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The text file to search.
+        validation:
+          maxLength: 4096
+      pattern:
+        type: string
+        displayName: Search Pattern
+        description: >
+          The literal string or regex to search for in each line.
+        validation:
+          maxLength: 256
+      regex:
+        type: string
+        displayName: Use Regex
+        description: >
+          If "true", interpret the pattern as an ECMAScript regex.
+          Patterns with nested quantifiers are rejected to prevent
+          catastrophic backtracking. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      case_sensitive:
+        type: string
+        displayName: Case Sensitive
+        description: >
+          If "true" (default), match is case-sensitive. If "false",
+          performs case-insensitive matching.
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+      max_matches:
+        type: int32
+        displayName: Maximum Matches
+        description: >
+          Maximum number of matching lines to return. Default: 100, max: 10000.
+        default: 100
+        validation:
+          minimum: 1
+          maximum: 10000
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: line_number
+        type: int32
+      - name: content
+        type: string
+      - name: total_matches
+        type: int32
+
+  readablePayload: "Search '${pattern}' in ${path}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.replace
+  displayName: Find and Replace in File
+  version: 0.4.0
+  description: >
+    Find and replace text in a file using literal string matching or regex.
+    Supports case-insensitive mode, dry-run (preview without writing), and
+    a maximum replacement count. The write is atomic (temp file + rename)
+    to prevent corruption. Files larger than 100 MB are rejected. Regex
+    patterns with nested quantifiers are rejected for safety.
+  tags: [filesystem, action, configuration, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: replace
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path, search]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The file to perform find/replace on.
+        validation:
+          maxLength: 4096
+      search:
+        type: string
+        displayName: Search String
+        description: >
+          The literal string or regex to search for.
+        validation:
+          maxLength: 256
+      replacement:
+        type: string
+        displayName: Replacement String
+        description: >
+          The text to replace matches with. Empty string removes matches.
+        default: ""
+      regex:
+        type: string
+        displayName: Use Regex
+        description: >
+          If "true", interpret search as an ECMAScript regex. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      case_sensitive:
+        type: string
+        displayName: Case Sensitive
+        description: >
+          If "true" (default), match is case-sensitive.
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+      dry_run:
+        type: string
+        displayName: Dry Run
+        description: >
+          If "true", count replacements without modifying the file. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      max_replacements:
+        type: int32
+        displayName: Maximum Replacements
+        description: >
+          Maximum number of replacements to perform. 0 = unlimited. Default: 0.
+        default: 0
+        validation:
+          minimum: 0
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: replacements_made
+        type: int32
+      - name: file_size_before
+        type: int64
+      - name: file_size_after
+        type: int64
+      - name: dry_run
+        type: bool
+
+  readablePayload: "Replace '${search}' with '${replacement}' in ${path}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.write_content
+  displayName: Write File Contents
+  version: 0.4.0
+  description: >
+    Write or create a file with the specified content. If the file exists,
+    overwrite must be true. If the file does not exist, create must be true.
+    Content is written atomically for existing files (temp + rename) to
+    prevent corruption. Maximum content size is 100 MB. Paths are
+    canonicalized; optional base_dir restricts access.
+  tags: [filesystem, action, configuration, deployment]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: write_content
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: >
+          The file path to write to. If the file does not exist, it will be
+          created if create=true.
+        validation:
+          maxLength: 4096
+      content:
+        type: string
+        displayName: Content
+        description: The text content to write to the file.
+      create:
+        type: string
+        displayName: Create If Missing
+        description: >
+          If "true", create the file if it does not exist. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      overwrite:
+        type: string
+        displayName: Overwrite Existing
+        description: >
+          If "true", overwrite an existing file. Default: "false".
+        default: "false"
+        validation:
+          enum: ["true", "false"]
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: bytes_written
+        type: int64
+      - name: path
+        type: string
+
+  readablePayload: "Write content to ${path} (create=${create}, overwrite=${overwrite})"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.append
+  displayName: Append to File
+  version: 0.4.0
+  description: >
+    Append text content to the end of an existing file. Optionally adds a
+    newline separator if the file does not end with one. The file must already
+    exist and be a regular file. Paths are canonicalized; optional base_dir
+    restricts access.
+  tags: [filesystem, action, logging, configuration]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: append
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The existing file to append content to.
+        validation:
+          maxLength: 4096
+      content:
+        type: string
+        displayName: Content
+        description: The text content to append to the file.
+      newline:
+        type: string
+        displayName: Auto-Newline
+        description: >
+          If "true" (default), adds a newline before appended content when
+          the file does not end with a newline character. Prevents content
+          from being joined to the last existing line.
+        default: "true"
+        validation:
+          enum: ["true", "false"]
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: bytes_appended
+        type: int64
+      - name: total_size
+        type: int64
+
+  readablePayload: "Append content to ${path}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.filesystem.delete_lines
+  displayName: Delete Line Range from File
+  version: 0.4.0
+  description: >
+    Delete a range of lines (1-based, inclusive) from a text file. Reads the
+    entire file, removes the specified lines, and writes it back atomically.
+    Files larger than 100 MB are rejected. The start_line must not exceed
+    the total number of lines; end_line is clamped if it goes past the end.
+  tags: [filesystem, action, configuration, remediation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem
+    action: delete_lines
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path, start_line, end_line]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: The text file to delete lines from.
+        validation:
+          maxLength: 4096
+      start_line:
+        type: int32
+        displayName: Start Line
+        description: >
+          The first line to delete (1-based, inclusive).
+        validation:
+          minimum: 1
+      end_line:
+        type: int32
+        displayName: End Line
+        description: >
+          The last line to delete (1-based, inclusive). Clamped to total
+          line count if it exceeds file length.
+        validation:
+          minimum: 1
+      base_dir:
+        type: string
+        displayName: Base Directory
+        description: >
+          Optional. Restricts access to files within this directory.
+        validation:
+          maxLength: 4096
+
+  result:
+    columns:
+      - name: lines_deleted
+        type: int32
+      - name: lines_before
+        type: int32
+      - name: lines_after
+        type: int32
+
+  readablePayload: "Delete lines ${start_line}-${end_line} from ${path}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.4.0
+    requiredPlugins: [filesystem]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.windows_updates.patch_connectivity
+  displayName: Test Patch Server Connectivity
+  version: 1.1.0
+  description: >
+    Test network connectivity to patch/update servers. Performs DNS resolution,
+    TCP connect, and optionally HTTPS handshake for each target URL. Targets
+    can be explicitly provided or default to the platform's standard update
+    servers (Windows Update, WSUS, apt/yum repos, macOS SUS). Returns per-target
+    DNS and TCP results plus an overall summary of reachable vs failed targets.
+  tags: [updates, patching, network, connectivity, diagnostics, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: windows_updates
+    action: patch_connectivity
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      targets:
+        type: string
+        displayName: Target URLs
+        description: >
+          Comma-separated list of URLs to test connectivity against.
+          If empty, uses platform-default patch servers (e.g. Windows Update
+          endpoints, apt/yum/dnf repos, macOS Software Update).
+          Example: "https://update.microsoft.com,https://download.windowsupdate.com"
+      timeout_seconds:
+        type: int32
+        displayName: Timeout (seconds)
+        description: >
+          TCP connection timeout per target. Default: 10, min: 1, max: 60.
+        default: 10
+        validation:
+          minimum: 1
+          maximum: 60
+
+  result:
+    columns:
+      - name: target
+        type: string
+      - name: dns_ok
+        type: bool
+      - name: dns_ms
+        type: int32
+      - name: ip
+        type: string
+      - name: tcp_ok
+        type: bool
+      - name: tcp_ms
+        type: int32
+      - name: tcp_error
+        type: string
+      - name: targets_tested
+        type: int32
+      - name: targets_reachable
+        type: int32
+      - name: targets_failed
+        type: int32
+
+  readablePayload: "Test patch server connectivity (timeout=${timeout_seconds}s)"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.1.0
+    requiredPlugins: [windows_updates]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: agent.content_dist.upload_file
+  displayName: Upload File to Server
+  version: 1.1.0
+  description: >
+    Upload a local file from the agent endpoint to the Yuzu server via
+    multipart POST. Computes the SHA-256 hash of the file before upload and
+    sends it alongside the file data for server-side verification. If
+    server_url is not provided, derives it from the agent's configured
+    server web URL. Maximum file size is configurable (default 100 MB).
+  tags: [content, upload, transfer, deployment]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: content_dist
+    action: upload_file
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [path]
+    properties:
+      path:
+        type: string
+        displayName: File Path
+        description: >
+          The local file path on the endpoint to upload.
+        validation:
+          maxLength: 4096
+      server_url:
+        type: string
+        displayName: Server URL
+        description: >
+          The Yuzu server base URL to upload to. If not provided, uses the
+          agent's configured server web URL (agent.server_web_url).
+        validation:
+          maxLength: 2048
+      max_size_mb:
+        type: int32
+        displayName: Max Size (MB)
+        description: >
+          Maximum allowed file size in megabytes. Default: 100.
+        default: 100
+        validation:
+          minimum: 1
+          maximum: 1000
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: sha256
+        type: string
+      - name: bytes_uploaded
+        type: int64
+      - name: filename
+        type: string
+
+  readablePayload: "Upload ${path} to server"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.1.0
+    requiredPlugins: [content_dist]
+
+status:
+  phase: active

@@ -7,6 +7,13 @@
  *   "file_hash"       — Compute SHA-256 (or SHA-1) hash of a file.
  *   "create_temp"     — Create a secure temporary file (mode 0600 / owner-only DACL).
  *   "create_temp_dir" — Create a secure temporary directory (mode 0700 / owner-only DACL).
+ *   "search_dir"      — Find directories/files by name pattern (glob/regex).
+ *   "get_version_info" — Extract PE version resource info (Windows only).
+ *   "search"          — Search file contents for a pattern.
+ *   "replace"         — Find/replace text in a file (atomic write).
+ *   "write_content"   — Write or overwrite file contents.
+ *   "append"          — Append content to a file.
+ *   "delete_lines"    — Delete a range of lines from a file.
  *
  * Security:
  *   - All paths are canonicalized via std::filesystem::canonical() to
@@ -14,6 +21,7 @@
  *   - An optional base_dir parameter restricts access to a subtree.
  *   - Temp files use mkstemps() (POSIX) / CreateFile+CREATE_NEW (Windows)
  *     with restrictive permissions to prevent TOCTOU races.
+ *   - Write operations use atomic temp+rename to prevent partial writes.
  *   - This plugin requires admin role on the server side.
  *
  * Output is pipe-delimited via write_output():
@@ -31,8 +39,11 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -49,10 +60,12 @@
 #include <sddl.h>
 #include <softpub.h>
 #include <wintrust.h>
+#include <winver.h>
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "version.lib")
 #else
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -281,21 +294,130 @@ std::string compute_hash_unix(const std::string& path, std::string_view algorith
 
 #endif
 
+// ── Regex safety check ─────────────────────────────────────────────────
+// Reject patterns with nested quantifiers that cause catastrophic backtracking.
+bool has_nested_quantifiers(std::string_view pattern) {
+    // Detect (X+)+, (X*)+, (X+)*, (X*)* and similar nested quantifier patterns
+    int paren_depth = 0;
+    bool last_was_quantifier = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        char c = pattern[i];
+        if (c == '\\' && i + 1 < pattern.size()) { ++i; last_was_quantifier = false; continue; }
+        if (c == '(') { ++paren_depth; last_was_quantifier = false; continue; }
+        if (c == ')') {
+            --paren_depth;
+            // If closing paren follows a quantifier and is itself followed by a quantifier
+            if (i + 1 < pattern.size() && last_was_quantifier) {
+                char next = pattern[i + 1];
+                if (next == '+' || next == '*' || next == '?' || next == '{')
+                    return true;
+            }
+            last_was_quantifier = false;
+            continue;
+        }
+        last_was_quantifier = (c == '+' || c == '*' || c == '?' ||
+                               (c == '}' && pattern.substr(0, i).rfind('{') != std::string_view::npos));
+    }
+    return false;
+}
+
+// ── Glob pattern matching ──────────────────────────────────────────────
+// Simple glob matcher: * matches any chars, ? matches one char, [abc] char class.
+bool glob_match(std::string_view pattern, std::string_view text) {
+    size_t px = 0, tx = 0;
+    size_t star_px = std::string_view::npos, star_tx = 0;
+
+    while (tx < text.size()) {
+        if (px < pattern.size() && (pattern[px] == '?' ||
+            (pattern[px] != '*' && pattern[px] != '[' && (pattern[px] == text[tx])))) {
+            ++px; ++tx;
+        } else if (px < pattern.size() && pattern[px] == '[') {
+            ++px;
+            bool negate = (px < pattern.size() && pattern[px] == '!');
+            if (negate) ++px;
+            bool matched = false;
+            while (px < pattern.size() && pattern[px] != ']') {
+                if (px + 2 < pattern.size() && pattern[px + 1] == '-') {
+                    if (text[tx] >= pattern[px] && text[tx] <= pattern[px + 2])
+                        matched = true;
+                    px += 3;
+                } else {
+                    if (text[tx] == pattern[px]) matched = true;
+                    ++px;
+                }
+            }
+            if (px < pattern.size()) ++px; // skip ']'
+            if (matched == negate) {
+                if (star_px != std::string_view::npos) { px = star_px + 1; tx = ++star_tx; }
+                else return false;
+            } else { ++tx; }
+        } else if (px < pattern.size() && pattern[px] == '*') {
+            star_px = px; star_tx = tx; ++px;
+        } else if (star_px != std::string_view::npos) {
+            px = star_px + 1; tx = ++star_tx;
+        } else {
+            return false;
+        }
+    }
+    while (px < pattern.size() && pattern[px] == '*') ++px;
+    return px == pattern.size();
+}
+
+// ── Atomic file write helper ───────────────────────────────────────────
+// Write content to a temp file in the same directory, then rename.
+bool atomic_write_file(const fs::path& target, std::string_view content) {
+    auto dir = target.parent_path();
+    auto tmp = dir / (target.filename().string() + ".yuzu_tmp");
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (!ofs) return false;
+        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!ofs) { std::error_code ec; fs::remove(tmp, ec); return false; }
+    }
+    std::error_code ec;
+#ifdef _WIN32
+    // On Windows, fs::rename may fail if target is open; try ReplaceFile first
+    std::wstring wold, wnew;
+    {
+        auto s = tmp.string();
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        wold.resize(static_cast<size_t>(len));
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, wold.data(), len);
+    }
+    {
+        auto s = target.string();
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        wnew.resize(static_cast<size_t>(len));
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, wnew.data(), len);
+    }
+    if (fs::exists(target, ec)) {
+        if (ReplaceFileW(wnew.c_str(), wold.c_str(), nullptr, 0, nullptr, nullptr))
+            return true;
+    }
+#endif
+    fs::rename(tmp, target, ec);
+    if (ec) { fs::remove(tmp, ec); return false; }
+    return true;
+}
+
 } // namespace
 
 class FilesystemPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "filesystem"; }
-    std::string_view version() const noexcept override { return "0.3.0"; }
+    std::string_view version() const noexcept override { return "0.4.0"; }
     std::string_view description() const noexcept override {
-        return "Filesystem operations — exists, list_dir, file_hash, create_temp, create_temp_dir "
+        return "Filesystem operations — exists, list_dir, file_hash, search_dir, text ops "
                "(admin-only)";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"exists",          "list_dir",      "file_hash",   "create_temp",
-                                     "create_temp_dir", "read",          "get_acl",     "get_signature",
-                                     "find_by_hash",    nullptr};
+        static const char* acts[] = {"exists",          "list_dir",        "file_hash",
+                                     "create_temp",     "create_temp_dir", "read",
+                                     "get_acl",         "get_signature",   "find_by_hash",
+                                     "search_dir",      "get_version_info",
+                                     "search",          "replace",         "write_content",
+                                     "append",          "delete_lines",    nullptr};
         return acts;
     }
 
@@ -330,6 +452,27 @@ public:
         }
         if (action == "find_by_hash") {
             return do_find_by_hash(ctx, params);
+        }
+        if (action == "search_dir") {
+            return do_search_dir(ctx, params);
+        }
+        if (action == "get_version_info") {
+            return do_get_version_info(ctx, params);
+        }
+        if (action == "search") {
+            return do_search(ctx, params);
+        }
+        if (action == "replace") {
+            return do_replace(ctx, params);
+        }
+        if (action == "write_content") {
+            return do_write_content(ctx, params);
+        }
+        if (action == "append") {
+            return do_append(ctx, params);
+        }
+        if (action == "delete_lines") {
+            return do_delete_lines(ctx, params);
         }
 
         ctx.write_output(std::format("unknown action: {}", action));
@@ -897,6 +1040,652 @@ private:
         ctx.write_output("error|Authenticode signature verification is not supported on this platform");
         return 1;
 #endif
+    }
+
+    // ── search_dir: Find directories/files by name pattern ────────────────
+
+    int do_search_dir(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto root = params.get("root");
+        auto pattern = params.get("pattern");
+        if (root.empty() || pattern.empty()) {
+            ctx.write_output("error|missing required parameters: root, pattern");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(root, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|root is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_directory(validated, ec)) {
+            ctx.write_output("error|root is not a directory");
+            return 1;
+        }
+
+        auto use_regex_str = params.get("regex", "false");
+        bool use_regex = (use_regex_str == "true");
+        auto match_type = params.get("match_type", "directories");
+
+        int max_depth = 5;
+        auto depth_str = params.get("max_depth", "5");
+        try { max_depth = std::stoi(std::string{depth_str}); } catch (...) {}
+        if (max_depth < 1) max_depth = 1;
+        if (max_depth > 20) max_depth = 20;
+
+        int max_results = 100;
+        auto results_str = params.get("max_results", "100");
+        try { max_results = std::stoi(std::string{results_str}); } catch (...) {}
+        if (max_results < 1) max_results = 1;
+        if (max_results > 1000) max_results = 1000;
+
+        // Compile regex if requested
+        std::regex re;
+        if (use_regex) {
+            std::string pat_str{pattern};
+            if (pat_str.size() > 256) {
+                ctx.write_output("error|pattern too long (max 256 chars)");
+                return 1;
+            }
+            if (has_nested_quantifiers(pat_str)) {
+                ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
+                return 1;
+            }
+            try {
+                re = std::regex(pat_str, std::regex::ECMAScript | std::regex::optimize);
+            } catch (const std::regex_error& e) {
+                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return 1;
+            }
+        }
+
+        int found_count = 0;
+        auto base_depth = std::count(validated.begin(), validated.end(), '/') +
+                          std::count(validated.begin(), validated.end(), '\\');
+
+        for (auto it = fs::recursive_directory_iterator(validated,
+                 fs::directory_options::skip_permission_denied, ec);
+             it != fs::recursive_directory_iterator() && found_count < max_results;
+             it.increment(ec)) {
+            if (ec) continue;
+
+            const auto& entry = *it;
+            auto entry_path = entry.path().string();
+            auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
+                         std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
+            if (depth > max_depth) {
+                it.disable_recursion_pending();
+                continue;
+            }
+
+            std::error_code fec;
+            bool is_dir = entry.is_directory(fec);
+            bool is_file = entry.is_regular_file(fec);
+
+            if (match_type == "directories" && !is_dir) continue;
+            if (match_type == "files" && !is_file) continue;
+            if (match_type == "both" && !is_dir && !is_file) continue;
+
+            auto name = entry.path().filename().string();
+            bool matched = false;
+            if (use_regex) {
+                matched = std::regex_match(name, re);
+            } else {
+                matched = glob_match(pattern, name);
+            }
+
+            if (matched) {
+                auto type_str = is_dir ? "directory" : "file";
+                ctx.write_output(std::format("result|{}|{}", entry_path, type_str));
+                ++found_count;
+            }
+        }
+
+        ctx.write_output(std::format("total_matches|{}", found_count));
+        return 0;
+    }
+
+    // ── get_version_info: Extract PE version resource (Windows) ─────────
+
+    int do_get_version_info(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+#ifdef _WIN32
+        // Convert to wide string
+        std::wstring wpath;
+        {
+            int len = MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, nullptr, 0);
+            wpath.resize(static_cast<size_t>(len));
+            MultiByteToWideChar(CP_UTF8, 0, validated.c_str(), -1, wpath.data(), len);
+        }
+
+        DWORD dummy = 0;
+        DWORD size = GetFileVersionInfoSizeW(wpath.c_str(), &dummy);
+        if (size == 0) {
+            ctx.write_output("error|no version info found in file");
+            return 1;
+        }
+
+        std::vector<BYTE> buf(size);
+        if (!GetFileVersionInfoW(wpath.c_str(), 0, size, buf.data())) {
+            ctx.write_output("error|failed to read version info");
+            return 1;
+        }
+
+        // Extract fixed version info
+        VS_FIXEDFILEINFO* ffi = nullptr;
+        UINT ffi_len = 0;
+        if (VerQueryValueW(buf.data(), L"\\", reinterpret_cast<LPVOID*>(&ffi), &ffi_len) && ffi) {
+            ctx.write_output(std::format("file_version|{}.{}.{}.{}",
+                HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS)));
+            ctx.write_output(std::format("product_version|{}.{}.{}.{}",
+                HIWORD(ffi->dwProductVersionMS), LOWORD(ffi->dwProductVersionMS),
+                HIWORD(ffi->dwProductVersionLS), LOWORD(ffi->dwProductVersionLS)));
+        }
+
+        // Get translation table for string queries
+        struct LangCodePage { WORD language; WORD code_page; };
+        LangCodePage* trans = nullptr;
+        UINT trans_len = 0;
+        if (VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation",
+                           reinterpret_cast<LPVOID*>(&trans), &trans_len) && trans) {
+            auto lang = trans[0].language;
+            auto cp = trans[0].code_page;
+
+            auto query_string = [&](const wchar_t* name) -> std::string {
+                auto sub_block = std::format(L"\\StringFileInfo\\{:04x}{:04x}\\{}", lang, cp, name);
+                wchar_t* val = nullptr;
+                UINT val_len = 0;
+                if (VerQueryValueW(buf.data(), sub_block.c_str(),
+                                   reinterpret_cast<LPVOID*>(&val), &val_len) && val && val_len > 0) {
+                    int mb_len = WideCharToMultiByte(CP_UTF8, 0, val, -1, nullptr, 0, nullptr, nullptr);
+                    std::string result(static_cast<size_t>(mb_len), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, val, -1, result.data(), mb_len, nullptr, nullptr);
+                    while (!result.empty() && result.back() == '\0') result.pop_back();
+                    return result;
+                }
+                return {};
+            };
+
+            auto emit = [&](const char* key, const wchar_t* name) {
+                auto val = query_string(name);
+                if (!val.empty()) ctx.write_output(std::format("{}|{}", key, val));
+            };
+
+            emit("company_name", L"CompanyName");
+            emit("file_description", L"FileDescription");
+            emit("internal_name", L"InternalName");
+            emit("original_filename", L"OriginalFilename");
+            emit("product_name", L"ProductName");
+            emit("legal_copyright", L"LegalCopyright");
+        }
+
+        return 0;
+#else
+        ctx.write_output("error|PE version info is only available on Windows");
+        return 1;
+#endif
+    }
+
+    // ── search: Search file contents for a pattern ──────────────────────
+
+    int do_search(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        auto pattern = params.get("pattern");
+        if (path.empty() || pattern.empty()) {
+            ctx.write_output("error|missing required parameters: path, pattern");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        auto file_size = fs::file_size(validated, ec);
+        constexpr std::uintmax_t kMaxSearchSize = 100ULL * 1024 * 1024;
+        if (file_size > kMaxSearchSize) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {})", file_size, kMaxSearchSize));
+            return 1;
+        }
+
+        bool use_regex = (params.get("regex", "false") == "true");
+        bool case_sensitive = (params.get("case_sensitive", "true") == "true");
+        int max_matches = 100;
+        auto mm_str = params.get("max_matches", "100");
+        try { max_matches = std::stoi(std::string{mm_str}); } catch (...) {}
+        if (max_matches < 1) max_matches = 1;
+        if (max_matches > 10000) max_matches = 10000;
+
+        std::regex re;
+        std::string pattern_str{pattern};
+        if (pattern_str.size() > 256) {
+            ctx.write_output("error|pattern too long (max 256 chars)");
+            return 1;
+        }
+
+        if (use_regex) {
+            if (has_nested_quantifiers(pattern_str)) {
+                ctx.write_output("error|regex rejected: nested quantifiers risk catastrophic backtracking");
+                return 1;
+            }
+            auto flags = std::regex::ECMAScript | std::regex::optimize;
+            if (!case_sensitive) flags |= std::regex::icase;
+            try {
+                re = std::regex(pattern_str, flags);
+            } catch (const std::regex_error& e) {
+                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return 1;
+            }
+        } else if (!case_sensitive) {
+            std::transform(pattern_str.begin(), pattern_str.end(), pattern_str.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        }
+
+        std::ifstream f(validated);
+        if (!f) {
+            ctx.write_output("error|failed to open file");
+            return 1;
+        }
+
+        std::string line;
+        int line_num = 0;
+        int match_count = 0;
+        while (std::getline(f, line) && match_count < max_matches) {
+            ++line_num;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+
+            bool matched = false;
+            if (use_regex) {
+                matched = std::regex_search(line, re);
+            } else {
+                if (case_sensitive) {
+                    matched = line.find(pattern_str) != std::string::npos;
+                } else {
+                    std::string lower = line;
+                    std::transform(lower.begin(), lower.end(), lower.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    matched = lower.find(pattern_str) != std::string::npos;
+                }
+            }
+
+            if (matched) {
+                ctx.write_output(std::format("match|{}|{}", line_num, line));
+                ++match_count;
+            }
+        }
+
+        ctx.write_output(std::format("total_matches|{}", match_count));
+        return 0;
+    }
+
+    // ── replace: Find/replace text in a file ────────────────────────────
+
+    int do_replace(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        auto search_str = params.get("search");
+        auto replacement = params.get("replacement");
+        if (path.empty() || search_str.empty()) {
+            ctx.write_output("error|missing required parameters: path, search");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        auto file_size = fs::file_size(validated, ec);
+        constexpr std::uintmax_t kMaxReplaceSize = 100ULL * 1024 * 1024;
+        if (file_size > kMaxReplaceSize) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {})", file_size, kMaxReplaceSize));
+            return 1;
+        }
+
+        bool use_regex = (params.get("regex", "false") == "true");
+        bool case_sensitive = (params.get("case_sensitive", "true") == "true");
+        bool dry_run = (params.get("dry_run", "false") == "true");
+        int max_replacements = 0; // 0 = unlimited
+        auto mr_str = params.get("max_replacements", "0");
+        try { max_replacements = std::stoi(std::string{mr_str}); } catch (...) {}
+
+        // Read entire file
+        std::ifstream f(validated, std::ios::binary);
+        if (!f) { ctx.write_output("error|failed to open file"); return 1; }
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+
+        auto size_before = content.size();
+        int count = 0;
+        std::string search_s{search_str};
+        std::string replace_s{replacement};
+
+        if (use_regex) {
+            if (search_s.size() > 256) {
+                ctx.write_output("error|pattern too long (max 256 chars)");
+                return 1;
+            }
+            if (has_nested_quantifiers(search_s)) {
+                ctx.write_output("error|regex rejected: nested quantifiers risk catastrophic backtracking");
+                return 1;
+            }
+            auto flags = std::regex::ECMAScript | std::regex::optimize;
+            if (!case_sensitive) flags |= std::regex::icase;
+            std::regex re;
+            try { re = std::regex(search_s, flags); }
+            catch (const std::regex_error& e) {
+                ctx.write_output(std::format("error|invalid regex: {}", e.what()));
+                return 1;
+            }
+
+            if (max_replacements <= 0) {
+                // Count matches first
+                auto it = std::sregex_iterator(content.begin(), content.end(), re);
+                auto end = std::sregex_iterator();
+                count = static_cast<int>(std::distance(it, end));
+                content = std::regex_replace(content, re, replace_s);
+            } else {
+                std::string result;
+                auto it = std::sregex_iterator(content.begin(), content.end(), re);
+                auto end = std::sregex_iterator();
+                size_t last_pos = 0;
+                for (; it != end && count < max_replacements; ++it, ++count) {
+                    auto& m = *it;
+                    result.append(content, last_pos, static_cast<size_t>(m.position()) - last_pos);
+                    result.append(replace_s);
+                    last_pos = static_cast<size_t>(m.position() + m.length());
+                }
+                result.append(content, last_pos, content.size() - last_pos);
+                content = std::move(result);
+            }
+        } else {
+            // Literal replace
+            std::string haystack;
+            std::string needle = search_s;
+            if (!case_sensitive) {
+                std::transform(needle.begin(), needle.end(), needle.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                // Build lowercase copy for case-insensitive searching
+                haystack = content;
+                std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            }
+
+            std::string result;
+            size_t pos = 0;
+            while (pos < content.size()) {
+                size_t found = std::string::npos;
+                // Search from current position
+                if (case_sensitive) {
+                    found = content.find(needle, pos);
+                } else {
+                    found = haystack.find(needle, pos);
+                }
+
+                if (found == std::string::npos) {
+                    result.append(content, pos, content.size() - pos);
+                    break;
+                }
+
+                if (max_replacements > 0 && count >= max_replacements) {
+                    result.append(content, pos, content.size() - pos);
+                    break;
+                }
+
+                result.append(content, pos, found - pos);
+                result.append(replace_s);
+                pos = found + search_s.size();
+                ++count;
+            }
+            content = std::move(result);
+        }
+
+        if (!dry_run && count > 0) {
+            if (!atomic_write_file(fs::path(validated), content)) {
+                ctx.write_output("error|failed to write file");
+                return 1;
+            }
+        }
+
+        ctx.write_output(std::format("replacements_made|{}", count));
+        ctx.write_output(std::format("file_size_before|{}", size_before));
+        ctx.write_output(std::format("file_size_after|{}", content.size()));
+        if (dry_run) ctx.write_output("dry_run|true");
+        return 0;
+    }
+
+    // ── write_content: Write or overwrite file contents ─────────────────
+
+    int do_write_content(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        auto content = params.get("content");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        bool create = (params.get("create", "false") == "true");
+        bool overwrite = (params.get("overwrite", "false") == "true");
+
+        // Validate path FIRST (canonicalize + base_dir check) before
+        // checking existence to prevent TOCTOU with symlinks.
+        // Try validate_path (for existing files), fall back to
+        // validate_path_or_parent (for new files).
+        auto validated = validate_path(path, base_dir);
+        bool exists = !validated.empty();
+        if (!exists) {
+            validated = validate_path_or_parent(path, base_dir);
+            if (validated.empty()) {
+                ctx.write_output("error|path is not accessible or outside allowed base directory");
+                return 1;
+            }
+        }
+
+        if (!exists && !create) {
+            ctx.write_output("error|file does not exist and create=false");
+            return 1;
+        }
+        if (exists && !overwrite) {
+            ctx.write_output("error|file exists and overwrite=false");
+            return 1;
+        }
+
+        constexpr size_t kMaxWriteSize = 100ULL * 1024 * 1024;
+        if (content.size() > kMaxWriteSize) {
+            ctx.write_output(std::format("error|content too large ({} bytes, max {})", content.size(), kMaxWriteSize));
+            return 1;
+        }
+
+        if (exists) {
+            if (!atomic_write_file(fs::path(validated), content)) {
+                ctx.write_output("error|failed to write file");
+                return 1;
+            }
+        } else {
+            std::ofstream ofs(validated, std::ios::binary | std::ios::trunc);
+            if (!ofs) { ctx.write_output("error|failed to create file"); return 1; }
+            ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+            if (!ofs) { ctx.write_output("error|write failed"); return 1; }
+        }
+
+        ctx.write_output("status|ok");
+        ctx.write_output(std::format("bytes_written|{}", content.size()));
+        ctx.write_output(std::format("path|{}", validated));
+        return 0;
+    }
+
+    // ── append: Append content to a file ────────────────────────────────
+
+    int do_append(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        auto content = params.get("content");
+        if (path.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        bool add_newline = (params.get("newline", "true") == "true");
+
+        std::ofstream ofs(validated, std::ios::binary | std::ios::app);
+        if (!ofs) {
+            ctx.write_output("error|failed to open file for append");
+            return 1;
+        }
+
+        size_t bytes = 0;
+
+        // Check if file ends with newline
+        if (add_newline) {
+            auto file_size = fs::file_size(validated, ec);
+            if (file_size > 0) {
+                std::ifstream check(validated, std::ios::binary | std::ios::ate);
+                check.seekg(-1, std::ios::end);
+                char last = 0;
+                check.get(last);
+                if (last != '\n') {
+                    ofs.put('\n');
+                    ++bytes;
+                }
+            }
+        }
+
+        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+        bytes += content.size();
+
+        if (!ofs) {
+            ctx.write_output("error|append failed");
+            return 1;
+        }
+
+        auto total_size = fs::file_size(validated, ec);
+        ctx.write_output("status|ok");
+        ctx.write_output(std::format("bytes_appended|{}", bytes));
+        ctx.write_output(std::format("total_size|{}", ec ? 0 : total_size));
+        return 0;
+    }
+
+    // ── delete_lines: Delete a range of lines from a file ───────────────
+
+    int do_delete_lines(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path = params.get("path");
+        auto start_str = params.get("start_line");
+        auto end_str = params.get("end_line");
+        if (path.empty() || start_str.empty() || end_str.empty()) {
+            ctx.write_output("error|missing required parameters: path, start_line, end_line");
+            return 1;
+        }
+
+        auto base_dir = params.get("base_dir");
+        auto validated = validate_path(path, base_dir);
+        if (validated.empty()) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
+
+        std::error_code ec;
+        if (!fs::is_regular_file(validated, ec)) {
+            ctx.write_output("error|path is not a regular file");
+            return 1;
+        }
+
+        auto file_size = fs::file_size(validated, ec);
+        constexpr std::uintmax_t kMaxSize = 100ULL * 1024 * 1024;
+        if (file_size > kMaxSize) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {})", file_size, kMaxSize));
+            return 1;
+        }
+
+        int start_line = 0, end_line = 0;
+        try { start_line = std::stoi(std::string{start_str}); } catch (...) {}
+        try { end_line = std::stoi(std::string{end_str}); } catch (...) {}
+        if (start_line < 1 || end_line < start_line) {
+            ctx.write_output("error|invalid line range (1-based, start <= end)");
+            return 1;
+        }
+
+        // Read all lines
+        std::ifstream f(validated);
+        if (!f) { ctx.write_output("error|failed to open file"); return 1; }
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(f, line)) {
+            lines.push_back(std::move(line));
+        }
+        f.close();
+
+        int total_before = static_cast<int>(lines.size());
+        if (start_line > total_before) {
+            ctx.write_output("error|start_line beyond end of file");
+            return 1;
+        }
+
+        // Clamp end_line
+        if (end_line > total_before) end_line = total_before;
+
+        int deleted = end_line - start_line + 1;
+        lines.erase(lines.begin() + (start_line - 1), lines.begin() + end_line);
+
+        // Rebuild content
+        std::string content;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            content += lines[i];
+            if (i + 1 < lines.size()) content += '\n';
+        }
+        if (!lines.empty()) content += '\n'; // trailing newline
+
+        if (!atomic_write_file(fs::path(validated), content)) {
+            ctx.write_output("error|failed to write file");
+            return 1;
+        }
+
+        ctx.write_output(std::format("lines_deleted|{}", deleted));
+        ctx.write_output(std::format("total_lines_before|{}", total_before));
+        ctx.write_output(std::format("total_lines_after|{}", static_cast<int>(lines.size())));
+        return 0;
     }
 
     // ── find_by_hash: Search for a file by SHA256 hash ───────────────────

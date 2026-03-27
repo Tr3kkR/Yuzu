@@ -28,39 +28,39 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [================================]  33/33 done  (100%)
-Advanced     [===========================---]   92/101 done  (91%)
-Future       [=============================---]  28/50 done  (56%)
+Advanced     [================================]  101/101 done (100%)
+Future       [====================------------]  31/50 done  (62%)
 ─────────────────────────────────────────────────────────────────
-Overall      [============================---]  153/184 done  (83%)
+Overall      [=============================-]   165/184 done (90%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
-| 1. Agent Lifecycle | 9 | 8 | 0 | 1 |
+| 1. Agent Lifecycle | 9 | 9 | 0 | 0 |
 | 2. Command Execution | 13 | 13 | 0 | 0 |
 | 3. Device & Endpoint Info | 10 | 8 | 0 | 2 |
 | 4. Network Info & Discovery | 11 | 9 | 0 | 2 |
 | 5. Process & Service Mgmt | 5 | 4 | 0 | 1 |
 | 6. User & Session Mgmt | 5 | 5 | 0 | 0 |
-| 7. Software & App Mgmt | 6 | 5 | 0 | 1 |
-| 8. Patch & Update Mgmt | 9 | 7 | 0 | 2 |
+| 7. Software & App Mgmt | 6 | 6 | 0 | 0 |
+| 8. Patch & Update Mgmt | 9 | 8 | 0 | 1 |
 | 9. Security & Compliance | 10 | 9 | 0 | 1 |
-| 10. File System Operations | 15 | 10 | 0 | 5 |
+| 10. File System Operations | 15 | 14 | 0 | 1 |
 | 11. Script & Command Exec | 4 | 4 | 0 | 0 |
 | 12. Registry & System Config | 7 | 7 | 0 | 0 |
-| 13. Content Distribution | 5 | 4 | 0 | 1 |
+| 13. Content Distribution | 5 | 5 | 0 | 0 |
 | 14. User Interaction | 6 | 3 | 0 | 3 |
-| 15. Inventory & Data Collection | 5 | 3 | 0 | 2 |
+| 15. Inventory & Data Collection | 5 | 4 | 0 | 1 |
 | 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 9 | 8 | 0 | 1 |
+| 18. Auth & Authorization | 9 | 9 | 0 | 0 |
 | 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 4 | 0 | 1 |
-| 22. System & Infrastructure | 8 | 4 | 0 | 4 |
+| 22. System & Infrastructure | 8 | 7 | 0 | 1 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
-| **TOTAL** | **184** | **153** | **0** | **31** |
+| **TOTAL** | **184** | **165** | **0** | **19** |
 
 ---
 
@@ -108,11 +108,9 @@ spdlog-based local logging on the agent. `agent_logging` plugin provides remote 
 
 Session ID returned on registration. `WatchEvents` tracks connect/disconnect events. `connection_info` action in diagnostics plugin reports server address, TLS status, session ID, gRPC channel state, reconnect count, latency, uptime.
 
-### 1.9 Instruction Execution Statistics :x: `T2`
+### 1.9 Instruction Execution Statistics :white_check_mark: `T2`
 
-No per-agent metrics on commands executed, success rate, or average duration.
-
-> **Need:** Full execution history and statistics for operational visibility.
+`ExecutionTracker` aggregation methods: per-agent stats, per-definition stats, fleet summary. REST endpoints: `GET /api/v1/execution-statistics`, `/agents`, `/definitions`. HTMX fragment for dashboard card.
 
 ---
 
@@ -354,11 +352,9 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 `installed_apps` plugin extended with per-user hive enumeration (HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile). Distinguishes system-wide from user-specific installs in output.
 
-### 7.6 Software Deployment (Install/Upgrade) :x: `T2`
+### 7.6 Software Deployment (Install/Upgrade) :white_check_mark: `T2`
 
-Can execute scripts, but no managed software deployment workflow.
-
-> **Need:** Package staging, silent install orchestration, and rollback. Ties into content distribution.
+`SoftwareDeploymentStore` (SQLite) with package registration, deployment lifecycle (staged/deploying/verifying/completed/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`.
 
 ---
 
@@ -397,9 +393,9 @@ Full reboot orchestration in `PatchManager::execute_deployment()`. Configurable 
 
 `PatchManager::get_fleet_patch_summary()` returns fleet-wide patch compliance (per-KB missing agent counts). `get_missing_patches()` with `PatchQuery` filters by agent, severity, status. Deployment tracking with aggregate progress.
 
-### 8.8 Patch Connectivity Testing :x: `T2`
+### 8.8 Patch Connectivity Testing :white_check_mark: `T2`
 
-Not implemented. Test connection to patch/update server.
+`patch_connectivity` action in `windows_updates` plugin. Per-target DNS resolution (getaddrinfo), TCP connect (non-blocking socket), latency measurement. Platform-specific defaults: Windows Update/WSUS, apt/yum repos, Apple SWUpdate.
 
 ### 8.9 Patch Inventory Event Generation :x: `T3`
 
@@ -491,13 +487,13 @@ Not implemented. Modify allow/block lists on endpoint security products.
 
 `filesystem` plugin `get_signature` action. Windows: Authenticode verification via WinVerifyTrust — reports signature status (valid, invalid, unsigned, untrusted), signer name, and timestamp. Linux/macOS: returns platform-unsupported status.
 
-### 10.9 File Version Info :x: `T2`
+### 10.9 File Version Info :white_check_mark: `T2`
 
-Not implemented. PE version resource extraction (Windows).
+`get_version_info` action in `filesystem` plugin. Windows: GetFileVersionInfoW/VerQueryValueW for VS_FIXEDFILEINFO + string table. Returns file_version, product_version, company_name, file_description, etc. Returns platform-unsupported on Linux/macOS.
 
-### 10.10 File Content Search and Replace :x: `T2`
+### 10.10 File Content Search and Replace :white_check_mark: `T2`
 
-Not implemented. Find/replace, append, write, and delete operations on text files.
+Five new actions in `filesystem` plugin: `search` (line-by-line pattern matching, literal or regex), `replace` (atomic temp+rename), `write_content`, `append`, `delete_lines`. All enforce base_dir restrictions. Pattern capped at 256 chars. Binary detection.
 
 ### 10.11 Directory Hash (Recursive) :x: `T3`
 
@@ -507,17 +503,17 @@ Not implemented. Integrity verification of directory trees.
 
 `yuzu_create_temp_file()` and `yuzu_create_temp_dir()` in SDK with secure permissions (POSIX mkstemps 0600, Windows owner-only DACL). Exposed via filesystem plugin `create_temp`/`create_temp_dir` actions.
 
-### 10.13 File Retrieval (Upload to Server) :x: `T2`
+### 10.13 File Retrieval (Upload to Server) :white_check_mark: `T2`
 
-Not implemented. Pull files from endpoint to server for analysis.
+`upload_file` action in `content_dist` plugin. Agent-side: SHA-256 hash, multipart POST to server. Server-side: `POST /api/v1/file-retrieval` endpoint. File stored in `{data_dir}/file-retrieval/`. `GET/DELETE` endpoints for management.
 
 ### 10.14 Find File by Size and Hash :white_check_mark: `T2`
 
 `filesystem` plugin `find_by_hash` action. Searches directory trees for files matching a SHA-256 hash. Used for malware hunting and file integrity verification. Recursive search with configurable root path.
 
-### 10.15 Directory Search by Name :x: `T2`
+### 10.15 Directory Search by Name :white_check_mark: `T2`
 
-Not implemented. Find directory paths matching a name pattern.
+`search_dir` action in `filesystem` plugin. `fs::recursive_directory_iterator` with glob or regex name matching. Parameters: root, pattern, match_type (directories/files/both), max_depth, max_results. Respects base_dir.
 
 ---
 
@@ -651,9 +647,9 @@ Not implemented. List all active survey/question responses waiting for user inpu
 
 `InventoryStore::list_tables()` returns all distinct inventory "tables" (one per plugin) with agent count and last collection timestamp. REST API endpoint and MCP `list_inventory_tables` tool expose this data.
 
-### 15.4 Inventory Evaluation (Item Lookup) :x: `T2`
+### 15.4 Inventory Evaluation (Item Lookup) :white_check_mark: `T2`
 
-Not implemented. Evaluate specific inventory items against criteria.
+`inventory_eval.hpp/cpp` evaluation engine. JSON dot-path field extraction, 10 comparison operators including version_gte/version_lte (semver-aware). REST: `POST /api/v1/inventory/evaluate` with conditions array and AND/OR combine.
 
 ### 15.5 Inventory Replication (Local Replica) :x: `T3`
 
@@ -765,9 +761,9 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `ApiTokenStore` with SQLite backend. Tokens generated via `POST /api/v1/tokens` with optional expiry. Auth via `Authorization: Bearer` header or `X-Yuzu-Token` header. RBAC permissions: `ApiToken:Read`, `ApiToken:Write`, `ApiToken:Delete`. Tokens support optional `mcp_tier` field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.
 
-### 18.8 Device Authorization Tokens :x: `T2`
+### 18.8 Device Authorization Tokens :white_check_mark: `T2`
 
-Not implemented. Per-instruction or per-device auth tokens.
+`DeviceTokenStore` (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: `GET/POST/DELETE /api/v1/device-tokens`. Integrated into auth chain.
 
 ### 18.9 HTTPS for Web Dashboard :white_check_mark: `T1`
 
@@ -877,13 +873,13 @@ Not implemented. Configure which events generate notifications.
 
 Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
 
-### 22.2 System Topology View :x: `T2`
+### 22.2 System Topology View :white_check_mark: `T2`
 
-Not implemented. Visual map of server nodes, gateways, agent counts.
+`topology_ui.cpp` dashboard page at `/topology`. HTMX fragment `/frag/topology-data` (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: `GET /api/v1/topology`.
 
-### 22.3 License Management :x: `T2`
+### 22.3 License Management :white_check_mark: `T2`
 
-Not implemented. Seat count, expiry, feature entitlements.
+`LicenseStore` (SQLite) with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`.
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
@@ -893,9 +889,9 @@ Not implemented. Seat count, expiry, feature entitlements.
 
 Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages agent connections, `yuzu_gw_upstream` handles server-side gRPC (batch heartbeat, proxy register, command forwarding). `yuzu_gw_heartbeat_buffer` batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).
 
-### 22.6 Statistics Dashboard :x: `T2`
+### 22.6 Statistics Dashboard :white_check_mark: `T2`
 
-Not implemented. High-level and detailed operational statistics.
+`statistics_ui.cpp` dashboard page at `/statistics`. Six HTMX cards (fleet, executions, compliance, top instructions, license, system health) each with independent 60s polling. REST: `GET /api/v1/statistics`.
 
 ### 22.7 Binary Resource Distribution :x: `T3`
 

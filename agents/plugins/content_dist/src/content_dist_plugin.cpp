@@ -6,6 +6,7 @@
  *   "execute_staged" — Execute a previously staged file.
  *   "list_staged"    — List files in the staging directory.
  *   "cleanup"        — Remove staged files older than N hours.
+ *   "upload_file"    — Upload a local file to the Yuzu server.
  *
  * Security: uses cpp-httplib for downloads (no shell invocation).
  *           execute_staged uses CreateProcessW/fork+execvp (no shell interpretation).
@@ -385,7 +386,8 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"stage", "execute_staged", "list_staged", "cleanup", nullptr};
+        static const char* acts[] = {"stage", "execute_staged", "list_staged", "cleanup",
+                                     "upload_file", nullptr};
         return acts;
     }
 
@@ -397,6 +399,7 @@ public:
         if (action == "execute_staged") return do_execute(ctx, params);
         if (action == "list_staged")    return do_list(ctx);
         if (action == "cleanup")        return do_cleanup(ctx, params);
+        if (action == "upload_file")    return do_upload(ctx, params);
         ctx.write_output(std::format("error|unknown action: {}", action));
         return 1;
     }
@@ -474,6 +477,134 @@ private:
             ++count;
         }
         ctx.write_output(std::format("count|{}", count));
+        return 0;
+    }
+
+    int do_upload(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto path_str = params.get("path");
+        auto server_url = params.get("server_url");
+        if (path_str.empty()) {
+            ctx.write_output("error|missing required parameter: path");
+            return 1;
+        }
+
+        // If no server_url provided, try to derive from agent config
+        if (server_url.empty()) {
+            yuzu::PluginContext pctx{g_ctx};
+            server_url = pctx.get_config("agent.server_web_url");
+        }
+        if (server_url.empty()) {
+            ctx.write_output("error|missing server_url parameter and agent.server_web_url not configured");
+            return 1;
+        }
+
+        fs::path file_path{std::string{path_str}};
+        std::error_code ec;
+        if (!fs::exists(file_path, ec) || !fs::is_regular_file(file_path, ec)) {
+            ctx.write_output("error|file does not exist or is not a regular file");
+            return 1;
+        }
+
+        // Canonicalize path to resolve symlinks and prevent traversal
+        auto canon = fs::canonical(file_path, ec);
+        if (ec) {
+            ctx.write_output("error|failed to resolve path");
+            return 1;
+        }
+        file_path = canon;
+
+        // Enforce base_dir restriction if provided
+        auto base_dir = params.get("base_dir");
+        if (!base_dir.empty()) {
+            auto canon_base = fs::canonical(fs::path{std::string{base_dir}}, ec);
+            if (ec) {
+                ctx.write_output("error|invalid base_dir");
+                return 1;
+            }
+            auto file_str = file_path.string();
+            auto base_str = canon_base.string();
+            if (file_str.size() < base_str.size() ||
+                file_str.compare(0, base_str.size(), base_str) != 0 ||
+                (file_str.size() > base_str.size() &&
+                 file_str[base_str.size()] != '/' && file_str[base_str.size()] != '\\')) {
+                ctx.write_output("error|path is outside allowed base directory");
+                return 1;
+            }
+        }
+
+        auto file_size = fs::file_size(file_path, ec);
+        int max_mb = 100;
+        auto max_str = params.get("max_size_mb", "100");
+        try { max_mb = std::stoi(std::string{max_str}); } catch (...) {}
+        if (file_size > static_cast<std::uintmax_t>(max_mb) * 1024 * 1024) {
+            ctx.write_output(std::format("error|file too large ({} bytes, max {} MB)", file_size, max_mb));
+            return 1;
+        }
+
+        // Compute SHA-256
+        auto hash = sha256_file(file_path);
+        if (hash.empty()) {
+            ctx.write_output("error|failed to compute file hash");
+            return 1;
+        }
+
+        // Read file contents
+        std::ifstream ifs(file_path, std::ios::binary);
+        if (!ifs) {
+            ctx.write_output("error|failed to open file");
+            return 1;
+        }
+        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        ifs.close();
+
+        // Parse server URL and POST the file
+        std::string url{server_url};
+        std::string scheme = "https";
+        std::string host = url;
+
+        if (url.starts_with("https://")) { host = url.substr(8); scheme = "https"; }
+        else if (url.starts_with("http://")) { host = url.substr(7); scheme = "http"; }
+
+        // Strip trailing slash
+        while (!host.empty() && host.back() == '/') host.pop_back();
+
+        ctx.report_progress(10);
+
+        auto filename = file_path.filename().string();
+
+        httplib::UploadFormDataItems items = {
+            {"file", content, filename, "application/octet-stream"},
+            {"sha256", hash, "", "text/plain"},
+            {"original_path", std::string{path_str}, "", "text/plain"},
+        };
+
+        std::unique_ptr<httplib::Client> client;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        if (scheme == "https") {
+            client = std::make_unique<httplib::Client>(scheme + "://" + host);
+        } else
+#endif
+        {
+            client = std::make_unique<httplib::Client>("http://" + host);
+        }
+        client->set_connection_timeout(30);
+        client->set_read_timeout(300);
+
+        auto result = client->Post("/api/v1/file-retrieval", items);
+
+        ctx.report_progress(90);
+
+        if (!result || result->status >= 400) {
+            auto status = result ? result->status : 0;
+            ctx.write_output(std::format("error|upload failed (HTTP {})", status));
+            return 1;
+        }
+
+        ctx.report_progress(100);
+        ctx.write_output("status|ok");
+        ctx.write_output(std::format("sha256|{}", hash));
+        ctx.write_output(std::format("size|{}", file_size));
+        ctx.write_output(std::format("filename|{}", filename));
         return 0;
     }
 

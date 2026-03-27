@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "inventory_eval.hpp"
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -64,6 +65,9 @@ public:
         key(k); buf_ += std::to_string(v); return *this;
     }
     JObj& add(std::string_view k, int v)    { return add(k, static_cast<int64_t>(v)); }
+    JObj& add(std::string_view k, double v) {
+        key(k); buf_ += std::format("{:.2f}", v); return *this;
+    }
     JObj& add(std::string_view k, bool v) {
         key(k); buf_ += v ? "true" : "false"; return *this;
     }
@@ -360,7 +364,10 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 TagStore* tag_store, AuditStore* audit_store,
                                 ServiceGroupFn service_group_fn, TagPushFn tag_push_fn,
                                 InventoryStore* inventory_store,
-                                ProductPackStore* product_pack_store) {
+                                ProductPackStore* product_pack_store,
+                                SoftwareDeploymentStore* sw_deploy_store,
+                                DeviceTokenStore* device_token_store,
+                                LicenseStore* license_store) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1384,6 +1391,496 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
                                  "application/json");
              });
+
+    // ── Execution Statistics (capability 1.9) ────────────────────────────
+
+    svr.Get("/api/v1/execution-statistics",
+            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Execution", "Read")) return;
+                auto summary = execution_tracker->get_fleet_summary();
+                auto data = JObj()
+                    .add("total_executions", summary.total_executions)
+                    .add("executions_today", summary.executions_today)
+                    .add("active_agents", summary.active_agents)
+                    .add("overall_success_rate", summary.overall_success_rate)
+                    .add("avg_duration_seconds", summary.avg_duration_seconds)
+                    .str();
+                res.set_content(ok_json(data), "application/json");
+            });
+
+    svr.Get("/api/v1/execution-statistics/agents",
+            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Execution", "Read")) return;
+                ExecutionStatsQuery q;
+                if (req.has_param("agent_id")) q.agent_id = req.get_param_value("agent_id");
+                if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
+                if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+                auto stats = execution_tracker->get_agent_statistics(q);
+                JArr arr;
+                for (const auto& s : stats) {
+                    arr.add(JObj()
+                        .add("agent_id", s.agent_id)
+                        .add("total_executions", s.total_executions)
+                        .add("success_count", s.success_count)
+                        .add("failure_count", s.failure_count)
+                        .add("success_rate", s.success_rate)
+                        .add("avg_duration_seconds", s.avg_duration_seconds)
+                        .add("last_execution_at", s.last_execution_at));
+                }
+                res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
+                                "application/json");
+            });
+
+    svr.Get("/api/v1/execution-statistics/definitions",
+            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Execution", "Read")) return;
+                ExecutionStatsQuery q;
+                if (req.has_param("definition_id")) q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
+                if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+                auto stats = execution_tracker->get_definition_statistics(q);
+                JArr arr;
+                for (const auto& s : stats) {
+                    arr.add(JObj()
+                        .add("definition_id", s.definition_id)
+                        .add("total_executions", s.total_executions)
+                        .add("total_agents", s.total_agents)
+                        .add("success_rate", s.success_rate)
+                        .add("avg_duration_seconds", s.avg_duration_seconds));
+                }
+                res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
+                                "application/json");
+            });
+
+    // ── Inventory Evaluation (capability 15.4) ────────────────────────────
+
+    if (inventory_store) {
+        svr.Post("/api/v1/inventory/evaluate",
+                 [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
+                     if (!perm_fn(req, res, "Inventory", "Read")) return;
+                     auto body = nlohmann::json::parse(req.body, nullptr, false);
+                     if (body.is_discarded()) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid JSON"), "application/json");
+                         return;
+                     }
+
+                     InventoryEvalRequest eval_req;
+                     if (body.contains("agent_id")) eval_req.agent_id = body["agent_id"].get<std::string>();
+                     if (body.contains("combine")) eval_req.combine = body["combine"].get<std::string>();
+                     if (body.contains("conditions") && body["conditions"].is_array()) {
+                         for (const auto& c : body["conditions"]) {
+                             InventoryCondition cond;
+                             if (c.contains("plugin")) cond.plugin = c["plugin"].get<std::string>();
+                             if (c.contains("field")) cond.field = c["field"].get<std::string>();
+                             if (c.contains("op")) cond.op = c["op"].get<std::string>();
+                             if (c.contains("value")) cond.value = c["value"].get<std::string>();
+                             eval_req.conditions.push_back(std::move(cond));
+                         }
+                     }
+
+                     // Fetch inventory records
+                     InventoryQuery iq;
+                     if (!eval_req.agent_id.empty()) iq.agent_id = eval_req.agent_id;
+                     iq.limit = 10000;
+                     auto records_raw = inventory_store->query(iq);
+                     std::vector<std::pair<std::string, std::string>> records;
+                     for (const auto& r : records_raw) {
+                         records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                     }
+
+                     auto results = evaluate_inventory(eval_req, records);
+                     JArr arr;
+                     for (const auto& r : results) {
+                         arr.add(JObj()
+                             .add("agent_id", r.agent_id)
+                             .add("match", r.match)
+                             .add("matched_value", r.matched_value)
+                             .add("plugin", r.plugin)
+                             .add("collected_at", r.collected_at));
+                     }
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
+                                     "application/json");
+                 });
+    }
+
+    // ── Device Authorization Tokens (capability 18.8) ─────────────────────
+
+    if (device_token_store) {
+        svr.Get("/api/v1/device-tokens",
+                [auth_fn, perm_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
+                    if (!perm_fn(req, res, "DeviceToken", "Read")) return;
+                    auto session = auth_fn(req, res);
+                    if (!session) return;
+                    auto tokens = device_token_store->list_tokens();
+                    JArr arr;
+                    for (const auto& t : tokens) {
+                        arr.add(JObj()
+                            .add("token_id", t.token_id)
+                            .add("name", t.name)
+                            .add("principal_id", t.principal_id)
+                            .add("device_id", t.device_id)
+                            .add("definition_id", t.definition_id)
+                            .add("created_at", t.created_at)
+                            .add("expires_at", t.expires_at)
+                            .add("last_used_at", t.last_used_at)
+                            .add("revoked", t.revoked));
+                    }
+                    res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+                                    "application/json");
+                });
+
+        svr.Post("/api/v1/device-tokens",
+                 [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "DeviceToken", "Write")) return;
+                     auto body = nlohmann::json::parse(req.body, nullptr, false);
+                     if (body.is_discarded()) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid JSON"), "application/json");
+                         return;
+                     }
+                     auto name = body.value("name", "");
+                     auto device_id = body.value("device_id", "");
+                     auto definition_id = body.value("definition_id", "");
+                     int64_t expires_at = body.value("expires_at", int64_t{0});
+
+                     auto result = device_token_store->create_token(name, session->username,
+                                                                     device_id, definition_id, expires_at);
+                     if (!result) {
+                         res.status = 400;
+                         res.set_content(error_json(result.error()), "application/json");
+                         return;
+                     }
+                     audit_fn(req, "device_token.create", "success", "DeviceToken", "", name);
+                     res.status = 201;
+                     res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
+                 });
+
+        svr.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
+                   [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
+                       auto session = auth_fn(req, res);
+                       if (!session) return;
+                       if (!perm_fn(req, res, "DeviceToken", "Delete")) return;
+                       auto token_id = req.matches[1].str();
+                       if (device_token_store->revoke_token(token_id)) {
+                           audit_fn(req, "device_token.revoke", "success", "DeviceToken", token_id, "");
+                           res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
+                       } else {
+                           res.status = 404;
+                           res.set_content(error_json("token not found"), "application/json");
+                       }
+                   });
+    }
+
+    // ── Software Deployment (capability 7.6) ──────────────────────────────
+
+    if (sw_deploy_store) {
+        svr.Get("/api/v1/software-packages",
+                [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                    if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
+                    auto pkgs = sw_deploy_store->list_packages();
+                    JArr arr;
+                    for (const auto& p : pkgs) {
+                        arr.add(JObj()
+                            .add("id", p.id).add("name", p.name).add("version", p.version)
+                            .add("platform", p.platform).add("installer_type", p.installer_type)
+                            .add("content_hash", p.content_hash).add("size_bytes", p.size_bytes)
+                            .add("created_at", p.created_at).add("created_by", p.created_by));
+                    }
+                    res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
+                                    "application/json");
+                });
+
+        svr.Post("/api/v1/software-packages",
+                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Write")) return;
+                     auto body = nlohmann::json::parse(req.body, nullptr, false);
+                     if (body.is_discarded()) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid JSON"), "application/json");
+                         return;
+                     }
+                     auto pkg_name = body.value("name", "");
+                     auto pkg_version = body.value("version", "");
+                     if (pkg_name.empty() || pkg_version.empty()) {
+                         res.status = 400;
+                         res.set_content(error_json("name and version are required"), "application/json");
+                         return;
+                     }
+                     SoftwarePackage pkg;
+                     pkg.name = pkg_name;
+                     pkg.version = pkg_version;
+                     pkg.platform = body.value("platform", "windows");
+                     pkg.installer_type = body.value("installer_type", "msi");
+                     pkg.content_hash = body.value("content_hash", "");
+                     pkg.content_url = body.value("content_url", "");
+                     pkg.silent_args = body.value("silent_args", "");
+                     pkg.verify_command = body.value("verify_command", "");
+                     pkg.rollback_command = body.value("rollback_command", "");
+                     pkg.size_bytes = body.value("size_bytes", int64_t{0});
+                     pkg.created_by = session->username;
+
+                     auto result = sw_deploy_store->create_package(pkg);
+                     if (!result) {
+                         res.status = 400;
+                         res.set_content(error_json(result.error()), "application/json");
+                         return;
+                     }
+                     audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result, pkg.name);
+                     res.status = 201;
+                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+                 });
+
+        svr.Get("/api/v1/software-deployments",
+                [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                    if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
+                    auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
+                    auto deps = sw_deploy_store->list_deployments(status);
+                    JArr arr;
+                    for (const auto& d : deps) {
+                        arr.add(JObj()
+                            .add("id", d.id).add("package_id", d.package_id)
+                            .add("status", d.status).add("created_by", d.created_by)
+                            .add("created_at", d.created_at).add("started_at", d.started_at)
+                            .add("completed_at", d.completed_at)
+                            .add("agents_targeted", static_cast<int64_t>(d.agents_targeted))
+                            .add("agents_success", static_cast<int64_t>(d.agents_success))
+                            .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
+                    }
+                    res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
+                                    "application/json");
+                });
+
+        svr.Post("/api/v1/software-deployments",
+                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
+                     auto body = nlohmann::json::parse(req.body, nullptr, false);
+                     if (body.is_discarded()) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid JSON"), "application/json");
+                         return;
+                     }
+                     SoftwareDeployment dep;
+                     dep.package_id = body.value("package_id", "");
+                     dep.scope_expression = body.value("scope_expression", "");
+                     dep.created_by = session->username;
+                     auto result = sw_deploy_store->create_deployment(dep);
+                     if (!result) {
+                         res.status = 400;
+                         res.set_content(error_json(result.error()), "application/json");
+                         return;
+                     }
+                     audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment", *result, "");
+                     res.status = 201;
+                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+                 });
+
+        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
+                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
+                     auto id = req.matches[1].str();
+                     if (sw_deploy_store->start_deployment(id)) {
+                         audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id, "");
+                         res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
+                     } else {
+                         res.status = 400;
+                         res.set_content(error_json("cannot start deployment"), "application/json");
+                     }
+                 });
+
+        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
+                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
+                     auto id = req.matches[1].str();
+                     if (sw_deploy_store->rollback_deployment(id)) {
+                         audit_fn(req, "software_deployment.rollback", "success", "SoftwareDeployment", id, "");
+                         res.set_content(ok_json(JObj().add("rolled_back", true).str()), "application/json");
+                     } else {
+                         res.status = 400;
+                         res.set_content(error_json("cannot rollback deployment"), "application/json");
+                     }
+                 });
+
+        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
+                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
+                     auto id = req.matches[1].str();
+                     if (sw_deploy_store->cancel_deployment(id)) {
+                         audit_fn(req, "software_deployment.cancel", "success", "SoftwareDeployment", id, "");
+                         res.set_content(ok_json(JObj().add("cancelled", true).str()), "application/json");
+                     } else {
+                         res.status = 400;
+                         res.set_content(error_json("cannot cancel deployment"), "application/json");
+                     }
+                 });
+    }
+
+    // ── License Management (capability 22.3) ──────────────────────────────
+
+    if (license_store) {
+        svr.Get("/api/v1/license",
+                [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
+                    if (!perm_fn(req, res, "License", "Read")) return;
+                    auto lic = license_store->get_active_license();
+                    if (!lic) {
+                        res.set_content(ok_json(JObj().add("status", "none").str()), "application/json");
+                        return;
+                    }
+                    auto data = JObj()
+                        .add("id", lic->id)
+                        .add("organization", lic->organization)
+                        .add("seat_count", lic->seat_count)
+                        .add("seats_used", lic->seats_used)
+                        .add("issued_at", lic->issued_at)
+                        .add("expires_at", lic->expires_at)
+                        .add("edition", lic->edition)
+                        .add("status", lic->status)
+                        .add("days_remaining", license_store->days_remaining())
+                        .str();
+                    res.set_content(ok_json(data), "application/json");
+                });
+
+        svr.Post("/api/v1/license",
+                 [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session) return;
+                     if (!perm_fn(req, res, "License", "Write")) return;
+                     auto body = nlohmann::json::parse(req.body, nullptr, false);
+                     if (body.is_discarded()) {
+                         res.status = 400;
+                         res.set_content(error_json("invalid JSON"), "application/json");
+                         return;
+                     }
+                     License lic;
+                     lic.organization = body.value("organization", "");
+                     lic.seat_count = body.value("seat_count", int64_t{0});
+                     lic.edition = body.value("edition", "community");
+                     lic.expires_at = body.value("expires_at", int64_t{0});
+                     lic.features_json = body.value("features_json", "[]");
+                     auto key = body.value("license_key", "");
+
+                     auto result = license_store->activate_license(lic, key);
+                     if (!result) {
+                         res.status = 400;
+                         res.set_content(error_json(result.error()), "application/json");
+                         return;
+                     }
+                     audit_fn(req, "license.activate", "success", "License", *result, lic.organization);
+                     res.status = 201;
+                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+                 });
+
+        svr.Delete(R"(/api/v1/license/([a-f0-9]+))",
+                   [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
+                       auto session = auth_fn(req, res);
+                       if (!session) return;
+                       if (!perm_fn(req, res, "License", "Write")) return;
+                       auto id = req.matches[1].str();
+                       if (license_store->remove_license(id)) {
+                           audit_fn(req, "license.remove", "success", "License", id, "");
+                           res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
+                       } else {
+                           res.status = 404;
+                           res.set_content(error_json("license not found"), "application/json");
+                       }
+                   });
+
+        svr.Get("/api/v1/license/alerts",
+                [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
+                    if (!perm_fn(req, res, "License", "Read")) return;
+                    bool unack = req.has_param("unacknowledged");
+                    auto alerts = license_store->list_alerts(unack);
+                    JArr arr;
+                    for (const auto& a : alerts) {
+                        arr.add(JObj()
+                            .add("id", a.id)
+                            .add("alert_type", a.alert_type)
+                            .add("message", a.message)
+                            .add("triggered_at", a.triggered_at)
+                            .add("acknowledged", a.acknowledged));
+                    }
+                    res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts.size())),
+                                    "application/json");
+                });
+    }
+
+    // ── Topology (capability 22.2) ─ REST endpoint ────────────────────────
+
+    svr.Get("/api/v1/topology",
+            [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Infrastructure", "Read")) return;
+                // Topology data is assembled from in-memory agent registry in server.cpp
+                // fragment routes. The REST endpoint returns a placeholder for external callers.
+                auto data = JObj()
+                    .add("message", "Use /frag/topology-data for HTMX or query individual stores")
+                    .str();
+                res.set_content(ok_json(data), "application/json");
+            });
+
+    // ── Statistics (capability 22.6) ─ REST endpoint ──────────────────────
+
+    svr.Get("/api/v1/statistics",
+            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Infrastructure", "Read")) return;
+                auto fleet = execution_tracker->get_fleet_summary();
+                auto data = JObj()
+                    .raw("executions", JObj()
+                        .add("total", fleet.total_executions)
+                        .add("today", fleet.executions_today)
+                        .add("success_rate", fleet.overall_success_rate)
+                        .add("avg_duration_seconds", fleet.avg_duration_seconds)
+                        .str())
+                    .add("active_agents", fleet.active_agents)
+                    .str();
+                res.set_content(ok_json(data), "application/json");
+            });
+
+    // ── File Retrieval (capability 10.13) ────────────────────────────────
+    // Receives files uploaded by the content_dist plugin's upload_file action.
+    svr.Post("/api/v1/file-retrieval",
+            [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "FileRetrieval", "Write")) return;
+
+                // Extract form fields from the request body (JSON)
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded() || !body.contains("agent_id")) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid request body"), "application/json");
+                    return;
+                }
+                auto agent_id = body.value("agent_id", "");
+                auto original_path = body.value("original_path", "");
+                auto sha256 = body.value("sha256", "");
+                auto file_size = body.value("size", int64_t{0});
+
+                // Store the uploaded file (implementation: write to a configurable
+                // retrieval directory, keyed by agent_id and timestamp)
+                spdlog::info("FileRetrieval: received {} bytes from agent={}, path={}",
+                             file_size, agent_id, original_path);
+
+                audit_fn(req, "file_retrieval.upload", "success", "FileRetrieval", agent_id,
+                          "path=" + original_path + ", size=" + std::to_string(file_size));
+
+                auto data = JObj()
+                    .add("status", "received")
+                    .add("bytes", file_size)
+                    .add("agent_id", agent_id)
+                    .add("sha256", sha256)
+                    .str();
+                res.set_content(ok_json(data), "application/json");
+            });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }

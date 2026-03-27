@@ -320,7 +320,7 @@ bool test_is_valid_wmi_namespace(std::string_view ns) {
     }
 
 DESCRIPTOR_TEST("http_client", "http_client", 3, "download", "get", "head")
-DESCRIPTOR_TEST("content_dist", "content_dist", 4, "stage", "execute_staged", "list_staged", "cleanup")
+DESCRIPTOR_TEST("content_dist", "content_dist", 5, "stage", "execute_staged", "list_staged", "cleanup", "upload_file")
 DESCRIPTOR_TEST("interaction", "interaction", 5, "notify", "message_box", "input", "survey", "set_dnd")
 DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")
 DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear")

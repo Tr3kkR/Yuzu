@@ -46,7 +46,7 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 14);
+    REQUIRE(types.size() == 18);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -59,6 +59,10 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("ApiToken"));
     CHECK(has("Security"));
     CHECK(has("Policy"));
+    CHECK(has("DeviceToken"));
+    CHECK(has("SoftwareDeployment"));
+    CHECK(has("License"));
+    CHECK(has("FileRetrieval"));
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -70,8 +74,8 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 14 types * 5 ops = 70 permissions
-    CHECK(perms.size() == 70);
+    // 18 types * 5 ops = 90 permissions
+    CHECK(perms.size() == 90);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 }
@@ -79,8 +83,8 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 13 types * Read only (not Infrastructure)
-    CHECK(perms.size() == 13);
+    // 17 types * Read only (not Infrastructure)
+    CHECK(perms.size() == 17);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -369,8 +373,8 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
     CHECK(role->description.find("IT Service") != std::string::npos);
 
     auto perms = store.get_role_permissions("ITServiceOwner");
-    // 11 types * 5 ops = 55 permissions
-    CHECK(perms.size() == 55);
+    // 15 types * 5 ops = 75 permissions
+    CHECK(perms.size() == 75);
     for (auto& p : perms) {
         CHECK(p.effect == "allow");
         // Should not include UserManagement, Security, ApiToken

@@ -10,7 +10,7 @@ namespace yuzu::server {
 namespace {
 
 std::string generate_id() {
-    static std::mt19937_64 rng(std::random_device{}());
+    static thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist;
     auto hi = dist(rng);
     auto lo = dist(rng);
@@ -61,6 +61,7 @@ ExecutionTracker::ExecutionTracker(sqlite3* db) : db_(db) {}
 void ExecutionTracker::create_tables() {
     if (!db_)
         return;
+    // No lock needed: DDL is idempotent and runs once at construction
 
     const char* ddl = R"(
         CREATE TABLE IF NOT EXISTS executions (
@@ -97,6 +98,17 @@ void ExecutionTracker::create_tables() {
     sqlite3_exec(db_,
         "CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);",
         nullptr, nullptr, nullptr);
+
+    // Indexes for execution statistics (capability 1.9)
+    sqlite3_exec(db_,
+        "CREATE INDEX IF NOT EXISTS idx_agent_exec_agent ON agent_exec_status(agent_id);",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
+        "CREATE INDEX IF NOT EXISTS idx_executions_dispatched ON executions(dispatched_at);",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(db_,
+        "CREATE INDEX IF NOT EXISTS idx_executions_definition ON executions(definition_id);",
+        nullptr, nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +119,7 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
     std::vector<Execution> results;
     if (!db_)
         return results;
+    std::lock_guard lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE 1=1";
     std::vector<std::string> binds;
@@ -139,6 +152,7 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
 std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) const {
     if (!db_)
         return std::nullopt;
+    std::lock_guard lock(mtx_);
 
     auto sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
@@ -157,16 +171,25 @@ std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) 
 ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
     ExecutionSummary s;
     s.id = id;
-    auto exec = get_execution(id);
-    if (!exec)
+    if (!db_)
         return s;
 
-    s.status = exec->status;
-    s.agents_targeted = exec->agents_targeted;
-    s.agents_responded = exec->agents_responded;
-    s.agents_success = exec->agents_success;
-    s.agents_failure = exec->agents_failure;
-    s.progress_pct = s.agents_targeted > 0 ? (s.agents_responded * 100 / s.agents_targeted) : 0;
+    std::lock_guard lock(mtx_);
+    auto sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE id = ?";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        return s;
+    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto exec = row_to_exec(stmt);
+        s.status = exec.status;
+        s.agents_targeted = exec.agents_targeted;
+        s.agents_responded = exec.agents_responded;
+        s.agents_success = exec.agents_success;
+        s.agents_failure = exec.agents_failure;
+        s.progress_pct = s.agents_targeted > 0 ? (s.agents_responded * 100 / s.agents_targeted) : 0;
+    }
+    sqlite3_finalize(stmt);
     return s;
 }
 
@@ -175,6 +198,7 @@ ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
     std::vector<AgentExecStatus> results;
     if (!db_)
         return results;
+    std::lock_guard lock(mtx_);
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(
@@ -205,6 +229,7 @@ std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_
     std::vector<Execution> results;
     if (!db_)
         return results;
+    std::lock_guard lock(mtx_);
 
     auto sql = std::string("SELECT ") + kSelectAll +
                " FROM executions WHERE parent_id = ? ORDER BY dispatched_at DESC";
@@ -228,6 +253,7 @@ std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_
 std::expected<std::string, std::string> ExecutionTracker::create_execution(const Execution& exec) {
     if (!db_)
         return std::unexpected("database not open");
+    std::lock_guard lock(mtx_);
 
     auto id = exec.id.empty() ? generate_id() : exec.id;
     auto now = now_epoch();
@@ -273,6 +299,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
                                            const AgentExecStatus& s) {
     if (!db_)
         return;
+    std::lock_guard lock(mtx_);
 
     const char* sql = R"(
         INSERT INTO agent_exec_status
@@ -307,6 +334,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
 void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     if (!db_)
         return;
+    std::lock_guard lock(mtx_);
 
     // Recompute aggregate counts from agent_exec_status
     const char* sql = R"(
@@ -381,6 +409,7 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
 void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& /*user*/) {
     if (!db_)
         return;
+    std::lock_guard lock(mtx_);
 
     auto now = now_epoch();
     sqlite3_stmt* stmt = nullptr;
@@ -393,6 +422,172 @@ void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+}
+
+// ---------------------------------------------------------------------------
+// Statistics (capability 1.9)
+// ---------------------------------------------------------------------------
+
+namespace {
+const char* safe_text(sqlite3_stmt* stmt, int col) {
+    auto p = sqlite3_column_text(stmt, col);
+    return p ? reinterpret_cast<const char*>(p) : "";
+}
+} // namespace
+
+std::vector<AgentExecutionStats> ExecutionTracker::get_agent_statistics(
+    const ExecutionStatsQuery& q) const {
+    std::lock_guard lock(mtx_);
+    std::vector<AgentExecutionStats> results;
+    if (!db_) return results;
+
+    // C5 fix: use status values actually set by update_agent_status/refresh_counts
+    std::string sql = R"(
+        SELECT a.agent_id,
+               COUNT(*) AS total,
+               SUM(CASE WHEN a.exit_code = 0 AND a.status != 'pending' THEN 1 ELSE 0 END) AS success,
+               SUM(CASE WHEN a.exit_code != 0 OR a.status IN ('failure','timeout','rejected','error') THEN 1 ELSE 0 END) AS failure,
+               AVG(CASE WHEN a.completed_at > a.dispatched_at
+                        THEN a.completed_at - a.dispatched_at ELSE NULL END) AS avg_dur,
+               MAX(a.dispatched_at) AS last_at
+        FROM agent_exec_status a
+        JOIN executions e ON e.id = a.execution_id
+        WHERE a.status NOT IN ('pending','dispatched')
+    )";
+    int bind_idx = 1;
+    if (!q.agent_id.empty()) sql += " AND a.agent_id = ?";
+    if (!q.definition_id.empty()) sql += " AND e.definition_id = ?";
+    if (q.since > 0) sql += " AND a.dispatched_at >= ?";
+    if (q.until > 0) sql += " AND a.dispatched_at <= ?";
+    sql += " GROUP BY a.agent_id ORDER BY total DESC LIMIT ?";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (!q.agent_id.empty()) sqlite3_bind_text(stmt, bind_idx++, q.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (!q.definition_id.empty()) sqlite3_bind_text(stmt, bind_idx++, q.definition_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (q.since > 0) sqlite3_bind_int64(stmt, bind_idx++, q.since);
+    if (q.until > 0) sqlite3_bind_int64(stmt, bind_idx++, q.until);
+    sqlite3_bind_int(stmt, bind_idx, q.limit > 0 ? q.limit : 50);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        AgentExecutionStats s;
+        s.agent_id = safe_text(stmt, 0);
+        s.total_executions = sqlite3_column_int64(stmt, 1);
+        s.success_count = sqlite3_column_int64(stmt, 2);
+        s.failure_count = sqlite3_column_int64(stmt, 3);
+        s.avg_duration_seconds = sqlite3_column_double(stmt, 4);
+        s.last_execution_at = sqlite3_column_int64(stmt, 5);
+        s.success_rate = s.total_executions > 0
+            ? 100.0 * static_cast<double>(s.success_count) / static_cast<double>(s.total_executions) : 0.0;
+        results.push_back(std::move(s));
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+std::vector<DefinitionExecutionStats> ExecutionTracker::get_definition_statistics(
+    const ExecutionStatsQuery& q) const {
+    std::lock_guard lock(mtx_);
+    std::vector<DefinitionExecutionStats> results;
+    if (!db_) return results;
+
+    // C5 fix: match all terminal execution statuses
+    std::string sql = R"(
+        SELECT e.definition_id,
+               COUNT(*) AS total,
+               SUM(e.agents_targeted) AS total_agents,
+               CASE WHEN SUM(e.agents_targeted) > 0
+                    THEN 100.0 * SUM(e.agents_success) / SUM(e.agents_targeted) ELSE 0 END AS rate,
+               AVG(CASE WHEN e.completed_at > e.dispatched_at
+                        THEN e.completed_at - e.dispatched_at ELSE NULL END) AS avg_dur
+        FROM executions e
+        WHERE e.status NOT IN ('pending','running')
+    )";
+    int bind_idx = 1;
+    if (!q.definition_id.empty()) sql += " AND e.definition_id = ?";
+    if (q.since > 0) sql += " AND e.dispatched_at >= ?";
+    if (q.until > 0) sql += " AND e.dispatched_at <= ?";
+    sql += " GROUP BY e.definition_id ORDER BY total DESC LIMIT ?";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return results;
+    if (!q.definition_id.empty()) sqlite3_bind_text(stmt, bind_idx++, q.definition_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (q.since > 0) sqlite3_bind_int64(stmt, bind_idx++, q.since);
+    if (q.until > 0) sqlite3_bind_int64(stmt, bind_idx++, q.until);
+    sqlite3_bind_int(stmt, bind_idx, q.limit > 0 ? q.limit : 50);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        DefinitionExecutionStats s;
+        s.definition_id = safe_text(stmt, 0);
+        s.total_executions = sqlite3_column_int64(stmt, 1);
+        s.total_agents = sqlite3_column_int64(stmt, 2);
+        s.success_rate = sqlite3_column_double(stmt, 3);
+        s.avg_duration_seconds = sqlite3_column_double(stmt, 4);
+        results.push_back(std::move(s));
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
+    std::lock_guard lock(mtx_);
+    FleetExecutionSummary s;
+    if (!db_) return s;
+
+    // Total executions and success rate — all bind params, no string concat
+    {
+        std::string sql = R"(
+            SELECT COUNT(*),
+                   CASE WHEN SUM(agents_targeted) > 0
+                        THEN 100.0 * SUM(agents_success) / SUM(agents_targeted) ELSE 0 END,
+                   AVG(CASE WHEN completed_at > dispatched_at
+                            THEN completed_at - dispatched_at ELSE NULL END)
+            FROM executions WHERE status NOT IN ('pending','running')
+        )";
+        if (since > 0) sql += " AND dispatched_at >= ?";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            if (since > 0) sqlite3_bind_int64(stmt, 1, since);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                s.total_executions = sqlite3_column_int64(stmt, 0);
+                s.overall_success_rate = sqlite3_column_double(stmt, 1);
+                s.avg_duration_seconds = sqlite3_column_double(stmt, 2);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // Executions today
+    {
+        auto now = now_epoch();
+        auto today_start = now - (now % 86400);
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                "SELECT COUNT(*) FROM executions WHERE dispatched_at >= ?",
+                -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, today_start);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                s.executions_today = sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    // Active agents
+    {
+        std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM agent_exec_status";
+        if (since > 0) sql += " WHERE dispatched_at >= ?";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            if (since > 0) sqlite3_bind_int64(stmt, 1, since);
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                s.active_agents = sqlite3_column_int64(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    return s;
 }
 
 } // namespace yuzu::server
