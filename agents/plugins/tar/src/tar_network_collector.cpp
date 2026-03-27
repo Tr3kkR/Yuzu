@@ -15,8 +15,10 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <format>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -46,7 +48,126 @@
 #include <iphlpapi.h>
 #endif
 
+// Need netdb.h for getnameinfo on POSIX (included via arpa/inet.h on some
+// platforms but not all). Include it unconditionally for POSIX.
+#if !defined(_WIN32)
+#include <netdb.h>
+#endif
+
 namespace yuzu::tar {
+
+// ── Reverse DNS resolution (all platforms) ──────────────────────────────────
+//
+// Resolved at collection time so TAR events store the hostname alongside the IP.
+// Uses getnameinfo(NI_NAMEREQD) which performs a PTR lookup.
+//
+// Design:
+//   - Result cache with TTL (1h positive, 5m negative). Avoids re-querying
+//     the same IPs across successive TAR snapshots.
+//   - Total time budget per snapshot (3 seconds). Once the budget is
+//     exhausted, remaining uncached IPs get empty remote_host. This prevents
+//     the TAR collector from stalling when many IPs have no PTR records
+//     and the DNS server is slow.
+//   - getnameinfo() is called synchronously (no std::async). The per-IP
+//     cost is bounded by the system DNS resolver timeout (typically 5s on
+//     Linux, configurable via resolv.conf). The total budget cap ensures
+//     the aggregate cost is bounded regardless.
+//   - Skip non-routable addresses: loopback, wildcard, link-local.
+
+namespace {
+
+constexpr int64_t kDnsPositiveTtlSeconds = 3600;   // 1 hour for resolved names
+constexpr int64_t kDnsNegativeTtlSeconds = 300;     // 5 minutes for failed lookups
+constexpr auto kDnsTotalBudget = std::chrono::seconds(3);
+
+struct DnsCacheEntry {
+    std::string host;     // empty = negative (no PTR record)
+    int64_t expires_at;   // steady_clock seconds
+};
+
+std::mutex g_dns_cache_mtx;
+std::unordered_map<std::string, DnsCacheEntry> g_dns_cache;
+
+bool is_skip_address(const std::string& addr) {
+    if (addr.empty() || addr == "*" || addr == "0.0.0.0" || addr == "::" ||
+        addr == "127.0.0.1" || addr == "::1")
+        return true;
+    // Link-local: 169.254.x.x (IPv4), fe80::/10 (IPv6)
+    if (addr.starts_with("169.254.") || addr.starts_with("fe80:"))
+        return true;
+    return false;
+}
+
+std::string getnameinfo_sync(const std::string& addr) {
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
+
+    struct addrinfo* ai = nullptr;
+    if (getaddrinfo(addr.c_str(), nullptr, &hints, &ai) != 0 || !ai)
+        return {};
+
+    char host[NI_MAXHOST]{};
+    int rc = getnameinfo(ai->ai_addr, ai->ai_addrlen, host, sizeof(host),
+                         nullptr, 0, NI_NAMEREQD);
+    freeaddrinfo(ai);
+
+    if (rc != 0)
+        return {};
+    return host;
+}
+
+int64_t steady_now_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+               .count();
+}
+
+/// Resolve hostnames for a batch of connections, respecting the total
+/// time budget. Connections are resolved in order; once the budget is
+/// exhausted, remaining uncached IPs get empty remote_host.
+void resolve_hostnames(std::vector<NetConnection>& connections) {
+    auto deadline = std::chrono::steady_clock::now() + kDnsTotalBudget;
+
+    for (auto& nc : connections) {
+        if (is_skip_address(nc.remote_addr))
+            continue;
+
+        auto now = steady_now_seconds();
+
+        // Check cache
+        {
+            std::lock_guard lock(g_dns_cache_mtx);
+            auto it = g_dns_cache.find(nc.remote_addr);
+            if (it != g_dns_cache.end() && it->second.expires_at > now) {
+                nc.remote_host = it->second.host;
+                continue;
+            }
+        }
+
+        // Budget exhausted — skip remaining uncached IPs
+        if (std::chrono::steady_clock::now() >= deadline) {
+            spdlog::debug("TAR: DNS resolution budget exhausted, skipping remaining IPs");
+            break;
+        }
+
+        // Synchronous resolve (bounded by system DNS timeout per IP,
+        // aggregate bounded by kDnsTotalBudget)
+        auto result = getnameinfo_sync(nc.remote_addr);
+
+        // Cache with appropriate TTL
+        int64_t ttl = result.empty() ? kDnsNegativeTtlSeconds : kDnsPositiveTtlSeconds;
+        {
+            std::lock_guard lock(g_dns_cache_mtx);
+            g_dns_cache[nc.remote_addr] = DnsCacheEntry{result, steady_now_seconds() + ttl};
+        }
+
+        nc.remote_host = std::move(result);
+    }
+}
+
+} // namespace
 
 // -- Linux implementation -----------------------------------------------------
 #ifdef __linux__
@@ -218,6 +339,8 @@ std::vector<NetConnection> enumerate_connections() {
     parse_proc_net_file("/proc/net/tcp6", "tcp6", inode_map, result, true,  true);
     parse_proc_net_file("/proc/net/udp",  "udp",  inode_map, result, false, false);
     parse_proc_net_file("/proc/net/udp6", "udp6", inode_map, result, false, true);
+
+    resolve_hostnames(result);
     return result;
 }
 
@@ -356,6 +479,8 @@ std::vector<NetConnection> enumerate_connections() {
             result.push_back(std::move(nc));
         }
     }
+
+    resolve_hostnames(result);
     return result;
 }
 
@@ -538,6 +663,8 @@ std::vector<NetConnection> enumerate_connections() {
     collect_tcp6(result);
     collect_udp4(result);
     collect_udp6(result);
+
+    resolve_hostnames(result);
     return result;
 }
 

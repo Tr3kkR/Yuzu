@@ -34,6 +34,7 @@ struct NetConnection {
     std::string proto;        // tcp, tcp6, udp, udp6
     std::string local_addr;
     std::string remote_addr;
+    std::string remote_host;  // reverse-DNS of remote_addr (resolved at collection time)
     int local_port{0};
     int remote_port{0};
     std::string state;        // ESTABLISHED, LISTEN, etc.
