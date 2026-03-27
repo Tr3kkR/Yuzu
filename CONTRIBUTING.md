@@ -41,7 +41,7 @@ The MCP server is embedded in the C++ server at `POST /mcp/v1/`. Changes to MCP 
 
 ## Governance
 
-All code changes follow mandatory governance gates defined in `CLAUDE.md`. In summary: change summary, security + docs deep-dive, domain-triggered review, all findings addressed before merge. See the Agent Team section in CLAUDE.md for the full workflow.
+All code changes follow mandatory governance gates defined in `CLAUDE.md`. In summary: change summary, security + docs deep-dive, domain-triggered review, correctness & resilience analysis (happy-path + unhappy-path + consistency-auditor in parallel), chaos analysis (chaos-injector), all findings addressed before merge. See the Agent Team section in CLAUDE.md for the full workflow and gate definitions.
 
 ## Pull Request Process
 
