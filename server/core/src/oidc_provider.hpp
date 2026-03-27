@@ -2,10 +2,15 @@
 
 #include <chrono>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+#include <openssl/evp.h>
+#endif
 
 namespace yuzu::server::oidc {
 
@@ -16,6 +21,7 @@ struct OidcConfig {
     std::string redirect_uri;
     std::string authorization_endpoint;
     std::string token_endpoint;
+    std::string jwks_uri;        // JWKS endpoint for JWT signature verification
     std::string exchange_script; // Path to oidc_token_exchange.py
     std::string admin_group_id;  // Entra group ID that maps to admin role
     bool skip_tls_verify{false}; // Disable TLS cert verification (insecure, dev only)
@@ -43,6 +49,15 @@ struct IdTokenClaims {
     int64_t exp{0};
     int64_t iat{0};
     std::vector<std::string> groups; // Entra security group object IDs
+};
+
+/// Cached JWK public key for JWT signature verification.
+struct CachedJwk {
+    std::string kid;
+    std::string alg;
+#ifndef _WIN32
+    std::shared_ptr<EVP_PKEY> pkey; // shared_ptr with custom deleter for RAII
+#endif
 };
 
 class OidcProvider {
@@ -73,6 +88,9 @@ public:
     std::expected<void, std::string> validate_claims(const IdTokenClaims& claims,
                                                      const std::string& expected_nonce) const;
 
+    /// Verify JWT signature against cached JWKS keys. Returns error string on failure.
+    std::expected<void, std::string> verify_jwt_signature(const std::string& jwt);
+
 private:
     static std::string url_encode(const std::string& value);
 
@@ -80,10 +98,19 @@ private:
                                                           const std::string& code_verifier,
                                                           const std::string& redirect_uri);
 
+    /// Fetch and cache JWKS from the IdP's jwks_uri endpoint.
+    void fetch_jwks();
+
     OidcConfig config_;
     std::string exchange_script_path_;
     mutable std::mutex mu_;
     std::unordered_map<std::string, PkceChallenge> pending_challenges_;
+
+    // JWKS cache for JWT signature verification (G2-SEC-A1-001)
+    mutable std::mutex jwks_mu_;
+    std::vector<CachedJwk> jwks_cache_;
+    std::chrono::steady_clock::time_point jwks_fetched_at_;
+    static constexpr auto kJwksCacheTtl = std::chrono::hours(1);
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };

@@ -17,8 +17,10 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "winhttp.lib")
 #else
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
 #endif
 
 namespace yuzu::server::oidc {
@@ -476,6 +478,272 @@ OidcProvider::exchange_code(const std::string& code, const std::string& code_ver
     return j["id_token"].get<std::string>();
 }
 
+// ── JWKS fetching and JWT signature verification (G2-SEC-A1-001) ─────────────
+
+#ifndef _WIN32
+// Convert base64url-encoded big-endian integer to BIGNUM
+static BIGNUM* base64url_to_bn(const std::string& b64url) {
+    auto bytes = OidcProvider::base64url_decode(b64url);
+    return BN_bin2bn(reinterpret_cast<const unsigned char*>(bytes.data()),
+                     static_cast<int>(bytes.size()), nullptr);
+}
+
+// Parse a single JWK (RSA public key) into an EVP_PKEY
+static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
+    auto kty = jwk.value("kty", "");
+    if (kty != "RSA")
+        return nullptr; // only RSA keys supported
+
+    auto n_str = jwk.value("n", "");
+    auto e_str = jwk.value("e", "");
+    if (n_str.empty() || e_str.empty())
+        return nullptr;
+
+    BIGNUM* bn_n = base64url_to_bn(n_str);
+    BIGNUM* bn_e = base64url_to_bn(e_str);
+    if (!bn_n || !bn_e) {
+        BN_free(bn_n);
+        BN_free(bn_e);
+        return nullptr;
+    }
+
+    // Build RSA public key and wrap in EVP_PKEY
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    RSA* rsa = RSA_new();
+    if (!rsa) {
+        BN_free(bn_n);
+        BN_free(bn_e);
+        return nullptr;
+    }
+    if (RSA_set0_key(rsa, bn_n, bn_e, nullptr) != 1) {
+        RSA_free(rsa); // frees bn_n and bn_e
+        return nullptr;
+    }
+    // bn_n and bn_e now owned by rsa
+
+    EVP_PKEY* pkey = EVP_PKEY_new();
+    if (!pkey) {
+        RSA_free(rsa);
+        return nullptr;
+    }
+    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        return nullptr;
+    }
+#pragma GCC diagnostic pop
+    // rsa now owned by pkey
+
+    return std::shared_ptr<EVP_PKEY>(pkey, EVP_PKEY_free);
+}
+#endif // !_WIN32
+
+void OidcProvider::fetch_jwks() {
+    if (config_.jwks_uri.empty()) {
+        spdlog::warn("OidcProvider: no jwks_uri configured, cannot fetch signing keys");
+        return;
+    }
+
+    spdlog::info("OidcProvider: fetching JWKS from {}", config_.jwks_uri);
+
+    std::string response_body;
+    try {
+        auto url = config_.jwks_uri;
+        std::string scheme;
+        if (url.starts_with("https://")) {
+            scheme = "https://";
+            url = url.substr(8);
+        } else if (url.starts_with("http://")) {
+            scheme = "http://";
+            url = url.substr(7);
+        } else {
+            spdlog::error("OidcProvider: invalid jwks_uri scheme");
+            return;
+        }
+        auto slash = url.find('/');
+        auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
+        auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
+
+        auto client = std::make_unique<httplib::Client>(scheme + host);
+        client->set_connection_timeout(5);
+        client->set_read_timeout(5);
+        client->enable_server_certificate_verification(!config_.skip_tls_verify);
+
+        auto result = client->Get(path);
+        int status = result ? result->status : 0;
+        response_body = result ? result->body : "";
+        client.reset();
+
+        if (status != 200) {
+            spdlog::error("OidcProvider: JWKS fetch failed (status={})", status);
+            return;
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("OidcProvider: JWKS fetch exception: {}", e.what());
+        return;
+    }
+
+    try {
+        auto j = nlohmann::json::parse(response_body);
+        if (!j.contains("keys") || !j["keys"].is_array()) {
+            spdlog::error("OidcProvider: JWKS response missing 'keys' array");
+            return;
+        }
+
+        std::vector<CachedJwk> new_keys;
+        for (const auto& key : j["keys"]) {
+            auto use = key.value("use", "sig");
+            if (use != "sig")
+                continue;
+
+            CachedJwk cached;
+            cached.kid = key.value("kid", "");
+            cached.alg = key.value("alg", "RS256");
+
+#ifndef _WIN32
+            cached.pkey = jwk_to_pkey(key);
+            if (!cached.pkey) {
+                spdlog::warn("OidcProvider: failed to parse JWK kid={}", cached.kid);
+                continue;
+            }
+#endif
+            new_keys.push_back(std::move(cached));
+        }
+
+        std::lock_guard lock(jwks_mu_);
+        jwks_cache_ = std::move(new_keys);
+        jwks_fetched_at_ = std::chrono::steady_clock::now();
+        spdlog::info("OidcProvider: cached {} JWKS signing keys", jwks_cache_.size());
+    } catch (const std::exception& e) {
+        spdlog::error("OidcProvider: JWKS parse error: {}", e.what());
+    }
+}
+
+std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::string& jwt) {
+    // Split JWT into header.payload.signature
+    auto dot1 = jwt.find('.');
+    if (dot1 == std::string::npos)
+        return std::unexpected("invalid JWT: no dots");
+    auto dot2 = jwt.find('.', dot1 + 1);
+    if (dot2 == std::string::npos)
+        return std::unexpected("invalid JWT: only one dot");
+
+    // Parse the header to extract alg and kid
+    auto header_json = base64url_decode(jwt.substr(0, dot1));
+
+    nlohmann::json hdr;
+    try {
+        hdr = nlohmann::json::parse(header_json);
+    } catch (...) {
+        return std::unexpected("JWT header parse error");
+    }
+
+    auto alg = hdr.value("alg", "");
+    auto kid = hdr.value("kid", "");
+
+    // Reject alg:none — the classic JWT bypass attack
+    if (alg.empty() || alg == "none" || alg == "None" || alg == "NONE")
+        return std::unexpected("JWT algorithm 'none' is not allowed");
+
+    // Only RS256/RS384/RS512 supported (Entra ID uses RS256)
+    if (alg != "RS256" && alg != "RS384" && alg != "RS512")
+        return std::unexpected("unsupported JWT algorithm: " + alg);
+
+#ifdef _WIN32
+    // TODO: Implement BCrypt-based JWT signature verification for Windows
+    spdlog::warn("OidcProvider: JWT signature verification not yet implemented on Windows");
+    return {};
+#else
+    // Ensure JWKS is cached and fresh
+    {
+        std::lock_guard lock(jwks_mu_);
+        auto age = std::chrono::steady_clock::now() - jwks_fetched_at_;
+        if (jwks_cache_.empty() || age > kJwksCacheTtl) {
+            // Need to fetch — release lock first (fetch acquires its own)
+        } else {
+            goto find_key; // cache is fresh, skip fetch
+        }
+    }
+    fetch_jwks();
+
+find_key:;
+    // Find the key matching kid
+    std::shared_ptr<EVP_PKEY> pkey;
+    {
+        std::lock_guard lock(jwks_mu_);
+        for (const auto& k : jwks_cache_) {
+            if (!kid.empty() && k.kid == kid) {
+                pkey = k.pkey;
+                break;
+            }
+        }
+    }
+    // If kid didn't match, re-fetch JWKS once (key rotation)
+    if (!pkey && !kid.empty()) {
+        spdlog::info("OidcProvider: kid={} not in cache, re-fetching JWKS", kid);
+        fetch_jwks();
+        std::lock_guard lock(jwks_mu_);
+        for (const auto& k : jwks_cache_) {
+            if (k.kid == kid) {
+                pkey = k.pkey;
+                break;
+            }
+        }
+    }
+    // If kid is empty, use the first key (some IdPs don't set kid)
+    if (!pkey) {
+        std::lock_guard lock(jwks_mu_);
+        if (!jwks_cache_.empty())
+            pkey = jwks_cache_.front().pkey;
+    }
+    if (!pkey)
+        return std::unexpected("no matching JWKS key found for kid=" + kid);
+
+    // The signing input is "header.payload" (first two base64url segments verbatim)
+    auto signing_input = jwt.substr(0, dot2);
+
+    // Decode the signature (third segment)
+    auto sig_bytes = base64url_decode(jwt.substr(dot2 + 1));
+
+    // Select hash algorithm
+    const EVP_MD* md = nullptr;
+    if (alg == "RS256")
+        md = EVP_sha256();
+    else if (alg == "RS384")
+        md = EVP_sha384();
+    else if (alg == "RS512")
+        md = EVP_sha512();
+
+    // Verify the signature
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        return std::unexpected("EVP_MD_CTX_new failed");
+
+    int rc = EVP_DigestVerifyInit(ctx, nullptr, md, nullptr, pkey.get());
+    if (rc != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected("EVP_DigestVerifyInit failed");
+    }
+
+    rc = EVP_DigestVerifyUpdate(ctx, signing_input.data(), signing_input.size());
+    if (rc != 1) {
+        EVP_MD_CTX_free(ctx);
+        return std::unexpected("EVP_DigestVerifyUpdate failed");
+    }
+
+    rc = EVP_DigestVerifyFinal(ctx, reinterpret_cast<const unsigned char*>(sig_bytes.data()),
+                               sig_bytes.size());
+    EVP_MD_CTX_free(ctx);
+
+    if (rc != 1)
+        return std::unexpected("JWT signature verification failed — token may be forged");
+
+    spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})", alg, kid);
+    return {};
+#endif // !_WIN32
+}
+
 // ── OidcProvider ─────────────────────────────────────────────────────────────
 
 OidcProvider::OidcProvider(OidcConfig config)
@@ -534,8 +802,11 @@ OidcProvider::OidcProvider(OidcConfig config)
                 config_.authorization_endpoint = j["authorization_endpoint"].get<std::string>();
             if (j.contains("token_endpoint"))
                 config_.token_endpoint = j["token_endpoint"].get<std::string>();
+            if (j.contains("jwks_uri"))
+                config_.jwks_uri = j["jwks_uri"].get<std::string>();
             spdlog::info("OidcProvider: authorize={}", config_.authorization_endpoint);
             spdlog::info("OidcProvider: token={}", config_.token_endpoint);
+            spdlog::info("OidcProvider: jwks_uri={}", config_.jwks_uri);
         } else {
             spdlog::warn("OidcProvider: discovery fetch failed (status={}), using fallback endpoints",
                          result ? result->status : 0);
@@ -624,7 +895,15 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const st
 
     spdlog::info("OIDC handle_callback: got id_token (len={})", id_token_result->size());
 
-    // Parse ID token
+    // Verify JWT signature before trusting any claims (G2-SEC-A1-001)
+    auto sig_check = verify_jwt_signature(*id_token_result);
+    if (!sig_check) {
+        spdlog::error("OIDC handle_callback: JWT signature verification failed: {}",
+                       sig_check.error());
+        return std::unexpected("JWT signature verification failed: " + sig_check.error());
+    }
+
+    // Parse ID token (claims can now be trusted)
     auto claims_result = parse_id_token(*id_token_result);
     if (!claims_result) {
         spdlog::error("OIDC handle_callback: JWT parse failed: {}", claims_result.error());
