@@ -317,10 +317,10 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ManagementGroupStore* mgmt_store,
                                 ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine,
-                                bool read_only_mode) {
+                                const bool& read_only_mode) {
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
-    svr.Post("/mcp/v1/", [=](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/mcp/v1/", [=, &read_only_mode](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Content-Type", "application/json");
 
         // Auth check — reuses the server's existing auth middleware pipeline

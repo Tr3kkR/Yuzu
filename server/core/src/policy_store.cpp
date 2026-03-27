@@ -1316,8 +1316,8 @@ FleetCompliance PolicyStore::get_fleet_compliance() const {
         }
     }
 
-    // Slow path: recompute under shared lock, then update cache
-    std::shared_lock lock(mtx_);
+    // Slow path: recompute under unique lock to prevent data race (CHAOS-T1-006)
+    std::unique_lock lock(mtx_);
     // Double-check: another thread may have refreshed while we waited
     if (fleet_compliance_last_computed_.time_since_epoch().count() > 0 &&
         (now - fleet_compliance_last_computed_) < kFleetComplianceCacheTtl) {
@@ -1340,7 +1340,7 @@ PolicyStore::invalidate_policy(const std::string& policy_id) {
     if (policy_id.empty())
         return std::unexpected("policy_id is required");
 
-    const char* sql = "UPDATE policy_status SET status = 'pending' WHERE policy_id = ?";
+    const char* sql = "UPDATE policy_status SET status = 'unknown' WHERE policy_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("PolicyStore: prepare failed in invalidate_policy: {}", sqlite3_errmsg(db_));
@@ -1368,7 +1368,7 @@ PolicyStore::invalidate_all_policies() {
     if (!db_)
         return std::unexpected("database not open");
 
-    const char* sql = "UPDATE policy_status SET status = 'pending'";
+    const char* sql = "UPDATE policy_status SET status = 'unknown'";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("PolicyStore: prepare failed in invalidate_all_policies: {}", sqlite3_errmsg(db_));

@@ -272,8 +272,12 @@ private:
 
     std::expected<Expression, std::string> parse_not() {
         if (tokenizer_.peek().type == TokenType::KwNot) {
+            ++depth_;
+            if (depth_ > kMaxDepth)
+                return std::unexpected("expression exceeds maximum nesting depth");
             tokenizer_.next(); // consume NOT
             auto child = parse_not();
+            --depth_;
             if (!child)
                 return child;
 
@@ -671,6 +675,8 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
     case CompOp::Like:
         return wildcard_match(cond.value, resolved);
     case CompOp::Matches: {
+        if (cond.value.size() > 256)
+            return false; // reject overly long regex patterns
         try {
             std::regex re(cond.value, std::regex::ECMAScript | std::regex::icase);
             return std::regex_search(std::string(resolved), re);
@@ -704,6 +710,9 @@ bool eval_condition(const Condition& cond, const AttributeResolver& resolver) {
 std::expected<Expression, std::string> parse(std::string_view input) {
     if (input.empty()) {
         return std::unexpected("empty expression");
+    }
+    if (input.size() > 4096) {
+        return std::unexpected("expression exceeds maximum length (4096 characters)");
     }
     Parser parser(input);
     return parser.parse_expression();
