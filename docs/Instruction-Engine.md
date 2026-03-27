@@ -686,20 +686,21 @@ These extensions keep the current parser and add operators as needed:
 
 Implementation: add new `TokenType` variants and `CompOp` cases. The parser architecture (tokenizer → recursive descent → AST → evaluator) supports these without structural changes.
 
-### 8.3 CEL Adoption Path (Phase 5)
+### 8.3 CEL Adoption — Implemented
 
-**Decision:** Adopt [Common Expression Language (CEL)](https://github.com/google/cel-spec) for typed policy evaluation expressions in Phase 5. Do not use CEL for device targeting (the scope DSL is simpler and sufficient).
+**Status:** Implemented. A CEL-compatible expression evaluator was built from scratch in `server/core/src/cel_eval.cpp` (~1000 LOC), following the same hand-rolled recursive-descent pattern as the existing `scope_engine.cpp` and the prior `compliance_eval.cpp`.
 
-**Rationale:**
-- abseil is already a transitive dependency via gRPC → cel-cpp is a natural addition
-- Policy compliance expressions need typed evaluation (bool, int, string, timestamp comparisons on structured result data)
-- CEL is sandboxed, deterministic, and designed for exactly this use case
-- The scope DSL cannot evaluate typed result data — it only handles string attribute comparisons
+**Approach:** Google's `cel-cpp` library is not available as a vcpkg port and has a heavy dependency chain (abseil, protobuf, RE2, ANTLR4, FlatBuffers) that would be impractical to build from source across all 4 CI platforms. Instead, a CEL-compatible subset was implemented with zero new dependencies — only C++23 standard library facilities.
+
+**Capabilities:** Typed evaluation (null, bool, int64, double, string, timestamp, duration, list), arithmetic operators, comparison operators, logical operators (`&&`/`||`/`!`), ternary (`?:`), `in` operator with list literals, string methods (`size`, `startsWith`, `endsWith`, `contains`, `matches`), timestamp/duration arithmetic, type casting functions, and `has()` for field presence. Full backward compatibility with the previous keyword-based syntax (AND/OR/NOT/contains/startswith).
+
+**Integration:** `compliance_eval.cpp` delegates to `cel::evaluate_bool()` and `cel::validate()`. All callers (policy_store, workflow_engine, server.cpp ConditionEvalFn) work unchanged. Legacy expressions are automatically migrated to CEL syntax at fragment creation time via `cel::migrate_expression()`.
 
 **Where CEL applies:**
 - `spec.compliance.expression` in PolicyFragments
 - `spec.fix.when` conditional expressions
 - `spec.rollout.condition` for staged rollouts
+- `WorkflowStep.condition` for conditional workflow steps
 
 **Where the scope DSL stays:**
 - All device targeting (`spec.scope.selector`)

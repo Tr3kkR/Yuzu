@@ -1102,21 +1102,105 @@ agent_version >= "0.9.0"
 | `len()` | `len(tag:name) > 5` | String length for validation |
 | `startswith()` | `startswith(hostname, "web-")` | Prefix check (more readable than LIKE) |
 
-### 9.3 CEL (Phase 5)
+### 9.3 CEL (Common Expression Language)
 
-In Phase 5, the Common Expression Language (CEL) will be adopted for typed policy evaluation expressions. CEL is not used for device targeting (the scope DSL is simpler and sufficient for that purpose).
+Yuzu implements a CEL-compatible expression evaluator (`server/core/src/cel_eval.cpp`) for typed policy evaluation expressions. CEL is not used for device targeting (the scope DSL is simpler and sufficient for that purpose).
 
 **Where CEL applies:**
 
 - `spec.compliance.expression` in PolicyFragments
 - `spec.fix.when` conditional expressions in PolicyFragments
 - `spec.rollout.condition` for staged rollouts in Policies
+- `WorkflowStep.condition` for conditional workflow steps
 
 **Where the scope DSL stays:**
 
 - All device targeting (`spec.scope.selector`)
 - `ScopeEngine` evaluation in the dispatch path
 - Dashboard filter expressions
+
+#### Type System
+
+| Type | CEL Syntax | Examples |
+|---|---|---|
+| null | `null` | `result.error == null` |
+| bool | `true`, `false` | `result.enabled == true` |
+| int | integer literals | `result.count > 5`, `3 + 4` |
+| double | floating-point literals | `result.score >= 80.5` |
+| string | single or double quotes | `result.status == 'running'` |
+| timestamp | `timestamp('...')` | `timestamp('2024-01-15T10:30:00Z')` |
+| duration | `duration('...')` | `duration('1h')`, `duration('30m')`, `duration('5s')` |
+| list | `[...]` | `result.status in ['running', 'starting']` |
+
+Variables from instruction results are provided as strings and automatically coerced to typed values: `"true"`/`"false"` to bool, integer strings to int, float strings to double, ISO 8601 strings to timestamp.
+
+#### Operators
+
+| Category | Operators |
+|---|---|
+| Comparison | `==`, `!=`, `<`, `>`, `<=`, `>=` |
+| Logical | `&&`, `\|\|`, `!` |
+| Arithmetic | `+`, `-`, `*`, `/`, `%` |
+| Membership | `in` (e.g., `x in [1, 2, 3]`) |
+| Ternary | `condition ? then : else` |
+
+String `+` performs concatenation. Timestamp arithmetic: `timestamp + duration = timestamp`, `timestamp - timestamp = duration`.
+
+#### Built-in Functions
+
+| Function | Description | Example |
+|---|---|---|
+| `size()` | String length or list size | `result.name.size() > 3` |
+| `startsWith()` | String prefix check | `result.path.startsWith('/usr')` |
+| `endsWith()` | String suffix check | `result.path.endsWith('.log')` |
+| `contains()` | Substring check (case-insensitive) | `result.name.contains('agent')` |
+| `matches()` | Regex match (ECMAScript) | `result.host.matches('^web-\\d+$')` |
+| `timestamp()` | Parse ISO 8601 string | `timestamp('2024-01-15T10:30:00Z')` |
+| `duration()` | Parse duration string | `duration('1h')` |
+| `int()` | Cast to integer | `int('42')` |
+| `double()` | Cast to double | `double('3.14')` |
+| `string()` | Cast to string | `string(42)` |
+| `has()` | Check field presence | `has('field_name')` |
+
+#### Backward Compatibility
+
+Legacy compliance expressions using `AND`, `OR`, `NOT`, `contains`, and `startswith` keywords continue to work. The evaluator accepts both CEL syntax (`&&`, `||`, `!`, `.contains()`, `.startsWith()`) and legacy keyword syntax. New fragments are automatically migrated to CEL syntax via `cel::migrate_expression()`.
+
+**Precedence note:** The keyword `NOT` has lower precedence than comparison operators (for backward compatibility), so `NOT result.status == 'failed'` is parsed as `NOT (result.status == 'failed')`. The CEL `!` operator has standard unary precedence, so `!result.status == 'failed'` is parsed as `(!result.status) == 'failed'`. Use parentheses when mixing styles to avoid ambiguity.
+
+#### Safety Limits
+
+| Limit | Value | Purpose |
+|---|---|---|
+| Max expression length | 4096 chars | Prevents DoS from oversized input |
+| Max nesting depth | 64 levels | Prevents stack overflow from deeply nested parens |
+| Max list elements | 1000 | Prevents memory exhaustion from large list literals |
+| Max regex pattern | 256 chars | Mitigates ReDoS via `matches()` |
+
+#### Examples
+
+```cel
+# Basic compliance check
+result.status == 'running'
+
+# Typed comparison with arithmetic
+result.cpu_percent < 90 && result.memory_mb > 512
+
+# Ternary for computed compliance
+result.score >= 80 ? true : false
+
+# Timestamp comparison
+timestamp(result.last_check) + duration('1h') > timestamp(result.current_time)
+
+# List membership
+result.os in ['windows', 'linux', 'darwin']
+
+# String functions
+result.hostname.startsWith('web-') && result.hostname.matches('^web-\\d+$')
+
+# Combined check with duration
+result.uptime_seconds > 3600 && result.status == 'running'
+```
 
 ---
 
