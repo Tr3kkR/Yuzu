@@ -8,7 +8,7 @@
 #include <ctime>
 #include <functional>
 #include <optional>
-#include <regex>
+#include <re2/re2.h>
 #include <stdexcept>
 #include <string>
 
@@ -624,14 +624,11 @@ CelValue fn_matches(const CelValue& receiver, const CelValue& arg) {
     auto* s = std::get_if<std::string>(&receiver);
     auto* pattern = std::get_if<std::string>(&arg);
     if (s && pattern) {
-        // Guard against ReDoS: reject overly long patterns
         if (pattern->size() > kMaxRegexPatternLen) return false;
-        try {
-            std::regex re(*pattern, std::regex::ECMAScript | std::regex::nosubs | std::regex::optimize);
-            return std::regex_search(*s, re);
-        } catch (...) {
-            return false;
-        }
+        // RE2 guarantees linear-time matching — immune to ReDoS (G2-SEC-D1-001)
+        RE2 re(*pattern, RE2::Quiet);
+        if (!re.ok()) return false;
+        return RE2::PartialMatch(*s, re);
     }
     return std::monostate{};
 }
