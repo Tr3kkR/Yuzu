@@ -120,6 +120,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reboot Management (8.6):** `reboot_if_needed` flag on patch deployments (no scheduled reboot workflow yet)
 - **System Health Monitoring (22.1):** /livez, /readyz probes + Prometheus metrics (no CPU/memory/queue monitoring yet)
 
+### Added (Governance — 2026-03-28)
+- 4 governance review agents: happy-path, unhappy-path, consistency-auditor, chaos-injector
+- 7-gate governance process (expanded from 5 gates) with mandatory correctness & resilience analysis
+- REST API v1 documentation for 25 previously undocumented endpoints (inventory, execution statistics, device tokens, software deployment, license management, topology, fleet statistics, file retrieval, OpenAPI spec)
+- Agent reconnect loop with exponential backoff (1s to 5min) on registration or stream failure
+- Semver downgrade protection in OTA updater — rejects older/equal versions
+- Per-plugin KV namespace isolation — `PluginContextImpl` with correct `plugin_name` per plugin
+
+### Fixed (Full Governance Review — ~380 findings across 492 files)
+
+#### Security — CRITICAL (5 fixed)
+- OIDC JWT signature verification via JWKS — forged ID tokens were previously accepted
+- 4 SQLite stores had mutexes declared but never locked (tag, discovery, instruction, deployment)
+
+#### Security — HIGH (18 fixed)
+- Replaced `std::regex` with RE2 in CEL `.matches()` and scope `MATCHES` operator (ReDoS)
+- CEL evaluation wall-clock timeout (prevents infinite loops in policy evaluation)
+- 11 SQLite stores gained shared_mutex protection for thread-safe concurrent access
+- RBAC permission cache to reduce per-request SQL query amplification
+- API token IDs extended from 12-char to 24-char hex (96-bit collision resistance)
+- MCP kill switch now evaluated at runtime, not just startup
+- ApprovalManager TOCTOU fixed with mutex + atomic WHERE on concurrent approve/reject
+- MCP read_only_mode captured by reference for runtime toggle support
+- Prometheus histogram `observe()` fixed — was double-counting across all bucket boundaries
+- Agent double plugin shutdown prevented on normal exit
+- Stagger/delay capped at 5min each to prevent thread pool worker exhaustion
+
+#### Security — MEDIUM (25 fixed)
+- Minimum password length enforced (12 characters)
+- Expired sessions opportunistically reaped
+- Token generation switched from mt19937_64 to CSPRNG (RAND_bytes)
+- Security response headers added (X-Frame-Options, HSTS, X-Content-Type-Options)
+- CSRF protection via Origin header validation
+- RBAC `set_permission` validates effect as "allow" or "deny"
+- OIDC pending challenges capped at 1000 entries with expiry cleanup
+- MCP `/health` resource now requires RBAC check
+- Dead CORS helper removed (was reflecting arbitrary Origin)
+- Execution statistics limit clamped to 1000
+- CEL recursion depth reduced from 64 to 16; string concatenation capped at 64 KiB
+- Unknown characters in CEL lexer return Error token instead of silent skip
+- Scope engine NOT recursion protected with DepthGuard
+- Response/audit store cleanup threads wrapped in proper mutex locks
+- Fleet compliance cache writes corrected from shared_lock to unique_lock
+- Non-thread-safe static RNGs made thread_local
+- Deleted user sessions now invalidated; session role updated on role change
+- Offline agents get 24hr staleness TTL on compliance status
+- MCP automation gets separate rate limit bucket from dashboard
+- Approval workflow: 7-day TTL and 1000 pending cap
+- CEL unresolved variables produce tri-state (true/false/error) instead of silent false
+
+#### Agent & Plugins (10 fixed)
+- `SecureZeroMemory` on CNG + CAPI intermediate key blobs after cert store export
+- Symlink rejection before plugin dlopen
+- OTA updater download size capped at 512 MiB
+- Content distribution staging directory set to owner-only permissions
+- Hash re-verification before executing staged content
+- HTTP client SSRF protection extended to CGNAT (100.64/10) and benchmarking (198.18/15) ranges
+- HTTP client response body capped at 100 MiB
+- `script_exec` output capped at 16 MiB; `setsid()` + `kill(-pid, SIGKILL)` for process group cleanup
+- `script_exec` child environment sanitized (PATH, HOME, USER, LANG, LC_ALL, TERM, TZ only)
+- Certificate plugin command injection fixed: hex-only thumbprint validation, safe path checks, temp file for PEM parsing
+
+#### Gateway
+- 5 dialyzer warnings resolved (ctx dependency, contract violations, dead code)
+- gpb bumped 4.21.2 → 4.21.7 for OTP 28 compatibility
+- Gateway proto synced from canonical (added stagger_seconds, delay_seconds)
+
+#### Documentation
+- REST API v1 now 100% documented (was 48% undocumented)
+- Full governance review document with cross-tier finding register
+- Erlang gateway build pitfalls documented in CLAUDE.md
+
 ### Fixed (RC Sprint — 52 findings resolved)
 
 #### Security (CRITICAL + HIGH)
