@@ -107,6 +107,32 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian** f
 
 After any cross-platform change, always run `bash scripts/run-tests.sh all` on Darwin before committing.
 
+## Erlang Gateway Build & Quality
+
+The gateway (`gateway/`) is a standalone rebar3 project. It compiles independently from the C++ codebase.
+
+### Build & verify commands
+```bash
+cd gateway
+rebar3 compile                # compile
+rebar3 eunit                  # unit tests (148 tests)
+rebar3 dialyzer               # type analysis — must be warning-free
+rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
+```
+
+**Always run `rebar3 dialyzer` after any Erlang change.** Compilation succeeding is not enough — dialyzer catches type violations, dead code, and missing dependencies that the compiler silently accepts. The project uses `warnings_as_errors` for compile but dialyzer warnings are separate.
+
+### Standing Erlang pitfalls
+
+| Area | Issue |
+|---|---|
+| `ctx` dependency | `ctx:background/0` is used for grpcbox RPC calls. `ctx` is a transitive dep of `grpcbox` but must be listed in `yuzu_gw.app.src` `applications` since we call it directly — otherwise dialyzer can't find it in the PLT. **Rule: if you call a function from a transitive dependency, add it to the applications list.** |
+| `-spec` contracts | If a function spec says `-spec f(map()) -> ok`, passing an atom like `f(some_atom)` compiles fine but dialyzer flags it. Always respect `-spec` contracts, even in catch/fallback paths. |
+| Circuit breaker dead code | `on_success/1` and `on_failure/1` only receive states `closed` or `half_open` (never `open`, because `check_circuit/1` rejects before the RPC runs). Don't add catchall clauses for states that are structurally unreachable — dialyzer knows the type is fully covered. |
+| `gpb` plugin warning | `Plugin gpb does not export init/1` is a benign warning from rebar3 — gpb is used via `grpc` config, not as a rebar3 plugin. Ignore it. |
+| Stray `.beam` / crash dumps | `erl_crash.dump` and loose `.beam` files in the gateway root are artifacts. They should be gitignored or deleted, never committed. |
+| Shutdown flush | During `stop/1`, `flush_sync/0` is the correct way to drain the heartbeat buffer. Do not fall back to `queue_heartbeat/1` with sentinel atoms — it violates the `map()` spec and would corrupt the buffer. If `flush_sync` fails, the process is already dead and the buffer is lost. |
+
 ## Instruction Engine
 
 The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:
