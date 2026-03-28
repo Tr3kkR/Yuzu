@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <shared_mutex>
 #include <vector>
 
 namespace yuzu::server {
@@ -54,6 +55,7 @@ public:
 
 private:
     sqlite3* db_;
+    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
 };
 
 } // namespace yuzu::server
