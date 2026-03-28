@@ -5970,6 +5970,13 @@ private:
                     res.set_header("Access-Control-Max-Age", "86400");
                 }
 
+                // Security response headers (G2-SEC-B1-004)
+                res.set_header("X-Content-Type-Options", "nosniff");
+                res.set_header("X-Frame-Options", "DENY");
+                res.set_header("Referrer-Policy", "strict-origin-when-cross-origin");
+                if (cfg_.https_enabled)
+                    res.set_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+
                 metrics_
                     .counter("yuzu_http_requests_total",
                              {{"method", req.method}, {"status", std::to_string(res.status)}})
@@ -9145,6 +9152,18 @@ private:
                 sched.scope_expression = j.value("scope_expression", "");
                 sched.requires_approval = j.value("requires_approval", false);
 
+                // Validate scope expression before storing (G2-SEC-D2-005)
+                if (!sched.scope_expression.empty()) {
+                    auto scope_check = yuzu::scope::validate(sched.scope_expression);
+                    if (!scope_check) {
+                        res.status = 400;
+                        res.set_content(
+                            nlohmann::json({{"error", "invalid scope_expression: " + scope_check.error()}}).dump(),
+                            "application/json");
+                        return;
+                    }
+                }
+
                 auto token = extract_session_cookie(req);
                 auto session = auth_mgr_.validate_session(token);
                 if (session)
@@ -9201,6 +9220,8 @@ private:
             auto enabled_str = extract_json_string(req.body, "enabled");
             bool enabled = (enabled_str != "false");
             schedule_engine_->set_enabled(id, enabled);
+            audit_log(req, enabled ? "schedule.enable" : "schedule.disable",
+                      "success", "schedule", id);
             res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
         });
 

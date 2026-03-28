@@ -138,7 +138,7 @@ TEST_CASE("has_users returns false initially", "[auth][user]") {
 
 TEST_CASE("upsert_user + list_users", "[auth][user]") {
     auto mgr = make_temp_auth();
-    REQUIRE(mgr->upsert_user("alice", "password123", Role::admin));
+    REQUIRE(mgr->upsert_user("alice", "password12345", Role::admin));
     REQUIRE(mgr->has_users());
 
     auto users = mgr->list_users();
@@ -149,7 +149,7 @@ TEST_CASE("upsert_user + list_users", "[auth][user]") {
 
 TEST_CASE("remove_user", "[auth][user]") {
     auto mgr = make_temp_auth();
-    mgr->upsert_user("alice", "pass", Role::admin);
+    mgr->upsert_user("alice", "password1234", Role::admin);
     REQUIRE(mgr->remove_user("alice"));
     REQUIRE_FALSE(mgr->has_users());
 }
@@ -163,16 +163,16 @@ TEST_CASE("remove_user returns false for nonexistent user", "[auth][user]") {
 
 TEST_CASE("authenticate succeeds with correct password", "[auth][session]") {
     auto mgr = make_temp_auth();
-    mgr->upsert_user("alice", "secret", Role::admin);
+    mgr->upsert_user("alice", "secret123456", Role::admin);
 
-    auto token = mgr->authenticate("alice", "secret");
+    auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
     REQUIRE_FALSE(token->empty());
 }
 
 TEST_CASE("authenticate fails with wrong password", "[auth][session]") {
     auto mgr = make_temp_auth();
-    mgr->upsert_user("alice", "secret", Role::admin);
+    mgr->upsert_user("alice", "secret123456", Role::admin);
 
     auto token = mgr->authenticate("alice", "wrong");
     REQUIRE_FALSE(token.has_value());
@@ -180,15 +180,15 @@ TEST_CASE("authenticate fails with wrong password", "[auth][session]") {
 
 TEST_CASE("authenticate fails for unknown user", "[auth][session]") {
     auto mgr = make_temp_auth();
-    auto token = mgr->authenticate("nobody", "pass");
+    auto token = mgr->authenticate("nobody", "password1234");
     REQUIRE_FALSE(token.has_value());
 }
 
 TEST_CASE("validate_session returns correct user info", "[auth][session]") {
     auto mgr = make_temp_auth();
-    mgr->upsert_user("alice", "secret", Role::admin);
+    mgr->upsert_user("alice", "secret123456", Role::admin);
 
-    auto token = mgr->authenticate("alice", "secret");
+    auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
 
     auto session = mgr->validate_session(*token);
@@ -199,9 +199,9 @@ TEST_CASE("validate_session returns correct user info", "[auth][session]") {
 
 TEST_CASE("invalidate_session destroys session", "[auth][session]") {
     auto mgr = make_temp_auth();
-    mgr->upsert_user("alice", "secret", Role::admin);
+    mgr->upsert_user("alice", "secret123456", Role::admin);
 
-    auto token = mgr->authenticate("alice", "secret");
+    auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
 
     mgr->invalidate_session(*token);
@@ -319,8 +319,8 @@ TEST_CASE("save and reload config preserves users", "[auth][config]") {
     {
         AuthManager mgr;
         mgr.load_config(tmp);
-        mgr.upsert_user("alice", "pass1", Role::admin);
-        mgr.upsert_user("bob", "pass2", Role::user);
+        mgr.upsert_user("alice", "password1pass", Role::admin);
+        mgr.upsert_user("bob", "password2pass", Role::user);
         REQUIRE(mgr.save_config());
     }
 
@@ -331,8 +331,8 @@ TEST_CASE("save and reload config preserves users", "[auth][config]") {
         REQUIRE(users.size() == 2);
 
         // Verify we can still authenticate
-        REQUIRE(mgr.authenticate("alice", "pass1").has_value());
-        REQUIRE(mgr.authenticate("bob", "pass2").has_value());
+        REQUIRE(mgr.authenticate("alice", "password1pass").has_value());
+        REQUIRE(mgr.authenticate("bob", "password2pass").has_value());
     }
 
     fs::remove(tmp);
