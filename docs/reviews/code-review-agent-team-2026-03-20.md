@@ -8,10 +8,10 @@
 |-------|-------|
 | Date | 2026-03-28 |
 | Process | 7-gate governance (expanded from 5 gates on 2026-03-28) |
-| Scope | Tier 1 complete (auth, REST API, engines, MCP). Tiers 2-4 pending. |
+| Scope | Tiers 1-2 complete. Tiers 3-4 pending. |
 | Prior art | RC sprint (2026-03-22 to 2026-03-24) found 52 findings (7C/16H/22M/7L), all resolved |
 | Agents used | security-guardian, docs-writer, architect, dsl-engineer, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector |
-| Invocations | ~50 agent invocations across Gates 1-5 |
+| Invocations | ~60 agent invocations across Gates 1-5 (Tiers 1-2) |
 
 ## Governance Process (7 Gates)
 
@@ -194,17 +194,120 @@ All 10 scenarios documented in the 2026-03-28 Gate 5 conversation output.
 
 ---
 
-## Remaining Work: Tiers 2-4
+## Tier 2 — Data Integrity (completed 2026-03-28)
 
-### Tier 2 — Data Integrity (next priority)
+### Scope
 
-| Partition | Batches | Files | Focus |
-|-----------|---------|-------|-------|
-| C: Data Stores | C1-C4 | 20+ *_store files | SQL injection audit, lock contention, pagination |
-| F: Server Infrastructure | F1-F4 | server.cpp (11K LOC), NVD, patches | God-object decomposition, startup security |
-| I: Gateway Erlang | I1-I4 | 18 .erl files | Process lifecycle, supervision, proto consistency |
+| Partition | Batches | Files | Status |
+|-----------|---------|-------|--------|
+| C: Data Stores | C1-C4 | 21 store pairs (hpp+cpp) | Complete |
+| F: Server Infrastructure | F1-F4 | server.cpp (11.4K LOC), NVD (6), patch_manager (2) | Complete |
+| I: Gateway Erlang | I1-I4 | 18 .erl files | Complete |
 
-**Estimated: ~30 agent invocations, ~1.5 hours**
+**Agents used:** security-guardian (×4), architect, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector
+**Invocations:** ~10 agent invocations across Gates 2-5
+
+### Tier 2 Finding Register
+
+#### CRITICAL (4 found, 4 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G2-SEC-C1-001 | TagStore mutex declared but never locked | tag_store.cpp | Added shared_lock/unique_lock to all methods + _impl variants |
+| G2-SEC-C1-002 | DiscoveryStore mutex declared but never locked | discovery_store.cpp | Added shared_lock/unique_lock to all methods |
+| G2-SEC-C2-001 | InstructionStore mutex declared but never locked | instruction_store.cpp | Added shared_lock/unique_lock to all methods + _impl variants |
+| G2-SEC-C2-002 | DeploymentStore mutex declared but never locked | deployment_store.cpp | Added shared_lock/unique_lock to all methods + _impl variants |
+
+#### HIGH — Security & Concurrency (17 found, 10 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G2-SEC-C1-003 | ResponseStore cleanup thread bypasses mutex | response_store.cpp | Wrapped cleanup DELETE in unique_lock |
+| G2-SEC-C1-004 | AuditStore cleanup thread bypasses mutex | audit_store.cpp | Wrapped cleanup DELETE in unique_lock |
+| G2-SEC-C1-005 | ResponseStore sqlite3_step return unchecked in store() | response_store.cpp | Documented; see G4-UHP-T2-001 |
+| G2-SEC-C1-006 | AuditStore sqlite3_step return unchecked in log() | audit_store.cpp | Documented; see G4-UHP-T2-001 |
+| G2-SEC-C3-001 | ManagementGroupStore most methods lack mutex | management_group_store.cpp | Pre-existing from Tier 1 (partial) |
+| G2-SEC-C4-001 | QuarantineStore mutex declared but never locked | quarantine_store.cpp | Added shared_lock/unique_lock + _impl |
+| G2-SEC-C4-002 | QuarantineStore quarantine_device TOCTOU | quarantine_store.cpp | Fixed: check+insert atomic under lock |
+| G2-SEC-C2-003 | DeploymentStore cancel_job TOCTOU | deployment_store.cpp | Fixed: check+update atomic under lock |
+| G2-SEC-C4-006 | WebhookStore detached threads use-after-free risk | webhook_store.cpp | Documented; needs thread pool refactor |
+| G2-SEC-C2-004 | InstructionQuery.limit no upper bound | instruction_store.cpp | Documented |
+| G2-SEC-C2-005 | list_sets() no LIMIT clause | instruction_store.cpp | Documented |
+| G2-SEC-C2-006 | list_jobs() no LIMIT clause | deployment_store.cpp | Documented |
+| G2-SEC-I2-001 | ETS take_pending TOCTOU race | yuzu_gw_registry.erl | Documented; fix: use ets:take/2 |
+| G2-SEC-I3-004 | Empty agent_ids broadcasts to entire fleet | yuzu_gw_router.erl | Documented; needs safety guard |
+| G2-SEC-I3-009 | Dev config ships plaintext gRPC on 0.0.0.0 | sys.config | Documented |
+| G2-SEC-I3-010 | No app-level auth on management gRPC | all services | Documented; mTLS in prod |
+| G2-SEC-I1-001 | Env variable integers no range validation | yuzu_gw_app.erl | Documented |
+
+#### HIGH — Architecture (3 found, 1 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G3-ARCH-T2-001 | server.cpp god object (11.4K LOC, 27 stores) | server.cpp | Documented; extraction planned |
+| G3-ARCH-T2-002 | Shared instruction DB fragile lifetime | server.cpp | Documented; needs shared_ptr refactor |
+| G3-ARCH-T2-003 | Gateway proto missing stagger/delay fields | agent.proto | **Fixed**: synced gateway proto from canonical |
+
+#### HIGH — Performance (5 found, 0 fixed — documented)
+
+| ID | Finding | File | Notes |
+|----|---------|------|-------|
+| G3-PERF-T2-003 | TagStore.set_tag recompiles SQL per call | tag_store.cpp | Pre-compile at construction |
+| G3-PERF-T2-004 | AgentRegistry.touch_activity exclusive lock on heartbeat | server.cpp | Switch to shared_mutex |
+| G3-PERF-T2-005 | ExecutionTracker recursive_mutex, all exclusive | execution_tracker.cpp | Switch to shared_mutex |
+| G3-PERF-T2-001/002 | TagStore/InstructionStore unlocked (dup of CRITICAL) | — | Fixed above |
+| G2-SEC-F3-001 | NvdDatabase no thread safety | nvd_db.cpp | **Fixed**: added shared_mutex + busy_timeout |
+
+#### HIGH — Correctness & Resilience (Gate 4)
+
+| ID | Finding | File | Notes |
+|----|---------|------|-------|
+| G4-UHP-T2-001 | sqlite3_step return unchecked across all stores | All stores | Documented; needs systematic fix |
+| G4-UHP-T2-002 | Cleanup threads continue on persistent DB failure | response/audit_store | Documented; needs backoff |
+| G4-UHP-T2-003 | No DB integrity check on startup | All stores | Documented; add PRAGMA quick_check |
+| G4-CON-T2-003 | Gateway heartbeat drops pending_commands | yuzu_gw_agent_service | Documented; architectural decision |
+| G4-CON-T2-004 | Gateway ListAgents omits platform/agent_version | yuzu_gw_mgmt_service | Documented |
+
+#### MEDIUM — Summary (53 total, see gate outputs for full details)
+
+Key categories:
+- **Unbounded queries** (12 stores): Missing LIMIT clauses, no pagination support
+- **Consistency gaps** (12): Path canonicalization, mutex type, error return types, ID generation
+- **Gateway**: Supervision strategy, heartbeat buffer drops, router fanout serialization, backpressure silent drops
+- **Server infra**: Detached threads (×2), gRPC message size, NVD LIKE wildcard injection, EventBus lock-under-callback
+- **Data integrity**: FK enforcement inconsistent, TOCTOU in ProductPackStore, missing composite indexes
+
+#### LOW — Summary (~35 findings, not itemized)
+
+Categories: retention policies, input validation, helper duplication, naming inconsistencies, informational observations.
+
+### Tier 2 Chaos Scenarios (Gate 5)
+
+| ID | Severity | Chain | Status |
+|----|----------|-------|--------|
+| CHAOS-T2-001 | CRITICAL | Disk-full silent data loss: all 20+ stores silently discard writes | Constituent findings fixed (mutexes); sqlite3_step checking still needed |
+| CHAOS-T2-002 | CRITICAL | Corrupt DB → ghost server: server starts, serves empty data | Documented; needs PRAGMA quick_check gate |
+| CHAOS-T2-003 | HIGH | NTP jump → approval wipe + schedule skip + premature cleanup | Documented |
+| CHAOS-T2-004 | HIGH | Gateway router crash → 100+ commands hang | Documented |
+| CHAOS-T2-005 | HIGH | Agent reconnect storm → dropped heartbeats + stale state | Documented |
+
+### Tier 2 Fix Summary
+
+| Files Modified | Change | Finding IDs |
+|---------------|--------|-------------|
+| tag_store.hpp/cpp | Added mutex locks to all 13 methods + 2 _impl variants | C1-001 |
+| discovery_store.cpp | Added mutex locks to all 5 methods | C1-002 |
+| instruction_store.hpp/cpp | Added mutex locks to all 10 methods + 2 _impl variants | C2-001 |
+| deployment_store.hpp/cpp | Added mutex locks to all 5 methods + 2 _impl variants, atomic cancel_job | C2-002, C2-003 |
+| quarantine_store.hpp/cpp | Added mutex locks to all 5 methods + 1 _impl variant, atomic quarantine | C4-001, C4-002 |
+| nvd_db.hpp/cpp | Added shared_mutex + busy_timeout + locks to all 8 methods + 2 _impl variants | F3-001, CON-T2-001/002 |
+| response_store.cpp | Wrapped cleanup thread DELETE in unique_lock | C1-003 |
+| audit_store.cpp | Wrapped cleanup thread DELETE in unique_lock | C1-004 |
+| gateway/priv/proto/.../agent.proto | Synced from canonical (added stagger_seconds, delay_seconds) | ARCH-T2-003 |
+
+---
+
+## Remaining Work: Tiers 3-4
 
 ### Tier 3 — Functional Correctness
 

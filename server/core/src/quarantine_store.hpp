@@ -46,6 +46,9 @@ private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
     void create_tables();
+
+    // Internal variant called under existing lock (no re-lock)
+    std::optional<QuarantineRecord> get_status_impl(const std::string& agent_id) const;
 };
 
 } // namespace yuzu::server

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -61,7 +62,12 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
+    mutable std::shared_mutex mtx_; // protects db_ access
     void create_tables();
+
+    // Internal variants called under existing lock (no re-lock)
+    void upsert_cve_impl(const CveRecord& record);
+    void upsert_cves_impl(const std::vector<CveRecord>& records);
 };
 
 /// Compare two version strings numerically (e.g. "1.10.0" > "1.9.0").

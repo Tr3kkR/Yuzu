@@ -85,6 +85,10 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+
+    // Internal variants called under existing lock (no re-lock)
+    std::optional<InstructionDefinition> get_definition_impl(const std::string& id) const;
+    std::expected<std::string, std::string> create_definition_impl(const InstructionDefinition& def);
 };
 
 } // namespace yuzu::server

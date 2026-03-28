@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 #include <random>
 
 namespace yuzu::server {
@@ -159,6 +160,7 @@ bool InstructionStore::is_open() const {
 
 std::vector<InstructionDefinition>
 InstructionStore::query_definitions(const InstructionQuery& q) const {
+    std::shared_lock lock(mtx_);
     std::vector<InstructionDefinition> results;
     if (!db_)
         return results;
@@ -204,6 +206,11 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
 }
 
 std::optional<InstructionDefinition> InstructionStore::get_definition(const std::string& id) const {
+    std::shared_lock lock(mtx_);
+    return get_definition_impl(id);
+}
+
+std::optional<InstructionDefinition> InstructionStore::get_definition_impl(const std::string& id) const {
     if (!db_)
         return std::nullopt;
 
@@ -224,6 +231,12 @@ std::optional<InstructionDefinition> InstructionStore::get_definition(const std:
 
 std::expected<std::string, std::string>
 InstructionStore::create_definition(const InstructionDefinition& def) {
+    std::unique_lock lock(mtx_);
+    return create_definition_impl(def);
+}
+
+std::expected<std::string, std::string>
+InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     if (!db_)
         return std::unexpected("database not open");
     if (def.name.empty())
@@ -290,6 +303,7 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
 
 std::expected<void, std::string>
 InstructionStore::update_definition(const InstructionDefinition& def) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (def.id.empty())
@@ -349,6 +363,7 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
 }
 
 bool InstructionStore::delete_definition(const std::string& id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return false;
 
@@ -369,7 +384,8 @@ bool InstructionStore::delete_definition(const std::string& id) {
 // ---------------------------------------------------------------------------
 
 std::string InstructionStore::export_definition_json(const std::string& id) const {
-    auto def = get_definition(id);
+    std::shared_lock lock(mtx_);
+    auto def = get_definition_impl(id);
     if (!def)
         return "{}";
 
@@ -405,6 +421,8 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
         return std::unexpected("invalid JSON");
+
+    std::unique_lock lock(mtx_);
 
     InstructionDefinition def;
     if (parsed.contains("id"))
@@ -450,7 +468,7 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     if (parsed.contains("readable_payload"))
         def.readable_payload = parsed.value("readable_payload", "");
 
-    return create_definition(def);
+    return create_definition_impl(def);
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +476,7 @@ InstructionStore::import_definition_json(const std::string& json_str) {
 // ---------------------------------------------------------------------------
 
 std::vector<InstructionSet> InstructionStore::list_sets() const {
+    std::shared_lock lock(mtx_);
     std::vector<InstructionSet> results;
     if (!db_)
         return results;
@@ -483,6 +502,7 @@ std::vector<InstructionSet> InstructionStore::list_sets() const {
 }
 
 std::expected<std::string, std::string> InstructionStore::create_set(const InstructionSet& s) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
     if (s.name.empty())
@@ -513,6 +533,7 @@ std::expected<std::string, std::string> InstructionStore::create_set(const Instr
 }
 
 bool InstructionStore::delete_set(const std::string& id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return false;
 
