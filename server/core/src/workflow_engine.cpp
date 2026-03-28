@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <random>
@@ -320,12 +321,14 @@ std::expected<std::string, std::string> WorkflowEngine::create_workflow(
         s.on_failure = rs.on_failure.empty() ? "abort" : rs.on_failure;
 
         if (!rs.retry_count.empty()) {
-            try { s.retry_count = std::stoi(rs.retry_count); }
-            catch (...) {}
+            try {
+                s.retry_count = std::clamp(std::stoi(rs.retry_count), 0, 10);
+            } catch (...) {}
         }
         if (!rs.retry_delay.empty()) {
-            try { s.retry_delay_seconds = std::stoi(rs.retry_delay); }
-            catch (...) {}
+            try {
+                s.retry_delay_seconds = std::clamp(std::stoi(rs.retry_delay), 0, 3600);
+            } catch (...) {}
         }
 
         steps.push_back(std::move(s));

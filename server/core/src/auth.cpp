@@ -336,8 +336,8 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto admin_pw = prompt_password("Admin password");
-    if (admin_pw.empty()) {
-        std::cerr << "Password cannot be empty.\n";
+    if (admin_pw.size() < 12) {
+        std::cerr << "Password must be at least 12 characters.\n";
         return false;
     }
     auto admin_pw2 = prompt_password("Confirm admin password");
@@ -359,8 +359,8 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
         return false;
     }
     auto user_pw = prompt_password("User password");
-    if (user_pw.empty()) {
-        std::cerr << "Password cannot be empty.\n";
+    if (user_pw.size() < 12) {
+        std::cerr << "Password must be at least 12 characters.\n";
         return false;
     }
     auto user_pw2 = prompt_password("Confirm user password");
@@ -424,10 +424,16 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     if (it == sessions_.end())
         return std::nullopt;
 
-    if (std::chrono::steady_clock::now() > it->second.expires_at) {
-        // Expired sessions are cleaned up lazily; don't mutate under shared lock.
-        // Return nullopt; the session will be reaped on next authenticate/invalidate.
+    auto now = std::chrono::steady_clock::now();
+    if (now > it->second.expires_at)
         return std::nullopt;
+
+    // Opportunistic reap: if sessions exceed threshold, upgrade lock and sweep (G2-SEC-A1-004)
+    if (sessions_.size() > 100) {
+        lock.unlock();
+        std::unique_lock wlock(mu_);
+        auto reap_now = std::chrono::steady_clock::now();
+        std::erase_if(sessions_, [&](const auto& p) { return reap_now > p.second.expires_at; });
     }
 
     return it->second;
@@ -456,6 +462,8 @@ std::vector<UserEntry> AuthManager::list_users() const {
 }
 
 bool AuthManager::upsert_user(const std::string& username, const std::string& password, Role role) {
+    if (password.size() < 12)
+        return false; // minimum password length (G2-SEC-A1-003)
     auto salt = random_bytes(16);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 

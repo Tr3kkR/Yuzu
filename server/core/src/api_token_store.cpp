@@ -15,6 +15,7 @@
 // clang-format on
 #include <bcrypt.h>
 #else
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 #endif
 
@@ -95,14 +96,24 @@ void ApiTokenStore::create_tables() {
 // ── Token generation and hashing ─────────────────────────────────────────────
 
 std::string ApiTokenStore::generate_raw_token() const {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    // Use CSPRNG for token generation (G2-SEC-A2-001)
+    unsigned char buf[32]{};
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCryptOpenAlgorithmProvider(&alg, BCRYPT_RNG_ALGORITHM, nullptr, 0);
+    if (alg) {
+        BCryptGenRandom(alg, buf, sizeof(buf), 0);
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+#else
+    RAND_bytes(buf, sizeof(buf));
+#endif
     static constexpr char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    std::string token = "yuzu_"; // prefix for easy identification
+    std::string token = "yuzu_";
     token.reserve(37);
-    std::uniform_int_distribution<int> dist(0, 61);
     for (int i = 0; i < 32; ++i)
-        token += chars[dist(rng)];
+        token += chars[buf[i] % 62];
     return token;
 }
 

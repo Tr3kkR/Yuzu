@@ -1306,10 +1306,18 @@ FleetCompliance PolicyStore::compute_fleet_compliance_locked() const {
     if (!db_)
         return fc;
 
-    const char* sql = "SELECT status, COUNT(*) FROM policy_status GROUP BY status";
+    // Count fresh statuses (checked within staleness TTL) and stale ones separately (G4-UHP-POL-007)
+    constexpr int64_t kStalenessTtl = 24 * 3600; // 24 hours
+    auto cutoff = now_epoch() - kStalenessTtl;
+
+    const char* sql =
+        "SELECT CASE WHEN last_check_at >= ? THEN status ELSE 'unknown' END AS effective_status, "
+        "COUNT(*) FROM policy_status GROUP BY effective_status";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return fc;
+
+    sqlite3_bind_int64(stmt, 1, cutoff);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         auto status = col_text(stmt, 0);
