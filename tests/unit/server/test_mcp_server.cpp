@@ -503,6 +503,8 @@ struct McpTestServer {
     std::string mock_tier;           // MCP tier for mock auth
     bool mock_auth_enabled{true};    // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
+    bool read_only_mode_{false};     // Must outlive register_routes (captured by ref)
+    bool mcp_disabled_{false};       // Must outlive register_routes (captured by ref)
 
     yuzu::server::mcp::McpServer mcp;
 
@@ -563,7 +565,8 @@ struct McpTestServer {
                             /*mgmt_store=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*schedule_engine=*/nullptr,
-                            /*read_only_mode=*/false);
+                            read_only_mode_,
+                            mcp_disabled_);
 
         // Bind to a random available port
         port = svr.bind_to_any_port("127.0.0.1");

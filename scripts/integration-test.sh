@@ -338,6 +338,22 @@ rebar3 compile > "$WORK_DIR/gw_build.log" 2>&1 || {
     cat "$WORK_DIR/gw_build.log"
     exit 1
 }
+# Workaround: rebar3 sometimes skips modules from hex deps (telemetry_handler_table)
+# and from proto sources (management_pb). Compile any missing beam files explicitly.
+for mod in _build/default/lib/telemetry/src/telemetry_handler_table.erl; do
+    beam="_build/default/lib/telemetry/ebin/$(basename "${mod%.erl}.beam")"
+    if [[ -f "$mod" && ! -f "$beam" ]]; then
+        erlc +debug_info -I _build/default/lib/telemetry/src \
+             -o _build/default/lib/telemetry/ebin "$mod"
+    fi
+done
+for mod in apps/yuzu_gw/src/management_pb.erl; do
+    beam="_build/default/lib/yuzu_gw/ebin/$(basename "${mod%.erl}.beam")"
+    if [[ -f "$mod" && ! -f "$beam" ]]; then
+        erlc +debug_info -I _build/default/lib/gpb/include \
+             -o _build/default/lib/yuzu_gw/ebin "$mod"
+    fi
+done
 # Start with all deps and generated proto modules on path
 erl -pa _build/default/lib/*/ebin \
     -pa _checkouts/*/ebin \
@@ -380,9 +396,14 @@ for i in $(seq 1 "$AGENT_COUNT"); do
     AGENT_PIDS+=($!)
 done
 
-# Wait for agents to register
+# Wait for agents to register (poll for up to 15s)
 log "  Waiting for agents to register..."
-sleep 5
+for i in $(seq 1 15); do
+    if grep -qi "register\|session" "$WORK_DIR/agent-1.log" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 
 ALIVE_AGENTS=0
 for pid in "${AGENT_PIDS[@]}"; do
