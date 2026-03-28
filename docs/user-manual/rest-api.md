@@ -55,6 +55,15 @@ When writing new integrations, always use `/api/v1/` endpoints. If you have exis
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Workflows](#workflows)
+  - [OpenAPI Spec](#openapi-spec)
+  - [Inventory](#inventory)
+  - [Execution Statistics](#execution-statistics)
+  - [Device Tokens](#device-tokens)
+  - [Software Deployment](#software-deployment)
+  - [License Management](#license-management)
+  - [Topology](#topology)
+  - [Fleet Statistics](#fleet-statistics)
+  - [File Retrieval](#file-retrieval)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -1745,6 +1754,596 @@ Get the status of a running or completed workflow execution, including per-step 
 2. Execute the workflow against a scope expression to target specific agents.
 3. Monitor execution progress via `GET /api/workflow-executions/{id}`.
 4. Each step runs sequentially; if a step fails on an agent, subsequent steps for that agent are skipped.
+
+---
+
+### OpenAPI Spec
+
+#### `GET /api/v1/openapi.json`
+
+Returns the OpenAPI/Swagger specification for the v1 API as JSON.
+
+**Permission:** None (public endpoint).
+
+**Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
+
+---
+
+### Inventory
+
+Inventory data is structured per-plugin telemetry collected from agents and stored server-side.
+
+#### `GET /api/v1/inventory/tables`
+
+List all inventory tables (one per plugin that reports inventory data).
+
+**Permission:** `Inventory:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "plugin": "hardware",
+      "agent_count": 142,
+      "last_collected": 1711900800
+    }
+  ],
+  "pagination": { "total": 12 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/inventory/{plugin}/{agent_id}`
+
+Get inventory data for a specific plugin and agent.
+
+**Permission:** `Inventory:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "plugin": "hardware",
+    "data": { "cpu_count": 8, "ram_gb": 32 },
+    "collected_at": 1711900800
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The `data` field contains the plugin-specific structured inventory blob as parsed JSON (or a string if the blob is not valid JSON).
+
+#### `POST /api/v1/inventory/query`
+
+Query inventory data across agents with filters.
+
+**Permission:** `Inventory:Read`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | No | Filter by agent ID |
+| `plugin` | string | No | Filter by plugin name |
+| `since` | integer | No | Unix timestamp — only records collected after this time |
+| `until` | integer | No | Unix timestamp — only records collected before this time |
+| `limit` | integer | No | Max results (default 100, max 1000) |
+
+**Response:** List of inventory records matching the query.
+
+#### `POST /api/v1/inventory/evaluate`
+
+Evaluate inventory conditions across agents. Returns agents whose inventory data matches the specified conditions.
+
+**Permission:** `Inventory:Read`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | No | Scope to a single agent |
+| `combine` | string | No | `"and"` (default) or `"or"` — how to combine multiple conditions |
+| `conditions` | array | Yes | List of condition objects |
+
+Each condition object:
+
+| Field | Type | Description |
+|---|---|---|
+| `plugin` | string | Plugin name to query |
+| `field` | string | JSON field path within the inventory data |
+| `op` | string | Operator: `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `contains` |
+| `value` | string | Value to compare against |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "agent_id": "agent-001",
+      "match": true,
+      "matched_value": "8",
+      "plugin": "hardware",
+      "collected_at": 1711900800
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Execution Statistics
+
+Fleet-wide and per-entity execution metrics.
+
+#### `GET /api/v1/execution-statistics`
+
+Get fleet-wide execution summary.
+
+**Permission:** `Execution:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "total_executions": 15420,
+    "executions_today": 230,
+    "active_agents": 142,
+    "overall_success_rate": 0.973,
+    "avg_duration_seconds": 4.2
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/execution-statistics/agents`
+
+Get per-agent execution statistics.
+
+**Permission:** `Execution:Read`
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `agent_id` | string | Filter to a single agent |
+| `since` | integer | Unix timestamp — only executions after this time |
+| `limit` | integer | Max results (default 100, max 1000) |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "agent_id": "agent-001",
+      "total_executions": 324,
+      "success_count": 310,
+      "failure_count": 14,
+      "success_rate": 0.957,
+      "avg_duration_seconds": 3.8,
+      "last_execution_at": 1711900800
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/execution-statistics/definitions`
+
+Get per-definition execution statistics.
+
+**Permission:** `Execution:Read`
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `definition_id` | string | Filter to a single definition |
+| `since` | integer | Unix timestamp — only executions after this time |
+| `limit` | integer | Max results (default 100, max 1000) |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "definition_id": "os-info-query",
+      "total_executions": 5200,
+      "total_agents": 142,
+      "success_rate": 0.995,
+      "avg_duration_seconds": 1.2
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Device Tokens
+
+Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.
+
+#### `GET /api/v1/device-tokens`
+
+List all device tokens.
+
+**Permission:** `DeviceToken:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "token_id": "a1b2c3d4e5f6",
+      "name": "Kiosk daily update",
+      "principal_id": "admin",
+      "device_id": "kiosk-001",
+      "definition_id": "windows-update-install",
+      "created_at": 1711900800,
+      "expires_at": 1714492800,
+      "last_used_at": 1711987200,
+      "revoked": false
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/device-tokens`
+
+Create a device-scoped token. The raw token value is returned exactly once at creation time.
+
+**Permission:** `DeviceToken:Write`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Human-readable token name |
+| `device_id` | string | No | Restrict token to a specific agent |
+| `definition_id` | string | No | Restrict token to a specific instruction definition |
+| `expires_at` | integer | No | Unix timestamp for token expiration |
+
+**Response (201):**
+
+```json
+{
+  "data": { "raw_token": "ydt_a1b2c3d4e5f6..." },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `DELETE /api/v1/device-tokens/{id}`
+
+Revoke a device token.
+
+**Permission:** `DeviceToken:Delete`
+
+**Response:**
+
+```json
+{
+  "data": { "revoked": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Software Deployment
+
+Manage software packages and their deployments to agents.
+
+#### `GET /api/v1/software-packages`
+
+List all registered software packages.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "pkg-001",
+      "name": "Firefox ESR",
+      "version": "115.8.0",
+      "platform": "windows",
+      "installer_type": "msi",
+      "content_hash": "sha256:abcdef...",
+      "size_bytes": 58720256,
+      "created_at": 1711900800,
+      "created_by": "admin"
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/software-packages`
+
+Register a new software package.
+
+**Permission:** `SoftwareDeployment:Write`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Package name |
+| `version` | string | Yes | Package version |
+| `platform` | string | No | Target platform (default `"windows"`) |
+| `installer_type` | string | No | Installer type (default `"msi"`) |
+| `content_hash` | string | No | SHA-256 hash of the installer |
+| `content_url` | string | No | Download URL for the installer binary |
+| `silent_args` | string | No | Silent install arguments |
+| `verify_command` | string | No | Post-install verification command |
+| `rollback_command` | string | No | Rollback command on failure |
+| `size_bytes` | integer | No | Installer file size in bytes |
+
+**Response (201):**
+
+```json
+{
+  "data": { "id": "pkg-001" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/software-deployments`
+
+List software deployments, optionally filtered by status.
+
+**Permission:** `SoftwareDeployment:Read`
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `status` | string | Filter by status: `pending`, `running`, `completed`, `failed`, `rolled_back` |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "dep-001",
+      "package_id": "pkg-001",
+      "status": "completed",
+      "created_by": "admin",
+      "created_at": 1711900800,
+      "started_at": 1711901400,
+      "completed_at": 1711902000,
+      "agents_targeted": 50,
+      "agents_success": 48,
+      "agents_failure": 2
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/software-deployments`
+
+Create a new software deployment.
+
+**Permission:** `SoftwareDeployment:Execute`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `package_id` | string | Yes | ID of the registered software package |
+| `scope_expression` | string | No | Scope expression selecting target agents |
+
+**Response (201):**
+
+```json
+{
+  "data": { "id": "dep-001" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/software-deployments/{id}/start`
+
+Start a pending deployment.
+
+**Permission:** `SoftwareDeployment:Execute`
+
+**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}`
+
+#### `POST /api/v1/software-deployments/{id}/rollback`
+
+Roll back a deployment.
+
+**Permission:** `SoftwareDeployment:Execute`
+
+**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}`
+
+#### `POST /api/v1/software-deployments/{id}/cancel`
+
+Cancel a running or pending deployment.
+
+**Permission:** `SoftwareDeployment:Execute`
+
+**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}`
+
+---
+
+### License Management
+
+Manage Yuzu license entries, seat counts, and alerts.
+
+#### `GET /api/v1/license`
+
+Get the active license details, or `{"status": "none"}` if no license is active.
+
+**Permission:** `License:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "lic-001",
+    "organization": "Acme Corp",
+    "seat_count": 500,
+    "seats_used": 142,
+    "issued_at": 1704067200,
+    "expires_at": 1735689600,
+    "edition": "enterprise",
+    "status": "active",
+    "days_remaining": 275
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/license`
+
+Activate a license.
+
+**Permission:** `License:Write`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `organization` | string | Yes | Organization name |
+| `seat_count` | integer | Yes | Licensed seat count |
+| `edition` | string | No | License edition (default `"community"`) |
+| `expires_at` | integer | No | Unix timestamp for license expiration |
+| `features_json` | string | No | JSON array of enabled feature flags |
+| `license_key` | string | Yes | License activation key |
+
+**Response (201):**
+
+```json
+{
+  "data": { "id": "lic-001" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `DELETE /api/v1/license/{id}`
+
+Remove a license entry.
+
+**Permission:** `License:Write`
+
+**Response:** `{"data": {"removed": true}, "meta": {"api_version": "v1"}}`
+
+#### `GET /api/v1/license/alerts`
+
+List license alerts (expiration warnings, seat limit approaching, etc.).
+
+**Permission:** `License:Read`
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `unacknowledged` | flag | If present, return only unacknowledged alerts |
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "alert-001",
+      "alert_type": "expiration_warning",
+      "message": "License expires in 30 days",
+      "triggered_at": 1711900800,
+      "acknowledged": false
+    }
+  ],
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### Topology
+
+#### `GET /api/v1/topology`
+
+Get infrastructure topology data. For full topology rendering, use the HTMX fragment endpoint `/frag/topology-data`. The REST endpoint provides a pointer for external callers.
+
+**Permission:** `Infrastructure:Read`
+
+---
+
+### Fleet Statistics
+
+#### `GET /api/v1/statistics`
+
+Get an aggregated view of fleet execution statistics.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "executions": {
+      "total": 15420,
+      "today": 230,
+      "success_rate": 0.973,
+      "avg_duration_seconds": 4.2
+    },
+    "active_agents": 142
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+### File Retrieval
+
+#### `POST /api/v1/file-retrieval`
+
+Receive file uploads from agents via the `content_dist` plugin's `upload_file` action. This endpoint is typically called by agents, not by operators.
+
+**Permission:** `FileRetrieval:Write`
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `agent_id` | string | Yes | Agent uploading the file |
+| `original_path` | string | No | Original file path on the agent |
+| `sha256` | string | No | SHA-256 hash of the uploaded content |
+| `size` | integer | No | File size in bytes |
+
+**Response:**
+
+```json
+{
+  "data": {
+    "status": "received",
+    "bytes": 1048576,
+    "agent_id": "agent-001",
+    "sha256": "abcdef..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
 
 ---
 

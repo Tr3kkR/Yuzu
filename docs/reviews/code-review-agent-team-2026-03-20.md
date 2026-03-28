@@ -8,10 +8,10 @@
 |-------|-------|
 | Date | 2026-03-28 |
 | Process | 7-gate governance (expanded from 5 gates on 2026-03-28) |
-| Scope | Tiers 1-3 complete. Tier 4 pending. |
+| Scope | Tiers 1-4 complete. |
 | Prior art | RC sprint (2026-03-22 to 2026-03-24) found 52 findings (7C/16H/22M/7L), all resolved |
-| Agents used | security-guardian, docs-writer, architect, dsl-engineer, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector |
-| Invocations | ~74 agent invocations across Gates 1-5 (Tiers 1-3) |
+| Agents used | security-guardian, docs-writer, architect, dsl-engineer, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector, quality-engineer |
+| Invocations | ~77 agent invocations across Gates 1-5 (Tiers 1-4) |
 
 ## Governance Process (7 Gates)
 
@@ -530,3 +530,124 @@ Categories: documentation gaps, dead code, informational observations, latent ri
 | CHAOS-T3-006 (Identity theft) | All UNFIXED | Partially fixed — key zeroing + reconnect |
 | CHAOS-T3-007 (Fleet blackout) | All UNFIXED | Mostly fixed — reconnect + stagger cap |
 | CHAOS-T3-008 (Trust anchor destruction) | Partially fixed (3/5) | Mostly fixed — reconnect added |
+
+---
+
+## Tier 4 — Coverage & Completeness (completed 2026-03-28)
+
+### Scope
+
+| Partition | Batches | Files | Status |
+|-----------|---------|-------|--------|
+| K: Tests | K1-K6 | 82 test files (28,108 lines) | Complete |
+| L: Docs, YAML, Deploy, CI | L1-L4 | 233+ files | Complete |
+
+**Agents used:** quality-engineer, docs-writer, consistency-auditor
+**Invocations:** 3 agent invocations (Gate 2)
+
+### K: Test Coverage Analysis
+
+#### CRITICAL — Untested Core Components (4 findings)
+
+| ID | Finding | File | Lines |
+|----|---------|------|-------|
+| G2-QE-K1-001 | REST API v1 handler layer has zero tests | rest_api_v1.cpp | 1,887 |
+| G2-QE-K1-002 | Workflow engine state machine has zero tests | workflow_engine.cpp | 949 |
+| G2-QE-K1-003 | ProductPack content model store has zero tests | product_pack_store.cpp | 680 |
+| G2-QE-K1-004 | Agent core orchestration has zero tests | agent.cpp | 1,160 |
+
+#### HIGH — Untested Stores & Components (6 findings)
+
+| ID | Finding | File | Lines |
+|----|---------|------|-------|
+| G2-QE-K2-001 | InventoryStore has zero tests | inventory_store.cpp | 276 |
+| G2-QE-K2-002 | DeploymentStore has zero tests | deployment_store.cpp | 282 |
+| G2-QE-K2-003 | DiscoveryStore has zero tests | discovery_store.cpp | 247 |
+| G2-QE-K2-004 | RuntimeConfigStore has zero tests | runtime_config_store.cpp | 225 |
+| G2-QE-K2-005 | DirectorySync (AD/Entra) has zero tests | directory_sync.cpp | 1,013 |
+| G2-QE-K2-006 | test_plugin_loader.cpp is a 22-line stub | test_plugin_loader.cpp | 22 |
+
+#### HIGH — Plugin Test Coverage (1 finding)
+
+| ID | Finding | Notes |
+|----|---------|-------|
+| G2-QE-K3-001 | 38 of 45 plugins have zero test coverage | Only 7 plugins tested (filesystem, tar, vuln_scan, http_client, content_dist, interaction, agent_logging, storage, registry, wmi — descriptor-level only for most) |
+
+#### MEDIUM — Thin Tests (2 findings)
+
+| ID | Finding | File | Lines |
+|----|---------|------|-------|
+| G2-QE-K4-001 | test_plugin_loader only tests empty/nonexistent dirs | test_plugin_loader.cpp | 22 |
+| G2-QE-K4-002 | test_https_config only tests config defaults, not TLS | test_https_config.cpp | 92 |
+
+**Test baseline:** 82 files, 28,108 lines, 350 test cases, 30,171 assertions. Server stores well-tested (14/19). Engines well-tested (4/5). Gateway has excellent coverage (22 test files).
+
+### L: Documentation Audit
+
+#### HIGH — Undocumented REST API Endpoints (1 finding, FIXED)
+
+| ID | Finding | Fix |
+|----|---------|-----|
+| G2-DOC-L1-001 | 25 of 52 v1 REST endpoints undocumented (48%) | **Fixed**: all 25 endpoints documented in `docs/user-manual/rest-api.md` |
+
+**Undocumented endpoint categories (now documented):**
+1. Inventory (4 endpoints): tables, per-agent, query, evaluate
+2. Execution Statistics (3 endpoints): fleet summary, per-agent, per-definition
+3. Device Tokens (3 endpoints): list, create, revoke
+4. Software Deployment (7 endpoints): packages CRUD, deployments CRUD, start/rollback/cancel
+5. License Management (4 endpoints): list, activate, remove, alerts
+6. Infrastructure (2 endpoints): topology, fleet statistics
+7. File Retrieval (1 endpoint): agent file upload receiver
+8. OpenAPI Spec (1 endpoint): self-describing API schema
+
+#### MEDIUM — Undocumented Legacy/Settings Endpoints (~44 endpoints)
+
+| ID | Finding | Notes |
+|----|---------|-------|
+| G2-DOC-L2-001 | ~44 legacy/settings endpoints undocumented | Product packs, notifications, chargen/procfetch, entire settings sub-API (~27 routes). Settings endpoints are HTMX-driven (not for external automation). |
+
+#### LOW — Documentation Observations
+
+- 0 phantom/stale docs (every documented endpoint confirmed in code)
+- Operations docs are thin: disaster recovery (85 lines), capacity planning (80 lines)
+- No Kubernetes deployment manifests
+
+### L: YAML Consistency Audit
+
+| ID | Finding | Severity |
+|----|---------|----------|
+| G2-CON-L3-001 | All 44 agent plugins have complete YAML definitions — 0 action mismatches | ✓ Clean |
+| G2-CON-L3-002 | All parameter names/types consistent between YAML and code (6 plugins deep-dived) | ✓ Clean |
+| G2-CON-L3-003 | 0 orphaned definitions (10 server-side YAMLs are legitimate) | ✓ Clean |
+| G2-CON-L3-004 | Server-side `plugin:` naming inconsistency: `server` vs `server_internal` vs `_server` | LOW |
+
+### Tier 4 Summary
+
+| Category | Total Findings | CRITICAL | HIGH | MEDIUM | LOW |
+|----------|---------------|----------|------|--------|-----|
+| Test coverage | 13 | 4 | 7 | 2 | 0 |
+| Documentation | 2 | 0 | 1 (fixed) | 1 | 2 |
+| YAML consistency | 1 | 0 | 0 | 0 | 1 |
+| **Total** | **16** | **4** | **8** | **3** | **3** |
+
+### Tier 4 Fix
+
+| File | Change | Finding ID |
+|------|--------|------------|
+| docs/user-manual/rest-api.md | Documented 25 undocumented v1 REST endpoints across 8 sections + updated ToC | G2-DOC-L1-001 |
+
+---
+
+## Cross-Tier Summary (All Tiers)
+
+| Tier | Scope | CRITICAL | HIGH | MEDIUM | LOW | Fixed |
+|------|-------|----------|------|--------|-----|-------|
+| 1: Auth, API, Engines, MCP | 39 files | 1 | 25 | 25 | ~40 | 39 fixed |
+| 2: Data Stores, Server, Gateway | 57 files | 4 | 25 | 53 | ~35 | 18 fixed |
+| 3: Agent, Plugins, Proto/SDK | 81 files | 13 | 44 | 52 | ~45 | 20 fixed |
+| 4: Tests, Docs, YAML, CI | 315 files | 4 | 8 | 3 | 3 | 1 fixed |
+| **Total** | **492 files** | **22** | **102** | **133** | **~123** | **78 fixed** |
+
+**Total findings: ~380. Total fixed: 78. Fix rate: 20% (code fixes) + doc fixes.**
+
+Test coverage gaps (Tier 4 CRITICALs) are by nature write-new-tests work, not bug fixes. The codebase's security and correctness posture is substantially improved by the Tier 1-3 fixes.
