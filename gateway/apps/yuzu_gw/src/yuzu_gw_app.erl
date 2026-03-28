@@ -66,10 +66,7 @@ stop(_State) ->
     logger:info("Flushing heartbeat buffer"),
     try yuzu_gw_heartbeat_buffer:flush_sync()
     catch _:_ ->
-        %% Fallback: best-effort async flush.
-        try yuzu_gw_heartbeat_buffer:queue_heartbeat(flush_sentinel)
-        catch _:_ -> ok
-        end,
+        %% flush_sync failed (process already down) — allow brief drain.
         timer:sleep(500)
     end,
 

@@ -212,9 +212,7 @@ on_success(#state{cb_state = half_open, cb_base_timeout = BaseTimeout} = State) 
         cb_state      = closed,
         cb_failures   = 0,
         cb_cur_timeout = BaseTimeout
-    };
-on_success(State) ->
-    State.
+    }.
 
 on_failure(#state{cb_state = closed, cb_failures = F, cb_threshold = T} = State) ->
     NewF = F + 1,
@@ -225,9 +223,7 @@ on_failure(#state{cb_state = closed, cb_failures = F, cb_threshold = T} = State)
 on_failure(#state{cb_state = half_open} = State) ->
     %% Probe failed — reopen with doubled timeout
     logger:warning("Circuit breaker: half_open -> open (probe failed, increasing backoff)"),
-    trip_circuit(State);
-on_failure(State) ->
-    State.
+    trip_circuit(State).
 
 trip_circuit(#state{cb_cur_timeout = CurTimeout, cb_max_timeout = MaxTimeout} = State) ->
     %% Cancel any existing timer
