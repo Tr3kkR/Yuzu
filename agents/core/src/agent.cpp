@@ -587,7 +587,22 @@ public:
             }
         }
 
-        // 3. Register with server
+        // 3. Register with server — with reconnect loop
+        int reconnect_count = 0;
+        constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
+
+        while (!stop_requested_.load(std::memory_order_acquire)) {
+            if (reconnect_count > 0) {
+                // Exponential backoff: 2^n seconds, capped at 5 minutes
+                int delay = std::min(1 << std::min(reconnect_count, 8), kMaxReconnectDelaySecs);
+                spdlog::info("Reconnecting in {}s (attempt #{})", delay, reconnect_count);
+                plugin_ctx_.config["agent.reconnect_count"] = std::to_string(reconnect_count);
+                for (int i = 0; i < delay && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+            }
+
         {
             grpc::ClientContext ctx;
             pb::RegisterRequest req;
@@ -680,21 +695,27 @@ public:
             auto status = stub->Register(&ctx, req, &resp);
             if (!status.ok()) {
                 spdlog::error("Failed to register with server: {}", status.error_message());
-                return;
+                ++reconnect_count;
+                continue; // Retry registration
             }
             if (!resp.accepted()) {
-                spdlog::error("Server rejected registration: {}", resp.reject_reason());
-                return;
+                if (resp.reject_reason().find("pending") != std::string::npos) {
+                    spdlog::warn("Registration pending admin approval — retrying");
+                    ++reconnect_count;
+                    continue; // Retry until approved
+                }
+                spdlog::error("Server permanently rejected registration: {}", resp.reject_reason());
+                return; // Hard rejection — no retry
             }
 
             auto enrollment_status = resp.enrollment_status();
             if (enrollment_status == "pending") {
-                spdlog::warn("Registration pending admin approval - agent will not receive "
-                             "commands until approved");
-                spdlog::info("Ask your administrator to approve agent '{}' in the server dashboard",
-                             cfg_.agent_id);
-                return;
+                spdlog::warn("Registration pending admin approval - retrying in backoff");
+                ++reconnect_count;
+                continue; // Retry until approved
             }
+
+            reconnect_count = 0; // Registration succeeded — reset backoff
 
             session_id_ = resp.session_id();
             auto connected_since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -919,8 +940,8 @@ public:
                 // outlives all writers (fixes use-after-free risk from #66).
                 bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
                     // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
-                    const int32_t stagger_s = cmd.stagger_seconds();
-                    const int32_t delay_s = cmd.delay_seconds();
+                    const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
+                    const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});      // cap 5 min
                     if (stagger_s > 0 || delay_s > 0) {
                         int32_t random_stagger = 0;
                         if (stagger_s > 0) {
@@ -929,7 +950,7 @@ public:
                             std::uniform_int_distribution<int32_t> dist(0, stagger_s);
                             random_stagger = dist(gen);
                         }
-                        const int32_t total_delay = (delay_s > 0 ? delay_s : 0) + random_stagger;
+                        const int32_t total_delay = std::min((delay_s > 0 ? delay_s : 0) + random_stagger, int32_t{600});
                         spdlog::debug("Command {} stagger {}s + delay {}s = {}s",
                                       cmd.command_id(), random_stagger, delay_s, total_delay);
 
@@ -1038,21 +1059,6 @@ public:
 
             subscribe_ctx_.store(nullptr, std::memory_order_release);
 
-            // Shutdown plugins first - signals long-running commands (e.g. chargen)
-            // to stop, so their exec threads can finish and release the stream.
-            // Note: the ScopeExit guard also calls shutdown, so we clear plugins_
-            // after this to prevent double-shutdown (which violates the ABI contract).
-            for (auto& handle : plugins_) {
-                if (handle.descriptor()->shutdown) {
-                    auto it = per_plugin_ctx_.find(handle.descriptor()->name);
-                    auto* ctx_ptr = (it != per_plugin_ctx_.end())
-                        ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
-                        : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
-                    handle.descriptor()->shutdown(ctx_ptr);
-                }
-            }
-            plugins_.clear(); // Prevent ScopeExit from calling shutdown again
-
             // Destroy thread pool BEFORE stream goes out of scope — this drains
             // the queue, waits for in-flight tasks, and joins all worker threads,
             // ensuring no task holds a dangling stream pointer.
@@ -1071,8 +1077,33 @@ public:
                 heartbeat_thread_.join();
             }
 
+            // Only shutdown plugins on final exit — keep them loaded for reconnect
+            if (stop_requested_.load(std::memory_order_acquire)) {
+                for (auto& handle : plugins_) {
+                    if (handle.descriptor()->shutdown) {
+                        auto it = per_plugin_ctx_.find(handle.descriptor()->name);
+                        auto* ctx_ptr = (it != per_plugin_ctx_.end())
+                            ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
+                            : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+                        handle.descriptor()->shutdown(ctx_ptr);
+                    }
+                }
+                plugins_.clear(); // Prevent ScopeExit from calling shutdown again
+            }
+
             spdlog::info("Subscribe stream ended");
+
+            // Re-create thread pool for next connection cycle
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+
+            if (!stop_requested_.load(std::memory_order_acquire)) {
+                ++reconnect_count;
+                spdlog::warn("Connection lost — will attempt reconnect");
+                continue; // Back to reconnect loop
+            }
         }
+        break; // stop_requested
+        } // end while (reconnect loop)
     }
 
     void stop() noexcept override {

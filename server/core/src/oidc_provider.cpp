@@ -844,10 +844,19 @@ std::string OidcProvider::start_auth_flow(const std::string& request_redirect_ur
 
     {
         std::lock_guard lock(mu_);
+        cleanup_expired_states_locked();
+        if (pending_challenges_.size() >= 1000) {
+            spdlog::warn("OIDC pending challenges map at capacity (1000), evicting oldest entries");
+            // Evict oldest entries to make room
+            auto oldest = pending_challenges_.begin();
+            for (auto it = pending_challenges_.begin(); it != pending_challenges_.end(); ++it) {
+                if (it->second.expires_at < oldest->second.expires_at)
+                    oldest = it;
+            }
+            pending_challenges_.erase(oldest);
+        }
         pending_challenges_[state] = std::move(pkce);
     }
-
-    cleanup_expired_states();
 
     auto url = config_.authorization_endpoint + "?client_id=" + url_encode(config_.client_id) +
                "&response_type=code" + "&scope=" + url_encode("openid profile email") +
@@ -928,8 +937,12 @@ std::expected<IdTokenClaims, std::string> OidcProvider::handle_callback(const st
 }
 
 void OidcProvider::cleanup_expired_states() {
-    auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(mu_);
+    cleanup_expired_states_locked();
+}
+
+void OidcProvider::cleanup_expired_states_locked() {
+    auto now = std::chrono::steady_clock::now();
     for (auto it = pending_challenges_.begin(); it != pending_challenges_.end();) {
         if (now > it->second.expires_at)
             it = pending_challenges_.erase(it);

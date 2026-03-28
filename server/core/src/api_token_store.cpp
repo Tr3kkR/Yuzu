@@ -1,4 +1,5 @@
 #include "api_token_store.hpp"
+#include "mcp_policy.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -161,6 +162,8 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
         return std::unexpected("token name cannot be empty");
     if (!scope_service.empty() && expires_at <= 0)
         return std::unexpected("service-scoped tokens must have an expiration time");
+    if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier))
+        return std::unexpected("invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
     if (!mcp_tier.empty() && expires_at <= 0)
         return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
     if (!mcp_tier.empty() && expires_at > 0) {
@@ -172,7 +175,7 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
 
     auto raw = generate_raw_token();
     auto hash = sha256_hex(raw);
-    auto token_id = hash.substr(0, 12); // Short display ID
+    auto token_id = hash.substr(0, 24); // Display ID — 24 hex chars (96 bits, collision-resistant)
     auto now = now_epoch();
 
     std::unique_lock db_lock(db_mtx_);

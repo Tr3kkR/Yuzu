@@ -472,6 +472,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             auto uri = param_str(params, "uri");
 
             if (uri == "yuzu://server/health") {
+                if (!perm_fn(req, res, "Server", "Read")) return;
                 auto agents = agents_fn();
                 auto content = JObj().add("status", "ok").add("agents_connected", static_cast<int64_t>(agents.size())).str();
                 JArr contents;
