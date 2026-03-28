@@ -641,18 +641,18 @@ TEST_CASE("PolicyStore: invalidate policy resets statuses", "[policy_store][inva
     REQUIRE(r.has_value());
     CHECK(r.value() == 3);
 
-    // All should be 'pending' now
+    // All should be 'unknown' now (invalidation resets to unknown)
     auto s1 = store.get_agent_status(pol.value(), "agent-1");
     REQUIRE(s1.has_value());
-    CHECK(s1->status == "pending");
+    CHECK(s1->status == "unknown");
 
     auto s2 = store.get_agent_status(pol.value(), "agent-2");
     REQUIRE(s2.has_value());
-    CHECK(s2->status == "pending");
+    CHECK(s2->status == "unknown");
 
     auto s3 = store.get_agent_status(pol.value(), "agent-3");
     REQUIRE(s3.has_value());
-    CHECK(s3->status == "pending");
+    CHECK(s3->status == "unknown");
 }
 
 TEST_CASE("PolicyStore: invalidate nonexistent policy returns 0",
@@ -691,14 +691,14 @@ TEST_CASE("PolicyStore: invalidate all policies", "[policy_store][invalidation]"
     REQUIRE(r.has_value());
     CHECK(r.value() == 3);
 
-    // Verify all pending
+    // Verify all unknown (invalidation resets to unknown)
     auto s1 = store.get_agent_status(pol1.value(), "agent-1");
     REQUIRE(s1.has_value());
-    CHECK(s1->status == "pending");
+    CHECK(s1->status == "unknown");
 
     auto s3 = store.get_agent_status(pol2.value(), "agent-3");
     REQUIRE(s3.has_value());
-    CHECK(s3->status == "pending");
+    CHECK(s3->status == "unknown");
 }
 
 TEST_CASE("PolicyStore: invalidate all with no data returns 0",
