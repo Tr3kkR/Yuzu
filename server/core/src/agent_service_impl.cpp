@@ -1,0 +1,1000 @@
+#include "agent_service_impl.hpp"
+
+#include <grpc/grpc_security_constants.h>
+
+#include "analytics_event_store.hpp"
+#include "inventory_store.hpp"
+#include "management_group_store.hpp"
+#include "notification_store.hpp"
+#include "response_store.hpp"
+#include "tag_store.hpp"
+#include "update_registry.hpp"
+#include "web_utils.hpp"
+#include "webhook_store.hpp"
+
+// compare_versions is declared in nvd_db.hpp
+#include "nvd_db.hpp"
+
+namespace yuzu::server::detail {
+
+// Bring html_escape into scope for the HTML rendering methods.
+using yuzu::server::html_escape;
+
+// -- Constructor --------------------------------------------------------------
+
+AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
+                                   bool require_client_identity, auth::AuthManager& auth_mgr,
+                                   auth::AutoApproveEngine& auto_approve,
+                                   yuzu::MetricsRegistry& metrics, bool gateway_mode,
+                                   UpdateRegistry* update_registry)
+    : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
+      metrics_(metrics), require_client_identity_(require_client_identity),
+      gateway_mode_(gateway_mode), update_registry_(update_registry) {}
+
+// -- Register -----------------------------------------------------------------
+
+grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
+                                        const pb::RegisterRequest* request,
+                                        pb::RegisterResponse* response) {
+    metrics_
+        .counter("yuzu_grpc_requests_total", {{"method", "Register"}, {"status", "received"}})
+        .increment();
+    const auto& info = request->info();
+
+    if (require_client_identity_) {
+        if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
+            spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
+            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                "agent_id must match client certificate identity (CN/SAN)");
+        }
+    }
+
+    // -- Tiered enrollment -------------------------------------------------------
+
+    const auto& enrollment_token = request->enrollment_token();
+
+    if (!enrollment_token.empty()) {
+        // Tier 2: Validate the pre-shared token
+        if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
+            spdlog::warn("Agent {} presented invalid enrollment token", info.agent_id());
+            response->set_accepted(false);
+            response->set_reject_reason("invalid, expired, or exhausted enrollment token");
+            response->set_enrollment_status("denied");
+            if (analytics_store_) {
+                AnalyticsEvent ae;
+                ae.event_type = "agent.enrollment_denied";
+                ae.agent_id = info.agent_id();
+                ae.hostname = info.hostname();
+                ae.os = info.platform().os();
+                ae.arch = info.platform().arch();
+                ae.severity = Severity::kWarn;
+                ae.attributes = {{"reason", "invalid_token"}};
+                analytics_store_->emit(std::move(ae));
+            }
+            return grpc::Status::OK;
+        }
+        spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
+        // Remove from pending queue if it was there
+        auth_mgr_.remove_pending_agent(info.agent_id());
+    } else {
+        // Tier 1.5: Auto-approve policies -- check before pending queue
+        auth::ApprovalContext approval_ctx;
+        approval_ctx.hostname = info.hostname();
+        approval_ctx.attestation_provider = request->attestation_provider();
+
+        // Extract peer IP from gRPC context (format: "ipv4:1.2.3.4:port")
+        if (context) {
+            auto peer = context->peer();
+            // Strip scheme prefix and port
+            auto colon1 = peer.find(':');
+            if (colon1 != std::string::npos) {
+                auto ip_start = colon1 + 1;
+                auto colon2 = peer.rfind(':');
+                if (colon2 > ip_start) {
+                    approval_ctx.peer_ip = peer.substr(ip_start, colon2 - ip_start);
+                } else {
+                    approval_ctx.peer_ip = peer.substr(ip_start);
+                }
+            }
+        }
+
+        auto matched_rule = auto_approve_.evaluate(approval_ctx);
+        if (!matched_rule.empty()) {
+            spdlog::info("Agent {} auto-approved by policy: {}", info.agent_id(), matched_rule);
+            auth_mgr_.remove_pending_agent(info.agent_id());
+            // Fall through to normal registration
+        } else {
+            // Tier 1: No token, no policy match -- check the pending queue
+            auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+
+            if (!pending_status) {
+                // First time seeing this agent -- add to pending queue
+                auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
+                                            info.platform().os(), info.platform().arch(),
+                                            info.agent_version());
+
+                response->set_accepted(false);
+                response->set_reject_reason("awaiting admin approval");
+                response->set_enrollment_status("pending");
+                bus_.publish("pending-agent", info.agent_id());
+                spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_pending";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    analytics_store_->emit(std::move(ae));
+                }
+                return grpc::Status::OK;
+            }
+
+            switch (*pending_status) {
+            case auth::PendingStatus::pending:
+                response->set_accepted(false);
+                response->set_reject_reason("still awaiting admin approval");
+                response->set_enrollment_status("pending");
+                return grpc::Status::OK;
+
+            case auth::PendingStatus::denied:
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_denied";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    ae.severity = Severity::kWarn;
+                    ae.attributes = {{"reason", "admin_denied"}};
+                    analytics_store_->emit(std::move(ae));
+                }
+                return grpc::Status::OK;
+
+            case auth::PendingStatus::approved:
+                spdlog::info("Agent {} enrolled (admin-approved)", info.agent_id());
+                // Fall through to normal registration
+                break;
+            }
+        } // auto-approve else
+    }
+
+    // -- Agent is enrolled -- proceed with registration --------------------------
+
+    registry_.register_agent(info);
+    // Auto-add to root management group
+    if (mgmt_group_store_ && mgmt_group_store_->is_open())
+        mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
+
+    if (analytics_store_) {
+        AnalyticsEvent ae;
+        ae.event_type = "agent.registered";
+        ae.agent_id = info.agent_id();
+        ae.hostname = info.hostname();
+        ae.os = info.platform().os();
+        ae.arch = info.platform().arch();
+        ae.agent_version = info.agent_version();
+        ae.attributes = {
+            {"enrollment_method", enrollment_token.empty() ? "approval" : "token"}};
+        nlohmann::json plugins_list = nlohmann::json::array();
+        for (const auto& p : info.plugins()) {
+            plugins_list.push_back(p.name());
+        }
+        ae.payload = {{"plugins", plugins_list}};
+        analytics_store_->emit(std::move(ae));
+    }
+
+    // Create notification for agent enrollment
+    if (notification_store_ && notification_store_->is_open()) {
+        notification_store_->create(
+            "success", "Agent Enrolled",
+            "Agent " + info.agent_id() + " (" + info.hostname() + ") enrolled successfully");
+    }
+
+    // Fire webhook for agent enrollment
+    if (webhook_store_ && webhook_store_->is_open()) {
+        nlohmann::json payload = {{"event", "agent.registered"},
+                                  {"agent_id", info.agent_id()},
+                                  {"hostname", info.hostname()},
+                                  {"os", info.platform().os()},
+                                  {"arch", info.platform().arch()},
+                                  {"agent_version", info.agent_version()}};
+        webhook_store_->fire_event("agent.registered", payload.dump());
+    }
+
+    // Sync agent-reported tags to persistent TagStore
+    if (tag_store_ && !info.scopable_tags().empty()) {
+        std::unordered_map<std::string, std::string> tags;
+        for (const auto& [k, v] : info.scopable_tags()) {
+            tags[k] = v;
+        }
+        tag_store_->sync_agent_tags(info.agent_id(), tags);
+    }
+
+    auto session_id =
+        "session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+    response->set_session_id(session_id);
+    response->set_accepted(true);
+    response->set_enrollment_status("enrolled");
+
+    PendingRegistration pending;
+    pending.agent_id = info.agent_id();
+    pending.register_peer = context ? context->peer() : std::string{};
+    pending.peer_identities =
+        context ? extract_peer_identities(*context) : std::vector<std::string>{};
+    pending.created_at = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(pending_mu_);
+        prune_expired_pending_locked();
+        pending_by_session_id_[session_id] = std::move(pending);
+    }
+
+    return grpc::Status::OK;
+}
+
+// -- Heartbeat ----------------------------------------------------------------
+
+grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
+                                         const pb::HeartbeatRequest* request,
+                                         pb::HeartbeatResponse* response) {
+    metrics_
+        .counter("yuzu_grpc_requests_total", {{"method", "Heartbeat"}, {"status", "received"}})
+        .increment();
+
+    // Validate session
+    const auto& session_id = request->session_id();
+    std::string agent_id;
+    {
+        std::lock_guard lock(pending_mu_);
+        auto it = pending_by_session_id_.find(std::string(session_id));
+        if (it != pending_by_session_id_.end()) {
+            agent_id = it->second.agent_id;
+        }
+    }
+    if (agent_id.empty()) {
+        // Try the registry directly
+        auto session = registry_.find_by_session(session_id);
+        if (session) {
+            agent_id = session->agent_id;
+        }
+    }
+
+    if (agent_id.empty()) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
+    }
+
+    // Store health snapshot and update session activity timestamp
+    if (health_store_) {
+        health_store_->upsert(agent_id, request->status_tags());
+    }
+    registry_.touch_activity(agent_id);
+    metrics_.counter("yuzu_heartbeats_received_total", {{"via", "direct"}}).increment();
+
+    response->set_acknowledged(true);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    response->mutable_server_time()->set_millis_epoch(now_ms);
+
+    spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
+    return grpc::Status::OK;
+}
+
+// -- Subscribe ----------------------------------------------------------------
+
+grpc::Status
+AgentServiceImpl::Subscribe(grpc::ServerContext* context,
+              grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) {
+    if (!context) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "missing server context");
+    }
+
+    const auto session_id = client_metadata_value(*context, kSessionMetadataKey);
+    if (session_id.empty()) {
+        spdlog::warn("Subscribe rejected: missing {} metadata", kSessionMetadataKey);
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "missing session metadata");
+    }
+
+    std::string agent_id;
+    {
+        std::lock_guard lock(pending_mu_);
+        prune_expired_pending_locked();
+        auto it = pending_by_session_id_.find(session_id);
+        if (it == pending_by_session_id_.end()) {
+            spdlog::warn("Subscribe rejected: unknown or expired session id");
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "invalid or expired session");
+        }
+
+        if (!gateway_mode_ && it->second.register_peer != context->peer()) {
+            spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
+            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
+        }
+
+        if (require_client_identity_) {
+            const auto subscribe_ids = extract_peer_identities(*context);
+            if (!has_identity_overlap(it->second.peer_identities, subscribe_ids)) {
+                spdlog::warn("Subscribe rejected: mTLS identity mismatch for session {}",
+                             session_id);
+                return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                    "peer identity mismatch");
+            }
+        }
+
+        agent_id = it->second.agent_id;
+        pending_by_session_id_.erase(it);
+    }
+
+    spdlog::info("Agent subscribe stream opened for {}", agent_id);
+    registry_.set_stream(agent_id, stream, context);
+    registry_.map_session(session_id, agent_id);
+
+    auto subscribe_start = std::chrono::steady_clock::now();
+    if (analytics_store_) {
+        AnalyticsEvent ae;
+        ae.event_type = "agent.connected";
+        ae.agent_id = agent_id;
+        ae.session_id = session_id;
+        ae.attributes = {{"via", "direct"}};
+        analytics_store_->emit(std::move(ae));
+    }
+
+    // Read loop -- process responses from the agent
+    pb::CommandResponse resp;
+    while (stream->Read(&resp)) {
+        registry_.touch_activity(agent_id);
+        if (resp.status() == pb::CommandResponse::RUNNING) {
+            // Intercept __timing__ metadata
+            if (resp.output().starts_with("__timing__|")) {
+                auto payload = resp.output().substr(11);
+                auto eq = payload.find('=');
+                auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
+                bus_.publish("timing",
+                    "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                    html_escape(ms) + " ms</strong>");
+                continue;
+            }
+
+            // Track first response for server-side latency
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                if (!cmd_first_seen_.contains(resp.command_id())) {
+                    cmd_first_seen_.insert(resp.command_id());
+                    auto it = cmd_send_times_.find(resp.command_id());
+                    if (it != cmd_send_times_.end()) {
+                        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now() - it->second)
+                                           .count();
+                        bus_.publish("timing",
+                            "<strong id=\"stat-network\" hx-swap-oob=\"true\">" +
+                            std::to_string(elapsed) + " ms</strong>");
+                    }
+                }
+            }
+
+            // Determine the plugin from command_id prefix (format: plugin-timestamp)
+            std::string plugin = extract_plugin(resp.command_id());
+
+            // Publish each row as its own SSE event
+            publish_output_rows(agent_id, plugin, resp.output());
+
+            // Store streaming response
+            if (response_store_) {
+                StoredResponse sr;
+                sr.instruction_id = resp.command_id();
+                sr.agent_id = agent_id;
+                sr.status = static_cast<int>(resp.status());
+                sr.output = resp.output();
+                response_store_->store(sr);
+            }
+
+            if (analytics_store_) {
+                AnalyticsEvent ae;
+                ae.event_type = "command.response";
+                ae.agent_id = agent_id;
+                ae.plugin = plugin;
+                ae.correlation_id = resp.command_id();
+                ae.payload = {{"output_bytes", resp.output().size()}};
+                analytics_store_->emit(std::move(ae));
+            }
+
+        } else {
+            spdlog::info("Command {} completed: status={}, exit_code={}", resp.command_id(),
+                         static_cast<int>(resp.status()), resp.exit_code());
+
+            // Store completion response
+            if (response_store_) {
+                StoredResponse sr;
+                sr.instruction_id = resp.command_id();
+                sr.agent_id = agent_id;
+                sr.status = static_cast<int>(resp.status());
+                sr.output = resp.output();
+                if (resp.has_error()) {
+                    sr.error_detail = resp.error().message();
+                }
+                response_store_->store(sr);
+            }
+
+            std::string status_str =
+                (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+            metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}})
+                .increment();
+            {
+                std::string badge_cls = (status_str == "done") ? "badge-done" : "badge-error";
+                std::string badge_text = (status_str == "done") ? "DONE" : "ERROR";
+                bus_.publish("command-status",
+                    "<span id=\"status-badge\" class=\"" + badge_cls +
+                    "\" hx-swap-oob=\"outerHTML\">" + badge_text + "</span>");
+            }
+
+            if (analytics_store_) {
+                AnalyticsEvent ae;
+                ae.event_type = "command.completed";
+                ae.agent_id = agent_id;
+                ae.plugin = extract_plugin(resp.command_id());
+                ae.correlation_id = resp.command_id();
+                ae.severity = (resp.status() == pb::CommandResponse::SUCCESS)
+                                  ? Severity::kInfo
+                                  : Severity::kError;
+                ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
+                if (resp.has_error()) {
+                    ae.payload["error_message"] = resp.error().message();
+                }
+                analytics_store_->emit(std::move(ae));
+            }
+
+            // Create notification on execution failure
+            if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
+                notification_store_->is_open()) {
+                std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+                notification_store_->create(
+                    "error", "Execution Failed",
+                    "Command " + resp.command_id() + " on agent " + agent_id +
+                        " failed: " + err_msg);
+            }
+
+            // Fire webhook on execution completion
+            if (webhook_store_ && webhook_store_->is_open()) {
+                nlohmann::json wh_payload = {
+                    {"event", "execution.completed"},
+                    {"command_id", resp.command_id()},
+                    {"agent_id", agent_id},
+                    {"status", status_str},
+                    {"exit_code", resp.exit_code()}};
+                if (resp.has_error()) {
+                    wh_payload["error"] = resp.error().message();
+                }
+                webhook_store_->fire_event("execution.completed", wh_payload.dump());
+            }
+
+            // Publish total round-trip and clean up timing maps
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                auto it = cmd_send_times_.find(resp.command_id());
+                if (it != cmd_send_times_.end()) {
+                    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - it->second)
+                                        .count();
+                    metrics_.histogram("yuzu_command_duration_seconds")
+                        .observe(static_cast<double>(total_ms) / 1000.0);
+                    bus_.publish("timing",
+                        "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
+                        std::to_string(total_ms) + " ms</strong>");
+                    cmd_send_times_.erase(it);
+                }
+                cmd_first_seen_.erase(resp.command_id());
+            }
+        }
+    }
+
+    // Agent disconnected
+    registry_.clear_stream(agent_id);
+    registry_.remove_agent(agent_id);
+    spdlog::info("Agent subscribe stream closed for {}", agent_id);
+
+    if (analytics_store_) {
+        auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - subscribe_start)
+                                    .count();
+        AnalyticsEvent ae;
+        ae.event_type = "agent.disconnected";
+        ae.agent_id = agent_id;
+        ae.session_id = session_id;
+        ae.payload = {{"session_duration_ms", session_duration}};
+        analytics_store_->emit(std::move(ae));
+    }
+
+    return grpc::Status::OK;
+}
+
+// -- record_send_time ---------------------------------------------------------
+
+void AgentServiceImpl::record_send_time(const std::string& command_id) {
+    std::lock_guard lock(cmd_times_mu_);
+    cmd_send_times_[command_id] = std::chrono::steady_clock::now();
+    output_row_count_.store(0, std::memory_order_relaxed);
+}
+
+// -- process_gateway_response -------------------------------------------------
+
+void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
+                                                 const pb::CommandResponse& resp) {
+    if (resp.status() == pb::CommandResponse::RUNNING) {
+        // Intercept __timing__ metadata
+        if (resp.output().starts_with("__timing__|")) {
+            auto payload = resp.output().substr(11);
+            auto eq = payload.find('=');
+            auto ms = (eq != std::string::npos) ? payload.substr(eq + 1) : payload;
+            bus_.publish("timing",
+                "<strong id=\"stat-agent\" hx-swap-oob=\"true\">" +
+                html_escape(ms) + " ms</strong>");
+            return;
+        }
+
+        // Track first response for server-side latency
+        {
+            std::lock_guard lock(cmd_times_mu_);
+            if (!cmd_first_seen_.contains(resp.command_id())) {
+                cmd_first_seen_.insert(resp.command_id());
+                auto it = cmd_send_times_.find(resp.command_id());
+                if (it != cmd_send_times_.end()) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - it->second)
+                                       .count();
+                    bus_.publish("timing",
+                        "<strong id=\"stat-network\" hx-swap-oob=\"true\">" +
+                        std::to_string(elapsed) + " ms</strong>");
+                }
+            }
+        }
+
+        std::string plugin = extract_plugin(resp.command_id());
+        publish_output_rows(agent_id, plugin, resp.output());
+
+        if (response_store_) {
+            StoredResponse sr;
+            sr.instruction_id = resp.command_id();
+            sr.agent_id = agent_id;
+            sr.status = static_cast<int>(resp.status());
+            sr.output = resp.output();
+            response_store_->store(sr);
+        }
+
+        if (analytics_store_) {
+            AnalyticsEvent ae;
+            ae.event_type = "command.response";
+            ae.agent_id = agent_id;
+            ae.plugin = plugin;
+            ae.correlation_id = resp.command_id();
+            ae.payload = {{"output_bytes", resp.output().size()}};
+            analytics_store_->emit(std::move(ae));
+        }
+    } else {
+        spdlog::info("[gateway] Command {} completed: status={}, exit_code={}",
+                     resp.command_id(), static_cast<int>(resp.status()), resp.exit_code());
+
+        if (response_store_) {
+            StoredResponse sr;
+            sr.instruction_id = resp.command_id();
+            sr.agent_id = agent_id;
+            sr.status = static_cast<int>(resp.status());
+            sr.output = resp.output();
+            if (resp.has_error()) {
+                sr.error_detail = resp.error().message();
+            }
+            response_store_->store(sr);
+        }
+
+        std::string status_str =
+            (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
+        metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}})
+            .increment();
+        {
+            std::string badge_cls = (status_str == "done") ? "badge-done" : "badge-error";
+            std::string badge_text = (status_str == "done") ? "DONE" : "ERROR";
+            bus_.publish("command-status",
+                "<span id=\"status-badge\" class=\"" + badge_cls +
+                "\" hx-swap-oob=\"outerHTML\">" + badge_text + "</span>");
+        }
+
+        if (analytics_store_) {
+            AnalyticsEvent ae;
+            ae.event_type = "command.completed";
+            ae.agent_id = agent_id;
+            ae.plugin = extract_plugin(resp.command_id());
+            ae.correlation_id = resp.command_id();
+            ae.severity = (resp.status() == pb::CommandResponse::SUCCESS)
+                              ? Severity::kInfo
+                              : Severity::kError;
+            ae.payload = {{"status", status_str}, {"exit_code", resp.exit_code()}};
+            if (resp.has_error()) {
+                ae.payload["error_message"] = resp.error().message();
+            }
+            analytics_store_->emit(std::move(ae));
+        }
+
+        if (resp.status() != pb::CommandResponse::SUCCESS && notification_store_ &&
+            notification_store_->is_open()) {
+            std::string err_msg = resp.has_error() ? resp.error().message() : "unknown";
+            notification_store_->create(
+                "error", "Execution Failed",
+                "Command " + resp.command_id() + " on agent " + agent_id +
+                    " failed: " + err_msg);
+        }
+
+        if (webhook_store_ && webhook_store_->is_open()) {
+            nlohmann::json wh_payload = {
+                {"event", "execution.completed"},
+                {"command_id", resp.command_id()},
+                {"agent_id", agent_id},
+                {"status", status_str},
+                {"exit_code", resp.exit_code()}};
+            if (resp.has_error()) {
+                wh_payload["error"] = resp.error().message();
+            }
+            webhook_store_->fire_event("execution.completed", wh_payload.dump());
+        }
+
+        // Publish total round-trip and clean up timing maps
+        {
+            std::lock_guard lock(cmd_times_mu_);
+            auto it = cmd_send_times_.find(resp.command_id());
+            if (it != cmd_send_times_.end()) {
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - it->second)
+                                    .count();
+                metrics_.histogram("yuzu_command_duration_seconds")
+                    .observe(static_cast<double>(total_ms) / 1000.0);
+                bus_.publish("timing",
+                    "<strong id=\"stat-total\" hx-swap-oob=\"true\">" +
+                    std::to_string(total_ms) + " ms</strong>");
+                cmd_send_times_.erase(it);
+            }
+            cmd_first_seen_.erase(resp.command_id());
+        }
+    }
+}
+
+// -- SSE row helpers ----------------------------------------------------------
+
+const std::vector<std::string>& AgentServiceImpl::columns_for_plugin(const std::string& plugin) {
+    static const std::unordered_map<std::string, std::vector<std::string>> kSchemas{
+        {"chargen",          {"Agent", "Output"}},
+        {"procfetch",        {"Agent", "PID", "Name", "Path", "SHA-1"}},
+        {"netstat",          {"Agent", "Proto", "Local Addr", "Local Port",
+                              "Remote Addr", "Remote Port", "State", "PID"}},
+        {"sockwho",          {"Agent", "PID", "Name", "Path", "Proto",
+                              "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}},
+        {"vuln_scan",        {"Agent", "Severity", "Category", "Title", "Detail"}},
+    };
+    // key|value schema plugins
+    static const std::vector<std::string> kKeyValue{"Agent", "Key", "Value"};
+    static const std::unordered_set<std::string> kKeyValuePlugins{
+        "status", "device_identity", "os_info", "hardware", "users",
+        "installed_apps", "msi_packages", "network_config", "diagnostics",
+        "agent_actions", "processes", "services", "filesystem",
+        "network_diag", "network_actions", "firewall", "antivirus",
+        "bitlocker", "windows_updates", "event_logs", "sccm",
+        "script_exec", "software_actions"};
+
+    auto it = kSchemas.find(plugin);
+    if (it != kSchemas.end()) return it->second;
+    if (kKeyValuePlugins.contains(plugin)) return kKeyValue;
+    return kDefaultColumns;
+}
+
+std::string AgentServiceImpl::thead_for_plugin(const std::string& plugin) {
+    auto& cols = columns_for_plugin(plugin);
+    std::string html = "<tr>";
+    for (size_t i = 0; i < cols.size(); ++i) {
+        html += (i == 0) ? "<th class=\"col-agent\">" : "<th>";
+        html += html_escape(cols[i]);
+        html += "</th>";
+    }
+    html += "</tr>";
+    return html;
+}
+
+size_t AgentServiceImpl::find_unescaped_pipe(const std::string& s, size_t pos) {
+    while (pos < s.size()) {
+        auto p = s.find('|', pos);
+        if (p == std::string::npos) return std::string::npos;
+        if (p > 0 && s[p - 1] == '\\') { pos = p + 1; continue; }
+        return p;
+    }
+    return std::string::npos;
+}
+
+std::string AgentServiceImpl::unescape_pipes(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') continue;
+        out += s[i];
+    }
+    return out;
+}
+
+std::vector<std::string> AgentServiceImpl::split_fields(const std::string& plugin,
+                                                         const std::string& line) {
+    // vuln_scan: severity|category|title|detail (4+ fields, last is remainder)
+    if (plugin == "vuln_scan") {
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        for (int i = 0; i < 3; ++i) {
+            auto p = find_unescaped_pipe(line, pos);
+            if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); return parts; }
+            parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
+            pos = p + 1;
+        }
+        parts.push_back(unescape_pipes(line.substr(pos))); // remainder = detail
+        return parts;
+    }
+    // key|value plugins: split into exactly 2 (key, rest)
+    auto& cols = columns_for_plugin(plugin);
+    if (cols.size() == 3) { // Agent + Key + Value
+        auto sep = find_unescaped_pipe(line, 0);
+        if (sep != std::string::npos)
+            return {unescape_pipes(line.substr(0, sep)), unescape_pipes(line.substr(sep + 1))};
+        return {unescape_pipes(line), ""};
+    }
+    // Default: split on all pipes
+    std::vector<std::string> parts;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        auto p = find_unescaped_pipe(line, pos);
+        if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); break; }
+        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
+        pos = p + 1;
+    }
+    return parts;
+}
+
+std::string AgentServiceImpl::render_row(const std::string& agent_name,
+                                          const std::string& plugin,
+                                          const std::string& line,
+                                          const std::vector<std::string>& col_names) {
+    auto fields = split_fields(plugin, line);
+
+    // Build cells: agent_name + fields
+    std::vector<std::string> cells;
+    cells.reserve(fields.size() + 1);
+    cells.push_back(agent_name);
+    for (auto& f : fields) cells.push_back(f);
+
+    // Data row
+    std::string html = "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">";
+    for (size_t i = 0; i < cells.size(); ++i) {
+        auto esc = html_escape(cells[i]);
+        html += (i == 0) ? "<td class=\"col-agent\" title=\"" : "<td title=\"";
+        html += esc;
+        html += "\">";
+        html += esc;
+        html += "</td>";
+    }
+    html += "</tr>";
+
+    // Detail drawer
+    html += "<tr class=\"result-detail\"><td colspan=\"";
+    html += std::to_string(cells.size());
+    html += "\"><div class=\"detail-content\">";
+    for (size_t i = 0; i < cells.size(); ++i) {
+        auto label = (i < col_names.size()) ? col_names[i]
+                                             : ("Column " + std::to_string(i + 1));
+        html += "<div class=\"detail-label\">" + html_escape(label) + "</div>";
+        html += "<div class=\"detail-value\">" + html_escape(cells[i]) + "</div>";
+    }
+    html += "</div></td></tr>";
+    return html;
+}
+
+void AgentServiceImpl::publish_output_rows(const std::string& agent_id,
+                                            const std::string& plugin,
+                                            const std::string& raw_output) {
+    if (raw_output.empty()) return;
+    auto agent_name = registry_.display_name(agent_id);
+    auto& col_names = columns_for_plugin(plugin);
+    size_t pos = 0;
+    while (pos < raw_output.size()) {
+        auto nl = raw_output.find('\n', pos);
+        std::string line = (nl == std::string::npos)
+                               ? raw_output.substr(pos)
+                               : raw_output.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) {
+            auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            auto html = render_row(agent_name, plugin, line, col_names);
+            // OOB: live row count
+            html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
+            html += std::to_string(count);
+            html += "</span>";
+            // OOB: remove empty-state placeholder on first row only
+            if (count == 1)
+                html += "<tr id=\"empty-row\" hx-swap-oob=\"delete\"></tr>";
+            bus_.publish("output", html);
+        }
+        pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
+    }
+}
+
+// -- OTA Update RPCs ----------------------------------------------------------
+
+grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
+                                              const pb::CheckForUpdateRequest* request,
+                                              pb::CheckForUpdateResponse* response) {
+    metrics_
+        .counter("yuzu_grpc_requests_total",
+                 {{"method", "CheckForUpdate"}, {"status", "received"}})
+        .increment();
+
+    if (!update_registry_) {
+        response->set_update_available(false);
+        return grpc::Status::OK;
+    }
+
+    auto latest =
+        update_registry_->latest_for(request->platform().os(), request->platform().arch());
+
+    if (!latest) {
+        response->set_update_available(false);
+        return grpc::Status::OK;
+    }
+
+    // Compare: if agent already has latest or newer, no update
+    if (compare_versions(latest->version, request->current_version()) <= 0) {
+        response->set_update_available(false);
+        return grpc::Status::OK;
+    }
+
+    bool eligible = UpdateRegistry::is_eligible(request->agent_id(), latest->rollout_pct);
+
+    response->set_update_available(true);
+    response->set_latest_version(latest->version);
+    response->set_sha256(latest->sha256);
+    response->set_mandatory(latest->mandatory);
+    response->set_eligible(eligible);
+    response->set_file_size(latest->file_size);
+
+    spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
+                 request->agent_id(), request->current_version(), latest->version, eligible,
+                 latest->mandatory);
+    return grpc::Status::OK;
+}
+
+grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* /*context*/,
+                                              const pb::DownloadUpdateRequest* request,
+                                              grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) {
+    metrics_
+        .counter("yuzu_grpc_requests_total",
+                 {{"method", "DownloadUpdate"}, {"status", "received"}})
+        .increment();
+
+    if (!update_registry_) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
+    }
+
+    auto pkg =
+        update_registry_->latest_for(request->platform().os(), request->platform().arch());
+    if (!pkg || pkg->version != request->version()) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
+    }
+
+    auto file_path = update_registry_->binary_path(*pkg);
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+        spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
+    }
+
+    constexpr std::size_t kChunkSize = 64 * 1024; // 64KB
+    std::vector<char> buffer(kChunkSize);
+    int64_t offset = 0;
+
+    while (file.read(buffer.data(), static_cast<std::streamsize>(kChunkSize)) ||
+           file.gcount() > 0) {
+        pb::DownloadUpdateChunk chunk;
+        chunk.set_data(buffer.data(), static_cast<std::size_t>(file.gcount()));
+        chunk.set_offset(offset);
+        chunk.set_total_size(pkg->file_size);
+
+        if (!writer->Write(chunk)) {
+            spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
+            return grpc::Status::CANCELLED;
+        }
+
+        offset += file.gcount();
+    }
+
+    spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}", offset, pkg->version,
+                 request->agent_id());
+    return grpc::Status::OK;
+}
+
+// -- Private helpers ----------------------------------------------------------
+
+std::vector<std::string> AgentServiceImpl::extract_peer_identities(
+    const grpc::ServerContext& context) {
+    std::vector<std::string> out;
+    auto auth_ctx = context.auth_context();
+    if (!auth_ctx || !auth_ctx->IsPeerAuthenticated()) {
+        return out;
+    }
+
+    auto append_unique = [&out](std::string_view s) {
+        if (s.empty())
+            return;
+        for (const auto& existing : out) {
+            if (existing == s)
+                return;
+        }
+        out.emplace_back(s);
+    };
+
+    for (const auto& id : auth_ctx->GetPeerIdentity()) {
+        append_unique(std::string_view{id.data(), id.size()});
+    }
+    for (const auto& cn : auth_ctx->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME)) {
+        append_unique(std::string_view{cn.data(), cn.size()});
+    }
+    for (const auto& san : auth_ctx->FindPropertyValues(GRPC_X509_SAN_PROPERTY_NAME)) {
+        append_unique(std::string_view{san.data(), san.size()});
+    }
+
+    return out;
+}
+
+bool AgentServiceImpl::peer_identity_matches_agent_id(const grpc::ServerContext& context,
+                                                      const std::string& agent_id) {
+    if (agent_id.empty())
+        return false;
+    const auto identities = extract_peer_identities(context);
+    for (const auto& id : identities) {
+        if (id == agent_id)
+            return true;
+    }
+    return false;
+}
+
+std::string AgentServiceImpl::client_metadata_value(const grpc::ServerContext& context,
+                                                    std::string_view key) {
+    const auto& md = context.client_metadata();
+    auto it = md.find(std::string(key));
+    if (it == md.end())
+        return {};
+    return std::string(it->second.data(), it->second.length());
+}
+
+bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,
+                                            const std::vector<std::string>& rhs) {
+    for (const auto& left : lhs) {
+        for (const auto& right : rhs) {
+            if (left == right)
+                return true;
+        }
+    }
+    return false;
+}
+
+void AgentServiceImpl::prune_expired_pending_locked() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = pending_by_session_id_.begin(); it != pending_by_session_id_.end();) {
+        if (now - it->second.created_at > kPendingRegistrationTtl) {
+            it = pending_by_session_id_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::string AgentServiceImpl::extract_plugin(const std::string& command_id) {
+    auto dash = command_id.find('-');
+    if (dash != std::string::npos) {
+        return command_id.substr(0, dash);
+    }
+    return command_id;
+}
+
+} // namespace yuzu::server::detail
