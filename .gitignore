@@ -7,6 +7,8 @@ out/
 
 # Erlang / rebar3
 gateway/_build/
+erl_crash.dump
+*.beam
 
 # Meson
 .mesonpy/
