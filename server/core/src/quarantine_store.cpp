@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 
 namespace yuzu::server {
 
@@ -72,11 +73,12 @@ std::expected<void, std::string> QuarantineStore::quarantine_device(const std::s
                                                                     const std::string& by,
                                                                     const std::string& reason,
                                                                     const std::string& whitelist) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
-    // Check if already quarantined
-    auto current = get_status(agent_id);
+    // Check if already quarantined — atomic check+insert under lock
+    auto current = get_status_impl(agent_id);
     if (current && current->status == "active")
         return std::unexpected("device is already quarantined");
 
@@ -103,6 +105,7 @@ std::expected<void, std::string> QuarantineStore::quarantine_device(const std::s
 }
 
 std::expected<void, std::string> QuarantineStore::release_device(const std::string& agent_id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -124,6 +127,11 @@ std::expected<void, std::string> QuarantineStore::release_device(const std::stri
 }
 
 std::optional<QuarantineRecord> QuarantineStore::get_status(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
+    return get_status_impl(agent_id);
+}
+
+std::optional<QuarantineRecord> QuarantineStore::get_status_impl(const std::string& agent_id) const {
     if (!db_)
         return std::nullopt;
     sqlite3_stmt* s = nullptr;
@@ -153,6 +161,7 @@ std::optional<QuarantineRecord> QuarantineStore::get_status(const std::string& a
 }
 
 std::vector<QuarantineRecord> QuarantineStore::list_quarantined() const {
+    std::shared_lock lock(mtx_);
     std::vector<QuarantineRecord> result;
     if (!db_)
         return result;
@@ -180,6 +189,7 @@ std::vector<QuarantineRecord> QuarantineStore::list_quarantined() const {
 }
 
 std::vector<QuarantineRecord> QuarantineStore::get_history(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
     std::vector<QuarantineRecord> result;
     if (!db_)
         return result;

@@ -80,6 +80,11 @@ private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
     void create_tables();
+
+    // Internal variants called under existing lock (no re-lock)
+    void set_tag_impl(const std::string& agent_id, const std::string& key,
+                      const std::string& value, const std::string& source);
+    std::string get_tag_impl(const std::string& agent_id, const std::string& key) const;
 };
 
 } // namespace yuzu::server

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <regex>
 #include <unordered_set>
 
@@ -86,6 +87,12 @@ bool TagStore::validate_value(const std::string& value) {
 
 void TagStore::set_tag(const std::string& agent_id, const std::string& key,
                        const std::string& value, const std::string& source) {
+    std::unique_lock lock(mtx_);
+    set_tag_impl(agent_id, key, value, source);
+}
+
+void TagStore::set_tag_impl(const std::string& agent_id, const std::string& key,
+                            const std::string& value, const std::string& source) {
     if (!db_)
         return;
     if (!validate_key(key) || !validate_value(value))
@@ -114,6 +121,11 @@ void TagStore::set_tag(const std::string& agent_id, const std::string& key,
 }
 
 std::string TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
+    std::shared_lock lock(mtx_);
+    return get_tag_impl(agent_id, key);
+}
+
+std::string TagStore::get_tag_impl(const std::string& agent_id, const std::string& key) const {
     if (!db_)
         return {};
     sqlite3_stmt* stmt = nullptr;
@@ -135,6 +147,7 @@ std::string TagStore::get_tag(const std::string& agent_id, const std::string& ke
 }
 
 bool TagStore::delete_tag(const std::string& agent_id, const std::string& key) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return false;
     sqlite3_stmt* stmt = nullptr;
@@ -151,6 +164,7 @@ bool TagStore::delete_tag(const std::string& agent_id, const std::string& key) {
 }
 
 std::vector<DeviceTag> TagStore::get_all_tags(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
     std::vector<DeviceTag> results;
     if (!db_)
         return results;
@@ -184,6 +198,7 @@ std::vector<DeviceTag> TagStore::get_all_tags(const std::string& agent_id) const
 
 std::unordered_map<std::string, std::string>
 TagStore::get_tag_map(const std::string& agent_id) const {
+    std::shared_lock lock(mtx_);
     std::unordered_map<std::string, std::string> result;
     if (!db_)
         return result;
@@ -208,6 +223,7 @@ TagStore::get_tag_map(const std::string& agent_id) const {
 
 void TagStore::sync_agent_tags(const std::string& agent_id,
                                const std::unordered_map<std::string, std::string>& tags) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
 
@@ -227,13 +243,14 @@ void TagStore::sync_agent_tags(const std::string& agent_id,
     for (const auto& [key, value] : tags) {
         if (!validate_key(key) || !validate_value(value))
             continue;
-        set_tag(agent_id, key, value, "agent");
+        set_tag_impl(agent_id, key, value, "agent");
     }
 
     sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
 }
 
 void TagStore::delete_all_tags(const std::string& agent_id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
     sqlite3_stmt* stmt = nullptr;
@@ -248,6 +265,7 @@ void TagStore::delete_all_tags(const std::string& agent_id) {
 
 std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
                                                    const std::string& value) const {
+    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;
@@ -306,12 +324,14 @@ TagStore::set_tag_checked(const std::string& agent_id, const std::string& key,
         }
     }
 
-    set_tag(agent_id, key, value, source);
+    std::unique_lock lock(mtx_);
+    set_tag_impl(agent_id, key, value, source);
     return {};
 }
 
 std::vector<std::pair<std::string, std::vector<std::string>>>
 TagStore::get_compliance_gaps() const {
+    std::shared_lock lock(mtx_);
     std::vector<std::pair<std::string, std::vector<std::string>>> result;
     if (!db_)
         return result;
@@ -335,7 +355,7 @@ TagStore::get_compliance_gaps() const {
     for (const auto& agent_id : all_agents) {
         std::vector<std::string> missing;
         for (auto cat_key : kCategoryKeys) {
-            std::string tag_val = get_tag(agent_id, std::string(cat_key));
+            std::string tag_val = get_tag_impl(agent_id, std::string(cat_key));
             if (tag_val.empty())
                 missing.emplace_back(cat_key);
         }
@@ -347,6 +367,7 @@ TagStore::get_compliance_gaps() const {
 }
 
 std::vector<std::string> TagStore::get_distinct_values(const std::string& key) const {
+    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
     if (!db_)
         return result;

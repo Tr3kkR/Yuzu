@@ -3170,6 +3170,16 @@ public:
             web_thread_.join();
         }
 
+        // Shutdown gRPC servers BEFORE releasing stores — in-flight RPCs
+        // hold raw pointers to stores via AgentServiceImpl::set_*_store().
+        // Without this, handlers that are still executing would access
+        // dangling pointers to execution_tracker_, approval_manager_, etc.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        if (agent_server_)
+            agent_server_->Shutdown(deadline);
+        if (mgmt_server_)
+            mgmt_server_->Shutdown(deadline);
+
         // Release Phase 2 components before closing shared DB
         execution_tracker_.reset();
         approval_manager_.reset();
@@ -3178,16 +3188,6 @@ public:
             sqlite3_close(shared_instr_db_);
             shared_instr_db_ = nullptr;
         }
-
-        // Shutdown with a deadline — without one, Shutdown() waits
-        // indefinitely for all RPCs to finish.  The Subscribe RPC is a
-        // long-lived bidirectional stream that never completes on its own,
-        // so a bare Shutdown() hangs forever.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
     }
 
 private:

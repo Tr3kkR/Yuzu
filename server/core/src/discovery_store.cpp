@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 
 namespace yuzu::server {
 
@@ -73,6 +74,7 @@ void DiscoveryStore::create_tables() {
 
 std::expected<void, std::string>
 DiscoveryStore::upsert_device(const DiscoveredDevice& device) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -113,6 +115,7 @@ DiscoveryStore::upsert_device(const DiscoveredDevice& device) {
 }
 
 std::vector<DiscoveredDevice> DiscoveryStore::list_devices(const std::string& subnet_filter) const {
+    std::shared_lock lock(mtx_);
     std::vector<DiscoveredDevice> result;
     if (!db_)
         return result;
@@ -157,6 +160,7 @@ std::vector<DiscoveredDevice> DiscoveryStore::list_devices(const std::string& su
 
 std::optional<DiscoveredDevice>
 DiscoveryStore::get_device(const std::string& ip_address) const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return std::nullopt;
 
@@ -192,6 +196,7 @@ DiscoveryStore::get_device(const std::string& ip_address) const {
 
 std::expected<void, std::string>
 DiscoveryStore::mark_managed(const std::string& ip_address, const std::string& agent_id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -215,6 +220,7 @@ DiscoveryStore::mark_managed(const std::string& ip_address, const std::string& a
 
 std::expected<void, std::string>
 DiscoveryStore::clear_results(const std::string& subnet) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 

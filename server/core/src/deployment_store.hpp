@@ -50,6 +50,12 @@ private:
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
     void create_tables();
     static std::string generate_id();
+
+    // Internal variants called under existing lock (no re-lock)
+    std::optional<DeploymentJob> get_job_impl(const std::string& id) const;
+    std::expected<void, std::string> update_status_impl(const std::string& id,
+                                                         const std::string& status,
+                                                         const std::string& error);
 };
 
 } // namespace yuzu::server

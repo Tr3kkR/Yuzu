@@ -92,6 +92,11 @@ message CommandRequest {
   string action     = 3;  // Action within the plugin
   map<string, string> parameters = 4;
   yuzu.common.v1.Timestamp expires_at = 5;  // Agent should discard after this
+
+  // Stagger/delay: prevent thundering herd on large-fleet dispatch.
+  // Agent waits (delay_seconds + random[0, stagger_seconds]) before executing.
+  int32 stagger_seconds = 6;  // Max random delay in seconds (0 = no stagger)
+  int32 delay_seconds   = 7;  // Fixed delay before execution (0 = immediate)
 }
 
 message CommandResponse {

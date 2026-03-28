@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <random>
 
 namespace yuzu::server {
@@ -86,6 +87,7 @@ void DeploymentStore::create_tables() {
 std::expected<std::string, std::string>
 DeploymentStore::create_job(const std::string& target_host, const std::string& os,
                             const std::string& method) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
@@ -140,6 +142,7 @@ DeploymentStore::create_job(const std::string& target_host, const std::string& o
 }
 
 std::vector<DeploymentJob> DeploymentStore::list_jobs() const {
+    std::shared_lock lock(mtx_);
     std::vector<DeploymentJob> result;
     if (!db_)
         return result;
@@ -170,6 +173,11 @@ std::vector<DeploymentJob> DeploymentStore::list_jobs() const {
 }
 
 std::optional<DeploymentJob> DeploymentStore::get_job(const std::string& id) const {
+    std::shared_lock lock(mtx_);
+    return get_job_impl(id);
+}
+
+std::optional<DeploymentJob> DeploymentStore::get_job_impl(const std::string& id) const {
     if (!db_)
         return std::nullopt;
 
@@ -204,6 +212,13 @@ std::optional<DeploymentJob> DeploymentStore::get_job(const std::string& id) con
 std::expected<void, std::string>
 DeploymentStore::update_status(const std::string& id, const std::string& status,
                                const std::string& error) {
+    std::unique_lock lock(mtx_);
+    return update_status_impl(id, status, error);
+}
+
+std::expected<void, std::string>
+DeploymentStore::update_status_impl(const std::string& id, const std::string& status,
+                                    const std::string& error) {
     if (!db_)
         return std::unexpected("database not open");
 
@@ -250,17 +265,18 @@ DeploymentStore::update_status(const std::string& id, const std::string& status,
 }
 
 std::expected<void, std::string> DeploymentStore::cancel_job(const std::string& id) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");
 
-    // Only pending or running jobs can be cancelled
-    auto job = get_job(id);
+    // Only pending or running jobs can be cancelled — atomic check+update under lock
+    auto job = get_job_impl(id);
     if (!job)
         return std::unexpected("job not found");
     if (job->status != "pending" && job->status != "running")
         return std::unexpected("only pending or running jobs can be cancelled");
 
-    return update_status(id, "cancelled", "cancelled by operator");
+    return update_status_impl(id, "cancelled", "cancelled by operator");
 }
 
 } // namespace yuzu::server

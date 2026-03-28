@@ -255,20 +255,23 @@ void AuditStore::run_cleanup() {
                        std::chrono::system_clock::now().time_since_epoch())
                        .count();
 
-        sqlite3_stmt* cleanup_stmt = nullptr;
-        if (sqlite3_prepare_v2(
-                db_, "DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(cleanup_stmt, 1, now);
-            if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
-                auto deleted = sqlite3_changes(db_);
-                if (deleted > 0) {
-                    spdlog::info("AuditStore: expired {} rows", deleted);
+        {
+            std::unique_lock lock(mtx_);
+            sqlite3_stmt* cleanup_stmt = nullptr;
+            if (sqlite3_prepare_v2(
+                    db_, "DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
+                    -1, &cleanup_stmt, nullptr) == SQLITE_OK) {
+                sqlite3_bind_int64(cleanup_stmt, 1, now);
+                if (sqlite3_step(cleanup_stmt) == SQLITE_DONE) {
+                    auto deleted = sqlite3_changes(db_);
+                    if (deleted > 0) {
+                        spdlog::info("AuditStore: expired {} rows", deleted);
+                    }
+                } else {
+                    spdlog::warn("AuditStore: cleanup error: {}", sqlite3_errmsg(db_));
                 }
-            } else {
-                spdlog::warn("AuditStore: cleanup error: {}", sqlite3_errmsg(db_));
+                sqlite3_finalize(cleanup_stmt);
             }
-            sqlite3_finalize(cleanup_stmt);
         }
     }
 }

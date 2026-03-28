@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <mutex>
 #include <string_view>
 #include <utility>
 
@@ -225,6 +226,7 @@ NvdDatabase::NvdDatabase(const std::filesystem::path& db_path) {
         spdlog::warn("NvdDatabase: WAL mode failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
     }
+    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
     spdlog::info("NvdDatabase: opened {}", db_path.string());
@@ -276,6 +278,11 @@ void NvdDatabase::create_tables() {
 }
 
 void NvdDatabase::upsert_cve(const CveRecord& record) {
+    std::unique_lock lock(mtx_);
+    upsert_cve_impl(record);
+}
+
+void NvdDatabase::upsert_cve_impl(const CveRecord& record) {
     if (!db_)
         return;
 
@@ -314,6 +321,11 @@ void NvdDatabase::upsert_cve(const CveRecord& record) {
 }
 
 void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
+    std::unique_lock lock(mtx_);
+    upsert_cves_impl(records);
+}
+
+void NvdDatabase::upsert_cves_impl(const std::vector<CveRecord>& records) {
     if (!db_ || records.empty())
         return;
 
@@ -326,7 +338,7 @@ void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
     }
 
     for (const auto& record : records) {
-        upsert_cve(record);
+        upsert_cve_impl(record);
     }
 
     rc = sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg);
@@ -340,7 +352,7 @@ void NvdDatabase::upsert_cves(const std::vector<CveRecord>& records) {
 
 std::vector<CveMatch>
 NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
-
+    std::shared_lock lock(mtx_);
     std::vector<CveMatch> matches;
     if (!db_ || inventory.empty())
         return matches;
@@ -396,6 +408,7 @@ NvdDatabase::match_inventory(const std::vector<SoftwareItem>& inventory) const {
 }
 
 std::string NvdDatabase::get_meta(const std::string& key) const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return {};
 
@@ -421,6 +434,7 @@ std::string NvdDatabase::get_meta(const std::string& key) const {
 }
 
 void NvdDatabase::set_meta(const std::string& key, const std::string& value) {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
 
@@ -444,6 +458,7 @@ void NvdDatabase::set_meta(const std::string& key, const std::string& value) {
 }
 
 void NvdDatabase::seed_builtin_rules() {
+    std::unique_lock lock(mtx_);
     if (!db_)
         return;
 
@@ -486,11 +501,12 @@ void NvdDatabase::seed_builtin_rules() {
         records.push_back(std::move(rec));
     }
 
-    upsert_cves(records);
+    upsert_cves_impl(records);
     spdlog::info("NvdDatabase: seeded {} builtin CVE rules", records.size());
 }
 
 std::size_t NvdDatabase::total_cve_count() const {
+    std::shared_lock lock(mtx_);
     if (!db_)
         return 0;
 
