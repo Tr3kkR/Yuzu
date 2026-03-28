@@ -78,7 +78,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
-## [Unreleased]
+## [0.6.0] - 2026-03-28
+
+### Changed (Architecture — God Object Decomposition)
+
+- **server.cpp decomposed from 11,437 to 4,411 LOC** — ServerImpl is now a slim composition root
+- 24 new files extracted (9,008 LOC total), each independently compilable and testable
+- Route modules use callback-injection pattern: `register_routes(httplib::Server&, AuthFn, PermFn, AuditFn, ...stores...)`
+- Extracted route modules: `auth_routes`, `settings_routes`, `compliance_routes`, `workflow_routes`, `notification_routes`, `webhook_routes`, `discovery_routes`
+- Extracted inner classes: `agent_registry`, `agent_service_impl`, `gateway_service_impl`, `event_bus`
+- `InstructionDbPool` RAII wrapper replaces raw `sqlite3*` pointer for shared instruction DB (fixes G3-ARCH-T2-002)
+- `route_types.hpp` provides shared `AuthFn`/`PermFn`/`AuditFn` callback type aliases
+- `AgentServiceImpl` mutable members moved from public to private
+- Governance findings G3-ARCH-001, G3-ARCH-T2-001, G3-ARCH-T2-002 marked FIXED in code review register
+
+### Fixed
+- Scoped API tokens with null `TagStore` now return 503 instead of silently granting access
+- `InstructionDbPool` member declaration order corrected — destroyed after all consumers
+
 ### Added
 - Wave 8: Release hardening (schema migrations, env var config, rate limiting, log rotation, health endpoints)
 - MCP (Model Context Protocol) server embedded at `/mcp/v1/` with JSON-RPC 2.0 transport
