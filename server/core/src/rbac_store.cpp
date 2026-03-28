@@ -592,6 +592,8 @@ std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_
 }
 
 std::expected<void, std::string> RbacStore::set_permission(const Permission& perm) {
+    if (perm.effect != "allow" && perm.effect != "deny")
+        return std::unexpected("effect must be 'allow' or 'deny'");
     std::unique_lock lock(mtx_);
     if (!db_)
         return std::unexpected("database not open");

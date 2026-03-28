@@ -50,6 +50,8 @@
 
 namespace {
 
+constexpr size_t kMaxOutputBytes = 16 * 1024 * 1024; // 16 MiB hard output cap
+
 // ── helper: parse timeout ──────────────────────────────────────────────────
 
 int parse_timeout(yuzu::Params& params) {
@@ -203,20 +205,36 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
     }
 
     if (pid == 0) {
-        // Child
+        // Child — new session so we can kill the entire process group on timeout
+        setsid();
+
         close(pipe_fd[0]);
         dup2(pipe_fd[1], STDOUT_FILENO);
         dup2(pipe_fd[1], STDERR_FILENO);
         close(pipe_fd[1]);
 
-        // Build argv for execvp
+        // Sanitize environment: keep only safe variables
+        const char* safe_vars[] = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TZ"};
+        std::vector<std::string> env_storage;
+        std::vector<const char*> env_ptrs;
+        for (const char* name : safe_vars) {
+            const char* val = getenv(name);
+            if (val) {
+                env_storage.push_back(std::string(name) + "=" + val);
+                env_ptrs.push_back(env_storage.back().c_str());
+            }
+        }
+        env_ptrs.push_back(nullptr);
+
+        // Build argv for execvpe
         std::vector<const char*> c_argv;
         for (const auto& arg : argv) {
             c_argv.push_back(arg.c_str());
         }
         c_argv.push_back(nullptr);
 
-        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+        execvpe(c_argv[0], const_cast<char* const*>(c_argv.data()),
+                const_cast<char* const*>(env_ptrs.data()));
         _exit(127); // exec failed
     }
 
@@ -229,6 +247,8 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
 
     auto start = std::chrono::steady_clock::now();
     bool timed_out = false;
+    bool output_truncated = false;
+    size_t total_output = 0;
     std::string line_buf;
     std::array<char, 512> buf{};
 
@@ -236,12 +256,25 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
         auto elapsed = std::chrono::steady_clock::now() - start;
         if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= timeout_secs) {
             timed_out = true;
-            kill(pid, SIGKILL);
+            kill(-pid, SIGKILL); // Kill entire process group
             break;
+        }
+
+        if (output_truncated) {
+            // Drain remaining output without storing
+            auto n = read(pipe_fd[0], buf.data(), buf.size());
+            if (n <= 0) break;
+            continue;
         }
 
         auto n = read(pipe_fd[0], buf.data(), buf.size());
         if (n > 0) {
+            total_output += static_cast<size_t>(n);
+            if (total_output > kMaxOutputBytes) {
+                output_truncated = true;
+                ctx.write_output("stdout|[output truncated — exceeded 16 MiB limit]");
+                continue;
+            }
             for (ssize_t i = 0; i < n; ++i) {
                 if (buf[i] == '\n') {
                     while (!line_buf.empty() && line_buf.back() == '\r')

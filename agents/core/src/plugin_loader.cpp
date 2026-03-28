@@ -269,6 +269,14 @@ PluginLoader::ScanResult PluginLoader::scan(
             spdlog::debug("Plugin {} hash verified: {}", fname, actual_hash);
         }
 
+        // Symlink check: reject symlinks to prevent directory traversal attacks
+        if (std::filesystem::is_symlink(entry.path())) {
+            spdlog::warn("Plugin {} is a symlink — skipping", entry.path().string());
+            result.errors.push_back(
+                LoadError{entry.path().string(), "symlinks not allowed in plugin directory"});
+            continue;
+        }
+
         auto loaded = PluginHandle::load(entry.path());
         if (loaded) {
             spdlog::info("Loaded plugin: {} v{} from {}", loaded->descriptor()->name,

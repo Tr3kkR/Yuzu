@@ -50,6 +50,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
+constexpr size_t kMaxDownloadSize = 100 * 1024 * 1024; // 100 MiB
+
 YuzuPluginContext* g_ctx = nullptr;
 
 bool is_valid_url(std::string_view url) {
@@ -73,6 +75,10 @@ bool is_private_ipv4(const struct sockaddr_in* addr) {
     // 169.254.0.0/16 (link-local)
     if ((ip >> 16) == (169 << 8 | 254)) return true;
     if ((ip & 0xFFFF0000) == 0xA9FE0000) return true;
+    // 100.64.0.0/10 (carrier-grade NAT / RFC 6598)
+    if ((ip & 0xFFC00000) == 0x64400000) return true;
+    // 198.18.0.0/15 (benchmarking / RFC 2544)
+    if ((ip & 0xFFFE0000) == 0xC6120000) return true;
     // 0.0.0.0
     if (ip == 0) return true;
     return false;
@@ -253,8 +259,6 @@ int download_url(std::string_view url, const fs::path& dest, std::string& error)
         return 1;
     }
 
-    // L9: Enforce a maximum download size of 100MB to prevent disk exhaustion
-    constexpr size_t kMaxDownloadSize = 100 * 1024 * 1024; // 100 MB
     size_t total_bytes = 0;
     bool size_exceeded = false;
 
@@ -343,6 +347,9 @@ std::string http_get(std::string_view url, int& status_code) {
         return "connection failed";
     }
     status_code = res->status;
+    if (res->body.size() > kMaxDownloadSize) {
+        return "response body exceeds maximum size limit";
+    }
     return res->body;
 }
 

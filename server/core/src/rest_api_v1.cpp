@@ -143,12 +143,9 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 
 // ── CORS helpers ────────────────────────────────────────────────────────
 
-void add_cors_headers(httplib::Response& res, const httplib::Request& req) {
-    auto origin = req.get_header_value("Origin");
-    if (!origin.empty()) {
-        res.set_header("Access-Control-Allow-Origin", origin);
-        res.set_header("Access-Control-Allow-Credentials", "true");
-    }
+void add_cors_headers(httplib::Response& res, const httplib::Request& /* req */) {
+    // Do NOT reflect arbitrary Origin — that defeats CORS.
+    // API is same-origin by design; external integrations use API tokens.
     res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Yuzu-Token");
     res.set_header("Access-Control-Max-Age", "86400");
@@ -1415,6 +1412,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 if (req.has_param("agent_id")) q.agent_id = req.get_param_value("agent_id");
                 if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
                 if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+                if (q.limit > 1000) q.limit = 1000;
                 auto stats = execution_tracker->get_agent_statistics(q);
                 JArr arr;
                 for (const auto& s : stats) {
@@ -1438,6 +1436,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 if (req.has_param("definition_id")) q.definition_id = req.get_param_value("definition_id");
                 if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
                 if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
+                if (q.limit > 1000) q.limit = 1000;
                 auto stats = execution_tracker->get_definition_statistics(q);
                 JArr arr;
                 for (const auto& s : stats) {
@@ -1482,7 +1481,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      // Fetch inventory records
                      InventoryQuery iq;
                      if (!eval_req.agent_id.empty()) iq.agent_id = eval_req.agent_id;
-                     iq.limit = 10000;
+                     iq.limit = 5000;
                      auto records_raw = inventory_store->query(iq);
                      std::vector<std::pair<std::string, std::string>> records;
                      for (const auto& r : records_raw) {

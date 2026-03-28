@@ -54,6 +54,10 @@ fs::path staging_dir() {
     fs::path dir = data_dir.empty() ? fs::temp_directory_path() / "yuzu-staged" : fs::path{std::string{data_dir}} / "staged";
     std::error_code ec;
     fs::create_directories(dir, ec);
+#ifndef _WIN32
+    // Restrict staging directory permissions to owner only
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+#endif
     return dir;
 }
 
@@ -447,6 +451,16 @@ private:
         if (!fs::exists(path)) {
             ctx.write_output(std::format("error|file not staged: {}", filename));
             return 1;
+        }
+
+        // Re-verify hash before execution to detect TOCTOU tampering
+        auto expected_hash = params.get("expected_hash");
+        if (!expected_hash.empty()) {
+            auto actual = sha256_file(path);
+            if (actual != expected_hash) {
+                ctx.write_output(std::format("error|hash re-verification failed: expected={}, got={}", expected_hash, actual));
+                return 1;
+            }
         }
 
         auto args = params.get("args");

@@ -98,6 +98,9 @@ private:
                                                           const std::string& code_verifier,
                                                           const std::string& redirect_uri);
 
+    /// Cleanup expired pending challenges (must hold mu_).
+    void cleanup_expired_states_locked();
+
     /// Fetch and cache JWKS from the IdP's jwks_uri endpoint.
     void fetch_jwks();
 

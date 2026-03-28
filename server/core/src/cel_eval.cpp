@@ -18,11 +18,12 @@ namespace {
 
 // ── Safety limits ───────────────────────────────────────────────────────────
 
-constexpr size_t kMaxExpressionLength = 4096;
-constexpr int    kMaxRecursionDepth   = 64;
-constexpr size_t kMaxListElements     = 1000;
-constexpr size_t kMaxRegexPatternLen  = 256;
-constexpr auto   kEvalTimeout         = std::chrono::milliseconds(100);
+constexpr size_t kMaxExpressionLength  = 4096;
+constexpr int    kMaxRecursionDepth    = 16;
+constexpr size_t kMaxListElements      = 1000;
+constexpr size_t kMaxRegexPatternLen   = 256;
+constexpr size_t kMaxStringResultLen   = 65536; // 64 KiB cap on string concatenation results
+constexpr auto   kEvalTimeout          = std::chrono::milliseconds(100);
 
 // ── Token types ─────────────────────────────────────────────────────────────
 
@@ -71,6 +72,7 @@ enum class TokenType {
     KwContains,  // contains  (legacy, maps to .contains())
     KwStartswith,// startswith (legacy, maps to .startsWith())
 
+    Error,       // unrecognized character
     End          // end of input
 };
 
@@ -141,9 +143,9 @@ public:
         if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
             return read_ident();
 
-        // Unknown character — skip
+        // Unknown character — return error token instead of silently skipping
         ++pos_;
-        return next();
+        return Token{TokenType::Error, std::string(1, c)};
     }
 
     size_t position() const { return pos_; }
@@ -477,9 +479,13 @@ CelValue add_values(const CelValue& lhs, const CelValue& rhs) {
         if (auto* rd = std::get_if<double>(&rhs))  return *ld + *rd;
         if (auto* ri = std::get_if<int64_t>(&rhs)) return *ld + static_cast<double>(*ri);
     }
-    // string + string (concatenation)
+    // string + string (concatenation) — bounded to prevent memory exhaustion
     if (auto* ls = std::get_if<std::string>(&lhs)) {
-        if (auto* rs = std::get_if<std::string>(&rhs)) return *ls + *rs;
+        if (auto* rs = std::get_if<std::string>(&rhs)) {
+            if (ls->size() + rs->size() > kMaxStringResultLen)
+                throw std::runtime_error("string concatenation exceeds maximum length");
+            return *ls + *rs;
+        }
     }
     // timestamp + duration
     if (auto* lt = std::get_if<CelTimestamp>(&lhs)) {
@@ -816,6 +822,7 @@ private:
         if (current_.type == TokenType::OpNot && current_.value != "!") {
             // This is the keyword NOT (case-insensitive), which has lower
             // precedence than comparison operators for backward compat
+            DepthGuard guard(depth_, deadline_);
             advance();
             auto val = parse_not_legacy();
             if (validate_only_) return std::monostate{};
@@ -929,6 +936,7 @@ private:
 
     CelValue parse_unary() {
         if (current_.type == TokenType::OpNot) {
+            DepthGuard guard(depth_, deadline_);
             advance();
             auto val = parse_unary();
             if (validate_only_) return std::monostate{};

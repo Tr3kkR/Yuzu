@@ -224,6 +224,39 @@ std::filesystem::path current_executable_path() {
 
 // ── Updater ────────────────────────────────────────────────────────────────
 
+// Semantic version comparison: returns -1 if a < b, 0 if equal, 1 if a > b.
+// Strips leading 'v' and handles up to 3 numeric components (major.minor.patch).
+int compare_semver(std::string_view a, std::string_view b) {
+    auto parse = [](std::string_view s) -> std::array<int, 3> {
+        std::array<int, 3> parts{0, 0, 0};
+        if (!s.empty() && (s[0] == 'v' || s[0] == 'V'))
+            s.remove_prefix(1);
+        // Strip pre-release suffix (e.g., "-rc1")
+        auto dash = s.find('-');
+        if (dash != std::string_view::npos)
+            s = s.substr(0, dash);
+        for (int i = 0; i < 3 && !s.empty(); ++i) {
+            auto dot = s.find('.');
+            auto part = s.substr(0, dot);
+            int val = 0;
+            std::from_chars(part.data(), part.data() + part.size(), val);
+            parts[i] = val;
+            if (dot == std::string_view::npos) break;
+            s.remove_prefix(dot + 1);
+        }
+        return parts;
+    };
+    auto pa = parse(a);
+    auto pb = parse(b);
+    for (int i = 0; i < 3; ++i) {
+        if (pa[i] < pb[i]) return -1;
+        if (pa[i] > pb[i]) return 1;
+    }
+    return 0;
+}
+
+constexpr int64_t kMaxDownloadBytes = 512 * 1024 * 1024; // 512 MiB hard cap
+
 Updater::Updater(UpdateConfig config, std::string agent_id, std::string current_version,
                  std::string os, std::string arch, std::filesystem::path exe_path)
     : config_{std::move(config)}, agent_id_{std::move(agent_id)},
@@ -277,6 +310,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     if (!check_resp.eligible()) {
         spdlog::info("Update {} available but agent is not eligible for rollout",
                      check_resp.latest_version());
+        return false;
+    }
+
+    // Downgrade protection: reject versions older than current
+    if (compare_semver(check_resp.latest_version(), current_version_) <= 0) {
+        spdlog::warn("Rejected update {} — not newer than current {} (downgrade blocked)",
+                     check_resp.latest_version(), current_version_);
         return false;
     }
 
@@ -352,6 +392,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         }
 
         bytes_downloaded += static_cast<int64_t>(data.size());
+        if (bytes_downloaded > kMaxDownloadBytes) {
+            out.close();
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            return std::unexpected(UpdateError{
+                std::format("Download exceeds maximum size ({} MiB)", kMaxDownloadBytes / (1024 * 1024))});
+        }
     }
 
     grpc::Status dl_status = reader->Finish();

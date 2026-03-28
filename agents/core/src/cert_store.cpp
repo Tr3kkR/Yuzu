@@ -220,6 +220,8 @@ CertStoreResult read_cert_from_store(const std::string& store_name, const std::s
                 result.error = "NCryptExportKey (PKCS8) failed: " + std::to_string(ss) +
                                ". The private key may not be marked as exportable.";
             }
+            // Zero private key material from intermediate buffer
+            SecureZeroMemory(blob.data(), blob.size());
         } else {
             result.error = "NCryptExportKey failed: " + std::to_string(ss) +
                            ". The private key may not be marked as exportable.";
@@ -260,6 +262,8 @@ CertStoreResult read_cert_from_store(const std::string& store_name, const std::s
                 } else {
                     result.error = "CryptExportKey failed. The key may not be exportable.";
                 }
+                // Zero private key material from intermediate buffer
+                SecureZeroMemory(blob.data(), blob.size());
             }
             CryptDestroyKey(hkey);
         } else {
