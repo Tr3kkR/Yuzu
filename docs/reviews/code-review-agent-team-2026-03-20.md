@@ -56,8 +56,8 @@
 
 | ID | Finding | File | Fix Commit |
 |----|---------|------|------------|
-| G3-ARCH-001 | server.cpp god object (11K LOC, 28 store members) | server.cpp | Documented; extraction planned |
-| G3-ARCH-002 | Two-tier DB ownership with decoupled lifetimes | Multiple | Documented |
+| G3-ARCH-001 | server.cpp god object (11K LOC, 28 store members) | server.cpp | **Fixed**: decomposed to 4.4K LOC + 24 extracted files |
+| G3-ARCH-002 | Two-tier DB ownership with decoupled lifetimes | Multiple | **Fixed**: InstructionDbPool RAII wrapper (G3-ARCH-T2-002) |
 | G3-ARCH-003 | 11 stores lack SQLite mutexes | 9 store headers | `6814755` (9 stores), `46183c0` (2 stores) |
 
 ### HIGH — Performance (5 found, 3 fixed)
@@ -245,12 +245,12 @@ All 10 scenarios documented in the 2026-03-28 Gate 5 conversation output.
 | G2-SEC-I3-010 | No app-level auth on management gRPC | all services | Documented; mTLS in prod |
 | G2-SEC-I1-001 | Env variable integers no range validation | yuzu_gw_app.erl | Documented |
 
-#### HIGH — Architecture (3 found, 1 fixed)
+#### HIGH — Architecture (3 found, 3 fixed)
 
 | ID | Finding | File | Fix |
 |----|---------|------|-----|
-| G3-ARCH-T2-001 | server.cpp god object (11.4K LOC, 27 stores) | server.cpp | Documented; extraction planned |
-| G3-ARCH-T2-002 | Shared instruction DB fragile lifetime | server.cpp | Documented; needs shared_ptr refactor |
+| G3-ARCH-T2-001 | server.cpp god object (11.4K LOC, 27 stores) | server.cpp | **Fixed**: decomposed to 4.4K LOC + 24 extracted files |
+| G3-ARCH-T2-002 | Shared instruction DB fragile lifetime | server.cpp | **Fixed**: InstructionDbPool RAII wrapper |
 | G3-ARCH-T2-003 | Gateway proto missing stagger/delay fields | agent.proto | **Fixed**: synced gateway proto from canonical |
 
 #### HIGH — Performance (5 found, 0 fixed — documented)
