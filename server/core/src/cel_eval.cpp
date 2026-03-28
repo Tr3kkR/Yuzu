@@ -22,6 +22,7 @@ constexpr size_t kMaxExpressionLength = 4096;
 constexpr int    kMaxRecursionDepth   = 64;
 constexpr size_t kMaxListElements     = 1000;
 constexpr size_t kMaxRegexPatternLen  = 256;
+constexpr auto   kEvalTimeout         = std::chrono::milliseconds(100);
 
 // ── Token types ─────────────────────────────────────────────────────────────
 
@@ -708,16 +709,21 @@ class Parser {
 public:
     Parser(std::string_view input, const std::map<std::string, std::string>& vars,
            bool validate_only = false)
-        : lexer_(input), vars_(vars), validate_only_(validate_only) {
+        : lexer_(input), vars_(vars), validate_only_(validate_only),
+          deadline_(std::chrono::steady_clock::now() + kEvalTimeout) {
         advance();
     }
 
-    // RAII depth guard for recursion limit
+    // RAII depth guard for recursion limit + wall-clock timeout (G2-SEC-D1-002)
     struct DepthGuard {
         int& depth;
-        explicit DepthGuard(int& d) : depth(d) {
+        const std::chrono::steady_clock::time_point& deadline;
+        explicit DepthGuard(int& d, const std::chrono::steady_clock::time_point& dl)
+            : depth(d), deadline(dl) {
             if (++depth > kMaxRecursionDepth)
                 throw std::runtime_error("expression exceeds maximum nesting depth");
+            if (std::chrono::steady_clock::now() > deadline)
+                throw std::runtime_error("expression evaluation timeout exceeded");
         }
         ~DepthGuard() { --depth; }
     };
@@ -744,6 +750,7 @@ private:
     const std::map<std::string, std::string>& vars_;
     bool validate_only_;
     int depth_{0};
+    std::chrono::steady_clock::time_point deadline_;
 
     void advance() { current_ = lexer_.next(); }
 
@@ -756,7 +763,7 @@ private:
     // ── Grammar productions ─────────────────────────────────────────────
 
     CelValue parse_ternary() {
-        DepthGuard guard(depth_);
+        DepthGuard guard(depth_, deadline_);
         auto cond = parse_or();
         if (current_.type == TokenType::Question) {
             advance();
@@ -1252,6 +1259,25 @@ bool evaluate_bool(std::string_view expression,
         return to_bool(parser.evaluate());
     } catch (...) {
         return false;
+    }
+}
+
+std::optional<bool> evaluate_tri(std::string_view expression,
+                                 const std::map<std::string, std::string>& variables) {
+    if (expression.empty())
+        return true;
+    if (expression.size() > kMaxExpressionLength)
+        return std::nullopt; // error, not false
+
+    try {
+        Parser parser(expression, variables);
+        auto result = parser.evaluate();
+        // monostate = evaluation error (missing variable, type error, timeout)
+        if (std::holds_alternative<std::monostate>(result))
+            return std::nullopt;
+        return to_bool(result);
+    } catch (...) {
+        return std::nullopt; // parse error or timeout
     }
 }
 

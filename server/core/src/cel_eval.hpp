@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -52,6 +53,13 @@ CelValue evaluate(std::string_view expression,
 /// Returns true if compliant, false if not (or on parse/evaluation error).
 bool evaluate_bool(std::string_view expression,
                    const std::map<std::string, std::string>& variables);
+
+/// Evaluate a CEL expression and return tri-state: true (compliant), false
+/// (non-compliant), or nullopt (evaluation error — timeout, parse error,
+/// missing variables producing monostate). Used by compliance_eval to
+/// distinguish genuine non-compliance from evaluation failures (G4-UHP-POL-008).
+std::optional<bool> evaluate_tri(std::string_view expression,
+                                 const std::map<std::string, std::string>& variables);
 
 /// Validate a CEL expression for syntax correctness without evaluation.
 /// Returns empty string on success, or an error message describing the problem.

@@ -404,6 +404,10 @@ void PolicyStore::create_tables() {
         spdlog::error("PolicyStore: create_tables failed: {}", err ? err : "unknown");
         sqlite3_free(err);
     }
+
+    // Migration: add fix_attempt_count column (G4-UHP-POL-003)
+    sqlite3_exec(db_, "ALTER TABLE policy_status ADD COLUMN fix_attempt_count INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
 }
 
 std::string PolicyStore::generate_id() const {
@@ -1143,17 +1147,44 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
 
     auto now = now_epoch();
 
-    // Upsert using INSERT OR REPLACE
+    // Fix retry limit (G4-UHP-POL-003): if transitioning to 'fixing' and
+    // the agent has already exceeded max fix attempts, force status to 'error'
+    constexpr int kMaxFixAttempts = 3;
+    std::string effective_status = status;
+    if (status == "fixing") {
+        sqlite3_stmt* chk = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                "SELECT fix_attempt_count FROM policy_status WHERE policy_id = ? AND agent_id = ?",
+                -1, &chk, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(chk, 1, policy_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(chk, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(chk) == SQLITE_ROW) {
+                int attempts = sqlite3_column_int(chk, 0);
+                if (attempts >= kMaxFixAttempts) {
+                    effective_status = "error";
+                    spdlog::warn("PolicyStore: fix retry limit ({}) exceeded for policy={} agent={}, "
+                                 "transitioning to error", kMaxFixAttempts, policy_id, agent_id);
+                }
+            }
+            sqlite3_finalize(chk);
+        }
+    }
+
+    // Upsert with fix_attempt_count tracking
     const char* sql = R"(
-        INSERT INTO policy_status (policy_id, agent_id, status, last_check_at, last_fix_at, check_result)
-        VALUES (?, ?, ?, ?, 0, ?)
+        INSERT INTO policy_status (policy_id, agent_id, status, last_check_at, last_fix_at, check_result, fix_attempt_count)
+        VALUES (?, ?, ?, ?, 0, ?, 0)
         ON CONFLICT(policy_id, agent_id) DO UPDATE SET
             status = excluded.status,
             last_check_at = excluded.last_check_at,
             check_result = excluded.check_result,
             last_fix_at = CASE WHEN excluded.status = 'fixing'
                           THEN excluded.last_check_at
-                          ELSE policy_status.last_fix_at END
+                          ELSE policy_status.last_fix_at END,
+            fix_attempt_count = CASE
+                WHEN excluded.status = 'fixing' THEN policy_status.fix_attempt_count + 1
+                WHEN excluded.status = 'compliant' THEN 0
+                ELSE policy_status.fix_attempt_count END
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -1163,7 +1194,7 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
 
     sqlite3_bind_text(stmt, 1, policy_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, effective_status.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 4, now);
     sqlite3_bind_text(stmt, 5, check_result.c_str(), -1, SQLITE_TRANSIENT);
 

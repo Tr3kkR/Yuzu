@@ -4,12 +4,20 @@
 
 namespace yuzu::server {
 
-bool evaluate_compliance(std::string_view expression,
-                         const std::map<std::string, std::string>& result_fields) {
+ComplianceResult evaluate_compliance(std::string_view expression,
+                                     const std::map<std::string, std::string>& result_fields) {
     if (expression.empty())
-        return true; // empty expression = always compliant
+        return ComplianceResult::compliant; // empty = always compliant
 
-    return cel::evaluate_bool(expression, result_fields);
+    auto result = cel::evaluate_tri(expression, result_fields);
+    if (!result.has_value())
+        return ComplianceResult::eval_error; // timeout, missing var, parse error
+    return *result ? ComplianceResult::compliant : ComplianceResult::non_compliant;
+}
+
+bool evaluate_compliance_bool(std::string_view expression,
+                              const std::map<std::string, std::string>& result_fields) {
+    return evaluate_compliance(expression, result_fields) == ComplianceResult::compliant;
 }
 
 std::string validate_compliance_expression(std::string_view expression) {
