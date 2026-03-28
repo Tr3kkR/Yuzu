@@ -435,7 +435,26 @@ private:
             return 1;
         }
 
+        // Path traversal protection: reject paths with ".." components
         fs::path dest{std::string{path}};
+        {
+            std::error_code ec;
+            auto parent = dest.parent_path();
+            if (parent.empty()) parent = fs::current_path(ec);
+            auto canonical_parent = fs::canonical(parent, ec);
+            if (ec) {
+                ctx.write_output(std::format("error|invalid download path: parent directory does not exist"));
+                return 1;
+            }
+            dest = canonical_parent / dest.filename();
+            // Reject if any component is ".."
+            for (const auto& component : fs::path{std::string{path}}) {
+                if (component == "..") {
+                    ctx.write_output("error|path traversal not allowed (contains '..')");
+                    return 1;
+                }
+            }
+        }
         std::string error;
         if (download_url(url, dest, error) != 0) {
             ctx.write_output(std::format("error|{}", error));

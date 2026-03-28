@@ -15,12 +15,28 @@ namespace yuzu {
 
 using Labels = std::vector<std::pair<std::string, std::string>>;
 
+// Escape label values for Prometheus exposition format (per OpenMetrics spec):
+// backslash → \\, double-quote → \", newline → \n
+inline std::string escape_label_value(const std::string& v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
 inline std::string labels_key(const Labels& labels) {
     std::string key;
     for (const auto& [k, v] : labels) {
         if (!key.empty())
             key += ',';
-        key += k + "=\"" + v + "\"";
+        key += k + "=\"" + escape_label_value(v) + "\"";
     }
     return key;
 }
@@ -32,7 +48,7 @@ inline std::string labels_prometheus(const Labels& labels) {
     for (size_t i = 0; i < labels.size(); ++i) {
         if (i > 0)
             out += ',';
-        out += labels[i].first + "=\"" + labels[i].second + "\"";
+        out += labels[i].first + "=\"" + escape_label_value(labels[i].second) + "\"";
     }
     out += '}';
     return out;
@@ -93,12 +109,19 @@ public:
         std::lock_guard lock(mu_);
         sum_ += value;
         count_++;
+        // Increment only the first matching bucket (non-cumulative storage).
+        // snapshot() cumulates on export for Prometheus format.
+        bool placed = false;
         for (size_t i = 0; i < boundaries_.size(); ++i) {
-            if (value <= boundaries_[i]) {
+            if (!placed && value <= boundaries_[i]) {
                 bucket_counts_[i]++;
+                placed = true;
+                break;
             }
         }
-        bucket_counts_.back()++; // +Inf bucket
+        if (!placed) {
+            bucket_counts_.back()++; // +Inf bucket (value exceeds all boundaries)
+        }
     }
 
     struct Snapshot {
