@@ -40,9 +40,32 @@
 #include <wincrypt.h>
 #else
 #include <filesystem>
+#include <fstream>
 #endif
 
 namespace {
+
+// ── Input validation ────────────────────────────────────────────────────────
+
+bool is_valid_thumbprint(std::string_view s) {
+    if (s.size() != 40) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+bool is_safe_path(std::string_view s) {
+    for (char c : s) {
+        // Reject shell metacharacters in filesystem paths
+        if (c == '`' || c == '$' || c == '(' || c == ')' || c == ';' ||
+            c == '|' || c == '&' || c == '\'' || c == '"' || c == '\n' ||
+            c == '\r' || c == '\0')
+            return false;
+    }
+    return true;
+}
 
 // ── Subprocess helper ────────────────────────────────────────────────────────
 
@@ -323,6 +346,14 @@ CertRecord parse_openssl_output(const std::string& pem_path, const std::string& 
     CertRecord rec;
     rec.store = store_name;
 
+    // Validate path against shell metacharacters to prevent command injection.
+    // The path comes from directory_iterator but crafted filenames could inject.
+    if (!is_safe_path(pem_path)) {
+        rec.subject = "(unsafe path)";
+        rec.thumbprint = "(skipped)";
+        return rec;
+    }
+
     // Get subject
     auto subj = run_command(
         std::format("openssl x509 -noout -subject -in \"{}\" 2>/dev/null", pem_path).c_str());
@@ -549,9 +580,18 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     CertRecord rec;
     rec.store = store_name;
 
-    // Write PEM to a temporary command via stdin using printf
-    // Use a heredoc-style approach through echo
-    auto base_cmd = std::format("echo '{}' | openssl x509 -noout", pem_block);
+    // Write PEM to a temp file to avoid shell injection via echo.
+    // PEM content from the keychain could contain single quotes that break
+    // the echo '...' pattern and enable command injection.
+    namespace fs = std::filesystem;
+    auto tmp_path = fs::temp_directory_path() / "yuzu_cert_tmp.pem";
+    {
+        std::ofstream tmp(tmp_path, std::ios::trunc);
+        if (!tmp) { rec.subject = "(temp file error)"; return rec; }
+        tmp << pem_block;
+    }
+    auto base_cmd = std::format("openssl x509 -noout -in \"{}\"", tmp_path.string());
+    auto cleanup = [&]() { std::error_code ec; fs::remove(tmp_path, ec); };
 
     // Subject
     auto subj = run_command(std::format("{} -subject 2>/dev/null", base_cmd).c_str());
@@ -633,6 +673,7 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
         rec.key_usage = "(none)";
     }
 
+    cleanup();
     return rec;
 }
 
@@ -695,6 +736,11 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint) 
 
 void delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view /*store*/) {
+    // Validate thumbprint is hex-only to prevent command injection.
+    if (!is_valid_thumbprint(thumbprint)) {
+        ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
+        return;
+    }
     // macOS: use security delete-certificate with the SHA-1 hash
     auto result = run_command(std::format("security delete-certificate -Z {} "
                                           "/Library/Keychains/System.keychain 2>&1",
@@ -758,6 +804,10 @@ public:
                 ctx.write_output("error|thumbprint parameter required");
                 return 1;
             }
+            if (!is_valid_thumbprint(thumbprint)) {
+                ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
+                return 1;
+            }
 
 #ifdef _WIN32
             details_cert_win(ctx, thumbprint);
@@ -774,6 +824,10 @@ public:
             auto store = params.get("store", "MY");
             if (thumbprint.empty()) {
                 ctx.write_output("error|thumbprint parameter required");
+                return 1;
+            }
+            if (!is_valid_thumbprint(thumbprint)) {
+                ctx.write_output("error|invalid thumbprint format (expected 40 hex characters)");
                 return 1;
             }
 

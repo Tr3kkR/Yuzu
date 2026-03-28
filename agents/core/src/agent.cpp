@@ -440,10 +440,18 @@ public:
 
         for (auto& handle : candidates) {
             const auto* descriptor = handle.descriptor();
-            // Set plugin name on context so KV storage is namespaced per-plugin
-            plugin_ctx_.plugin_name = descriptor->name;
+            // Create a per-plugin context with the correct plugin_name for KV namespacing.
+            // Each plugin gets its own PluginContextImpl so concurrent executions
+            // don't clobber each other's KV namespace (was a data corruption bug).
+            auto pctx = std::make_unique<PluginContextImpl>();
+            pctx->config = plugin_ctx_.config;
+            pctx->kv_store = plugin_ctx_.kv_store;
+            pctx->trigger_engine = plugin_ctx_.trigger_engine;
+            pctx->plugin_name = descriptor->name;
+
+            auto* raw_pctx = reinterpret_cast<YuzuPluginContext*>(pctx.get());
             if (handle.descriptor()->init) {
-                int rc = handle.descriptor()->init(raw_plugin_ctx);
+                int rc = handle.descriptor()->init(raw_pctx);
                 if (rc != 0) {
                     spdlog::warn("Plugin {} init returned {}, skipping", handle.descriptor()->name,
                                  rc);
@@ -453,6 +461,7 @@ public:
                     continue;
                 }
             }
+            per_plugin_ctx_[descriptor->name] = std::move(pctx);
             record_module(descriptor->name, descriptor->version, descriptor->description, "loaded");
             plugin_names_.emplace_back(handle.descriptor()->name);
             plugins_.push_back(std::move(handle));
@@ -480,8 +489,12 @@ public:
         ScopeExit cleanup{[this]() {
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
-                    handle.descriptor()->shutdown(
-                        reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
+                    // Use per-plugin context if available, fall back to shared
+                    auto it = per_plugin_ctx_.find(handle.descriptor()->name);
+                    auto* ctx_ptr = (it != per_plugin_ctx_.end())
+                        ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
+                        : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+                    handle.descriptor()->shutdown(ctx_ptr);
                 }
             }
             // Destroy the thread pool — signals stop, drains queue, joins workers
@@ -1027,12 +1040,18 @@ public:
 
             // Shutdown plugins first - signals long-running commands (e.g. chargen)
             // to stop, so their exec threads can finish and release the stream.
+            // Note: the ScopeExit guard also calls shutdown, so we clear plugins_
+            // after this to prevent double-shutdown (which violates the ABI contract).
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
-                    handle.descriptor()->shutdown(
-                        reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_));
+                    auto it = per_plugin_ctx_.find(handle.descriptor()->name);
+                    auto* ctx_ptr = (it != per_plugin_ctx_.end())
+                        ? reinterpret_cast<YuzuPluginContext*>(it->second.get())
+                        : reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
+                    handle.descriptor()->shutdown(ctx_ptr);
                 }
             }
+            plugins_.clear(); // Prevent ScopeExit from calling shutdown again
 
             // Destroy thread pool BEFORE stream goes out of scope — this drains
             // the queue, waits for in-flight tasks, and joins all worker threads,

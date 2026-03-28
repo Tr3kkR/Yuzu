@@ -91,16 +91,17 @@ TEST_CASE("Histogram: observe and snapshot", "[metrics][histogram]") {
     REQUIRE(snap.count == 4);
     REQUIRE(snap.sum == 25.5);
 
-    // Buckets count all values <= boundary, then snapshot makes them cumulative.
-    // observe(0.5): hits buckets 0,1,2  →  raw = [1,1,1,1]
-    // observe(3.0): hits buckets 1,2    →  raw = [1,2,2,2]
-    // observe(7.0): hits bucket 2       →  raw = [1,2,3,3]
-    // observe(15.0): hits none+inf      →  raw = [1,2,3,4]
-    // cumulative: [1, 1+2=3, 3+3=6, count=4]
+    // Each observe() increments only the first matching bucket (non-cumulative).
+    // snapshot() cumulates on export for Prometheus format.
+    // observe(0.5): hits bucket 0 (0.5 <= 1.0)     →  raw = [1,0,0,0]
+    // observe(3.0): hits bucket 1 (3.0 <= 5.0)     →  raw = [1,1,0,0]
+    // observe(7.0): hits bucket 2 (7.0 <= 10.0)    →  raw = [1,1,1,0]
+    // observe(15.0): hits +Inf (15.0 > 10.0)       →  raw = [1,1,1,1]
+    // cumulative: [1, 1+1=2, 2+1=3, count=4]
     REQUIRE(snap.cumulative_counts.size() == 4);
     CHECK(snap.cumulative_counts[0] == 1); // le=1.0
-    CHECK(snap.cumulative_counts[1] == 3); // le=5.0 (cumulative)
-    CHECK(snap.cumulative_counts[2] == 6); // le=10.0 (cumulative)
+    CHECK(snap.cumulative_counts[1] == 2); // le=5.0 (cumulative)
+    CHECK(snap.cumulative_counts[2] == 3); // le=10.0 (cumulative)
     CHECK(snap.cumulative_counts[3] == 4); // +Inf = count
 }
 

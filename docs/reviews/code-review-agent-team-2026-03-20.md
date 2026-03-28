@@ -8,10 +8,10 @@
 |-------|-------|
 | Date | 2026-03-28 |
 | Process | 7-gate governance (expanded from 5 gates on 2026-03-28) |
-| Scope | Tiers 1-2 complete. Tiers 3-4 pending. |
+| Scope | Tiers 1-3 complete. Tier 4 pending. |
 | Prior art | RC sprint (2026-03-22 to 2026-03-24) found 52 findings (7C/16H/22M/7L), all resolved |
 | Agents used | security-guardian, docs-writer, architect, dsl-engineer, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector |
-| Invocations | ~60 agent invocations across Gates 1-5 (Tiers 1-2) |
+| Invocations | ~74 agent invocations across Gates 1-5 (Tiers 1-3) |
 
 ## Governance Process (7 Gates)
 
@@ -307,17 +307,163 @@ Categories: retention policies, input validation, helper duplication, naming inc
 
 ---
 
-## Remaining Work: Tiers 3-4
+## Tier 3 — Functional Correctness (completed 2026-03-28)
 
-### Tier 3 — Functional Correctness
+### Scope
 
-| Partition | Batches | Files | Focus |
-|-----------|---------|-------|-------|
-| G: Agent Core | G1-G3 | 23 files | Plugin loader, trigger engine, cert handling |
-| H: Plugins | H1-H8 | 45 dirs | ABI compliance, isolation, crash safety |
-| J: Proto & SDK | J1 | 11 files | Wire compatibility, ABI stability |
+| Partition | Batches | Files | Status |
+|-----------|---------|-------|--------|
+| G: Agent Core | G1-G3 | 23 files (agent, identity, certs, cloud, plugins, triggers, KV, updater, utils) | Complete |
+| H: Plugins | H1-H8 | 44 plugin dirs, ~54 files | Complete |
+| J: Proto & SDK | J1 | 4 .proto + 7 SDK headers | Complete |
 
-**Estimated: ~25 agent invocations, ~1.5 hours**
+**Agents used:** security-guardian (×9), architect, performance, happy-path, unhappy-path, consistency-auditor, chaos-injector
+**Invocations:** ~14 agent invocations across Gates 2-5
+
+### Tier 3 Finding Register
+
+#### CRITICAL (13 found, 4 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G2-SEC-G1-001 | Enrollment token visible in process args (`/proc/pid/cmdline`) | main.cpp:97 | Documented; support token-from-file or env-only |
+| G2-SEC-G1-002 | Private key blob not zeroed after cert store export (Windows) | cert_store.cpp:213 | Documented; `SecureZeroMemory` on intermediate buffers |
+| G2-SEC-G2-001 | No code signing on plugins — allowlist is optional | plugin_loader.cpp:242 | Documented; make allowlist mandatory in production |
+| G2-SEC-G2-002 | No version downgrade protection in OTA updater | updater.cpp:253 | Documented; semantic version comparison needed |
+| G2-SEC-H3-001 | Command injection in discovery_plugin `ping_host()` via `system()` | discovery_plugin.cpp:321 | Documented; add `inet_pton` validation or use `execvp` |
+| G2-SEC-H3-002 | SSRF via DNS rebinding in http_client — TOCTOU on resolved IP | http_client_plugin.cpp:106 | Documented; pin resolved IP for connection lifetime |
+| G2-SEC-H3-003 | Arbitrary file write via path traversal in http_client download | http_client_plugin.cpp:426 | **Fixed**: path traversal rejection + parent canonicalization |
+| G2-SEC-H4-001 | Command injection in certificates_plugin Linux (`parse_openssl_output`) | certificates_plugin.cpp:327 | **Fixed**: `is_safe_path()` validation before shell interpolation |
+| G2-SEC-H4-002 | Command injection in certificates_plugin macOS `delete_cert` thumbprint | certificates_plugin.cpp:698 | **Fixed**: `is_valid_thumbprint()` hex-only validation |
+| G2-SEC-H4-003 | Command injection in certificates_plugin macOS PEM echo to openssl | certificates_plugin.cpp:554 | **Fixed**: temp file approach replaces `echo '...'` pipe |
+| G2-SEC-H4-004 | Certificate deletion from ROOT store without authorization | certificates_plugin.cpp:772 | Documented; require confirm + RBAC elevation |
+| G2-SEC-H5-001 | TOCTOU in filesystem write allows base_dir escape for new files | filesystem_plugin.cpp:1505 | Documented; canonicalize parent, reconstruct path |
+| G2-SEC-H8-001 | script_exec unbounded output → agent OOM | script_exec_plugin.cpp:107 | Documented; 16 MB hard output cap needed |
+
+#### HIGH — Security (36 found, 2 fixed)
+
+| ID | Finding | File |
+|----|---------|------|
+| G2-SEC-G1-003 | Identity DB (agent.db) no file permission restrictions | identity_store.cpp:111 |
+| G2-SEC-G1-004 | No validation of CLI-provided agent_id format | identity_store.cpp:106 |
+| G2-SEC-G1-005 | Cert discovery doesn't verify private key file permissions | cert_discovery.cpp:37 |
+| G2-SEC-G1-006 | IMDS token unsanitized in HTTP headers (CRLF injection) | cloud_identity.cpp:209 |
+| G2-SEC-G2-003 | TOCTOU between SHA-256 hash check and dlopen | plugin_loader.cpp:253 |
+| G2-SEC-G2-004 | Plugin dir traversal via symlinks in recursive scan | plugin_loader.cpp:236 |
+| G2-SEC-G2-005 | `dispatch_` callback read without lock in `fire_trigger` | trigger_engine.cpp:144 |
+| G2-SEC-G2-006 | Updater no download size limit — disk fill DoS | updater.cpp:330 |
+| G2-SEC-G2-007 | Updater hash from same server as binary — single trust point | updater.cpp:264 |
+| G2-SEC-H3-004 | HTTP GET response body unbounded in memory | http_client_plugin.cpp:309 |
+| G2-SEC-H3-005 | SSRF bypass via redirect following (httplib defaults on) | http_client_plugin.cpp:234 |
+| G2-SEC-H3-006 | SSRF IP check missing 100.64/10, 198.18/15 ranges | http_client_plugin.cpp:62 |
+| G2-SEC-H3-007 | WiFi interface name injection into shell command | wifi_plugin.cpp:196 |
+| G2-SEC-H3-008 | Chargen 1ms min rate enables CPU/network exhaustion | chargen_plugin.cpp:101 |
+| G2-SEC-H4-005 | Command injection in bitlocker via crafted device name | bitlocker_plugin.cpp:129 |
+| G2-SEC-H4-006 | Quarantine bypass via ESTABLISHED,RELATED existing connections | quarantine_plugin.cpp:288 |
+| G2-SEC-H4-007 | macOS quarantine overwrites entire pf ruleset | quarantine_plugin.cpp:435 |
+| G2-SEC-H4-008 | Quarantine temp file race in /tmp (macOS) | quarantine_plugin.cpp:412 |
+| G2-SEC-H4-009 | IOC domain check only searches /etc/hosts (false negatives) | ioc_plugin.cpp:666 |
+| G2-SEC-H4-010 | Event logs sanitizer bypass allows filtered PowerShell injection | event_logs_plugin.cpp:94 |
+| G2-SEC-H4-011 | No thumbprint hex validation in certificates plugin | certificates_plugin.cpp:756 | **Fixed** (with H4-002) |
+| G2-SEC-H5-002 | content_dist upload_file reads arbitrary files without mandatory base_dir | content_dist_plugin.cpp:483 |
+| G2-SEC-H5-003 | No hash re-verification before executing staged content | content_dist_plugin.cpp:441 |
+| G2-SEC-H5-004 | Staging directory in /tmp with weak permissions | content_dist_plugin.cpp:51 |
+| G2-SEC-H6-001 | Unsanitized username in shell command (Linux lastlog) | users_plugin.cpp:366 |
+| G2-SEC-H7-001 | `command_exists()` uses `system()` — injection hazard | installed_apps_plugin.cpp:58 |
+| G2-SEC-H8-002 | script_exec child inherits full parent environment (secrets) | script_exec_plugin.cpp:205 |
+| G2-SEC-H8-003 | script_exec no working directory restriction | script_exec_plugin.cpp:160 |
+| G2-SEC-H8-004 | script_exec POSIX timeout doesn't kill process group | script_exec_plugin.cpp:239 |
+| G2-SEC-H8-005 | WMI null pointer crash in get_instance error paths | wmi_plugin.cpp:230 |
+| G2-SEC-H8-006 | WMI `is_select_only` trivially bypassable | wmi_plugin.cpp:68 |
+| G2-SEC-J1-001 | Prometheus label injection — no escaping | metrics.hpp:28 | **Fixed**: escape `\`, `"`, `\n` in label values |
+| G2-SEC-J1-002 | No null-check on plugin descriptor fields after load | plugin_loader.cpp:207 |
+| G2-SEC-J1-003 | Empty `agent_ids` = broadcast — dangerous proto3 default | management.proto:60 |
+| G3-ABI-J1-001 | No `reserved` field declarations in any proto message | All .proto |
+| G3-ABI-J1-002 | Plugin descriptor struct has no padding/struct_size for ABI evolution | plugin.h:74 |
+
+#### HIGH — Architecture & Correctness (Gate 3-4, 7 found, 3 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G3-ARCH-T3-001 | TriggerEngine never wired into agent — registration stubs silently succeed | agent.cpp:348 | Documented |
+| G3-ARCH-T3-002 | Stagger/delay sleep blocks thread pool workers — DoS on staggered dispatch | agent.cpp:908 | Documented |
+| G3-ARCH-T3-005 | Double plugin shutdown on normal exit — ABI contract violation | agent.cpp:480,1030 | **Fixed**: `plugins_.clear()` after explicit shutdown prevents double-call |
+| G4-UHP-T3-001 | No retry/reconnect on registration or stream failure — agent exits permanently | agent.cpp:667 | Documented |
+| G4-UHP-T3-002 | No command execution timeout — hanging plugin consumes worker forever | agent.cpp:972 | Documented |
+| G4-UHP-T3-007 | gRPC stream break loses all in-flight results; no reconnect | agent.cpp:840 | Documented |
+| G4-CON-T3-003 | Trigger registration stubs return success but do nothing (dup of ARCH-T3-001) | agent.cpp:348 | Documented |
+| G4-CON-T3-005 | Shared `plugin_ctx_` — all KV writes go to last-initialized plugin's namespace | agent.cpp:444 | **Fixed**: per-plugin `PluginContextImpl` with correct `plugin_name` |
+
+#### HIGH — Performance (Gate 3, 1 found, 1 fixed)
+
+| ID | Finding | File | Fix |
+|----|---------|------|-----|
+| G3-PERF-T3-003 | Histogram bucket double-counting — all histogram metrics incorrect | metrics.hpp:92 | **Fixed**: observe() now increments only first matching bucket |
+
+#### MEDIUM — Summary (52 total, by category)
+
+Key categories:
+- **Input validation** (14): Tag key allowlist unenforced, thumbprint hex, IP validation, service name @, registry username path traversal, WMI unbounded results, ping count, regex DoS bypass
+- **Resource exhaustion** (10): Unbounded output in 8+ plugins, KV store no quota, DNS cache unbounded, chargen rate
+- **Credential hygiene** (4): Enrollment token not zeroed, key path disclosed, child env inheritance, IMDS token unsanitized
+- **TOCTOU / symlinks** (5): Filesystem write, cert deletion, atomic write temp name, file trigger mtime
+- **Lock contention / threading** (6): Metrics triple-lock, tags plugin no mutex, trigger deadlock risk, COM init per-call
+- **Protocol / ABI** (5): secure_zero platform coverage, ScopeCondition.op is string, RUNNING=0 default, no calling convention annotation, context lifetime undocumented
+- **Information disclosure** (4): WiFi BSSID geolocation, proxy credentials, DNS cache browsing history, process cmdlines in TAR state
+- **HTTP/staging** (4): Plaintext HTTP downloads, BCrypt handle leak, predictable temp file, staging dir permissions
+
+#### LOW — Summary (~45 findings, not itemized)
+
+Categories: documentation gaps, dead code, informational observations, latent risks from shell command patterns with hardcoded inputs, minor inconsistencies, algorithm inefficiencies.
+
+### Tier 3 Chaos Scenarios (Gate 5)
+
+| ID | Severity | Chain | Findings | Status |
+|----|----------|-------|----------|--------|
+| CHAOS-T3-001 | CRITICAL | Full agent takeover via malicious plugin injection | G2-001+003+004, G2-002 | All UNFIXED |
+| CHAOS-T3-002 | CRITICAL | RCE via certificate plugin cmd injection (3 vectors) | H4-001/002/003/004, UHP-002 | **Partially fixed** — 3/5 constituents (cmd injection) fixed |
+| CHAOS-T3-003 | CRITICAL | Persistent compromise: SSRF + content staging + file write | H3-002/003/005, H5-003/004 | **Partially fixed** — H3-003 (path traversal) fixed |
+| CHAOS-T3-004 | HIGH | Fleet DoS: thread pool exhaustion + OOM + KV corruption | ARCH-002, H8-001, UHP-002, CON-005 | **Partially fixed** — CON-005 (KV namespace) fixed |
+| CHAOS-T3-005 | CRITICAL | Silent fleet downgrade + credential theft | G2-002, G1-001, H5-001 | All UNFIXED |
+| CHAOS-T3-006 | HIGH | Agent identity theft: key material + SSRF + no reconnect | G1-002, H3-002, UHP-001 | All UNFIXED |
+| CHAOS-T3-007 | HIGH | Cascading fleet blackout: server interruption → all agents exit | UHP-001, ARCH-002, UHP-002 | All UNFIXED |
+| CHAOS-T3-008 | HIGH | Trust anchor destruction: unauthorized cert purge + no reconnect | H4-004, H4-001/002/003, UHP-001 | **Partially fixed** — 3/5 constituents (cmd injection) fixed |
+| CHAOS-T3-009 | HIGH | MCP approval bypass via parameter injection chain | H3-003, CON-005, H3-002 | **Partially fixed** — H3-003 + CON-005 fixed (2/3) |
+
+### Fix Priority Matrix
+
+| Priority | Findings | Chaos Scenarios Broken |
+|----------|----------|----------------------|
+| **P0 (fix now)** | H4-001/002/003 (cmd injection in certs) | T3-002, T3-008 | **FIXED** |
+| **P0 (fix now)** | UHP-T3-001 (no reconnect) | T3-006, T3-007, T3-008 | Unfixed |
+| **P0 (fix now)** | H3-003 (path traversal in download) | T3-003, T3-009 | **FIXED** |
+| **P0 (fix now)** | CON-T3-005 (shared plugin_ctx_ KV corruption) | T3-004, T3-009 | **FIXED** |
+| **P1 (before release)** | G2-003 (TOCTOU hash-to-dlopen) | T3-001 | Unfixed |
+| **P1 (before release)** | ARCH-T3-002 (stagger blocks workers) | T3-004, T3-007 | Unfixed |
+| **P1 (before release)** | G2-002 (no downgrade protection) | T3-001, T3-005 | Unfixed |
+| **P1 (before release)** | H3-002 (DNS rebinding SSRF) | T3-003, T3-006, T3-009 | Unfixed |
+| **P1 (before release)** | PERF-T3-003 (histogram double-count) | Data correctness | **FIXED** |
+| **P2 (this sprint)** | UHP-T3-002 (no command timeout) | T3-002, T3-004, T3-007 | Unfixed |
+| **P2 (this sprint)** | G1-002 (key not zeroed) | T3-006 | Unfixed |
+| **P2 (this sprint)** | H5-003/004 (staging verification) | T3-003 | Unfixed |
+| **P2 (this sprint)** | H8-001 (script_exec OOM) | T3-004 | Unfixed |
+
+### Tier 3 Commits (2026-03-28 governance session)
+
+| Commit | Description | Files | Changes |
+|--------|-------------|-------|---------|
+| (pending) | Fix 10 Tier 3 findings: KV isolation, histogram, cmd injection, path traversal, label escaping, double shutdown | 6 | +281/-32 |
+
+**Files modified:**
+- `agents/core/src/agent.cpp` — Per-plugin `PluginContextImpl` for KV namespace isolation; double-shutdown prevention via `plugins_.clear()`; per-plugin context in shutdown paths
+- `agents/plugins/certificates/src/certificates_plugin.cpp` — `is_valid_thumbprint()` hex validation; `is_safe_path()` shell metachar check; temp file for macOS PEM parsing; thumbprint validation at action entry points
+- `agents/plugins/http_client/src/http_client_plugin.cpp` — Path traversal rejection (`..` components); parent directory canonicalization before file write
+- `sdk/include/yuzu/metrics.hpp` — Histogram `observe()` fixed to increment only first matching bucket; `escape_label_value()` for Prometheus label injection prevention
+- `tests/unit/test_metrics.cpp` — Updated histogram test expectations to match corrected bucket counting
+
+---
+
+## Remaining Work: Tier 4
 
 ### Tier 4 — Coverage & Completeness
 
@@ -336,3 +482,4 @@ Categories: retention policies, input validation, helper duplication, naming inc
 4. **Erlang gateway:** Pre-existing rebar3/OTP version issues on this box. Gateway compiles but CT suite needs live upstream.
 5. **Rate limits:** Session hit Claude API rate limits after ~50 agent invocations. Plan for 2-3 sessions to complete Tiers 2-4.
 6. **Documentation debt:** The 10 HIGH doc findings (24 undocumented endpoints) should be addressed in a dedicated docs session, not interleaved with code fixes.
+7. **Tier 3 volume:** 142 Gate 2 + 16 Gate 3 + 14 Gate 4 = ~170 findings (after dedup). 13 CRITICAL, ~43 HIGH, ~52 MEDIUM, ~45 LOW. Fix P0 findings first — they break 7 of 9 chaos scenarios.
