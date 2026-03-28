@@ -1245,10 +1245,18 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     if (yuzu::scope::evaluate(*parsed_expr, resolver))
                         matching.add(agent_id);
                 }
+                // Blast-radius guard: warn when scope matches many agents (G4-UHP-MCP-011)
+                constexpr size_t kMcpScopeWarnThreshold = 50;
+                bool scope_warning = matching.size() > kMcpScopeWarnThreshold;
+
                 auto obj = JObj()
                     .add("expression", expression)
                     .add("matched_count", static_cast<int64_t>(matching.size()))
                     .raw("matched_agents", matching.str());
+                if (scope_warning)
+                    obj.add("warning", "scope matches " + std::to_string(matching.size()) +
+                            " agents (>" + std::to_string(kMcpScopeWarnThreshold) +
+                            "). Phase 2 write operations targeting this scope will require approval.");
                 auto result = JObj().raw("content", JArr().add(JObj().add("type", "text").add("text", obj.str())).str()).str();
                 mcp_audit("success", expression);
                 res.set_content(success_response(id, result), "application/json");

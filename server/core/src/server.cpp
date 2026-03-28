@@ -2583,7 +2583,8 @@ public:
           agent_service_(registry_, event_bus_, cfg_.tls_enabled && !cfg_.tls_ca_cert.empty(),
                          auth_mgr, auto_approve_, metrics_, cfg_.gateway_mode),
           api_rate_limiter_(cfg_.rate_limit),
-          login_rate_limiter_(cfg_.login_rate_limit) {
+          login_rate_limiter_(cfg_.login_rate_limit),
+          mcp_rate_limiter_(std::max(cfg_.rate_limit / 5.0, 20.0)) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
@@ -5730,14 +5731,42 @@ private:
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
-                // Rate limiting — check before auth to protect against brute force
+                // Rate limiting — separate buckets for login, MCP, and general API (G4-UHP-MCP-008)
                 bool is_login = (req.path == "/login" && req.method == "POST");
-                auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
+                bool is_mcp = req.path.starts_with("/mcp/");
+                auto& limiter = is_login ? login_rate_limiter_
+                              : is_mcp   ? mcp_rate_limiter_
+                              :            api_rate_limiter_;
                 if (!limiter.allow(req.remote_addr)) {
                     res.status = 429;
                     res.set_header("Retry-After", "1");
                     res.set_content(R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})", "application/json");
                     return httplib::Server::HandlerResponse::Handled;
+                }
+
+                // CSRF protection: reject state-changing requests from foreign origins
+                // when authenticated via session cookie (G2-SEC-B1-005).
+                // API token auth (Bearer/X-Yuzu-Token) is naturally CSRF-immune.
+                if (req.method == "POST" || req.method == "PUT" || req.method == "DELETE") {
+                    auto origin = req.get_header_value("Origin");
+                    if (!origin.empty()) {
+                        auto scheme = cfg_.https_enabled ? "https" : "http";
+                        auto port = cfg_.https_enabled ? cfg_.https_port : cfg_.web_port;
+                        auto self1 = std::format("{}://{}:{}", scheme, cfg_.web_address, port);
+                        auto self2 = std::format("{}://localhost:{}", scheme, port);
+                        auto self3 = std::format("{}://127.0.0.1:{}", scheme, port);
+                        if (origin != self1 && origin != self2 && origin != self3) {
+                            // Foreign origin + no Bearer token = CSRF attempt
+                            auto bearer = req.get_header_value("Authorization");
+                            auto yuzu_tok = req.get_header_value("X-Yuzu-Token");
+                            if (bearer.empty() && yuzu_tok.empty()) {
+                                res.status = 403;
+                                res.set_content(R"({"error":{"code":403,"message":"CSRF: origin mismatch"},"meta":{"api_version":"v1"}})",
+                                                "application/json");
+                                return httplib::Server::HandlerResponse::Handled;
+                            }
+                        }
+                    }
                 }
 
                 // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
@@ -11395,6 +11424,7 @@ private:
     // Rate limiting
     RateLimiter api_rate_limiter_;
     RateLimiter login_rate_limiter_;
+    RateLimiter mcp_rate_limiter_;
 };
 
 // -- Factory ------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <shared_mutex>
 #include <string>
 
 namespace yuzu::server {
@@ -34,6 +35,7 @@ public:
 
 private:
     sqlite3* db_;
+    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
 };
 
 } // namespace yuzu::server

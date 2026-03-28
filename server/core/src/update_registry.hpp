@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <shared_mutex>
 #include <vector>
 
 namespace yuzu::server {
@@ -47,6 +48,7 @@ public:
 
 private:
     sqlite3* db_{nullptr};
+    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
     std::filesystem::path update_dir_;
     void create_tables();
 };
