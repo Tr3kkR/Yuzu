@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -123,6 +125,17 @@ private:
     /// Collect all role names for a user (direct + via group membership).
     /// Caller must hold at least a shared lock on mtx_.
     std::vector<std::string> collect_roles_locked(const std::string& username) const;
+
+    // Permission cache (G3-PERF-004): avoids 2+ SQL queries per REST request.
+    // Invalidated by incrementing cache_generation_ on any permission/role mutation.
+    mutable std::mutex cache_mtx_;
+    mutable std::unordered_map<std::string, bool> perm_cache_; // "user:type:op" -> allow/deny
+    mutable uint64_t cache_generation_{0};
+    uint64_t write_generation_{0}; // bumped on mutations; cache cleared when mismatch
+
+    void invalidate_perm_cache();
+    std::string perm_cache_key(const std::string& user, const std::string& type,
+                               const std::string& op) const;
 };
 
 } // namespace yuzu::server

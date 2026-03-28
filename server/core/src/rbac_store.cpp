@@ -610,6 +610,7 @@ std::expected<void, std::string> RbacStore::set_permission(const Permission& per
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE)
         return std::unexpected(sqlite3_errmsg(db_));
+    invalidate_perm_cache();
     return {};
 }
 
@@ -630,6 +631,7 @@ std::expected<void, std::string> RbacStore::remove_permission(const std::string&
     sqlite3_bind_text(s, 3, operation.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    invalidate_perm_cache();
     return {};
 }
 
@@ -701,6 +703,7 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
     sqlite3_finalize(s);
     if (rc != SQLITE_DONE)
         return std::unexpected(sqlite3_errmsg(db_));
+    invalidate_perm_cache();
     return {};
 }
 
@@ -721,6 +724,7 @@ std::expected<void, std::string> RbacStore::unassign_role(const std::string& pri
     sqlite3_bind_text(s, 3, role_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    invalidate_perm_cache();
     return {};
 }
 
@@ -868,8 +872,34 @@ std::vector<std::string> RbacStore::collect_roles_locked(const std::string& user
     return roles;
 }
 
+std::string RbacStore::perm_cache_key(const std::string& user, const std::string& type,
+                                      const std::string& op) const {
+    return user + ":" + type + ":" + op;
+}
+
+void RbacStore::invalidate_perm_cache() {
+    std::lock_guard lock(cache_mtx_);
+    perm_cache_.clear();
+    ++write_generation_;
+}
+
 bool RbacStore::check_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation) const {
+    // Fast path: check permission cache (G3-PERF-004)
+    auto key = perm_cache_key(username, securable_type, operation);
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        if (cache_generation_ == write_generation_) {
+            auto it = perm_cache_.find(key);
+            if (it != perm_cache_.end())
+                return it->second;
+        } else {
+            // Mutations happened since last cache read — clear stale entries
+            perm_cache_.clear();
+            cache_generation_ = write_generation_;
+        }
+    }
+
     std::shared_lock lock(mtx_);
     if (!db_)
         return false;
@@ -910,6 +940,13 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
             has_allow = true;
     }
     sqlite3_finalize(s);
+
+    // Store result in cache
+    {
+        std::lock_guard cache_lock(cache_mtx_);
+        if (cache_generation_ == write_generation_)
+            perm_cache_[key] = has_allow;
+    }
     return has_allow;
 }
 

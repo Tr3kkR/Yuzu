@@ -10500,7 +10500,7 @@ private:
                 // Condition evaluator using compliance_eval
                 auto condition_fn = [](const std::string& expression,
                                        const std::map<std::string, std::string>& fields) -> bool {
-                    return evaluate_compliance(expression, fields);
+                    return evaluate_compliance_bool(expression, fields);
                 };
 
                 auto result = workflow_engine_->execute(

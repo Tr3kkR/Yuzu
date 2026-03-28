@@ -93,6 +93,44 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     if (submitted_by.empty())
         return std::unexpected("submitted_by is required");
 
+    std::lock_guard lock(mtx_);
+
+    // Queue size limit: prevent unbounded growth (G4-UHP-MCP-004)
+    constexpr int kMaxPendingApprovals = 1000;
+    {
+        sqlite3_stmt* cnt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'",
+                               -1, &cnt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(cnt) == SQLITE_ROW) {
+                int pending = sqlite3_column_int(cnt, 0);
+                if (pending >= kMaxPendingApprovals) {
+                    sqlite3_finalize(cnt);
+                    return std::unexpected("approval queue is full (" +
+                                           std::to_string(kMaxPendingApprovals) + " pending)");
+                }
+            }
+            sqlite3_finalize(cnt);
+        }
+    }
+
+    // Expire stale pending approvals older than 7 days
+    constexpr int64_t k7Days = 7 * 24 * 3600;
+    {
+        auto cutoff = now_epoch() - k7Days;
+        sqlite3_stmt* exp = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "UPDATE approvals SET status = 'expired' "
+                               "WHERE status = 'pending' AND submitted_at < ?",
+                               -1, &exp, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(exp, 1, cutoff);
+            sqlite3_step(exp);
+            auto expired = sqlite3_changes(db_);
+            sqlite3_finalize(exp);
+            if (expired > 0)
+                spdlog::info("ApprovalManager: expired {} stale pending approvals", expired);
+        }
+    }
+
     auto id = generate_id();
     auto ts = now_epoch();
 
