@@ -7,6 +7,7 @@
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "response_store.hpp"
+#include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "web_utils.hpp"
@@ -388,6 +389,7 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
                 sr.output = resp.output();
+                sr.plugin = plugin;
                 response_store_->store(sr);
             }
 
@@ -407,11 +409,13 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
 
             // Store completion response
             if (response_store_) {
+                auto plugin_name = extract_plugin(resp.command_id());
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
                 sr.output = resp.output();
+                sr.plugin = plugin_name;
                 if (resp.has_error()) {
                     sr.error_detail = resp.error().message();
                 }
@@ -560,6 +564,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.agent_id = agent_id;
             sr.status = static_cast<int>(resp.status());
             sr.output = resp.output();
+            sr.plugin = plugin;
             response_store_->store(sr);
         }
 
@@ -577,11 +582,13 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                      resp.command_id(), static_cast<int>(resp.status()), resp.exit_code());
 
         if (response_store_) {
+            auto gw_plugin = extract_plugin(resp.command_id());
             StoredResponse sr;
             sr.instruction_id = resp.command_id();
             sr.agent_id = agent_id;
             sr.status = static_cast<int>(resp.status());
             sr.output = resp.output();
+            sr.plugin = gw_plugin;
             if (resp.has_error()) {
                 sr.error_detail = resp.error().message();
             }
@@ -659,35 +666,11 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
 }
 
 // -- SSE row helpers ----------------------------------------------------------
-
-const std::vector<std::string>& AgentServiceImpl::columns_for_plugin(const std::string& plugin) {
-    static const std::unordered_map<std::string, std::vector<std::string>> kSchemas{
-        {"chargen",          {"Agent", "Output"}},
-        {"procfetch",        {"Agent", "PID", "Name", "Path", "SHA-1"}},
-        {"netstat",          {"Agent", "Proto", "Local Addr", "Local Port",
-                              "Remote Addr", "Remote Port", "State", "PID"}},
-        {"sockwho",          {"Agent", "PID", "Name", "Path", "Proto",
-                              "Local Addr", "Local Port", "Remote Addr", "Remote Port", "State"}},
-        {"vuln_scan",        {"Agent", "Severity", "Category", "Title", "Detail"}},
-    };
-    // key|value schema plugins
-    static const std::vector<std::string> kKeyValue{"Agent", "Key", "Value"};
-    static const std::unordered_set<std::string> kKeyValuePlugins{
-        "status", "device_identity", "os_info", "hardware", "users",
-        "installed_apps", "msi_packages", "network_config", "diagnostics",
-        "agent_actions", "processes", "services", "filesystem",
-        "network_diag", "network_actions", "firewall", "antivirus",
-        "bitlocker", "windows_updates", "event_logs", "sccm",
-        "script_exec", "software_actions"};
-
-    auto it = kSchemas.find(plugin);
-    if (it != kSchemas.end()) return it->second;
-    if (kKeyValuePlugins.contains(plugin)) return kKeyValue;
-    return kDefaultColumns;
-}
+// Parsing utilities are in result_parsing.hpp.  Thin delegators kept here for
+// API compatibility (thead_for_plugin is called from server.cpp).
 
 std::string AgentServiceImpl::thead_for_plugin(const std::string& plugin) {
-    auto& cols = columns_for_plugin(plugin);
+    auto& cols = yuzu::server::columns_for_plugin(plugin);
     std::string html = "<tr>";
     for (size_t i = 0; i < cols.size(); ++i) {
         html += (i == 0) ? "<th class=\"col-agent\">" : "<th>";
@@ -698,66 +681,11 @@ std::string AgentServiceImpl::thead_for_plugin(const std::string& plugin) {
     return html;
 }
 
-size_t AgentServiceImpl::find_unescaped_pipe(const std::string& s, size_t pos) {
-    while (pos < s.size()) {
-        auto p = s.find('|', pos);
-        if (p == std::string::npos) return std::string::npos;
-        if (p > 0 && s[p - 1] == '\\') { pos = p + 1; continue; }
-        return p;
-    }
-    return std::string::npos;
-}
-
-std::string AgentServiceImpl::unescape_pipes(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '|') continue;
-        out += s[i];
-    }
-    return out;
-}
-
-std::vector<std::string> AgentServiceImpl::split_fields(const std::string& plugin,
-                                                         const std::string& line) {
-    // vuln_scan: severity|category|title|detail (4+ fields, last is remainder)
-    if (plugin == "vuln_scan") {
-        std::vector<std::string> parts;
-        size_t pos = 0;
-        for (int i = 0; i < 3; ++i) {
-            auto p = find_unescaped_pipe(line, pos);
-            if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); return parts; }
-            parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-            pos = p + 1;
-        }
-        parts.push_back(unescape_pipes(line.substr(pos))); // remainder = detail
-        return parts;
-    }
-    // key|value plugins: split into exactly 2 (key, rest)
-    auto& cols = columns_for_plugin(plugin);
-    if (cols.size() == 3) { // Agent + Key + Value
-        auto sep = find_unescaped_pipe(line, 0);
-        if (sep != std::string::npos)
-            return {unescape_pipes(line.substr(0, sep)), unescape_pipes(line.substr(sep + 1))};
-        return {unescape_pipes(line), ""};
-    }
-    // Default: split on all pipes
-    std::vector<std::string> parts;
-    size_t pos = 0;
-    while (pos <= line.size()) {
-        auto p = find_unescaped_pipe(line, pos);
-        if (p == std::string::npos) { parts.push_back(unescape_pipes(line.substr(pos))); break; }
-        parts.push_back(unescape_pipes(line.substr(pos, p - pos)));
-        pos = p + 1;
-    }
-    return parts;
-}
-
 std::string AgentServiceImpl::render_row(const std::string& agent_name,
                                           const std::string& plugin,
                                           const std::string& line,
                                           const std::vector<std::string>& col_names) {
-    auto fields = split_fields(plugin, line);
+    auto fields = yuzu::server::split_fields(plugin, line);
 
     // Build cells: agent_name + fields
     std::vector<std::string> cells;
@@ -796,27 +724,19 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id,
                                             const std::string& raw_output) {
     if (raw_output.empty()) return;
     auto agent_name = registry_.display_name(agent_id);
-    auto& col_names = columns_for_plugin(plugin);
-    size_t pos = 0;
-    while (pos < raw_output.size()) {
-        auto nl = raw_output.find('\n', pos);
-        std::string line = (nl == std::string::npos)
-                               ? raw_output.substr(pos)
-                               : raw_output.substr(pos, nl - pos);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) {
-            auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-            auto html = render_row(agent_name, plugin, line, col_names);
-            // OOB: live row count
-            html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
-            html += std::to_string(count);
-            html += "</span>";
-            // OOB: remove empty-state placeholder on first row only
-            if (count == 1)
-                html += "<tr id=\"empty-row\" hx-swap-oob=\"delete\"></tr>";
-            bus_.publish("output", html);
-        }
-        pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
+    auto& col_names = yuzu::server::columns_for_plugin(plugin);
+    auto lines = yuzu::server::split_output_lines(raw_output);
+    for (const auto& line : lines) {
+        auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto html = render_row(agent_name, plugin, line, col_names);
+        // OOB: live row count
+        html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
+        html += std::to_string(count);
+        html += "</span>";
+        // OOB: remove empty-state placeholder on first row only
+        if (count == 1)
+            html += "<tr id=\"empty-row\" hx-swap-oob=\"delete\"></tr>";
+        bus_.publish("output", html);
     }
 }
 

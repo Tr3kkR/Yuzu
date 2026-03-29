@@ -12,6 +12,7 @@ extern const char* const kDashboardIndexHtml =
   <title>Yuzu — Dashboard</title>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+  <script>htmx.config.useTemplateFragments = true;</script>
   <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" integrity="sha384-fw+eTlCc7suMV/1w/7fr2/PmwElUIt5i82bi+qTiLXvjRXZ2/FkiTNA/w0MhXnGI" crossorigin="anonymous"></script>
   <style>
     body {
@@ -112,6 +113,68 @@ extern const char* const kDashboardIndexHtml =
       background: var(--surface);
     }
     .results-header h2 { font-size: 0.85rem; font-weight: 600; }
+
+    /* Filter bar */
+    .filter-bar {
+      display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+      padding: 0.4rem 1rem; background: var(--surface);
+      border-bottom: 1px solid var(--border); font-size: 0.75rem;
+    }
+    .filter-bar label { color: #8b949e; font-weight: 600; font-size: 0.65rem; text-transform: uppercase; }
+    .filter-bar select, .filter-bar input[type="text"], .filter-bar input[type="search"] {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.75rem;
+      font-family: var(--font-mono);
+    }
+    .filter-bar select:focus, .filter-bar input:focus { border-color: #58a6ff; outline: none; }
+
+    /* Sortable column headers */
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: #58a6ff; }
+
+    /* Pagination */
+    #result-pagination {
+      display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.4rem 1rem; font-size: 0.75rem; color: #8b949e;
+    }
+    .btn-page {
+      background: var(--surface); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer;
+    }
+    .btn-page:hover { border-color: #58a6ff; color: #58a6ff; }
+
+    /* Group creation */
+    .btn-create-group {
+      background: #238636; color: #fff; border: none; border-radius: 4px;
+      padding: 0.25rem 0.6rem; font-size: 0.7rem; cursor: pointer; margin-left: 0.5rem;
+    }
+    .btn-create-group:hover { background: #2ea043; }
+    .create-group-form {
+      display: flex; align-items: center; gap: 0.5rem;
+      padding: 0.5rem 1rem; font-size: 0.75rem;
+    }
+    .create-group-form input[type="text"] {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.75rem;
+    }
+    .create-group-form button {
+      background: #238636; color: #fff; border: none; border-radius: 4px;
+      padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;
+    }
+    .form-hint { color: #8b949e; font-size: 0.7rem; }
+    .feedback-error { color: #f85149; font-size: 0.75rem; }
+
+    /* Scope section headers */
+    .scope-section-header {
+      padding: 0.3rem 0.75rem; font-size: 0.6rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.05em; color: #484f58;
+      border-top: 1px solid var(--border); margin-top: 0.25rem;
+    }
+
+    /* HTMX indicator */
+    .htmx-indicator { display: none; }
+    .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: block; }
+
     .table-wrap {
       flex: 1; overflow-y: auto;
     }
@@ -290,25 +353,29 @@ extern const char* const kDashboardIndexHtml =
   <div class="dashboard-grid">
 
   <!-- ── Instruction Bar ────────────────────────────────────── -->
-  <div class="instr-bar">
+  <form class="instr-bar" id="instr-form"
+        hx-post="/api/dashboard/execute" hx-swap="none"
+        hx-on::before-request="closeAC()">
     <label>Instruction</label>
     <div class="instr-wrap">
-      <input type="text" id="instr-input" placeholder="Type a command or 'help'..."
+      <input type="text" id="instr-input" name="instruction"
+             placeholder="Type a command or 'help'..."
              autocomplete="off" spellcheck="false"
-             name="q" hx-get="/api/help/autocomplete" hx-trigger="input changed delay:150ms"
+             hx-get="/api/help/autocomplete" hx-trigger="input changed delay:150ms"
              hx-target="#ac-list" hx-swap="innerHTML">
       <div class="ac-list" id="ac-list"></div>
     </div>
-    <button id="btn-send" onclick="sendInstruction()">Send</button>
+    <input type="hidden" name="scope" id="scope-input" value="__all__">
+    <button type="submit" id="btn-send">Send</button>
     <span id="status-badge" class="badge-idle">IDLE</span>
-    <button class="btn-clear" onclick="clearResults()">Clear</button>
+    <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
     <div class="stats">
       <span>Rows: <strong id="row-count">0</strong></span>
       <span>Network: <strong id="stat-network">&mdash;</strong></span>
       <span>Agent: <strong id="stat-agent">&mdash;</strong></span>
       <span>Total: <strong id="stat-total">&mdash;</strong></span>
     </div>
-  </div>
+  </form>
 
   <!-- ── About Modal ──────────────────────────────────────── -->
   <div class="modal-overlay" id="about-modal" onclick="closeAbout(event)">
@@ -368,6 +435,7 @@ extern const char* const kDashboardIndexHtml =
     <div class="results-header">
       <h2>Results</h2>
       <span id="result-context" style="font-size:0.75rem;color:#8b949e"></span>
+      <div id="result-summary" style="font-size:0.75rem;color:#8b949e"></div>
       <span style="flex:1"></span>
       <button class="density-toggle" id="density-toggle" onclick="toggleDensity()" title="Toggle table density">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -376,6 +444,10 @@ extern const char* const kDashboardIndexHtml =
         <span id="density-label">Comfortable</span>
       </button>
     </div>
+    <!-- Filter bar — populated by OOB swap after command dispatch -->
+    <div id="filter-bar"></div>
+    <!-- Loading indicator for HTMX filter/sort requests -->
+    <div id="results-loading" class="htmx-indicator" style="padding:0.5rem;color:var(--muted);font-size:0.75rem">Loading...</div>
     <div class="table-wrap" hx-ext="sse" sse-connect="/events">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
@@ -395,6 +467,9 @@ extern const char* const kDashboardIndexHtml =
       <div sse-swap="agent-offline" hx-swap="none" style="display:none"
            hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
     </div>
+    <!-- Pagination + group creation slot — populated by OOB swaps -->
+    <nav id="result-pagination"></nav>
+    <div id="group-form-slot"></div>
   </div>
 
   <!-- ── Scope Panel ────────────────────────────────────────── -->
@@ -594,7 +669,11 @@ extern const char* const kDashboardIndexHtml =
       var items = document.querySelectorAll('.scope-item');
       for (var i = 0; i < items.length; i++) items[i].classList.remove('selected');
       el.classList.add('selected');
-      selectedScope = el.getAttribute('data-agent-id');
+      // Support both data-agent-id (legacy) and data-scope (groups, new items)
+      selectedScope = el.getAttribute('data-scope') || el.getAttribute('data-agent-id');
+      // Sync hidden input for HTMX form submission
+      var scopeInput = document.getElementById('scope-input');
+      if (scopeInput) scopeInput.value = selectedScope;
     }
 
     /* refreshAgentList / renderAgentList removed — scope panel is now
@@ -608,84 +687,15 @@ extern const char* const kDashboardIndexHtml =
       return agentId || '?';
     }
 
-    /* ── Send instruction ─────────────────────────────────── */
-    function showHelp() {
-      clearResults();
-      setBadge('idle');
-      document.body.dispatchEvent(new Event('loadHelp'));
-    }
+    /* showHelp() removed — help is now handled server-side:
+       POST /api/dashboard/execute returns HX-Trigger: {"loadHelp": true}
+       which triggers the declarative #help-trigger element. */
 
 )HTM"
     R"HTM(
-    function sendInstruction() {
-      var input = document.getElementById('instr-input');
-      var raw = input.value.trim().toLowerCase();
-      if (!raw) return;
-      closeAC();
-
-      /* Built-in help command — triggers declarative HTMX element */
-      if (raw === 'help' || raw.startsWith('help ')) {
-        showHelp();
-        return;
-      }
-
-      var mapped = instructionMap[raw];
-      if (!mapped) {
-        setBadge('error');
-        document.getElementById('result-context').textContent =
-          'Unknown command: "' + raw + '". Type "help" to list all commands.';
-        return;
-      }
-
-      currentInstruction = raw;
-
-      clearResults();
-
-      /* Determine target agent IDs */
-      var agentIds = [];
-      if (selectedScope !== '__all__') {
-        agentIds.push(selectedScope);
-      }
-
-      var scopeLabel = selectedScope === '__all__' ? 'all agents' : agentDisplayName(selectedScope);
-      addHistory(raw, scopeLabel);
-
-      var payload = JSON.stringify({
-        plugin:    mapped.plugin,
-        action:    mapped.action,
-        agent_ids: agentIds
-      });
-
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/api/command');
-      xhr.setRequestHeader('Content-Type', 'application/json');
-      xhr.onload = function() {
-        if (xhr.status === 200) {
-          setBadge('running');
-          document.getElementById('result-context').textContent = raw + ' → scope: ' + scopeLabel;
-          try {
-            var rj = JSON.parse(xhr.responseText);
-            /* Server returns thead_html for this plugin's column schema */
-            if (rj.thead_html) {
-              document.getElementById('results-thead').innerHTML = rj.thead_html;
-            }
-            showToast('Command sent to ' + (rj.agents_reached || '?') + ' agent(s)', 'success');
-          } catch(_) { showToast('Command sent', 'success'); }
-        } else {
-          setBadge('error');
-          try {
-            var err = JSON.parse(xhr.responseText);
-            var emsg = (err.error && err.error.message) ? err.error.message : 'Command failed';
-            document.getElementById('result-context').textContent = emsg;
-            showToast(emsg, 'error');
-          } catch(e) {
-            document.getElementById('result-context').textContent = 'Command failed (HTTP ' + xhr.status + ')';
-            showToast('Command failed (HTTP ' + xhr.status + ')', 'error');
-          }
-        }
-      };
-      xhr.send(payload);
-    }
+    /* sendInstruction() removed — instruction bar is now an HTMX form
+       (hx-post="/api/dashboard/execute"). Server resolves instruction text,
+       dispatches, and returns OOB swaps for thead, tbody, filter bar, badge. */
 
     /* ── Command history ─────────────────────────────────── */
     function addHistory(cmd, scope) {
