@@ -43,6 +43,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
@@ -2030,72 +2031,7 @@ private:
                             "application/json");
         });
 
-        // -- Scope panel fragment (HTMX polling) --------------------------------
-
-        web_server_->Get("/fragments/scope-list", [this](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            auto session = require_auth(req, res);
-            if (!session) return;
-
-            std::string selected = req.get_param_value("selected");
-            if (selected.empty()) selected = "__all__";
-
-            auto agents_arr = get_visible_agents_json(session->username);
-
-            // Sort by agent_id
-            std::sort(agents_arr.begin(), agents_arr.end(),
-                      [](const nlohmann::json& a, const nlohmann::json& b) {
-                          return a.value("agent_id", "") < b.value("agent_id", "");
-                      });
-
-            std::string html;
-            html.reserve(agents_arr.size() * 400 + 2048);
-
-            // "All Agents" item
-            html += "<div class=\"scope-item";
-            if (selected == "__all__") html += " selected";
-            html += "\" data-agent-id=\"__all__\" onclick=\"selectScope(this)\">"
-                    "<span class=\"scope-item-name scope-item-all\">All Agents</span>"
-                    "<span class=\"scope-item-meta\">Broadcast to every connected agent</span>"
-                    "</div>";
-
-            // Individual agents
-            for (const auto& a : agents_arr) {
-                auto id = a.value("agent_id", "");
-                auto hostname = a.value("hostname", "");
-                auto os = a.value("os", "?");
-                auto arch = a.value("arch", "?");
-                auto version = a.value("agent_version", "");
-                auto short_id = (id.size() > 12) ? id.substr(0, 12) : id;
-
-                html += "<div class=\"scope-item";
-                if (selected == id) html += " selected";
-                html += "\" data-agent-id=\"" + html_escape(id) +
-                        "\" onclick=\"selectScope(this)\">"
-                        "<span class=\"scope-item-name\"><span class=\"online-dot\"></span>" +
-                        html_escape(hostname.empty() ? id : hostname) +
-                        "</span><span class=\"scope-item-meta\">" +
-                        html_escape(short_id) + " &middot; " +
-                        html_escape(os) + "/" + html_escape(arch) +
-                        (version.empty() ? "" : " &middot; v" + html_escape(version)) +
-                        "</span></div>";
-            }
-
-            // OOB: agent count badge
-            auto count = agents_arr.size();
-            html += "<span id=\"agent-count\" hx-swap-oob=\"true\">" +
-                    std::to_string(count) + " agent" +
-                    (count != 1u ? "s" : "") + "</span>";
-
-            // Hidden data carrier — bridges agent JSON to client-side JS state
-            html += "<div id=\"scope-data\" data-agents=\"" +
-                    html_escape(agents_arr.dump()) +
-                    "\" style=\"display:none\"></div>";
-
-            res.set_content(html, "text/html");
-        });
+        // /fragments/scope-list — moved to DashboardRoutes (with groups support)
 
         web_server_->Get("/api/help", [this](const httplib::Request& req, httplib::Response& res) {
             if (!require_permission(req, res, "Infrastructure", "Read"))
@@ -2257,8 +2193,17 @@ private:
             auto scope_expr = extract_json_string(req.body, "scope");
 
             int sent = 0;
-            if (!scope_expr.empty()) {
-                // Scope-based dispatch
+            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                // Group-based dispatch — resolve group members
+                auto group_id = scope_expr.substr(6);
+                if (mgmt_group_store_) {
+                    auto members = mgmt_group_store_->get_members(group_id);
+                    for (const auto& m : members) {
+                        if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                    }
+                }
+            } else if (!scope_expr.empty()) {
+                // Scope expression dispatch
                 auto parsed = yuzu::scope::parse(scope_expr);
                 if (!parsed) {
                     res.status = 400;
@@ -4047,6 +3992,91 @@ private:
             policy_store_.get(),
             [this]() -> std::string { return registry_.to_json(); });
 
+        // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
+        //                   /fragments/create-group-form, /api/dashboard/group-from-results
+        dashboard_routes_ = std::make_unique<DashboardRoutes>();
+        dashboard_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            response_store_.get(),
+            mgmt_group_store_.get(),
+            &registry_,
+            tag_store_.get(),
+            &event_bus_,
+            [this]() -> std::string { return registry_.to_json(); },
+            // DispatchFn — reuses /api/command dispatch logic
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids,
+                   const std::string& scope_expr) -> std::pair<std::string, int> {
+                auto command_id = plugin + "-" +
+                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin(plugin);
+                cmd.set_action(action);
+                agent_service_.record_send_time(command_id);
+
+                int sent = 0;
+                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                    auto group_id = scope_expr.substr(6);
+                    if (mgmt_group_store_) {
+                        auto members = mgmt_group_store_->get_members(group_id);
+                        for (const auto& m : members) {
+                            if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                        }
+                    }
+                } else if (!scope_expr.empty()) {
+                    auto parsed = yuzu::scope::parse(scope_expr);
+                    if (parsed) {
+                        auto matched = registry_.evaluate_scope(
+                            *parsed, tag_store_.get(), custom_properties_store_.get());
+                        for (const auto& aid : matched) {
+                            if (registry_.send_to(aid, cmd)) ++sent;
+                        }
+                    }
+                } else if (agent_ids.empty()) {
+                    sent = registry_.send_to_all(cmd);
+                } else {
+                    for (const auto& aid : agent_ids) {
+                        if (registry_.send_to(aid, cmd)) ++sent;
+                    }
+                }
+
+                forward_gateway_pending();
+
+                if (sent > 0) {
+                    metrics_.counter("yuzu_commands_dispatched_total").increment();
+                    event_bus_.publish("command-status",
+                        "<span id=\"status-badge\" class=\"badge-running\""
+                        " hx-swap-oob=\"outerHTML\">RUNNING</span>");
+                }
+                return {command_id, sent};
+            },
+            // ResolveFn — resolve instruction text → (plugin, action)
+            [this](const std::string& text) -> std::pair<std::string, std::string> {
+                auto help = registry_.help_json();
+                auto data = nlohmann::json::parse(help, nullptr, false);
+                if (!data.is_object() || !data.contains("plugins")) return {"", ""};
+                for (const auto& p : data["plugins"]) {
+                    auto pname = p.value("name", "");
+                    auto& actions = p["actions"];
+                    // "plugin" alone → first action
+                    if (text == pname && !actions.empty()) {
+                        auto aname = actions[0].is_string()
+                                         ? actions[0].get<std::string>()
+                                         : actions[0].value("name", "");
+                        return {pname, aname};
+                    }
+                    // "plugin action" → specific action
+                    for (const auto& a : actions) {
+                        auto aname = a.is_string() ? a.get<std::string>()
+                                                    : a.value("name", "");
+                        if (text == pname + " " + aname) return {pname, aname};
+                    }
+                }
+                return {"", ""};
+            });
+
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
         workflow_routes_ = std::make_unique<WorkflowRoutes>();
@@ -4356,6 +4386,7 @@ private:
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
     std::unique_ptr<WebhookRoutes> webhook_routes_;

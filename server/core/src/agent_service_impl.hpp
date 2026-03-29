@@ -79,15 +79,11 @@ public:
                                    const pb::CommandResponse& resp);
 
     // -- Server-rendered SSE row helpers ----------------------------------------
+    // Parsing utilities (columns_for_plugin, split_fields, etc.) are in
+    // result_parsing.hpp.  Only rendering helpers that depend on AgentServiceImpl
+    // state remain here.
 
-    static inline const std::vector<std::string> kDefaultColumns{"Agent", "Output"};
-
-    static const std::vector<std::string>& columns_for_plugin(const std::string& plugin);
     static std::string thead_for_plugin(const std::string& plugin);
-    static size_t find_unescaped_pipe(const std::string& s, size_t pos);
-    static std::string unescape_pipes(const std::string& s);
-    static std::vector<std::string> split_fields(const std::string& plugin,
-                                                  const std::string& line);
     static std::string render_row(const std::string& agent_name,
                                    const std::string& plugin,
                                    const std::string& line,
