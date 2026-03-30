@@ -78,6 +78,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
+## [0.7.0] - 2026-03-30
+
+### Added
+
+#### Gateway
+- Gateway defaults moved to own port range (5006x) — server, gateway, and agent can now run on the same box without port overrides
+  - Agent-facing gRPC: 50051 → 50061
+  - Management gRPC: 50052/50053 → 50063
+  - Health HTTP: 8080 → 8081 (consistent across dev and prod configs)
+- UAT enrollment token automatically saved to `/tmp/yuzu-uat/enrollment-token` for CT suite consumption
+
+#### Server
+- Semantic YAML syntax highlighting in the Instructions editor preview pane
+  - `type: question` renders green, `type: action` orange, `approval: required` red, `concurrency: single/serial` yellow
+  - Color legend now matches actual preview output
+- YAML editor value color changed from near-blue (#a5d6ff) to gray-white (#c9d1d9) for clearer key/value contrast
+
+#### Infrastructure
+- Linux UAT script (`scripts/linux-start-UAT.sh`) with full server-gateway-agent stack, 6 automated connectivity and command round-trip tests
+- `real_upstream_SUITE` CT suite auto-reads enrollment token from UAT environment (no manual token setup needed)
+
+### Fixed
+- YAML editor preview now triggers on paste events (changed HTMX trigger from `keyup` to `input` for cross-browser compatibility with Safari/context-menu paste)
+- Stale database directories no longer break session authentication on server restart (UAT script wipes state on each run)
+- Help command display and result table clearing on HTMX dashboard
+- Enrollment token `max_uses` increased from 10 to 1000 to support CT suite test runs
+
 ## [0.6.0] - 2026-03-28
 
 ### Changed (Architecture — God Object Decomposition)
