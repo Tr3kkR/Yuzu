@@ -166,6 +166,72 @@ TAR is designed for minimal performance overhead:
 - **Automatic purge**: old events are removed hourly based on the retention setting
 - **WAL mode**: SQLite Write-Ahead Logging ensures reads never block writes
 
+## Warehouse Query System
+
+TAR includes a typed data warehouse that replaces the legacy flat `tar_events` table with structured, tiered tables optimized for different query time horizons.
+
+### Warehouse tables
+
+Table names use `$`-prefixed identifiers (e.g., `$Process_Live`) which the agent translates to real SQLite table names at execution time. There are four capture sources, each with multiple granularity tiers:
+
+| Source | Live | Hourly | Daily | Monthly |
+|--------|:----:|:------:|:-----:|:-------:|
+| **Process** | `$Process_Live` (5000 rows) | `$Process_Hourly` (24h) | `$Process_Daily` (31d) | `$Process_Monthly` (12mo) |
+| **TCP** | `$TCP_Live` (5000 rows) | `$TCP_Hourly` (24h) | `$TCP_Daily` (31d) | `$TCP_Monthly` (12mo) |
+| **Service** | `$Service_Live` (5000 rows) | `$Service_Hourly` (24h) | -- | -- |
+| **User** | `$User_Live` (5000 rows) | -- | `$User_Daily` (31d) | -- |
+
+- **Live** tables hold the most recent raw events with a 5000-row cap (oldest rows are evicted).
+- **Hourly** tables aggregate counts and summaries per hour, retained for 24 hours.
+- **Daily** tables aggregate per day, retained for 31 days.
+- **Monthly** tables aggregate per month, retained for 12 months.
+- Service only has live and hourly tiers. User only has live and daily tiers.
+
+### Key columns by table type
+
+**Process tables:** `ts`, `name`, `pid`, `ppid`, `cmdline`, `user`, `action` (started/stopped). Aggregated tiers add `start_count`, `stop_count`.
+
+**TCP tables:** `ts`, `process_name`, `pid`, `remote_addr`, `remote_port`, `local_port`, `proto`, `state`. Aggregated tiers add `connect_count`.
+
+**Service tables:** `ts`, `name`, `status`, `prev_status`, `action` (started/stopped/state_changed). Hourly tier adds `change_count`.
+
+**User tables:** `ts`, `user`, `domain`, `logon_type`, `action` (login/logout). Daily tier adds `login_count`.
+
+### Querying with SQL
+
+Use the `tar.sql` action to execute SELECT queries against warehouse tables:
+
+```
+POST /api/v1/instructions/execute
+{
+  "plugin": "tar",
+  "action": "sql",
+  "parameters": {
+    "sql": "SELECT name, pid, cmdline FROM $Process_Live ORDER BY ts DESC LIMIT 50"
+  }
+}
+```
+
+Pre-built queries are available in `content/definitions/tar_warehouse.yaml`, covering common use cases like recent processes, TCP connections by process, listening ports, hourly summaries, service state changes, user sessions, and process trees.
+
+### Rollup aggregation
+
+The warehouse automatically runs a rollup aggregation cycle every 15 minutes. Each cycle:
+
+1. Aggregates live-tier data into hourly summaries
+2. Aggregates hourly data into daily summaries
+3. Aggregates daily data into monthly summaries
+4. Enforces retention limits on each tier
+
+To force an immediate rollup, use the `tar.rollup` action.
+
+### Safety controls
+
+SQL queries are validated at multiple levels:
+
+- **Server-side:** Only SELECT statements are permitted. A keyword blocklist rejects INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, and REINDEX.
+- **Agent-side:** Table names must use the `$`-prefixed whitelist (`$Process_Live`, `$TCP_Hourly`, etc.). Only a single SQL statement is allowed. Queries exceeding 4KB are rejected.
+
 ## Data storage
 
 TAR events are stored in `{data_dir}/tar.db` (SQLite), where `data_dir` is the agent's configured data directory. The database uses:

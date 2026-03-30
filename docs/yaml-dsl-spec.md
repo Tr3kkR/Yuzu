@@ -1550,10 +1550,15 @@ This section enumerates the stable builtin primitives that content authors targe
 
 | Primitive | Backing Plugin | Win | Linux | macOS | Status |
 |---|---|:---:|:---:|:---:|---|
+| `tar.status` | `tar` | Y | Y | Y | Verified |
 | `tar.query` | `tar` | Y | Y | Y | Verified |
-| `tar.stats` | `tar` | Y | Y | Y | Verified |
-| `tar.purge` | `tar` | Y | Y | Y | Verified |
+| `tar.snapshot` | `tar` | Y | Y | Y | Verified |
+| `tar.export` | `tar` | Y | Y | Y | Verified |
 | `tar.configure` | `tar` | Y | Y | Y | Verified |
+| `tar.collect_fast` | `tar` | Y | Y | Y | Verified |
+| `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
+| `tar.sql` | `tar` | Y | Y | Y | Verified |
+| `tar.rollup` | `tar` | Y | Y | Y | Verified |
 
 ### 14.16 Test and Debug
 

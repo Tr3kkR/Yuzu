@@ -727,8 +727,53 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id,
     auto& col_names = yuzu::server::columns_for_plugin(plugin);
     auto lines = yuzu::server::split_output_lines(raw_output);
     for (const auto& line : lines) {
+        // TAR warehouse protocol lines: __schema__ and __total__
+        if (plugin == "tar" && yuzu::server::is_tar_protocol_line(line)) {
+            if (line.starts_with("__schema__|")) {
+                auto cols = yuzu::server::parse_tar_schema_line(line);
+                // M16: Validate schema line has non-empty columns
+                if (cols.empty()) continue;
+                // H14: Thread-safe per-instance cache with mutex
+                {
+                    std::lock_guard lock(cmd_times_mu_);
+                    tar_dynamic_columns_ = cols;
+                }
+                // C1: HTML-escape column names to prevent XSS via AS aliases
+                std::string thead = "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr>"
+                                    "<th class=\"col-agent\">Agent</th>";
+                for (const auto& c : cols) {
+                    thead += "<th>";
+                    // Escape HTML special characters
+                    for (char ch : c) {
+                        switch (ch) {
+                        case '<':  thead += "&lt;"; break;
+                        case '>':  thead += "&gt;"; break;
+                        case '&':  thead += "&amp;"; break;
+                        case '"':  thead += "&quot;"; break;
+                        case '\'': thead += "&#39;"; break;
+                        default:   thead += ch; break;
+                        }
+                    }
+                    thead += "</th>";
+                }
+                thead += "</tr></thead>";
+                bus_.publish("output", thead);
+            }
+            continue;
+        }
+
+        // Use dynamic columns for TAR SQL results if available (H14: lock)
+        std::vector<std::string> tar_cols_copy;
+        {
+            std::lock_guard lock(cmd_times_mu_);
+            tar_cols_copy = tar_dynamic_columns_;
+        }
+        auto& effective_cols = (!tar_cols_copy.empty() && plugin == "tar")
+                                   ? tar_cols_copy
+                                   : col_names;
+
         auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        auto html = render_row(agent_name, plugin, line, col_names);
+        auto html = render_row(agent_name, plugin, line, effective_cols);
         // OOB: live row count
         html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
         html += std::to_string(count);

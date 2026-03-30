@@ -316,7 +316,8 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  // scope == "__all__" or empty → broadcast (empty agent_ids + empty scope)
 
                  // Dispatch
-                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr);
+                 std::unordered_map<std::string, std::string> params;
+                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr, params);
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -386,6 +387,106 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
 
                  audit_fn_(req, "command.dispatch", "success", "command", command_id,
                           plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)");
+
+                 res.set_content(html, "text/html; charset=utf-8");
+             });
+
+    // -- POST /api/dashboard/tar-execute (TAR warehouse SQL query) -------------
+    svr.Post("/api/dashboard/tar-execute",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Execution", "Execute")) return;
+
+                 auto sql = req.get_param_value("sql");
+                 if (sql.empty()) {
+                     res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     "Missing SQL query.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 // M5: Server-side SQL validation with keyword blocklist (defense in depth)
+                 if (sql.size() > 4096) {
+                     res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     "SQL query exceeds 4KB limit.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 {
+                     auto upper = sql;
+                     for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                     size_t start = upper.find_first_not_of(" \t\r\n");
+                     if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
+                         res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                                         " style=\"font-size:0.75rem;color:#f85149\">"
+                                         "Only SELECT queries are allowed.</span>",
+                                         "text/html; charset=utf-8");
+                         return;
+                     }
+                     // Block dangerous keywords server-side too
+                     static const char* blocked[] = {
+                         "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+                         "ATTACH", "DETACH", "PRAGMA", "LOAD_EXTENSION", nullptr
+                     };
+                     for (auto kw = blocked; *kw; ++kw) {
+                         if (upper.find(*kw) != std::string::npos) {
+                             res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                                             " style=\"font-size:0.75rem;color:#f85149\">"
+                                             "Query contains forbidden keyword.</span>",
+                                             "text/html; charset=utf-8");
+                             return;
+                         }
+                     }
+                 }
+
+                 auto scope = req.get_param_value("scope");
+                 std::vector<std::string> agent_ids;
+                 std::string scope_expr;
+                 if (!scope.empty() && scope.starts_with("group:")) {
+                     scope_expr = scope;
+                 } else if (!scope.empty() && scope != "__all__") {
+                     agent_ids.push_back(scope);
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 params["sql"] = sql;
+                 auto [command_id, sent] = dispatch_fn_("tar", "sql", agent_ids, scope_expr, params);
+
+                 if (sent == 0) {
+                     res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     "No agents connected.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 // Success: return OOB swaps for the results area
+                 std::string html;
+                 html += "<thead id=\"results-thead\" hx-swap-oob=\"innerHTML\">"
+                         "<tr><th class=\"col-agent\">Agent</th>"
+                         "<th>Waiting for schema...</th></tr></thead>";
+                 html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
+                         "<tr id=\"empty-row\"><td colspan=\"99\" style=\"text-align:center;"
+                         "color:#8b949e;padding:2rem 0\">"
+                         "Waiting for results...</td></tr></tbody>";
+                 html += "<span id=\"status-badge\" class=\"badge-running\""
+                         " hx-swap-oob=\"outerHTML\">RUNNING</span>";
+                 html += "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " style=\"font-size:0.75rem;color:#8b949e\">TAR SQL &rarr; " +
+                         std::to_string(sent) + " agent" +
+                         (sent != 1 ? "s" : "") + "</span>";
+                 html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
+                 html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
+                 html += "<div id=\"result-summary\" hx-swap-oob=\"true\"></div>";
+
+                 res.set_header("HX-Trigger",
+                     "{\"showToast\":{\"message\":\"TAR query sent to " +
+                     std::to_string(sent) +
+                     " agent(s)\",\"level\":\"success\"}}");
+
+                 audit_fn_(req, "tar.sql", "success", "command", command_id,
+                          "TAR SQL -> " + std::to_string(sent) + " agent(s)");
 
                  res.set_content(html, "text/html; charset=utf-8");
              });

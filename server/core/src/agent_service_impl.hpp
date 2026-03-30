@@ -130,6 +130,7 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
     std::atomic<size_t> output_row_count_{0};
+    std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};
     bool gateway_mode_{false};
     UpdateRegistry* update_registry_{nullptr};

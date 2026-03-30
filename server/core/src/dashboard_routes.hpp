@@ -8,6 +8,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <httplib.h>
@@ -44,7 +45,8 @@ public:
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
-        const std::vector<std::string>& agent_ids, const std::string& scope_expr)>;
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters)>;
 
     /// Resolve instruction text → (plugin, action). Empty strings on failure.
     using ResolveFn = std::function<std::pair<std::string, std::string>(
