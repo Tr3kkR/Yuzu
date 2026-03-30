@@ -1,0 +1,21 @@
+# Prometheus config for UAT (native services, Docker Prometheus)
+# Targets use host.docker.internal to reach services on the Windows host
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'yuzu-server'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          component: 'server'
+
+  - job_name: 'yuzu-gateway'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['host.docker.internal:9568']
+        labels:
+          component: 'gateway'

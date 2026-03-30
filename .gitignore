@@ -53,6 +53,10 @@ Thumbs.db
 # Logs
 *.log
 
+# UAT runtime state
+.uat/
+bash.exe.stackdump
+
 # Dev artifacts
 _build_tmp.bat
 _debug_vcvars.bat
