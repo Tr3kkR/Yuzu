@@ -328,7 +328,7 @@ extern const char* const kInstructionEditorHtml = R"HTM(
                 <div class="yaml-split">
                     <textarea id="yaml-editor" name="yaml_source"
                               hx-post="/fragments/instructions/yaml-preview"
-                              hx-trigger="keyup changed delay:500ms"
+                              hx-trigger="input changed delay:500ms"
                               hx-target="#yaml-preview"
                               hx-swap="innerHTML"
                               spellcheck="false"
