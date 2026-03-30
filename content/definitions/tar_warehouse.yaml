@@ -1,0 +1,565 @@
+## TAR Warehouse SQL Query Definitions
+## Pre-built SQL queries against the TAR data warehouse tables.
+## Plugin: tar | Action: sql | Uses $-prefixed table names.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.sql
+  displayName: "TAR: SQL Query"
+  version: 1.0.0
+  description: >
+    Execute an arbitrary SELECT query against the TAR warehouse tables on each
+    targeted agent. Use $-prefixed table names ($Process_Live, $TCP_Hourly, etc.)
+    which are translated to real table names on the agent. Only SELECT queries
+    are permitted.
+  tags: [tar, warehouse, sql, query]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        displayName: SQL Query
+        description: >
+          A SELECT query using $-prefixed table names. Available tables include
+          $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly,
+          $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
+          $Service_Live, $Service_Hourly, $User_Live, $User_Daily.
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob, description: "Dynamic columns returned by the SQL query" }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.recent_processes
+  displayName: "TAR: Recent Processes"
+  version: 1.0.0
+  description: >
+    Show all processes that started or stopped in the last 24 hours.
+  tags: [tar, warehouse, processes, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.tcp_by_process
+  displayName: "TAR: TCP Connections by Process"
+  version: 1.0.0
+  description: >
+    Aggregate TCP connections grouped by process name and remote endpoint.
+  tags: [tar, warehouse, network, tcp]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.listening_ports
+  displayName: "TAR: Listening Ports"
+  version: 1.0.0
+  description: >
+    Show all listening TCP ports with the process that owns them.
+  tags: [tar, warehouse, network, listeners]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.hourly_process_summary
+  displayName: "TAR: Hourly Process Summary"
+  version: 1.0.0
+  description: >
+    Show hourly aggregated process start counts for the last 7 days.
+  tags: [tar, warehouse, processes, aggregation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT hour_ts, name, start_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 168"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.service_state_changes
+  displayName: "TAR: Service State Changes"
+  version: 1.0.0
+  description: >
+    Show recent service start/stop/state_changed events.
+  tags: [tar, warehouse, services]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.connections_to_ip
+  displayName: "TAR: Network Connections to IP"
+  version: 1.0.0
+  description: >
+    Show all TCP connections to a specific remote IP address. Replace the
+    target_ip parameter with the IP to investigate.
+  tags: [tar, warehouse, network, investigation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        displayName: SQL Query
+        description: "Query with target IP. Edit the IP address in the WHERE clause."
+        default: "SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '10.0.0.1' ORDER BY ts DESC LIMIT 500"
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.daily_connection_summary
+  displayName: "TAR: Daily Connection Summary"
+  version: 1.0.0
+  description: >
+    Show daily aggregated TCP connection counts by remote address and process.
+  tags: [tar, warehouse, network, aggregation]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.user_sessions
+  displayName: "TAR: User Sessions"
+  version: 1.0.0
+  description: >
+    Show recent user login and logout events.
+  tags: [tar, warehouse, users, sessions]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.process_tree
+  displayName: "TAR: Process Tree"
+  version: 1.0.0
+  description: >
+    Show recently started processes with parent-child relationships
+    for the last hour.
+  tags: [tar, warehouse, processes, tree, forensics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.rollup
+  displayName: "TAR: Run Aggregation"
+  version: 1.0.0
+  description: >
+    Force an immediate rollup aggregation cycle (normally runs every 15 minutes).
+    Aggregates live data into hourly, daily, and monthly summary tables and
+    enforces retention limits on each tier.
+  tags: [tar, warehouse, rollup, aggregation]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: rollup
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: rows_aggregated
+        type: int32
+
+  readablePayload: "Force TAR warehouse rollup aggregation"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.7.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active

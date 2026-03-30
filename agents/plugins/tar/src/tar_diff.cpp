@@ -405,4 +405,150 @@ std::vector<TarEvent> compute_user_diff(
     return events;
 }
 
+// ── Typed event production ──────────────────────────────────────────────────
+// These parallel the legacy diff functions but produce typed event structs
+// for direct insertion into the warehouse live tables.
+
+std::vector<ProcessEvent> compute_process_events(
+    const std::vector<yuzu::agent::ProcessInfo>& previous,
+    const std::vector<yuzu::agent::ProcessInfo>& current,
+    int64_t timestamp, int64_t snapshot_id,
+    const std::vector<std::string>& redaction_patterns) {
+
+    std::vector<ProcessEvent> events;
+
+    struct ProcState { std::string name; std::string cmdline; std::string user; uint32_t ppid; };
+    std::unordered_map<uint32_t, ProcState> prev_map;
+    prev_map.reserve(previous.size());
+    for (const auto& p : previous)
+        prev_map[p.pid] = {p.name, p.cmdline, p.user, p.ppid};
+
+    std::unordered_map<uint32_t, ProcState> curr_map;
+    curr_map.reserve(current.size());
+    for (const auto& p : current)
+        curr_map[p.pid] = {p.name, p.cmdline, p.user, p.ppid};
+
+    for (const auto& p : current) {
+        auto it = prev_map.find(p.pid);
+        if (it == prev_map.end()) {
+            events.push_back({timestamp, snapshot_id, "started", p.pid, p.ppid,
+                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+        } else if (it->second.name != p.name) {
+            events.push_back({timestamp - 1, snapshot_id, "stopped", p.pid, it->second.ppid,
+                              it->second.name, redact_cmdline(it->second.cmdline, redaction_patterns),
+                              it->second.user});
+            events.push_back({timestamp, snapshot_id, "started", p.pid, p.ppid,
+                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+        }
+    }
+
+    for (const auto& p : previous) {
+        if (!curr_map.contains(p.pid)) {
+            events.push_back({timestamp, snapshot_id, "stopped", p.pid, p.ppid,
+                              p.name, redact_cmdline(p.cmdline, redaction_patterns), p.user});
+        }
+    }
+
+    return events;
+}
+
+std::vector<NetworkEvent> compute_network_events(
+    const std::vector<NetConnection>& previous,
+    const std::vector<NetConnection>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<NetworkEvent> events;
+
+    auto make_key = [](const NetConnection& c) -> std::string {
+        return std::format("{}:{}:{}:{}:{}", c.proto, c.local_addr, c.local_port,
+                           c.remote_addr, c.remote_port);
+    };
+
+    std::unordered_map<std::string, const NetConnection*> prev_map;
+    for (const auto& c : previous) prev_map[make_key(c)] = &c;
+
+    std::unordered_map<std::string, const NetConnection*> curr_map;
+    for (const auto& c : current) curr_map[make_key(c)] = &c;
+
+    for (const auto& c : current) {
+        if (!prev_map.contains(make_key(c))) {
+            events.push_back({timestamp, snapshot_id, "connected", c.proto,
+                              c.local_addr, c.local_port, c.remote_addr, c.remote_host,
+                              c.remote_port, c.state, c.pid, c.process_name});
+        }
+    }
+
+    for (const auto& c : previous) {
+        if (!curr_map.contains(make_key(c))) {
+            events.push_back({timestamp, snapshot_id, "disconnected", c.proto,
+                              c.local_addr, c.local_port, c.remote_addr, c.remote_host,
+                              c.remote_port, c.state, c.pid, c.process_name});
+        }
+    }
+
+    return events;
+}
+
+std::vector<ServiceEvent> compute_service_events(
+    const std::vector<ServiceInfo>& previous,
+    const std::vector<ServiceInfo>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<ServiceEvent> events;
+
+    std::unordered_map<std::string, const ServiceInfo*> prev_map;
+    for (const auto& s : previous) prev_map[s.name] = &s;
+    std::unordered_map<std::string, const ServiceInfo*> curr_map;
+    for (const auto& s : current) curr_map[s.name] = &s;
+
+    for (const auto& s : current) {
+        auto it = prev_map.find(s.name);
+        if (it == prev_map.end()) {
+            events.push_back({timestamp, snapshot_id, "started", s.name, s.display_name,
+                              s.status, "", s.startup_type, ""});
+        } else {
+            const auto* prev = it->second;
+            if (prev->status != s.status || prev->startup_type != s.startup_type) {
+                events.push_back({timestamp, snapshot_id, "state_changed", s.name, s.display_name,
+                                  s.status, prev->status, s.startup_type, prev->startup_type});
+            }
+        }
+    }
+
+    for (const auto& s : previous) {
+        if (!curr_map.contains(s.name)) {
+            events.push_back({timestamp, snapshot_id, "stopped", s.name, s.display_name,
+                              s.status, "", s.startup_type, ""});
+        }
+    }
+
+    return events;
+}
+
+std::vector<UserEvent> compute_user_events(
+    const std::vector<UserSession>& previous,
+    const std::vector<UserSession>& current,
+    int64_t timestamp, int64_t snapshot_id) {
+
+    std::vector<UserEvent> events;
+
+    auto make_key = [](const UserSession& u) -> std::string { return u.user + ":" + u.session_id; };
+
+    std::unordered_map<std::string, const UserSession*> prev_map;
+    for (const auto& u : previous) prev_map[make_key(u)] = &u;
+    std::unordered_map<std::string, const UserSession*> curr_map;
+    for (const auto& u : current) curr_map[make_key(u)] = &u;
+
+    for (const auto& u : current) {
+        if (!prev_map.contains(make_key(u)))
+            events.push_back({timestamp, snapshot_id, "login", u.user, u.domain, u.logon_type, u.session_id});
+    }
+    for (const auto& u : previous) {
+        if (!curr_map.contains(make_key(u)))
+            events.push_back({timestamp, snapshot_id, "logout", u.user, u.domain, u.logon_type, u.session_id});
+    }
+
+    return events;
+}
+
 } // namespace yuzu::tar

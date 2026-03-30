@@ -22,6 +22,9 @@
 
 #include "tar_collectors.hpp"
 #include "tar_db.hpp"
+#include "tar_schema_registry.hpp"
+#include "tar_aggregator.hpp"
+#include "tar_sql_executor.hpp"
 
 #include <yuzu/agent/process_enum.hpp>
 #include <yuzu/plugin.hpp>
@@ -200,7 +203,8 @@ public:
 
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"status", "query", "snapshot", "export",
-                                      "configure", "collect_fast", "collect_slow", nullptr};
+                                      "configure", "collect_fast", "collect_slow",
+                                      "rollup", "sql", nullptr};
         return acts;
     }
 
@@ -247,6 +251,12 @@ public:
             slow_interval);
         ctx.register_trigger("tar.slow", "interval", slow_config);
 
+        // Register rollup trigger (15-minute aggregation cycle)
+        auto rollup_config = std::format(
+            R"({{"interval_seconds":900,"plugin":"tar","action":"rollup","parameters":{{}}}})"
+        );
+        ctx.register_trigger("tar.rollup", "interval", rollup_config);
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})",
                      fast_interval, slow_interval, db_path.string());
         return {};
@@ -255,6 +265,7 @@ public:
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
         ctx.unregister_trigger("tar.fast");
         ctx.unregister_trigger("tar.slow");
+        ctx.unregister_trigger("tar.rollup");
         db_.reset();
         spdlog::info("TAR plugin shut down");
     }
@@ -272,6 +283,8 @@ public:
         if (action == "export")        return do_export(ctx, params);
         if (action == "snapshot")      return do_snapshot(ctx);
         if (action == "configure")     return do_configure(ctx, params);
+        if (action == "rollup")        return do_rollup(ctx);
+        if (action == "sql")           return do_sql(ctx, params);
 
         ctx.write_output(std::format("error|unknown action: {}", action));
         return 1;
@@ -281,7 +294,6 @@ private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::unique_ptr<yuzu::tar::TarDatabase> db_;
     std::mutex collect_mu_;     // Protects the state read-diff-write sequence in collect methods
-    int64_t last_purge_time_{0};
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -291,16 +303,20 @@ private:
         auto redaction = load_redaction_patterns(*db_);
         int total_events = 0;
 
-        // Process diff
+        // Process diff (C6: check insert return, abort state save on failure)
         {
             auto current = yuzu::agent::enumerate_processes();
             auto prev_json = db_->get_state("process");
             auto previous = json_to_processes(prev_json);
 
-            auto events = yuzu::tar::compute_process_diff(previous, current, ts, snap_id, redaction);
-            if (!events.empty()) {
-                db_->insert_events(events);
-                total_events += static_cast<int>(events.size());
+            auto typed = yuzu::tar::compute_process_events(previous, current, ts, snap_id, redaction);
+            if (!typed.empty()) {
+                if (!db_->insert_process_events(typed)) {
+                    spdlog::error("TAR: failed to insert process events, skipping state save");
+                    ctx.write_output("error|process insert failed");
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
             }
 
             db_->set_state("process", processes_to_json(current).dump());
@@ -312,10 +328,14 @@ private:
             auto prev_json = db_->get_state("network");
             auto previous = json_to_connections(prev_json);
 
-            auto events = yuzu::tar::compute_network_diff(previous, current, ts, snap_id);
-            if (!events.empty()) {
-                db_->insert_events(events);
-                total_events += static_cast<int>(events.size());
+            auto typed = yuzu::tar::compute_network_events(previous, current, ts, snap_id);
+            if (!typed.empty()) {
+                if (!db_->insert_network_events(typed)) {
+                    spdlog::error("TAR: failed to insert network events, skipping state save");
+                    ctx.write_output("error|network insert failed");
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
             }
 
             db_->set_state("network", connections_to_json(current).dump());
@@ -337,16 +357,20 @@ private:
         auto snap_id = next_snapshot_id();
         int total_events = 0;
 
-        // Service diff
+        // Service diff (C6: check insert return)
         {
             auto current = yuzu::tar::enumerate_services();
             auto prev_json = db_->get_state("service");
             auto previous = json_to_services(prev_json);
 
-            auto events = yuzu::tar::compute_service_diff(previous, current, ts, snap_id);
-            if (!events.empty()) {
-                db_->insert_events(events);
-                total_events += static_cast<int>(events.size());
+            auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
+            if (!typed.empty()) {
+                if (!db_->insert_service_events(typed)) {
+                    spdlog::error("TAR: failed to insert service events, skipping state save");
+                    ctx.write_output("error|service insert failed");
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
             }
 
             db_->set_state("service", services_to_json(current).dump());
@@ -358,27 +382,20 @@ private:
             auto prev_json = db_->get_state("user");
             auto previous = json_to_users(prev_json);
 
-            auto events = yuzu::tar::compute_user_diff(previous, current, ts, snap_id);
-            if (!events.empty()) {
-                db_->insert_events(events);
-                total_events += static_cast<int>(events.size());
+            auto typed = yuzu::tar::compute_user_events(previous, current, ts, snap_id);
+            if (!typed.empty()) {
+                if (!db_->insert_user_events(typed)) {
+                    spdlog::error("TAR: failed to insert user events, skipping state save");
+                    ctx.write_output("error|user insert failed");
+                    return 1;
+                }
+                total_events += static_cast<int>(typed.size());
             }
 
             db_->set_state("user", users_to_json(current).dump());
         }
 
-        // Periodic purge check (every hour)
-        if (ts - last_purge_time_ >= 3600) {
-            last_purge_time_ = ts;
-            auto retention_str = db_->get_config("retention_days", "7");
-            int retention_days = 7;
-            try { retention_days = std::stoi(retention_str); } catch (...) {}
-            int64_t cutoff = ts - static_cast<int64_t>(retention_days) * 86400;
-            int purged = db_->purge(cutoff);
-            if (purged > 0) {
-                spdlog::info("TAR: purged {} events older than {} days", purged, retention_days);
-            }
-        }
+        // Legacy purge removed — retention is now handled by run_retention() in rollup action
 
         ctx.write_output(std::format("tar|collect_slow|{}|events_recorded", total_events));
         return 0;
@@ -436,22 +453,62 @@ private:
         if (limit <= 0 || limit > 10000)
             limit = 1000;
 
-        auto events = db_->query(from, to, type_filter, limit);
-        for (const auto& ev : events) {
-            ctx.write_output(std::format("{}|{}|{}|{}|{}",
-                ev.timestamp, ev.event_type, ev.event_action,
-                ev.snapshot_id, ev.detail_json));
+        // Query typed live tables (replaces legacy tar_events)
+        auto from_s = std::to_string(from);
+        auto to_s = std::to_string(to);
+        auto lim_s = std::to_string(limit);
+        std::string where = " WHERE ts >= " + from_s + " AND ts <= " + to_s;
+        std::string tail = " ORDER BY ts ASC LIMIT " + lim_s;
+
+        std::string sql;
+        if (type_filter == "process") {
+            sql = "SELECT ts, 'process' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM process_live" + where + tail;
+        } else if (type_filter == "network") {
+            sql = "SELECT ts, 'network' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM tcp_live" + where + tail;
+        } else if (type_filter == "service") {
+            sql = "SELECT ts, 'service' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM service_live" + where + tail;
+        } else if (type_filter == "user") {
+            sql = "SELECT ts, 'user' AS event_type, action, snapshot_id, "
+                  "'' AS detail_json FROM user_live" + where + tail;
+        } else {
+            sql = "SELECT * FROM ("
+                  "SELECT ts, 'process' AS event_type, action, snapshot_id, '' AS detail_json FROM process_live" + where +
+                  " UNION ALL "
+                  "SELECT ts, 'network', action, snapshot_id, '' FROM tcp_live" + where +
+                  " UNION ALL "
+                  "SELECT ts, 'service', action, snapshot_id, '' FROM service_live" + where +
+                  " UNION ALL "
+                  "SELECT ts, 'user', action, snapshot_id, '' FROM user_live" + where +
+                  ")" + tail;
         }
-        ctx.write_output(std::format("total|{}", events.size()));
+
+        auto query_result = db_->execute_query(sql);
+        if (!query_result) {
+            ctx.write_output(std::format("error|{}", query_result.error()));
+            return 1;
+        }
+        for (const auto& row : query_result->rows) {
+            std::string line;
+            for (size_t i = 0; i < row.size(); ++i) {
+                if (i > 0) line += '|';
+                line += row[i];
+            }
+            ctx.write_output(line);
+        }
+        ctx.write_output(std::format("total|{}", query_result->rows.size()));
         return 0;
     }
 
     // ── export action (JSON array output) ─────────────────────────────────────
 
     int do_export(yuzu::CommandContext& ctx, yuzu::Params params) {
+        // Export delegates to the sql action with a JSON wrapper
+        auto type_filter = std::string{params.get("type")};
         auto from_str = params.get("from", "0");
         auto to_str = params.get("to");
-        auto type_filter = std::string{params.get("type")};
         auto limit_str = params.get("limit", "1000");
 
         int64_t from = 0;
@@ -463,25 +520,45 @@ private:
             try { to = std::stoll(std::string{to_str}); } catch (...) {}
         }
         try { limit = std::stoi(std::string{limit_str}); } catch (...) {}
+        if (limit <= 0 || limit > 10000) limit = 1000;
 
-        if (limit <= 0 || limit > 10000)
-            limit = 1000;
+        // Pick the right live table (HP-5: handle empty filter and unknown types)
+        std::string sql;
+        if (type_filter.empty()) {
+            // Export from all live tables
+            sql = std::format(
+                "SELECT * FROM ("
+                "SELECT 'process' AS source, * FROM process_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                "SELECT 'network', * FROM tcp_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                "SELECT 'service', * FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                "SELECT 'user', * FROM user_live WHERE ts >= {} AND ts <= {}"
+                ") ORDER BY ts ASC LIMIT {}",
+                from, to, from, to, from, to, from, to, limit);
+        } else {
+            std::string table;
+            if (type_filter == "process") table = "process_live";
+            else if (type_filter == "network") table = "tcp_live";
+            else if (type_filter == "service") table = "service_live";
+            else if (type_filter == "user") table = "user_live";
+            else {
+                ctx.write_output(std::format("error|unknown type filter: {}", type_filter));
+                return 1;
+            }
+            sql = std::format("SELECT * FROM {} WHERE ts >= {} AND ts <= {} ORDER BY ts ASC LIMIT {}",
+                              table, from, to, limit);
+        }
 
-        auto events = db_->query(from, to, type_filter, limit);
+        auto query_result = db_->execute_query(sql);
+        if (!query_result) {
+            ctx.write_output(std::format("error|{}", query_result.error()));
+            return 1;
+        }
 
         json arr = json::array();
-        for (const auto& ev : events) {
+        for (const auto& row : query_result->rows) {
             json obj;
-            obj["id"] = ev.id;
-            obj["timestamp"] = ev.timestamp;
-            obj["event_type"] = ev.event_type;
-            obj["event_action"] = ev.event_action;
-            obj["snapshot_id"] = ev.snapshot_id;
-            // Parse detail_json so it's nested JSON, not a string
-            try {
-                obj["detail"] = json::parse(ev.detail_json);
-            } catch (...) {
-                obj["detail"] = ev.detail_json;
+            for (size_t i = 0; i < query_result->columns.size() && i < row.size(); ++i) {
+                obj[query_result->columns[i]] = row[i];
             }
             arr.push_back(std::move(obj));
         }
@@ -511,15 +588,12 @@ private:
         bool changed = false;
         int fast_secs = 0;
         int slow_secs = 0;
+        int days = 0;
 
+        // M13: Validate ALL parameters BEFORE writing any to the database
         if (!retention.empty()) {
-            int days = 0;
             try { days = std::stoi(std::string{retention}); } catch (...) {}
-            if (days >= 1 && days <= 365) {
-                db_->set_config("retention_days", std::string{retention});
-                ctx.write_output(std::format("config|retention_days|{}", retention));
-                changed = true;
-            } else {
+            if (days < 1 || days > 365) {
                 ctx.write_output("error|retention_days must be 1-365");
                 return 1;
             }
@@ -527,11 +601,7 @@ private:
 
         if (!fast_interval.empty()) {
             try { fast_secs = std::stoi(std::string{fast_interval}); } catch (...) {}
-            if (fast_secs >= 10 && fast_secs <= 3600) {
-                db_->set_config("fast_interval_seconds", std::string{fast_interval});
-                ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-                changed = true;
-            } else {
+            if (fast_secs < 10 || fast_secs > 3600) {
                 ctx.write_output("error|fast_interval must be 10-3600 seconds");
                 return 1;
             }
@@ -539,22 +609,35 @@ private:
 
         if (!slow_interval.empty()) {
             try { slow_secs = std::stoi(std::string{slow_interval}); } catch (...) {}
-            if (slow_secs >= 30 && slow_secs <= 7200) {
-                db_->set_config("slow_interval_seconds", std::string{slow_interval});
-                ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-                changed = true;
-            } else {
+            if (slow_secs < 30 || slow_secs > 7200) {
                 ctx.write_output("error|slow_interval must be 30-7200 seconds");
                 return 1;
             }
         }
 
-        // Validate fast_interval < slow_interval when both are provided
+        // Cross-field validation BEFORE any writes
         if (fast_secs > 0 && slow_secs > 0 && fast_secs >= slow_secs) {
-            spdlog::warn("TAR: fast_interval ({}) >= slow_interval ({}); intervals appear inverted",
-                         fast_secs, slow_secs);
             ctx.write_output("error|fast_interval must be less than slow_interval");
             return 1;
+        }
+
+        // Now persist all validated values
+        if (days > 0) {
+            db_->set_config("retention_days", std::string{retention});
+            ctx.write_output(std::format("config|retention_days|{}", retention));
+            changed = true;
+        }
+
+        if (fast_secs > 0) {
+            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
+            changed = true;
+        }
+
+        if (slow_secs > 0) {
+            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
+            changed = true;
         }
 
         if (!redaction.empty()) {
@@ -603,6 +686,60 @@ private:
         }
 
         ctx.write_output("status|ok");
+        return 0;
+    }
+
+    // ── rollup action (aggregation engine) ───────────────────────────────────
+
+    int do_rollup(yuzu::CommandContext& ctx) {
+        // No collect_mu_ needed — rollup operates on aggregate tables, not live-state diffs.
+        // The SQLite-level mutex (db_->mu_) provides thread safety.
+        auto ts = now_epoch_seconds();
+        int total = yuzu::tar::run_aggregation(*db_, ts);
+        yuzu::tar::run_retention(*db_, ts);
+        ctx.write_output(std::format("tar|rollup|{}|rows_aggregated", total));
+        return 0;
+    }
+
+    // ── sql action (warehouse query engine) ──────────────────────────────────
+
+    int do_sql(yuzu::CommandContext& ctx, yuzu::Params params) {
+        auto sql_param = std::string{params.get("sql")};
+        if (sql_param.empty()) {
+            ctx.write_output("error|missing required 'sql' parameter");
+            return 1;
+        }
+
+        auto validated = yuzu::tar::validate_and_translate_sql(sql_param);
+        if (!validated) {
+            ctx.write_output(std::format("error|{}", validated.error()));
+            return 1;
+        }
+
+        auto query_result = db_->execute_query(*validated);
+        if (!query_result) {
+            ctx.write_output(std::format("error|{}", query_result.error()));
+            return 1;
+        }
+        auto& result = *query_result;
+
+        // Output schema line
+        std::string schema_line = "__schema__";
+        for (const auto& col : result.columns)
+            schema_line += "|" + col;
+        ctx.write_output(schema_line);
+
+        // Output data rows
+        for (const auto& row : result.rows) {
+            std::string line;
+            for (size_t i = 0; i < row.size(); ++i) {
+                if (i > 0) line += '|';
+                line += row[i];
+            }
+            ctx.write_output(line);
+        }
+
+        ctx.write_output(std::format("__total__|{}", result.rows.size()));
         return 0;
     }
 };

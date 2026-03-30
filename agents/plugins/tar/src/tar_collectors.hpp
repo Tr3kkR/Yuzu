@@ -145,4 +145,27 @@ std::vector<TarEvent> compute_user_diff(
     const std::vector<UserSession>& current,
     int64_t timestamp, int64_t snapshot_id);
 
+// ── Typed event diff functions (for warehouse live tables) ──────────────────
+
+std::vector<ProcessEvent> compute_process_events(
+    const std::vector<yuzu::agent::ProcessInfo>& previous,
+    const std::vector<yuzu::agent::ProcessInfo>& current,
+    int64_t timestamp, int64_t snapshot_id,
+    const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns);
+
+std::vector<NetworkEvent> compute_network_events(
+    const std::vector<NetConnection>& previous,
+    const std::vector<NetConnection>& current,
+    int64_t timestamp, int64_t snapshot_id);
+
+std::vector<ServiceEvent> compute_service_events(
+    const std::vector<ServiceInfo>& previous,
+    const std::vector<ServiceInfo>& current,
+    int64_t timestamp, int64_t snapshot_id);
+
+std::vector<UserEvent> compute_user_events(
+    const std::vector<UserSession>& previous,
+    const std::vector<UserSession>& current,
+    int64_t timestamp, int64_t snapshot_id);
+
 } // namespace yuzu::tar

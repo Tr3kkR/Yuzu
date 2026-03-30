@@ -80,6 +80,7 @@ When writing new integrations, always use `/api/v1/` endpoints. If you have exis
   - [Tags (Legacy)](#tags-legacy)
   - [Analytics and NVD](#analytics-and-nvd)
   - [SSE Event Stream](#sse-event-stream)
+  - [Dashboard TAR](#dashboard-tar)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
 - [Health](#health)
@@ -2745,6 +2746,40 @@ data: {"agent_id":"agent-01","hostname":"web-server-01"}
 event: command_response
 data: {"agent_id":"agent-01","command_id":"cmd-abc","status":"COMPLETED"}
 ```
+
+---
+
+### Dashboard TAR
+
+#### `POST /api/dashboard/tar-execute`
+
+Execute a TAR warehouse SQL query against targeted agents. Returns HTMX HTML fragments: a `thead` OOB swap with dynamic column headers and sets up an SSE stream for result rows.
+
+**Permission:** `Execution:Execute`
+
+**Request body (form-encoded):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `sql` | string | Yes | A SELECT query using `$`-prefixed table names (e.g., `$Process_Live`, `$TCP_Hourly`). |
+| `scope` | string | No | Target scope. An agent ID, `group:<expression>`, or `__all__` for all agents. Defaults to all connected agents. |
+
+**Example (curl):**
+
+```bash
+curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
+  -H "Cookie: yuzu_session=abc123" \
+  -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
+  -d "scope=__all__"
+```
+
+**Response:** HTMX HTML fragments. The response contains:
+1. A `<thead>` element with `hx-swap-oob="innerHTML:#tar-results-head"` containing dynamic column headers derived from the query result schema.
+2. An SSE stream setup that delivers result rows as `<tr>` fragments.
+
+**Safety controls:**
+- Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
+- Agent-side: validates `$`-prefixed table name whitelist, enforces single-statement limit, and rejects queries exceeding 4KB.
 
 ---
 

@@ -4017,7 +4017,8 @@ private:
             // DispatchFn — reuses /api/command dispatch logic
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids,
-                   const std::string& scope_expr) -> std::pair<std::string, int> {
+                   const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
                 auto command_id = plugin + "-" +
                     auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
@@ -4025,6 +4026,8 @@ private:
                 cmd.set_command_id(command_id);
                 cmd.set_plugin(plugin);
                 cmd.set_action(action);
+                for (const auto& [k, v] : parameters)
+                    (*cmd.mutable_parameters())[k] = v;
                 agent_service_.record_send_time(command_id);
 
                 int sent = 0;
