@@ -183,6 +183,10 @@ Both the `yuzu_gw` app config AND the `grpcbox` `listen_opts` for the management
 
 The script generates a fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed credentials on each run (`admin` / `adminpassword1`). All UAT state lives under `/tmp/yuzu-uat/` and is wiped on each start.
 
+### Known bug: stale DB breaks session auth on restart
+
+If the server is restarted against an existing data directory (stale SQLite databases from a prior run), session authentication breaks: `authenticate()` succeeds (HTTP 200, Set-Cookie returned) but `validate_session()` fails on subsequent requests (HTTP 401). The UAT script works around this by doing `rm -rf /tmp/yuzu-uat` before each run. This bug should be investigated — the in-memory `sessions_` map and the database state may be interacting incorrectly on restart.
+
 ## Instruction Engine
 
 The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:

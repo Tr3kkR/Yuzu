@@ -25,7 +25,7 @@ GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="/tmp/yuzu-uat"
 
 ADMIN_USER="admin"
-ADMIN_PASS="adminpassword1"
+ADMIN_PASS='YuzuUatAdmin1!'
 
 # Colours (disabled if not a terminal)
 if [ -t 1 ]; then
@@ -386,7 +386,7 @@ for r in d.get('responses',[]):
     echo "║              UAT Stack Ready                     ║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Dashboard:  http://localhost:8080               ║"
-    echo "║  Login:      $ADMIN_USER / $ADMIN_PASS               ║"
+    printf "║  Login:      %-37s ║\n" "$ADMIN_USER / $ADMIN_PASS"
     echo "║  GW Health:  http://localhost:8081/readyz        ║"
     echo "║  GW Metrics: http://localhost:9568/metrics       ║"
     echo "╠══════════════════════════════════════════════════╣"
