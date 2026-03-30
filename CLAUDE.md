@@ -133,6 +133,56 @@ rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 | Stray `.beam` / crash dumps | `erl_crash.dump` and loose `.beam` files in the gateway root are artifacts. They should be gitignored or deleted, never committed. |
 | Shutdown flush | During `stop/1`, `flush_sync/0` is the correct way to drain the heartbeat buffer. Do not fall back to `queue_heartbeat/1` with sentinel atoms — it violates the `map()` spec and would corrupt the buffer. If `flush_sync` fails, the process is already dead and the buffer is lost. |
 
+## UAT Environment (Server ↔ Gateway ↔ Agent)
+
+A Linux UAT script at `scripts/linux-start-UAT.sh` stands up the full stack, verifies connectivity, and runs command round-trip tests. Usage:
+
+```bash
+bash scripts/linux-start-UAT.sh          # start + verify (6 automated tests)
+bash scripts/linux-start-UAT.sh stop     # kill all
+bash scripts/linux-start-UAT.sh status   # show running processes
+```
+
+### Port assignments
+
+The server and gateway have overlapping default ports. The UAT environment resolves conflicts:
+
+| Port | Component | Purpose |
+|------|-----------|---------|
+| 8080 | Server | Web dashboard + REST API |
+| 50054 | Server | Agent gRPC (direct connections) |
+| 50055 | Server | Gateway upstream (registration, heartbeats) |
+| 50052 | Server | Management gRPC |
+| 50051 | Gateway | Agent-facing gRPC (agents connect here) |
+| 50053 | Gateway | Management/command forwarding (server sends commands here) |
+| 9568 | Gateway | Prometheus metrics |
+| 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
+
+### Gateway command forwarding
+
+The gateway's primary function is **command fanout** — relaying commands from the server to potentially millions of agents and aggregating responses. This requires three server flags:
+
+1. **`--gateway-upstream 0.0.0.0:50055`** — Enables the `GatewayUpstream` gRPC service so the gateway can proxy agent registrations and batch heartbeats to the server.
+2. **`--gateway-mode`** — Relaxes Subscribe stream peer-mismatch validation so gateway-proxied agents can receive commands (their Register and Subscribe peers are both the gateway's address, not the agent's).
+3. **`--gateway-command-addr localhost:50053`** — Points the server at the gateway's `ManagementService` for command forwarding. Without this, commands to gateway-connected agents are queued in `gw_pending_` but never forwarded. The server calls `SendCommand` (server-streaming RPC) on this address; the gateway fans out to agents and streams responses back.
+
+The dispatch flow in `agent_registry.cpp` `send_to()`:
+- Agent has a local Subscribe stream → write directly (direct-connect agents)
+- Agent has a `gateway_node` but no local stream → queue to `gw_pending_` for gateway forwarding
+- `forward_gateway_pending()` drains the queue via `gw_mgmt_stub_->SendCommand()`
+
+### Gateway config changes (`gateway/config/sys.config`)
+
+The default gateway config has two port conflicts with the server:
+- **`mgmt_listen_port`**: Changed from `50052` → `50053` (server uses 50052 for its own management gRPC)
+- **`health_port`**: Changed from `8080` → `8081` (server uses 8080 for the web dashboard)
+
+Both the `yuzu_gw` app config AND the `grpcbox` `listen_opts` for the management server must match (they're configured independently).
+
+### Credential generation
+
+The script generates a fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed credentials on each run (`admin` / `adminpassword1`). All UAT state lives under `/tmp/yuzu-uat/` and is wiped on each start.
+
 ## Instruction Engine
 
 The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:
