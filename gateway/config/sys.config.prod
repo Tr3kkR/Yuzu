@@ -11,18 +11,18 @@
 %%   YUZU_GW_TLS_CACERTFILE    — CA certificate bundle
 %%   YUZU_GW_TLS_ENABLED       — Set to "false" to disable TLS (test only!)
 %%   YUZU_GW_PROMETHEUS_PORT   — Prometheus metrics port (default: 9568)
-%%   YUZU_GW_HEALTH_PORT       — Health endpoint port    (default: 8080)
+%%   YUZU_GW_HEALTH_PORT       — Health endpoint port    (default: 8081)
 %%
 %% See yuzu_gw_app:apply_env_overrides/0 for the full list.
 [
     {yuzu_gw, [
         %% Agent-facing gRPC listen address (agents connect here)
         {agent_listen_addr, "0.0.0.0"},
-        {agent_listen_port, 50051},
+        {agent_listen_port, 50061},
 
         %% Operator-facing gRPC listen address (dashboard/CLI connects here)
         {mgmt_listen_addr, "0.0.0.0"},
-        {mgmt_listen_port, 50052},
+        {mgmt_listen_port, 50063},
 
         %% Upstream C++ yuzu-server address (GatewayUpstream service port)
         {upstream_addr, "127.0.0.1"},
@@ -41,7 +41,7 @@
         {prometheus_port, 9568},
 
         %% Health/readiness HTTP port
-        {health_port, 8080},
+        {health_port, 8081},
 
         %% Agent telemetry gauge emission interval (ms)
         {telemetry_gauge_interval_ms, 10000},
@@ -92,7 +92,7 @@
                 service_protos => [agent_pb],
                 services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
             },
-            listen_opts => #{port => 50051, ip => {0,0,0,0}},
+            listen_opts => #{port => 50061, ip => {0,0,0,0}},
             transport_opts => #{
                 certfile => "/etc/yuzu/gateway.crt",
                 keyfile  => "/etc/yuzu/gateway.key",
@@ -105,7 +105,7 @@
                 service_protos => [management_pb],
                 services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}
             },
-            listen_opts => #{port => 50052, ip => {0,0,0,0}},
+            listen_opts => #{port => 50063, ip => {0,0,0,0}},
             transport_opts => #{
                 certfile => "/etc/yuzu/gateway.crt",
                 keyfile  => "/etc/yuzu/gateway.key",

@@ -2,7 +2,7 @@
 %%% @doc HTTP health and readiness endpoint for Kubernetes / load
 %%% balancer integration.
 %%%
-%%% Listens on a configurable port (default 8080) and responds to:
+%%% Listens on a configurable port (default 8081) and responds to:
 %%%   GET /healthz — liveness probe (200 if process is responding)
 %%%   GET /readyz  — readiness probe (200 if all core processes alive,
 %%%                  503 if any are down or circuit breaker is open)
@@ -20,7 +20,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(SERVER, ?MODULE).
--define(DEFAULT_PORT, 8080).
+-define(DEFAULT_PORT, 8081).
 
 -record(state, {
     listen_sock :: gen_tcp:socket()

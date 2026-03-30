@@ -7,7 +7,7 @@
 %%%
 %%% Prerequisites:
 %%%   C++ server running with:
-%%%     yuzu-server --gateway-mode --gateway-upstream 0.0.0.0:50054 \
+%%%     yuzu-server --gateway-upstream 0.0.0.0:50055 \
 %%%                 --no-tls --no-https --web-port 8080
 %%%
 %%% Run:
@@ -23,7 +23,7 @@
 -compile([export_all, nowarn_export_all]).
 
 -define(UPSTREAM_HOST, "127.0.0.1").
--define(UPSTREAM_PORT, 50054).
+-define(UPSTREAM_PORT, 50055).
 %% Enrollment token for Tier 2 auto-approval.
 %% Generate via: POST /api/settings/enrollment-tokens on the C++ server.
 %% Override at runtime: YUZU_GW_TEST_TOKEN=<hex>

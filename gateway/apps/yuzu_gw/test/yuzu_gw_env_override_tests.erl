@@ -50,7 +50,7 @@ setup() ->
     %% Set known defaults so we can verify they're changed.
     application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
     application:set_env(yuzu_gw, upstream_port, 50055),
-    application:set_env(yuzu_gw, health_port, 8080),
+    application:set_env(yuzu_gw, health_port, 8081),
     application:set_env(yuzu_gw, backpressure_threshold, 1000),
     application:unset_env(yuzu_gw, tls_enabled),
     application:unset_env(yuzu_gw, tls),
@@ -154,7 +154,7 @@ no_clobber() ->
 absent_env_noop() ->
     %% No env vars set at all. Defaults should remain.
     application:set_env(yuzu_gw, upstream_port, 50055),
-    application:set_env(yuzu_gw, health_port, 8080),
+    application:set_env(yuzu_gw, health_port, 8081),
     yuzu_gw_app:apply_env_overrides(),
     ?assertEqual(50055, application:get_env(yuzu_gw, upstream_port, undefined)),
-    ?assertEqual(8080, application:get_env(yuzu_gw, health_port, undefined)).
+    ?assertEqual(8081, application:get_env(yuzu_gw, health_port, undefined)).
