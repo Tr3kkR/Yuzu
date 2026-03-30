@@ -31,7 +31,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.gateway
     ports:
-      - "50051:50051"   # gRPC (agent-facing)
+      - "50061:50061"   # gRPC (agent-facing)
       - "9568:9568"     # Prometheus metrics
     depends_on:
       - server

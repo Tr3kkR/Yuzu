@@ -145,18 +145,18 @@ bash scripts/linux-start-UAT.sh status   # show running processes
 
 ### Port assignments
 
-The server and gateway have overlapping default ports. The UAT environment resolves conflicts:
+Server and gateway defaults do not conflict — all three components can run on the same box without overrides:
 
 | Port | Component | Purpose |
 |------|-----------|---------|
 | 8080 | Server | Web dashboard + REST API |
-| 50054 | Server | Agent gRPC (direct connections) |
-| 50055 | Server | Gateway upstream (registration, heartbeats) |
+| 50051 | Server | Agent gRPC (direct connections) |
 | 50052 | Server | Management gRPC |
-| 50051 | Gateway | Agent-facing gRPC (agents connect here) |
-| 50053 | Gateway | Management/command forwarding (server sends commands here) |
-| 9568 | Gateway | Prometheus metrics |
+| 50055 | Server | Gateway upstream (registration, heartbeats) |
+| 50061 | Gateway | Agent-facing gRPC (agents connect here) |
+| 50063 | Gateway | Management/command forwarding (server sends commands here) |
 | 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
+| 9568 | Gateway | Prometheus metrics |
 
 ### Gateway command forwarding
 
@@ -164,20 +164,16 @@ The gateway's primary function is **command fanout** — relaying commands from 
 
 1. **`--gateway-upstream 0.0.0.0:50055`** — Enables the `GatewayUpstream` gRPC service so the gateway can proxy agent registrations and batch heartbeats to the server.
 2. **`--gateway-mode`** — Relaxes Subscribe stream peer-mismatch validation so gateway-proxied agents can receive commands (their Register and Subscribe peers are both the gateway's address, not the agent's).
-3. **`--gateway-command-addr localhost:50053`** — Points the server at the gateway's `ManagementService` for command forwarding. Without this, commands to gateway-connected agents are queued in `gw_pending_` but never forwarded. The server calls `SendCommand` (server-streaming RPC) on this address; the gateway fans out to agents and streams responses back.
+3. **`--gateway-command-addr localhost:50063`** — Points the server at the gateway's `ManagementService` for command forwarding. Without this, commands to gateway-connected agents are queued in `gw_pending_` but never forwarded. The server calls `SendCommand` (server-streaming RPC) on this address; the gateway fans out to agents and streams responses back.
 
 The dispatch flow in `agent_registry.cpp` `send_to()`:
 - Agent has a local Subscribe stream → write directly (direct-connect agents)
 - Agent has a `gateway_node` but no local stream → queue to `gw_pending_` for gateway forwarding
 - `forward_gateway_pending()` drains the queue via `gw_mgmt_stub_->SendCommand()`
 
-### Gateway config changes (`gateway/config/sys.config`)
+### Gateway config (`gateway/config/sys.config`)
 
-The default gateway config has two port conflicts with the server:
-- **`mgmt_listen_port`**: Changed from `50052` → `50053` (server uses 50052 for its own management gRPC)
-- **`health_port`**: Changed from `8080` → `8081` (server uses 8080 for the web dashboard)
-
-Both the `yuzu_gw` app config AND the `grpcbox` `listen_opts` for the management server must match (they're configured independently).
+The gateway uses its own port range (5006x) to avoid conflicts with the server (5005x). Both the `yuzu_gw` app config AND the `grpcbox` `listen_opts` must match (they're configured independently).
 
 ### Credential generation
 
