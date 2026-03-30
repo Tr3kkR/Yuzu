@@ -25,9 +25,9 @@
 -define(UPSTREAM_HOST, "127.0.0.1").
 -define(UPSTREAM_PORT, 50055).
 %% Enrollment token for Tier 2 auto-approval.
-%% Generate via: POST /api/settings/enrollment-tokens on the C++ server.
-%% Override at runtime: YUZU_GW_TEST_TOKEN=<hex>
--define(DEFAULT_TOKEN, "f2dbf450c90c9a2116754b70726fd64ee94ce3e99b369b1972b3147512c04a50").
+%% Automatically read from UAT environment (/tmp/yuzu-uat/enrollment-token)
+%% or override at runtime: YUZU_GW_TEST_TOKEN=<hex>
+-define(UAT_TOKEN_FILE, "/tmp/yuzu-uat/enrollment-token").
 
 %%%===================================================================
 %%% CT callbacks
@@ -395,8 +395,14 @@ register_and_heartbeat_roundtrip(_Config) ->
 
 make_register_req(AgentId) ->
     Token = case os:getenv("YUZU_GW_TEST_TOKEN") of
-        false -> list_to_binary(?DEFAULT_TOKEN);
-        Val   -> list_to_binary(Val)
+        false ->
+            case file:read_file(?UAT_TOKEN_FILE) of
+                {ok, Bin} -> string:trim(Bin);
+                {error, _} ->
+                    ct:fail("No enrollment token: set YUZU_GW_TEST_TOKEN or "
+                            "run scripts/linux-start-UAT.sh first")
+            end;
+        Val -> list_to_binary(Val)
     end,
     #{
         agent_id         => AgentId,

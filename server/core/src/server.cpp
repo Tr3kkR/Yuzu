@@ -897,7 +897,8 @@ private:
     // Used by instruction editor routes. YAML helpers are also duplicated in
     // settings_routes.cpp (anonymous namespace) for the settings YAML preview.
 
-    static std::string highlight_yaml_value(const std::string& val) {
+    static std::string highlight_yaml_value(const std::string& val,
+                                             const std::string& key = {}) {
         if (val.empty())
             return {};
         auto trimmed = val;
@@ -905,6 +906,16 @@ private:
         if (sp == std::string::npos)
             return html_escape(val);
         trimmed = trimmed.substr(sp);
+        // Semantic highlighting: color specific key:value pairs to match the legend.
+        if (key == "type" && (trimmed == "question" || trimmed == "\"question\""))
+            return "<span class=\"yq\">" + html_escape(val) + "</span>";
+        if (key == "type" && (trimmed == "action" || trimmed == "\"action\""))
+            return "<span class=\"yact\">" + html_escape(val) + "</span>";
+        if (key == "approval" && (trimmed == "required" || trimmed == "\"required\""))
+            return "<span class=\"yar\">" + html_escape(val) + "</span>";
+        if (key == "concurrency" && (trimmed == "single" || trimmed == "serial"
+                                     || trimmed == "\"single\"" || trimmed == "\"serial\""))
+            return "<span class=\"ycc\">" + html_escape(val) + "</span>";
         if (trimmed == "true" || trimmed == "false" || trimmed == "True" || trimmed == "False")
             return "<span class=\"yb\">" + html_escape(val) + "</span>";
         bool is_number = !trimmed.empty();
@@ -930,7 +941,7 @@ private:
         bool is_schema = (key == "apiVersion" || key == "kind");
         std::string key_cls = is_schema ? "ya" : "yk";
         return html_escape(indent) + "<span class=\"" + key_cls + "\">" +
-               html_escape(key) + "</span>:" + highlight_yaml_value(rest);
+               html_escape(key) + "</span>:" + highlight_yaml_value(rest, key);
     }
 
     static std::string highlight_yaml(std::string_view source) {

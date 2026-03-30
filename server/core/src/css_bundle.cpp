@@ -236,12 +236,16 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
       user-select: none; }
 /* YAML syntax token colors */
 .yk { color: #79c0ff; }
-.yv { color: #a5d6ff; }
+.yv { color: #c9d1d9; }
 .yc { color: #8b949e; font-style: italic; }
 .yn { color: #79c0ff; }
 .yb { color: #ff7b72; }
 .yd { color: #8b949e; }
 .ya { color: #d2a8ff; }
+.yq { color: #7ee787; }
+.yact { color: #ffa657; }
+.yar { color: #ff7b72; font-weight: 600; }
+.ycc { color: #d29922; }
 
 /* Row detail drawer */
 .result-row { cursor: pointer; }

@@ -215,7 +215,7 @@ start_all() {
     local token_html
     token_html=$(curl -s -b "$UAT_DIR/cookies.txt" \
         -X POST http://localhost:8080/api/settings/enrollment-tokens \
-        -d "label=uat-auto&max_uses=10&ttl=86400")
+        -d "label=uat-auto&max_uses=1000&ttl=86400")
     local enroll_token
     enroll_token=$(echo "$token_html" | grep -oP '[a-f0-9]{64}' | head -1)
 
@@ -223,7 +223,8 @@ start_all() {
         fail "Failed to create enrollment token"
         exit 1
     fi
-    ok "Enrollment token created"
+    echo "$enroll_token" > "$UAT_DIR/enrollment-token"
+    ok "Enrollment token created (saved to $UAT_DIR/enrollment-token)"
 
     # ── 3. Agent (via gateway) ──────────────────────────────────────────
     echo ""
