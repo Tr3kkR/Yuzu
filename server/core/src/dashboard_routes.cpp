@@ -248,12 +248,48 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      return;
                  }
 
-                 // Handle built-in "help" command
+                 // Handle built-in "help" command — render directly
                  auto lower_instr = instruction;
                  for (auto& c : lower_instr) c = static_cast<char>(std::tolower(c));
                  if (lower_instr == "help" || lower_instr.starts_with("help ")) {
-                     res.set_header("HX-Trigger", R"({"loadHelp":true})");
-                     res.set_content("", "text/html; charset=utf-8");
+                     std::string filter;
+                     if (lower_instr.size() > 5)
+                         filter = lower_instr.substr(5);
+
+                     // Get help content — contains <tr> rows then OOB elements.
+                     // Extract only the <tr> rows (everything up to the first
+                     // <span or <thead OOB tag) for the tbody swap.
+                     auto full = registry_->help_html(filter);
+                     auto oob_start = full.find("<span ");
+                     std::string rows_only = (oob_start != std::string::npos)
+                                                 ? full.substr(0, oob_start)
+                                                 : full;
+                     // Count rows (each data row is a <tr class="result-row">)
+                     int row_count = 0;
+                     for (size_t p = 0; (p = rows_only.find("result-row", p)) != std::string::npos; ++p)
+                         ++row_count;
+
+                     std::string context = filter.empty() ? "help \u2014 all plugins"
+                                                           : "help " + html_escape(filter);
+
+                     // Build OOB response — each element is a standalone OOB swap
+                     std::string html;
+                     html += "<thead id=\"results-thead\" hx-swap-oob=\"innerHTML\">"
+                             "<tr><th class=\"col-agent\">Plugin</th>"
+                             "<th>Action</th><th>Description</th></tr></thead>";
+                     html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
+                             + rows_only + "</tbody>";
+                     html += "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " style=\"font-size:0.75rem;color:#8b949e\">"
+                             + html_escape(context) + "</span>";
+                     html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
+                             + std::to_string(row_count) + "</strong>";
+                     // Clear filter bar and pagination for help display
+                     html += "<div id=\"filter-bar\" hx-swap-oob=\"innerHTML\"></div>";
+                     html += "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\"></nav>";
+                     html += "<div id=\"result-summary\" hx-swap-oob=\"innerHTML\"></div>";
+                     html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
+                     res.set_content(html, "text/html; charset=utf-8");
                      return;
                  }
 
@@ -305,10 +341,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  }
                  html += "</tr></thead>";
 
-                 // Note: tbody is NOT cleared here. SSE output events will
-                 // append rows, and the first event deletes #empty-row via OOB.
-                 // Clearing tbody would race with SSE events that are published
-                 // during dispatch_fn before this HTTP response returns.
+                 // Clear tbody — necessary to remove stale content (e.g. help
+                 // rows).  If the command completes before this response arrives,
+                 // the SSE rows will be wiped — but the filter bar self-refreshes
+                 // after 2s and the user can re-fetch from ResponseStore.
+                 html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
+                         "<tr id=\"empty-row\"><td colspan=\"" +
+                         std::to_string(col_names.size()) +
+                         "\" class=\"empty-state\">Waiting for results...</td></tr>"
+                         "</tbody>";
 
                  // OOB: status badge → RUNNING
                  html += "<span id=\"status-badge\" class=\"badge-running\""
