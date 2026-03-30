@@ -545,17 +545,25 @@ std::string AgentRegistry::help_html(std::string_view filter) const {
         }
     }
 
-    // Wrap: context span + thead + tbody in a single OOB-capable response
+    // Return data rows FIRST, OOB elements AFTER.
+    // The swap target is #results-tbody (innerHTML).  If <span> OOB
+    // elements appear before <tr> rows, the browser's parser rejects the
+    // <span> inside <tbody> and the subsequent <tr> rows are lost.
     std::string context = filter.empty() ? "help \u2014 all plugins"
                                          : "help " + std::string(filter);
     std::string result;
+    // Primary swap content: <tr> rows (valid inside <tbody>)
+    result += html;
+    // OOB side-effects: context label + row count (extracted by HTMX
+    // regardless of position, won't break the tbody parse context)
     result += "<span id=\"result-context\" hx-swap-oob=\"innerHTML\" style=\"font-size:0.75rem;color:#8b949e\">"
               + esc(context) + "</span>";
-    result += "<tr id=\"help-thead-row\" hx-swap-oob=\"innerHTML:#results-thead\">"
-              "<th class=\"col-agent\">Plugin</th><th>Action</th><th>Description</th></tr>";
-    result += "<span id=\"help-row-count\" hx-swap-oob=\"innerHTML:#row-count\">"
+    result += "<span id=\"row-count\" hx-swap-oob=\"innerHTML\">"
               + std::to_string(row_count) + "</span>";
-    result += html;
+    // OOB: set the thead to Plugin/Action/Description for help display
+    result += "<thead id=\"results-thead\" hx-swap-oob=\"innerHTML\">"
+              "<tr><th class=\"col-agent\">Plugin</th><th>Action</th><th>Description</th></tr>"
+              "</thead>";
     return result;
 }
 
