@@ -1,6 +1,6 @@
 # Yuzu Development Roadmap
 
-**Version:** 1.4 | **Date:** 2026-03-21
+**Version:** 2.0 | **Date:** 2026-03-30
 
 This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.
 
@@ -80,6 +80,49 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
+| **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | Open |
+| | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | Open |
+| | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
+| **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
+| | 9.2 | [#257](https://github.com/Tr3kkR/Yuzu/issues/257) | Inventory Repository Model | Open |
+| | 9.3 | [#258](https://github.com/Tr3kkR/Yuzu/issues/258) | SCCM / ConfigMgr Connector | Open |
+| | 9.4 | [#259](https://github.com/Tr3kkR/Yuzu/issues/259) | Intune Connector | Open |
+| | 9.5 | [#260](https://github.com/Tr3kkR/Yuzu/issues/260) | ServiceNow Connector | Open |
+| | 9.6 | [#261](https://github.com/Tr3kkR/Yuzu/issues/261) | WSUS Connector | Open |
+| | 9.7 | [#262](https://github.com/Tr3kkR/Yuzu/issues/262) | CSV / File Upload Connector | Open |
+| | 9.8 | [#263](https://github.com/Tr3kkR/Yuzu/issues/263) | Inventory Consolidation & Normalization | Open |
+| **10** | 10.1 | [#264](https://github.com/Tr3kkR/Yuzu/issues/264) | Software Catalog Store | Open |
+| | 10.2 | [#265](https://github.com/Tr3kkR/Yuzu/issues/265) | Software Usage Tracking | Open |
+| | 10.3 | [#266](https://github.com/Tr3kkR/Yuzu/issues/266) | License Entitlements & Compliance | Open |
+| | 10.4 | [#267](https://github.com/Tr3kkR/Yuzu/issues/267) | Software Tags | Open |
+| **11** | 11.1 | [#268](https://github.com/Tr3kkR/Yuzu/issues/268) | Consumer Application Registration | Open |
+| | 11.2 | [#269](https://github.com/Tr3kkR/Yuzu/issues/269) | Event Source Management | Open |
+| | 11.3 | [#270](https://github.com/Tr3kkR/Yuzu/issues/270) | PowerShell Module | Open |
+| | 11.4 | [#271](https://github.com/Tr3kkR/Yuzu/issues/271) | Python SDK | Open |
+| **12** | 12.1 | [#272](https://github.com/Tr3kkR/Yuzu/issues/272) | Mapped Drive History | Open |
+| | 12.2 | [#273](https://github.com/Tr3kkR/Yuzu/issues/273) | Printer Inventory | Open |
+| | 12.3 | [#274](https://github.com/Tr3kkR/Yuzu/issues/274) | Port Scanning | Open |
+| | 12.4 | [#275](https://github.com/Tr3kkR/Yuzu/issues/275) | NetBIOS Lookup | Open |
+| | 12.5 | [#276](https://github.com/Tr3kkR/Yuzu/issues/276) | Open Windows Enumeration | Open |
+| | 12.6 | [#277](https://github.com/Tr3kkR/Yuzu/issues/277) | Directory Hash (Recursive) | Open |
+| | 12.7 | [#278](https://github.com/Tr3kkR/Yuzu/issues/278) | Survey Dialog | Open |
+| | 12.8 | [#279](https://github.com/Tr3kkR/Yuzu/issues/279) | Do-Not-Disturb Mode | Open |
+| | 12.9 | [#280](https://github.com/Tr3kkR/Yuzu/issues/280) | Active Response Tracking | Open |
+| | 12.10 | [#281](https://github.com/Tr3kkR/Yuzu/issues/281) | Patch Inventory Event Generation | Open |
+| | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
+| | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | Open |
+| | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open |
+| | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | Open |
+| | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
+| | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
+| | 13.5 | [#289](https://github.com/Tr3kkR/Yuzu/issues/289) | MCP Phase 2 (Write Tools) | Open |
+| **14** | 14.1 | [#290](https://github.com/Tr3kkR/Yuzu/issues/290) | P2P Content Distribution | Open |
+| | 14.2 | [#291](https://github.com/Tr3kkR/Yuzu/issues/291) | Multi-Gateway Topology | Open |
+| | 14.3 | [#292](https://github.com/Tr3kkR/Yuzu/issues/292) | Database Sharding (Response Partitioning) | Open |
+| | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
+| | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
+| | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
 
 ## Current Status
 
@@ -93,7 +136,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
-| **Total** | **72** | **0** | **72** | **100%** |
+| 8: Visualization & Response Experience | 0 | 3 | 3 | 0% |
+| 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% |
+| 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% |
+| 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
+| 12: Remaining Agent Capabilities | 0 | 13 | 13 | 0% |
+| 13: Security Hardening & Operational Polish | 0 | 5 | 5 | 0% |
+| 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
+| **Total** | **72** | **43** | **115** | **63%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -881,6 +931,555 @@ Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI 
 
 ---
 
+## Phase 8: Visualization & Response Experience
+
+*Make collected data actionable with charts, templates, and processing pipelines.*
+
+### Issue 8.1: Response Visualization Engine
+**Capabilities:** 20.6 (partial), new | **Scope:** Server | **Status:** Open
+
+Add chart rendering to instruction response views with server-side data transformation:
+- Built-in processors: SingleSeries, MultiSeries, DateTimeSeries
+- Chart types: Pie, Bar, Column, Line, Area (rendered via lightweight JS chart library in HTMX pages)
+- Configuration via `spec.visualization` in InstructionDefinition YAML:
+  ```yaml
+  spec:
+    visualization:
+      charts:
+        - type: pie
+          title: "OS Distribution"
+          x: os_name
+          y: count
+          processor: single_series
+  ```
+- REST endpoint: `GET /api/v1/executions/{id}/visualization`
+- Dashboard: embedded chart cards in execution detail view
+
+**Files:** New `server/core/src/visualization_engine.cpp`, `server/core/src/instruction_ui.cpp`, `server/core/src/rest_api_v1.cpp`
+
+### Issue 8.2: Response Templates
+**Capability:** 20.6 | **Scope:** Server | **Status:** Open
+**Depends on:** 8.1
+
+Named response view configurations:
+- Column selection, sort order, filter presets stored per InstructionDefinition in `spec.responseTemplates`
+- Default template auto-generated from result schema
+- Template CRUD via REST API
+- Dashboard: template selector dropdown in execution results view
+
+**Files:** `server/core/src/instruction_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+### Issue 8.3: Response Offloading (Data Export Streams)
+**Capability:** 20.7 | **Scope:** Server | **Status:** Open
+
+Configure external HTTP endpoints to receive response data in real time:
+- `OffloadTarget` model: URL, auth (bearer/basic/HMAC), event filter, batch size
+- Fire-and-forget delivery on background thread (reuse WebhookStore pattern)
+- Per-instruction override: `spec.offload.target` in YAML
+- REST: `GET/POST/DELETE /api/v1/offload-targets`
+
+**Files:** New `server/core/src/offload_target_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+---
+
+## Phase 9: Connector Framework & Multi-Source Inventory
+
+*Federate inventory data from external management systems. Core enterprise integration capability.*
+
+### Issue 9.1: Connector Framework (Core)
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+Pluggable connector architecture for bidirectional data sync with external systems:
+- `ConnectorStore` (SQLite): connector type, name, config (encrypted credentials), schedule, status
+- `ConnectorEngine`: background sync with pluggable connector implementations
+- Connector interface:
+  ```cpp
+  class Connector {
+  public:
+      virtual std::string type() const = 0;
+      virtual SyncResult sync(const ConnectorConfig& config, InventoryRepository& repo) = 0;
+      virtual ConnectionTestResult test(const ConnectorConfig& config) = 0;
+  };
+  ```
+- Sync lifecycle: NotStarted → Pending → InProgress → Completed/Failed/Cancelled
+- REST: `GET/POST/PUT/DELETE /api/v1/connectors`, `POST .../sync`, `POST .../test`
+- Dashboard: Connectors page in Settings with add/edit/delete/test/sync actions
+
+**Files:** New `server/core/src/connector_store.cpp`, `server/core/src/connector_engine.cpp`, `server/core/src/settings_routes.cpp`
+
+### Issue 9.2: Inventory Repository Model
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+Named repositories for partitioned inventory data:
+- `RepositoryStore` (SQLite): named repositories per type (inventory, compliance, entitlement)
+- Default repository created on first boot (cannot be deleted)
+- Connectors bound to repositories; multiple connectors per repository
+- Consolidation, deduplication, normalization pipeline
+- Repository types: Inventory, Compliance, Entitlement (extensible)
+- REST: `GET/POST/PUT/DELETE /api/v1/repositories`
+
+**Files:** New `server/core/src/repository_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+### Issue 9.3: SCCM / ConfigMgr Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+SQL query against ConfigMgr database:
+- Hardware inventory (Win32_ComputerSystem, Win32_OperatingSystem, etc.)
+- Software inventory (installed applications, MSI packages)
+- User/device associations
+- Patch compliance data
+- Configuration: database server, instance, auth (Windows/SQL login)
+
+**Files:** New `server/core/src/connectors/sccm_connector.cpp`
+
+### Issue 9.4: Intune Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+Microsoft Graph API integration (`/deviceManagement/managedDevices`):
+- Device inventory (hardware, OS, compliance state)
+- Installed applications
+- Configuration profiles and compliance policies
+- OAuth2 client credentials flow (reuse DirectorySync Graph client)
+
+**Files:** New `server/core/src/connectors/intune_connector.cpp`
+
+### Issue 9.5: ServiceNow Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+ServiceNow REST API (Table API) integration:
+- CMDB CI records (cmdb_ci_computer, cmdb_ci_server)
+- Incidents and change requests (optional)
+- User/group import
+- OAuth2 or basic auth
+
+**Files:** New `server/core/src/connectors/servicenow_connector.cpp`
+
+### Issue 9.6: WSUS Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+SQL query against WSUS database:
+- Update approval status
+- Per-device patch compliance
+- Update metadata (KB, severity, classification)
+- Configuration: database server, instance, auth
+
+**Files:** New `server/core/src/connectors/wsus_connector.cpp`
+
+### Issue 9.7: CSV / File Upload Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+Import inventory data from structured files:
+- Parse TSV/CSV with configurable column mapping
+- Upload via REST API or dashboard file picker
+- Validation and error reporting per row
+- Scheduling support for automated file ingestion from watched directories
+
+**Files:** New `server/core/src/connectors/file_upload_connector.cpp`
+
+### Issue 9.8: Inventory Consolidation & Normalization
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.2
+
+Multi-source inventory cleanup pipeline:
+- Deduplication by device identity (hostname + MAC + serial)
+- Software normalization: vendor/title/version canonicalization
+- Hardware normalization: processor model mapping, VM detection
+- Consolidation reports: matched vs. unmatched, normalization coverage percentage
+- Runs after each connector sync or on-demand via REST
+
+**Files:** New `server/core/src/inventory_consolidation.cpp`, `server/core/src/repository_store.cpp`
+
+---
+
+## Phase 10: Software Catalog & License Compliance
+
+*Normalized software identification for license management and compliance reporting.*
+
+### Issue 10.1: Software Catalog Store
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.8
+
+Canonical software registry:
+- `CatalogStore` (SQLite): normalized software entries (vendor, title, version, edition, platform)
+- Catalog import from CSV/JSON
+- Manual curation UI: merge duplicates, set canonical names, mark as ignored
+- Automatic matching: raw inventory entries linked to catalog entries by fuzzy title/vendor
+- REST: `GET/POST/PUT /api/v1/catalog/software`, `POST /api/v1/catalog/software/match`
+
+**Files:** New `server/core/src/catalog_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+### Issue 10.2: Software Usage Tracking
+**Capability:** new | **Scope:** Agent + Server | **Status:** Open
+**Depends on:** 10.1
+
+Agent-side application usage metering:
+- New `software_usage` agent plugin
+- Track application launches, cumulative run time, last-used timestamp
+- Categorize: Used (30d), Rarely Used (90d), Unused (>90d), Unreported
+- Report via ReportInventory RPC
+- Server-side aggregation: per-title usage across fleet
+- Dashboard: usage summary with reclamation candidates
+
+**Files:** New `agents/plugins/software_usage/`, `server/core/src/catalog_store.cpp`
+
+### Issue 10.3: License Entitlements & Compliance
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 10.1
+
+License compliance calculation:
+- Entitlement records: product, purchased_seats, license_type (per-device/per-user/site/enterprise)
+- Compliance calculation: installed_count vs. entitled_count
+- Over/under-licensed reporting per product
+- REST: `GET/POST/PUT/DELETE /api/v1/entitlements`
+- Dashboard: license compliance summary with drill-down
+
+**Files:** New `server/core/src/entitlement_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+### Issue 10.4: Software Tags
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 10.1
+
+Server-side tags on software catalog entries:
+- Tag software titles for categorization (e.g., "approved", "prohibited", "eval")
+- Used for Management Group rules ("devices with software tagged X")
+- REST: `GET/POST/DELETE /api/v1/catalog/software/{id}/tags`
+- Dashboard: tag management in catalog view
+
+**Files:** `server/core/src/catalog_store.cpp`, `server/core/src/management_group_store.cpp`
+
+---
+
+## Phase 11: Consumer Model & Platform Extensibility
+
+*Formalize third-party integration and provide client libraries for automation.*
+
+### Issue 11.1: Consumer Application Registration
+**Capability:** 24.4 | **Scope:** Server | **Status:** Open
+
+Formal model for external systems consuming Yuzu data:
+- `ConsumerStore` (SQLite): name, URL, max_concurrent_instructions, offload_target, enabled
+- Consumers get scoped API tokens with rate limits
+- Custom data field for consumer-specific metadata
+- Consumer deploy: push instruction definitions and policies to specific consumers
+- REST: `GET/POST/PUT/DELETE /api/v1/consumers`
+- Dashboard: Consumers page in Settings
+
+**Files:** New `server/core/src/consumer_store.cpp`, `server/core/src/settings_routes.cpp`
+
+### Issue 11.2: Event Source Management
+**Capability:** 21.5 | **Scope:** Server | **Status:** Open
+
+Configure which system events generate notifications and webhook deliveries:
+- Event source categories: agent_lifecycle, execution, compliance, security, system
+- Per-category enable/disable with severity threshold
+- Granular event type selection within each category
+- REST: `GET/PUT /api/v1/event-sources`
+- Dashboard: Event Sources section in Settings
+
+**Files:** New `server/core/src/event_source_config.cpp`, `server/core/src/webhook_store.cpp`, `server/core/src/notification_store.cpp`
+
+### Issue 11.3: PowerShell Module
+**Capability:** 24.7 (partial) | **Scope:** External | **Status:** Open
+
+`Yuzu.Management` PowerShell module wrapping REST API v1:
+- Cmdlets: `Connect-YuzuServer`, `Get-YuzuAgent`, `Send-YuzuInstruction`, `Get-YuzuCompliance`, `Get-YuzuAuditLog`, `New-YuzuSchedule`, etc.
+- Authentication: API token via `Connect-YuzuServer -Server <url> -Token <token>`
+- Tab completion for instruction names, agent IDs, scope attributes
+- Published to PowerShell Gallery
+
+**Files:** New `sdk/powershell/`
+
+### Issue 11.4: Python SDK
+**Capability:** 24.7 (partial) | **Scope:** External | **Status:** Open
+
+`yuzu-sdk` Python package wrapping REST API v1:
+- Async support via httpx
+- Typed models (dataclasses or Pydantic)
+- Convenience methods: `client.agents.list()`, `client.instructions.execute()`, etc.
+- Published to PyPI
+
+**Files:** New `sdk/python/`
+
+---
+
+## Phase 12: Remaining Agent Capabilities
+
+*Close all 19 "Not Started" items from the capability map to reach 100% coverage.*
+
+### Issue 12.1: Mapped Drive History
+**Capability:** 3.8 | **Scope:** Agent Plugin | **Status:** Open
+
+New actions in `users` plugin: `mapped_drives`, `mapped_drive_history`.
+- Windows: WMI `Win32_MappedLogicalDisk` + Event Log 4624/4634 for historical connections
+- Returns: drive_letter, remote_path, username, timestamp, direction (inbound/outbound)
+
+**Files:** `agents/plugins/users/src/users_plugin.cpp`
+
+### Issue 12.2: Printer Inventory
+**Capability:** 3.9 | **Scope:** Agent Plugin | **Status:** Open
+
+New action in `hardware` plugin: `printers`.
+- Windows: `EnumPrinters` API. Linux: CUPS `lpstat`. macOS: `lpstat`
+- Returns: name, driver, port, status, shared, default, network/local
+
+**Files:** `agents/plugins/hardware/src/hardware_plugin.cpp`
+
+### Issue 12.3: Port Scanning
+**Capability:** 4.11 | **Scope:** Agent Plugin | **Status:** Open
+
+New action in `discovery` plugin: `scan_ports`.
+- Parameters: target_ips (comma-separated), ports (range notation: "22,80,443,8000-8100")
+- Non-blocking connect with configurable timeout (default 2s)
+- Returns: ip, port, status (open/closed/filtered), service_guess
+
+**Files:** `agents/plugins/discovery/src/discovery_plugin.cpp`
+
+### Issue 12.4: NetBIOS Lookup
+**Capability:** 4.9 | **Scope:** Agent Plugin | **Status:** Open
+
+New action in `discovery` plugin: `netbios_lookup`.
+- Parameters: ip_addresses (comma-separated)
+- Send NetBIOS Name Query (UDP 137) and parse response
+- Returns: ip, netbios_name, domain, mac_address
+
+**Files:** `agents/plugins/discovery/src/discovery_plugin.cpp`
+
+### Issue 12.5: Open Windows Enumeration
+**Capability:** 5.5 | **Scope:** Agent Plugin | **Status:** Open
+
+New action in `interaction` plugin: `list_windows` (Windows-only).
+- `EnumWindows` + `GetWindowText` + `GetWindowThreadProcessId`
+- Returns: hwnd, title, process_name, pid, visible, minimized
+
+**Files:** `agents/plugins/interaction/src/interaction_plugin.cpp`
+
+### Issue 12.6: Directory Hash (Recursive)
+**Capability:** 10.11 | **Scope:** Agent Plugin | **Status:** Open
+
+New action in `filesystem` plugin: `hash_directory`.
+- Recursive SHA-256 of all file contents, sorted by relative path for deterministic output
+- Returns: directory_hash, file_count, total_bytes, elapsed_ms
+
+**Files:** `agents/plugins/filesystem/src/filesystem_plugin.cpp`
+
+### Issue 12.7: Survey Dialog
+**Capability:** 14.4 | **Scope:** Agent Plugin | **Status:** Open
+
+Extend `interaction` plugin: `survey` action.
+- Multi-question form: text input, single-choice, multi-choice, rating scale
+- Windows: WinForms-style dialog. Linux: zenity --forms. macOS: osascript
+- Unique survey name prevents repeat display. Response validity period.
+- Returns: structured JSON response with question_id → answer mapping
+
+**Files:** `agents/plugins/interaction/src/interaction_plugin.cpp`
+
+### Issue 12.8: Do-Not-Disturb Mode
+**Capability:** 14.5 | **Scope:** Agent Plugin | **Status:** Open
+
+Extend `interaction` plugin: `set_dnd` / `get_dnd_status` actions.
+- Suppress all notifications/dialogs for configurable duration
+- Persisted in agent KV storage (survives restart)
+- Returns: active (bool), expires_at (timestamp)
+
+**Files:** `agents/plugins/interaction/src/interaction_plugin.cpp`
+
+### Issue 12.9: Active Response Tracking
+**Capability:** 14.6 | **Scope:** Agent Plugin | **Status:** Open
+
+Extend `interaction` plugin: `list_pending` action.
+- Returns all outstanding surveys/questions awaiting user input
+- Includes: interaction_id, type, prompt, issued_at, timeout_at
+
+**Files:** `agents/plugins/interaction/src/interaction_plugin.cpp`
+
+### Issue 12.10: Patch Inventory Event Generation
+**Capability:** 8.9 | **Scope:** Agent Plugin | **Status:** Open
+
+Extend `windows_updates` plugin: `generate_inventory_events` action.
+- Emit structured events for each installed/missing patch
+- Feed into AnalyticsEventStore for SIEM/compliance integration
+- Event format: patch_kb, status (installed/missing), severity, agent_id, timestamp
+
+**Files:** `agents/plugins/windows_updates/src/windows_updates_plugin.cpp`
+
+### Issue 12.11: Application Whitelisting
+**Capability:** 9.10 | **Scope:** Agent Plugin | **Status:** Open
+
+New `app_control` plugin:
+- Windows: AppLocker policy query/modification via WMI or PowerShell
+- Linux: fapolicyd rules (if available)
+- Actions: `get_policy`, `add_rule`, `remove_rule`, `get_blocked_events`
+
+**Files:** New `agents/plugins/app_control/`
+
+### Issue 12.12: Inventory Replication (Delta Sync)
+**Capability:** 15.5 | **Scope:** Agent + Server | **Status:** Open
+
+Agent-side inventory cache with delta sync:
+- Agent-side: inventory cache in SQLite KV store, track hash of last-sent inventory per plugin
+- Server-side: track per-agent sync state (last_sync_at, inventory_hash)
+- Only send changed inventory since last sync, reducing bandwidth for large fleets
+
+**Files:** `agents/core/src/agent.cpp`, `server/core/src/inventory_store.cpp`
+
+### Issue 12.13: Binary Resource Distribution
+**Capability:** 22.7 | **Scope:** Server | **Status:** Open
+
+Server-side resource registry for versioned binary blobs:
+- Resource model: name, version, platform, hash, size, upload_at
+- Agents pull resources by name + version with SHA-256 hash verification
+- Used by instructions that need supporting files (scripts, configs, tools)
+- REST: `GET/POST/DELETE /api/v1/resources`, `GET /api/v1/resources/{name}/{version}/download`
+
+**Files:** New `server/core/src/resource_store.cpp`, `server/core/src/rest_api_v1.cpp`
+
+---
+
+## Phase 13: Security Hardening & Operational Polish
+
+*Close remaining security gaps and improve operational UX.*
+
+### Issue 13.1: 2FA for Instruction Approval (TOTP)
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+TOTP (RFC 6238) second factor on instruction approval:
+- Per-user TOTP secret stored encrypted in auth store
+- QR code enrollment via Settings UI
+- Approval endpoint requires `totp_code` parameter when 2FA is enabled for the user
+- Fallback: email-based one-time code (requires SMTP configuration)
+- Configurable: per-user opt-in or system-wide enforcement
+
+**Files:** `server/core/src/approval_manager.cpp`, `server/core/src/auth.cpp`, `server/core/src/settings_routes.cpp`
+
+### Issue 13.2: Composable Instruction Chains
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 7.14 (Workflow Primitives)
+
+Server-side multi-step instruction composition extending the WorkflowEngine:
+- Variables from previous steps available via `${step_name.field}` interpolation
+- CEL conditions for conditional step execution
+- Result row iteration via `foreach` for fan-out patterns
+- Provides composable instruction chaining without requiring an agent-side scripting language
+
+**Files:** `server/core/src/workflow_engine.cpp`, `server/core/src/execution_tracker.cpp`
+
+### Issue 13.3: Process / Sync Logging UI
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+Dashboard page at `/monitoring` with operational log views:
+- Tabs: Connector Sync Log, Scheduled Executions, Infrastructure Log
+- Reuse existing AuditStore with category filtering
+- HTMX fragments with 30s auto-refresh
+- Status indicators, filtering by action type / status / time range
+
+**Files:** New `server/core/src/monitoring_ui.cpp`, `server/core/src/dashboard_routes.cpp`
+
+### Issue 13.4: Dashboard Branding
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+White-label customization for enterprise deployments:
+- `BrandingConfig`: logo_url, product_name, primary_color, accent_color
+- Stored in RuntimeConfigStore (safe keys)
+- Settings UI: branding section with live preview
+- CSS variables for theme customization, applied globally
+
+**Files:** `server/core/src/css_bundle.cpp`, `server/core/src/settings_routes.cpp`, `server/core/src/runtime_config_store.cpp`
+
+### Issue 13.5: MCP Phase 2 (Write Tools)
+**Capabilities:** 24.8 (extension) | **Scope:** Server | **Status:** Open
+**Depends on:** 7.20 (MCP Phase 1)
+
+6 write/execute tools for the MCP server:
+- `set_tag`, `delete_tag` — device tag management
+- `execute_instruction` — dispatch instruction to agents (operator/supervised tiers)
+- `approve_request`, `reject_request` — approval workflow actions (supervised tier)
+- `quarantine_device` — network isolation (supervised tier)
+- Approval workflow integration for destructive operations
+- SSE streaming for execution progress
+
+**Files:** `server/core/src/mcp_server.cpp`, `server/core/src/mcp_policy.hpp`
+
+---
+
+## Phase 14: Scale & Enterprise Readiness
+
+*Features needed for very large deployments (>100K devices) and enterprise-grade resilience.*
+
+### Issue 14.1: P2P Content Distribution
+**Capability:** 13.5 | **Scope:** Agent | **Status:** Open
+
+Agent mesh for peer content sharing within subnets:
+- Leader election via mDNS/broadcast within subnet
+- Content announce/request protocol over UDP
+- Cache management: LRU eviction, configurable max size
+- Falls back to server download when no peers have content
+- Bandwidth throttling to avoid network saturation
+
+**Files:** New `agents/core/src/p2p_mesh.cpp`, `agents/plugins/content_dist/src/content_dist_plugin.cpp`
+
+### Issue 14.2: Multi-Gateway Topology
+**Capability:** 22.5 (extension) | **Scope:** Gateway + Server | **Status:** Open
+**Depends on:** 7.1, 7.1.1
+
+Server supports multiple concurrent gateway registrations:
+- Gateway affinity: agents assigned to nearest gateway via latency probing
+- Gateway failover: agents reconnect to alternate gateway on primary failure
+- Topology view shows all gateways with agent counts and health status
+
+**Files:** `server/core/src/agent_registry.cpp`, `server/core/src/gateway_service_impl.cpp`, `gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl`
+
+### Issue 14.3: Database Sharding (Response Partitioning)
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+Time-partitioned response storage for high-throughput environments:
+- Response data partitioned by time (monthly SQLite files)
+- Automatic file rotation and TTL cleanup
+- Query router spans partitions transparently
+- Reduces WAL contention for high-throughput response collection
+
+**Files:** `server/core/src/response_store.cpp`
+
+### Issue 14.4: vCenter Connector
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+VMware vSphere API integration:
+- Sync: VMs, ESXi hosts, datastores, clusters, resource pools
+- VM-to-agent correlation via hostname or UUID
+- Virtual summary reporting (physical hosts, guest count, density)
+
+**Files:** New `server/core/src/connectors/vcenter_connector.cpp`
+
+### Issue 14.5: Additional Connectors (BigFix, O365, Oracle)
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 9.1
+
+Extend the connector framework with additional integrations:
+- **BigFix**: REST API integration for inventory and patch compliance sync
+- **Office 365**: Microsoft Graph API for license and usage data
+- **Oracle LMS**: Database query for Oracle deployment facts and licensing
+
+**Files:** New `server/core/src/connectors/bigfix_connector.cpp`, `server/core/src/connectors/o365_connector.cpp`, `server/core/src/connectors/oracle_connector.cpp`
+
+### Issue 14.6: High Availability (Active-Passive)
+**Capability:** new | **Scope:** Server | **Status:** Open
+
+Active-passive failover for server resilience:
+- Shared SQLite over network filesystem (NFS/SMB) or replicated storage
+- Heartbeat between primary and standby servers
+- Automatic failover on primary health check failure
+- Gateway re-registration on failover event
+
+**Files:** New `server/core/src/ha_manager.cpp`, `server/core/src/server.cpp`
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -890,104 +1489,89 @@ Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI 
 
 ## Future Phase (T3 Items — Not Scheduled)
 
-These capabilities represent competitive parity with the most mature platforms. They are tracked but not scheduled into the current roadmap. Each will become a GitHub issue when prioritized.
+These capabilities are tracked but not yet scheduled. Each will become a GitHub issue when prioritized.
 
 | # | Capability | Notes |
 |---|-----------|-------|
-| 3.8 | Mapped drive history | Windows lateral movement analysis |
-| 3.9 | Printer inventory | Asset tracking |
-| 4.9 | NetBIOS/name lookup | Legacy reverse lookup |
-| 4.10 | ARP scanning | Active subnet discovery |
-| 4.11 | Port scanning | Service discovery |
-| 5.5 | Open windows enumeration | Desktop interaction |
-| 8.9 | Patch inventory events | SIEM integration |
-| 9.10 | Application whitelisting | Endpoint security product integration |
-| 10.11 | Directory hash | Integrity verification |
-| 12.3 | WMI namespace enumeration | WMI discovery |
-| 13.5 | Peer-to-peer content distribution | P2P caching with agent mesh |
-| 15.5 | Inventory replication | Agent-side cache with delta sync |
-| 20.6 | Response templates | Pre-defined response formats |
-| 20.7 | Response offloading | Route responses to external HTTP endpoints |
-| 22.3 | License management | Seat count, expiry, feature entitlements |
-| 22.7 | Binary resource distribution | Versioned binary distribution |
+| 4.10 | ARP scanning | Active subnet discovery (partially covered by `discovery` plugin `scan_subnet`) |
+| 12.3 | WMI namespace enumeration | WMI discovery (partially covered by `wmi` plugin configurable namespace) |
+| 22.3 | License management | Seat count, expiry, feature entitlements (LicenseStore exists; key generation strategy TBD — see D1) |
 | 23.2 | Remote key-value access | Cross-agent storage access |
-| 24.4 | Consumer registration | External system data feeds |
-| 24.7 | SDK libraries | Client libraries for third-party integration |
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 0 (Foundation)
-  └── No dependencies; can start immediately
+Phase 0–7 (All Done)
+  └── Foundation → Data Infrastructure → Instruction System → Security/RBAC
+      → Agent Infrastructure → Policy Engine → Windows Depth → Scale & Integration
 
-Phase 1 (Data Infrastructure)
-  ├── 1.1 Response Store ─── prerequisite for ──→ 1.2 Filtering, 1.3 Aggregation
-  ├── 1.5 Device Tags ───── prerequisite for ──→ 1.6 Scope Engine
-  └── 1.6 Scope Engine ──── prerequisite for ──→ Phase 2 (Scheduling, Targeting)
+Phase 8 (Visualization & Response Experience)
+  ├── 8.1 Visualization Engine ── builds on ResponseStore + InstructionStore
+  ├── 8.2 Response Templates ──── requires 8.1
+  └── 8.3 Response Offloading ─── independent (reuses WebhookStore pattern)
 
-Phase 2 (Instruction System)
-  ├── Requires: Phase 1 (response store, scope engine)
-  ├── 2.1 Definitions ───── prerequisite for ──→ 2.2 Sets, 2.3 Scheduling, 2.5 Hierarchies
-  ├── 2.4 Approvals ─────── prerequisite for ──→ 2.3 Scheduling (approval gates)
-  ├── 2.8 Error Codes ───── independent (can retrofit any time)
-  ├── 2.9 Concurrency ───── independent (can retrofit any time)
-  ├── 2.10 YAML UI ──────── requires 2.1 Definitions
-  ├── 2.11 Legacy Shim ──── requires 2.1 Definitions
-  └── 2.12 Result Envelope ─ prerequisite for ──→ 5.5 CEL, 7.14 Workflows
+Phase 9 (Connector Framework)
+  ├── 9.1 Connector Core ──────── independent (new subsystem)
+  ├── 9.2 Repository Model ────── requires 9.1
+  ├── 9.3–9.7 Connectors ─────── require 9.1 (all independent of each other)
+  └── 9.8 Consolidation ──────── requires 9.2
 
-Phase 3 (Security & RBAC)
-  ├── 3.1 RBAC ──────────── prerequisite for ──→ 3.2 Management Groups
-  ├── 3.2 Mgmt Groups ──── prerequisite for ──→ Phase 5 (Policy Assignment)
-  ├── 3.5 REST API ──────── can start after Phase 1
-  └── 3.9 Scope DSL Ext ─── independent (extends 1.6 Scope Engine)
+Phase 10 (Software Catalog)
+  ├── 10.1 Catalog Store ──────── requires 9.8 (normalized inventory data)
+  ├── 10.2 Usage Tracking ─────── requires 10.1
+  ├── 10.3 Entitlements ───────── requires 10.1
+  └── 10.4 Software Tags ─────── requires 10.1
 
-Phase 4 (Agent Infrastructure)
-  ├── 4.5 Triggers ──────── prerequisite for ──→ Phase 5 (Policy Engine)
-  ├── 4.1 Storage ───────── prerequisite for ──→ 4.5 Triggers (state), 3.6 Quarantine (state)
-  ├── 4.2 HTTP Client ───── prerequisite for ──→ 4.3 Content Staging
-  └── 4.8 set_start_mode ── independent (services plugin extension)
+Phase 11 (Consumer Model)
+  ├── 11.1 Consumer Registration ── independent
+  ├── 11.2 Event Sources ──────── independent (extends WebhookStore + NotificationStore)
+  ├── 11.3 PowerShell Module ──── independent (wraps REST API)
+  └── 11.4 Python SDK ─────────── independent (wraps REST API)
 
-Phase 5 (Policy Engine)
-  ├── Requires: Phase 3 (Mgmt Groups), Phase 4 (Triggers, Storage)
-  ├── 5.1 Rules ─────────── prerequisite for ──→ 5.2 Assignment, 5.3 Dashboard, 5.5 CEL
-  └── 5.5 CEL ─────────────  requires 5.1 Rules + 2.12 Result Envelope
+Phase 12 (Agent Capabilities)
+  ├── 12.1–12.6 ─── independent plugin extensions (no cross-deps)
+  ├── 12.7–12.9 ─── extend interaction plugin (sequential within plugin)
+  ├── 12.10 Patch Events ──────── extends windows_updates plugin
+  ├── 12.11 App Whitelisting ──── new plugin (independent)
+  ├── 12.12 Inventory Delta ───── extends agent core + InventoryStore
+  └── 12.13 Resource Distribution ── independent (new server store)
 
-Phase 6 (Windows Depth)
-  ├── Can start any time after Phase 0
-  └── 6.6 Registry Trigger ── requires Phase 4.5 (Trigger Framework)
+Phase 13 (Security & Polish)
+  ├── 13.1 2FA / TOTP ─────────── extends ApprovalManager
+  ├── 13.2 Instruction Chains ─── requires 7.14 Workflows
+  ├── 13.3 Monitoring UI ──────── independent (new dashboard page)
+  ├── 13.4 Branding ───────────── independent (CSS + RuntimeConfigStore)
+  └── 13.5 MCP Phase 2 ───────── requires 7.20 MCP Phase 1
 
-Phase 7 (Scale & Integration)
-  ├── Most items can start after Phase 3
-  ├── 7.1.1 Gateway Adjacency ── requires 7.1 Gateway
-  ├── 7.9 Product Packs ── requires Phase 2.1 (Instruction Definitions)
-  ├── 7.13 Pack Trust Chain ── requires 7.9 Product Packs
-  ├── 7.14 Workflows ────── requires 2.5 Hierarchies + 2.12 Result Envelope
-  ├── 7.18 Device Discovery ── complements 7.7 Agent Deployment Jobs
-  └── 7.20 MCP Server ──────── requires 3.3 API Tokens + 3.5 REST API
+Phase 14 (Scale & Enterprise)
+  ├── 14.1 P2P Content ────────── independent (agent-side mesh)
+  ├── 14.2 Multi-Gateway ──────── requires 7.1 + 7.1.1
+  ├── 14.3 DB Sharding ────────── extends ResponseStore
+  ├── 14.4 vCenter Connector ──── requires 9.1
+  ├── 14.5 Additional Connectors ── requires 9.1
+  └── 14.6 High Availability ──── independent (new subsystem)
+
+Cross-phase dependencies:
+  Phase 10 ──→ Phase 9.8 (catalog needs normalized inventory)
+  Phase 13.2 ──→ Phase 7.14 (chains extend workflows)
+  Phase 14.4–14.5 ──→ Phase 9.1 (connectors need framework)
 ```
 
 ---
 
 ## Recommended Execution Order
 
-For maximum value delivery, interleave phases based on dependencies:
+Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 0** — Complete all foundation gaps (small scope, high impact)
-2. **Phase 1** — Server data infrastructure (enables everything else)
-3. **Phase 4.1** — Agent storage (quick win, enables later phases)
-4. **Phase 3.1** — Granular RBAC (enterprise blocker)
-5. **Phase 2.1-2.2** — Instruction definitions and sets (core value)
-6. **Phase 3.2** — Management groups (scoping)
-7. **Phase 3.5** — REST API (external integration)
-8. **Phase 6.1** — Registry plugin (high demand)
-9. **Phase 2.3-2.4** — Scheduling and approvals
-10. **Phase 4.5** — Trigger framework
-11. **Phase 5** — Policy engine (flagship differentiator)
-12. **Phase 4.6** — User interaction
-13. **Phase 4.2-4.3** — Content distribution
-14. **Phase 7** — Scale and remaining features
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope)
+2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
+3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
+4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)
+5. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12)
+6. **Phase 13** — Security hardening & polish (2FA, branding, MCP write tools)
+7. **Phase 14** — Scale & enterprise readiness (P2P, multi-gateway, HA — large deployment needs)
 
 ---
 
@@ -997,14 +1581,19 @@ For maximum value delivery, interleave phases based on dependencies:
 |-------|:------:|:-------------------:|
 | 0: Foundation | 5 | 7 |
 | 1: Data Infrastructure | 7 | 12 |
-| 2: Instruction System | 7 | 10 |
-| 3: Security & RBAC | 8 | 12 |
-| 4: Agent Infrastructure | 7 | 14 |
-| 5: Policy Engine | 4 | 6 |
+| 2: Instruction System | 12 | 10 |
+| 3: Security & RBAC | 9 | 12 |
+| 4: Agent Infrastructure | 8 | 14 |
+| 5: Policy Engine | 5 | 6 |
 | 6: Windows Depth | 6 | 13 |
-| 7: Scale & Integration | 13 | 24 |
-| **Total** | **57** | **98** |
+| 7: Scale & Integration | 20 | 24 |
+| 8: Visualization & Response Experience | 3 | 3 |
+| 9: Connector Framework | 8 | 8 |
+| 10: Software Catalog | 4 | 4 |
+| 11: Consumer Model | 4 | 4 |
+| 12: Agent Capabilities | 13 | 13 |
+| 13: Security & Polish | 5 | 5 |
+| 14: Scale & Enterprise | 6 | 6 |
+| **Total** | **115** | **141** |
 
-Plus 19 future-tier items tracked but not scheduled = **117 of 142** capabilities addressed.
-
-The remaining 25 capabilities are covered by existing "Done" implementations that need no further work.
+Plus 4 future-tier items tracked but not scheduled. The remaining capabilities are covered by existing "Done" implementations.

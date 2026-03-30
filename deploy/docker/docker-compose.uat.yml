@@ -1,0 +1,41 @@
+# Yuzu UAT Stack — Prometheus + Grafana only
+#
+# Server, gateway, and agent run natively on the host.
+# Prometheus scrapes host services via host.docker.internal.
+#
+# Usage (from deploy/docker/):
+#   docker compose -f docker-compose.uat.yml up -d
+#   docker compose -f docker-compose.uat.yml down -v
+#
+# Or let scripts/win-start-UAT.sh manage this automatically.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../prometheus/prometheus-uat.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-uat-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${UAT_DASHBOARDS:-../grafana}:/var/lib/grafana/dashboards:ro
+      - grafana-uat-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-uat-data:
+  grafana-uat-data:

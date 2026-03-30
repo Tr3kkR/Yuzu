@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 2.0 | **Date:** 2026-03-26 | **Status:** Draft
+**Version:** 3.0 | **Date:** 2026-03-30 | **Status:** Draft
 
 ---
 
@@ -30,8 +30,9 @@ Each capability is rated on two axes:
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
 Future       [====================------------]  31/50 done  (62%)
+New (Ph 8-14)[----------------------------]     0/24 done   (0%)
 ─────────────────────────────────────────────────────────────────
-Overall      [=============================-]   165/184 done (90%)
+Overall      [======================---------]   165/208 done (79%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -53,14 +54,19 @@ Overall      [=============================-]   165/184 done (90%)
 | 15. Inventory & Data Collection | 5 | 4 | 0 | 1 |
 | 16. Policy & Compliance Engine | 8 | 8 | 0 | 0 |
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
-| 18. Auth & Authorization | 9 | 9 | 0 | 0 |
+| 18. Auth & Authorization | 10 | 9 | 0 | 1 |
 | 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
 | 20. Response Collection | 7 | 5 | 0 | 2 |
 | 21. Notifications & Audit | 5 | 4 | 0 | 1 |
-| 22. System & Infrastructure | 8 | 7 | 0 | 1 |
+| 22. System & Infrastructure | 10 | 7 | 0 | 3 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration & Extensibility | 10 | 8 | 0 | 2 |
-| **TOTAL** | **184** | **165** | **0** | **19** |
+| 25. Connector Framework | 5 | 0 | 0 | 5 |
+| 26. Inventory Repositories | 4 | 0 | 0 | 4 |
+| 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
+| 28. Response Visualization | 3 | 0 | 0 | 3 |
+| 29. Consumer Applications | 4 | 0 | 0 | 4 |
+| **TOTAL** | **208** | **165** | **0** | **43** |
 
 ---
 
@@ -769,6 +775,10 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 `httplib::SSLServer` with OpenSSL. CLI flags: `--https`, `--https-port`, `--https-cert`, `--https-key`, `--no-https-redirect`. HTTP-to-HTTPS 301 redirect. Secure cookie flag. Settings UI TLS configuration section.
 
+### 18.10 Two-Factor Authentication for Approvals :x: `T2`
+
+Not implemented. TOTP (RFC 6238) second factor for instruction approval workflows. Per-user TOTP enrollment with QR code, email-based OTP fallback.
+
 ---
 
 ## 19. Server: Device and Group Management
@@ -901,6 +911,14 @@ Not implemented. Distribute versioned binary resources via server.
 
 `ProductPackStore` (680 LOC). Install multi-document YAML bundles containing InstructionDefinitions, PolicyFragments, Policies, TriggerTemplates. Ed25519 signature verification (OpenSSL on Unix, BCrypt on Windows). Install/uninstall with callback delegation to origin stores. Pack metadata, item tracking, and version management. REST API for pack CRUD.
 
+### 22.9 Database Sharding (Response Partitioning) :x: `T3`
+
+Not implemented. Time-partitioned response storage (monthly SQLite files) with automatic rotation, TTL cleanup, and transparent cross-partition query routing.
+
+### 22.10 High Availability (Active-Passive) :x: `T3`
+
+Not implemented. Active-passive failover with shared storage, inter-server heartbeat, automatic failover on primary health check failure, and gateway re-registration.
+
 ---
 
 ## 23. Agent-Side Key-Value Storage
@@ -967,6 +985,120 @@ Settings page section for MCP configuration: enable/disable toggle, read-only mo
 
 ---
 
+## 25. Connector Framework
+
+*Bidirectional data sync with external management systems.*
+
+### 25.1 Connector Registry and Configuration :x: `T2`
+
+Not implemented. Pluggable connector architecture for syncing inventory data from external systems. ConnectorStore with encrypted credentials, sync scheduling, and connection testing.
+
+### 25.2 Connector Sync Engine :x: `T2`
+
+Not implemented. Background sync execution with lifecycle management (NotStarted → Pending → InProgress → Completed/Failed/Cancelled).
+
+### 25.3 SCCM / ConfigMgr Connector :x: `T2`
+
+Not implemented. SQL query integration with ConfigMgr database for hardware, software, user, and patch inventory.
+
+### 25.4 Intune Connector :x: `T2`
+
+Not implemented. Microsoft Graph API integration for managed device inventory and compliance state.
+
+### 25.5 ServiceNow Connector :x: `T2`
+
+Not implemented. REST API integration with ServiceNow CMDB for CI records, incidents, and change requests.
+
+---
+
+## 26. Inventory Repositories
+
+*Named, multi-source inventory partitions with consolidation and normalization.*
+
+### 26.1 Repository Model :x: `T2`
+
+Not implemented. Named repositories per type (inventory, compliance, entitlement) with connector bindings and default repository.
+
+### 26.2 Inventory Consolidation :x: `T2`
+
+Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records.
+
+### 26.3 Software Normalization :x: `T2`
+
+Not implemented. Vendor/title/version canonicalization pipeline. Normalize raw inventory entries to canonical software identities.
+
+### 26.4 WSUS / CSV / File Upload Connectors :x: `T2`
+
+Not implemented. WSUS database connector for patch compliance. CSV/TSV file upload connector with configurable column mapping.
+
+---
+
+## 27. Software Catalog & Licensing
+
+*Normalized software identification and license compliance management.*
+
+### 27.1 Software Catalog Store :x: `T2`
+
+Not implemented. Canonical software registry (vendor, title, version, edition, platform) with manual curation and automatic matching from raw inventory.
+
+### 27.2 Software Usage Tracking :x: `T2`
+
+Not implemented. Agent-side application usage metering (launch tracking, run time, last-used timestamp). Categorization: Used, Rarely Used, Unused, Unreported.
+
+### 27.3 License Entitlements & Compliance :x: `T2`
+
+Not implemented. Entitlement records (product, purchased_seats, license_type). Compliance calculation: installed vs. entitled with over/under-licensed reporting.
+
+### 27.4 Software Tags :x: `T2`
+
+Not implemented. Server-side tags on software catalog entries for categorization (approved, prohibited, eval). Usable in Management Group rules.
+
+### 27.5 License Compliance Dashboard :x: `T2`
+
+Not implemented. Per-product compliance summary with drill-down to device-level detail. Reclamation candidate identification from usage data.
+
+---
+
+## 28. Response Visualization
+
+*Chart rendering, data processing, and template management for instruction responses.*
+
+### 28.1 Response Visualization Engine :x: `T2`
+
+Not implemented. Server-side data transformation with built-in processors (SingleSeries, MultiSeries, DateTimeSeries). Chart types: Pie, Bar, Column, Line, Area. Configured via `spec.visualization` in InstructionDefinition YAML.
+
+### 28.2 Response Templates :x: `T2`
+
+Not implemented. Named response view configurations (column selection, sort order, filter presets) stored per InstructionDefinition.
+
+### 28.3 Response Offloading :x: `T2`
+
+Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.
+
+---
+
+## 29. Consumer Applications
+
+*Formal registration and management of external systems consuming Yuzu data.*
+
+### 29.1 Consumer Application Registration :x: `T2`
+
+Not implemented. ConsumerStore for registering third-party applications with scoped API tokens, rate limits, and custom data fields.
+
+### 29.2 Event Source Management :x: `T2`
+
+Not implemented. Configure which system events generate notifications and webhook deliveries. Per-category enable/disable with severity thresholds.
+
+### 29.3 PowerShell Module :x: `T3`
+
+Not implemented. `Yuzu.Management` PowerShell module wrapping REST API v1 with cmdlets for fleet management, instruction execution, and compliance queries.
+
+### 29.4 Python SDK :x: `T3`
+
+Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async support and typed models.
+
+---
+
 ## Appendix A: Plugin Coverage Matrix
 
 | Plugin | Win | Linux | macOS | Category |
@@ -1016,7 +1148,10 @@ Settings page section for MCP configuration: enable/disable toggle, read-only mo
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**44 plugins** — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.
+| software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
+| app_control | Y | Y | - | Security | *Planned (Phase 12)* |
+
+**44 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.
 
 ---
 
