@@ -254,7 +254,7 @@ start_all() {
         --log-level info \
         --metrics-no-auth \
         --config "$UAT_DIR/yuzu-server.cfg" \
-        --clickhouse-url http://localhost:8123 \
+        --clickhouse-url http://127.0.0.1:8123 \
         --clickhouse-database yuzu \
         --clickhouse-table yuzu_events \
         --clickhouse-user default \
@@ -495,18 +495,26 @@ for r in d.get('responses',[]):
         fi
     fi
 
-    # Test 10: ClickHouse analytics ingest (wait for drain interval)
+    # Test 10: ClickHouse analytics ingest (poll until drain fires)
+    # The server drains events from SQLite to ClickHouse every 5s.
+    # Poll up to 15s (3 drain cycles) rather than sleeping a fixed amount.
     tests_total=$((tests_total + 1))
     info "Waiting for analytics drain to ClickHouse..."
-    sleep 8  # drain interval is 5s, give extra buffer
-    local ch_count
-    ch_count=$(curl -s "http://localhost:8123/?query=SELECT+count()+FROM+yuzu.yuzu_events" 2>/dev/null || echo "0")
-    ch_count=$(echo "$ch_count" | tr -d '[:space:]')
+    local ch_count=0
+    local ch_attempt=0
+    for ch_attempt in $(seq 1 15); do
+        ch_count=$(curl -s "http://localhost:8123/?query=SELECT+count()+FROM+yuzu.yuzu_events" 2>/dev/null || echo "0")
+        ch_count=$(echo "$ch_count" | tr -d '[:space:]')
+        if [ "$ch_count" -gt 0 ] 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
     if [ "$ch_count" -gt 0 ] 2>/dev/null; then
-        ok "ClickHouse: $ch_count event(s) ingested"
+        ok "ClickHouse: $ch_count event(s) ingested (${ch_attempt}s)"
         tests_passed=$((tests_passed + 1))
     else
-        warn "ClickHouse: no events yet (server may not have drained — check later)"
+        fail "ClickHouse: no events after 15s — check server analytics config"
     fi
 
     # ── Summary ───────────────────────────────────────────────────────────

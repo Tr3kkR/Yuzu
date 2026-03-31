@@ -68,7 +68,7 @@ public:
         }
         auto query = "/?database=" + database_ + "&query=" + encoded;
 
-        httplib::Client cli(scheme + "://" + host, port);
+        httplib::Client cli(scheme + "://" + host + ":" + std::to_string(port));
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
 
