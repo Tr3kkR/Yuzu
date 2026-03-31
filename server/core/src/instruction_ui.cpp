@@ -387,14 +387,25 @@ function executeInstruction() {
     btn.disabled = false;
     if (resp.status >= 400) {
       status.textContent = '';
-      var msg = resp.data.error ? (resp.data.error.message || resp.data.error) : 'Failed';
-      document.getElementById('exec-result').innerHTML =
-        '<div class="alert alert-error">' + msg + '</div>';
+      var msg = resp.data.error ? (resp.data.error.message || String(resp.data.error)) : 'Failed';
+      var errDiv = document.createElement('div');
+      errDiv.className = 'alert alert-error';
+      errDiv.textContent = msg;
+      var er = document.getElementById('exec-result');
+      er.innerHTML = '';
+      er.appendChild(errDiv);
     } else {
       status.textContent = 'Dispatched to ' + (resp.data.agents_reached || 0) + ' agent(s)';
-      document.getElementById('exec-result').innerHTML =
-        '<div class="alert alert-success">Command <code>' + (resp.data.command_id || '') +
-        '</code> dispatched to ' + (resp.data.agents_reached || 0) + ' agent(s)</div>';
+      var okDiv = document.createElement('div');
+      okDiv.className = 'alert alert-success';
+      var cmdCode = document.createElement('code');
+      cmdCode.textContent = resp.data.command_id || '';
+      okDiv.appendChild(document.createTextNode('Command '));
+      okDiv.appendChild(cmdCode);
+      okDiv.appendChild(document.createTextNode(' dispatched to ' + (resp.data.agents_reached || 0) + ' agent(s)'));
+      var er2 = document.getElementById('exec-result');
+      er2.innerHTML = '';
+      er2.appendChild(okDiv);
     }
   })
   .catch(function(e) {
@@ -418,12 +429,19 @@ function loadExecAgents() {
         o.textContent = (a.hostname || a.agent_id || a.id) + ' (' + (a.os || '?') + ')';
         sel.appendChild(o);
       });
-      list.innerHTML = agents.map(function(a) {
-        return '<div style="padding:.3rem .5rem;border-bottom:1px solid var(--border)">' +
-          '<strong>' + (a.hostname || '?') + '</strong> ' +
-          '<span style="color:var(--muted)">' + (a.os || '') + ' ' + (a.arch || '') + '</span>' +
-          '</div>';
-      }).join('');
+      list.innerHTML = '';
+      agents.forEach(function(a) {
+        var row = document.createElement('div');
+        row.style.cssText = 'padding:.3rem .5rem;border-bottom:1px solid var(--border)';
+        var hn = document.createElement('strong');
+        hn.textContent = a.hostname || '?';
+        var info = document.createElement('span');
+        info.style.color = 'var(--muted)';
+        info.textContent = ' ' + (a.os || '') + ' ' + (a.arch || '');
+        row.appendChild(hn);
+        row.appendChild(info);
+        list.appendChild(row);
+      });
     })
     .catch(function(){});
 }

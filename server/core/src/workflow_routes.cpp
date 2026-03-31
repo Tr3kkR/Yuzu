@@ -230,9 +230,9 @@ void WorkflowRoutes::register_routes(
                 try {
                     auto j = nlohmann::json::parse(req.body);
                     yaml_source = j.value("yaml_source", "");
-                } catch (const std::exception& e) {
+                } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
             } else {
@@ -340,9 +340,9 @@ void WorkflowRoutes::register_routes(
                     for (const auto& aid : j["agent_ids"])
                         agent_ids.push_back(aid.get<std::string>());
                 }
-            } catch (const std::exception& e) {
+            } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
@@ -506,17 +506,26 @@ void WorkflowRoutes::register_routes(
                     for (auto& [k, v] : j["params"].items())
                         params[k] = v.is_string() ? v.get<std::string>() : v.dump();
                 }
-            } catch (const std::exception& e) {
+            } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                res.set_content(R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
             }
 
             // Empty agent_ids + empty scope = broadcast to all agents
 
             // Dispatch
-            auto [command_id, sent] = cmd_dispatch(
-                def->plugin, def->action, agent_ids, scope_expr, params);
+            std::string command_id;
+            int sent = 0;
+            try {
+                std::tie(command_id, sent) = cmd_dispatch(
+                    def->plugin, def->action, agent_ids, scope_expr, params);
+            } catch (const std::exception& e) {
+                spdlog::error("instruction dispatch failed: {}", e.what());
+                res.status = 500;
+                res.set_content(R"({"error":{"code":500,"message":"dispatch failed"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
 
             if (sent == 0) {
                 res.status = 503;
@@ -613,9 +622,9 @@ void WorkflowRoutes::register_routes(
                 try {
                     auto j = nlohmann::json::parse(req.body);
                     yaml_bundle = j.value("yaml_source", "");
-                } catch (const std::exception& e) {
+                } catch (const std::exception&) {
                     res.status = 400;
-                    res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                    res.set_content(R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})", "application/json");
                     return;
                 }
             } else {
