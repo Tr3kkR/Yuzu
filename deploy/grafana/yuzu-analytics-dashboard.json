@@ -1,0 +1,219 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_CLICKHOUSE",
+      "label": "ClickHouse",
+      "type": "datasource",
+      "pluginId": "grafana-clickhouse-datasource"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Total Events (24h)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT count() AS total FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "green", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Unique Agents (24h)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT uniq(agent_id) AS agents FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND agent_id != ''",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Error Events (24h)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT count() AS errors FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND severity IN ('error', 'critical')",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Login Attempts (24h)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT count() AS logins FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND event_type LIKE 'auth.login%'",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Events Over Time",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfMinute(event_time) AS time, event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY time, event_type ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 20,
+            "stacking": { "mode": "normal" }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "right" }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Events by Type (24h)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_type, count() AS count, uniq(agent_id) AS agents FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY event_type ORDER BY count DESC LIMIT 20",
+          "refId": "A",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Events by Severity (24h)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT severity, count() AS count FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY severity ORDER BY count DESC",
+          "refId": "A",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Recent Events",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_time, event_type, severity, agent_id, plugin, principal, source FROM yuzu.yuzu_events ORDER BY event_time DESC LIMIT 50",
+          "refId": "A",
+          "format": 1
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Command Completions by Plugin",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfMinute(event_time) AS time, plugin, count() AS cnt FROM yuzu.yuzu_events WHERE event_type = 'command.completed' AND event_time > now() - INTERVAL 1 DAY GROUP BY time, plugin ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom" }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Agent Activity (24h)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT agent_id, os, arch, agent_version, count() AS events, max(event_time) AS last_seen FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND agent_id != '' GROUP BY agent_id, os, arch, agent_version ORDER BY events DESC LIMIT 20",
+          "refId": "A",
+          "format": 1
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["yuzu", "analytics", "clickhouse"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Yuzu Analytics",
+  "uid": "yuzu-analytics",
+  "version": 1
+}

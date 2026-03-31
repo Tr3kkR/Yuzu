@@ -2192,6 +2192,14 @@ private:
             cmd.set_plugin(plugin);
             cmd.set_action(action);
 
+            // Parameters: pass-through key-value pairs to the agent plugin
+            {
+                auto params_map = extract_json_string_map(req.body, "params");
+                for (const auto& [k, v] : params_map) {
+                    (*cmd.mutable_parameters())[k] = v;
+                }
+            }
+
             // Stagger/delay: prevent thundering herd on large-fleet dispatch
             auto stagger = extract_json_int(req.body, "stagger", 0);
             auto delay = extract_json_int(req.body, "delay", 0);
@@ -4108,7 +4116,48 @@ private:
             },
             workflow_engine_.get(), execution_tracker_.get(),
             schedule_engine_.get(), product_pack_store_.get(),
-            instruction_store_.get(), policy_store_.get());
+            instruction_store_.get(), policy_store_.get(),
+            // CommandDispatchFn — dispatch commands to agents via gRPC
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids,
+                   const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
+                auto command_id = plugin + "-" +
+                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin(plugin);
+                cmd.set_action(action);
+                for (const auto& [k, v] : parameters)
+                    (*cmd.mutable_parameters())[k] = v;
+                agent_service_.record_send_time(command_id);
+                int sent = 0;
+                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                    auto group_id = scope_expr.substr(6);
+                    if (mgmt_group_store_) {
+                        auto members = mgmt_group_store_->get_members(group_id);
+                        for (const auto& m : members)
+                            if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                    }
+                } else if (!scope_expr.empty()) {
+                    auto parsed = yuzu::scope::parse(scope_expr);
+                    if (parsed) {
+                        auto matched = registry_.evaluate_scope(
+                            *parsed, tag_store_.get(), custom_properties_store_.get());
+                        for (const auto& aid : matched)
+                            if (registry_.send_to(aid, cmd)) ++sent;
+                    }
+                } else if (agent_ids.empty()) {
+                    sent = registry_.send_to_all(cmd);
+                } else {
+                    for (const auto& aid : agent_ids)
+                        if (registry_.send_to(aid, cmd)) ++sent;
+                }
+                forward_gateway_pending();
+                if (sent > 0)
+                    metrics_.counter("yuzu_commands_dispatched_total").increment();
+                return {command_id, sent};
+            });
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
@@ -4319,6 +4368,24 @@ private:
                     if (elem.is_string()) {
                         result.push_back(elem.get<std::string>());
                     }
+                }
+                return result;
+            }
+        } catch (...) {}
+        return {};
+    }
+
+    static std::unordered_map<std::string, std::string>
+    extract_json_string_map(const std::string& body, const std::string& key) {
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.contains(key) && j[key].is_object()) {
+                std::unordered_map<std::string, std::string> result;
+                for (auto& [k, v] : j[key].items()) {
+                    if (v.is_string())
+                        result[k] = v.get<std::string>();
+                    else
+                        result[k] = v.dump();
                 }
                 return result;
             }

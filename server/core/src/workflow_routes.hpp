@@ -18,6 +18,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -42,6 +43,13 @@ public:
     using ScopeEstimateFn =
         std::function<std::pair<std::size_t, std::size_t>(const std::string& expression)>;
 
+    /// Command dispatch callback — sends a command to agents via gRPC.
+    /// Returns (command_id, number_of_agents_reached).
+    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters)>;
+
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
                          WorkflowEngine* workflow_engine,
@@ -49,7 +57,8 @@ public:
                          ScheduleEngine* schedule_engine,
                          ProductPackStore* product_pack_store,
                          InstructionStore* instruction_store,
-                         PolicyStore* policy_store);
+                         PolicyStore* policy_store,
+                         CommandDispatchFn command_dispatch_fn);
 };
 
 } // namespace yuzu::server

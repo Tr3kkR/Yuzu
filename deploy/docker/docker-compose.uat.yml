@@ -1,7 +1,8 @@
-# Yuzu UAT Stack — Prometheus + Grafana only
+# Yuzu UAT Stack — Prometheus + Grafana + ClickHouse
 #
 # Server, gateway, and agent run natively on the host.
 # Prometheus scrapes host services via host.docker.internal.
+# ClickHouse receives analytics events from the server via HTTP.
 #
 # Usage (from deploy/docker/):
 #   docker compose -f docker-compose.uat.yml up -d
@@ -21,6 +22,24 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    ports:
+      - "8123:8123"   # HTTP interface (analytics ingest + Grafana queries)
+      - "9000:9000"   # Native TCP (Grafana plugin)
+    environment:
+      - CLICKHOUSE_DB=yuzu
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - ../clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-uat-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
     ports:
@@ -28,14 +47,17 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ${UAT_DASHBOARDS:-../grafana}:/var/lib/grafana/dashboards:ro
       - grafana-uat-data:/var/lib/grafana
     depends_on:
       - prometheus
+      - clickhouse
     restart: unless-stopped
 
 volumes:
   prometheus-uat-data:
   grafana-uat-data:
+  clickhouse-uat-data:
