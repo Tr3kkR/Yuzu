@@ -2527,6 +2527,34 @@ Store raw YAML source for an instruction definition.
 
 Validate YAML against the `yuzu.io/v1alpha1` DSL schema without persisting it.
 
+#### `POST /api/instructions/{id}/execute`
+
+Execute an instruction definition by dispatching it to agents. Requires `Execution:Execute` permission.
+
+**Request body:**
+```json
+{
+  "agent_ids": ["agent-uuid-1"],
+  "scope": "",
+  "params": {"key": "value"}
+}
+```
+
+- `agent_ids` (optional) — array of agent IDs to target
+- `scope` (optional) — scope expression (e.g., `group:servers`). Empty string + empty `agent_ids` = broadcast
+- `params` (optional) — key-value parameters passed to the plugin
+
+**Response (200):**
+```json
+{
+  "command_id": "plugin-hexid",
+  "agents_reached": 3,
+  "definition_id": "filesystem.exists"
+}
+```
+
+**Errors:** 404 (definition not found), 400 (invalid body), 503 (no agents reached or store unavailable).
+
 ---
 
 ### Instruction Sets

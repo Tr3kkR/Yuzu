@@ -927,6 +927,45 @@ curl -s -b cookies.txt \
   -o exported-definition.json
 ```
 
+#### Execute an instruction definition
+
+```
+POST /api/instructions/{id}/execute
+```
+
+Dispatches the instruction definition to agents. Requires `Execution:Execute` permission.
+
+**Request body:**
+
+```json
+{
+  "agent_ids": ["agent-uuid-1"],
+  "scope": "",
+  "params": {"path": "C:\\Windows\\System32\\notepad.exe"}
+}
+```
+
+- `agent_ids` — optional array of specific agent IDs to target.
+- `scope` — optional scope expression (e.g., `group:servers`, `os:windows AND tag:prod`). Empty string with empty `agent_ids` broadcasts to all connected agents.
+- `params` — key-value parameters to pass to the plugin action. Keys should match the definition's `parameter_schema`.
+
+**Response (200):**
+
+```json
+{
+  "command_id": "filesystem-a1b2c3",
+  "agents_reached": 3,
+  "definition_id": "filesystem.exists"
+}
+```
+
+```bash
+curl -s -b cookies.txt \
+  -X POST http://localhost:8080/api/instructions/filesystem.exists/execute \
+  -H "Content-Type: application/json" \
+  -d '{"params":{"path":"C:\\Windows"},"scope":""}'
+```
+
 #### List definitions (v1 endpoint)
 
 ```
@@ -1182,7 +1221,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | View running and completed executions. Per-agent status drill-down. Rerun and cancel actions. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, view running and completed executions with per-agent status drill-down, rerun, and cancel actions. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. |
 
@@ -1194,6 +1233,24 @@ The definition editor supports two modes:
 - **Code mode**: Full CodeMirror editor with YAML syntax highlighting. Paste or write YAML directly. A "Validate" button checks syntax without saving.
 
 Both modes save through the same `/api/instructions/yaml` endpoint.
+
+### Inline Parameters (CLI-style)
+
+The dashboard instruction bar supports CLI-style inline parameters using `key=value` syntax:
+
+```
+filesystem exists path=C:\Windows\System32\notepad.exe
+registry get_value hive=HKLM key=SOFTWARE\Microsoft\Windows value=ProductName
+```
+
+**Syntax rules:**
+- Tokens containing `=` are parsed as `key=value` parameters
+- Tokens without `=` form the command text (plugin + action)
+- Quoted values are supported: `key="value with spaces"`
+- Keys are lowercased; values preserve original case
+- Parameters are passed to the plugin as a `map<string, string>`
+
+This differs from YAML-parameterised instructions where parameters are defined in the `parameter_schema` of an `InstructionDefinition`. Inline parameters are ad-hoc and bypass schema validation — they are sent directly to the plugin action. YAML-defined parameters provide type constraints, descriptions, default values, and validation.
 
 ---
 
