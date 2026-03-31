@@ -5,9 +5,10 @@
 #   Agent --> Gateway(:50061) --> Server(:50055 upstream)
 #   Server --> Gateway(:50063) --> Agent   (command fanout)
 #
-# Monitoring (Docker containers):
+# Monitoring & Analytics (Docker containers):
 #   Prometheus(:9090) scrapes Server(:8080/metrics) + Gateway(:9568/metrics)
-#   Grafana(:3000) reads from Prometheus, dashboards auto-provisioned
+#   Grafana(:3000) reads from Prometheus + ClickHouse, dashboards auto-provisioned
+#   ClickHouse(:8123) receives analytics events from Server
 #
 # Usage:
 #   bash scripts/win-start-UAT.sh          # start all
@@ -90,6 +91,7 @@ show_status() {
     echo "  Dashboard:   http://localhost:8080"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
+    echo "  ClickHouse:  http://localhost:8123 (HTTP) / localhost:9000 (native)"
     echo "  GW Health:   http://localhost:8081/readyz"
     echo "  GW Metrics:  http://localhost:9568/metrics"
 }
@@ -152,8 +154,11 @@ prepare_dashboards() {
     for f in "$src"/*.json; do
         local base
         base=$(basename "$f")
-        # Replace "${DS_PROMETHEUS}" import variable with provisioned datasource ref
-        sed 's|"\${DS_PROMETHEUS}"|{"type": "prometheus", "uid": "prometheus"}|g' "$f" > "$dst/$base"
+        # Replace import variables with provisioned datasource refs
+        sed \
+            -e 's|"\${DS_PROMETHEUS}"|{"type": "prometheus", "uid": "prometheus"}|g' \
+            -e 's|"\${DS_CLICKHOUSE}"|{"type": "grafana-clickhouse-datasource", "uid": "clickhouse"}|g' \
+            "$f" > "$dst/$base"
     done
 
     # Also copy alert rules if present
@@ -213,11 +218,11 @@ start_all() {
     prepare_dashboards
     ok "Prepared provisioned dashboards"
 
-    # ── 1. Docker (Prometheus + Grafana) ──────────────────────────────────
+    # ── 1. Docker (Prometheus + Grafana + ClickHouse) ───────────────────
     echo ""
-    echo "[1/4] Starting Prometheus + Grafana (Docker)..."
+    echo "[1/4] Starting Prometheus + Grafana + ClickHouse (Docker)..."
     cd "$YUZU_ROOT/deploy/docker"
-    UAT_DASHBOARDS="$UAT_DIR/dashboards" docker compose -f docker-compose.uat.yml up -d 2>&1 | tail -3
+    UAT_DASHBOARDS="$UAT_DIR/dashboards" docker compose -f docker-compose.uat.yml up -d 2>&1 | tail -5
     cd "$YUZU_ROOT"
 
     if ! wait_for_http "http://localhost:9090/-/ready" "Prometheus" 30; then
@@ -225,8 +230,13 @@ start_all() {
     else
         ok "Prometheus up at http://localhost:9090"
     fi
-    if ! wait_for_http "http://localhost:3000/api/health" "Grafana" 30; then
-        warn "Grafana may still be starting"
+    if ! wait_for_http "http://localhost:8123/ping" "ClickHouse" 30; then
+        warn "ClickHouse may still be starting"
+    else
+        ok "ClickHouse up at http://localhost:8123"
+    fi
+    if ! wait_for_http "http://localhost:3000/api/health" "Grafana" 45; then
+        warn "Grafana may still be starting (installing ClickHouse plugin...)"
     else
         ok "Grafana up at http://localhost:3000 (admin/admin)"
     fi
@@ -244,6 +254,12 @@ start_all() {
         --log-level info \
         --metrics-no-auth \
         --config "$UAT_DIR/yuzu-server.cfg" \
+        --clickhouse-url http://localhost:8123 \
+        --clickhouse-database yuzu \
+        --clickhouse-table yuzu_events \
+        --clickhouse-user default \
+        --analytics-drain-interval 5 \
+        --analytics-batch-size 50 \
         > "$UAT_DIR/server.log" 2>&1 &
     disown
 
@@ -410,11 +426,21 @@ except: print(0)
         fail "Grafana not healthy"
     fi
 
-    # Test 7: help command (plugin listing via /api/help/html)
+    # Test 7: ClickHouse reachable and schema applied
+    tests_total=$((tests_total + 1))
+    local ch_tables
+    ch_tables=$(curl -s "http://localhost:8123/?query=SHOW+TABLES+FROM+yuzu" 2>/dev/null || echo "")
+    if echo "$ch_tables" | grep -q "yuzu_events"; then
+        ok "ClickHouse: yuzu.yuzu_events table exists"
+        tests_passed=$((tests_passed + 1))
+    else
+        fail "ClickHouse: yuzu_events table not found"
+    fi
+
+    # Test 8: help command (plugin listing via /api/help/html)
     echo ""
     echo "=== Command Tests ==="
     tests_total=$((tests_total + 1))
-    info "Fetching help (plugin listing)..."
     local help_html
     help_html=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
         http://localhost:8080/api/help/html 2>/dev/null)
@@ -427,7 +453,7 @@ except: print(0)
         fail "help: no plugin actions returned"
     fi
 
-    # Test 8: os_info round-trip (server -> gateway -> agent -> gateway -> server)
+    # Test 9: os_info round-trip (server -> gateway -> agent -> gateway -> server)
     tests_total=$((tests_total + 1))
     info "Sending 'os_info os_name' (full round-trip via gateway)..."
     local cmd_resp
@@ -469,6 +495,20 @@ for r in d.get('responses',[]):
         fi
     fi
 
+    # Test 10: ClickHouse analytics ingest (wait for drain interval)
+    tests_total=$((tests_total + 1))
+    info "Waiting for analytics drain to ClickHouse..."
+    sleep 8  # drain interval is 5s, give extra buffer
+    local ch_count
+    ch_count=$(curl -s "http://localhost:8123/?query=SELECT+count()+FROM+yuzu.yuzu_events" 2>/dev/null || echo "0")
+    ch_count=$(echo "$ch_count" | tr -d '[:space:]')
+    if [ "$ch_count" -gt 0 ] 2>/dev/null; then
+        ok "ClickHouse: $ch_count event(s) ingested"
+        tests_passed=$((tests_passed + 1))
+    else
+        warn "ClickHouse: no events yet (server may not have drained — check later)"
+    fi
+
     # ── Summary ───────────────────────────────────────────────────────────
     echo ""
     if [ "$tests_passed" -eq "$tests_total" ]; then
@@ -486,14 +526,16 @@ for r in d.get('responses',[]):
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
+    echo "  ClickHouse:  http://localhost:8123"
     echo ""
     echo "  GW Health:   http://localhost:8081/readyz"
     echo "  GW Metrics:  http://localhost:9568/metrics"
     echo ""
     echo "  Agent -> GW(:50061) -> Server(:50055)   [data]"
     echo "  Server -> GW(:50063) -> Agent           [commands]"
+    echo "  Server -> ClickHouse(:8123)             [analytics]"
     echo "  Prometheus -> Server(:8080) + GW(:9568) [metrics]"
-    echo "  Grafana -> Prometheus(:9090)            [dashboards]"
+    echo "  Grafana -> Prometheus + ClickHouse      [dashboards]"
     echo ""
     echo "  Logs: $UAT_DIR/{server,gateway,agent}.log"
     echo "  Stop: bash scripts/win-start-UAT.sh stop"

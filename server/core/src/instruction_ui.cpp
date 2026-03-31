@@ -112,8 +112,58 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 <div id="tab-definitions" hx-get="/fragments/instructions" hx-trigger="load" hx-swap="innerHTML">
     <div class="empty-state">Loading...</div>
 </div>
-<div id="tab-executions" style="display:none" hx-get="/fragments/executions" hx-trigger="revealed" hx-swap="innerHTML">
-    <div class="empty-state">Loading...</div>
+<div id="tab-executions" style="display:none">
+    <!-- Execute form — pick instruction, set params, choose scope, dispatch -->
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1.5rem">
+      <h3 style="margin:0 0 .8rem 0;font-size:.9rem;border:none;padding:0">Execute Instruction</h3>
+      <div style="display:grid;grid-template-columns:1fr 260px;gap:1.2rem">
+        <div>
+          <div class="form-group" style="margin-bottom:.8rem">
+            <label>Instruction Definition</label>
+            <select id="exec-def-select" style="width:100%"
+                    onchange="onDefSelected(this.value)">
+              <option value="">— Select an instruction —</option>
+            </select>
+          </div>
+          <div id="exec-def-info" style="display:none;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:.8rem;margin-bottom:.8rem">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem">
+              <strong id="exec-def-name" style="font-size:.85rem"></strong>
+              <code id="exec-def-id" style="font-size:.6rem;color:var(--muted)"></code>
+            </div>
+            <div id="exec-def-desc" style="font-size:.75rem;color:var(--muted);margin-bottom:.3rem"></div>
+            <div style="display:flex;gap:1rem;font-size:.7rem">
+              <span>Plugin: <code id="exec-def-plugin"></code></span>
+              <span>Action: <code id="exec-def-action"></code></span>
+              <span>Type: <code id="exec-def-type"></code></span>
+            </div>
+          </div>
+          <div id="exec-params-area" style="display:none;margin-bottom:.8rem">
+            <label>Parameters</label>
+            <div id="exec-params-fields" class="form-grid" style="margin-top:.3rem"></div>
+          </div>
+          <div>
+            <button class="btn btn-primary" onclick="executeInstruction()" id="exec-btn" disabled>
+              Execute
+            </button>
+            <span id="exec-status" style="font-size:.75rem;color:var(--muted);margin-left:.8rem"></span>
+          </div>
+          <div id="exec-result" style="margin-top:.5rem"></div>
+        </div>
+        <div>
+          <label>Scope</label>
+          <select id="exec-scope" style="width:100%;margin-top:.3rem;margin-bottom:.5rem">
+            <option value="__all__">All agents</option>
+          </select>
+          <div id="exec-agent-list" style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;font-size:.7rem">
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- Execution history — loaded via HTMX fragment -->
+    <h3 style="font-size:.9rem;margin-bottom:.5rem;border:none;padding:0">Execution History</h3>
+    <div id="exec-history" hx-get="/fragments/executions" hx-trigger="revealed" hx-swap="innerHTML">
+      <div class="empty-state">Loading...</div>
+    </div>
 </div>
 <div id="tab-schedules" style="display:none" hx-get="/fragments/schedules" hx-trigger="revealed" hx-swap="innerHTML">
     <div class="empty-state">Loading...</div>
@@ -128,7 +178,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 </div><!-- /padding wrapper -->
 
 <div id="toast-container" class="toast-container"></div>
-
+)HTM"
+    // Part 2: JavaScript (split to stay under MSVC's 16380-byte string limit)
+    R"HTM(
 <script>
 /* ── Toast notification system ─────────────────────────── */
 function showToast(message, level) {
@@ -205,6 +257,176 @@ fetch('/api/me').then(function(r){return r.json()}).then(function(d){
     if(sl) sl.style.display = 'none';
   }
 });
+loadExecDefinitions();
+loadExecAgents();
+
+/* ── Execute tab ──────────────────────────────────────────── */
+var execDefs = [];
+var selectedDef = null;
+
+function loadExecDefinitions() {
+  fetch('/api/instructions?enabled_only=1&limit=500')
+    .then(function(r){return r.json()})
+    .then(function(data) {
+      execDefs = data.definitions || [];
+      var sel = document.getElementById('exec-def-select');
+      if (!sel) return;
+      sel.innerHTML = '<option value="">— Select an instruction —</option>';
+      var byPlugin = {};
+      execDefs.forEach(function(d) {
+        var p = d.plugin || 'other';
+        if (!byPlugin[p]) byPlugin[p] = [];
+        byPlugin[p].push(d);
+      });
+      Object.keys(byPlugin).sort().forEach(function(p) {
+        var og = document.createElement('optgroup');
+        og.label = p;
+        byPlugin[p].forEach(function(d) {
+          var o = document.createElement('option');
+          o.value = d.id;
+          o.textContent = d.name || (d.plugin + ' ' + d.action);
+          og.appendChild(o);
+        });
+        sel.appendChild(og);
+      });
+    });
+}
+
+function onDefSelected(defId) {
+  selectedDef = null;
+  var info = document.getElementById('exec-def-info');
+  var paramsArea = document.getElementById('exec-params-area');
+  var btn = document.getElementById('exec-btn');
+
+  if (!defId) {
+    info.style.display = 'none';
+    paramsArea.style.display = 'none';
+    btn.disabled = true;
+    return;
+  }
+
+  selectedDef = execDefs.find(function(d){return d.id === defId});
+  if (!selectedDef) return;
+
+  document.getElementById('exec-def-name').textContent = selectedDef.name || '';
+  document.getElementById('exec-def-id').textContent = selectedDef.id;
+  document.getElementById('exec-def-desc').textContent = selectedDef.description || '';
+  document.getElementById('exec-def-plugin').textContent = selectedDef.plugin || '';
+  document.getElementById('exec-def-action').textContent = selectedDef.action || '';
+  document.getElementById('exec-def-type').textContent = selectedDef.type || '';
+  info.style.display = 'block';
+  btn.disabled = false;
+
+  var fields = document.getElementById('exec-params-fields');
+  fields.innerHTML = '';
+  try {
+    var schema = typeof selectedDef.parameter_schema === 'string'
+      ? JSON.parse(selectedDef.parameter_schema || '{}')
+      : (selectedDef.parameter_schema || {});
+    var props = schema.properties || {};
+    var required = schema.required || [];
+    var keys = Object.keys(props);
+    if (keys.length > 0) {
+      paramsArea.style.display = 'block';
+      keys.forEach(function(k) {
+        var p = props[k];
+        var div = document.createElement('div');
+        div.className = 'form-group';
+        var lbl = document.createElement('label');
+        lbl.textContent = k + (required.indexOf(k) >= 0 ? ' *' : '');
+        var inp = document.createElement('input');
+        inp.name = 'param_' + k;
+        inp.placeholder = p.description || p.type || '';
+        if (p.default !== undefined) inp.value = p.default;
+        div.appendChild(lbl);
+        div.appendChild(inp);
+        fields.appendChild(div);
+      });
+    } else {
+      paramsArea.style.display = 'none';
+    }
+  } catch(e) {
+    paramsArea.style.display = 'none';
+  }
+}
+)HTM"
+    // Part 3: Execute + form-to-YAML JavaScript
+    R"HTM(
+function executeInstruction() {
+  if (!selectedDef) return;
+  var btn = document.getElementById('exec-btn');
+  var status = document.getElementById('exec-status');
+  btn.disabled = true;
+  status.textContent = 'Dispatching...';
+
+  var params = {};
+  var fields = document.querySelectorAll('#exec-params-fields input');
+  fields.forEach(function(inp) {
+    var key = inp.name.replace('param_', '');
+    if (inp.value.trim()) params[key] = inp.value.trim();
+  });
+
+  var scope = document.getElementById('exec-scope').value;
+
+  var body = {params: params};
+  if (scope === '__all__') {
+    body.scope = '';
+  } else if (scope.startsWith('group:')) {
+    body.scope = scope;
+  } else {
+    body.agent_ids = [scope];
+  }
+
+  fetch('/api/instructions/' + encodeURIComponent(selectedDef.id) + '/execute', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(function(r){return r.json().then(function(d){return {status:r.status,data:d}})})
+  .then(function(resp) {
+    btn.disabled = false;
+    if (resp.status >= 400) {
+      status.textContent = '';
+      var msg = resp.data.error ? (resp.data.error.message || resp.data.error) : 'Failed';
+      document.getElementById('exec-result').innerHTML =
+        '<div class="alert alert-error">' + msg + '</div>';
+    } else {
+      status.textContent = 'Dispatched to ' + (resp.data.agents_reached || 0) + ' agent(s)';
+      document.getElementById('exec-result').innerHTML =
+        '<div class="alert alert-success">Command <code>' + (resp.data.command_id || '') +
+        '</code> dispatched to ' + (resp.data.agents_reached || 0) + ' agent(s)</div>';
+    }
+  })
+  .catch(function(e) {
+    btn.disabled = false;
+    status.textContent = 'Error: ' + e.message;
+  });
+}
+
+function loadExecAgents() {
+  fetch('/api/agents')
+    .then(function(r){return r.json()})
+    .then(function(data) {
+      var sel = document.getElementById('exec-scope');
+      var list = document.getElementById('exec-agent-list');
+      if (!sel || !list) return;
+      sel.innerHTML = '<option value="__all__">All agents</option>';
+      var agents = data.agents || [];
+      agents.forEach(function(a) {
+        var o = document.createElement('option');
+        o.value = a.agent_id || a.id;
+        o.textContent = (a.hostname || a.agent_id || a.id) + ' (' + (a.os || '?') + ')';
+        sel.appendChild(o);
+      });
+      list.innerHTML = agents.map(function(a) {
+        return '<div style="padding:.3rem .5rem;border-bottom:1px solid var(--border)">' +
+          '<strong>' + (a.hostname || '?') + '</strong> ' +
+          '<span style="color:var(--muted)">' + (a.os || '') + ' ' + (a.arch || '') + '</span>' +
+          '</div>';
+      }).join('');
+    })
+    .catch(function(){});
+}
 
 function formToYaml() {
     var f = document.getElementById('def-form');

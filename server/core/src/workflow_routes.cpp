@@ -11,6 +11,7 @@
 #include <expected>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -23,7 +24,10 @@ void WorkflowRoutes::register_routes(
     ScheduleEngine* schedule_engine,
     ProductPackStore* product_pack_store,
     InstructionStore* instruction_store,
-    PolicyStore* policy_store) {
+    PolicyStore* policy_store,
+    CommandDispatchFn command_dispatch_fn) {
+
+    auto cmd_dispatch = std::move(command_dispatch_fn);
 
     // -- HTMX fragments --------------------------------------------------------
 
@@ -317,7 +321,7 @@ void WorkflowRoutes::register_routes(
 
     // POST /api/workflows/:id/execute -- execute workflow against agents
     svr.Post(R"(/api/workflows/([^/]+)/execute)",
-        [perm_fn, audit_fn, emit_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, audit_fn, emit_fn, workflow_engine, instruction_store, cmd_dispatch](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Execute"))
                 return;
             if (!workflow_engine || !workflow_engine->is_open()) {
@@ -348,19 +352,52 @@ void WorkflowRoutes::register_routes(
                 return;
             }
 
-            // Create a dispatch function that uses the existing command dispatch
-            auto dispatch_fn = [](const std::string& instruction_id,
-                                  const std::string& agent_ids_json,
-                                  const std::string& parameters_json)
+            // Create a dispatch function that uses the real command dispatch
+            auto dispatch_fn = [instruction_store, &cmd_dispatch](
+                                    const std::string& instruction_id,
+                                    const std::string& agent_ids_json,
+                                    const std::string& parameters_json)
                 -> std::expected<std::string, std::string> {
-                // In a production system this would dispatch via the gRPC
-                // CommandRequest mechanism. For now, return a placeholder
-                // result that the execution can track.
-                return nlohmann::json({{"status", "dispatched"},
-                                       {"instruction_id", instruction_id},
-                                       {"agents", nlohmann::json::parse(agent_ids_json, nullptr, false)},
-                                       {"parameters", nlohmann::json::parse(parameters_json, nullptr, false)}})
-                    .dump();
+                // Look up the instruction definition to get plugin + action
+                if (!instruction_store || !instruction_store->is_open())
+                    return std::unexpected<std::string>("instruction store not available");
+
+                auto def = instruction_store->get_definition(instruction_id);
+                if (!def)
+                    return std::unexpected<std::string>("unknown instruction: " + instruction_id);
+
+                // Parse agent_ids from JSON array
+                std::vector<std::string> target_ids;
+                try {
+                    auto j = nlohmann::json::parse(agent_ids_json);
+                    if (j.is_array()) {
+                        for (const auto& a : j)
+                            target_ids.push_back(a.get<std::string>());
+                    }
+                } catch (...) {}
+
+                // Parse parameters from JSON object
+                std::unordered_map<std::string, std::string> params;
+                try {
+                    auto j = nlohmann::json::parse(parameters_json);
+                    if (j.is_object()) {
+                        for (auto& [k, v] : j.items())
+                            params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                    }
+                } catch (...) {}
+
+                // Dispatch via gRPC
+                auto [command_id, sent] = cmd_dispatch(
+                    def->plugin, def->action, target_ids, "", params);
+
+                if (sent == 0)
+                    return std::unexpected<std::string>("no agents reached for " + instruction_id);
+
+                return nlohmann::json({
+                    {"status", "dispatched"},
+                    {"command_id", command_id},
+                    {"agents_reached", sent}
+                }).dump();
             };
 
             // Condition evaluator using compliance_eval
@@ -428,6 +465,86 @@ void WorkflowRoutes::register_routes(
                                 {"completed_at", exec->completed_at},
                                 {"steps", steps_arr}})
                     .dump(),
+                "application/json");
+        });
+
+    // -- Single Instruction Execution API --------------------------------------
+
+    // POST /api/instructions/:id/execute — dispatch a single instruction definition
+    svr.Post(R"(/api/instructions/([^/]+)/execute)",
+        [perm_fn, audit_fn, emit_fn, instruction_store, cmd_dispatch, execution_tracker](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Execution", "Execute"))
+                return;
+            if (!instruction_store || !instruction_store->is_open()) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+
+            auto def_id = req.matches[1].str();
+            auto def = instruction_store->get_definition(def_id);
+            if (!def) {
+                res.status = 404;
+                res.set_content(R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+
+            // Parse request body
+            std::vector<std::string> agent_ids;
+            std::string scope_expr;
+            std::unordered_map<std::string, std::string> params;
+            try {
+                auto j = nlohmann::json::parse(req.body);
+                if (j.contains("agent_ids") && j["agent_ids"].is_array()) {
+                    for (const auto& a : j["agent_ids"])
+                        agent_ids.push_back(a.get<std::string>());
+                }
+                if (j.contains("scope") && j["scope"].is_string())
+                    scope_expr = j["scope"].get<std::string>();
+                if (j.contains("params") && j["params"].is_object()) {
+                    for (auto& [k, v] : j["params"].items())
+                        params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                }
+            } catch (const std::exception& e) {
+                res.status = 400;
+                res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+                return;
+            }
+
+            // Empty agent_ids + empty scope = broadcast to all agents
+
+            // Dispatch
+            auto [command_id, sent] = cmd_dispatch(
+                def->plugin, def->action, agent_ids, scope_expr, params);
+
+            if (sent == 0) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+
+            // Record execution if tracker available
+            if (execution_tracker) {
+                Execution exec;
+                exec.definition_id = def_id;
+                exec.status = "running";
+                exec.scope_expression = scope_expr;
+                exec.parameter_values = nlohmann::json(params).dump();
+                exec.agents_targeted = sent;
+                exec.dispatched_by = "api";
+                execution_tracker->create_execution(exec);
+            }
+
+            audit_fn(req, "instruction.execute", "success", "instruction", def_id,
+                      "command_id=" + command_id + " agents=" + std::to_string(sent));
+            emit_fn("instruction.executed", req);
+
+            auto trigger_msg = std::string("{\"showToast\":{\"message\":\"Instruction dispatched to ")
+                + std::to_string(sent) + " agent(s)\",\"level\":\"success\"}}";
+            res.set_header("HX-Trigger", trigger_msg);
+            res.set_content(
+                nlohmann::json({{"command_id", command_id}, {"agents_reached", sent}, {"definition_id", def_id}}).dump(),
                 "application/json");
         });
 

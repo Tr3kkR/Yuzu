@@ -43,6 +43,58 @@ static int col_index_for_name(const std::string& plugin, const std::string& name
     return -1;
 }
 
+/// Parse CLI-style "plugin action key=val key2=\"quoted val\"" into command + params.
+static std::pair<std::string, std::unordered_map<std::string, std::string>>
+parse_instruction_params(const std::string& text) {
+    std::unordered_map<std::string, std::string> params;
+    std::string command;
+
+    size_t pos = 0;
+    size_t len = text.size();
+
+    while (pos < len) {
+        // Skip whitespace
+        while (pos < len && text[pos] == ' ') ++pos;
+        if (pos >= len) break;
+
+        // Look ahead to find '=' in this token
+        size_t scan = pos;
+        while (scan < len && text[scan] != ' ' && text[scan] != '=') ++scan;
+
+        if (scan < len && text[scan] == '=' && scan > pos) {
+            // key=value pair — key is lowercase, value preserves case
+            std::string key = text.substr(pos, scan - pos);
+            for (auto& c : key) c = static_cast<char>(std::tolower(c));
+            ++scan; // skip '='
+
+            std::string val;
+            if (scan < len && text[scan] == '"') {
+                // Quoted value: read until closing quote
+                ++scan;
+                size_t close = text.find('"', scan);
+                if (close == std::string::npos) close = len;
+                val = text.substr(scan, close - scan);
+                pos = (close < len) ? close + 1 : len;
+            } else {
+                // Unquoted value: read until space
+                size_t vstart = scan;
+                while (scan < len && text[scan] != ' ') ++scan;
+                val = text.substr(vstart, scan - vstart);
+                pos = scan;
+            }
+            params[key] = val;
+        } else {
+            // Regular word — part of the command
+            size_t end = pos;
+            while (end < len && text[end] != ' ') ++end;
+            if (!command.empty()) command += ' ';
+            command += text.substr(pos, end - pos);
+            pos = end;
+        }
+    }
+    return {command, params};
+}
+
 // ---------------------------------------------------------------------------
 // register_routes
 // ---------------------------------------------------------------------------
@@ -238,8 +290,6 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  auto scope = extract_form_value(req.body, "scope");
 
                  if (instruction.empty()) {
-                     // OOB swap — hx-swap="none" ignores HX-Retarget, so
-                     // all feedback goes via OOB into #result-context.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
                          " style=\"font-size:0.75rem;color:#f85149\">"
@@ -248,13 +298,16 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      return;
                  }
 
+                 // Parse CLI-style key=value parameters from instruction text
+                 auto [command_text, inline_params] = parse_instruction_params(instruction);
+
                  // Handle built-in "help" command — render directly
-                 auto lower_instr = instruction;
-                 for (auto& c : lower_instr) c = static_cast<char>(std::tolower(c));
-                 if (lower_instr == "help" || lower_instr.starts_with("help ")) {
+                 auto lower_cmd = command_text;
+                 for (auto& c : lower_cmd) c = static_cast<char>(std::tolower(c));
+                 if (lower_cmd == "help" || lower_cmd.starts_with("help ")) {
                      std::string filter;
-                     if (lower_instr.size() > 5)
-                         filter = lower_instr.substr(5);
+                     if (lower_cmd.size() > 5)
+                         filter = lower_cmd.substr(5);
 
                      // Get help content — contains <tr> rows then OOB elements.
                      // Extract only the <tr> rows (everything up to the first
@@ -294,7 +347,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  }
 
                  // Resolve instruction text → plugin/action
-                 auto [plugin, action] = resolve_fn_(lower_instr);
+                 auto [plugin, action] = resolve_fn_(lower_cmd);
                  if (plugin.empty()) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -315,9 +368,8 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  }
                  // scope == "__all__" or empty → broadcast (empty agent_ids + empty scope)
 
-                 // Dispatch
-                 std::unordered_map<std::string, std::string> params;
-                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr, params);
+                 // Dispatch with inline CLI parameters
+                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params);
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
