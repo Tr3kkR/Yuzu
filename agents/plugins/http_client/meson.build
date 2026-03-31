@@ -1,7 +1,6 @@
 http_cpp_args = []
+# Windows: bcrypt.lib + ws2_32.lib linked via #pragma comment(lib) in source
 if host_machine.system() == 'windows'
-  _http_bcrypt = cxx.find_library('bcrypt')
-  _http_ws2 = cxx.find_library('ws2_32')
   # Try to find OpenSSL on Windows for HTTPS support
   _http_openssl = dependency('openssl', method: 'cmake',
                               modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'],
@@ -14,10 +13,10 @@ if host_machine.system() == 'windows'
     endif
   endif
   if not is_disabler(_http_openssl) and _http_openssl.found()
-    http_extra_deps = [_http_bcrypt, _http_ws2, _http_openssl]
+    http_extra_deps = [_http_openssl]
     http_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
   else
-    http_extra_deps = [_http_bcrypt, _http_ws2]
+    http_extra_deps = []
   endif
 else
   _http_openssl = dependency('openssl', required: true)

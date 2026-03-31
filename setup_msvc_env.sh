@@ -34,7 +34,9 @@ export VSCMD_VER="17.14.27"
 # ── Temp directories (Windows-native paths for non-MSYS2 tools like rebar3) ──
 # MSYS2 sets TMP=/tmp which native Windows programs interpret as \\tmp\\ (UNC),
 # causing rebar3 fetches to fail when moving downloaded dependencies.
-export TMP="C:\\Users\\${USER}\\AppData\\Local\\Temp"
+_WINUSER="${USER:-${USERNAME:-natha}}"
+export TMP="C:\\Users\\${_WINUSER}\\AppData\\Local\\Temp"
+unset _WINUSER
 export TEMP="$TMP"
 
 # ── CMake / build config ─────────────────────────────────────────────────────
