@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #define YUZU_DLOPEN(p) LoadLibraryW((p).wstring().c_str())
 #define YUZU_DLSYM(h, s) GetProcAddress(static_cast<HMODULE>(h), s)
 #define YUZU_DLCLOSE(h) FreeLibrary(static_cast<HMODULE>(h))

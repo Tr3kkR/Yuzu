@@ -1,8 +1,7 @@
 # Platform-specific crypto for auth module
+# Windows: bcrypt.lib + winhttp.lib linked via #pragma comment(lib) in source
 if host_machine.system() == 'windows'
-  bcrypt_dep = cxx.find_library('bcrypt')
-  winhttp_dep = cxx.find_library('winhttp')
-  auth_crypto_deps = [bcrypt_dep, winhttp_dep]
+  auth_crypto_deps = []
 else
   openssl_dep = dependency('openssl', required: true)
   auth_crypto_deps = [openssl_dep]

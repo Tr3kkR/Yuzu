@@ -12,6 +12,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <ctime>
 #include <format>
 #include <string>
 
@@ -27,12 +28,20 @@ int64_t day_boundary(int64_t epoch)   { return (epoch / 86400) * 86400; }
 int64_t month_boundary(int64_t epoch) {
     time_t t = static_cast<time_t>(epoch);
     struct tm tm_val{};
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
     gmtime_r(&t, &tm_val);
+#endif
     tm_val.tm_mday = 1;
     tm_val.tm_hour = 0;
     tm_val.tm_min = 0;
     tm_val.tm_sec = 0;
+#ifdef _WIN32
+    return static_cast<int64_t>(_mkgmtime(&tm_val));
+#else
     return static_cast<int64_t>(timegm(&tm_val));
+#endif
 }
 
 // Maximum expected interval between rollup marks (H11: clock skew protection)

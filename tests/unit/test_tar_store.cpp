@@ -1,8 +1,8 @@
 /**
  * test_tar_store.cpp -- Unit tests for TarDatabase (SQLite-backed TAR storage)
  *
- * Covers: open/create, table existence, event insert/query, type filtering,
- * limit, purge, stats, config get/set, state get/set.
+ * Covers: open/create, warehouse tables, typed inserts, SQL queries,
+ * stats, config get/set, state get/set.
  */
 
 #include "tar_db.hpp"
@@ -53,146 +53,141 @@ TEST_CASE("TarDatabase: open creates database file", "[tar][store][lifecycle]") 
     CHECK(fs::exists(t.path));
 }
 
-TEST_CASE("TarDatabase: tables exist after open", "[tar][store][lifecycle]") {
+TEST_CASE("TarDatabase: warehouse tables created on open", "[tar][store][lifecycle]") {
     auto t = make_test_db();
-    // Verify by inserting an event -- would fail if table doesn't exist
-    TarEvent ev;
-    ev.timestamp = 1000;
-    ev.event_type = "process";
-    ev.event_action = "started";
-    ev.detail_json = R"({"pid":42})";
+    // Verify by inserting a process event -- would fail if table doesn't exist
+    ProcessEvent ev;
+    ev.ts = 1000;
     ev.snapshot_id = 1;
+    ev.action = "started";
+    ev.pid = 42;
+    ev.name = "test.exe";
 
-    CHECK(t.db.insert_events({ev}));
+    CHECK(t.db.insert_process_events({ev}));
 }
 
 // =============================================================================
-// Event insert and query
+// Typed inserts and SQL queries
 // =============================================================================
 
-TEST_CASE("TarDatabase: insert and query events", "[tar][store][crud]") {
+TEST_CASE("TarDatabase: insert and query process events", "[tar][store][crud]") {
     auto t = make_test_db();
 
-    std::vector<TarEvent> events;
+    std::vector<ProcessEvent> events;
     for (int i = 0; i < 5; ++i) {
-        TarEvent ev;
-        ev.timestamp = 1000 + i;
-        ev.event_type = "process";
-        ev.event_action = (i % 2 == 0) ? "started" : "stopped";
-        ev.detail_json = R"({"pid":)" + std::to_string(i + 1) + "}";
+        ProcessEvent ev;
+        ev.ts = 1000 + i;
         ev.snapshot_id = 1;
+        ev.action = (i % 2 == 0) ? "started" : "stopped";
+        ev.pid = static_cast<uint32_t>(i + 1);
+        ev.name = "proc" + std::to_string(i);
         events.push_back(std::move(ev));
     }
 
-    REQUIRE(t.db.insert_events(events));
+    REQUIRE(t.db.insert_process_events(events));
 
-    auto results = t.db.query(1000, 1010);
-    REQUIRE(results.size() == 5);
-    CHECK(results[0].timestamp == 1000);
-    CHECK(results[4].timestamp == 1004);
-    CHECK(results[0].event_type == "process");
+    auto results = t.db.execute_query("SELECT ts, action, pid, name FROM process_live ORDER BY ts");
+    REQUIRE(results.has_value());
+    REQUIRE(results->rows.size() == 5);
+    CHECK(results->rows[0][0] == "1000");
+    CHECK(results->rows[4][0] == "1004");
+    CHECK(results->rows[0][1] == "started");
+}
+
+TEST_CASE("TarDatabase: insert and query network events", "[tar][store][crud]") {
+    auto t = make_test_db();
+
+    NetworkEvent ev;
+    ev.ts = 2000;
+    ev.snapshot_id = 1;
+    ev.action = "connected";
+    ev.proto = "tcp";
+    ev.local_addr = "127.0.0.1";
+    ev.local_port = 8080;
+    ev.remote_addr = "10.0.0.1";
+    ev.remote_port = 443;
+    ev.pid = 100;
+    ev.process_name = "curl";
+
+    REQUIRE(t.db.insert_network_events({ev}));
+
+    auto results = t.db.execute_query("SELECT proto, local_port, remote_addr FROM tcp_live");
+    REQUIRE(results.has_value());
+    REQUIRE(results->rows.size() == 1);
+    CHECK(results->rows[0][0] == "tcp");
+    CHECK(results->rows[0][1] == "8080");
+    CHECK(results->rows[0][2] == "10.0.0.1");
 }
 
 TEST_CASE("TarDatabase: query with time range filter", "[tar][store][query]") {
     auto t = make_test_db();
 
-    std::vector<TarEvent> events;
+    std::vector<ProcessEvent> events;
     for (int i = 0; i < 10; ++i) {
-        TarEvent ev;
-        ev.timestamp = 1000 + i;
-        ev.event_type = "process";
-        ev.event_action = "started";
-        ev.detail_json = "{}";
+        ProcessEvent ev;
+        ev.ts = 1000 + i;
         ev.snapshot_id = 1;
+        ev.action = "started";
+        ev.pid = static_cast<uint32_t>(i);
+        ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    t.db.insert_events(events);
+    REQUIRE(t.db.insert_process_events(events));
 
-    auto results = t.db.query(1003, 1006);
-    REQUIRE(results.size() == 4);
-    CHECK(results[0].timestamp == 1003);
-    CHECK(results[3].timestamp == 1006);
+    auto results = t.db.execute_query(
+        "SELECT ts FROM process_live WHERE ts >= 1003 AND ts <= 1006 ORDER BY ts");
+    REQUIRE(results.has_value());
+    REQUIRE(results->rows.size() == 4);
+    CHECK(results->rows[0][0] == "1003");
+    CHECK(results->rows[3][0] == "1006");
 }
 
-TEST_CASE("TarDatabase: query with type filter", "[tar][store][query]") {
+TEST_CASE("TarDatabase: query with LIMIT", "[tar][store][query]") {
     auto t = make_test_db();
 
-    TarEvent proc_ev;
-    proc_ev.timestamp = 1000;
-    proc_ev.event_type = "process";
-    proc_ev.event_action = "started";
-    proc_ev.detail_json = "{}";
-    proc_ev.snapshot_id = 1;
-
-    TarEvent net_ev;
-    net_ev.timestamp = 1001;
-    net_ev.event_type = "network";
-    net_ev.event_action = "connected";
-    net_ev.detail_json = "{}";
-    net_ev.snapshot_id = 1;
-
-    TarEvent svc_ev;
-    svc_ev.timestamp = 1002;
-    svc_ev.event_type = "service";
-    svc_ev.event_action = "started";
-    svc_ev.detail_json = "{}";
-    svc_ev.snapshot_id = 1;
-
-    t.db.insert_events({proc_ev, net_ev, svc_ev});
-
-    auto proc_results = t.db.query(0, 2000, "process");
-    REQUIRE(proc_results.size() == 1);
-    CHECK(proc_results[0].event_type == "process");
-
-    auto net_results = t.db.query(0, 2000, "network");
-    REQUIRE(net_results.size() == 1);
-    CHECK(net_results[0].event_type == "network");
-}
-
-TEST_CASE("TarDatabase: query with limit", "[tar][store][query]") {
-    auto t = make_test_db();
-
-    std::vector<TarEvent> events;
+    std::vector<ProcessEvent> events;
     for (int i = 0; i < 20; ++i) {
-        TarEvent ev;
-        ev.timestamp = 1000 + i;
-        ev.event_type = "process";
-        ev.event_action = "started";
-        ev.detail_json = "{}";
+        ProcessEvent ev;
+        ev.ts = 1000 + i;
         ev.snapshot_id = 1;
+        ev.action = "started";
+        ev.pid = static_cast<uint32_t>(i);
+        ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    t.db.insert_events(events);
+    REQUIRE(t.db.insert_process_events(events));
 
-    auto results = t.db.query(0, 2000, "", 5);
-    CHECK(results.size() == 5);
+    auto results = t.db.execute_query("SELECT ts FROM process_live LIMIT 5");
+    REQUIRE(results.has_value());
+    CHECK(results->rows.size() == 5);
 }
 
 // =============================================================================
-// Purge
+// Retention (purge via SQL)
 // =============================================================================
 
-TEST_CASE("TarDatabase: purge removes old records", "[tar][store][purge]") {
+TEST_CASE("TarDatabase: purge old records via execute_sql_range", "[tar][store][purge]") {
     auto t = make_test_db();
 
-    std::vector<TarEvent> events;
+    std::vector<ProcessEvent> events;
     for (int i = 0; i < 10; ++i) {
-        TarEvent ev;
-        ev.timestamp = 1000 + i;
-        ev.event_type = "process";
-        ev.event_action = "started";
-        ev.detail_json = "{}";
+        ProcessEvent ev;
+        ev.ts = 1000 + i;
         ev.snapshot_id = 1;
+        ev.action = "started";
+        ev.pid = static_cast<uint32_t>(i);
+        ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    t.db.insert_events(events);
+    REQUIRE(t.db.insert_process_events(events));
 
-    int purged = t.db.purge(1005);
-    CHECK(purged == 5);
+    // Delete records with ts < 1005
+    REQUIRE(t.db.execute_sql("DELETE FROM process_live WHERE ts < 1005"));
 
-    auto remaining = t.db.query(0, 2000);
-    CHECK(remaining.size() == 5);
-    CHECK(remaining[0].timestamp == 1005);
+    auto remaining = t.db.execute_query("SELECT ts FROM process_live ORDER BY ts");
+    REQUIRE(remaining.has_value());
+    CHECK(remaining->rows.size() == 5);
+    CHECK(remaining->rows[0][0] == "1005");
 }
 
 // =============================================================================
@@ -202,17 +197,17 @@ TEST_CASE("TarDatabase: purge removes old records", "[tar][store][purge]") {
 TEST_CASE("TarDatabase: stats returns correct values", "[tar][store][stats]") {
     auto t = make_test_db();
 
-    std::vector<TarEvent> events;
+    std::vector<ProcessEvent> events;
     for (int i = 0; i < 5; ++i) {
-        TarEvent ev;
-        ev.timestamp = 2000 + i;
-        ev.event_type = "process";
-        ev.event_action = "started";
-        ev.detail_json = "{}";
+        ProcessEvent ev;
+        ev.ts = 2000 + i;
         ev.snapshot_id = 1;
+        ev.action = "started";
+        ev.pid = static_cast<uint32_t>(i);
+        ev.name = "proc";
         events.push_back(std::move(ev));
     }
-    t.db.insert_events(events);
+    REQUIRE(t.db.insert_process_events(events));
 
     auto s = t.db.stats();
     CHECK(s.record_count == 5);

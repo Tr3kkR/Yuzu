@@ -14,6 +14,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #else
 #include <openssl/sha.h>
 #endif

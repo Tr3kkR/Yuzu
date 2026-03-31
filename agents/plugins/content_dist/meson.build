@@ -1,6 +1,6 @@
 cd_cpp_args = []
+# Windows: bcrypt.lib linked via #pragma comment(lib) in source
 if host_machine.system() == 'windows'
-  _cd_bcrypt = cxx.find_library('bcrypt')
   # Try to find OpenSSL on Windows for HTTPS support
   _cd_openssl = dependency('openssl', method: 'cmake',
                             modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'],
@@ -13,10 +13,10 @@ if host_machine.system() == 'windows'
     endif
   endif
   if not is_disabler(_cd_openssl) and _cd_openssl.found()
-    cd_extra_deps = [_cd_bcrypt, _cd_openssl]
+    cd_extra_deps = [_cd_openssl]
     cd_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
   else
-    cd_extra_deps = [_cd_bcrypt]
+    cd_extra_deps = []
   endif
 else
   _cd_openssl = dependency('openssl', required: true)
