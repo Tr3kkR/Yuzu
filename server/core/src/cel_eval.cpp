@@ -1012,15 +1012,19 @@ private:
                 expect(TokenType::RBracket, "expected ']'");
                 if (validate_only_) { obj = std::monostate{}; continue; }
 
-                // List index access
+                // List index access — copy before reassigning obj, because
+                // obj holds the shared_ptr<CelList> whose items we're reading;
+                // assigning to obj destroys that shared_ptr first on MSVC.
                 if (auto* l = std::get_if<std::shared_ptr<CelList>>(&obj)) {
                     if (auto* ii = std::get_if<int64_t>(&idx)) {
                         auto i = *ii;
                         auto& items = (*l)->items;
-                        if (i >= 0 && static_cast<size_t>(i) < items.size())
-                            obj = items[static_cast<size_t>(i)];
-                        else
+                        if (i >= 0 && static_cast<size_t>(i) < items.size()) {
+                            CelValue extracted = items[static_cast<size_t>(i)];
+                            obj = extracted;
+                        } else {
                             obj = std::monostate{};
+                        }
                     } else {
                         obj = std::monostate{};
                     }

@@ -27,16 +27,18 @@ struct TestPatchDb {
     PatchManager mgr;
 
     TestPatchDb()
-        : path("/tmp/test_patch_mgr_" + std::to_string(++g_test_counter) + "_" +
-               std::to_string(reinterpret_cast<uintptr_t>(this)) + ".db"),
+        : path(std::filesystem::temp_directory_path() /
+               ("test_patch_mgr_" + std::to_string(++g_test_counter) + "_" +
+                std::to_string(reinterpret_cast<uintptr_t>(this)) + ".db")),
           mgr(path) {}
 
     ~TestPatchDb() {
         // Destructor of mgr closes the DB; then remove the file.
-        std::filesystem::remove(path);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
         // WAL/SHM files
-        std::filesystem::remove(std::filesystem::path(path.string() + "-wal"));
-        std::filesystem::remove(std::filesystem::path(path.string() + "-shm"));
+        std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
+        std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
     }
 };
 
