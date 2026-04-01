@@ -693,9 +693,11 @@ extern const char* const kDashboardIndexHtml =
 
 )HTM"
     R"HTM(
-    /* sendInstruction() removed — instruction bar is now an HTMX form
-       (hx-post="/api/dashboard/execute"). Server resolves instruction text,
-       dispatches, and returns OOB swaps for thead, tbody, filter bar, badge. */
+    /* Trigger the HTMX form submission programmatically.
+       Called by Enter key, history clicks, and global shortcut. */
+    function sendInstruction() {
+      document.getElementById('instr-form').requestSubmit();
+    }
 
     /* ── Command history ─────────────────────────────────── */
     function addHistory(cmd, scope) {
@@ -1171,6 +1173,12 @@ extern const char* const kDashboardIndexHtml =
        attributes (hx-trigger="load") — no JS init calls needed
        except loadUserInfo which updates body data-role. */
     loadUserInfo();
+
+    /* Auto-open command palette if redirected from another page via ?palette=1 */
+    if (new URLSearchParams(window.location.search).has('palette')) {
+      history.replaceState(null, '', '/');
+      setTimeout(function() { cmdPalette.open(); }, 100);
+    }
   </script>
   <div id="toast-container" class="toast-container"></div>
 </body>
