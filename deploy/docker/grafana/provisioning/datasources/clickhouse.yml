@@ -8,7 +8,7 @@ datasources:
     url: http://clickhouse:8123
     jsonData:
       defaultDatabase: yuzu
-      port: 9000
+      port: 8123
       server: clickhouse
       protocol: http
     editable: false
