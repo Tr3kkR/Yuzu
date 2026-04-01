@@ -25,6 +25,18 @@ UAT_DIR="$YUZU_ROOT/.uat"
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
+# Ensure Docker CLI is on PATH (Docker Desktop doesn't always add it after reboot)
+if ! command -v docker > /dev/null 2>&1; then
+    for docker_bin in \
+        "/c/Program Files/Docker/Docker/resources/bin" \
+        "$PROGRAMFILES/Docker/Docker/resources/bin"; do
+        if [ -f "$docker_bin/docker.exe" ]; then
+            export PATH="$PATH:$docker_bin"
+            break
+        fi
+    done
+fi
+
 # Colours
 if [ -t 1 ]; then
     GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -195,8 +207,39 @@ start_all() {
         errors=$((errors + 1))
     fi
     if ! docker info > /dev/null 2>&1; then
-        fail "Docker not running"
-        errors=$((errors + 1))
+        info "Docker not running — attempting to start Docker Desktop..."
+        # Try common install locations
+        local docker_exe=""
+        for candidate in \
+            "/c/Program Files/Docker/Docker/Docker Desktop.exe" \
+            "$PROGRAMFILES/Docker/Docker/Docker Desktop.exe" \
+            "$LOCALAPPDATA/Docker/Docker Desktop.exe"; do
+            if [ -f "$candidate" ]; then
+                docker_exe="$candidate"
+                break
+            fi
+        done
+        if [ -z "$docker_exe" ]; then
+            fail "Docker not running and Docker Desktop not found"
+            errors=$((errors + 1))
+        else
+            "$docker_exe" &
+            disown
+            # Poll until Docker daemon responds (up to 60s)
+            local docker_wait=0
+            while ! docker info > /dev/null 2>&1; do
+                sleep 2
+                docker_wait=$((docker_wait + 2))
+                if [ "$docker_wait" -ge 60 ]; then
+                    fail "Docker Desktop did not start within 60s"
+                    errors=$((errors + 1))
+                    break
+                fi
+            done
+            if docker info > /dev/null 2>&1; then
+                ok "Docker Desktop started (${docker_wait}s)"
+            fi
+        fi
     fi
     if [ "$errors" -gt 0 ]; then
         echo ""; fail "$errors preflight check(s) failed — aborting"

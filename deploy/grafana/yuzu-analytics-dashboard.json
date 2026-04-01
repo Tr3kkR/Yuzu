@@ -1,123 +1,187 @@
 {
-  "__inputs": [
-    {
-      "name": "DS_CLICKHOUSE",
-      "label": "ClickHouse",
-      "type": "datasource",
-      "pluginId": "grafana-clickhouse-datasource"
-    }
-  ],
   "annotations": { "list": [] },
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 1,
+  "graphTooltip": 2,
   "id": null,
   "links": [],
+  "liveNow": false,
+  "style": "dark",
   "panels": [
+
+    {
+      "type": "row",
+      "title": "",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+
     {
       "type": "stat",
-      "title": "Total Events (24h)",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "title": "Total Events",
+      "description": "All analytics events in the selected time range",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT count() AS total FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY",
+          "rawSql": "SELECT count() AS total FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime",
           "refId": "A",
           "format": 1
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "blue", "value": null },
-              { "color": "green", "value": 100 }
-            ]
-          }
+          "color": { "mode": "fixed", "fixedColor": "#3B82F6" },
+          "thresholds": { "steps": [{ "color": "#3B82F6", "value": null }] }
         },
         "overrides": []
-      }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
+
     {
       "type": "stat",
-      "title": "Unique Agents (24h)",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "title": "Active Agents",
+      "description": "Unique agents reporting events",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT uniq(agent_id) AS agents FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND agent_id != ''",
+          "rawSql": "SELECT uniq(agent_id) AS agents FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND agent_id != ''",
           "refId": "A",
           "format": 1
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "blue", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
+          "color": { "mode": "fixed", "fixedColor": "#F59E0B" },
+          "thresholds": { "steps": [{ "color": "#F59E0B", "value": null }] }
         },
         "overrides": []
-      }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
+
     {
       "type": "stat",
-      "title": "Error Events (24h)",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "title": "Commands Executed",
+      "description": "Total commands dispatched to agents",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT count() AS errors FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND severity IN ('error', 'critical')",
+          "rawSql": "SELECT count() AS commands FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND event_type = 'command.dispatched'",
           "refId": "A",
           "format": 1
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 10 }
-            ]
-          }
+          "color": { "mode": "fixed", "fixedColor": "#10B981" },
+          "thresholds": { "steps": [{ "color": "#10B981", "value": null }] }
         },
         "overrides": []
-      }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
+
     {
       "type": "stat",
-      "title": "Login Attempts (24h)",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "title": "Completion Rate",
+      "description": "Percentage of dispatched commands that completed successfully",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT count() AS logins FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND event_type LIKE 'auth.login%'",
+          "rawSql": "SELECT round(countIf(event_type = 'command.completed') * 100.0 / greatest(countIf(event_type = 'command.dispatched'), 1), 1) AS pct FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND event_type IN ('command.dispatched', 'command.completed')",
           "refId": "A",
           "format": 1
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "thresholds": {
-            "steps": [
-              { "color": "blue", "value": null }
-            ]
-          }
+          "unit": "percent",
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "#EF4444", "value": null },
+            { "color": "#F59E0B", "value": 80 },
+            { "color": "#10B981", "value": 95 }
+          ] },
+          "min": 0, "max": 100
         },
         "overrides": []
-      }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
     },
+
+    {
+      "type": "stat",
+      "title": "Errors",
+      "description": "Events with error or critical severity",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT count() AS errors FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND severity IN ('error', 'critical')",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "steps": [
+            { "color": "#10B981", "value": null },
+            { "color": "#F59E0B", "value": 1 },
+            { "color": "#EF4444", "value": 10 }
+          ] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "type": "stat",
+      "title": "Logins",
+      "description": "Authentication events",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT count() AS logins FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND event_type LIKE 'auth.%'",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "#8B5CF6" },
+          "thresholds": { "steps": [{ "color": "#8B5CF6", "value": null }] }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "textMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    {
+      "type": "row",
+      "title": "Event Timeline",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+
     {
       "type": "timeseries",
       "title": "Events Over Time",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "description": "All events stacked by type, aligned to Grafana time range",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 6 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT toStartOfMinute(event_time) AS time, event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY time, event_type ORDER BY time",
+          "rawSql": "SELECT toStartOfInterval(event_time, INTERVAL $__interval_s second) AS time, event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime GROUP BY time, event_type ORDER BY time",
           "refId": "A",
           "format": 1
         }
@@ -126,94 +190,442 @@
         "defaults": {
           "custom": {
             "lineWidth": 1,
-            "fillOpacity": 20,
-            "stacking": { "mode": "normal" }
-          }
+            "fillOpacity": 30,
+            "gradientMode": "opacity",
+            "stacking": { "mode": "normal" },
+            "pointSize": 3,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": { "mode": "palette-classic-by-name" }
         },
-        "overrides": []
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "command.dispatched" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3B82F6" } }] },
+          { "matcher": { "id": "byName", "options": "command.response" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#60A5FA" } }] },
+          { "matcher": { "id": "byName", "options": "command.completed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#10B981" } }] },
+          { "matcher": { "id": "byName", "options": "auth.login" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#8B5CF6" } }] },
+          { "matcher": { "id": "byName", "options": "agent.registered" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }] },
+          { "matcher": { "id": "byName", "options": "agent.connected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#FBBF24" } }] },
+          { "matcher": { "id": "byName", "options": "agent.disconnected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F87171" } }] }
+        ]
       },
       "options": {
-        "tooltip": { "mode": "multi" },
-        "legend": { "displayMode": "table", "placement": "right" }
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "max"] }
       }
     },
+
     {
-      "type": "table",
-      "title": "Events by Type (24h)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "targets": [
-        {
-          "rawSql": "SELECT event_type, count() AS count, uniq(agent_id) AS agents FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY event_type ORDER BY count DESC LIMIT 20",
-          "refId": "A",
-          "format": 1
-        }
-      ]
+      "type": "row",
+      "title": "Command Analytics",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "collapsed": false,
+      "panels": []
     },
+
     {
-      "type": "table",
-      "title": "Events by Severity (24h)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "type": "barchart",
+      "title": "Commands by Plugin",
+      "description": "Top plugins by command volume",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 16 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT severity, count() AS count FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY GROUP BY severity ORDER BY count DESC",
-          "refId": "A",
-          "format": 1
-        }
-      ]
-    },
-    {
-      "type": "table",
-      "title": "Recent Events",
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "targets": [
-        {
-          "rawSql": "SELECT event_time, event_type, severity, agent_id, plugin, principal, source FROM yuzu.yuzu_events ORDER BY event_time DESC LIMIT 50",
-          "refId": "A",
-          "format": 1
-        }
-      ]
-    },
-    {
-      "type": "timeseries",
-      "title": "Command Completions by Plugin",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
-      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "targets": [
-        {
-          "rawSql": "SELECT toStartOfMinute(event_time) AS time, plugin, count() AS cnt FROM yuzu.yuzu_events WHERE event_type = 'command.completed' AND event_time > now() - INTERVAL 1 DAY GROUP BY time, plugin ORDER BY time",
+          "rawSql": "SELECT plugin, countIf(event_type = 'command.dispatched') AS dispatched, countIf(event_type = 'command.completed') AS completed, countIf(event_type = 'command.response') AS responses FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND plugin != '' GROUP BY plugin ORDER BY dispatched DESC LIMIT 25",
           "refId": "A",
           "format": 1
         }
       ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 80, "gradientMode": "hue" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "dispatched" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3B82F6" } }] },
+          { "matcher": { "id": "byName", "options": "completed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#10B981" } }] },
+          { "matcher": { "id": "byName", "options": "responses" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }] }
+        ]
+      },
       "options": {
+        "orientation": "horizontal",
+        "barWidth": 0.7,
+        "groupWidth": 0.8,
+        "stacking": "none",
+        "legend": { "displayMode": "list", "placement": "bottom" },
         "tooltip": { "mode": "multi" },
-        "legend": { "displayMode": "table", "placement": "bottom" }
+        "xTickLabelRotation": 0,
+        "xTickLabelMaxLength": 20
       }
     },
+
     {
-      "type": "table",
-      "title": "Agent Activity (24h)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "type": "piechart",
+      "title": "Event Type Distribution",
+      "description": "Breakdown of all event types",
+      "gridPos": { "h": 9, "w": 6, "x": 12, "y": 16 },
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
       "targets": [
         {
-          "rawSql": "SELECT agent_id, os, arch, agent_version, count() AS events, max(event_time) AS last_seen FROM yuzu.yuzu_events WHERE event_time > now() - INTERVAL 1 DAY AND agent_id != '' GROUP BY agent_id, os, arch, agent_version ORDER BY events DESC LIMIT 20",
+          "rawSql": "SELECT event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime GROUP BY event_type ORDER BY cnt DESC",
           "refId": "A",
           "format": 1
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic-by-name" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "command.dispatched" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3B82F6" } }] },
+          { "matcher": { "id": "byName", "options": "command.response" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#60A5FA" } }] },
+          { "matcher": { "id": "byName", "options": "command.completed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#10B981" } }] },
+          { "matcher": { "id": "byName", "options": "auth.login" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#8B5CF6" } }] },
+          { "matcher": { "id": "byName", "options": "agent.registered" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }] },
+          { "matcher": { "id": "byName", "options": "agent.connected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#FBBF24" } }] },
+          { "matcher": { "id": "byName", "options": "agent.disconnected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F87171" } }] }
+        ]
+      },
+      "options": {
+        "pieType": "donut",
+        "reduceOptions": { "calcs": ["sum"] },
+        "legend": { "displayMode": "table", "placement": "right", "values": ["percent", "value"] },
+        "tooltip": { "mode": "single" }
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Command Throughput",
+      "description": "Commands dispatched vs completed over time",
+      "gridPos": { "h": 9, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfInterval(event_time, INTERVAL $__interval_s second) AS time, countIf(event_type = 'command.dispatched') AS dispatched, countIf(event_type = 'command.completed') AS completed FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND event_type IN ('command.dispatched', 'command.completed') GROUP BY time ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "gradientMode": "opacity", "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "dispatched" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#3B82F6" } }] },
+          { "matcher": { "id": "byName", "options": "completed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#10B981" } }] }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Agent Fleet",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "collapsed": false,
+      "panels": []
+    },
+
+    {
+      "type": "table",
+      "title": "Agent Inventory",
+      "description": "All agents with event counts, OS, version, and last activity",
+      "gridPos": { "h": 9, "w": 14, "x": 0, "y": 26 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT agent_id, any(hostname) AS hostname, any(os) AS os, any(arch) AS arch, any(agent_version) AS version, count() AS events, countIf(event_type = 'command.completed') AS commands, max(event_time) AS last_seen FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND agent_id != '' GROUP BY agent_id ORDER BY events DESC LIMIT 50",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "agent_id" }, "properties": [{ "id": "custom.width", "value": 280 }] },
+          { "matcher": { "id": "byName", "options": "hostname" }, "properties": [{ "id": "custom.width", "value": 120 }] },
+          { "matcher": { "id": "byName", "options": "os" }, "properties": [{ "id": "custom.width", "value": 80 }] },
+          { "matcher": { "id": "byName", "options": "arch" }, "properties": [{ "id": "custom.width", "value": 70 }] },
+          { "matcher": { "id": "byName", "options": "version" }, "properties": [{ "id": "custom.width", "value": 90 }] },
+          { "matcher": { "id": "byName", "options": "events" }, "properties": [
+            { "id": "custom.width", "value": 70 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+            { "id": "color", "value": { "mode": "continuous-BlYlRd" } }
+          ] },
+          { "matcher": { "id": "byName", "options": "commands" }, "properties": [
+            { "id": "custom.width", "value": 80 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+            { "id": "color", "value": { "mode": "continuous-blues" } }
+          ] },
+          { "matcher": { "id": "byName", "options": "last_seen" }, "properties": [{ "id": "custom.width", "value": 160 }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "events", "desc": true }],
+        "footer": { "enablePagination": true, "countRows": true }
+      }
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Agent Lifecycle Events",
+      "description": "Registrations, connections, and disconnections over time",
+      "gridPos": { "h": 9, "w": 10, "x": 14, "y": 26 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfInterval(event_time, INTERVAL $__interval_s second) AS time, event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND event_type IN ('agent.registered', 'agent.connected', 'agent.disconnected', 'agent.enrollment_pending', 'agent.enrollment_denied') GROUP BY time, event_type ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 20, "gradientMode": "opacity", "showPoints": "auto", "pointSize": 5, "spanNulls": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "agent.registered" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }] },
+          { "matcher": { "id": "byName", "options": "agent.connected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#10B981" } }] },
+          { "matcher": { "id": "byName", "options": "agent.disconnected" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#EF4444" } }] },
+          { "matcher": { "id": "byName", "options": "agent.enrollment_pending" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#A78BFA" } }] },
+          { "matcher": { "id": "byName", "options": "agent.enrollment_denied" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F87171" } }] }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Security & Authentication",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": false,
+      "panels": []
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Authentication Events",
+      "description": "Login attempts and enrollment activity over time",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfInterval(event_time, INTERVAL $__interval_s second) AS time, event_type, count() AS cnt FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND (event_type LIKE 'auth.%' OR event_type LIKE 'agent.enrollment%') GROUP BY time, event_type ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 2, "fillOpacity": 25, "gradientMode": "opacity", "showPoints": "auto", "pointSize": 5, "spanNulls": true, "drawStyle": "bars", "barAlignment": 0 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "auth.login" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#8B5CF6" } }] },
+          { "matcher": { "id": "byName", "options": "agent.enrollment_pending" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }] },
+          { "matcher": { "id": "byName", "options": "agent.enrollment_denied" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#EF4444" } }] }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "type": "table",
+      "title": "Security Event Log",
+      "description": "Recent auth and enrollment events with principal details",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_time, event_type, principal, principal_role, hostname, source, JSONExtractString(attributes, 'reason') AS detail FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND (event_type LIKE 'auth.%' OR event_type LIKE 'agent.enrollment%') ORDER BY event_time DESC LIMIT 100",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "event_time" }, "properties": [{ "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "event_type" }, "properties": [
+            { "id": "custom.width", "value": 160 },
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "color", "value": { "mode": "fixed", "fixedColor": "#8B5CF6" } }
+          ] },
+          { "matcher": { "id": "byName", "options": "principal" }, "properties": [{ "id": "custom.width", "value": 100 }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "event_time", "desc": true }],
+        "footer": { "enablePagination": true }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Plugin Performance",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "collapsed": false,
+      "panels": []
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Command Completions by Plugin",
+      "description": "Per-plugin command completion rate over time",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 45 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT toStartOfInterval(event_time, INTERVAL $__interval_s second) AS time, plugin, count() AS cnt FROM yuzu.yuzu_events WHERE event_type = 'command.completed' AND event_time >= $__fromTime AND event_time <= $__toTime AND plugin != '' GROUP BY time, plugin ORDER BY time",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "lineWidth": 1, "fillOpacity": 15, "gradientMode": "opacity", "showPoints": "never", "spanNulls": true, "stacking": { "mode": "normal" } },
+          "color": { "mode": "palette-classic-by-name" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] }
+      }
+    },
+
+    {
+      "type": "table",
+      "title": "Plugin Summary",
+      "description": "Per-plugin event counts and completion rate",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 45 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT plugin, countIf(event_type = 'command.dispatched') AS dispatched, countIf(event_type = 'command.completed') AS completed, countIf(event_type = 'command.response') AS responses, round(countIf(event_type = 'command.completed') * 100.0 / greatest(countIf(event_type = 'command.dispatched'), 1), 0) AS completion_pct FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime AND plugin != '' GROUP BY plugin ORDER BY dispatched DESC LIMIT 30",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "plugin" }, "properties": [{ "id": "custom.width", "value": 120 }] },
+          { "matcher": { "id": "byName", "options": "completion_pct" }, "properties": [
+            { "id": "unit", "value": "percent" },
+            { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+            { "id": "color", "value": { "mode": "continuous-GrYlRd" } },
+            { "id": "min", "value": 0 },
+            { "id": "max", "value": 100 }
+          ] },
+          { "matcher": { "id": "byName", "options": "dispatched" }, "properties": [{ "id": "custom.width", "value": 80 }] },
+          { "matcher": { "id": "byName", "options": "completed" }, "properties": [{ "id": "custom.width", "value": 80 }] },
+          { "matcher": { "id": "byName", "options": "responses" }, "properties": [{ "id": "custom.width", "value": 80 }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "dispatched", "desc": true }],
+        "footer": { "enablePagination": true }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Event Log",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 54 },
+      "collapsed": false,
+      "panels": []
+    },
+
+    {
+      "type": "table",
+      "title": "Recent Events",
+      "description": "Full event log with filtering — click column headers to sort, use filter icons to narrow",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 55 },
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "targets": [
+        {
+          "rawSql": "SELECT event_time, event_type, severity, agent_id, hostname, plugin, capability, principal, source, correlation_id FROM yuzu.yuzu_events WHERE event_time >= $__fromTime AND event_time <= $__toTime ORDER BY event_time DESC LIMIT 200",
+          "refId": "A",
+          "format": 1
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "event_time" }, "properties": [{ "id": "custom.width", "value": 170 }] },
+          { "matcher": { "id": "byName", "options": "event_type" }, "properties": [
+            { "id": "custom.width", "value": 160 },
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "mappings", "value": [
+              { "type": "value", "options": { "command.dispatched": { "color": "#3B82F6", "text": "cmd.dispatched" } } },
+              { "type": "value", "options": { "command.response": { "color": "#60A5FA", "text": "cmd.response" } } },
+              { "type": "value", "options": { "command.completed": { "color": "#10B981", "text": "cmd.completed" } } },
+              { "type": "value", "options": { "auth.login": { "color": "#8B5CF6", "text": "auth.login" } } },
+              { "type": "value", "options": { "agent.registered": { "color": "#F59E0B", "text": "agent.registered" } } },
+              { "type": "value", "options": { "agent.connected": { "color": "#FBBF24", "text": "agent.connected" } } },
+              { "type": "value", "options": { "agent.disconnected": { "color": "#EF4444", "text": "agent.disconnected" } } }
+            ] }
+          ] },
+          { "matcher": { "id": "byName", "options": "severity" }, "properties": [
+            { "id": "custom.width", "value": 70 },
+            { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "basic" } },
+            { "id": "mappings", "value": [
+              { "type": "value", "options": { "info": { "color": "#1E3A5F" } } },
+              { "type": "value", "options": { "warn": { "color": "#78350F" } } },
+              { "type": "value", "options": { "error": { "color": "#7F1D1D" } } },
+              { "type": "value", "options": { "critical": { "color": "#EF4444" } } },
+              { "type": "value", "options": { "debug": { "color": "#1F2937" } } }
+            ] }
+          ] },
+          { "matcher": { "id": "byName", "options": "agent_id" }, "properties": [{ "id": "custom.width", "value": 270 }] },
+          { "matcher": { "id": "byName", "options": "hostname" }, "properties": [{ "id": "custom.width", "value": 100 }] },
+          { "matcher": { "id": "byName", "options": "plugin" }, "properties": [
+            { "id": "custom.width", "value": 110 },
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "color", "value": { "mode": "fixed", "fixedColor": "#F59E0B" } }
+          ] },
+          { "matcher": { "id": "byName", "options": "capability" }, "properties": [{ "id": "custom.width", "value": 120 }] },
+          { "matcher": { "id": "byName", "options": "principal" }, "properties": [{ "id": "custom.width", "value": 80 }] },
+          { "matcher": { "id": "byName", "options": "source" }, "properties": [{ "id": "custom.width", "value": 70 }] },
+          { "matcher": { "id": "byName", "options": "correlation_id" }, "properties": [{ "id": "custom.width", "value": 200 }] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "event_time", "desc": true }],
+        "footer": { "enablePagination": true, "countRows": true }
+      }
     }
+
   ],
   "schemaVersion": 39,
   "tags": ["yuzu", "analytics", "clickhouse"],
   "templating": { "list": [] },
   "time": { "from": "now-24h", "to": "now" },
-  "timepicker": {},
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "7d", "30d"]
+  },
   "timezone": "browser",
   "title": "Yuzu Analytics",
   "uid": "yuzu-analytics",
-  "version": 1
+  "version": 2
 }
