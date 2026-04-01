@@ -69,6 +69,16 @@ kill_native() {
         ok "No stale native processes"
     else
         ok "Killed $killed process(es)"
+        # Wait for gateway ports to be released by the OS (TCP TIME_WAIT)
+        local port_wait=0
+        while netstat -an 2>/dev/null | grep -q ":50063.*LISTEN\|:50061.*LISTEN"; do
+            sleep 1
+            port_wait=$((port_wait + 1))
+            if [ "$port_wait" -ge 10 ]; then
+                warn "Gateway ports still held after 10s — continuing anyway"
+                break
+            fi
+        done
     fi
     sleep 1
 }
@@ -329,8 +339,9 @@ start_all() {
         fail "Gateway failed to start — check $UAT_DIR/gateway.log"
         exit 1
     fi
-    if ! wait_for_port 50063 "gateway (mgmt/command)" 5; then
-        warn "Gateway mgmt port :50063 not ready — command forwarding may not work"
+    if ! wait_for_port 50063 "gateway (mgmt/command)" 30; then
+        fail "Gateway mgmt port :50063 not ready — command forwarding will fail"
+        exit 1
     fi
     ok "Gateway up"
     info "Agent-facing :50061 | Command mgmt :50063 | Metrics :9568 | Health :8081"
