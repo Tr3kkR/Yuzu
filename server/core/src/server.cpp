@@ -1106,20 +1106,54 @@ private:
             for (auto& gp : gw_pending) {
                 auto* stub = gw_mgmt_stub_.get();
                 auto* svc = &agent_service_;
-                std::thread([stub, svc, gp = std::move(gp)]() {
+                auto cmd_id = gp.cmd.command_id();
+                spdlog::debug("Forwarding command {} to gateway for agent {}",
+                              cmd_id, gp.agent_id);
+                std::thread([stub, svc, gp = std::move(gp), cmd_id]() {
                     ::yuzu::server::v1::SendCommandRequest req;
                     req.add_agent_ids(gp.agent_id);
                     *req.mutable_command() = gp.cmd;
                     req.set_timeout_seconds(300);
 
-                    grpc::ClientContext ctx;
-                    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(300));
-                    auto reader = stub->SendCommand(&ctx, req);
+                    // Retry up to 3 times on transient connection failures
+                    for (int attempt = 0; attempt < 3; ++attempt) {
+                        if (attempt > 0) {
+                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})",
+                                         cmd_id, attempt + 1);
+                            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
+                        }
 
-                    ::yuzu::server::v1::SendCommandResponse resp;
-                    while (reader->Read(&resp)) {
-                        svc->process_gateway_response(resp.agent_id(), resp.response());
+                        grpc::ClientContext ctx;
+                        ctx.set_deadline(
+                            std::chrono::system_clock::now() + std::chrono::seconds(300));
+                        auto reader = stub->SendCommand(&ctx, req);
+
+                        ::yuzu::server::v1::SendCommandResponse resp;
+                        int resp_count = 0;
+                        while (reader->Read(&resp)) {
+                            ++resp_count;
+                            svc->process_gateway_response(resp.agent_id(), resp.response());
+                        }
+                        auto status = reader->Finish();
+                        if (status.ok()) {
+                            spdlog::debug(
+                                "Gateway SendCommand for {} completed: {} response(s)",
+                                cmd_id, resp_count);
+                            return;  // success — done
+                        }
+                        // Only retry on UNAVAILABLE (connection refused / not ready)
+                        if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
+                            spdlog::warn(
+                                "Gateway SendCommand RPC for {} failed: {} ({})",
+                                cmd_id, status.error_message(),
+                                static_cast<int>(status.error_code()));
+                            return;  // non-transient error — don't retry
+                        }
+                        spdlog::warn(
+                            "Gateway SendCommand for {} unavailable (attempt {}): {}",
+                            cmd_id, attempt + 1, status.error_message());
                     }
+                    spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
                 }).detach();
             }
         }
