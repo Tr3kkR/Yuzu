@@ -233,8 +233,14 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
         }
         c_argv.push_back(nullptr);
 
+#ifdef __linux__
         execvpe(c_argv[0], const_cast<char* const*>(c_argv.data()),
                 const_cast<char* const*>(env_ptrs.data()));
+#else
+        // macOS/BSD: set environment then exec (no execvpe)
+        environ = const_cast<char**>(env_ptrs.data());
+        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+#endif
         _exit(127); // exec failed
     }
 
