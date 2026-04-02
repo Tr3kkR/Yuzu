@@ -38,7 +38,10 @@ else
     add_project_arguments('-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=2', language: 'cpp')
   endif
   # Full RELRO + immediate binding — makes GOT/PLT read-only after load.
-  add_project_link_arguments('-Wl,-z,relro,-z,now', language: 'cpp')
+  # Only ELF platforms; Apple's ld64 does not support -z flags.
+  if host_os != 'darwin'
+    add_project_link_arguments('-Wl,-z,relro,-z,now', language: 'cpp')
+  endif
   if cxx.get_id() == 'clang'
     add_project_arguments('-Wno-gnu-zero-variadic-macro-arguments', language: 'cpp')
   endif

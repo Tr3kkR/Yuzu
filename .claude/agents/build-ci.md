@@ -11,7 +11,7 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 - **Meson build files** — Every new, renamed, or deleted source file must be reflected in the appropriate `meson.build`. Build must succeed on all targets.
 - **CI matrix** — Maintain the GitHub Actions CI matrix: Linux (GCC 13, Clang 18), Windows (MSVC), macOS (Apple Clang), ARM64 cross-compile.
 - **vcpkg manifest** — Keep `vcpkg.json` baseline pinning and platform filters in sync. Manage the `builtin-baseline` for version constraints.
-- **Build performance** — Optimize sccache hit rates, build parallelism, and CI cache strategies (`actions/cache` for vcpkg).
+- **Build performance** — Optimize ccache hit rates, build parallelism, and CI cache strategies (`actions/cache` for vcpkg).
 - **Proto codegen** — Maintain `proto/meson.build` and `proto/gen_proto.py`. Ensure `#include` path rewriting works on all platforms.
 - **CI capabilities** — Add missing CI features: vulnerability scanning, coverage gates, artifact publishing, release workflows.
 - **Build reproducibility** — Pin tool versions, use lock files, ensure builds are deterministic.
