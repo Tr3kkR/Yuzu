@@ -238,8 +238,7 @@ int compare_semver(std::string_view a, std::string_view b) {
         for (int i = 0; i < 3 && !s.empty(); ++i) {
             auto dot = s.find('.');
             auto part = s.substr(0, dot);
-            int val = 0;
-            std::from_chars(part.data(), part.data() + part.size(), val);
+            int val = std::atoi(std::string(part).c_str());
             parts[i] = val;
             if (dot == std::string_view::npos) break;
             s.remove_prefix(dot + 1);

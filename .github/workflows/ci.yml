@@ -84,7 +84,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18' }}
+            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18 libstdc++-13-dev' }}
           pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Cache ccache
