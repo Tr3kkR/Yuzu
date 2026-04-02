@@ -230,7 +230,6 @@ template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
 };
-template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // anonymous namespace
 

@@ -127,11 +127,16 @@ std::deque<std::string> tail_file(const std::string& path, int count) {
  * Uses system_clock conversion where available.
  */
 std::string format_file_time(const fs::file_time_type& ft) {
-    // Convert to system_clock time_point
-    auto sctp = std::chrono::clock_cast<std::chrono::system_clock>(ft);
-    auto epoch_s = std::chrono::duration_cast<std::chrono::seconds>(
-                       sctp.time_since_epoch())
-                       .count();
+    // Convert file_clock to system_clock epoch seconds.
+    // clock_cast and file_clock::to_sys are not portable across all compilers,
+    // so compute via relative offset from "now" in both clock domains.
+    auto file_now = fs::file_time_type::clock::now();
+    auto sys_now  = std::chrono::system_clock::now();
+    auto diff     = ft - file_now;
+    auto sys_tp   = sys_now + diff;
+    auto epoch_s  = std::chrono::duration_cast<std::chrono::seconds>(
+                        sys_tp.time_since_epoch())
+                        .count();
     return std::format("{}", epoch_s);
 }
 
