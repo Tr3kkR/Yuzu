@@ -1,0 +1,41 @@
+# Build artifacts
+builddir/
+vcpkg_installed/
+*.exe
+*.dll
+*.pdb
+*.obj
+
+# Git / CI
+.git/
+.github/
+
+# Claude Code
+.claude/
+
+# Documentation (not needed in build context)
+*.md
+docs/
+
+# Tests (excluded from production builds)
+tests/
+
+# Node / Puppeteer
+node_modules/
+
+# Gateway build artifacts
+gateway/_build/
+gateway/.deps_cache/
+gateway/ebin/
+gateway/erl_crash.dump
+gateway/rebar3.crashdump
+gateway/test_ebin/
+
+# UAT / test artifacts
+.uat/
+test_output.txt
+test_xml.txt
+Synthetic-UAT-Puppeteer.js
+
+# Deploy configs (not source code)
+deploy/docker/docker-compose*.yml
