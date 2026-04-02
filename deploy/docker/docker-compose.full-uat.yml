@@ -1,0 +1,133 @@
+# Yuzu Full-Docker UAT — Server + Gateway + Prometheus + Grafana + ClickHouse
+#
+# All infrastructure runs in Docker.  Only the agent runs natively.
+# Managed by scripts/docker-start-UAT.sh.
+#
+# Network topology:
+#   Agent (native, host) --> Gateway(:50061) --> Server(:50055)
+#   Server --> Gateway(:50063) --> Agent  (command fanout)
+#   Server --> ClickHouse(:8123)          (analytics)
+#   Prometheus --> Server(:8080) + Gateway(:9568)  (metrics)
+#   Grafana --> Prometheus + ClickHouse   (dashboards)
+
+services:
+  # ── Yuzu Server ────────────────────────────────────────────────────────
+  server:
+    image: yuzu-server:latest
+    container_name: yuzu-uat-server
+    command:
+      - "--listen"
+      - "0.0.0.0:50054"
+      - "--no-tls"
+      - "--no-https"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--log-level"
+      - "info"
+      - "--metrics-no-auth"
+      - "--config"
+      - "/var/lib/yuzu/yuzu-server.cfg"
+      - "--clickhouse-url"
+      - "http://clickhouse:8123"
+      - "--clickhouse-database"
+      - "yuzu"
+      - "--clickhouse-table"
+      - "yuzu_events"
+      - "--clickhouse-user"
+      - "default"
+      - "--analytics-drain-interval"
+      - "5"
+      - "--analytics-batch-size"
+      - "50"
+    ports:
+      - "8080:8080"     # Web dashboard + REST API
+      - "50054:50054"   # gRPC (direct agent connections)
+      - "50052:50052"   # gRPC (management)
+      - "50055:50055"   # gRPC (gateway upstream)
+    volumes:
+      - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
+      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+    depends_on:
+      clickhouse:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Erlang Gateway ─────────────────────────────────────────────────────
+  gateway:
+    image: yuzu-gateway:latest
+    container_name: yuzu-uat-gateway
+    environment:
+      - YUZU_GW_UPSTREAM_ADDR=server
+    ports:
+      - "50061:50061"   # gRPC (agent-facing — exposed for native agent)
+      - "50063:50063"   # gRPC (management/command forwarding)
+      - "9568:9568"     # Prometheus metrics
+      - "8081:8081"     # Health/readiness
+    volumes:
+      - ./gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  # ── Prometheus ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
+    container_name: yuzu-uat-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../prometheus/prometheus-full-uat.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-uat-data:/prometheus
+    restart: unless-stopped
+
+  # ── ClickHouse ─────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    container_name: yuzu-uat-clickhouse
+    ports:
+      - "8123:8123"     # HTTP interface
+      - "9000:9000"     # Native TCP
+    environment:
+      - CLICKHOUSE_DB=yuzu
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - ../clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-uat-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
+  # ── Grafana ────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
+    container_name: yuzu-uat-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-dashboard.json
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${UAT_DASHBOARDS:-../grafana}:/var/lib/grafana/dashboards:ro
+      - grafana-uat-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - clickhouse
+    restart: unless-stopped
+
+volumes:
+  server-uat-data:
+  prometheus-uat-data:
+  grafana-uat-data:
+  clickhouse-uat-data:

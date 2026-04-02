@@ -1,18 +1,39 @@
-# Yuzu Gateway — Erlang/OTP Docker build
-# Build:  docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
-# Run:    docker run -p 50061:50061 -p 9568:9568 yuzu-gateway
+# Yuzu Gateway — Erlang/OTP Docker build with dependency caching
+#
+# The build uses three stages so that rebar3 dependency fetching and
+# compilation are cached separately from application code.
+#
+# Quick rebuild (code-only):
+#   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
+#
+# Pre-bake the deps image:
+#   docker build --target deps -t yuzu-gateway-deps -f deploy/docker/Dockerfile.gateway .
+#   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
-# ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM erlang:27-alpine@sha256:fc946258810fbcc5cc2a39fa0dfa041d7467d00bd3b07b5fbe8493b6c657f611 AS builder
+# ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
+FROM erlang:27-alpine@sha256:fc946258810fbcc5cc2a39fa0dfa041d7467d00bd3b07b5fbe8493b6c657f611 AS deps
 
 RUN apk add --no-cache git
 
 WORKDIR /src
+
+# Copy only dependency manifests — this layer caches until deps change
+COPY gateway/rebar.config gateway/rebar.lock ./
+
+# Fetch and compile deps (but not app code)
+RUN rebar3 compile --deps_only
+
+# ── Stage 2: build — copy app source and build release ────────────────────
+FROM deps AS builder
+
+# Copy the rest of the gateway source
 COPY gateway/ .
+
 RUN rebar3 as prod release
 
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805
+# ── Stage 3: Runtime — must match the builder's Alpine version (3.22) for
+#    OpenSSL ABI compatibility (crypto NIF links against libcrypto.so)
+FROM alpine:3.22
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && adduser -D -s /sbin/nologin yuzu-gw
