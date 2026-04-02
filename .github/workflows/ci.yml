@@ -126,11 +126,19 @@ jobs:
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
+      - name: Detect GCC toolchain for Clang
+        if: matrix.compiler == 'clang-18'
+        run: |
+          GCC_DIR=$(dirname $(dirname $(g++-13 -print-libgcc-file-name)))
+          echo "GCC_INSTALL_DIR=$GCC_DIR" >> $GITHUB_ENV
+          echo "Clang will use GCC toolchain: $GCC_DIR"
+
       - name: Configure (Meson)
         env:
           CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
           CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          CXXFLAGS: ${{ matrix.compiler == 'clang-18' && format('--gcc-install-dir={0}', env.GCC_INSTALL_DIR) || '' }}
         run: |
           meson setup builddir \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \

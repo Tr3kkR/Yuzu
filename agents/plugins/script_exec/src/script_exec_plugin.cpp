@@ -236,8 +236,9 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
 #ifdef __linux__
         execvpe(c_argv[0], const_cast<char* const*>(c_argv.data()),
                 const_cast<char* const*>(env_ptrs.data()));
-#else
-        // macOS/BSD: set environment then exec (no execvpe)
+#elif defined(__APPLE__)
+        // macOS: no execvpe; use environ + execvp
+        extern char **environ;
         environ = const_cast<char**>(env_ptrs.data());
         execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
 #endif
