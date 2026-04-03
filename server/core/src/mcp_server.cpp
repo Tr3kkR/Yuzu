@@ -320,12 +320,17 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool& read_only_mode,
                                 const bool& mcp_disabled) {
 
+    // Copy reference parameters to locals so the lambda captures values,
+    // not dangling references to register_routes() parameters.
+    const bool is_read_only = read_only_mode;
+    const bool is_disabled  = mcp_disabled;
+
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
-    svr.Post("/mcp/v1/", [=, &read_only_mode, &mcp_disabled](const httplib::Request& req, httplib::Response& res) {
+    svr.Post("/mcp/v1/", [=](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Content-Type", "application/json");
 
         // Runtime kill switch check (G4-UHP-MCP-003) — evaluated on every request
-        if (mcp_disabled) {
+        if (is_disabled) {
             res.set_content(error_response_null(kMcpDisabled, "MCP is disabled on this server"),
                             "application/json");
             return;
@@ -545,7 +550,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             // ── C7: read_only_mode enforcement ──────────────────────────
             // When the server is in read-only mode, reject any tool that
             // performs a Write/Execute/Delete operation.
-            if (read_only_mode && kWriteTools.contains(tool_name)) {
+            if (is_read_only && kWriteTools.contains(tool_name)) {
                 mcp_audit("denied", "read-only mode");
                 res.set_content(error_response(id, kTierDenied, "MCP is in read-only mode"),
                                 "application/json");
@@ -1309,7 +1314,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     spdlog::info("MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",
                  kToolCount, kResourceCount, kPromptCount,
-                 read_only_mode ? ", read-only mode" : "");
+                 is_read_only ? ", read-only mode" : "");
 }
 
 } // namespace yuzu::server::mcp

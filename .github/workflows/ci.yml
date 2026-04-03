@@ -221,6 +221,7 @@ jobs:
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
+            -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=true `
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
