@@ -231,7 +231,7 @@ jobs:
 
       - name: Test
         env:
-          PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows/tools/protobuf;${{ github.workspace }}/vcpkg_installed/x64-windows/tools/grpc;${{ env.PATH }}
+          PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows/${{ matrix.build_type == 'debug' && 'debug/bin' || 'bin' }};${{ github.workspace }}/vcpkg_installed/x64-windows/tools/protobuf;${{ github.workspace }}/vcpkg_installed/x64-windows/tools/grpc;${{ env.PATH }}
         run: meson test -C builddir --print-errorlogs
 
       - name: ccache stats
