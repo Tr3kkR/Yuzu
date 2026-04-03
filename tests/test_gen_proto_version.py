@@ -29,16 +29,30 @@ class TestProtocVersionCheck(unittest.TestCase):
 
     def _make_mock_protoc(self, version_output, version_rc=0, compile_rc=0):
         """Create a mock protoc script that returns a controlled version string."""
-        mock_path = os.path.join(self.tmpdir, 'mock_protoc')
-        with open(mock_path, 'w') as f:
-            f.write('#!/usr/bin/env python3\n')
-            f.write('import sys\n')
-            f.write('if "--version" in sys.argv:\n')
-            f.write(f'    print({version_output!r})\n')
-            f.write(f'    sys.exit({version_rc})\n')
-            f.write(f'sys.exit({compile_rc})\n')
-        os.chmod(mock_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
-        return mock_path
+        if sys.platform == 'win32':
+            # Windows: create a .bat wrapper that calls a .py script
+            py_path = os.path.join(self.tmpdir, 'mock_protoc.py')
+            with open(py_path, 'w') as f:
+                f.write('import sys\n')
+                f.write('if "--version" in sys.argv:\n')
+                f.write(f'    print({version_output!r})\n')
+                f.write(f'    sys.exit({version_rc})\n')
+                f.write(f'sys.exit({compile_rc})\n')
+            bat_path = os.path.join(self.tmpdir, 'mock_protoc.bat')
+            with open(bat_path, 'w') as f:
+                f.write(f'@"{sys.executable}" "{py_path}" %*\n')
+            return bat_path
+        else:
+            mock_path = os.path.join(self.tmpdir, 'mock_protoc')
+            with open(mock_path, 'w') as f:
+                f.write('#!/usr/bin/env python3\n')
+                f.write('import sys\n')
+                f.write('if "--version" in sys.argv:\n')
+                f.write(f'    print({version_output!r})\n')
+                f.write(f'    sys.exit({version_rc})\n')
+                f.write(f'sys.exit({compile_rc})\n')
+            os.chmod(mock_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+            return mock_path
 
     def _run_gen_proto(self, mock_protoc_path):
         """Run gen_proto.py with mock protoc and no proto files.
@@ -50,7 +64,7 @@ class TestProtocVersionCheck(unittest.TestCase):
             [sys.executable, GEN_PROTO,
              self.outdir,          # outdir
              mock_protoc_path,     # protoc
-             '/dev/null',          # grpc plugin (unused — no protos)
+             os.devnull,           # grpc plugin (unused — no protos)
              self.tmpdir],         # proto_root  (unused — no protos)
             capture_output=True, text=True
         )
