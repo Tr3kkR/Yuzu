@@ -67,12 +67,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc-13, clang-18]
+        compiler: [gcc-13, clang-19]
         build_type: [debug, release]
         exclude:
           # PRs: only gcc-13 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
-          - compiler: ${{ github.event_name == 'pull_request' && 'clang-18' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -84,7 +84,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18 g++-13' }}
+            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
           pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Cache ccache
@@ -126,40 +126,14 @@ jobs:
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
-      - name: Detect GCC toolchain for Clang
-        if: matrix.compiler == 'clang-18'
-        run: |
-          echo "=== GCC installations ==="
-          ls /usr/lib/gcc/x86_64-linux-gnu/ 2>/dev/null || echo "No GCC found"
-          echo "=== g++-13 libgcc ==="
-          g++-13 -print-libgcc-file-name 2>/dev/null || echo "g++-13 not found"
-          echo "=== clang default selection ==="
-          clang++-18 -v -x c++ /dev/null -fsyntax-only 2>&1 | grep "Selected GCC" || echo "No selection info"
-          echo "=== Testing std::expected ==="
-          echo '#include <expected>' | clang++-18 -std=c++23 --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13 -x c++ -fsyntax-only - 2>&1 && echo "OK with --gcc-install-dir=13" || echo "FAILED with 13"
-          echo '#include <expected>' | clang++-18 -std=c++23 --gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/14 -x c++ -fsyntax-only - 2>&1 && echo "OK with --gcc-install-dir=14" || echo "FAILED with 14"
-          echo '#include <expected>' | clang++-18 -std=c++23 -x c++ -fsyntax-only - 2>&1 && echo "OK without flags" || echo "FAILED without flags"
-          # Set the working path for configure
-          GCC_DIR=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/13 2>/dev/null || ls -d /usr/lib/gcc/x86_64-linux-gnu/14 2>/dev/null || echo "")
-          if [ -n "$GCC_DIR" ]; then
-            echo "CLANG_GCC_DIR=$GCC_DIR" >> $GITHUB_ENV
-          fi
-
       - name: Configure (Meson)
         env:
-          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
-          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
+          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-19' }}
+          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-19' }}
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
-          CLANG_FLAGS=""
-          if [ "${{ matrix.compiler }}" = "clang-18" ] && [ -n "${CLANG_GCC_DIR:-}" ]; then
-            CLANG_FLAGS="--gcc-install-dir=$CLANG_GCC_DIR"
-            export CXXFLAGS="$CLANG_FLAGS"
-            export CFLAGS="$CLANG_FLAGS"
-            echo "Using GCC install dir: $CLANG_GCC_DIR"
-          fi
           meson setup builddir \
-            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \

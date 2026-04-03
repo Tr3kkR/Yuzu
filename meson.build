@@ -104,7 +104,8 @@ sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLi
 # macOS frameworks needed by gRPC, abseil, and cpp-httplib
 if host_os == 'darwin'
   corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
-  grpcpp_dep = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+  grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+  httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
