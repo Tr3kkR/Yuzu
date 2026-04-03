@@ -46,6 +46,9 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <crt_externs.h> // _NSGetEnviron
+#endif
 #endif
 
 namespace {
@@ -237,9 +240,8 @@ int run_process_posix(yuzu::CommandContext& ctx, const std::vector<std::string>&
         execvpe(c_argv[0], const_cast<char* const*>(c_argv.data()),
                 const_cast<char* const*>(env_ptrs.data()));
 #elif defined(__APPLE__)
-        // macOS: no execvpe; use environ + execvp
-        extern char **environ;
-        environ = const_cast<char**>(env_ptrs.data());
+        // macOS: no execvpe; set environment then exec
+        *_NSGetEnviron() = const_cast<char**>(env_ptrs.data());
         execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
 #endif
         _exit(127); // exec failed
