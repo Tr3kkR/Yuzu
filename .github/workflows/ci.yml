@@ -137,7 +137,7 @@ jobs:
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
-            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+            ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
 
       - name: Build
         run: meson compile -C builddir
