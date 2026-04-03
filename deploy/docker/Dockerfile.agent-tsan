@@ -29,8 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd -r -s /sbin/nologin yuzu
 
 COPY --from=builder /build/src/builddir/agents/core/yuzu-agent /usr/local/bin/
+COPY --from=builder /build/src/builddir/agents/core/libyuzu_agent_core.so /usr/local/lib/
 COPY --from=builder /build/src/builddir/agents/plugins/ /usr/local/lib/yuzu/plugins/
-RUN chmod +x /usr/local/bin/yuzu-agent
+RUN chmod +x /usr/local/bin/yuzu-agent && ldconfig
 
 USER yuzu
 ENV TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:log_path=/var/log/yuzu/tsan"
