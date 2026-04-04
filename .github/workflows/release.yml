@@ -4,6 +4,10 @@ on:
   push:
     tags: ['v*']
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   packages: write
@@ -19,6 +23,7 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v6
@@ -30,8 +35,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip
+            pkg-config curl zip unzip tar python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-release-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-release-linux-
+
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -44,8 +60,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc-13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
+            vcpkg-x64-linux-gcc-13-
             vcpkg-x64-linux-
 
       - name: Setup vcpkg
@@ -62,8 +79,8 @@ jobs:
 
       - name: Configure (Meson release + LTO)
         env:
-          CC: gcc-13
-          CXX: g++-13
+          CC: ccache gcc-13
+          CXX: ccache g++-13
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
@@ -74,6 +91,10 @@ jobs:
 
       - name: Build
         run: meson compile -C builddir
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
       - name: Test (smoke)
         run: |
@@ -129,26 +150,27 @@ jobs:
         with:
           name: yuzu-linux-x64
           path: yuzu-linux-x64.tar.gz
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload .deb artifacts
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-linux-deb
           path: "*.deb"
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload .rpm artifacts
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-linux-rpm
           path: "*.rpm"
-          retention-days: 5
+          retention-days: 3
 
   # ── Linux ARM64 release build (cross-compile) ───────────────────────
   build-linux-arm64:
     name: "Build Linux ARM64"
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v6
@@ -162,8 +184,20 @@ jobs:
             cmake ninja-build \
             gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            pkg-config curl zip unzip tar python3-pip
+            pkg-config crossbuild-essential-arm64 \
+            curl zip unzip tar python3-pip ccache
           pip3 install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-release-arm64-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-release-arm64-
+
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -204,6 +238,10 @@ jobs:
       - name: Build
         run: meson compile -C builddir
 
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
       - name: Package archive
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -231,12 +269,13 @@ jobs:
         with:
           name: yuzu-linux-arm64
           path: yuzu-linux-arm64.tar.gz
-          retention-days: 5
+          retention-days: 3
 
   # ── Erlang gateway release build ──────────────────────────────────────
   build-gateway:
     name: "Build Gateway (Erlang)"
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v6
@@ -254,6 +293,14 @@ jobs:
           key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
           restore-keys: |
             rebar3-deps-
+
+      - name: Cache Dialyzer PLT
+        uses: actions/cache@v4
+        with:
+          path: gateway/_build/default/*_plt*
+          key: dialyzer-plt-otp27-${{ hashFiles('gateway/rebar.lock') }}
+          restore-keys: |
+            dialyzer-plt-otp27-
 
       - name: Compile gateway
         working-directory: gateway
@@ -309,26 +356,27 @@ jobs:
         with:
           name: yuzu-gateway-linux-x64
           path: yuzu-gateway-linux-x64.tar.gz
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-gateway-deb
           path: "*.deb"
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload .rpm artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-gateway-rpm
           path: "*.rpm"
-          retention-days: 5
+          retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
   build-windows:
     name: "Build Windows x64"
     runs-on: windows-2022
+    timeout-minutes: 35
     env:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
@@ -340,8 +388,21 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Meson
-        run: pip install meson==${{ env.MESON_VERSION }}
+      - name: Install Meson and ccache
+        run: |
+          pip install meson==${{ env.MESON_VERSION }}
+          choco install ccache --yes --no-progress
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\ccache
+          key: ccache-release-windows-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-release-windows-
+
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -370,19 +431,24 @@ jobs:
             --triplet x64-windows `
             --x-manifest-root="${{ github.workspace }}"
 
-      - name: Configure (Meson release + LTO)
+      - name: Configure (Meson release)
         env:
-          CC: cl
-          CXX: cl
+          CC: ccache cl
+          CXX: ccache cl
         run: |
           meson setup builddir `
             --buildtype=release `
             -Dcpp_std=vc++latest `
+            -Ddefault_library=static `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false
 
       - name: Build
         run: meson compile -C builddir
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
       - name: Test (smoke)
         run: |
@@ -536,19 +602,20 @@ jobs:
         with:
           name: yuzu-windows-x64
           path: yuzu-windows-x64.zip
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-windows-installer
           path: YuzuAgentSetup-*.exe
-          retention-days: 5
+          retention-days: 3
 
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
     runs-on: macos-14
+    timeout-minutes: 30
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
@@ -560,8 +627,19 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja pipx
+          brew install cmake ninja ccache pipx
           pipx install meson==${{ env.MESON_VERSION }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ccache
+          key: ccache-release-macos-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-release-macos-
+
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -592,8 +670,8 @@ jobs:
 
       - name: Configure (Meson release + LTO)
         env:
-          CC: cc
-          CXX: c++
+          CC: ccache cc
+          CXX: ccache c++
         run: |
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
@@ -604,6 +682,10 @@ jobs:
 
       - name: Build
         run: meson compile -C builddir
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
 
       - name: Test (smoke)
         run: |
@@ -774,20 +856,21 @@ jobs:
         with:
           name: yuzu-macos-arm64
           path: yuzu-macos-arm64.tar.gz
-          retention-days: 5
+          retention-days: 3
 
       - name: Upload .pkg artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-macos-pkg
           path: "YuzuAgent-*.pkg"
-          retention-days: 5
+          retention-days: 3
 
   # ── Docker multi-arch publish ────────────────────────────────────────
   docker-publish:
     name: "Docker multi-arch push"
     needs: [build-linux, build-linux-arm64]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -870,6 +953,7 @@ jobs:
     name: "Create Release"
     needs: [build-linux, build-linux-arm64, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v6
