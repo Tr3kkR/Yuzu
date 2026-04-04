@@ -5,6 +5,11 @@ Summary:        Yuzu endpoint management gateway
 License:        Apache-2.0
 URL:            https://github.com/Tr3kkR/Yuzu
 
+# The Erlang release bundles crypto.so with broad OpenSSL runpaths from upstream.
+# This is a self-contained release with embedded ERTS — runpath validation is not applicable.
+%define __brp_check_rpaths %{nil}
+AutoReqProv:    no
+
 %description
 Erlang/OTP gateway node for scaling Yuzu agent connections.
 Routes commands from the server to agents and aggregates responses.
@@ -39,3 +44,7 @@ chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 /opt/yuzu_gw
 %{_unitdir}/yuzu-gateway.service
 %dir %attr(0755,yuzu-gw,yuzu-gw) /var/log/yuzu
+
+%changelog
+* Fri Apr 04 2026 Yuzu Team <noreply@yuzu.io> - 0.1.0-1
+- Initial RPM packaging
