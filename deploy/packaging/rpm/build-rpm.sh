@@ -28,16 +28,25 @@ trap "rm -rf $TOPDIR" EXIT
 
 mkdir -p "$TOPDIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-# Copy sources
-cp "$BIN_DIR/yuzu-server" "$TOPDIR/SOURCES/"
-cp "$BIN_DIR/yuzu-agent" "$TOPDIR/SOURCES/"
+# Copy sources — handle both flat layout and meson build layout
+for bin in yuzu-server yuzu-agent; do
+    if [[ -f "$BIN_DIR/$bin" ]]; then
+        cp "$BIN_DIR/$bin" "$TOPDIR/SOURCES/"
+    else
+        # Meson layout: server/core/yuzu-server, agents/core/yuzu-agent
+        found=$(find "$BIN_DIR" -name "$bin" -type f | head -1)
+        [[ -n "$found" ]] && cp "$found" "$TOPDIR/SOURCES/" || { echo "ERROR: $bin not found in $BIN_DIR" >&2; exit 1; }
+    fi
+done
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$TOPDIR/SOURCES/"
 
+# Plugins — check both builddir/plugins/ (deploy_dlls layout) and agents/plugins/ (meson layout)
+mkdir -p "$TOPDIR/SOURCES/plugins"
 if [[ -d "$BIN_DIR/plugins" ]]; then
-    mkdir -p "$TOPDIR/SOURCES/plugins"
     cp "$BIN_DIR/plugins/"*.so "$TOPDIR/SOURCES/plugins/" 2>/dev/null || true
 fi
+find "$BIN_DIR/agents/plugins" -name '*.so' -exec cp {} "$TOPDIR/SOURCES/plugins/" \; 2>/dev/null || true
 
 # Determine Release field
 if [[ -n "$PRERELEASE" ]]; then

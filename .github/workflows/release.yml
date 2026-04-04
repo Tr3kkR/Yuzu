@@ -77,8 +77,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/yuzu-server --help || true
-          ./builddir/yuzu-agent --help || true
+          ./builddir/server/core/yuzu-server --help || true
+          ./builddir/agents/core/yuzu-agent --help || true
 
       - name: Package archive
         run: |
@@ -88,8 +88,8 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/yuzu-server "${STAGING}/bin/"
-          cp builddir/yuzu-agent "${STAGING}/bin/"
+          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
+          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core shared library
           find builddir -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
@@ -212,8 +212,8 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/yuzu-server "${STAGING}/bin/"
-          cp builddir/yuzu-agent "${STAGING}/bin/"
+          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
+          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core shared library
           find builddir -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
@@ -377,6 +377,7 @@ jobs:
         run: |
           meson setup builddir `
             --buildtype=release `
+            -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false `
             -Db_lto=true
@@ -386,8 +387,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          & ./builddir/yuzu-server.exe --help
-          & ./builddir/yuzu-agent.exe --help
+          & ./builddir/server/core/yuzu-server.exe --help
+          & ./builddir/agents/core/yuzu-agent.exe --help
         continue-on-error: true
 
       - name: Sign binaries (Authenticode)
@@ -415,8 +416,8 @@ jobs:
 
           # Collect all EXE and DLL files to sign
           $filesToSign = @()
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-server.exe"
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-agent.exe"
+          $filesToSign += Get-ChildItem builddir -Filter "yuzu-server.exe" -Recurse
+          $filesToSign += Get-ChildItem builddir -Filter "yuzu-agent.exe" -Recurse
           $filesToSign += Get-ChildItem builddir -Filter "yuzu_agent_core.dll" -Recurse
           $filesToSign += Get-ChildItem builddir/agents/plugins -Filter "*.dll" -Recurse
 
@@ -451,8 +452,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
 
           # Binaries
-          Copy-Item "builddir/yuzu-server.exe" "${staging}/bin/"
-          Copy-Item "builddir/yuzu-agent.exe" "${staging}/bin/"
+          Copy-Item "builddir/server/core/yuzu-server.exe" "${staging}/bin/"
+          Copy-Item "builddir/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
           # Agent core DLL
           Get-ChildItem -Path builddir -Filter "yuzu_agent_core.dll" -Recurse | Copy-Item -Destination "${staging}/bin/"
@@ -607,8 +608,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/yuzu-server --help || true
-          ./builddir/yuzu-agent --help || true
+          ./builddir/server/core/yuzu-server --help || true
+          ./builddir/agents/core/yuzu-agent --help || true
 
       - name: Sign binaries (codesign)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -709,8 +710,8 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/yuzu-server "${STAGING}/bin/"
-          cp builddir/yuzu-agent "${STAGING}/bin/"
+          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
+          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core dylib
           find builddir -name 'libyuzu_agent_core.dylib*' -exec cp {} "${STAGING}/bin/" \;

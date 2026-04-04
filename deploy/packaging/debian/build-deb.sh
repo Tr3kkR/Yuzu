@@ -37,7 +37,14 @@ mkdir -p "$PKG/var/lib/yuzu"
 mkdir -p "$PKG/var/log/yuzu"
 mkdir -p "$PKG/usr/share/yuzu/content/definitions"
 
-cp "$BIN_DIR/yuzu-server" "$PKG/usr/local/bin/"
+# Handle both flat layout (staging) and meson build layout (server/core/)
+if [[ -f "$BIN_DIR/yuzu-server" ]]; then
+    cp "$BIN_DIR/yuzu-server" "$PKG/usr/local/bin/"
+elif [[ -f "$BIN_DIR/server/core/yuzu-server" ]]; then
+    cp "$BIN_DIR/server/core/yuzu-server" "$PKG/usr/local/bin/"
+else
+    echo "ERROR: yuzu-server not found in $BIN_DIR" >&2; exit 1
+fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$PKG/usr/lib/systemd/system/"
 
 if [[ -d "$BIN_DIR/content/definitions" ]]; then
@@ -74,12 +81,19 @@ mkdir -p "$PKG/usr/lib/yuzu/plugins"
 mkdir -p "$PKG/usr/lib/systemd/system"
 mkdir -p "$PKG/var/lib/yuzu-agent"
 
-cp "$BIN_DIR/yuzu-agent" "$PKG/usr/local/bin/"
+if [[ -f "$BIN_DIR/yuzu-agent" ]]; then
+    cp "$BIN_DIR/yuzu-agent" "$PKG/usr/local/bin/"
+elif [[ -f "$BIN_DIR/agents/core/yuzu-agent" ]]; then
+    cp "$BIN_DIR/agents/core/yuzu-agent" "$PKG/usr/local/bin/"
+else
+    echo "ERROR: yuzu-agent not found in $BIN_DIR" >&2; exit 1
+fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$PKG/usr/lib/systemd/system/"
 
 if [[ -d "$BIN_DIR/plugins" ]]; then
     cp "$BIN_DIR/plugins/"*.so "$PKG/usr/lib/yuzu/plugins/" 2>/dev/null || true
 fi
+find "$BIN_DIR/agents/plugins" -name '*.so' -exec cp {} "$PKG/usr/lib/yuzu/plugins/" \; 2>/dev/null || true
 
 cat > "$PKG/DEBIAN/control" <<EOF
 Package: yuzu-agent
