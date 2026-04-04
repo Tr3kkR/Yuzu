@@ -105,17 +105,17 @@ jobs:
       - name: Build .deb packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION//-/_}"
+          DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
-            --bin-dir builddir --version "$VERSION" --output .
+            --bin-dir builddir --version "$DEB_VERSION" --output .
 
       - name: Build .rpm packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION//-/_}"
+          RPM_VERSION="${VERSION%%-*}"
           sudo apt-get install -y rpm
           bash deploy/packaging/rpm/build-rpm.sh \
-            --bin-dir builddir --version "$VERSION" --output .
+            --bin-dir builddir --version "$RPM_VERSION" --output .
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@v4
@@ -276,19 +276,19 @@ jobs:
       - name: Build .deb package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION//-/_}"
+          DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-gateway-deb.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
-            --version "$VERSION" --output .
+            --version "$DEB_VERSION" --output .
 
       - name: Build .rpm package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION//-/_}"
+          RPM_VERSION="${VERSION%%-*}"
           sudo apt-get install -y rpm
           bash deploy/packaging/rpm/build-gateway-rpm.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
-            --version "$VERSION" --output .
+            --version "$RPM_VERSION" --output .
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
