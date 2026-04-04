@@ -101,11 +101,38 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
-      - name: Upload artifact
+      - name: Build .deb packages
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash deploy/packaging/debian/build-deb.sh \
+            --bin-dir builddir --version "$VERSION" --output .
+
+      - name: Build .rpm packages
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sudo apt-get install -y rpm
+          bash deploy/packaging/rpm/build-rpm.sh \
+            --bin-dir builddir --version "$VERSION" --output .
+
+      - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-linux-x64
           path: yuzu-linux-x64.tar.gz
+          retention-days: 5
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-linux-deb
+          path: "*.deb"
+          retention-days: 5
+
+      - name: Upload .rpm artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-linux-rpm
+          path: "*.rpm"
           retention-days: 5
 
   # ── Linux ARM64 release build (cross-compile) ───────────────────────
@@ -193,6 +220,88 @@ jobs:
         with:
           name: yuzu-linux-arm64
           path: yuzu-linux-arm64.tar.gz
+          retention-days: 5
+
+  # ── Erlang gateway release build ──────────────────────────────────────
+  build-gateway:
+    name: "Build Gateway (Erlang)"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          rebar3-version: '3.24'
+
+      - name: Cache rebar3 dependencies
+        uses: actions/cache@v4
+        with:
+          path: gateway/_build/default/lib
+          key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
+          restore-keys: |
+            rebar3-deps-
+
+      - name: Compile gateway
+        working-directory: gateway
+        run: rebar3 compile
+
+      - name: Run EUnit tests
+        working-directory: gateway
+        run: rebar3 eunit
+
+      - name: Run Dialyzer
+        working-directory: gateway
+        run: rebar3 dialyzer
+
+      - name: Build production release
+        working-directory: gateway
+        run: rebar3 as prod release
+
+      - name: Package release tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="yuzu-gateway-${VERSION}-linux-x64"
+          mkdir -p "${STAGING}"
+          cp -a gateway/_build/prod/rel/yuzu_gw/* "${STAGING}/"
+          tar czf "yuzu-gateway-linux-x64.tar.gz" "${STAGING}"
+
+      - name: Build .deb package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash deploy/packaging/debian/build-gateway-deb.sh \
+            --rel-dir gateway/_build/prod/rel/yuzu_gw \
+            --version "$VERSION" --output .
+
+      - name: Build .rpm package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sudo apt-get install -y rpm
+          bash deploy/packaging/rpm/build-gateway-rpm.sh \
+            --rel-dir gateway/_build/prod/rel/yuzu_gw \
+            --version "$VERSION" --output .
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-gateway-linux-x64
+          path: yuzu-gateway-linux-x64.tar.gz
+          retention-days: 5
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-gateway-deb
+          path: "*.deb"
+          retention-days: 5
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-gateway-rpm
+          path: "*.rpm"
           retention-days: 5
 
   # ── Windows x64 release build ────────────────────────────────────────
@@ -339,11 +448,78 @@ jobs:
 
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-windows-x64.zip"
 
-      - name: Upload artifact
+      - name: Build Windows installer (InnoSetup)
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+
+          # Install InnoSetup 6
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Error "ISCC.exe not found after InnoSetup install"
+            exit 1
+          }
+
+          # Compile the installer
+          & $iscc `
+            "/DAppVersion=${version}" `
+            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "deploy\packaging\windows\yuzu-agent.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "InnoSetup compilation failed"
+            exit 1
+          }
+
+          # Move installer to workspace root for easy artifact upload
+          $installer = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
+          Copy-Item $installer "YuzuAgentSetup-${version}.exe"
+          Write-Host "Installer built: YuzuAgentSetup-${version}.exe ($('{0:N1} MB' -f ((Get-Item $installer).Length / 1MB)))"
+
+      - name: Sign installer (Authenticode)
+        if: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
+        env:
+          WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $installer = "YuzuAgentSetup-${version}.exe"
+
+          $certPath = "${{ runner.temp }}\signing-cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+            Where-Object { $_.FullName -match "x64" } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          Write-Host "Signing installer: $installer"
+          & $signtool sign `
+            /f $certPath `
+            /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
+            /fd sha256 `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            /d "Yuzu Agent Installer" `
+            $installer
+
+          & $signtool verify /pa $installer
+          Remove-Item $certPath -Force
+
+      - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-windows-x64
           path: yuzu-windows-x64.zip
+          retention-days: 5
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-windows-installer
+          path: YuzuAgentSetup-*.exe
           retention-days: 5
 
   # ── macOS ARM64 release build ────────────────────────────────────────
@@ -520,11 +696,61 @@ jobs:
 
           tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
 
-      - name: Upload artifact
+      - name: Build macOS installer (.pkg)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash deploy/packaging/macos/build-pkg.sh \
+            --bin-dir builddir --version "$VERSION" --output .
+
+      - name: Sign installer (.pkg)
+        if: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="YuzuAgent-${VERSION}-macos-arm64.pkg"
+          SIGNED="YuzuAgent-${VERSION}-macos-arm64-signed.pkg"
+
+          # productsign signs the .pkg with Developer ID Installer identity
+          INSTALLER_ID=$(echo "${MACOS_SIGNING_IDENTITY}" | sed 's/Developer ID Application/Developer ID Installer/')
+          productsign --sign "${INSTALLER_ID}" "${PKG}" "${SIGNED}"
+          mv "${SIGNED}" "${PKG}"
+          echo "Signed: ${PKG}"
+
+      - name: Notarize installer (.pkg)
+        if: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
+        env:
+          MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG="YuzuAgent-${VERSION}-macos-arm64.pkg"
+
+          echo "Submitting installer for Apple notarization..."
+          xcrun notarytool submit "${PKG}" \
+            --apple-id "${MACOS_NOTARIZATION_APPLE_ID}" \
+            --password "${MACOS_NOTARIZATION_PASSWORD}" \
+            --team-id "${MACOS_NOTARIZATION_TEAM_ID}" \
+            --wait \
+            --timeout 15m
+
+          # Staple the notarization ticket to the .pkg
+          xcrun stapler staple "${PKG}"
+          echo "Notarized and stapled: ${PKG}"
+
+      - name: Upload archive artifact
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-macos-arm64
           path: yuzu-macos-arm64.tar.gz
+          retention-days: 5
+
+      - name: Upload .pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuzu-macos-pkg
+          path: "YuzuAgent-*.pkg"
           retention-days: 5
 
   # ── Docker multi-arch publish ────────────────────────────────────────
@@ -611,7 +837,7 @@ jobs:
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"
-    needs: [build-linux, build-linux-arm64, build-windows, build-macos, docker-publish]
+    needs: [build-linux, build-linux-arm64, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
 
     steps:
@@ -625,8 +851,8 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg' \) -exec mv {} . \;
+          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
@@ -680,14 +906,48 @@ jobs:
           fi
 
           cat >> release-notes.md <<NOTES_EOF
+          ## Enterprise installers
+
+          | Installer | Platform | Format |
+          |---|---|---|
+          | \`YuzuAgentSetup-${VERSION}.exe\` | Windows x64 | InnoSetup (service + wizard) |
+          | \`YuzuAgent-${VERSION}-macos-arm64.pkg\` | macOS ARM64 | macOS installer (launchd) |
+          | \`yuzu-agent_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
+          | \`yuzu-server_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
+          | \`yuzu-agent-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
+          | \`yuzu-server-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
+          | \`yuzu-gateway_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
+          | \`yuzu-gateway-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
+
+          ### Windows silent install (GPO / SCCM / Intune)
+          \`\`\`powershell
+          YuzuAgentSetup-${VERSION}.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+          \`\`\`
+
+          ### macOS silent install (Jamf / MDM)
+          \`\`\`bash
+          sudo installer -pkg YuzuAgent-${VERSION}-macos-arm64.pkg -target /
+          \`\`\`
+
+          ### Linux install
+          \`\`\`bash
+          # Debian/Ubuntu
+          sudo dpkg -i yuzu-agent_${VERSION}_amd64.deb
+          sudo systemctl edit yuzu-agent  # set --server address
+
+          # RHEL/Fedora
+          sudo rpm -i yuzu-agent-${VERSION}-1.x86_64.rpm
+          \`\`\`
+
           ## Platform archives
 
           | Archive | Platform | Arch |
           |---|---|---|
-          | \`yuzu-linux-x64.tar.gz\` | Linux | x86_64 |
-          | \`yuzu-linux-arm64.tar.gz\` | Linux | ARM64 |
-          | \`yuzu-windows-x64.zip\` | Windows | x86_64 |
-          | \`yuzu-macos-arm64.tar.gz\` | macOS | ARM64 (Apple Silicon) |
+          | \`yuzu-linux-x64.tar.gz\` | Linux (server + agent) | x86_64 |
+          | \`yuzu-linux-arm64.tar.gz\` | Linux (server + agent) | ARM64 |
+          | \`yuzu-gateway-linux-x64.tar.gz\` | Linux (gateway) | x86_64 |
+          | \`yuzu-windows-x64.zip\` | Windows (server + agent) | x86_64 |
+          | \`yuzu-macos-arm64.tar.gz\` | macOS (server + agent) | ARM64 (Apple Silicon) |
 
           ## Docker images
 
@@ -698,13 +958,6 @@ jobs:
           \`\`\`
 
           Multi-arch: \`linux/amd64\`, \`linux/arm64\`
-
-          ### What's included
-
-          - \`bin/yuzu-server\` — Yuzu server daemon
-          - \`bin/yuzu-agent\` — Yuzu agent daemon
-          - \`plugins/\` — Agent plugin shared libraries
-          - \`content/definitions/\` — YAML instruction definitions
 
           ### Verify checksums
 
@@ -719,15 +972,6 @@ jobs:
             --certificate-identity-regexp '.*' \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
-          \`\`\`
-
-          ### Quick start
-
-          \`\`\`bash
-          # Linux / macOS
-          tar xzf yuzu-linux-x64.tar.gz
-          cd yuzu-*/bin
-          ./yuzu-server
           \`\`\`
 
           See the [user manual](docs/user-manual/) for full setup instructions.
@@ -750,7 +994,12 @@ jobs:
             ${PRERELEASE_FLAG} \
             artifacts/yuzu-linux-x64.tar.gz \
             artifacts/yuzu-linux-arm64.tar.gz \
+            artifacts/yuzu-gateway-linux-x64.tar.gz \
             artifacts/yuzu-windows-x64.zip \
+            artifacts/YuzuAgentSetup-*.exe \
+            artifacts/YuzuAgent-*.pkg \
             artifacts/yuzu-macos-arm64.tar.gz \
+            artifacts/*.deb \
+            artifacts/*.rpm \
             artifacts/SHA256SUMS \
             artifacts/SHA256SUMS.bundle

@@ -25,6 +25,7 @@ if [[ -d /src ]]; then
     echo "[1/4] Copying source..."
     cp -r /src /build/src
     cd /build/src
+    rm -rf builddir vcpkg_installed node_modules .uat gateway/_build gateway/.deps_cache
 else
     echo "ERROR: Mount your source at /src: docker run -v \$(pwd):/src ..."
     exit 1
