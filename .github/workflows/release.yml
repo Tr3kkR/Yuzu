@@ -308,6 +308,8 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: windows-2022
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -368,7 +370,7 @@ jobs:
         continue-on-error: true
 
       - name: Sign binaries (Authenticode)
-        if: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
@@ -478,7 +480,7 @@ jobs:
           Write-Host "Installer built: YuzuAgentSetup-${version}.exe ($('{0:N1} MB' -f ((Get-Item $installer).Length / 1MB)))"
 
       - name: Sign installer (Authenticode)
-        if: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
@@ -526,6 +528,9 @@ jobs:
   build-macos:
     name: "Build macOS ARM64"
     runs-on: macos-14
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+      HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -585,7 +590,7 @@ jobs:
           ./builddir/yuzu-agent --help || true
 
       - name: Sign binaries (codesign)
-        if: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
           MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
@@ -639,7 +644,7 @@ jobs:
           rm -f "${CERT_PATH}"
 
       - name: Notarize binaries
-        if: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
+        if: env.HAS_NOTARIZATION == 'true'
         env:
           MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
@@ -703,7 +708,7 @@ jobs:
             --bin-dir builddir --version "$VERSION" --output .
 
       - name: Sign installer (.pkg)
-        if: ${{ secrets.MACOS_SIGNING_CERT != '' }}
+        if: env.HAS_SIGNING_CERT == 'true'
         env:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
@@ -718,7 +723,7 @@ jobs:
           echo "Signed: ${PKG}"
 
       - name: Notarize installer (.pkg)
-        if: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
+        if: env.HAS_NOTARIZATION == 'true'
         env:
           MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
