@@ -113,9 +113,16 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           RPM_VERSION="${VERSION%%-*}"
-          sudo apt-get install -y rpm
-          bash deploy/packaging/rpm/build-rpm.sh \
-            --bin-dir builddir --version "$RPM_VERSION" --output .
+          PRERELEASE="${VERSION#*-}"
+          [ "$PRERELEASE" = "$VERSION" ] && PRERELEASE=""
+          PRE_FLAG=""
+          [ -n "$PRERELEASE" ] && PRE_FLAG="--prerelease $PRERELEASE"
+          docker run --rm -v "$PWD:/build:z" fedora:40 bash -c "
+            dnf install -y rpm-build systemd-rpm-macros
+            cd /build
+            bash deploy/packaging/rpm/build-rpm.sh \
+              --bin-dir builddir --version $RPM_VERSION $PRE_FLAG --output .
+          "
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@v4
@@ -285,10 +292,17 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           RPM_VERSION="${VERSION%%-*}"
-          sudo apt-get install -y rpm
-          bash deploy/packaging/rpm/build-gateway-rpm.sh \
-            --rel-dir gateway/_build/prod/rel/yuzu_gw \
-            --version "$RPM_VERSION" --output .
+          PRERELEASE="${VERSION#*-}"
+          [ "$PRERELEASE" = "$VERSION" ] && PRERELEASE=""
+          PRE_FLAG=""
+          [ -n "$PRERELEASE" ] && PRE_FLAG="--prerelease $PRERELEASE"
+          docker run --rm -v "$PWD:/build:z" fedora:40 bash -c "
+            dnf install -y rpm-build systemd-rpm-macros
+            cd /build
+            bash deploy/packaging/rpm/build-gateway-rpm.sh \
+              --rel-dir gateway/_build/prod/rel/yuzu_gw \
+              --version $RPM_VERSION $PRE_FLAG --output .
+          "
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
@@ -926,35 +940,30 @@ jobs:
           cat >> release-notes.md <<NOTES_EOF
           ## Enterprise installers
 
-          | Installer | Platform | Format |
-          |---|---|---|
-          | \`YuzuAgentSetup-${VERSION}.exe\` | Windows x64 | InnoSetup (service + wizard) |
-          | \`YuzuAgent-${VERSION}-macos-arm64.pkg\` | macOS ARM64 | macOS installer (launchd) |
-          | \`yuzu-agent_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
-          | \`yuzu-server_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
-          | \`yuzu-agent-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
-          | \`yuzu-server-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
-          | \`yuzu-gateway_${VERSION}_amd64.deb\` | Debian/Ubuntu x64 | .deb (systemd) |
-          | \`yuzu-gateway-${VERSION}-1.x86_64.rpm\` | RHEL/Fedora x64 | .rpm (systemd) |
+          | Component | Windows | macOS | Debian/Ubuntu | RHEL/Fedora |
+          |---|---|---|---|---|
+          | Agent | \`.exe\` (InnoSetup) | \`.pkg\` (launchd) | \`.deb\` (systemd) | \`.rpm\` (systemd) |
+          | Server | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
+          | Gateway | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
-          YuzuAgentSetup-${VERSION}.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+          YuzuAgentSetup-*.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
           \`\`\`
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash
-          sudo installer -pkg YuzuAgent-${VERSION}-macos-arm64.pkg -target /
+          sudo installer -pkg YuzuAgent-*.pkg -target /
           \`\`\`
 
           ### Linux install
           \`\`\`bash
           # Debian/Ubuntu
-          sudo dpkg -i yuzu-agent_${VERSION}_amd64.deb
+          sudo dpkg -i yuzu-agent_*.deb
           sudo systemctl edit yuzu-agent  # set --server address
 
           # RHEL/Fedora
-          sudo rpm -i yuzu-agent-${VERSION}-1.x86_64.rpm
+          sudo rpm -i yuzu-agent-*.rpm
           \`\`\`
 
           ## Platform archives
