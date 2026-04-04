@@ -83,6 +83,7 @@ jobs:
       - name: Package archive
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-linux-x64"
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
@@ -104,12 +105,14 @@ jobs:
       - name: Build .deb packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           bash deploy/packaging/debian/build-deb.sh \
             --bin-dir builddir --version "$VERSION" --output .
 
       - name: Build .rpm packages
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           sudo apt-get install -y rpm
           bash deploy/packaging/rpm/build-rpm.sh \
             --bin-dir builddir --version "$VERSION" --output .
@@ -197,6 +200,7 @@ jobs:
       - name: Package archive
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-linux-arm64"
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
@@ -263,6 +267,7 @@ jobs:
       - name: Package release tarball
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           STAGING="yuzu-gateway-${VERSION}-linux-x64"
           mkdir -p "${STAGING}"
           cp -a gateway/_build/prod/rel/yuzu_gw/* "${STAGING}/"
@@ -271,6 +276,7 @@ jobs:
       - name: Build .deb package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           bash deploy/packaging/debian/build-gateway-deb.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$VERSION" --output .
@@ -278,6 +284,7 @@ jobs:
       - name: Build .rpm package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           sudo apt-get install -y rpm
           bash deploy/packaging/rpm/build-gateway-rpm.sh \
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
@@ -425,7 +432,7 @@ jobs:
       - name: Package archive
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
           $staging = "yuzu-${version}-windows-x64"
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
 
@@ -453,7 +460,7 @@ jobs:
       - name: Build Windows installer (InnoSetup)
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
 
           # Install InnoSetup 6
           choco install innosetup -y --no-progress
@@ -486,7 +493,7 @@ jobs:
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
           $installer = "YuzuAgentSetup-${version}.exe"
 
           $certPath = "${{ runner.temp }}\signing-cert.pfx"
@@ -683,6 +690,7 @@ jobs:
       - name: Package archive
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-macos-arm64"
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
@@ -704,6 +712,7 @@ jobs:
       - name: Build macOS installer (.pkg)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           bash deploy/packaging/macos/build-pkg.sh \
             --bin-dir builddir --version "$VERSION" --output .
 
@@ -713,6 +722,7 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           PKG="YuzuAgent-${VERSION}-macos-arm64.pkg"
           SIGNED="YuzuAgent-${VERSION}-macos-arm64-signed.pkg"
 
@@ -730,6 +740,7 @@ jobs:
           MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           PKG="YuzuAgent-${VERSION}-macos-arm64.pkg"
 
           echo "Submitting installer for Apple notarization..."
@@ -772,6 +783,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
+          VERSION="${VERSION//-/_}"
           MAJOR_MINOR="${VERSION%.*}"
           REGISTRY="ghcr.io/${{ github.repository_owner }}"
 
@@ -885,6 +897,7 @@ jobs:
         id: changelog
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
           # Extract the section for this version from CHANGELOG.md
           if [ -f CHANGELOG.md ]; then
             awk "/^## \[${VERSION}\]/{found=1;next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > changelog_section.md
