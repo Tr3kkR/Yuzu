@@ -9,8 +9,8 @@ env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
 jobs:
-  warmup-windows:
-    name: "Warmup: Windows static-md vcpkg cache"
+  warmup-arm64:
+    name: "Warmup: ARM64 cross-compile vcpkg cache"
     runs-on: self-hosted
     timeout-minutes: 360
     steps:
@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -35,8 +35,8 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Install vcpkg packages (static-md)
+      - name: Install vcpkg packages (arm64 cross)
         run: |
-          & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
-            --triplet x64-windows-static-md `
-            --x-manifest-root="${{ github.workspace }}"
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet arm64-linux \
+            --x-manifest-root=${{ github.workspace }}
