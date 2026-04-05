@@ -6,7 +6,7 @@ on:
 
 env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,readwrite"
 
 jobs:
   warmup-arm64:

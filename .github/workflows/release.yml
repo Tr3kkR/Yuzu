@@ -16,7 +16,8 @@ permissions:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,readwrite"
+  NUGET_SOURCE_URL: "https://nuget.pkg.github.com/Tr3kkR/index.json"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
@@ -70,6 +71,26 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Configure NuGet credentials
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.nuget/NuGet
+          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="${NUGET_SOURCE_URL}" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          NUGETEOF
 
       - name: Install vcpkg packages
         run: |
@@ -219,6 +240,26 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Configure NuGet credentials
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.nuget/NuGet
+          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="${NUGET_SOURCE_URL}" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          NUGETEOF
 
       - name: Install vcpkg packages (cross)
         run: |
@@ -426,6 +467,28 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Configure NuGet credentials
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $configDir = "$env:APPDATA\NuGet"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="$env:NUGET_SOURCE_URL" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${{ github.repository_owner }}" />
+                <add key="ClearTextPassword" value="$env:GITHUB_TOKEN" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          "@ | Set-Content "$configDir\NuGet.Config"
 
       - name: Install vcpkg packages
         run: |
@@ -663,6 +726,26 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Configure NuGet credentials
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.nuget/NuGet
+          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="${NUGET_SOURCE_URL}" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          NUGETEOF
 
       - name: Install vcpkg packages
         run: |
