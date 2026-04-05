@@ -29,14 +29,15 @@ jobs:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Install vcpkg packages (arm64 cross)
+      - name: Setup and install vcpkg packages (arm64 cross)
         run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
+          # Clone vcpkg at the pinned commit
+          git clone https://github.com/microsoft/vcpkg.git vcpkg-tree
+          cd vcpkg-tree
+          git checkout ${{ env.VCPKG_COMMIT }}
+          ./bootstrap-vcpkg.sh -disableMetrics
+          cd ..
+          # Install arm64-linux packages
+          ./vcpkg-tree/vcpkg install \
             --triplet arm64-linux \
             --x-manifest-root=${{ github.workspace }}
