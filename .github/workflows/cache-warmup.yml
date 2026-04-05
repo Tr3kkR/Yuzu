@@ -29,26 +29,25 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Configure NuGet credentials
-        shell: pwsh
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $configDir = "$env:APPDATA\NuGet"
-          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-          @"
+          mkdir -p "$APPDATA/NuGet"
+          cat > "$APPDATA/NuGet/NuGet.Config" <<NUGETEOF
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
             <packageSources>
-              <add key="github" value="$env:NUGET_SOURCE_URL" />
+              <add key="github" value="${NUGET_SOURCE_URL}" />
             </packageSources>
             <packageSourceCredentials>
               <github>
-                <add key="Username" value="${{ github.repository_owner }}" />
-                <add key="ClearTextPassword" value="$env:GITHUB_TOKEN" />
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
               </github>
             </packageSourceCredentials>
           </configuration>
-          "@ | Set-Content "$configDir\NuGet.Config"
+          NUGETEOF
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -57,9 +56,10 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages (x64-windows-static-md)
+        shell: bash
         run: |
-          & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
-            --triplet x64-windows-static-md `
+          "${{ github.workspace }}/vcpkg/vcpkg.exe" install \
+            --triplet x64-windows-static-md \
             --x-manifest-root="${{ github.workspace }}"
 
   warmup-linux:
