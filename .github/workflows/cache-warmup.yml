@@ -4,14 +4,19 @@ on:
   push:
     branches: ['cache-warmup']
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,readwrite"
+  NUGET_SOURCE_URL: "https://nuget.pkg.github.com/Tr3kkR/index.json"
 
 jobs:
-  warmup-arm64:
-    name: "Warmup: ARM64 cross-compile vcpkg cache"
-    runs-on: self-hosted
+  warmup-windows:
+    name: "Warmup: Windows x64-windows-static-md"
+    runs-on: [self-hosted, Windows]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
@@ -23,21 +28,128 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-
-      - name: Setup and install vcpkg packages (arm64 cross)
+      - name: Configure NuGet credentials
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Clone vcpkg at the pinned commit
+          $configDir = "$env:APPDATA\NuGet"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="$env:NUGET_SOURCE_URL" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${{ github.repository_owner }}" />
+                <add key="ClearTextPassword" value="$env:GITHUB_TOKEN" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          "@ | Set-Content "$configDir\NuGet.Config"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages (x64-windows-static-md)
+        run: |
+          & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
+            --triplet x64-windows-static-md `
+            --x-manifest-root="${{ github.workspace }}"
+
+  warmup-linux:
+    name: "Warmup: Linux x64-linux"
+    needs: warmup-windows
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure NuGet credentials
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.nuget/NuGet
+          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="${NUGET_SOURCE_URL}" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          NUGETEOF
+
+      - name: Setup and install vcpkg packages (x64-linux)
+        run: |
           git clone https://github.com/microsoft/vcpkg.git vcpkg-tree
           cd vcpkg-tree
           git checkout ${{ env.VCPKG_COMMIT }}
           ./bootstrap-vcpkg.sh -disableMetrics
           cd ..
-          # Install arm64-linux packages
+          ./vcpkg-tree/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+  warmup-arm64:
+    name: "Warmup: Linux arm64-linux (cross)"
+    needs: warmup-linux
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure NuGet credentials
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.nuget/NuGet
+          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <add key="github" value="${NUGET_SOURCE_URL}" />
+            </packageSources>
+            <packageSourceCredentials>
+              <github>
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
+              </github>
+            </packageSourceCredentials>
+          </configuration>
+          NUGETEOF
+
+      - name: Setup and install vcpkg packages (arm64-linux cross)
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git vcpkg-tree
+          cd vcpkg-tree
+          git checkout ${{ env.VCPKG_COMMIT }}
+          ./bootstrap-vcpkg.sh -disableMetrics
+          cd ..
           ./vcpkg-tree/vcpkg install \
             --triplet arm64-linux \
             --x-manifest-root=${{ github.workspace }}
