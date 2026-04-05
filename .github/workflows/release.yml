@@ -227,6 +227,8 @@ jobs:
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson cross release + LTO)
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
@@ -376,7 +378,7 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
