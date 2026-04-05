@@ -228,7 +228,7 @@ jobs:
 
       - name: Configure (Meson cross release + LTO)
         env:
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-linux/lib/pkgconfig
+          PKG_CONFIG_LIBDIR: ${{ github.workspace }}/vcpkg_installed/arm64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
             --cross-file meson/cross/aarch64-linux-gnu.ini \
