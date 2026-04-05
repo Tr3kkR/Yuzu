@@ -1,7 +1,8 @@
 name: Cache Warmup
 
 on:
-  workflow_dispatch:
+  push:
+    branches: ['cache-warmup']
 
 env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
