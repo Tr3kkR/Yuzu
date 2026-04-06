@@ -60,12 +60,22 @@ RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
 # This is the expensive step (~20-30 min on 32 cores) that saves hours in CI.
 # The vcpkg_installed directory is portable within the same triplet+compiler.
 COPY vcpkg.json vcpkg-configuration.json /tmp/vcpkg-manifest/
-RUN cd /tmp/vcpkg-manifest \
-    && vcpkg install --triplet x64-linux --x-manifest-root=/tmp/vcpkg-manifest \
-    && vcpkg install --triplet arm64-linux --x-manifest-root=/tmp/vcpkg-manifest \
+
+# Install x64-linux packages in isolated directory
+RUN cp -r /tmp/vcpkg-manifest /tmp/vcpkg-x64 \
+    && cd /tmp/vcpkg-x64 \
+    && vcpkg install --triplet x64-linux --x-manifest-root=/tmp/vcpkg-x64 \
     && mkdir -p /opt/vcpkg_installed \
-    && cp -a /tmp/vcpkg-manifest/vcpkg_installed/* /opt/vcpkg_installed/ \
-    && rm -rf /tmp/vcpkg-manifest \
+    && cp -a /tmp/vcpkg-x64/vcpkg_installed/x64-linux /opt/vcpkg_installed/ \
+    && rm -rf /tmp/vcpkg-x64 \
+    && rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/downloads /opt/vcpkg/packages
+
+# Install arm64-linux packages in isolated directory
+RUN cp -r /tmp/vcpkg-manifest /tmp/vcpkg-arm64 \
+    && cd /tmp/vcpkg-arm64 \
+    && vcpkg install --triplet arm64-linux --x-manifest-root=/tmp/vcpkg-arm64 \
+    && cp -a /tmp/vcpkg-arm64/vcpkg_installed/arm64-linux /opt/vcpkg_installed/ \
+    && rm -rf /tmp/vcpkg-arm64 /tmp/vcpkg-manifest \
     && rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/downloads /opt/vcpkg/packages
 
 # ── Git safe directory (container workspace) ──────────────────────────
