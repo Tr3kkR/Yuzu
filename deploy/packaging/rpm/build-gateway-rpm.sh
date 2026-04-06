@@ -42,12 +42,23 @@ else
     RPM_RELEASE="1%{?dist}"
 fi
 
+# Define systemd macros if not available (e.g., building on Ubuntu/Debian)
+SYSTEMD_DEFINES=()
+if ! rpm --showrc 2>/dev/null | grep -q systemd_post; then
+    SYSTEMD_DEFINES=(
+        --define "systemd_post() systemctl preset %{?*} >/dev/null 2>&1 || :"
+        --define "systemd_preun() if [ \$1 -eq 0 ]; then systemctl --no-reload disable --now %{?*} >/dev/null 2>&1 || :; fi"
+        --define "systemd_postun_with_restart() if [ \$1 -ge 1 ]; then systemctl try-restart %{?*} >/dev/null 2>&1 || :; fi"
+        --define "_unitdir /usr/lib/systemd/system"
+    )
+fi
+
 # Build RPM
 echo "=== Building yuzu-gateway-${VERSION} RPM ==="
 sed -e "s/^Version:.*/Version:        $VERSION/" \
     -e "s/^Release:.*/Release:        $RPM_RELEASE/" \
     "$SCRIPT_DIR/yuzu-gateway.spec" > "$TOPDIR/SPECS/yuzu-gateway.spec"
-rpmbuild --define "_topdir $TOPDIR" -bb "$TOPDIR/SPECS/yuzu-gateway.spec"
+rpmbuild --define "_topdir $TOPDIR" "${SYSTEMD_DEFINES[@]}" -bb "$TOPDIR/SPECS/yuzu-gateway.spec"
 
 # Copy output
 mkdir -p "$OUTPUT"
