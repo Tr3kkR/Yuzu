@@ -156,6 +156,8 @@ jobs:
     name: "Build Gateway (Erlang)"
     runs-on: [self-hosted, Linux]
     timeout-minutes: 15
+    env:
+      ImageOS: ubuntu24
 
     steps:
       - uses: actions/checkout@v6
@@ -302,26 +304,25 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Configure NuGet credentials
-        shell: pwsh
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $configDir = "$env:APPDATA\NuGet"
-          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-          @"
+          mkdir -p "$APPDATA/NuGet"
+          cat > "$APPDATA/NuGet/NuGet.Config" <<NUGETEOF
           <?xml version="1.0" encoding="utf-8"?>
           <configuration>
             <packageSources>
-              <add key="github" value="$env:NUGET_SOURCE_URL" />
+              <add key="github" value="${NUGET_SOURCE_URL}" />
             </packageSources>
             <packageSourceCredentials>
               <github>
-                <add key="Username" value="${{ github.repository_owner }}" />
-                <add key="ClearTextPassword" value="$env:GITHUB_TOKEN" />
+                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
+                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
               </github>
             </packageSourceCredentials>
           </configuration>
-          "@ | Set-Content "$configDir\NuGet.Config"
+          NUGETEOF
 
       - name: Install vcpkg packages
         run: |
