@@ -120,7 +120,7 @@ jobs:
           [ "$PRERELEASE" = "$VERSION" ] && PRERELEASE=""
           PRE_FLAG=""
           [ -n "$PRERELEASE" ] && PRE_FLAG="--prerelease $PRERELEASE"
-          which rpmbuild >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq rpm; }
+          which rpmbuild >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq rpm 2>/dev/null || sudo apt-get update -qq && sudo apt-get install -y -qq rpm; }
           bash deploy/packaging/rpm/build-rpm.sh \
             --bin-dir builddir --version "$RPM_VERSION" $PRE_FLAG --output .
 
@@ -222,7 +222,7 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          which rpmbuild >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq rpm; }
+          which rpmbuild >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq rpm 2>/dev/null || sudo apt-get update -qq && sudo apt-get install -y -qq rpm; }
           VERSION="${GITHUB_REF_NAME#v}"
           RPM_VERSION="${VERSION%%-*}"
           PRERELEASE="${VERSION#*-}"
@@ -338,6 +338,8 @@ jobs:
         env:
           CC: ccache cl
           CXX: ccache cl
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-static-md/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-static-md
         run: |
           meson setup builddir `
             --buildtype=release `
