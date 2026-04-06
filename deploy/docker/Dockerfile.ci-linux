@@ -1,0 +1,77 @@
+# Yuzu CI Linux — pre-populated build environment for GitHub Actions
+#
+# Covers both Linux x64 and ARM64 cross-compile jobs.
+# Pre-bakes vcpkg packages for both triplets so CI skips compilation.
+#
+# Push to ghcr.io/tr3kkr/yuzu-ci-linux:latest
+#
+# Usage in workflows:
+#   jobs:
+#     build-linux:
+#       runs-on: ubuntu-24.04
+#       container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
+
+FROM ubuntu:24.04
+
+ARG MESON_VERSION=1.9.2
+ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
+
+# ── System packages (covers both x64 and ARM64 cross-compile) ─────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    cmake ninja-build pkg-config ccache \
+    gcc-13 g++-13 \
+    # ARM64 cross-compile toolchain
+    gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    crossbuild-essential-arm64 \
+    # Utilities
+    curl git zip unzip tar ca-certificates gnupg jq \
+    # Python (for meson)
+    python3 python3-pip python3-venv \
+    # NuGet binary cache support
+    mono-complete \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js 20 (required by GitHub Actions runner actions) ────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Meson (pinned version) ────────────────────────────────────────────
+RUN pip3 install --break-system-packages meson==${MESON_VERSION}
+
+# ── vcpkg (pre-cloned at pinned commit) ───────────────────────────────
+RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && cd /opt/vcpkg \
+    && git checkout ${VCPKG_COMMIT} \
+    && ./bootstrap-vcpkg.sh -disableMetrics \
+    && ln -s /opt/vcpkg/vcpkg /usr/local/bin/vcpkg
+
+ENV VCPKG_ROOT=/opt/vcpkg
+
+# ── Default compiler symlinks (must be before vcpkg install) ──────────
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 130 \
+    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 130 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 130
+
+# ── Pre-build vcpkg packages for both triplets ───────────────────────
+# This is the expensive step (~20-30 min on 32 cores) that saves hours in CI.
+# The vcpkg_installed directory is portable within the same triplet+compiler.
+COPY vcpkg.json vcpkg-configuration.json /tmp/vcpkg-manifest/
+RUN cd /tmp/vcpkg-manifest \
+    && vcpkg install --triplet x64-linux --x-manifest-root=/tmp/vcpkg-manifest \
+    && vcpkg install --triplet arm64-linux --x-manifest-root=/tmp/vcpkg-manifest \
+    && mkdir -p /opt/vcpkg_installed \
+    && cp -a /tmp/vcpkg-manifest/vcpkg_installed/* /opt/vcpkg_installed/ \
+    && rm -rf /tmp/vcpkg-manifest \
+    && rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/downloads /opt/vcpkg/packages
+
+# ── Git safe directory (container workspace) ──────────────────────────
+RUN git config --global --add safe.directory '*'
+
+# ── Labels ────────────────────────────────────────────────────────────
+LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
+LABEL org.opencontainers.image.description="Yuzu CI build environment (Linux x64 + ARM64 cross) with pre-built vcpkg dependencies"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

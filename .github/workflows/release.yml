@@ -24,20 +24,13 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -50,53 +43,17 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc-13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc-13-
-            vcpkg-x64-linux-
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Configure NuGet credentials
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Link pre-built vcpkg packages
         run: |
-          mkdir -p ~/.nuget/NuGet
-          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <add key="github" value="${NUGET_SOURCE_URL}" />
-            </packageSources>
-            <packageSourceCredentials>
-              <github>
-                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
-                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
-              </github>
-            </packageSourceCredentials>
-          </configuration>
-          NUGETEOF
-
-      - name: Install vcpkg packages
-        run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
-            --x-manifest-root=${{ github.workspace }}
+          # Use packages pre-built in the Docker image
+          if [ -d /opt/vcpkg_installed/x64-linux ]; then
+            mkdir -p vcpkg_installed
+            ln -s /opt/vcpkg_installed/x64-linux vcpkg_installed/x64-linux
+            echo "Using pre-built vcpkg packages from Docker image"
+          else
+            echo "WARNING: Pre-built packages not found, falling back to vcpkg install"
+            vcpkg install --triplet x64-linux --x-manifest-root=${{ github.workspace }}
+          fi
 
       - name: Configure (Meson release + LTO)
         env:
@@ -191,23 +148,13 @@ jobs:
   build-linux-arm64:
     name: "Build Linux ARM64"
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - name: Install cross-compile toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build \
-            gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            pkg-config crossbuild-essential-arm64 \
-            curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -220,52 +167,16 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-linux-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-arm64-linux-
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Configure NuGet credentials
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Link pre-built vcpkg packages
         run: |
-          mkdir -p ~/.nuget/NuGet
-          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <add key="github" value="${NUGET_SOURCE_URL}" />
-            </packageSources>
-            <packageSourceCredentials>
-              <github>
-                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
-                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
-              </github>
-            </packageSourceCredentials>
-          </configuration>
-          NUGETEOF
-
-      - name: Install vcpkg packages (cross)
-        run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet arm64-linux \
-            --x-manifest-root=${{ github.workspace }}
+          if [ -d /opt/vcpkg_installed/arm64-linux ]; then
+            mkdir -p vcpkg_installed
+            ln -s /opt/vcpkg_installed/arm64-linux vcpkg_installed/arm64-linux
+            echo "Using pre-built vcpkg packages from Docker image"
+          else
+            echo "WARNING: Pre-built packages not found, falling back to vcpkg install"
+            vcpkg install --triplet arm64-linux --x-manifest-root=${{ github.workspace }}
+          fi
 
       - name: Configure (Meson cross release + LTO)
         env:
@@ -318,24 +229,18 @@ jobs:
   build-gateway:
     name: "Build Gateway (Erlang)"
     runs-on: ubuntu-24.04
+    container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
     timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Erlang/OTP and rebar3
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: '27'
-          rebar3-version: '3.24'
-
-      - name: Cache rebar3 dependencies
-        uses: actions/cache@v4
-        with:
-          path: gateway/_build/default/lib
-          key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
-          restore-keys: |
-            rebar3-deps-
+      - name: Restore pre-built rebar3 dependencies
+        run: |
+          if [ -d /opt/rebar3_deps/_build ]; then
+            cp -a /opt/rebar3_deps/_build gateway/_build
+            echo "Restored pre-built rebar3 deps from Docker image"
+          fi
 
       - name: Cache Dialyzer PLT
         uses: actions/cache@v4
