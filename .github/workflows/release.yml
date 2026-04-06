@@ -16,7 +16,7 @@ permissions:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,readwrite"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,read"
   NUGET_SOURCE_URL: "https://nuget.pkg.github.com/Tr3kkR/index.json"
 
 jobs:
