@@ -17,18 +17,22 @@ ARG MESON_VERSION=1.9.2
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 
 # ── System packages (covers both x64 and ARM64 cross-compile) ─────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     # Build essentials
-    cmake ninja-build pkg-config ccache \
+    cmake ninja-build make pkg-config ccache \
     gcc-13 g++-13 \
+    # Autotools (required by vcpkg ports: c-ares, grpc)
+    autoconf automake libtool \
+    # OpenSSL build deps
+    perl linux-libc-dev \
     # Utilities
     curl git zip unzip tar ca-certificates gnupg jq \
-    # Python (for meson)
+    # Python (for meson + vcpkg build scripts)
     python3 python3-pip python3-venv \
     # NuGet binary cache support
     mono-complete \
-    # RPM packaging (rpmbuild for building .rpm natively)
-    rpm \
+    # Packaging tools
+    rpm dpkg-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Node.js 20 (required by GitHub Actions runner actions) ────────────
