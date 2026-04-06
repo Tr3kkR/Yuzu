@@ -21,10 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build essentials
     cmake ninja-build pkg-config ccache \
     gcc-13 g++-13 \
-    # ARM64 cross-compile toolchain
-    gcc-13-aarch64-linux-gnu g++-13-aarch64-linux-gnu \
-    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-    crossbuild-essential-arm64 \
     # Utilities
     curl git zip unzip tar ca-certificates gnupg jq \
     # Python (for meson)
@@ -58,27 +54,10 @@ RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
     && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 130 \
     && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 130
 
-# ── Pre-build vcpkg packages for both triplets ───────────────────────
-# This is the expensive step (~20-30 min on 32 cores) that saves hours in CI.
-# The vcpkg_installed directory is portable within the same triplet+compiler.
-COPY vcpkg.json vcpkg-configuration.json /tmp/vcpkg-manifest/
-
-# Install x64-linux packages in isolated directory
-RUN cp -r /tmp/vcpkg-manifest /tmp/vcpkg-x64 \
-    && cd /tmp/vcpkg-x64 \
-    && vcpkg install --triplet x64-linux --x-manifest-root=/tmp/vcpkg-x64 \
-    && mkdir -p /opt/vcpkg_installed \
-    && cp -a /tmp/vcpkg-x64/vcpkg_installed/x64-linux /opt/vcpkg_installed/ \
-    && rm -rf /tmp/vcpkg-x64 \
-    && rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/downloads /opt/vcpkg/packages
-
-# Install arm64-linux packages in isolated directory
-RUN cp -r /tmp/vcpkg-manifest /tmp/vcpkg-arm64 \
-    && cd /tmp/vcpkg-arm64 \
-    && vcpkg install --triplet arm64-linux --x-manifest-root=/tmp/vcpkg-arm64 \
-    && cp -a /tmp/vcpkg-arm64/vcpkg_installed/arm64-linux /opt/vcpkg_installed/ \
-    && rm -rf /tmp/vcpkg-arm64 /tmp/vcpkg-manifest \
-    && rm -rf /opt/vcpkg/buildtrees /opt/vcpkg/downloads /opt/vcpkg/packages
+# ── vcpkg packages installed at CI runtime via NuGet/x-gha cache ──────
+# Pre-baking vcpkg into Docker is fragile (OpenSSL download auth,
+# network in build context). The self-hosted runner's NuGet binary
+# cache provides the same speed benefit without the complexity.
 
 # ── Git safe directory (container workspace) ──────────────────────────
 RUN git config --global --add safe.directory '*'
