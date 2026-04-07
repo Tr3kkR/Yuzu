@@ -117,7 +117,9 @@ auto resolve_agent_id(std::string_view cli_override, const std::filesystem::path
     }
 
     sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open(db_path.string().c_str(), &raw_db);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &raw_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     SqliteDb db(raw_db);
     if (rc != SQLITE_OK) {
         return std::unexpected(IdentityError{std::format(

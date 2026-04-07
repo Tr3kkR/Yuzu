@@ -10,7 +10,9 @@ namespace yuzu::server {
 AnalyticsEventStore::AnalyticsEventStore(const std::filesystem::path& db_path,
                                          int drain_interval_seconds, int batch_size)
     : drain_interval_seconds_(drain_interval_seconds), batch_size_(batch_size) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("AnalyticsEventStore: failed to open {}: {}", db_path.string(),
                       sqlite3_errmsg(db_));

@@ -20,7 +20,9 @@ static const char* safe(const char* p) {
 // ── Construction / teardown ──────────────────────────────────────────────────
 
 QuarantineStore::QuarantineStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("QuarantineStore: failed to open {}: {}", db_path.string(),
                       sqlite3_errmsg(db_));
