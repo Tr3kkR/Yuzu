@@ -62,63 +62,63 @@ Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Componen
 Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 
 ; --- Plugins: core (always installed) ---
-Source: "{#BuildDir}\plugins\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\agent_actions.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\agent_logging.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\tags.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\diagnostics.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\content_dist.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\device_identity.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\status\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\agent_actions\agent_actions.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\agent_logging\agent_logging.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\tags\tags.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\diagnostics\diagnostics.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\content_dist\content_dist.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\device_identity\device_identity.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
 
 ; --- Plugins: system ---
-Source: "{#BuildDir}\plugins\os_info.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\hardware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\storage.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\filesystem.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\users.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\installed_apps.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\msi_packages.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\asset_tags.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\os_info\os_info.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\hardware\hardware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\storage\storage.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\filesystem\filesystem.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\users\users.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\installed_apps\installed_apps.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\msi_packages\msi_packages.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\asset_tags\asset_tags.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 
 ; --- Plugins: network ---
-Source: "{#BuildDir}\plugins\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\network_diag.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\network_actions.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\netstat.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\sockwho.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\wifi.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\wol.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\http_client.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\network_diag\network_diag.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\network_actions\network_actions.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\netstat\netstat.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\sockwho\sockwho.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\wifi\wifi.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\wol\wol.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\http_client\http_client.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion
 
 ; --- Plugins: security ---
-Source: "{#BuildDir}\plugins\antivirus.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\bitlocker.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\certificates.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\firewall.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\quarantine.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\antivirus\antivirus.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\bitlocker\bitlocker.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\certificates\certificates.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\firewall\firewall.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\quarantine\quarantine.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 ; --- Plugins: windows ---
-Source: "{#BuildDir}\plugins\event_logs.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\registry.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\wmi.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\windows_updates.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\sccm.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\event_logs\event_logs.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\registry\registry.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\wmi\wmi.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\windows_updates\windows_updates.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\sccm\sccm.dll"; DestDir: "{app}\plugins"; Components: plugins\windows; Flags: ignoreversion
 
 ; --- Plugins: management ---
-Source: "{#BuildDir}\plugins\processes.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\services.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\software_actions.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\script_exec.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\interaction.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\processes\processes.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\services\services.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\software_actions\software_actions.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\script_exec\script_exec.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\interaction\interaction.dll"; DestDir: "{app}\plugins"; Components: plugins\management; Flags: ignoreversion
 
 ; --- Plugins: advanced ---
-Source: "{#BuildDir}\plugins\discovery.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\tar.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\procfetch.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\chargen.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
-Source: "{#BuildDir}\plugins\example.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\discovery\discovery.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\tar\tar.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\procfetch\procfetch.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\chargen\chargen.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 [Dirs]
 Name: "{app}\logs"; Permissions: service-full

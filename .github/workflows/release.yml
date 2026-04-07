@@ -746,93 +746,10 @@ jobs:
           path: "YuzuAgent-*.pkg"
           retention-days: 3
 
-  # ── Docker multi-arch publish ────────────────────────────────────────
-  docker-publish:
-    name: "Docker multi-arch push"
-    needs: [build-linux]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Compute Docker tags
-        id: tags
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          VERSION="${VERSION//-/_}"
-          MAJOR_MINOR="${VERSION%.*}"
-          REGISTRY="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}"
-
-          IS_PRERELEASE="false"
-          if [[ "$TAG" == *"-alpha"* ]] || [[ "$TAG" == *"-beta"* ]] || [[ "$TAG" == *"-rc"* ]]; then
-            IS_PRERELEASE="true"
-          fi
-
-          # Build tag lists for each image (newline-separated for build-push-action)
-          for IMAGE in yuzu-server yuzu-agent yuzu-gateway; do
-            OUTPUT_KEY="tags_${IMAGE//-/_}"
-            EOF_MARKER=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "${OUTPUT_KEY}<<${EOF_MARKER}" >> "$GITHUB_OUTPUT"
-            echo "${REGISTRY}/${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
-            if [[ "$IS_PRERELEASE" == "false" ]]; then
-              echo "${REGISTRY}/${IMAGE}:latest" >> "$GITHUB_OUTPUT"
-              echo "${REGISTRY}/${IMAGE}:${MAJOR_MINOR}" >> "$GITHUB_OUTPUT"
-            fi
-            echo "${EOF_MARKER}" >> "$GITHUB_OUTPUT"
-          done
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push yuzu-server
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.server
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags_yuzu_server }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build and push yuzu-agent
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.agent
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags_yuzu_agent }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build and push yuzu-gateway
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.gateway
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.tags.outputs.tags_yuzu_gateway }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"
-    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
+    needs: [build-linux, build-gateway, build-windows, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
