@@ -1,0 +1,61 @@
+# Self-hosted GitHub Actions runner with Yuzu build tools
+#
+# Extends the CI build image with the GitHub Actions runner binary.
+# Auto-registers on startup using RUNNER_TOKEN env var.
+#
+# Usage:
+#   docker build -f deploy/docker/Dockerfile.runner-linux -t yuzu-runner-linux .
+#   docker run -d --restart always \
+#     -e RUNNER_TOKEN=<token> \
+#     -e RUNNER_NAME=yuzu-local-linux \
+#     -e RUNNER_URL=https://github.com/Tr3kkR/Yuzu \
+#     --name yuzu-local-linux yuzu-runner-linux
+
+FROM ghcr.io/actions/actions-runner:latest
+
+USER root
+
+ARG MESON_VERSION=1.9.2
+ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
+
+# ── Build tools (mirrors Dockerfile.ci-linux) ─────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build make pkg-config ccache \
+    gcc-13 g++-13 \
+    autoconf automake libtool \
+    perl linux-libc-dev \
+    curl zip unzip tar ca-certificates gnupg jq \
+    python3 python3-pip python3-venv \
+    rpm dpkg-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Meson ─────────────────────────────────────────────────────────────
+RUN pip3 install --break-system-packages meson==${MESON_VERSION}
+
+# ── Default compiler symlinks ─────────────────────────────────────────
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 130 \
+    && update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 130 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 130
+
+# ── vcpkg ─────────────────────────────────────────────────────────────
+RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && cd /opt/vcpkg \
+    && git checkout ${VCPKG_COMMIT} \
+    && ./bootstrap-vcpkg.sh -disableMetrics \
+    && ln -s /opt/vcpkg/vcpkg /usr/local/bin/vcpkg
+
+ENV VCPKG_ROOT=/opt/vcpkg
+
+# ── Fix permissions for runner user ───────────────────────────────────
+RUN chown -R runner:runner /opt/vcpkg
+
+# ── Git safe directory ────────────────────────────────────────────────
+RUN git config --global --add safe.directory '*'
+
+# ── Entrypoint: configure + run ───────────────────────────────────────
+COPY deploy/docker/runner-entrypoint.sh /runner-entrypoint.sh
+RUN chmod +x /runner-entrypoint.sh
+
+USER runner
+ENTRYPOINT ["/runner-entrypoint.sh"]

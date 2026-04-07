@@ -23,7 +23,7 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: [self-hosted, Linux]
-    timeout-minutes: 20
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
