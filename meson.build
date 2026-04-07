@@ -87,7 +87,12 @@ grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], requ
 if not grpcpp_dep.found()
   grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
 endif
-protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: false)
+protobuf_cmake_args = []
+if host_os == 'windows'
+  protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
+endif
+protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
+  cmake_args: protobuf_cmake_args, required: false)
 if not protobuf_dep.found()
   protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
 endif
