@@ -16,8 +16,7 @@ permissions:
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite;nuget,https://nuget.pkg.github.com/Tr3kkR/index.json,read"
-  NUGET_SOURCE_URL: "https://nuget.pkg.github.com/Tr3kkR/index.json"
+  VCPKG_BINARY_SOURCES: "default"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
@@ -296,9 +295,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-windows-static-md-
+            vcpkg-x64-windows-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -306,45 +305,21 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Configure NuGet credentials
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p "$APPDATA/NuGet"
-          cat > "$APPDATA/NuGet/NuGet.Config" <<NUGETEOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <add key="github" value="${NUGET_SOURCE_URL}" />
-            </packageSources>
-            <packageSourceCredentials>
-              <github>
-                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
-                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
-              </github>
-            </packageSourceCredentials>
-          </configuration>
-          NUGETEOF
-
       - name: Install vcpkg packages
         run: |
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
-            --triplet x64-windows-static-md `
+            --triplet x64-windows `
             --x-manifest-root="${{ github.workspace }}"
 
       - name: Configure (Meson release)
         env:
           CC: ccache cl
           CXX: ccache cl
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-static-md/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-static-md
         run: |
           meson setup builddir `
             --buildtype=release `
             -Dcpp_std=vc++latest `
-            -Ddefault_library=static `
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows-static-md `
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false
 
       - name: Build
@@ -565,26 +540,6 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Configure NuGet credentials
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p ~/.nuget/NuGet
-          cat > ~/.nuget/NuGet/NuGet.Config <<NUGETEOF
-          <?xml version="1.0" encoding="utf-8"?>
-          <configuration>
-            <packageSources>
-              <add key="github" value="${NUGET_SOURCE_URL}" />
-            </packageSources>
-            <packageSourceCredentials>
-              <github>
-                <add key="Username" value="${GITHUB_REPOSITORY_OWNER}" />
-                <add key="ClearTextPassword" value="${GITHUB_TOKEN}" />
-              </github>
-            </packageSourceCredentials>
-          </configuration>
-          NUGETEOF
 
       - name: Install vcpkg packages
         run: |
