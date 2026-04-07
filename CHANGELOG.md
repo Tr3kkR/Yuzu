@@ -78,6 +78,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
+## [0.7.1] - 2026-04-07
+
+### Added
+
+#### Server
+- ClickHouse analytics event drain with CLI configuration parameters
+- TAR data warehouse: typed SQLite tables, SQL query engine, rollup aggregation
+- Instruction execute API endpoint for programmatic command dispatch
+- Rich Grafana dashboard templates for fleet analytics and observability
+- Ctrl+K command palette enabled on all dashboard pages
+
+#### Infrastructure
+- Enterprise readiness plan for SOC 2 compliance and first customer preparation
+- Enterprise installers: DEB and RPM packages with systemd integration
+- Pre-release QA pipeline with release workflow artifact validation
+- Docker UAT environment with dep-cached builds and automated tests
+- Windows UAT environment with Prometheus + Grafana observability stack
+- Puppeteer synthetic UAT tests for end-to-end browser validation
+- Pre-populated CI Docker images for faster build times
+- Self-hosted runner infrastructure (Linux, Windows)
+- NuGet binary cache as fallback for vcpkg package caching
+- 3 new governance agents: compliance-officer, SRE, enterprise-readiness
+
+### Fixed
+
+#### Security — CRITICAL
+- **SIGBUS crash in SQLite stores under concurrent HTTP load (#329)** — all 30 stores migrated from `sqlite3_open()` to `sqlite3_open_v2()` with `SQLITE_OPEN_FULLMUTEX`, enabling SQLite's serialized threading mode per-connection. Runtime `sqlite3_threadsafe()` guard added at server and agent startup. WAL mode and `busy_timeout` pragma consistency enforced across all stores.
+
+#### Security — MEDIUM
+- XSS, error information leakage, and missing SQLite pragmas (governance findings)
+- MCP thread-safety race conditions identified and fixed via ThreadSanitizer
+- CEL list index undefined behavior on out-of-bounds access
+
+#### Server
+- Gateway command forwarding: IPv6 port conflict resolution and retry logic
+- ClickHouse analytics drain connection and ingest reliability
+- Enter key form submission fixed on all dashboard pages
+- Patch manager test crash on Windows
+
+#### Build & CI
+- macOS CI upgraded to macos-15 (Xcode 16) with `clock_cast` and CTAD compatibility fixes
+- Clang upgraded 18 → 19 with CoreFoundation linkage and `from_chars` portability fixes
+- ARM64 cross-compile: pkg-config path resolution for vcpkg
+- Windows: migrated to `x64-windows-static-md` vcpkg triplet
+- Windows system libraries migrated to `#pragma comment(lib)` for build reliability
+- LTO disabled for problematic configurations (Linux x64 self-hosted, Clang 19 release)
+- Apple Clang: deduction guide for `ScopeExit`, `execvpe` platform guard, `environ` linkage
+- CI concurrency: per-SHA group to prevent self-cancellation
+
 ## [0.7.0] - 2026-03-30
 
 ### Added
