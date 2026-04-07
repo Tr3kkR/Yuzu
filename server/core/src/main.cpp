@@ -23,6 +23,8 @@
 #else
 #include <unistd.h>
 #endif
+#include <sqlite3.h>
+
 #include <format>
 #include <iostream>
 #include <memory>
@@ -362,6 +364,12 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
+    if (sqlite3_threadsafe() == 0) {
+        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
+        return EXIT_FAILURE;
+    }
 
     // -- Auth config loading / first-run setup --------------------------------
 

@@ -126,6 +126,10 @@ auto resolve_agent_id(std::string_view cli_override, const std::filesystem::path
             "failed to open database {}: {}", db_path.string(), sqlite3_errmsg(db.get()))});
     }
 
+    // Enable WAL mode and busy_timeout for concurrent access safety
+    sqlite3_exec(db.get(), "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+
     // Create table if needed
     const char* create_sql =
         "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)";

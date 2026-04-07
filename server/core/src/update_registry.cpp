@@ -36,6 +36,7 @@ UpdateRegistry::UpdateRegistry(const std::filesystem::path& db_path,
         spdlog::warn("UpdateRegistry: WAL mode failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
     }
+    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
     spdlog::info("UpdateRegistry: opened {}", db_path.string());
