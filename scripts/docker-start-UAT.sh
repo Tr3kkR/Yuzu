@@ -329,11 +329,21 @@ start_all() {
     # ── 2. Native agent (connects to gateway on host-exposed port) ────
     echo ""
     echo "[2/2] Starting yuzu-agent (native, -> gateway :50051)..."
+
+    # When running a Windows .exe from WSL2, paths must be Windows-style.
+    # The .exe cannot resolve /mnt/c/... paths — use wslpath to convert.
+    local agent_data_dir="$UAT_DIR/agent-data"
+    local agent_plugin_dir="$BUILDDIR/agents/plugins"
+    if [[ "$agent_bin" == *.exe ]] && command -v wslpath > /dev/null 2>&1; then
+        agent_data_dir=$(wslpath -w "$agent_data_dir")
+        agent_plugin_dir=$(wslpath -w "$agent_plugin_dir")
+    fi
+
     "$agent_bin" \
         --server localhost:50051 \
         --no-tls \
-        --data-dir "$UAT_DIR/agent-data" \
-        --plugin-dir "$BUILDDIR/agents/plugins" \
+        --data-dir "$agent_data_dir" \
+        --plugin-dir "$agent_plugin_dir" \
         --log-level info \
         --enrollment-token "$enroll_token" \
         > "$UAT_DIR/agent.log" 2>&1 &
