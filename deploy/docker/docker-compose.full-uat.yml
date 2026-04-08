@@ -1,23 +1,24 @@
-# Yuzu Full-Docker UAT — Server + Gateway + Prometheus + Grafana + ClickHouse
+# Yuzu Full-Docker UAT — Server (gateway mode) + Gateway + Prometheus + Grafana + ClickHouse
 #
-# All infrastructure runs in Docker.  Only the agent runs natively.
-# Managed by scripts/docker-start-UAT.sh.
+# Gateway deployment: agents connect to the gateway on :50051.
+# Server runs in gateway mode — no direct agent connections.
+# Only the agent runs natively on the host.
 #
 # Network topology:
-#   Agent (native, host) --> Gateway(:50061) --> Server(:50055)
+#   Agent (native, host) --> Gateway(:50051) --> Server(:50055)
 #   Server --> Gateway(:50063) --> Agent  (command fanout)
 #   Server --> ClickHouse(:8123)          (analytics)
 #   Prometheus --> Server(:8080) + Gateway(:9568)  (metrics)
 #   Grafana --> Prometheus + ClickHouse   (dashboards)
 
 services:
-  # ── Yuzu Server ────────────────────────────────────────────────────────
+  # ── Yuzu Server (gateway mode) ─────────────────────────────────────────
   server:
     image: yuzu-server:latest
     container_name: yuzu-uat-server
     command:
       - "--listen"
-      - "0.0.0.0:50054"
+      - "0.0.0.0:50051"
       - "--no-tls"
       - "--no-https"
       - "--gateway-upstream"
@@ -48,9 +49,8 @@ services:
       - "50"
     ports:
       - "8080:8080"     # Web dashboard + REST API
-      - "50054:50054"   # gRPC (direct agent connections)
       - "50052:50052"   # gRPC (management)
-      - "50055:50055"   # gRPC (gateway upstream)
+      - "50055:50055"   # gRPC (gateway upstream — internal)
     volumes:
       - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
       - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
@@ -66,7 +66,7 @@ services:
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
     ports:
-      - "50061:50061"   # gRPC (agent-facing — exposed for native agent)
+      - "50051:50051"   # gRPC (agent-facing — agents connect here)
       - "50063:50063"   # gRPC (management/command forwarding)
       - "9568:9568"     # Prometheus metrics
       - "8081:8081"     # Health/readiness
@@ -127,7 +127,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  server-uat-data:
   prometheus-uat-data:
   grafana-uat-data:
   clickhouse-uat-data:

@@ -157,7 +157,7 @@ Server and gateway defaults do not conflict — all three components can run on 
 | 50051 | Server | Agent gRPC (direct connections) |
 | 50052 | Server | Management gRPC |
 | 50055 | Server | Gateway upstream (registration, heartbeats) |
-| 50061 | Gateway | Agent-facing gRPC (agents connect here) |
+| 50051 | Gateway | Agent-facing gRPC (agents connect here) |
 | 50063 | Gateway | Management/command forwarding (server sends commands here) |
 | 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
 | 9568 | Gateway | Prometheus metrics |

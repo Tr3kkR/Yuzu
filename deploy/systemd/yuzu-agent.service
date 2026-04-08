@@ -9,7 +9,7 @@ Type=simple
 User=yuzu-agent
 Group=yuzu-agent
 ExecStart=/usr/local/bin/yuzu-agent \
-    --server %H:50054 \
+    --server %H:50051 \
     --plugin-dir /usr/lib/yuzu/plugins \
     --data-dir /var/lib/yuzu-agent
 Restart=always

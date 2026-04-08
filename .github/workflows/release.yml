@@ -167,7 +167,7 @@ jobs:
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@v1
         with:
-          otp-version: '27'
+          otp-version: '28'
           rebar3-version: '3.24'
 
       - name: Cache rebar3 dependencies

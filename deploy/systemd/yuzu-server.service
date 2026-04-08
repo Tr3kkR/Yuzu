@@ -9,7 +9,7 @@ Type=simple
 User=yuzu
 Group=yuzu
 ExecStart=/usr/local/bin/yuzu-server \
-    --listen 0.0.0.0:50054 \
+    --listen 0.0.0.0:50051 \
     --gateway-upstream 0.0.0.0:50055 \
     --web-port 8080
 Restart=on-failure

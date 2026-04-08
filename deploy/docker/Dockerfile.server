@@ -63,7 +63,7 @@ COPY --from=builder /src/content/definitions/ /usr/share/yuzu/definitions/
 USER yuzu
 WORKDIR /var/lib/yuzu
 
-EXPOSE 8080 50054 50052 50055
+EXPOSE 8080 50051 50052 50055
 
 ENTRYPOINT ["yuzu-server"]
-CMD ["--listen", "0.0.0.0:50054", "--gateway-upstream", "0.0.0.0:50055", "--web-port", "8080"]
+CMD ["--listen", "0.0.0.0:50051", "--no-tls", "--no-https", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg"]

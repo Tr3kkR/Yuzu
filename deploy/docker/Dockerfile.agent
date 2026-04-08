@@ -1,6 +1,6 @@
 # Yuzu Agent — Multi-stage Docker build
 # Build:  docker build -t yuzu-agent -f deploy/docker/Dockerfile.agent .
-# Run:    docker run --network host yuzu-agent --server localhost:50054 --no-tls
+# Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c AS builder
@@ -49,4 +49,4 @@ USER yuzu-agent
 WORKDIR /var/lib/yuzu-agent
 
 ENTRYPOINT ["yuzu-agent"]
-CMD ["--server", "yuzu-server:50054", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]
+CMD ["--server", "yuzu-server:50051", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]

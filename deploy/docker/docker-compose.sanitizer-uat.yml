@@ -13,7 +13,7 @@ services:
     container_name: yuzu-san-server
     command:
       - "--listen"
-      - "0.0.0.0:50054"
+      - "0.0.0.0:50051"
       - "--no-tls"
       - "--no-https"
       - "--gateway-upstream"
@@ -32,7 +32,7 @@ services:
       - "/var/lib/yuzu/yuzu-server.cfg"
     ports:
       - "8080:8080"
-      - "50054:50054"
+      - "50051:50051"
       - "50055:50055"
     volumes:
       - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
@@ -46,7 +46,7 @@ services:
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
     ports:
-      - "50061:50061"
+      - "50051:50051"
       - "50063:50063"
       - "9568:9568"
       - "8081:8081"
@@ -61,7 +61,7 @@ services:
     container_name: yuzu-san-agent
     command:
       - "--server"
-      - "gateway:50061"
+      - "gateway:50051"
       - "--no-tls"
       - "--agent-id"
       - "san-test-agent"

@@ -37,5 +37,5 @@ RUN chmod +x /usr/local/bin/yuzu-server
 USER yuzu
 ENV TSAN_OPTIONS="halt_on_error=0:second_deadlock_stack=1:log_path=/var/log/yuzu/tsan"
 
-EXPOSE 8080 50054 50052 50055
+EXPOSE 8080 50051 50052 50055
 ENTRYPOINT ["yuzu-server"]

@@ -1,5 +1,8 @@
 # Yuzu Development Stack — Docker Compose
 #
+# Standalone server + agent — works out of the box, no gateway needed.
+# For gateway deployments, see docker-compose.full-uat.yml.
+#
 # Usage:
 #   cd deploy/docker
 #   docker compose up -d          # start all
@@ -18,23 +21,10 @@ services:
       dockerfile: deploy/docker/Dockerfile.server
     ports:
       - "8080:8080"     # Web dashboard + REST API
-      - "50054:50054"   # gRPC (direct agent connections)
+      - "50051:50051"   # gRPC (agent connections)
       - "50052:50052"   # gRPC (management)
-      - "50055:50055"   # gRPC (gateway upstream)
     volumes:
       - server-data:/var/lib/yuzu
-    restart: unless-stopped
-
-  # ── Erlang Gateway ──────────────────────────────────────────────────
-  gateway:
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile.gateway
-    ports:
-      - "50061:50061"   # gRPC (agent-facing)
-      - "9568:9568"     # Prometheus metrics
-    depends_on:
-      - server
     restart: unless-stopped
 
   # ── Yuzu Agent ──────────────────────────────────────────────────────
@@ -42,7 +32,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.agent
-    command: ["--server", "server:50054", "--no-tls", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]
+    command: ["--server", "server:50051", "--no-tls", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]
     volumes:
       - agent-data:/var/lib/yuzu-agent
     depends_on:

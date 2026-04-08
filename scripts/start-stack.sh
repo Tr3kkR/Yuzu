@@ -2,7 +2,7 @@
 # start-stack.sh — Start the full Yuzu development stack
 #
 # Components:
-#   1. yuzu-server  (gRPC :50054, web :8080)
+#   1. yuzu-server  (gRPC :50051, web :8080)
 #   2. Erlang gateway (agent gRPC :50051, metrics :9568)
 #   3. yuzu-agent   (connects to gateway :50051)
 #   4. Prometheus   (scraper :9090)
@@ -34,7 +34,7 @@ status() {
     done
     echo ""
     echo "=== Ports ==="
-    netstat -an 2>/dev/null | grep -E "LISTENING" | grep -E ":(50051|50054|8080|9090|9568|3000) " || true
+    netstat -an 2>/dev/null | grep -E "LISTENING" | grep -E ":(50051|8080|9090|9568|3000) " || true
 }
 
 stop_all() {
@@ -70,11 +70,11 @@ start_all() {
     taskkill //F //IM yuzu-server.exe 2>/dev/null || true
     sleep 1
 
-    # 1. Yuzu Server (gRPC on :50054 for gateway upstream, web on :8080)
-    echo "[1/5] Starting yuzu-server (gRPC :50054, web :8080)..."
+    # 1. Yuzu Server (gRPC on :50051 for gateway upstream, web on :8080)
+    echo "[1/5] Starting yuzu-server (gRPC :50051, web :8080)..."
     "$BUILDDIR/server/core/yuzu-server.exe" \
         --no-tls \
-        --listen 0.0.0.0:50054 \
+        --listen 0.0.0.0:50051 \
         --gateway-upstream 0.0.0.0:50055 \
         --web-port 8080 \
         2>&1 &
@@ -87,7 +87,7 @@ start_all() {
     fi
     echo "  ✓ Server up — dashboard at http://127.0.0.1:8080"
 
-    # 2. Erlang Gateway (agent-facing :50051, upstream to server :50054, metrics :9568)
+    # 2. Erlang Gateway (agent-facing :50051, upstream to server :50051, metrics :9568)
     echo "[2/5] Starting Erlang gateway (agent gRPC :50051, metrics :9568)..."
     cd "$GATEWAY_DIR"
     erl -pa _build/default/lib/*/ebin \
@@ -104,12 +104,12 @@ start_all() {
         echo "  ⚠ Gateway may not be listening yet (check logs)"
     fi
 
-    # 3. Yuzu Agent (connects directly to server on :50054)
+    # 3. Yuzu Agent (connects directly to server on :50051)
     #    NOTE: Gateway proxy registration is not yet wired — agents register
     #    directly with the server. Once registered, heartbeats can go via gateway.
-    echo "[3/5] Starting yuzu-agent (connecting to server :50054)..."
+    echo "[3/5] Starting yuzu-agent (connecting to server :50051)..."
     "$BUILDDIR/agents/core/yuzu-agent.exe" \
-        --server localhost:50054 \
+        --server localhost:50051 \
         --no-tls \
         --data-dir "$AGENT_DATA_DIR" \
         --plugin-dir "$BUILDDIR/agents/plugins" \
@@ -160,7 +160,7 @@ start_all() {
     echo "  Dashboard:  http://127.0.0.1:8080"
     echo "  Grafana:    http://localhost:3000"
     echo "  Prometheus: http://localhost:9090"
-    echo "  Gateway:    :50051 (agents) → :50054 (server upstream)"
+    echo "  Gateway:    :50051 (agents) → :50051 (server upstream)"
     echo "  Metrics:    :9568 (gateway), :8080/metrics (server)"
     echo ""
     echo "  Stop all:   bash scripts/start-stack.sh stop"

@@ -118,7 +118,18 @@ When the server starts for the first time and no `yuzu-server.cfg` exists, it en
 
 After setup completes, the server writes `yuzu-server.cfg` and starts normally. Subsequent restarts skip the setup prompt.
 
-> **Headless deployment:** For automated deployments, pre-create `yuzu-server.cfg` with a PBKDF2-hashed password entry before starting the server for the first time.
+> **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time. A sample config with default credentials is provided below for quick evaluation.
+
+### Default Credentials (Evaluation Only)
+
+For Docker, automated, and quick-start deployments, the following `yuzu-server.cfg` ships with pre-hashed credentials so the server starts without interactive setup:
+
+| Username | Password | Role |
+|---|---|---|
+| `admin` | `administrator` | Admin (full access) |
+| `user` | `useroperator` | User (read-only) |
+
+> **WARNING: Change these credentials immediately after first login.** These defaults are published in documentation and are not suitable for production. Use the Settings page (User Management) to change passwords and create new accounts. For enterprise deployments, integrate OIDC SSO and disable local accounts.
 
 ---
 
@@ -520,16 +531,16 @@ Yuzu provides multiple deployment options: Docker Compose for quick setup, syste
 
 ### Docker Compose
 
-The Docker deployment includes Yuzu server, Erlang gateway, agent, Prometheus, and Grafana.
+The default Docker deployment runs the server and agent standalone -- no gateway required. For scaled deployments with a gateway, see `docker-compose.full-uat.yml`.
 
 **Files:**
 
 | File | Description |
 |---|---|
 | `deploy/docker/Dockerfile.server` | Multi-stage build for the Yuzu server binary |
-| `deploy/docker/Dockerfile.agent` | Multi-stage build for the Yuzu agent binary |
 | `deploy/docker/Dockerfile.gateway` | Erlang/OTP build for the gateway node |
-| `deploy/docker/docker-compose.yml` | Full stack composition |
+| `deploy/docker/docker-compose.yml` | Standalone stack (server + agent + monitoring) |
+| `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
 
 **Usage:**
 
@@ -542,16 +553,17 @@ docker compose down           # stop all services
 
 **Exposed ports:**
 
-| Port | Service |
-|---|---|
-| 8080 | Web dashboard + REST API |
-| 50054 | gRPC (direct agent connections) |
-| 50052 | gRPC (management) |
-| 50055 | gRPC (gateway upstream) |
-| 50051 | gRPC (gateway agent-facing) |
-| 9568 | Gateway Prometheus metrics |
-| 9090 | Prometheus |
-| 3000 | Grafana (default login: admin/admin) |
+| Port | Service | Deployment |
+|---|---|---|
+| 8080 | Web dashboard + REST API | Always |
+| 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
+| 50052 | gRPC (management) | Always |
+| 50055 | gRPC (gateway upstream) | Gateway deployments only |
+| 50063 | gRPC (gateway command forwarding) | Gateway deployments only |
+| 8081 | Gateway health/readiness | Gateway deployments only |
+| 9568 | Gateway Prometheus metrics | Gateway deployments only |
+| 9090 | Prometheus | Monitoring stack |
+| 3000 | Grafana (default login: admin/admin) | Monitoring stack |
 
 **Volumes:** `server-data`, `agent-data`, `prometheus-data`, and `grafana-data` are persisted across container restarts.
 
@@ -592,7 +604,7 @@ The `scripts/start-stack.sh` script starts the full development stack locally (w
 
 **Components started:**
 
-1. `yuzu-server` -- gRPC on :50054, web on :8080
+1. `yuzu-server` -- gRPC on :50051, web on :8080
 2. Erlang gateway -- agent gRPC on :50051, metrics on :9568
 3. `yuzu-agent` -- connects to gateway on :50051
 4. Prometheus -- scraper on :9090
@@ -619,7 +631,7 @@ REM Create the Yuzu server service
 sc.exe create YuzuServer binPath= "C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key" start= auto DisplayName= "Yuzu Server"
 
 REM Create the Yuzu agent service
-sc.exe create YuzuAgent binPath= "C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50054" start= auto DisplayName= "Yuzu Agent"
+sc.exe create YuzuAgent binPath= "C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50051" start= auto DisplayName= "Yuzu Agent"
 
 REM Set startup type to automatic (delayed start, recommended)
 sc.exe config YuzuServer start= delayed-auto
@@ -651,7 +663,7 @@ nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
 
 REM Set arguments
 nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
-nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50054"
+nssm set YuzuAgent AppParameters "--server-address yuzu.example.com:50051"
 
 REM Configure startup and recovery
 nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START

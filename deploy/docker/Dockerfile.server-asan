@@ -40,5 +40,5 @@ USER yuzu
 ENV ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:log_path=/var/log/yuzu/asan"
 ENV UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:log_path=/var/log/yuzu/ubsan"
 
-EXPOSE 8080 50054 50052 50055
+EXPOSE 8080 50051 50052 50055
 ENTRYPOINT ["yuzu-server"]

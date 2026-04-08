@@ -139,7 +139,7 @@ jobs:
               image: $REGISTRY/yuzu-server:$VERSION
               command:
                 - "--listen"
-                - "0.0.0.0:50054"
+                - "0.0.0.0:50051"
                 - "--no-tls"
                 - "--no-https"
                 - "--gateway-upstream"
@@ -170,7 +170,7 @@ jobs:
               environment:
                 - YUZU_GW_UPSTREAM_ADDR=server
               ports:
-                - "50061:50061"
+                - "50051:50051"
                 - "50063:50063"
                 - "8081:8081"
                 - "9568:9568"
@@ -182,7 +182,7 @@ jobs:
               image: $REGISTRY/yuzu-agent:$VERSION
               command:
                 - "--server"
-                - "gateway:50061"
+                - "gateway:50051"
                 - "--no-tls"
                 - "--log-level"
                 - "info"
@@ -645,7 +645,7 @@ jobs:
           services:
             server:
               image: $REGISTRY/yuzu-server:$VERSION
-              command: ["--listen","0.0.0.0:50054","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
+              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
               healthcheck:
@@ -656,13 +656,13 @@ jobs:
             gateway:
               image: $REGISTRY/yuzu-gateway:$VERSION
               environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50061:50061","50063:50063","8081:8081","9568:9568"]
+              ports: ["50051:50051","50063:50063","8081:8081","9568:9568"]
               depends_on:
                 server:
                   condition: service_healthy
             agent:
               image: $REGISTRY/yuzu-agent:$VERSION
-              command: ["--server","gateway:50061","--no-tls"]
+              command: ["--server","gateway:50051","--no-tls"]
               depends_on: [gateway]
           COMPOSE
 
@@ -800,7 +800,7 @@ jobs:
           services:
             server:
               image: $REGISTRY/yuzu-server:\${YUZU_VER}
-              command: ["--listen","0.0.0.0:50054","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
+              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
               ports: ["8080:8080","50055:50055"]
               volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
               healthcheck:
@@ -811,13 +811,13 @@ jobs:
             gateway:
               image: $REGISTRY/yuzu-gateway:\${YUZU_VER}
               environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
-              ports: ["50061:50061","50063:50063","8081:8081"]
+              ports: ["50051:50051","50063:50063","8081:8081"]
               depends_on:
                 server:
                   condition: service_healthy
             agent:
               image: $REGISTRY/yuzu-agent:\${YUZU_VER}
-              command: ["--server","gateway:50061","--no-tls"]
+              command: ["--server","gateway:50051","--no-tls"]
               depends_on: [gateway]
           COMPOSE
 
