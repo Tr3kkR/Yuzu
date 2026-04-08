@@ -77,7 +77,9 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     }
 
     sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open(db_path.string().c_str(), &raw_db);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &raw_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
         if (raw_db)

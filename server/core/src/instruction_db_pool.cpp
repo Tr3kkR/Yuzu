@@ -5,7 +5,9 @@
 namespace yuzu::server {
 
 InstructionDbPool::InstructionDbPool(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("InstructionDbPool: failed to open {}: {}", db_path.string(),
                       db_ ? sqlite3_errmsg(db_) : "unknown error");

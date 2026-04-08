@@ -15,7 +15,9 @@ ResponseStore::ResponseStore(const std::filesystem::path& db_path, int retention
                              int cleanup_interval_min)
     : db_path_(db_path), retention_days_(retention_days),
       cleanup_interval_min_(cleanup_interval_min) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("ResponseStore: failed to open {}: {}", db_path.string(),
                       sqlite3_errmsg(db_));

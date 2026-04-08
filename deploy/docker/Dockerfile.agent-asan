@@ -1,0 +1,40 @@
+# Yuzu Agent — ASan+UBSan instrumented build for long-running service testing
+#
+# Build:
+#   docker build -t yuzu-agent-asan -f deploy/docker/Dockerfile.agent-asan .
+
+FROM yuzu-ci AS builder
+
+COPY . /build/src
+WORKDIR /build/src
+RUN rm -rf builddir vcpkg_installed node_modules .uat gateway/_build gateway/.deps_cache \
+    && cp -r /opt/vcpkg_installed ./vcpkg_installed
+
+RUN CC="gcc-13" CXX="g++-13" \
+    PKG_CONFIG_PATH=/build/src/vcpkg_installed/x64-linux/lib/pkgconfig \
+    meson setup builddir \
+      --native-file meson/native/linux-gcc13.ini \
+      --buildtype=debug \
+      -Dcmake_prefix_path=/build/src/vcpkg_installed/x64-linux \
+      -Dbuild_tests=false \
+      -Db_sanitize=address,undefined \
+    && meson compile -C builddir
+
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgcc-13-dev libstdc++6 libssl3t64 ca-certificates \
+        libasan8 libubsan1 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -s /sbin/nologin yuzu
+
+COPY --from=builder /build/src/builddir/agents/core/yuzu-agent /usr/local/bin/
+COPY --from=builder /build/src/builddir/agents/core/libyuzu_agent_core.so /usr/local/lib/
+COPY --from=builder /build/src/builddir/agents/plugins/ /usr/local/lib/yuzu/plugins/
+RUN chmod +x /usr/local/bin/yuzu-agent && ldconfig
+
+USER yuzu
+ENV ASAN_OPTIONS="detect_leaks=1:halt_on_error=0:log_path=/var/log/yuzu/asan"
+ENV UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:log_path=/var/log/yuzu/ubsan"
+
+ENTRYPOINT ["yuzu-agent"]

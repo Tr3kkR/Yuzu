@@ -46,7 +46,9 @@ DeviceTokenStore::DeviceTokenStore(const std::filesystem::path& db_path) {
                 canonical_path = canon_parent / db_path.filename();
         }
     }
-    int rc = sqlite3_open(canonical_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(canonical_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("DeviceTokenStore: failed to open {}: {}", canonical_path.string(),
                       sqlite3_errmsg(db_));

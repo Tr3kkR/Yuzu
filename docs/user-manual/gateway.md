@@ -226,7 +226,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
     %% Upstream C++ server (GatewayUpstream service)
     {upstream_addr, "127.0.0.1"},
-    {upstream_port, 50054},
+    {upstream_port, 50051},
 
     %% Upstream connection pool size
     {upstream_pool_size, 16},
@@ -269,7 +269,7 @@ the address and port for the GatewayUpstream service. This port must match
 `upstream_port` in `sys.config`:
 
 ```bash
-yuzu-server --gateway-upstream "0.0.0.0:50054"
+yuzu-server --gateway-upstream "0.0.0.0:50051"
 ```
 
 ---

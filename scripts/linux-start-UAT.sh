@@ -2,14 +2,14 @@
 # linux-start-UAT.sh — Start a full Yuzu UAT environment on Linux
 #
 # Topology (all traffic flows through the gateway):
-#   Agent ──→ Gateway(:50061) ──→ Server(:50055 upstream)
+#   Agent ──→ Gateway(:50051) ──→ Server(:50055 upstream)
 #                                   │
 #   Server ──→ Gateway(:50063) ──→ Agent   (command fanout)
 #
 # Ports:
 #   Server:   :50051 agent gRPC    :50055 gateway upstream
 #             :50052 mgmt gRPC     :8080  web dashboard
-#   Gateway:  :50061 agent-facing  :50063 mgmt (command forwarding)
+#   Gateway:  :50051 agent-facing  :50063 mgmt (command forwarding)
 #             :9568  metrics       :8081  health
 #
 # Usage:
@@ -85,7 +85,7 @@ show_status() {
     done
     echo ""
     echo "=== Listening Ports ==="
-    ss -tlnp 2>/dev/null | grep -E ":(50051|50052|50055|50061|50063|8080|8081|9568) " || echo "  (none)"
+    ss -tlnp 2>/dev/null | grep -E ":(50051|50052|50055|50063|8080|8081|9568) " || echo "  (none)"
 }
 
 # ── Wait for port ───────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ start_all() {
         > "$UAT_DIR/gateway.log" 2>&1) &
     local gw_pid=$!
 
-    if ! wait_for_port 50061 "gateway (agent-facing)" 15; then
+    if ! wait_for_port 50051 "gateway (agent-facing)" 15; then
         fail "Gateway failed to start. Check $UAT_DIR/gateway.log"
         exit 1
     fi
@@ -205,7 +205,7 @@ start_all() {
         warn "Command forwarding through gateway will not work"
     fi
     ok "Gateway up (PID $gw_pid)"
-    info "Agent-facing :50061  |  Command mgmt :50063  |  Metrics :9568  |  Health :8081"
+    info "Agent-facing :50051  |  Command mgmt :50063  |  Metrics :9568  |  Health :8081"
 
     # ── Login & create enrollment token ─────────────────────────────────
     info "Creating enrollment token..."
@@ -228,9 +228,9 @@ start_all() {
 
     # ── 3. Agent (via gateway) ──────────────────────────────────────────
     echo ""
-    echo "[3/3] Starting yuzu-agent (→ gateway :50061)..."
+    echo "[3/3] Starting yuzu-agent (→ gateway :50051)..."
     "$BUILDDIR/agents/core/yuzu-agent" \
-        --server localhost:50061 \
+        --server localhost:50051 \
         --no-tls \
         --data-dir "$UAT_DIR/agent-data" \
         --plugin-dir "$BUILDDIR/agents/plugins" \
@@ -389,7 +389,7 @@ for r in d.get('responses',[]):
     echo "║  GW Health:  http://localhost:8081/readyz        ║"
     echo "║  GW Metrics: http://localhost:9568/metrics       ║"
     echo "╠══════════════════════════════════════════════════╣"
-    echo "║  Agent → GW(:50061) → Server(:50055)  [data]    ║"
+    echo "║  Agent → GW(:50051) → Server(:50055)  [data]    ║"
     echo "║  Server → GW(:50063) → Agent          [commands]║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Logs:  $UAT_DIR/{server,gateway,agent}.log     ║"

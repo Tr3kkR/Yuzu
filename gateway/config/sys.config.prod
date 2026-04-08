@@ -18,7 +18,7 @@
     {yuzu_gw, [
         %% Agent-facing gRPC listen address (agents connect here)
         {agent_listen_addr, "0.0.0.0"},
-        {agent_listen_port, 50061},
+        {agent_listen_port, 50051},
 
         %% Operator-facing gRPC listen address (dashboard/CLI connects here)
         {mgmt_listen_addr, "0.0.0.0"},
@@ -78,7 +78,7 @@
     {grpcbox, [
         {client, #{channels => [
             %% Upstream channel with TLS (gateway -> C++ server)
-            {default_channel, [{https, "127.0.0.1", 50054, [
+            {default_channel, [{https, "127.0.0.1", 50055, [
                 {cacertfile, "/etc/yuzu/ca.crt"},
                 {certfile, "/etc/yuzu/gateway.crt"},
                 {keyfile,  "/etc/yuzu/gateway.key"},
@@ -92,7 +92,7 @@
                 service_protos => [agent_pb],
                 services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
             },
-            listen_opts => #{port => 50061, ip => {0,0,0,0}},
+            listen_opts => #{port => 50051, ip => {0,0,0,0}},
             transport_opts => #{
                 certfile => "/etc/yuzu/gateway.crt",
                 keyfile  => "/etc/yuzu/gateway.key",

@@ -117,12 +117,18 @@ auto resolve_agent_id(std::string_view cli_override, const std::filesystem::path
     }
 
     sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open(db_path.string().c_str(), &raw_db);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &raw_db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     SqliteDb db(raw_db);
     if (rc != SQLITE_OK) {
         return std::unexpected(IdentityError{std::format(
             "failed to open database {}: {}", db_path.string(), sqlite3_errmsg(db.get()))});
     }
+
+    // Enable WAL mode and busy_timeout for concurrent access safety
+    sqlite3_exec(db.get(), "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     // Create table if needed
     const char* create_sql =

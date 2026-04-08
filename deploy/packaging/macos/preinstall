@@ -1,0 +1,15 @@
+#!/bin/bash
+# Yuzu Agent macOS pre-install script
+# Stops the existing agent if upgrading.
+
+set -e
+
+PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
+
+if [ -f "${PLIST}" ] && launchctl list com.yuzu.agent &>/dev/null; then
+    echo "Stopping existing Yuzu Agent..."
+    launchctl unload "${PLIST}" 2>/dev/null || true
+    sleep 2
+fi
+
+exit 0

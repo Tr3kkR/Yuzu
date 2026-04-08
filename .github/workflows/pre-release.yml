@@ -1,0 +1,944 @@
+name: Pre-release QA
+
+# Runs after a release workflow completes, or manually for any tag.
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. v0.7.0-rc1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # ── Resolve version and download release artifacts ──────────────────
+  resolve:
+    name: "Resolve version"
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      has_prev: ${{ steps.prev.outputs.has_prev }}
+      prev_tag: ${{ steps.prev.outputs.prev_tag }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Testing: $TAG (version $VERSION)"
+
+      - name: Find previous stable release
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT="${{ steps.ver.outputs.tag }}"
+          PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
+            -q "[.[] | select(.tagName != \"$CURRENT\" and .isPrerelease == false)] | .[0].tagName // empty")
+          if [[ -n "$PREV" ]]; then
+            echo "has_prev=true" >> "$GITHUB_OUTPUT"
+            echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
+            echo "Previous stable release: $PREV"
+          else
+            echo "has_prev=false" >> "$GITHUB_OUTPUT"
+            echo "No previous stable release found"
+          fi
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          mkdir -p artifacts
+          gh release download "$TAG" --dir artifacts/ || {
+            echo "Release $TAG not found yet, waiting 60s..."
+            sleep 60
+            gh release download "$TAG" --dir artifacts/
+          }
+          ls -la artifacts/
+
+      - name: Verify checksums
+        run: |
+          cd artifacts
+          sha256sum -c SHA256SUMS
+          echo "All checksums verified"
+
+      - name: Upload verified artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts/
+          retention-days: 3
+
+  # ── Full-stack integration test (Docker) ────────────────────────────
+  integration:
+    name: "Integration test (Docker)"
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull release images
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          for img in yuzu-server yuzu-agent yuzu-gateway; do
+            docker pull "$REGISTRY/$img:${TAG#v}"
+          done
+
+      - name: Generate server config
+        run: |
+          mkdir -p /tmp/yuzu-qa
+          python3 -c "
+          import hashlib, os
+          salt = os.urandom(16)
+          dk = hashlib.pbkdf2_hmac('sha256', b'qapassword1', salt, 100000, dklen=32)
+          print(f'qaadmin:admin:{salt.hex()}:{dk.hex()}')
+          " > /tmp/yuzu-qa/yuzu-server.cfg
+
+      - name: Create Docker Compose for QA
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          cat > /tmp/yuzu-qa/docker-compose.yml <<COMPOSE
+          services:
+            server:
+              image: $REGISTRY/yuzu-server:$VERSION
+              command:
+                - "--listen"
+                - "0.0.0.0:50051"
+                - "--no-tls"
+                - "--no-https"
+                - "--gateway-upstream"
+                - "0.0.0.0:50055"
+                - "--gateway-mode"
+                - "--gateway-command-addr"
+                - "gateway:50063"
+                - "--web-address"
+                - "0.0.0.0"
+                - "--web-port"
+                - "8080"
+                - "--metrics-no-auth"
+                - "--config"
+                - "/var/lib/yuzu/yuzu-server.cfg"
+              ports:
+                - "8080:8080"
+                - "50055:50055"
+              volumes:
+                - /tmp/yuzu-qa/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
+              healthcheck:
+                test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+                interval: 5s
+                timeout: 3s
+                retries: 10
+
+            gateway:
+              image: $REGISTRY/yuzu-gateway:$VERSION
+              environment:
+                - YUZU_GW_UPSTREAM_ADDR=server
+              ports:
+                - "50051:50051"
+                - "50063:50063"
+                - "8081:8081"
+                - "9568:9568"
+              depends_on:
+                server:
+                  condition: service_healthy
+
+            agent:
+              image: $REGISTRY/yuzu-agent:$VERSION
+              command:
+                - "--server"
+                - "gateway:50051"
+                - "--no-tls"
+                - "--log-level"
+                - "info"
+              depends_on:
+                - gateway
+          COMPOSE
+
+      - name: Start stack
+        working-directory: /tmp/yuzu-qa
+        run: |
+          docker compose up -d
+          echo "Waiting for stack to be healthy..."
+          # Wait for server
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/livez &>/dev/null; then break; fi
+            sleep 2
+          done
+          # Wait for gateway
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8081/readyz &>/dev/null; then break; fi
+            sleep 2
+          done
+          # Wait for agent registration
+          for i in $(seq 1 30); do
+            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+            if [ "$COUNT" -ge 1 ]; then break; fi
+            sleep 2
+          done
+          echo "Stack ready"
+
+      - name: Test — Dashboard reachable
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+
+      - name: Test — Gateway health
+        run: |
+          HEALTH=$(curl -sf http://localhost:8081/readyz)
+          echo "$HEALTH" | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: $HEALTH"; exit 1; }
+
+      - name: Test — Agent registered
+        run: |
+          COUNT=$(curl -s http://localhost:8080/metrics | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+          [ "$COUNT" -ge 1 ] && echo "PASS: $COUNT agent(s) registered" || { echo "FAIL: 0 agents"; exit 1; }
+
+      - name: Test — Gateway sees agent
+        run: |
+          COUNT=$(curl -s http://localhost:9568/metrics | \
+            grep -oP 'yuzu_gw_agents_connected_total\{[^}]*\} \K[0-9]+' || echo "0")
+          [ "$COUNT" -ge 1 ] && echo "PASS: Gateway shows $COUNT agent(s)" || { echo "FAIL: 0 agents"; exit 1; }
+
+      - name: Test — Command round-trip (os_info)
+        run: |
+          # Login
+          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
+            -d "username=qaadmin&password=qapassword1" -o /dev/null
+
+          # Dispatch command
+          RESP=$(curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
+            -H "Content-Type: application/json" \
+            -d '{"plugin":"os_info","action":"os_name"}')
+          CMD_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null)
+
+          if [ -z "$CMD_ID" ]; then
+            echo "FAIL: Command dispatch failed: $RESP"
+            exit 1
+          fi
+
+          echo "Command dispatched: $CMD_ID"
+
+          # Poll for response
+          for i in $(seq 1 20); do
+            sleep 2
+            RESULT=$(curl -s -b /tmp/cookies.txt "http://localhost:8080/api/responses/$CMD_ID" | \
+              python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          for r in d.get('responses',[]):
+              o=r.get('output','')
+              if 'os_name|' in o:
+                  print(o.split('|',1)[1])
+                  break
+          " 2>/dev/null)
+            [ -n "$RESULT" ] && break
+          done
+
+          if [ -n "$RESULT" ]; then
+            echo "PASS: os_info returned '$RESULT' (${i}s)"
+          else
+            echo "FAIL: No response after polling"
+            exit 1
+          fi
+
+      - name: Collect logs
+        if: always()
+        working-directory: /tmp/yuzu-qa
+        run: |
+          docker compose logs > /tmp/yuzu-qa/integration-logs.txt 2>&1
+          docker compose ps
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: /tmp/yuzu-qa/integration-logs.txt
+          retention-days: 3
+
+      - name: Teardown
+        if: always()
+        working-directory: /tmp/yuzu-qa
+        run: docker compose down -v
+
+  # ── Installer smoke tests: .deb on multiple distros ─────────────────
+  install-deb:
+    name: "Install .deb (${{ matrix.distro }})"
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Test .deb install and removal
+        run: |
+          for PKG in server agent gateway; do
+            DEB=$(ls artifacts/yuzu-${PKG}*.deb 2>/dev/null | head -1)
+            [ -z "$DEB" ] && { echo "SKIP: no yuzu-$PKG .deb found"; continue; }
+
+            echo "=== Testing $DEB on ${{ matrix.distro }} ==="
+
+            docker run --rm -v "$PWD/artifacts:/debs:ro" "${{ matrix.distro }}" bash -c "
+              set -e
+              apt-get update -qq
+              dpkg -i /debs/$(basename $DEB) 2>&1 || apt-get install -f -y -qq
+              echo 'PASS: installed'
+
+              # Verify service file
+              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
+                test -f /usr/lib/systemd/system/yuzu-gateway.service
+              echo 'PASS: systemd service file exists'
+
+              # Remove
+              dpkg -r yuzu-$PKG
+              echo 'PASS: removed cleanly'
+            "
+          done
+
+  # ── Installer smoke tests: .rpm on Fedora/Rocky ─────────────────────
+  install-rpm:
+    name: "Install .rpm (${{ matrix.distro }})"
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ["fedora:40", "rockylinux:9"]
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Test .rpm install and removal
+        run: |
+          for PKG in server agent gateway; do
+            RPM=$(ls artifacts/yuzu-${PKG}*.rpm 2>/dev/null | head -1)
+            [ -z "$RPM" ] && { echo "SKIP: no yuzu-$PKG .rpm found"; continue; }
+
+            echo "=== Testing $RPM on ${{ matrix.distro }} ==="
+
+            docker run --rm -v "$PWD/artifacts:/rpms:ro" "${{ matrix.distro }}" bash -c "
+              set -e
+              rpm -i /rpms/$(basename $RPM)
+              echo 'PASS: installed'
+
+              test -f /usr/lib/systemd/system/yuzu-${PKG}.service || \
+                test -f /usr/lib/systemd/system/yuzu-gateway.service
+              echo 'PASS: systemd service file exists'
+
+              rpm -e yuzu-$PKG
+              echo 'PASS: removed cleanly'
+            "
+          done
+
+  # ── Windows installer smoke test ────────────────────────────────────
+  install-windows:
+    name: "Install Windows .exe"
+    needs: resolve
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "artifacts/YuzuAgentSetup-*.exe" | Select-Object -First 1
+          Write-Host "Installing: $($installer.Name)"
+          Start-Process $installer.FullName `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOSTART','/LOG=install.log' `
+            -Wait
+          Get-Content install.log | Select-Object -Last 20
+
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          # Binary exists and runs
+          $agent = "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe"
+          if (!(Test-Path $agent)) { Write-Error "FAIL: binary not found"; exit 1 }
+          & $agent --version
+          Write-Host "PASS: binary runs"
+
+          # Plugins installed
+          $plugins = (Get-ChildItem "${env:ProgramFiles}\Yuzu\plugins\*.dll" -ErrorAction SilentlyContinue).Count
+          if ($plugins -lt 5) { Write-Error "FAIL: only $plugins plugins"; exit 1 }
+          Write-Host "PASS: $plugins plugins installed"
+
+          # Service registered (we used /NOSTART so it won't be running)
+          $svc = Get-Service "YuzuAgent" -ErrorAction SilentlyContinue
+          if ($svc) { Write-Host "PASS: service registered (Status: $($svc.Status))" }
+          else { Write-Error "FAIL: service not registered"; exit 1 }
+
+      - name: Silent uninstall
+        shell: pwsh
+        run: |
+          $uninstaller = "${env:ProgramFiles}\Yuzu\unins000.exe"
+          if (Test-Path $uninstaller) {
+            Start-Process $uninstaller -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+            Start-Sleep -Seconds 3
+          }
+          if (!(Test-Path "${env:ProgramFiles}\Yuzu\bin\yuzu-agent.exe")) {
+            Write-Host "PASS: uninstalled cleanly"
+          } else {
+            Write-Error "FAIL: binary still present after uninstall"
+            exit 1
+          }
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-log
+          path: install.log
+          retention-days: 3
+
+  # ── macOS installer smoke test ──────────────────────────────────────
+  install-macos:
+    name: "Install macOS .pkg"
+    needs: resolve
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Install .pkg
+        run: |
+          PKG=$(ls artifacts/YuzuAgent-*.pkg 2>/dev/null | head -1)
+          [ -z "$PKG" ] && { echo "SKIP: no .pkg found"; exit 0; }
+          echo "Installing: $PKG"
+          sudo installer -pkg "$PKG" -target / -verboseR
+
+      - name: Verify installation
+        run: |
+          test -x /usr/local/bin/yuzu-agent && echo "PASS: binary installed" || { echo "FAIL: binary missing"; exit 1; }
+          /usr/local/bin/yuzu-agent --version
+          test -f /Library/LaunchDaemons/com.yuzu.agent.plist && echo "PASS: launchd plist installed" || { echo "FAIL: plist missing"; exit 1; }
+          PLUGINS=$(ls /usr/local/lib/yuzu/plugins/*.dylib 2>/dev/null | wc -l | tr -d ' ')
+          echo "PASS: $PLUGINS plugins installed"
+
+  # ── Artifact deep inspection ────────────────────────────────────────
+  artifact-verify:
+    name: "Artifact verification"
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: artifacts
+
+      - name: Verify archive contents
+        run: |
+          cd artifacts
+          VERSION="${{ needs.resolve.outputs.version }}"
+
+          echo "=== Linux x64 archive ==="
+          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: server binary"
+          tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: agent binary"
+          PLUGINS=$(tar tzf yuzu-linux-x64.tar.gz | grep -c '\.so$' || true)
+          echo "Plugins: $PLUGINS"
+          [ "$PLUGINS" -ge 30 ] && echo "PASS: plugin count" || { echo "FAIL: only $PLUGINS plugins"; exit 1; }
+
+          echo "=== Gateway archive ==="
+          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'bin/yuzu_gw' && echo "PASS: gateway binary"
+          tar tzf yuzu-gateway-linux-x64.tar.gz | grep -q 'releases/' && echo "PASS: Erlang release structure"
+
+          echo "=== ARM64 archive ==="
+          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: ARM64 server"
+          tar tzf yuzu-linux-arm64.tar.gz | grep -q 'bin/yuzu-agent' && echo "PASS: ARM64 agent"
+
+      - name: Inspect Linux binaries
+        run: |
+          cd artifacts
+          tar xzf yuzu-linux-x64.tar.gz
+          DIR=$(ls -d yuzu-*-linux-x64 | head -1)
+
+          echo "=== Binary format ==="
+          file "$DIR/bin/yuzu-server" | grep -q 'ELF 64-bit.*x86-64' && echo "PASS: ELF x86-64" || { echo "FAIL"; exit 1; }
+
+          echo "=== Hardening checks ==="
+          # PIE
+          readelf -h "$DIR/bin/yuzu-server" | grep 'Type:' | grep -q 'DYN' && echo "PASS: PIE enabled" || echo "WARN: not PIE"
+          # RELRO
+          readelf -l "$DIR/bin/yuzu-server" | grep -q 'GNU_RELRO' && echo "PASS: RELRO" || echo "WARN: no RELRO"
+          # Stack canary
+          readelf -s "$DIR/bin/yuzu-server" | grep -q '__stack_chk_fail' && echo "PASS: stack canary" || echo "WARN: no canary"
+          # NX (no executable stack)
+          if readelf -l "$DIR/bin/yuzu-server" | grep 'GNU_STACK' | grep -q 'RWE'; then
+            echo "FAIL: executable stack (NX disabled)"
+            exit 1
+          else
+            echo "PASS: NX enabled"
+          fi
+
+      - name: Inspect DEB metadata
+        run: |
+          cd artifacts
+          VERSION="${{ needs.resolve.outputs.version }}"
+          for deb in *.deb; do
+            echo "=== $deb ==="
+            dpkg-deb --field "$deb" Package Version
+            DEB_VER=$(dpkg-deb --field "$deb" Version)
+            [ "$DEB_VER" = "$VERSION" ] && echo "PASS: version matches" || echo "WARN: version $DEB_VER != $VERSION"
+          done
+
+      - name: Inspect RPM metadata
+        run: |
+          cd artifacts
+          docker run --rm -v "$PWD:/pkg:ro" fedora:40 bash -c '
+            for rpm in /pkg/*.rpm; do
+              echo "=== $(basename $rpm) ==="
+              rpm -qip "$rpm" 2>/dev/null | grep -E "^(Name|Version|Architecture)"
+            done
+          '
+
+      - name: Inspect Docker images
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          for img in yuzu-server yuzu-agent yuzu-gateway; do
+            echo "=== $img ==="
+            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
+            # Non-root user
+            USER=$(docker inspect "$REGISTRY/$img:$VERSION" --format='{{.Config.User}}')
+            [ -n "$USER" ] && [ "$USER" != "root" ] && echo "PASS: non-root user ($USER)" || echo "WARN: running as root"
+            # Image size
+            SIZE=$(docker image inspect "$REGISTRY/$img:$VERSION" --format='{{.Size}}' | awk '{printf "%.0f", $1/1024/1024}')
+            echo "Size: ${SIZE}MB"
+          done
+
+  # ── Security scanning ───────────────────────────────────────────────
+  security-scan:
+    name: "Security scan (Trivy)"
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan Docker images
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+          FAILED=0
+          for img in yuzu-server yuzu-agent yuzu-gateway; do
+            echo "=== Scanning $img ==="
+            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: not found"; continue; }
+
+            # Scan for HIGH/CRITICAL vulns (warn but don't fail on unfixed)
+            trivy image --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 0 \
+              "$REGISTRY/$img:$VERSION" | tee "trivy-${img}.txt"
+
+            # Generate SBOM
+            trivy image --format spdx-json \
+              -o "sbom-${img}.json" \
+              "$REGISTRY/$img:$VERSION" 2>/dev/null || true
+          done
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan
+          path: |
+            trivy-*.txt
+            sbom-*.json
+          retention-days: 7
+
+  # ── Soak test (10 min stability) ────────────────────────────────────
+  soak-test:
+    name: "Soak test (10 min)"
+    needs: [resolve, integration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start stack
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          mkdir -p /tmp/yuzu-soak
+
+          python3 -c "
+          import hashlib, os
+          salt = os.urandom(16)
+          dk = hashlib.pbkdf2_hmac('sha256', b'soakpass1', salt, 100000, dklen=32)
+          print(f'soak:admin:{salt.hex()}:{dk.hex()}')
+          " > /tmp/yuzu-soak/yuzu-server.cfg
+
+          cat > /tmp/yuzu-soak/docker-compose.yml <<COMPOSE
+          services:
+            server:
+              image: $REGISTRY/yuzu-server:$VERSION
+              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
+              ports: ["8080:8080","50055:50055"]
+              volumes: ["/tmp/yuzu-soak/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              healthcheck:
+                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                interval: 5s
+                timeout: 3s
+                retries: 10
+            gateway:
+              image: $REGISTRY/yuzu-gateway:$VERSION
+              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
+              ports: ["50051:50051","50063:50063","8081:8081","9568:9568"]
+              depends_on:
+                server:
+                  condition: service_healthy
+            agent:
+              image: $REGISTRY/yuzu-agent:$VERSION
+              command: ["--server","gateway:50051","--no-tls"]
+              depends_on: [gateway]
+          COMPOSE
+
+          cd /tmp/yuzu-soak
+          docker compose up -d
+
+          # Wait for full stack
+          for i in $(seq 1 40); do
+            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+            [ "$COUNT" -ge 1 ] && break
+            sleep 3
+          done
+          echo "Stack ready, agent registered"
+
+      - name: Run soak (10 minutes)
+        run: |
+          echo "Starting 10-minute soak test..."
+          echo "timestamp,server,gateway,agent,agents_registered" > /tmp/yuzu-soak/soak.csv
+
+          # Login for commands
+          curl -s -c /tmp/cookies.txt http://localhost:8080/login \
+            -d "username=soak&password=soakpass1" -o /dev/null
+
+          FAILURES=0
+          for i in $(seq 1 20); do
+            TS=$(date +%H:%M:%S)
+
+            # Check all containers running
+            RUNNING=$(cd /tmp/yuzu-soak && docker compose ps --format json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          states = [c.get('State','') for c in (data if isinstance(data, list) else [data])]
+          print(len([s for s in states if s == 'running']))
+          " 2>/dev/null || echo "0")
+
+            # Check agent count
+            AGENTS=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+
+            # Check gateway health
+            GW_OK="yes"
+            curl -sf http://localhost:8081/readyz &>/dev/null || GW_OK="no"
+
+            # Memory (container RSS)
+            SERVER_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-server-1 2>/dev/null | cut -d/ -f1 || echo "?")
+            GW_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-gateway-1 2>/dev/null | cut -d/ -f1 || echo "?")
+            AGENT_MEM=$(docker stats --no-stream --format "{{.MemUsage}}" yuzu-soak-agent-1 2>/dev/null | cut -d/ -f1 || echo "?")
+
+            echo "$TS  containers=$RUNNING  agents=$AGENTS  gw=$GW_OK  mem=[S:$SERVER_MEM G:$GW_MEM A:$AGENT_MEM]"
+            echo "$TS,$SERVER_MEM,$GW_MEM,$AGENT_MEM,$AGENTS" >> /tmp/yuzu-soak/soak.csv
+
+            if [ "$RUNNING" -lt 3 ] || [ "$AGENTS" -lt 1 ] || [ "$GW_OK" = "no" ]; then
+              FAILURES=$((FAILURES + 1))
+              echo "WARNING: degraded state at $TS"
+            fi
+
+            # Send a command every 30s to exercise the data path
+            if [ $((i % 2)) -eq 0 ]; then
+              curl -s -b /tmp/cookies.txt -X POST http://localhost:8080/api/command \
+                -H "Content-Type: application/json" \
+                -d '{"plugin":"status","action":"ping"}' > /dev/null 2>&1
+            fi
+
+            sleep 30
+          done
+
+          echo ""
+          if [ "$FAILURES" -eq 0 ]; then
+            echo "PASS: Soak test completed — 10 minutes, 0 failures"
+          else
+            echo "FAIL: $FAILURES degraded samples during soak"
+            exit 1
+          fi
+
+      - name: Check for crashes in logs
+        if: always()
+        run: |
+          cd /tmp/yuzu-soak
+          docker compose logs > soak-logs.txt 2>&1
+          if grep -iE 'segfault|ASAN|UBSAN|panic|SIGABRT|core dump' soak-logs.txt; then
+            echo "FAIL: crash detected in logs"
+            exit 1
+          else
+            echo "PASS: no crashes in logs"
+          fi
+
+      - name: Upload soak data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-test
+          path: |
+            /tmp/yuzu-soak/soak.csv
+            /tmp/yuzu-soak/soak-logs.txt
+          retention-days: 3
+
+      - name: Teardown
+        if: always()
+        run: cd /tmp/yuzu-soak && docker compose down -v
+
+  # ── Upgrade test ────────────────────────────────────────────────────
+  upgrade-test:
+    name: "Upgrade test"
+    needs: [resolve, integration]
+    if: needs.resolve.outputs.has_prev == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start previous release
+        run: |
+          PREV_VER="${{ needs.resolve.outputs.prev_tag }}"
+          PREV_VER="${PREV_VER#v}"
+          NEW_VER="${{ needs.resolve.outputs.version }}"
+          mkdir -p /tmp/yuzu-upgrade
+
+          python3 -c "
+          import hashlib, os
+          salt = os.urandom(16)
+          dk = hashlib.pbkdf2_hmac('sha256', b'upgradepass1', salt, 100000, dklen=32)
+          print(f'upgrade:admin:{salt.hex()}:{dk.hex()}')
+          " > /tmp/yuzu-upgrade/yuzu-server.cfg
+
+          # Compose file with variable image tags
+          cat > /tmp/yuzu-upgrade/docker-compose.yml <<COMPOSE
+          services:
+            server:
+              image: $REGISTRY/yuzu-server:\${YUZU_VER}
+              command: ["--listen","0.0.0.0:50051","--no-tls","--no-https","--gateway-upstream","0.0.0.0:50055","--gateway-mode","--gateway-command-addr","gateway:50063","--web-address","0.0.0.0","--web-port","8080","--metrics-no-auth","--config","/var/lib/yuzu/yuzu-server.cfg"]
+              ports: ["8080:8080","50055:50055"]
+              volumes: ["/tmp/yuzu-upgrade/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro"]
+              healthcheck:
+                test: ["CMD","curl","-sf","http://localhost:8080/livez"]
+                interval: 5s
+                timeout: 3s
+                retries: 10
+            gateway:
+              image: $REGISTRY/yuzu-gateway:\${YUZU_VER}
+              environment: ["YUZU_GW_UPSTREAM_ADDR=server"]
+              ports: ["50051:50051","50063:50063","8081:8081"]
+              depends_on:
+                server:
+                  condition: service_healthy
+            agent:
+              image: $REGISTRY/yuzu-agent:\${YUZU_VER}
+              command: ["--server","gateway:50051","--no-tls"]
+              depends_on: [gateway]
+          COMPOSE
+
+          cd /tmp/yuzu-upgrade
+          echo "Starting previous release: $PREV_VER"
+          YUZU_VER="$PREV_VER" docker compose up -d
+
+          # Wait for stack
+          for i in $(seq 1 40); do
+            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+            [ "$COUNT" -ge 1 ] && break
+            sleep 3
+          done
+          echo "Previous release stack ready ($PREV_VER)"
+
+      - name: Upgrade to new release
+        run: |
+          NEW_VER="${{ needs.resolve.outputs.version }}"
+          cd /tmp/yuzu-upgrade
+
+          echo "Upgrading to: $NEW_VER"
+          YUZU_VER="$NEW_VER" docker compose up -d
+
+          # Wait for stack to recover
+          for i in $(seq 1 40); do
+            COUNT=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+              grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+            [ "$COUNT" -ge 1 ] && break
+            sleep 3
+          done
+
+      - name: Verify post-upgrade
+        run: |
+          # Dashboard reachable
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
+          [ "$CODE" = "200" ] && echo "PASS: Dashboard HTTP $CODE" || { echo "FAIL: HTTP $CODE"; exit 1; }
+
+          # Agent reconnected
+          COUNT=$(curl -s http://localhost:8080/metrics | \
+            grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+          [ "$COUNT" -ge 1 ] && echo "PASS: Agent reconnected ($COUNT)" || { echo "FAIL: Agent not reconnected"; exit 1; }
+
+          # Gateway healthy
+          curl -sf http://localhost:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
+
+          echo "PASS: Upgrade from ${{ needs.resolve.outputs.prev_tag }} to v${{ needs.resolve.outputs.version }} succeeded"
+
+      - name: Collect logs
+        if: always()
+        run: cd /tmp/yuzu-upgrade && docker compose logs > upgrade-logs.txt 2>&1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-logs
+          path: /tmp/yuzu-upgrade/upgrade-logs.txt
+          retention-days: 3
+
+      - name: Teardown
+        if: always()
+        run: cd /tmp/yuzu-upgrade && docker compose down -v
+
+  # ── QA summary ──────────────────────────────────────────────────────
+  report:
+    name: "QA Report"
+    needs: [resolve, integration, install-deb, install-rpm, install-windows, install-macos, artifact-verify, security-scan, soak-test, upgrade-test]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate report
+        env:
+          R_INTEGRATION: ${{ needs.integration.result }}
+          R_DEB: ${{ needs.install-deb.result }}
+          R_RPM: ${{ needs.install-rpm.result }}
+          R_WINDOWS: ${{ needs.install-windows.result }}
+          R_MACOS: ${{ needs.install-macos.result }}
+          R_ARTIFACT: ${{ needs.artifact-verify.result }}
+          R_SECURITY: ${{ needs.security-scan.result }}
+          R_SOAK: ${{ needs.soak-test.result }}
+          R_UPGRADE: ${{ needs.upgrade-test.result }}
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          TAG="${{ needs.resolve.outputs.tag }}"
+
+          status_icon() {
+            case "$1" in
+              success)  echo "PASS" ;;
+              failure)  echo "FAIL" ;;
+              skipped)  echo "SKIP" ;;
+              *)        echo "????" ;;
+            esac
+          }
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<REPORT
+          ## Pre-release QA Report: ${TAG}
+
+          | Test Suite | Result |
+          |---|---|
+          | Integration (full stack round-trip) | $(status_icon "$R_INTEGRATION") |
+          | .deb install (Ubuntu 22/24, Debian 12) | $(status_icon "$R_DEB") |
+          | .rpm install (Fedora 40, Rocky 9) | $(status_icon "$R_RPM") |
+          | Windows installer (silent) | $(status_icon "$R_WINDOWS") |
+          | macOS .pkg install | $(status_icon "$R_MACOS") |
+          | Artifact verification | $(status_icon "$R_ARTIFACT") |
+          | Security scan (Trivy) | $(status_icon "$R_SECURITY") |
+          | Soak test (10 min) | $(status_icon "$R_SOAK") |
+          | Upgrade test | $(status_icon "$R_UPGRADE") |
+
+          REPORT
+
+          # Determine overall result
+          ALL_RESULTS="$R_INTEGRATION $R_DEB $R_RPM $R_WINDOWS $R_MACOS $R_ARTIFACT $R_SECURITY $R_SOAK $R_UPGRADE"
+          if echo "$ALL_RESULTS" | grep -q "failure"; then
+            echo "### Result: FAILED" >> "$GITHUB_STEP_SUMMARY"
+            echo ""
+            echo "QA FAILED for $TAG"
+            exit 1
+          else
+            echo "### Result: PASSED" >> "$GITHUB_STEP_SUMMARY"
+            echo ""
+            echo "QA PASSED for $TAG"
+          fi

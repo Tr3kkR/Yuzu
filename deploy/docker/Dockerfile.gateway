@@ -11,7 +11,7 @@
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:27-alpine@sha256:fc946258810fbcc5cc2a39fa0dfa041d7467d00bd3b07b5fbe8493b6c657f611 AS deps
+FROM erlang:28-alpine@sha256:45e2af23dea3aa5fc1d320d9a520688495e73515a7c61d8836be33f542380484 AS deps
 
 RUN apk add --no-cache git
 
@@ -44,7 +44,7 @@ RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 USER yuzu-gw
 WORKDIR /opt/yuzu_gw
 
-EXPOSE 50061 50063 9568
+EXPOSE 50051 50063 8081 9568
 
 ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
 CMD ["foreground"]

@@ -2,12 +2,12 @@
 # docker-start-UAT.sh — Yuzu UAT with Docker infrastructure + native agent
 #
 # Topology:
-#   Agent (native) --> Gateway (Docker :50061) --> Server (Docker :50055)
+#   Agent (native) --> Gateway (Docker :50051) --> Server (Docker :50055)
 #   Server (Docker) --> Gateway (Docker :50063) --> Agent  (command fanout)
 #
 # All infrastructure in Docker:
-#   Server       (:8080 web, :50054 gRPC, :50055 upstream)
-#   Gateway      (:50061 agent, :50063 mgmt, :9568 metrics, :8081 health)
+#   Server       (:8080 web, :50051 gRPC, :50055 upstream)
+#   Gateway      (:50051 agent, :50063 mgmt, :9568 metrics, :8081 health)
 #   Prometheus   (:9090) scrapes server + gateway via Docker network
 #   ClickHouse   (:8123) receives analytics from server via Docker network
 #   Grafana      (:3000) reads Prometheus + ClickHouse, dashboards provisioned
@@ -328,9 +328,9 @@ start_all() {
 
     # ── 2. Native agent (connects to gateway on host-exposed port) ────
     echo ""
-    echo "[2/2] Starting yuzu-agent (native, -> gateway :50061)..."
+    echo "[2/2] Starting yuzu-agent (native, -> gateway :50051)..."
     "$agent_bin" \
-        --server localhost:50061 \
+        --server localhost:50051 \
         --no-tls \
         --data-dir "$UAT_DIR/agent-data" \
         --plugin-dir "$BUILDDIR/agents/plugins" \
@@ -555,7 +555,7 @@ for r in d.get('responses',[]):
     echo "  GW Health:   http://localhost:8081/readyz"
     echo "  GW Metrics:  http://localhost:9568/metrics"
     echo ""
-    echo "  Agent (native) -> GW(:50061) -> Server(:50055)  [data]"
+    echo "  Agent (native) -> GW(:50051) -> Server(:50055)  [data]"
     echo "  Server -> GW(:50063) -> Agent                   [commands]"
     echo "  Server -> ClickHouse (Docker network)           [analytics]"
     echo "  Prometheus -> Server + GW (Docker network)      [metrics]"

@@ -1,11 +1,11 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.7.0',
+  version: '0.7.1',
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++20',
+    'cpp_std=c++23',
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -26,7 +26,6 @@ if cxx.get_id() == 'msvc'
   )
 else
   add_project_arguments(
-    '-std=c++23',             # override c++20 default to get C++23 on GCC/Clang
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
     '-fstack-protector-strong',
@@ -38,7 +37,10 @@ else
     add_project_arguments('-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=2', language: 'cpp')
   endif
   # Full RELRO + immediate binding — makes GOT/PLT read-only after load.
-  add_project_link_arguments('-Wl,-z,relro,-z,now', language: 'cpp')
+  # Only ELF platforms; Apple's ld64 does not support -z flags.
+  if host_os != 'darwin'
+    add_project_link_arguments('-Wl,-z,relro,-z,now', language: 'cpp')
+  endif
   if cxx.get_id() == 'clang'
     add_project_arguments('-Wno-gnu-zero-variadic-macro-arguments', language: 'cpp')
   endif
@@ -85,7 +87,12 @@ grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], requ
 if not grpcpp_dep.found()
   grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
 endif
-protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'], required: false)
+protobuf_cmake_args = []
+if host_os == 'windows'
+  protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
+endif
+protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
+  cmake_args: protobuf_cmake_args, required: false)
 if not protobuf_dep.found()
   protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
 endif
@@ -102,7 +109,8 @@ sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLi
 # macOS frameworks needed by gRPC, abseil, and cpp-httplib
 if host_os == 'darwin'
   corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
-  grpcpp_dep = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+  grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
+  httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────

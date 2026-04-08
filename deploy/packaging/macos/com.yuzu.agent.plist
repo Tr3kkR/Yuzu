@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yuzu.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/yuzu-agent</string>
+        <string>--plugin-dir</string>
+        <string>/usr/local/lib/yuzu/plugins</string>
+        <string>--data-dir</string>
+        <string>/Library/Application Support/Yuzu</string>
+        <string>--log-file</string>
+        <string>/Library/Logs/Yuzu/yuzu-agent.log</string>
+        <string>--log-max-size</string>
+        <string>52428800</string>
+        <string>--log-max-files</string>
+        <string>5</string>
+    </array>
+
+    <!-- Start at boot, keep running -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Restart on crash after 10 seconds -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/Library/Application Support/Yuzu</string>
+
+    <!-- Logging (stderr goes to system log by default) -->
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Yuzu/yuzu-agent.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Yuzu/yuzu-agent.stderr.log</string>
+</dict>
+</plist>

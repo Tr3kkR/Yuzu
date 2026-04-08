@@ -2,7 +2,7 @@
 # win-start-UAT.sh — Full Yuzu UAT on Windows (MSYS2/bash)
 #
 # Topology (all agent traffic flows through the gateway):
-#   Agent --> Gateway(:50061) --> Server(:50055 upstream)
+#   Agent --> Gateway(:50051) --> Server(:50055 upstream)
 #   Server --> Gateway(:50063) --> Agent   (command fanout)
 #
 # Monitoring & Analytics (Docker containers):
@@ -71,7 +71,7 @@ kill_native() {
         ok "Killed $killed process(es)"
         # Wait for gateway ports to be released by the OS (TCP TIME_WAIT)
         local port_wait=0
-        while netstat -an 2>/dev/null | grep -q ":50063.*LISTEN\|:50061.*LISTEN"; do
+        while netstat -an 2>/dev/null | grep -q ":50063.*LISTEN\|:50051.*LISTEN"; do
             sleep 1
             port_wait=$((port_wait + 1))
             if [ "$port_wait" -ge 10 ]; then
@@ -335,7 +335,7 @@ start_all() {
         > "$UAT_DIR/gateway.log" 2>&1) &
     disown
 
-    if ! wait_for_port 50061 "gateway (agent-facing)" 15; then
+    if ! wait_for_port 50051 "gateway (agent-facing)" 15; then
         fail "Gateway failed to start — check $UAT_DIR/gateway.log"
         exit 1
     fi
@@ -344,7 +344,7 @@ start_all() {
         exit 1
     fi
     ok "Gateway up"
-    info "Agent-facing :50061 | Command mgmt :50063 | Metrics :9568 | Health :8081"
+    info "Agent-facing :50051 | Command mgmt :50063 | Metrics :9568 | Health :8081"
 
     # ── Login & enrollment token ──────────────────────────────────────────
     info "Creating enrollment token..."
@@ -367,9 +367,9 @@ start_all() {
 
     # ── 4. Agent (via gateway) ────────────────────────────────────────────
     echo ""
-    echo "[4/4] Starting yuzu-agent (-> gateway :50061)..."
+    echo "[4/4] Starting yuzu-agent (-> gateway :50051)..."
     "$BUILDDIR/agents/core/yuzu-agent.exe" \
-        --server localhost:50061 \
+        --server localhost:50051 \
         --no-tls \
         --data-dir "$UAT_DIR/agent-data" \
         --plugin-dir "$BUILDDIR/agents/plugins" \
@@ -593,7 +593,7 @@ for r in d.get('responses',[]):
     echo "  GW Health:   http://localhost:8081/readyz"
     echo "  GW Metrics:  http://localhost:9568/metrics"
     echo ""
-    echo "  Agent -> GW(:50061) -> Server(:50055)   [data]"
+    echo "  Agent -> GW(:50051) -> Server(:50055)   [data]"
     echo "  Server -> GW(:50063) -> Agent           [commands]"
     echo "  Server -> ClickHouse(:8123)             [analytics]"
     echo "  Prometheus -> Server(:8080) + GW(:9568) [metrics]"

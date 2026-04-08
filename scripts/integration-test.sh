@@ -32,7 +32,7 @@ AGENT_PIDS=()
 # Server ports (C++ server listens on 50050 in gateway mode)
 SERVER_AGENT_PORT=50050
 SERVER_MGMT_PORT=50053
-SERVER_GW_PORT=50054     # GatewayUpstream service port (gateway connects here)
+SERVER_GW_PORT=50051     # GatewayUpstream service port (gateway connects here)
 SERVER_WEB_PORT=8090
 
 # Gateway ports (agents connect here)

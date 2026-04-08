@@ -7,15 +7,20 @@ on:
   pull_request:
     branches: [main, dev]
     paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   MESON_VERSION: "1.9.2"
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
-  VCPKG_BINARY_SOURCES: "clear"
+  VCPKG_BINARY_SOURCES: "default"
   CCACHE_MAXSIZE: "500M"
   CCACHE_COMPRESS: "true"
 
@@ -41,8 +46,9 @@ jobs:
   proto-compat:
     name: "Proto backward-compat"
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
@@ -58,15 +64,16 @@ jobs:
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc-13, clang-18]
+        compiler: [gcc-13, clang-19]
         build_type: [debug, release]
         exclude:
           # PRs: only gcc-13 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
-          - compiler: ${{ github.event_name == 'pull_request' && 'clang-18' || 'NONE' }}
+          - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@v6
@@ -78,14 +85,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
-            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-18' }}
+            ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
           pip3 install meson==${{ env.MESON_VERSION }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.sha }}
+          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-
             ccache-linux-${{ matrix.compiler }}-
@@ -93,13 +100,20 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-release-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-release-${{ matrix.compiler }}-
+            vcpkg-x64-linux-${{ matrix.compiler }}-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -107,24 +121,24 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux-release \
+            --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson)
         env:
-          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-18' }}
-          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-18' }}
+          CC: ccache ${{ matrix.compiler == 'gcc-13' && 'gcc-13' || 'clang-19' }}
+          CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-19' }}
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
-            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang18.ini' }} \
+            --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
-            ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
+            ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
 
       - name: Build
         run: meson compile -C builddir
@@ -140,6 +154,7 @@ jobs:
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
     runs-on: windows-2022
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -165,10 +180,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\ccache
-          key: ccache-windows-${{ matrix.build_type }}-${{ github.sha }}
+          key: ccache-windows-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-windows-${{ matrix.build_type }}-
             ccache-windows-
+
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Reset ccache stats
         run: ccache -z
@@ -200,6 +222,7 @@ jobs:
         run: |
           meson setup builddir `
             --buildtype=${{ matrix.build_type }} `
+            -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=true `
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
@@ -208,7 +231,9 @@ jobs:
         run: meson compile -C builddir
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        run: |
+          $env:PATH = "${{ github.workspace }}/vcpkg_installed/x64-windows/${{ matrix.build_type == 'debug' && 'debug/bin' || 'bin' }};${{ github.workspace }}/vcpkg_installed/x64-windows/tools/protobuf;${{ github.workspace }}/vcpkg_installed/x64-windows/tools/grpc;$env:PATH"
+          meson test -C builddir --print-errorlogs
 
       - name: ccache stats
         if: always()
@@ -217,7 +242,8 @@ jobs:
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
     name: "macOS ${{ matrix.build_type }}"
-    runs-on: macos-14  # Apple Silicon
+    runs-on: macos-15  # Apple Silicon, Xcode 16 / Apple Clang 16
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -239,7 +265,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/ccache
-          key: ccache-macos-${{ matrix.build_type }}-${{ github.sha }}
+          key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-macos-${{ matrix.build_type }}-
             ccache-macos-
@@ -247,13 +273,20 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-release-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-arm64-osx-release-
+            vcpkg-arm64-osx-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -261,22 +294,22 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet arm64-osx-release \
+            --triplet arm64-osx \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson)
         env:
           CC: ccache cc
           CXX: ccache c++
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
         run: |
           meson setup builddir \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx-release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -290,81 +323,13 @@ jobs:
         if: always()
         run: ccache -s
 
-  # ── ARM64 Linux cross-compile ──────────────────────────────────────────
-  arm64-cross:
-    name: "Linux ARM64 cross-compile"
-    # Only run on push to main (cross-compile is slow, not needed for every PR)
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    runs-on: ubuntu-24.04
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install cross-compile toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build g++ \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            pkg-config curl zip unzip tar \
-            python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-arm64-cross-${{ github.sha }}
-          restore-keys: |
-            ccache-arm64-cross-
-
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-linux-release-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-arm64-linux-release-
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-
-      - name: Install vcpkg packages (cross)
-        run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet arm64-linux-release \
-            --x-manifest-root=${{ github.workspace }}
-
-      - name: Configure (Meson cross)
-        env:
-          CC: ccache gcc
-          CXX: ccache g++
-        run: |
-          meson setup builddir \
-            --cross-file meson/cross/aarch64-linux-gnu.ini \
-            --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-linux-release
-
-      - name: Build
-        run: meson compile -C builddir
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
   # ── Sanitizers (ASan + UBSan) — main/dev push only ────────────────────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
@@ -386,20 +351,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-asan-${{ github.sha }}
+          key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-linux-asan-
 
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-release-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-release-gcc13-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -407,22 +379,22 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux-release \
+            --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + ASan/UBSan)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined
 
@@ -442,6 +414,7 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
 
@@ -462,20 +435,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-tsan-${{ github.sha }}
+          key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-linux-tsan-
 
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-release-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-release-gcc13-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -483,22 +463,22 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux-release \
+            --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + TSan)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_sanitize=thread
 
@@ -518,6 +498,7 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v6
@@ -536,20 +517,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-coverage-${{ github.sha }}
+          key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
             ccache-linux-coverage-
 
       - name: Reset ccache stats
         run: ccache -z
 
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-release-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-release-gcc13-
+            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -557,22 +545,22 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-
       - name: Install vcpkg packages
         run: |
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux-release \
+            --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + coverage)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-release \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true \
             -Db_coverage=true
 

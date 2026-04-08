@@ -26,6 +26,8 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_diag_init)() = diag_befo
 #ifndef _WIN32
 #include <unistd.h>
 #endif
+#include <sqlite3.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -224,6 +226,12 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Agent v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
+    if (sqlite3_threadsafe() == 0) {
+        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
+        return EXIT_FAILURE;
+    }
 
     // Resolve persistent agent ID
     auto id_result = yuzu::agent::resolve_agent_id(cfg.agent_id, cfg.data_dir / "agent.db");

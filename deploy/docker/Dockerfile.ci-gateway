@@ -1,0 +1,54 @@
+# Yuzu CI Gateway — Erlang/OTP build environment for GitHub Actions
+#
+# Based on official erlang:27 with rebar3 and CI tooling pre-installed.
+# Eliminates the 2-5 min erlef/setup-beam install step.
+#
+# Push to ghcr.io/tr3kkr/yuzu-ci-gateway:latest
+#
+# Usage in workflows:
+#   jobs:
+#     build-gateway:
+#       runs-on: ubuntu-24.04
+#       container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
+
+FROM erlang:27
+
+ARG REBAR3_VERSION=3.24.0
+
+# ── System packages ───────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl tar zip unzip ca-certificates gnupg jq \
+    # NuGet binary cache support (for vcpkg fallback if needed)
+    mono-complete \
+    # RPM packaging support (gateway .rpm built in Fedora container)
+    rpm \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js 20 (required by GitHub Actions runner actions) ────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── rebar3 (pinned version) ──────────────────────────────────────────
+RUN curl -fsSL "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERSION}/rebar3" \
+    -o /usr/local/bin/rebar3 \
+    && chmod +x /usr/local/bin/rebar3 \
+    && rebar3 --version
+
+# ── Pre-compile rebar3 dependencies ───────────────────────────────────
+# Copy gateway source and compile deps so CI only compiles app code
+COPY gateway/rebar.config gateway/rebar.lock /tmp/gateway/
+COPY gateway/apps/yuzu_gw/src/yuzu_gw.app.src /tmp/gateway/apps/yuzu_gw/src/
+RUN cd /tmp/gateway \
+    && rebar3 compile --deps_only 2>/dev/null || true \
+    && mkdir -p /opt/rebar3_deps \
+    && cp -a /tmp/gateway/_build /opt/rebar3_deps/_build \
+    && rm -rf /tmp/gateway
+
+# ── Git safe directory (container workspace) ──────────────────────────
+RUN git config --global --add safe.directory '*'
+
+# ── Labels ────────────────────────────────────────────────────────────
+LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
+LABEL org.opencontainers.image.description="Yuzu CI gateway build environment (Erlang/OTP 27 + rebar3)"
+LABEL org.opencontainers.image.licenses="Apache-2.0"

@@ -16,7 +16,9 @@ namespace yuzu::server {
 UpdateRegistry::UpdateRegistry(const std::filesystem::path& db_path,
                                const std::filesystem::path& update_dir)
     : update_dir_(update_dir) {
-    int rc = sqlite3_open(db_path.string().c_str(), &db_);
+    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("UpdateRegistry: failed to open {}: {}", db_path.string(),
                       sqlite3_errmsg(db_));
@@ -34,6 +36,7 @@ UpdateRegistry::UpdateRegistry(const std::filesystem::path& db_path,
         spdlog::warn("UpdateRegistry: WAL mode failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
     }
+    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
     spdlog::info("UpdateRegistry: opened {}", db_path.string());

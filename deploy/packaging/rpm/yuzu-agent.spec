@@ -40,4 +40,5 @@ ldconfig
 %{_bindir}/yuzu-agent
 %{_unitdir}/yuzu-agent.service
 %dir %{_libdir}/yuzu/plugins
+%{_libdir}/yuzu/plugins/*.so
 %dir %attr(0750,yuzu-agent,yuzu-agent) /var/lib/yuzu-agent

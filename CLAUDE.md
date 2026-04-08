@@ -59,8 +59,11 @@ Agents live in `.claude/agents/` and are invoked by name.
 | plugin-developer | Plugin Dev & SDK | New plugins, ABI guard, InstructionDefinition YAML |
 | release-deploy | Release & Deployment | Docker, systemd, installers, release workflow |
 | dsl-engineer | DSL & Expression Language | Scope DSL, CEL, parameter interpolation, trigger expressions, workflow primitives |
+| compliance-officer | Compliance Officer | SOC 2 control alignment, evidence generation, change traceability, audit readiness |
+| sre | Site Reliability Engineer | SLOs, observability, backup/recovery, capacity planning, hardened deployment |
+| enterprise-readiness | Enterprise Readiness | Customer assurance package, security questionnaires, deployment experience, pilot readiness |
 
-**Workflow:** architect first (design) → feature agents (implement) → erlang-dev (review Erlang code) → cross-platform (compile) → security-guardian (review) → happy-path + unhappy-path + consistency-auditor (parallel analysis) → chaos-injector (failure scenarios) → quality-engineer (test) → docs-writer (document) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
+**Workflow:** architect first (design) → feature agents (implement) → erlang-dev (review Erlang code) → cross-platform (compile) → security-guardian (review) → happy-path + unhappy-path + consistency-auditor (parallel analysis) → chaos-injector (failure scenarios) → quality-engineer (test) → docs-writer (document) → compliance-officer + sre + enterprise-readiness (parallel operational review) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
 
 **DSL touchpoints:** dsl-engineer is invoked as a feature agent for scope targeting, policy conditions (CEL), trigger template expressions, parameter binding, workflow primitives, and any YAML DSL spec evolution.
 
@@ -75,8 +78,9 @@ Agents live in `.claude/agents/` and are invoked by name.
 3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, erlang-dev, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
 4. **Correctness & resilience analysis** — happy-path, unhappy-path, and consistency-auditor run in parallel. happy-path validates normal-condition correctness. unhappy-path performs systematic failure-mode interrogation and produces a risk register. consistency-auditor checks cross-component state/schema/contract consistency. All three are mandatory during full governance; consistency-auditor also triggers on schema evolution and protocol changes.
 5. **Chaos analysis** — chaos-injector ingests outputs from unhappy-path and consistency-auditor (plus happy-path correctness baseline as optional context) to generate controlled failure scenarios with success criteria and rollback procedures. Runs only after gate 4 completes. Skipped if neither unhappy-path nor consistency-auditor produce findings.
-6. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
-7. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
+6. **Operational & compliance review** — compliance-officer, sre, and enterprise-readiness run in parallel. compliance-officer verifies SOC 2 control alignment and evidence chain. sre reviews observability, deployment hardening, and recovery posture. enterprise-readiness verifies customer-facing documentation and assurance package consistency. All three are mandatory during full governance.
+7. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
+8. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
 
 **Known limitation:** The governance pipeline is convention-enforced, not automated. There are no git hooks or CI checks that verify gate completion. Discipline and peer review are the enforcement mechanism. Future improvement: add governance attestation artifacts or PR checklist requirements.
 
@@ -100,7 +104,7 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian** f
 | Area | Issue |
 |---|---|
 | Path comparisons | macOS `/var` → `/private/var` symlink: always call `fs::canonical()` on both sides before comparing paths in tests. |
-| SQLite concurrency | Any new store that emits from multiple threads needs a mutex protecting the `db_` handle. |
+| SQLite concurrency | All stores must open with `sqlite3_open_v2()` using `SQLITE_OPEN_READWRITE \| SQLITE_OPEN_CREATE \| SQLITE_OPEN_FULLMUTEX` flags — never plain `sqlite3_open()`. Application-level mutexes (`shared_mutex`) are retained as defense-in-depth and are **required** (not optional) for stores with cached prepared statements, because FULLMUTEX does not make bind-step-reset sequences atomic. |
 | Erlang rebar3 ct | Always pass `--dir apps/yuzu_gw/test` together with `--suite` flags. |
 | `curl -f` in tests | Do **not** use `-f` where 4xx is an acceptable response — it causes `|| echo "000"` fallbacks to contaminate the status code variable. |
 | `prometheus_httpd` | Use `start/0` with `application:set_env(prometheus, prometheus_http, [{port, P}, {path, "/metrics"}])` — `start/1` does not exist. Call `application:ensure_all_started(prometheus_httpd)` first so `prometheus_http_impl:setup/0` runs before the first scrape. |
@@ -153,7 +157,7 @@ Server and gateway defaults do not conflict — all three components can run on 
 | 50051 | Server | Agent gRPC (direct connections) |
 | 50052 | Server | Management gRPC |
 | 50055 | Server | Gateway upstream (registration, heartbeats) |
-| 50061 | Gateway | Agent-facing gRPC (agents connect here) |
+| 50051 | Gateway | Agent-facing gRPC (agents connect here) |
 | 50063 | Gateway | Management/command forwarding (server sends commands here) |
 | 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
 | 9568 | Gateway | Prometheus metrics |
@@ -200,6 +204,20 @@ Key design documents:
 - `docs/getting-started.md` — Beginner's guide with tutorial
 
 The YAML DSL uses `apiVersion: yuzu.io/v1alpha1` and supports 6 `kind` values: `InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`. Definitions are stored with `yaml_source` (verbatim YAML, source of truth) plus denormalized columns for queries.
+
+## Enterprise Readiness and SOC 2
+
+The enterprise readiness plan (`docs/enterprise-readiness-soc2-first-customer.md`) defines the path from feature-complete to enterprise-deployable. It covers 7 workstreams:
+
+- **A. GRC** — Control framework, risk register, policy suite, evidence automation
+- **B. Identity & Access** — SSO enforcement, MFA for approvals, session governance, token lifecycle
+- **C. Application & Infrastructure Security** — TLS enforcement, security headers, supply chain signing, vuln management
+- **D. Reliability & Operations** — SLOs, alerting, backup/restore drills, incident response, capacity planning
+- **E. Data Governance** — Data classification, retention policies, deletion workflows, encryption
+- **F. Secure SDLC** — Branch protection, mandatory review, CI gates, change traceability, env segregation
+- **G. Customer Assurance** — Security whitepaper, questionnaire responses, pen-test summaries, DPA templates
+
+Every code change should be evaluated against this plan. The compliance-officer, sre, and enterprise-readiness agents enforce this in the governance pipeline.
 
 ## Development Roadmap
 

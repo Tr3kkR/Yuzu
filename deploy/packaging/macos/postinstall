@@ -1,0 +1,26 @@
+#!/bin/bash
+# Yuzu Agent macOS post-install script
+# Runs as root after pkgbuild installs files.
+
+set -e
+
+DATA_DIR="/Library/Application Support/Yuzu"
+LOG_DIR="/Library/Logs/Yuzu"
+PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
+
+# Create directories
+mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+chmod 750 "${DATA_DIR}"
+chmod 755 "${LOG_DIR}"
+
+# Load the launch daemon (starts the agent)
+if launchctl list com.yuzu.agent &>/dev/null; then
+    launchctl unload "${PLIST}" 2>/dev/null || true
+fi
+launchctl load -w "${PLIST}"
+
+echo "Yuzu Agent installed and started."
+echo "  Data:    ${DATA_DIR}"
+echo "  Logs:    ${LOG_DIR}"
+echo "  Service: launchctl list com.yuzu.agent"
+exit 0

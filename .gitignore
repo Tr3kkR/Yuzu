@@ -69,3 +69,4 @@ _build_err.txt
 _build_out.txt
 build_log.txt
 .claude/settings.local.json
+.uat-sanitizer/

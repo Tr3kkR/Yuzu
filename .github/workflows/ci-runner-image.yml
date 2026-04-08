@@ -1,0 +1,85 @@
+name: CI Runner Images
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'deploy/docker/Dockerfile.ci-linux'
+      - 'deploy/docker/Dockerfile.ci-gateway'
+      - 'vcpkg.json'
+      - 'vcpkg-configuration.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-ci-linux:
+    name: "Build CI Linux image"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set lowercase owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push yuzu-ci-linux
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.ci-linux
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/yuzu-ci-linux:latest
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/yuzu-ci-linux:${{ github.sha }}
+          cache-from: type=gha,scope=ci-linux
+          cache-to: type=gha,mode=max,scope=ci-linux
+
+  build-ci-gateway:
+    name: "Build CI Gateway image"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set lowercase owner
+        id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push yuzu-ci-gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.ci-gateway
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/yuzu-ci-gateway:latest
+            ${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/yuzu-ci-gateway:${{ github.sha }}
+          cache-from: type=gha,scope=ci-gateway
+          cache-to: type=gha,mode=max,scope=ci-gateway

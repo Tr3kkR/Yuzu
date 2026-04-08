@@ -1,0 +1,77 @@
+# Yuzu Sanitizer UAT — Server + Agent under ASan/UBSan or TSan
+#
+# Runs the full stack with sanitizer-instrumented binaries to catch
+# memory errors and data races during real concurrent operation.
+#
+# Usage (managed by scripts/sanitizer-uat.sh):
+#   SANITIZER=asan docker compose -f deploy/docker/docker-compose.sanitizer-uat.yml up
+#   SANITIZER=tsan docker compose -f deploy/docker/docker-compose.sanitizer-uat.yml up
+
+services:
+  server:
+    image: yuzu-server-${SANITIZER:-asan}:latest
+    container_name: yuzu-san-server
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--log-level"
+      - "info"
+      - "--metrics-no-auth"
+      - "--config"
+      - "/var/lib/yuzu/yuzu-server.cfg"
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+      - "50055:50055"
+    volumes:
+      - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
+      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+      - sanitizer-logs:/var/log/yuzu
+    restart: "no"
+
+  gateway:
+    image: yuzu-gateway:latest
+    container_name: yuzu-san-gateway
+    environment:
+      - YUZU_GW_UPSTREAM_ADDR=server
+    ports:
+      - "50051:50051"
+      - "50063:50063"
+      - "9568:9568"
+      - "8081:8081"
+    volumes:
+      - ./gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    depends_on:
+      - server
+    restart: "no"
+
+  agent:
+    image: yuzu-agent-${SANITIZER:-asan}:latest
+    container_name: yuzu-san-agent
+    command:
+      - "--server"
+      - "gateway:50051"
+      - "--no-tls"
+      - "--agent-id"
+      - "san-test-agent"
+      - "--enrollment-token"
+      - "${ENROLLMENT_TOKEN:-}"
+    volumes:
+      - sanitizer-logs:/var/log/yuzu
+    depends_on:
+      - gateway
+    restart: "no"
+
+volumes:
+  sanitizer-logs:

@@ -1,0 +1,60 @@
+# Yuzu CI — Pre-built Linux CI image with all deps ready
+#
+# Contains: GCC 13, Clang 18, Meson, ccache, vcpkg with all packages
+# pre-compiled. Mount your source tree and run configure+build+test
+# instantly — no waiting for vcpkg or apt installs.
+#
+# Build (one-time, ~40 min):
+#   docker build -t yuzu-ci -f deploy/docker/Dockerfile.ci .
+#
+# Usage — GCC 13 debug:
+#   docker run --rm -v "$(pwd):/src" yuzu-ci gcc-13 debug
+#
+# Usage — Clang 18 release:
+#   docker run --rm -v "$(pwd):/src" yuzu-ci clang-18 release
+#
+# Usage — interactive shell:
+#   docker run --rm -it -v "$(pwd):/src" yuzu-ci bash
+
+FROM ubuntu:24.04
+
+# ── System packages (matches ci.yml) ─────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+        cmake ninja-build pkg-config curl zip unzip tar \
+        python3-pip ccache git \
+        gcc-13 g++-13 clang-18 \
+    && pip3 install --break-system-packages meson==1.9.2 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
+
+# ── Bootstrap vcpkg ──────────────────────────────────────────────────────
+RUN git clone https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && cd /opt/vcpkg \
+    && git checkout ${VCPKG_COMMIT} \
+    && ./bootstrap-vcpkg.sh -disableMetrics
+
+ENV VCPKG_ROOT=/opt/vcpkg
+ENV PATH="/opt/vcpkg:${PATH}"
+
+# ── Install vcpkg packages (the expensive step — cached in the image) ───
+WORKDIR /tmp/vcpkg-build
+COPY vcpkg.json vcpkg-configuration.json ./
+RUN /opt/vcpkg/vcpkg install \
+        --triplet x64-linux \
+        --x-manifest-root=/tmp/vcpkg-build \
+    && cp -r /tmp/vcpkg-build/vcpkg_installed /opt/vcpkg_installed \
+    && rm -rf /tmp/vcpkg-build
+
+# ── ccache config ────────────────────────────────────────────────────────
+ENV CCACHE_MAXSIZE=2G
+ENV CCACHE_COMPRESS=true
+ENV CCACHE_DIR=/ccache
+
+# ── Entrypoint script ───────────────────────────────────────────────────
+COPY deploy/docker/ci-entrypoint.sh /usr/local/bin/ci-entrypoint.sh
+RUN chmod +x /usr/local/bin/ci-entrypoint.sh
+
+WORKDIR /build
+ENTRYPOINT ["ci-entrypoint.sh"]
+CMD ["gcc-13", "debug"]

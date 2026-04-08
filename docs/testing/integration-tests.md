@@ -84,7 +84,7 @@ meson test -C builddir --print-errorlogs
 │                  │ │                  │ │                  │
 │  Ports:          │ │  Ports:          │ │  Connects to:    │
 │  - :50050 agent  │ │  - :50051 agent  │ │  Gateway :50051  │
-│  - :50054 gw     │ │  - :50052 mgmt   │ │                  │
+│  - :50051 gw     │ │  - :50052 mgmt   │ │                  │
 │  - :8090 web     │ │                  │ │                  │
 └──────────────────┘ └──────────────────┘ └──────────────────┘
          ▲                   │

@@ -16,6 +16,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
