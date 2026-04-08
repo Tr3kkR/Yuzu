@@ -52,21 +52,23 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Install vcpkg packages
+      - name: Install vcpkg packages (static linkage)
         run: |
-          vcpkg install --triplet x64-linux --x-manifest-root=${{ github.workspace }}
+          vcpkg install --triplet x64-linux-static \
+            --overlay-triplets=${{ github.workspace }}/triplets \
+            --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson release)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=release \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-static \
             -Dbuild_tests=false
 
       - name: Build
@@ -418,7 +420,7 @@ jobs:
 
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-windows-x64.zip"
 
-      - name: Build Windows installer (InnoSetup)
+      - name: Build Windows installers (InnoSetup)
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
@@ -431,23 +433,32 @@ jobs:
             exit 1
           }
 
-          # Compile the installer
+          # Build agent installer
+          Write-Host "=== Building Agent Installer ==="
           & $iscc `
             "/DAppVersion=${version}" `
             "/DBuildDir=${{ github.workspace }}\builddir" `
             "deploy\packaging\windows\yuzu-agent.iss"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Agent installer failed"; exit 1 }
 
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "InnoSetup compilation failed"
-            exit 1
-          }
+          $agentInstaller = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
+          Copy-Item $agentInstaller "YuzuAgentSetup-${version}.exe"
+          Write-Host "Agent installer: $('{0:N1} MB' -f ((Get-Item $agentInstaller).Length / 1MB))"
 
-          # Move installer to workspace root for easy artifact upload
-          $installer = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
-          Copy-Item $installer "YuzuAgentSetup-${version}.exe"
-          Write-Host "Installer built: YuzuAgentSetup-${version}.exe ($('{0:N1} MB' -f ((Get-Item $installer).Length / 1MB)))"
+          # Build server installer
+          Write-Host "=== Building Server Installer ==="
+          & $iscc `
+            "/DAppVersion=${version}" `
+            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "/DContentDir=${{ github.workspace }}\content" `
+            "deploy\packaging\windows\yuzu-server.iss"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
 
-      - name: Sign installer (Authenticode)
+          $serverInstaller = "deploy\packaging\windows\output\YuzuServerSetup-${version}.exe"
+          Copy-Item $serverInstaller "YuzuServerSetup-${version}.exe"
+          Write-Host "Server installer: $('{0:N1} MB' -f ((Get-Item $serverInstaller).Length / 1MB))"
+
+      - name: Sign installers (Authenticode)
         if: env.HAS_SIGNING_CERT == 'true'
         env:
           WINDOWS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
@@ -455,7 +466,6 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
-          $installer = "YuzuAgentSetup-${version}.exe"
 
           $certPath = "${{ runner.temp }}\signing-cert.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
@@ -465,17 +475,21 @@ jobs:
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1 -ExpandProperty FullName
 
-          Write-Host "Signing installer: $installer"
-          & $signtool sign `
-            /f $certPath `
-            /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
-            /fd sha256 `
-            /tr http://timestamp.digicert.com `
-            /td sha256 `
-            /d "Yuzu Agent Installer" `
-            $installer
+          foreach ($installer in @("YuzuAgentSetup-${version}.exe", "YuzuServerSetup-${version}.exe")) {
+            if (Test-Path $installer) {
+              Write-Host "Signing: $installer"
+              & $signtool sign `
+                /f $certPath `
+                /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
+                /fd sha256 `
+                /tr http://timestamp.digicert.com `
+                /td sha256 `
+                /d "Yuzu Endpoint Management" `
+                $installer
+              & $signtool verify /pa $installer
+            }
+          }
 
-          & $signtool verify /pa $installer
           Remove-Item $certPath -Force
 
       - name: Upload archive artifact
@@ -485,11 +499,13 @@ jobs:
           path: yuzu-windows-x64.zip
           retention-days: 3
 
-      - name: Upload installer artifact
+      - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: yuzu-windows-installer
-          path: YuzuAgentSetup-*.exe
+          path: |
+            YuzuAgentSetup-*.exe
+            YuzuServerSetup-*.exe
           retention-days: 3
 
   # ── macOS ARM64 release build ────────────────────────────────────────
@@ -825,12 +841,17 @@ jobs:
           | Component | Windows | macOS | Debian/Ubuntu | RHEL/Fedora |
           |---|---|---|---|---|
           | Agent | \`.exe\` (InnoSetup) | \`.pkg\` (launchd) | \`.deb\` (systemd) | \`.rpm\` (systemd) |
-          | Server | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
+          | Server | \`.exe\` (InnoSetup) | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
           | Gateway | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
+          # Agent
           YuzuAgentSetup-*.exe /VERYSILENT /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
+
+          # Server
+          YuzuServerSetup-*.exe /VERYSILENT /ADMIN_USER=admin /ADMIN_PASS=<password> \`
+            /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
 
           ### macOS silent install (Jamf / MDM)
@@ -904,6 +925,7 @@ jobs:
             artifacts/yuzu-gateway-linux-x64.tar.gz \
             artifacts/yuzu-windows-x64.zip \
             artifacts/YuzuAgentSetup-*.exe \
+            artifacts/YuzuServerSetup-*.exe \
             artifacts/YuzuAgent-*.pkg \
             artifacts/yuzu-macos-arm64.tar.gz \
             artifacts/*.deb \
