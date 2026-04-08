@@ -41,6 +41,9 @@ done
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$TOPDIR/SOURCES/"
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$TOPDIR/SOURCES/"
 
+# Agent core shared library (plugins link against it)
+find "$BIN_DIR" -name 'libyuzu_agent_core.so*' -exec cp {} "$TOPDIR/SOURCES/" \; 2>/dev/null || true
+
 # Plugins — check both builddir/plugins/ (deploy_dlls layout) and agents/plugins/ (meson layout)
 mkdir -p "$TOPDIR/SOURCES/plugins"
 if [[ -d "$BIN_DIR/plugins" ]]; then

@@ -90,10 +90,22 @@ else
 fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-agent.service" "$PKG/usr/lib/systemd/system/"
 
+# Agent core shared library (plugins link against it)
+AGENT_CORE_FOUND=0
+find "$BIN_DIR" -name 'libyuzu_agent_core.so*' -exec cp {} "$PKG/usr/lib/yuzu/" \; 2>/dev/null && AGENT_CORE_FOUND=1
+if [[ "$AGENT_CORE_FOUND" -eq 0 ]] || ! ls "$PKG/usr/lib/yuzu/libyuzu_agent_core.so"* >/dev/null 2>&1; then
+    echo "WARNING: libyuzu_agent_core.so not found in $BIN_DIR — agent may fail to start" >&2
+fi
+
+# Plugin shared libraries
 if [[ -d "$BIN_DIR/plugins" ]]; then
     cp "$BIN_DIR/plugins/"*.so "$PKG/usr/lib/yuzu/plugins/" 2>/dev/null || true
 fi
 find "$BIN_DIR/agents/plugins" -name '*.so' -exec cp {} "$PKG/usr/lib/yuzu/plugins/" \; 2>/dev/null || true
+
+# ldconfig configuration so the linker can find libyuzu_agent_core.so
+mkdir -p "$PKG/etc/ld.so.conf.d"
+echo "/usr/lib/yuzu" > "$PKG/etc/ld.so.conf.d/yuzu.conf"
 
 cat > "$PKG/DEBIAN/control" <<EOF
 Package: yuzu-agent

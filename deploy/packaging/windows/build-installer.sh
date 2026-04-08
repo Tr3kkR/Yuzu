@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Build the Yuzu Agent Windows installer.
+# Build Yuzu Windows installers (agent, server, or both).
 #
 # Usage:
-#   bash deploy/packaging/windows/build-installer.sh [--builddir DIR] [--version VER]
+#   bash deploy/packaging/windows/build-installer.sh [--builddir DIR] [--version VER] [--target agent|server|all]
 #
 # Defaults:
 #   --builddir  builddir       (relative to repo root)
 #   --version   extracted from meson.build
+#   --target    all
 #
 # Requires: InnoSetup 6 (ISCC.exe on PATH, or installed via Chocolatey)
 
@@ -18,14 +19,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Defaults
 BUILD_DIR="$REPO_ROOT/builddir"
 VERSION=""
+TARGET="all"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --builddir) BUILD_DIR="$2"; shift 2 ;;
         --version)  VERSION="$2"; shift 2 ;;
+        --target)   TARGET="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--builddir DIR] [--version VER]"
+            echo "Usage: $0 [--builddir DIR] [--version VER] [--target agent|server|all]"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -41,28 +44,10 @@ if [[ -z "$VERSION" ]]; then
     fi
 fi
 
-echo "=== Yuzu Agent Installer Builder ==="
+echo "=== Yuzu Windows Installer Builder ==="
 echo "Version:   $VERSION"
 echo "Build dir: $BUILD_DIR"
-echo ""
-
-# Verify build artifacts exist
-if [[ ! -f "$BUILD_DIR/agents/core/yuzu-agent.exe" ]]; then
-    echo "ERROR: yuzu-agent.exe not found in $BUILD_DIR/agents/core/" >&2
-    echo "Run 'meson compile -C builddir' first." >&2
-    exit 1
-fi
-
-PLUGIN_COUNT=$(ls "$BUILD_DIR/plugins/"*.dll 2>/dev/null | wc -l)
-if [[ "$PLUGIN_COUNT" -eq 0 ]]; then
-    echo "ERROR: No plugin DLLs found in $BUILD_DIR/plugins/" >&2
-    exit 1
-fi
-
-DLL_COUNT=$(ls "$BUILD_DIR/agents/core/"*.dll 2>/dev/null | wc -l)
-echo "Agent exe:    found"
-echo "Runtime DLLs: $DLL_COUNT"
-echo "Plugin DLLs:  $PLUGIN_COUNT"
+echo "Target:    $TARGET"
 echo ""
 
 # Find ISCC.exe
@@ -81,28 +66,63 @@ else
 fi
 
 echo "ISCC: $ISCC"
-echo ""
 
 # Create output directory
 mkdir -p "$SCRIPT_DIR/output"
 
 # Convert paths to Windows format for ISCC
 WIN_BUILD_DIR=$(cygpath -w "$BUILD_DIR" 2>/dev/null || echo "$BUILD_DIR")
-WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-agent.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-agent.iss")
+WIN_CONTENT_DIR=$(cygpath -w "$REPO_ROOT/content" 2>/dev/null || echo "$REPO_ROOT/content")
 
-echo "Building installer..."
-# MSYS_NO_PATHCONV prevents MSYS2 from mangling /D flags into Unix paths
-MSYS_NO_PATHCONV=1 "$ISCC" \
-    "/DAppVersion=$VERSION" \
-    "/DBuildDir=$WIN_BUILD_DIR" \
-    "$WIN_ISS"
+# ── Build agent installer ──
+if [[ "$TARGET" == "agent" || "$TARGET" == "all" ]]; then
+    echo ""
+    echo "=== Building Agent Installer ==="
+
+    if [[ ! -f "$BUILD_DIR/agents/core/yuzu-agent.exe" ]]; then
+        echo "ERROR: yuzu-agent.exe not found in $BUILD_DIR/agents/core/" >&2
+        echo "Run 'meson compile -C builddir' first." >&2
+        exit 1
+    fi
+
+    AGENT_DLL_COUNT=$(ls "$BUILD_DIR/agents/core/"*.dll 2>/dev/null | wc -l)
+    echo "Agent exe:    found"
+    echo "Runtime DLLs: $AGENT_DLL_COUNT"
+
+    WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-agent.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-agent.iss")
+
+    MSYS_NO_PATHCONV=1 "$ISCC" \
+        "/DAppVersion=$VERSION" \
+        "/DBuildDir=$WIN_BUILD_DIR" \
+        "$WIN_ISS"
+
+    echo "Built: $SCRIPT_DIR/output/YuzuAgentSetup-$VERSION.exe"
+fi
+
+# ── Build server installer ──
+if [[ "$TARGET" == "server" || "$TARGET" == "all" ]]; then
+    echo ""
+    echo "=== Building Server Installer ==="
+
+    if [[ ! -f "$BUILD_DIR/server/core/yuzu-server.exe" ]]; then
+        echo "ERROR: yuzu-server.exe not found in $BUILD_DIR/server/core/" >&2
+        echo "Run 'meson compile -C builddir' first." >&2
+        exit 1
+    fi
+
+    echo "Server exe:   found"
+
+    WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-server.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-server.iss")
+
+    MSYS_NO_PATHCONV=1 "$ISCC" \
+        "/DAppVersion=$VERSION" \
+        "/DBuildDir=$WIN_BUILD_DIR" \
+        "/DContentDir=$WIN_CONTENT_DIR" \
+        "$WIN_ISS"
+
+    echo "Built: $SCRIPT_DIR/output/YuzuServerSetup-$VERSION.exe"
+fi
 
 echo ""
 echo "=== Build complete ==="
-OUTPUT="$SCRIPT_DIR/output/YuzuAgentSetup-$VERSION.exe"
-if [[ -f "$OUTPUT" ]]; then
-    SIZE=$(du -h "$OUTPUT" | cut -f1)
-    echo "Output: $OUTPUT ($SIZE)"
-else
-    echo "Output: $SCRIPT_DIR/output/YuzuAgentSetup-$VERSION.exe"
-fi
+ls -lh "$SCRIPT_DIR/output/"*.exe 2>/dev/null || true

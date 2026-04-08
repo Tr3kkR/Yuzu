@@ -31,6 +31,11 @@ case "$1" in
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
         fi
 
+        # Update shared library cache (agent ships libyuzu_agent_core.so)
+        if [[ "$COMPONENT" == "yuzu-agent" ]]; then
+            ldconfig || true
+        fi
+
         # Enable systemd service
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload

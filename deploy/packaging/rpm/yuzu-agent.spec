@@ -16,6 +16,15 @@ install -D -m 0644 %{_sourcedir}/yuzu-agent.service %{buildroot}%{_unitdir}/yuzu
 install -d -m 0755 %{buildroot}%{_libdir}/yuzu/plugins
 install -d -m 0750 %{buildroot}/var/lib/yuzu-agent
 
+# Agent core shared library (plugins link against it)
+if ls %{_sourcedir}/libyuzu_agent_core.so* 1>/dev/null 2>&1; then
+    install -m 0755 %{_sourcedir}/libyuzu_agent_core.so* %{buildroot}%{_libdir}/yuzu/
+fi
+
+# ldconfig configuration
+install -D -m 0644 /dev/null %{buildroot}/etc/ld.so.conf.d/yuzu.conf
+echo "%{_libdir}/yuzu" > %{buildroot}/etc/ld.so.conf.d/yuzu.conf
+
 # Install plugins if present
 if ls %{_sourcedir}/plugins/*.so 1>/dev/null 2>&1; then
     install -m 0755 %{_sourcedir}/plugins/*.so %{buildroot}%{_libdir}/yuzu/plugins/
@@ -39,6 +48,9 @@ ldconfig
 %files
 %{_bindir}/yuzu-agent
 %{_unitdir}/yuzu-agent.service
+%dir %{_libdir}/yuzu
+%{_libdir}/yuzu/libyuzu_agent_core.so*
 %dir %{_libdir}/yuzu/plugins
 %{_libdir}/yuzu/plugins/*.so
+/etc/ld.so.conf.d/yuzu.conf
 %dir %attr(0750,yuzu-agent,yuzu-agent) /var/lib/yuzu-agent
