@@ -451,13 +451,18 @@ extern const char* const kDashboardIndexHtml =
     <div class="table-wrap" hx-ext="sse" sse-connect="/events">
       <table id="results-table">
         <thead id="results-thead"><tr></tr></thead>
-        <tbody id="results-tbody" sse-swap="output" hx-swap="beforeend show:bottom">
+        <tbody id="results-tbody">
           <tr id="empty-row"><td colspan="1" class="empty-state">
             Type an instruction above and press <strong>Send</strong> to execute.
           </td></tr>
         </tbody>
       </table>
-      <!-- Hidden sinks for OOB swap events -->
+      <!-- Hidden sinks for OOB swap events.  All SSE events use
+           hx-swap="none" so only OOB-targeted elements are processed.
+           This avoids mixing <tr> and <span> in the same fragment,
+           which breaks under the browser's table content model
+           (foster parenting ejects non-table elements). -->
+      <div sse-swap="output" hx-swap="none" style="display:none"></div>
       <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
       <div sse-swap="timing" hx-swap="none" style="display:none"></div>
       <div sse-swap="heartbeat" hx-swap="none" style="display:none"
