@@ -862,11 +862,10 @@ jobs:
 
           \`\`\`bash
           docker pull ghcr.io/${OWNER}/yuzu-server:${TAG}
-          docker pull ghcr.io/${OWNER}/yuzu-agent:${TAG}
           docker pull ghcr.io/${OWNER}/yuzu-gateway:${TAG}
           \`\`\`
 
-          Multi-arch: \`linux/amd64\`, \`linux/arm64\`
+          Architecture: \`linux/amd64\`. Docker images are published separately after the release is created.
 
           ### Verify checksums
 
