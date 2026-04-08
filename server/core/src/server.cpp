@@ -4102,9 +4102,28 @@ private:
 
                 if (sent > 0) {
                     metrics_.counter("yuzu_commands_dispatched_total").increment();
+                    // Publish RUNNING status + clear results via SSE.
+                    // This MUST happen via SSE (not in the POST response)
+                    // because the POST response races with SSE output
+                    // events — fast agents respond before the browser
+                    // receives the POST reply, and an innerHTML OOB in
+                    // the POST response would wipe already-displayed rows.
+                    //
+                    // Each OOB element is published separately to avoid
+                    // mixing table elements (<tbody>) with non-table
+                    // elements (<span>, <strong>) in the same fragment.
+                    // Browsers apply table content model rules during
+                    // fragment parsing and silently discard <tbody> tags
+                    // outside a <table> context (foster parenting).
                     event_bus_.publish("command-status",
                         "<span id=\"status-badge\" class=\"badge-running\""
                         " hx-swap-oob=\"outerHTML\">RUNNING</span>");
+                    event_bus_.publish("output",
+                        "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
+                        "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
+                        "Waiting for results...</td></tr></tbody>");
+                    event_bus_.publish("output",
+                        "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
                 }
                 return {command_id, sent};
             },

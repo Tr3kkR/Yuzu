@@ -773,7 +773,18 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id,
                                    : col_names;
 
         auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        auto html = render_row(agent_name, plugin, line, effective_cols);
+        auto row_html = render_row(agent_name, plugin, line, effective_cols);
+
+        // All elements must be OOB-targeted — the SSE sink uses
+        // hx-swap="none".  Mixing <tr> and <span> in a single
+        // fragment breaks under the browser's table content model
+        // (foster parenting ejects non-table elements, losing the
+        // swap target).
+        std::string html;
+        // OOB: append rows to results tbody
+        html += "<tbody id=\"results-tbody\" hx-swap-oob=\"beforeend\">";
+        html += row_html;
+        html += "</tbody>";
         // OOB: live row count
         html += "<span id=\"row-count\" hx-swap-oob=\"true\">";
         html += std::to_string(count);

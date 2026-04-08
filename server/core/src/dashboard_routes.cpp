@@ -394,29 +394,23 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  }
                  html += "</tr></thead>";
 
-                 // Clear tbody — necessary to remove stale content (e.g. help
-                 // rows).  If the command completes before this response arrives,
-                 // the SSE rows will be wiped — but the filter bar self-refreshes
-                 // after 2s and the user can re-fetch from ResponseStore.
-                 html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
-                         "<tr id=\"empty-row\"><td colspan=\"" +
-                         std::to_string(col_names.size()) +
-                         "\" class=\"empty-state\">Waiting for results...</td></tr>"
-                         "</tbody>";
+                 // tbody is cleared via the SSE command-status:RUNNING
+                 // event (published by the DispatchFn before this POST
+                 // response returns).  Clearing it here would race with
+                 // SSE output events — fast agents respond before the
+                 // browser receives this POST reply, so an innerHTML OOB
+                 // here would wipe already-displayed result rows.
 
-                 // OOB: status badge → RUNNING
-                 html += "<span id=\"status-badge\" class=\"badge-running\""
-                         " hx-swap-oob=\"outerHTML\">RUNNING</span>";
+                 // Status badge and row count are set by the SSE
+                 // command-status:RUNNING event (no OOB here — it
+                 // would race with SSE updates from fast agents).
 
-                 // OOB: result context
+                 // OOB: result context (only set here, no SSE race)
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
                          " style=\"font-size:0.75rem;color:#8b949e\">" +
                          html_escape(instruction) + " &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
-
-                 // OOB: row count reset
-                 html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
 
                  // OOB: filter bar — initially empty, self-refreshes after
                  // results arrive (facets are stored when agent responds,
