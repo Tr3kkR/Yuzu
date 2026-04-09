@@ -143,6 +143,93 @@ location /api/ {
 }
 ```
 
+## HTTP Security Response Headers
+
+Yuzu sets six standard security response headers on every HTTP response from the server (dashboard, REST API, MCP, metrics, health probes, error pages). No configuration is required to enable them.
+
+| Header | Value | Purpose |
+|---|---|---|
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'[; upgrade-insecure-requests]` | Restricts which sources can be loaded by the dashboard. Defends against XSS, clickjacking, and content injection. `upgrade-insecure-requests` is appended only when HTTPS is enabled. |
+| `X-Frame-Options` | `DENY` | Blocks the dashboard from being embedded in any `<iframe>`. Defense-in-depth alongside CSP `frame-ancestors 'none'`. |
+| `X-Content-Type-Options` | `nosniff` | Prevents MIME-type sniffing attacks. Browsers must respect the declared `Content-Type`. |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Sends only the origin (not the full URL with query strings) when navigating cross-origin. Defends against URL-based secret leakage to third-party sites. |
+| `Permissions-Policy` | `accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()` | Deny-all baseline for browser feature APIs the dashboard never uses. `fullscreen=(self)` is permitted for same-origin chart libraries. |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | (HTTPS only) Tells browsers to always use HTTPS for this origin for one year. Defends against TLS downgrade attacks. Only sent when `https_enabled` is true, per RFC 6797 §7.2. |
+
+At server startup, the resolved header bundle is logged at INFO level so operators can confirm activation:
+
+```
+[info] Security headers active: CSP=277 bytes, HSTS=on, Referrer-Policy="strict-origin-when-cross-origin", Permissions-Policy=315 bytes
+```
+
+### Why `'unsafe-inline'` for scripts and styles
+
+The HTMX dashboard uses inline `<script>` blocks, inline `onclick=` event handlers, and inline `<style>` blocks. Tightening to a strict nonce-based CSP would require refactoring all event handlers to `addEventListener` and threading per-request nonces through every HTML render path. This work is tracked separately. The current CSP is restrictive enough to block external script injection while keeping the dashboard functional.
+
+### `https://unpkg.com` allowance
+
+The dashboard loads `htmx.org` and `htmx-ext-sse` from unpkg with Subresource Integrity (SRI) hashes pinned in the HTML. The CSP whitelists `https://unpkg.com` for `script-src` so these CDN scripts can load. SRI ensures that even a CDN compromise would fail the integrity check and the browser would reject the script. To use a vendored copy instead, mirror the HTMX assets under your own origin and remove `unpkg.com` from the CSP via a future build option.
+
+### Extending CSP for customer environments
+
+Some deployments need to reach additional origins from the dashboard — a customer-hosted CDN, a monitoring beacon (e.g. New Relic, Sentry), an analytics endpoint, or a custom favicon host. Use `--csp-extra-sources` to append additional source-list entries to the `script-src`, `style-src`, `connect-src`, and `img-src` directives:
+
+```bash
+yuzu-server \
+  --csp-extra-sources "https://cdn.example.com https://beacon.example.com"
+```
+
+The argument is a single space-separated string. Each entry is appended to all four directives. To set this via environment variable:
+
+```bash
+export YUZU_CSP_EXTRA_SOURCES="https://cdn.example.com https://beacon.example.com"
+yuzu-server
+```
+
+#### Validation
+
+The flag is validated at startup. The server will refuse to start with a clear error message if the value contains:
+
+- Control bytes (0x00–0x1F except SP/HTAB, plus 0x7F) — these would cause cpp-httplib's header validation to silently drop the entire CSP header.
+- Semicolons (`;`) or commas (`,`) — these would inject additional CSP directives.
+- Quoted CSP keywords other than the safe allow-list `'self'`, `'none'`, or `'sha256-...'`/`'sha384-...'`/`'sha512-...'`/`'nonce-...'` hash and nonce expressions. Notably `'unsafe-eval'` and `'strict-dynamic'` are **rejected** — operators who genuinely need them must extend the server build and accept the security trade-off.
+- Unquoted tokens with stray single quotes (malformed sources).
+
+For example:
+
+```bash
+# Rejected at startup with: csp_extra_sources contains forbidden control byte 0x0d at position 18
+yuzu-server --csp-extra-sources $'https://ok.example\rInjected'
+
+# Rejected at startup with: csp_extra_sources token "'unsafe-eval'" is not a valid CSP source expression
+yuzu-server --csp-extra-sources "'unsafe-eval'"
+```
+
+### Behind a reverse proxy
+
+If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) that **also** sets a `Content-Security-Policy` header, the browser will see two CSP headers and apply the **intersection** of both policies — the strictest combined policy wins. This can be confusing when debugging "why is my extra source blocked?" — check both layers. If your proxy sets its own CSP, either:
+
+- Disable the proxy's CSP and let Yuzu's CSP apply, or
+- Disable Yuzu's CSP via the proxy's `proxy_hide_header Content-Security-Policy;` directive, or
+- Match both policies so the intersection allows what you need.
+
+The same applies to all other security headers — if both layers set them, browsers honor the strictest.
+
+### Verifying headers
+
+Run the dashboard and inspect the response headers in your browser's developer tools (Network tab → click any request → Response Headers), or with `curl`:
+
+```bash
+curl -sk -i https://yuzu.example.com:8443/livez \
+  | grep -E '^(Content-Security|X-Frame|X-Content|Referrer-Policy|Permissions-Policy|Strict-Transport)'
+```
+
+You should see all six headers present on HTTPS responses (and the first five on HTTP responses).
+
+### Bandwidth note
+
+The six security headers add roughly 700–900 bytes per HTTP response depending on whether `--csp-extra-sources` is set. For a fleet that pulls heavily from the REST API (e.g. an analytics pipeline polling `/api/v1/responses` thousands of times per hour), this is a non-trivial increase in egress on metered connections. Plan capacity accordingly. The headers cannot be disabled.
+
 ## Audit Log Forwarding
 
 Configure webhooks to forward audit events to your SIEM:

@@ -63,6 +63,7 @@
 #include "patch_manager.hpp"
 #include "process_health.hpp"
 #include "rate_limiter.hpp"
+#include "security_headers.hpp"
 
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
@@ -192,6 +193,7 @@ public:
         metrics_.describe("yuzu_commands_completed_total",
                           "Total number of completed commands by status", "counter");
         metrics_.describe("yuzu_command_duration_seconds", "Command execution latency in seconds",
+
                           "histogram");
         metrics_.describe("yuzu_grpc_requests_total", "Total gRPC requests by method and status",
                           "counter");
@@ -1377,9 +1379,35 @@ private:
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
         auth_routes_->register_routes(*web_server_);
 
-        // -- HTTP metrics + CORS (post-routing handler) --------------------------
+        // -- HTTP metrics + CORS + security headers (post-routing handler) -------
+        // Security headers (SOC2-C1) — pre-compute the static header bundle
+        // ONCE at startup and capture it by value into the lambda. The same
+        // HeaderBundle code path is exercised by the unit tests in
+        // tests/unit/server/test_security_headers.cpp, so a regression in the
+        // bundle would be caught by CI before reaching the post-routing
+        // handler.
+        //
+        // Pre-condition: cfg_.csp_extra_sources has already been validated by
+        // main.cpp via security::validate_csp_extra_sources before
+        // Server::create was called.
+        const auto security_headers =
+            security::HeaderBundle::make(cfg_.csp_extra_sources, cfg_.https_enabled);
+        spdlog::info(
+            "Security headers active: CSP={} bytes, HSTS={}, "
+            "Referrer-Policy=\"{}\", Permissions-Policy={} bytes",
+            security_headers.csp.size(),
+            security_headers.https_enabled ? "on" : "off",
+            security_headers.referrer_policy,
+            security_headers.permissions_policy.size());
+        spdlog::debug("Resolved Content-Security-Policy: {}", security_headers.csp);
         web_server_->set_post_routing_handler(
-            [this](const httplib::Request& req, httplib::Response& res) {
+            [this, security_headers](
+                const httplib::Request& req, httplib::Response& res) {
+                // -- Security response headers (SOC2-C1) ---------------------
+                // Applied to ALL responses (dashboard, API, metrics, health,
+                // error pages).
+                security_headers.apply(res);
+
                 // CORS headers for all /api/ responses (H6)
                 // Only reflect Origin if it matches the server's own origin
                 // to prevent credentialed cross-origin attacks.

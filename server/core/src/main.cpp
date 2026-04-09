@@ -3,6 +3,8 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "security_headers.hpp"
+
 #include <CLI/CLI.hpp>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -149,6 +151,12 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
         ->envname("YUZU_METRICS_NO_AUTH");
 
+    // Security response headers (SOC2-C1)
+    app.add_option("--csp-extra-sources", cfg.csp_extra_sources,
+                   "Extra CSP sources appended to script-src/style-src/connect-src/img-src "
+                   "(space-separated, e.g. \"https://cdn.example.com https://beacon.example.com\")")
+        ->envname("YUZU_CSP_EXTRA_SOURCES");
+
     // MCP (Model Context Protocol) server
     app.add_flag("--mcp-disable", cfg.mcp_disable,
                  "Disable MCP endpoint entirely (rejects all /mcp/v1/ requests)")
@@ -275,6 +283,18 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
+    // Done immediately after CLI parse so operators see a clear startup
+    // error rather than a silently-dropped CSP header on every response.
+    if (auto validated = yuzu::server::security::validate_csp_extra_sources(
+            cfg.csp_extra_sources);
+        validated.has_value()) {
+        cfg.csp_extra_sources = std::move(*validated);
+    } else {
+        std::cerr << "Invalid --csp-extra-sources: " << validated.error() << "\n";
+        return EXIT_FAILURE;
+    }
 
 #ifdef _WIN32
     if (install_service || remove_service) {
