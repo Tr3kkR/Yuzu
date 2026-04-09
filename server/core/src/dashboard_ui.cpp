@@ -354,8 +354,7 @@ extern const char* const kDashboardIndexHtml =
 
   <!-- ── Instruction Bar ────────────────────────────────────── -->
   <form class="instr-bar" id="instr-form"
-        hx-post="/api/dashboard/execute" hx-swap="none"
-        hx-on::before-request="closeAC()">
+        hx-post="/api/dashboard/execute" hx-swap="none">
     <label>Instruction</label>
     <div class="instr-wrap">
       <input type="text" id="instr-input" name="instruction"
@@ -465,12 +464,9 @@ extern const char* const kDashboardIndexHtml =
       <div sse-swap="output" hx-swap="none" style="display:none"></div>
       <div sse-swap="command-status" hx-swap="none" style="display:none"></div>
       <div sse-swap="timing" hx-swap="none" style="display:none"></div>
-      <div sse-swap="heartbeat" hx-swap="none" style="display:none"
-           hx-on:htmx:sse-message="clearTimeout(window._ht);window._ht=setTimeout(function(){var w=document.querySelector('[sse-connect]');if(w){w.removeAttribute('sse-connect');setTimeout(function(){w.setAttribute('sse-connect','/events');htmx.process(w)},100)}},10000)"></div>
-      <div sse-swap="agent-online" hx-swap="none" style="display:none"
-           hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
-      <div sse-swap="agent-offline" hx-swap="none" style="display:none"
-           hx-on:htmx:sse-message="htmx.trigger(document.body, 'agentChanged')"></div>
+      <div sse-swap="heartbeat" hx-swap="none" style="display:none"></div>
+      <div sse-swap="agent-online" hx-swap="none" style="display:none"></div>
+      <div sse-swap="agent-offline" hx-swap="none" style="display:none"></div>
     </div>
     <!-- Pagination + group creation slot — populated by OOB swaps -->
     <nav id="result-pagination"></nav>
@@ -485,9 +481,7 @@ extern const char* const kDashboardIndexHtml =
     <div class="scope-list" id="scope-list"
          hx-get="/fragments/scope-list"
          hx-trigger="load, every 5s, agentChanged from:body"
-         hx-swap="innerHTML"
-         hx-vals="js:{selected: selectedScope || '__all__'}"
-         hx-on::after-swap="var d=this.querySelector('#scope-data'); if(d){agents=JSON.parse(d.dataset.agents);cmdPalette.agentsCache=null;}">
+         hx-swap="innerHTML">
     </div>
   </div>
 
@@ -495,16 +489,14 @@ extern const char* const kDashboardIndexHtml =
 
   <!-- HTMX-driven data loaders (no JS fetch calls) -->
   <div id="help-loader" hx-get="/api/help" hx-trigger="load, agentChanged from:body"
-       hx-swap="none" style="display:none"
-       hx-on::after-request="if(event.detail.successful) buildInstructionMap(JSON.parse(event.detail.xhr.responseText));"></div>
+       hx-swap="none" style="display:none"></div>
 
   <!-- Declarative help trigger — fires on loadHelp event, reads filter from input -->
   <div id="help-trigger" style="display:none"
        hx-get="/api/help/html"
        hx-target="#results-tbody"
        hx-swap="innerHTML settle:0ms"
-       hx-trigger="loadHelp from:body"
-       hx-vals="js:{filter: (document.getElementById('instr-input').value.replace(/^help\\s*/i,'') || '').trim().toLowerCase()}">
+       hx-trigger="loadHelp from:body">
   </div>
 
   </div><!-- /.dashboard-grid -->
@@ -1172,6 +1164,100 @@ extern const char* const kDashboardIndexHtml =
         return;
       }
     });
+
+    /* ── CSP-safe HTMX bindings ─────────────────────────────
+       The dashboard's strict CSP forbids 'unsafe-eval', so HTMX
+       features that internally call new Function(...) — namely
+       hx-on:* attributes and hx-vals="js:..." — are blocked at
+       runtime. We re-create each broken handler here using
+       addEventListener (covered by 'unsafe-inline') and the
+       htmx:configRequest event (no eval). */
+
+    /* hx-vals="js:..." replacements: inject params per request */
+    document.body.addEventListener('htmx:configRequest', function(e) {
+      var elt = e.detail && e.detail.elt;
+      if (!elt) return;
+      if (elt.id === 'scope-list') {
+        e.detail.parameters.selected =
+          (typeof selectedScope !== 'undefined' && selectedScope) || '__all__';
+      } else if (elt.id === 'help-trigger') {
+        var input = document.getElementById('instr-input');
+        var v = input ? input.value.replace(/^help\s*/i, '').trim().toLowerCase() : '';
+        e.detail.parameters.filter = v;
+      }
+    });
+
+    /* instr-form: close autocomplete before submit */
+    var instrForm = document.getElementById('instr-form');
+    if (instrForm) {
+      instrForm.addEventListener('htmx:beforeRequest', function() {
+        if (typeof closeAC === 'function') closeAC();
+      });
+    }
+
+    /* SSE heartbeat watchdog: reconnect /events if no message in 10s */
+    var heartbeatEl = document.querySelector('[sse-swap="heartbeat"]');
+    if (heartbeatEl) {
+      heartbeatEl.addEventListener('htmx:sseMessage', function() {
+        clearTimeout(window._ht);
+        window._ht = setTimeout(function() {
+          var w = document.querySelector('[sse-connect]');
+          if (w) {
+            w.removeAttribute('sse-connect');
+            setTimeout(function() {
+              w.setAttribute('sse-connect', '/events');
+              htmx.process(w);
+            }, 100);
+          }
+        }, 10000);
+      });
+    }
+
+    /* Agent online/offline → trigger agentChanged on body */
+    ['[sse-swap="agent-online"]', '[sse-swap="agent-offline"]'].forEach(function(sel) {
+      var el = document.querySelector(sel);
+      if (el) {
+        el.addEventListener('htmx:sseMessage', function() {
+          htmx.trigger(document.body, 'agentChanged');
+        });
+      }
+    });
+
+    /* scope-list after-swap: parse #scope-data, refresh agents map.
+       Server returns a JSON ARRAY of agent objects but the rest of
+       the JS expects a {agent_id: agentObj} map, so convert here. */
+    var scopeListEl = document.getElementById('scope-list');
+    if (scopeListEl) {
+      scopeListEl.addEventListener('htmx:afterSwap', function() {
+        var d = scopeListEl.querySelector('#scope-data');
+        if (!d) return;
+        try {
+          var raw = JSON.parse(d.dataset.agents || '[]');
+          var map = {};
+          if (Array.isArray(raw)) {
+            for (var i = 0; i < raw.length; i++) {
+              if (raw[i] && raw[i].agent_id) map[raw[i].agent_id] = raw[i];
+            }
+          } else if (raw && typeof raw === 'object') {
+            map = raw;
+          }
+          agents = map;
+          cmdPalette.agentsCache = null;
+        } catch (err) { /* swallow parse errors */ }
+      });
+    }
+
+    /* help-loader after-request: build instructionMap from JSON */
+    var helpLoaderEl = document.getElementById('help-loader');
+    if (helpLoaderEl) {
+      helpLoaderEl.addEventListener('htmx:afterRequest', function(event) {
+        if (event.detail && event.detail.successful) {
+          try {
+            buildInstructionMap(JSON.parse(event.detail.xhr.responseText));
+          } catch (err) { /* swallow */ }
+        }
+      });
+    }
 
     /* ── Init ─────────────────────────────────────────────── */
     /* Agent list, help data, and user info are loaded by HTMX
