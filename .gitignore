@@ -2,6 +2,8 @@
 build/
 build-*/
 builddir/
+clion-build/
+cmake-build-*/
 out/
 .cache/
 
