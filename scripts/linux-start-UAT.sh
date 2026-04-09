@@ -3,11 +3,13 @@
 #
 # Topology (all traffic flows through the gateway):
 #   Agent ──→ Gateway(:50051) ──→ Server(:50055 upstream)
+#   (single-host UAT: server's direct agent listener moved to :50054 to
+#    free :50051 for the gateway; in production these run on separate hosts)
 #                                   │
 #   Server ──→ Gateway(:50063) ──→ Agent   (command fanout)
 #
 # Ports:
-#   Server:   :50051 agent gRPC    :50055 gateway upstream
+#   Server:   :50054 agent gRPC    :50055 gateway upstream
 #             :50052 mgmt gRPC     :8080  web dashboard
 #   Gateway:  :50051 agent-facing  :50063 mgmt (command forwarding)
 #             :9568  metrics       :8081  health
@@ -85,7 +87,7 @@ show_status() {
     done
     echo ""
     echo "=== Listening Ports ==="
-    ss -tlnp 2>/dev/null | grep -E ":(50051|50052|50055|50063|8080|8081|9568) " || echo "  (none)"
+    ss -tlnp 2>/dev/null | grep -E ":(50051|50052|50054|50055|50063|8080|8081|9568) " || echo "  (none)"
 }
 
 # ── Wait for port ───────────────────────────────────────────────────────
@@ -161,11 +163,19 @@ start_all() {
     ok "Generated server config ($ADMIN_USER / $ADMIN_PASS)"
 
     # ── 1. Server ───────────────────────────────────────────────────────
+    # NOTE: --listen is moved off the default :50051 to :50054 because the
+    # gateway will bind :50051 for agent-facing gRPC on this same host. In
+    # multi-host production deployments the server can keep :50051 because
+    # the gateway lives on a separate box; in single-host UAT we deconflict
+    # by moving the server's direct agent listener out of the way. The
+    # server's :50054 listener stays open for any direct agent connections
+    # but in this UAT topology agents connect through the gateway only.
     echo ""
     echo "[1/3] Starting yuzu-server..."
     "$BUILDDIR/server/core/yuzu-server" \
         --no-tls \
         --no-https \
+        --listen 0.0.0.0:50054 \
         --gateway-upstream 0.0.0.0:50055 \
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
@@ -182,7 +192,7 @@ start_all() {
     fi
     ok "Server up (PID $server_pid)"
     info "Dashboard http://localhost:8080"
-    info "Agent gRPC :50051  |  Gateway upstream :50055  |  Mgmt :50052"
+    info "Direct agent gRPC :50054  |  Gateway upstream :50055  |  Mgmt :50052"
 
     # ── 2. Gateway ──────────────────────────────────────────────────────
     echo ""

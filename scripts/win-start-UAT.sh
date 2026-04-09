@@ -5,6 +5,11 @@
 #   Agent --> Gateway(:50051) --> Server(:50055 upstream)
 #   Server --> Gateway(:50063) --> Agent   (command fanout)
 #
+# Single-host UAT note: the server's direct agent listener is moved off
+# the default :50051 to :50054 so the gateway can take :50051 for its
+# agent-facing port. In production they live on separate hosts and this
+# isn't necessary.
+#
 # Monitoring & Analytics (Docker containers):
 #   Prometheus(:9090) scrapes Server(:8080/metrics) + Gateway(:9568/metrics)
 #   Grafana(:3000) reads from Prometheus + ClickHouse, dashboards auto-provisioned
@@ -300,6 +305,7 @@ start_all() {
     "$BUILDDIR/server/core/yuzu-server.exe" \
         --no-tls \
         --no-https \
+        --listen 0.0.0.0:50054 \
         --gateway-upstream 0.0.0.0:50055 \
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
@@ -321,7 +327,7 @@ start_all() {
         exit 1
     fi
     ok "Server up (dashboard http://localhost:8080)"
-    info "Agent gRPC :50051 | Gateway upstream :50055 | Mgmt :50052"
+    info "Direct agent gRPC :50054 | Gateway upstream :50055 | Mgmt :50052"
 
     # ── 3. Gateway ────────────────────────────────────────────────────────
     echo ""
