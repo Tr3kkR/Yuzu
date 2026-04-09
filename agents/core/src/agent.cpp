@@ -28,9 +28,12 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 #include "agent.grpc.pb.h"
 
 #ifdef _WIN32
-#include <winsock2.h> // gethostname
+#include <winsock2.h> // gethostname (must precede windows.h)
+#include <windows.h>  // GetModuleHandleW, GetProcAddress
+#include <winternl.h> // RTL_OSVERSIONINFOW (for RtlGetVersion)
 #else
-#include <unistd.h> // gethostname
+#include <sys/utsname.h> // uname (OS version)
+#include <unistd.h>      // gethostname
 #endif
 
 #include <atomic>
@@ -75,6 +78,35 @@ constexpr const char* kAgentArch = "aarch64";
 constexpr const char* kAgentOs = "linux";
 constexpr const char* kAgentArch = "x86_64";
 #endif
+
+// Returns the running OS version string (e.g. "10.0.26200" on Windows,
+// "5.15.0-89-generic" on Linux, "23.4.0" on macOS). Empty string on
+// failure. Used at registration time so the server's AgentInfo.platform
+// can identify which build of which OS the agent is running on.
+//
+// On Windows we use RtlGetVersion via NTDLL rather than the deprecated
+// GetVersionEx (which is subject to manifest-based version spoofing
+// since Windows 8.1) — RtlGetVersion always reports the true OS version.
+// On Unix we use the standard uname syscall.
+[[nodiscard]] std::string get_os_version() {
+#ifdef _WIN32
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return {};
+    using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    auto fn = reinterpret_cast<RtlGetVersionFn>(
+        ::GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!fn) return {};
+    RTL_OSVERSIONINFOW v{};
+    v.dwOSVersionInfoSize = sizeof(v);
+    if (fn(&v) != 0) return {};
+    return std::format("{}.{}.{}", v.dwMajorVersion, v.dwMinorVersion,
+                       v.dwBuildNumber);
+#else
+    struct utsname u{};
+    if (::uname(&u) != 0) return {};
+    return std::string{u.release};
+#endif
+}
 
 std::string read_file_contents(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -610,6 +642,20 @@ public:
             auto* info = req.mutable_info();
             info->set_agent_id(cfg_.agent_id);
             info->set_agent_version(std::string{yuzu::kFullVersionString});
+
+            // Populate Platform sub-message so the server (and the dashboard
+            // scope panel via /fragments/scope-list) can identify which OS
+            // and architecture this agent is running on. kAgentOs and
+            // kAgentArch are compile-time constants pinned per build target;
+            // get_os_version() probes the running kernel for the version
+            // string. The OTA updater also reads platform.os/arch to find
+            // matching binaries, so this fix unblocks OTA selection too.
+            {
+                auto* platform = info->mutable_platform();
+                platform->set_os(kAgentOs);
+                platform->set_arch(kAgentArch);
+                platform->set_version(get_os_version());
+            }
 
             // Set hostname for auto-approve hostname_glob matching
             {
