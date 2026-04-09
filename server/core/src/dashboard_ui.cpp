@@ -11,9 +11,9 @@ extern const char* const kDashboardIndexHtml =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu — Dashboard</title>
   <link rel="stylesheet" href="/static/yuzu.css">
-  <script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+  <script src="/static/htmx.js"></script>
   <script>htmx.config.useTemplateFragments = true;</script>
-  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js" integrity="sha384-fw+eTlCc7suMV/1w/7fr2/PmwElUIt5i82bi+qTiLXvjRXZ2/FkiTNA/w0MhXnGI" crossorigin="anonymous"></script>
+  <script src="/static/sse.js"></script>
   <style>
     body {
       display: flex; flex-direction: column; height: 100vh;

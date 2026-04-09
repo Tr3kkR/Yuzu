@@ -93,6 +93,7 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_static_js_bundle.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

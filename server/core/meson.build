@@ -122,6 +122,7 @@ yuzu_server_core_lib = static_library(
     'src/topology_ui.cpp',
     'src/statistics_ui.cpp',
     'src/css_bundle.cpp',
+    'src/static_js_bundle.cpp',
     'src/icons_svg.cpp',
     'src/migration_runner.cpp',
     'src/rate_limiter.cpp',

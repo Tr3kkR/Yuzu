@@ -151,6 +151,8 @@ extern const char* const kInstructionEditorDeniedHtml;
 // Shared design system assets (css_bundle.cpp, icons_svg.cpp).
 extern const char* const kYuzuCss;
 extern const char* const kYuzuIconsSvg;
+extern const std::string kHtmxJs;
+extern const std::string kSseJs;
 
 namespace yuzu::server {
 
@@ -2014,6 +2016,16 @@ private:
                          [](const httplib::Request&, httplib::Response& res) {
                              res.set_header("Cache-Control", "public, max-age=3600");
                              res.set_content(kYuzuIconsSvg, "image/svg+xml");
+                         });
+        web_server_->Get("/static/htmx.js",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=86400");
+                             res.set_content(kHtmxJs, "application/javascript; charset=utf-8");
+                         });
+        web_server_->Get("/static/sse.js",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=86400");
+                             res.set_content(kSseJs, "application/javascript; charset=utf-8");
                          });
 
         // -- Dashboard (unified UI) -------------------------------------------

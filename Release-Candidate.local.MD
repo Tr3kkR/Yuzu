@@ -220,7 +220,7 @@ A focused 3-4 week sprint resolves all blockers.
 |----|---------|-------|
 | M9 | Broad exception suppression (`catch (...)` without logging) | Replace in `analytics_event_store.cpp`, `auth.cpp` |
 | M10 | Config file permissions not explicitly set to 0600 | Add `fs::permissions()` after write |
-| M11 | HTMX loaded from unpkg CDN (external dependency) | Vendor HTMX or add SRI hash |
+| ~~M11~~ | ~~HTMX loaded from unpkg CDN (external dependency)~~ | **RESOLVED** — HTMX 2.0.4 + htmx-ext-sse 2.2.2 vendored locally as `server/core/src/static_js_bundle.cpp`; served from same-origin `/static/htmx.js` and `/static/sse.js`. CSP `script-src` is now `'self'`-only with no external CDN allowance. Air-gap-friendly by default. Both upstream packages are 0BSD (no attribution required). |
 | M12 | Config file format lacks schema versioning | Add version header for migration path |
 | M13 | Missing `chargen.yaml` instruction definition | Only plugin without YAML (44/45 covered) |
 | M14 | Max 500 triggers hardcoded | Make configurable or bump to 1000 |
@@ -317,7 +317,7 @@ A focused 3-4 week sprint resolves all blockers.
 - [ ] M13: Create `content/definitions/chargen.yaml`
 
 **HTMX/UI Champion:**
-- [ ] M11: Vendor HTMX library (remove CDN dependency)
+- [x] ~~M11: Vendor HTMX library (remove CDN dependency)~~ — done; embedded in `static_js_bundle.cpp`
 
 **Server Dev:**
 - [ ] M2: Enforce session timeout in Subscribe RPC
