@@ -9,7 +9,7 @@ extern const char* const kInstructionPageHtml = R"HTM(<!DOCTYPE html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Instructions</title>
 <link rel="stylesheet" href="/static/yuzu.css">
-<script src="https://unpkg.com/htmx.org@2.0.4" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+<script src="/static/htmx.js"></script>
 <style>
 body{padding:0}
 a{color:var(--accent)}h1{border-bottom:1px solid var(--border);padding-bottom:.5rem}

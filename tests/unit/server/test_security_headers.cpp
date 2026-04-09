@@ -214,7 +214,10 @@ TEST_CASE("build_csp: default produces all expected directives",
     const std::string csp = build_csp("", false);
 
     CHECK_THAT(csp, ContainsSubstring("default-src 'self'"));
-    CHECK_THAT(csp, ContainsSubstring("script-src 'self' 'unsafe-inline' https://unpkg.com"));
+    // HTMX is served from /static/htmx.js (embedded via static_js_bundle.cpp),
+    // so script-src does NOT need to whitelist any external CDN.
+    CHECK_THAT(csp, ContainsSubstring("script-src 'self' 'unsafe-inline'"));
+    CHECK_THAT(csp, !ContainsSubstring("https://unpkg.com"));
     CHECK_THAT(csp, ContainsSubstring("style-src 'self' 'unsafe-inline'"));
     CHECK_THAT(csp, ContainsSubstring("img-src 'self' data:"));
     CHECK_THAT(csp, ContainsSubstring("connect-src 'self'"));
@@ -238,7 +241,7 @@ TEST_CASE("build_csp: extras append to script/style/img/connect only",
           "[security-headers][csp][build]") {
     const std::string csp = build_csp("https://cdn.example.com", false);
 
-    CHECK_THAT(csp, ContainsSubstring("script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.example.com;"));
+    CHECK_THAT(csp, ContainsSubstring("script-src 'self' 'unsafe-inline' https://cdn.example.com;"));
     CHECK_THAT(csp, ContainsSubstring("style-src 'self' 'unsafe-inline' https://cdn.example.com;"));
     CHECK_THAT(csp, ContainsSubstring("img-src 'self' data: https://cdn.example.com;"));
     CHECK_THAT(csp, ContainsSubstring("connect-src 'self' https://cdn.example.com;"));
@@ -255,7 +258,7 @@ TEST_CASE("build_csp: multiple extras propagate to all four directives",
         build_csp("https://cdn.example.com https://beacon.example.com", true);
 
     for (auto directive : {
-             "script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.example.com https://beacon.example.com",
+             "script-src 'self' 'unsafe-inline' https://cdn.example.com https://beacon.example.com",
              "style-src 'self' 'unsafe-inline' https://cdn.example.com https://beacon.example.com",
              "img-src 'self' data: https://cdn.example.com https://beacon.example.com",
              "connect-src 'self' https://cdn.example.com https://beacon.example.com",
@@ -267,7 +270,6 @@ TEST_CASE("build_csp: multiple extras propagate to all four directives",
 TEST_CASE("build_csp: empty extras leaves no stray whitespace",
           "[security-headers][csp][build]") {
     const std::string csp = build_csp("", false);
-    CHECK_THAT(csp, !ContainsSubstring("https://unpkg.com ;"));
     CHECK_THAT(csp, !ContainsSubstring("'unsafe-inline' ;"));
     CHECK_THAT(csp, !ContainsSubstring("data: ;"));
     CHECK_THAT(csp, !ContainsSubstring("'self' ;"));

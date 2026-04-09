@@ -127,7 +127,7 @@ std::string build_csp(std::string_view extra_sources, bool https_enabled) {
     std::string csp;
     csp.reserve(640);
     csp += "default-src 'self'; ";
-    csp += "script-src 'self' 'unsafe-inline' https://unpkg.com";
+    csp += "script-src 'self' 'unsafe-inline'";
     csp += extra;
     csp += "; ";
     csp += "style-src 'self' 'unsafe-inline'";

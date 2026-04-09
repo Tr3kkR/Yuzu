@@ -12,7 +12,7 @@ const char* const kTopologyHtml = R"html(<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — System Topology</title>
 <link rel="stylesheet" href="/static/yuzu.css">
-<script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+<script src="/static/htmx.js"></script>
 <style>
 :root{--fg:#e0e0e0;--bg:#1a1a2e;--surface:#16213e;--border:#334155;--accent:#0f7dff;--green:#22c55e;--red:#ef4444;--yellow:#eab308}
 *{box-sizing:border-box;margin:0;padding:0}

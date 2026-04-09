@@ -149,7 +149,7 @@ Yuzu sets six standard security response headers on every HTTP response from the
 
 | Header | Value | Purpose |
 |---|---|---|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'[; upgrade-insecure-requests]` | Restricts which sources can be loaded by the dashboard. Defends against XSS, clickjacking, and content injection. `upgrade-insecure-requests` is appended only when HTTPS is enabled. |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'[; upgrade-insecure-requests]` | Restricts which sources can be loaded by the dashboard. Defends against XSS, clickjacking, and content injection. `upgrade-insecure-requests` is appended only when HTTPS is enabled. The CSP is fully `'self'`-only — no external CDN allowance — because the HTMX runtime is embedded in the server binary and served from `/static/htmx.js` (see below). |
 | `X-Frame-Options` | `DENY` | Blocks the dashboard from being embedded in any `<iframe>`. Defense-in-depth alongside CSP `frame-ancestors 'none'`. |
 | `X-Content-Type-Options` | `nosniff` | Prevents MIME-type sniffing attacks. Browsers must respect the declared `Content-Type`. |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Sends only the origin (not the full URL with query strings) when navigating cross-origin. Defends against URL-based secret leakage to third-party sites. |
@@ -166,9 +166,16 @@ At server startup, the resolved header bundle is logged at INFO level so operato
 
 The HTMX dashboard uses inline `<script>` blocks, inline `onclick=` event handlers, and inline `<style>` blocks. Tightening to a strict nonce-based CSP would require refactoring all event handlers to `addEventListener` and threading per-request nonces through every HTML render path. This work is tracked separately. The current CSP is restrictive enough to block external script injection while keeping the dashboard functional.
 
-### `https://unpkg.com` allowance
+### Embedded HTMX runtime — no external CDN
 
-The dashboard loads `htmx.org` and `htmx-ext-sse` from unpkg with Subresource Integrity (SRI) hashes pinned in the HTML. The CSP whitelists `https://unpkg.com` for `script-src` so these CDN scripts can load. SRI ensures that even a CDN compromise would fail the integrity check and the browser would reject the script. To use a vendored copy instead, mirror the HTMX assets under your own origin and remove `unpkg.com` from the CSP via a future build option.
+The HTMX 2.0.4 runtime and the `htmx-ext-sse` extension are compiled into the server binary as static C++ string literals (`server/core/src/static_js_bundle.cpp`) and served from same-origin paths:
+
+- `GET /static/htmx.js` — HTMX core (~51 KB)
+- `GET /static/sse.js` — Server-Sent Events extension (~9 KB)
+
+Both responses set `Cache-Control: public, max-age=86400`. The dashboard's `<head>` references them as `<script src="/static/htmx.js">` and `<script src="/static/sse.js">`, so the CSP `script-src` only needs `'self'` — there is no external CDN allowance and **no internet connectivity required** for the dashboard to load. This makes the server suitable for air-gapped deployments out of the box.
+
+If you need to update HTMX, replace the payloads in `server/core/src/static_js_bundle.cpp` and rebuild. The file is split into 14 KB chunks because MSVC's raw string literal limit is 16380 bytes (error C2026) — keep that constraint in mind when re-vendoring.
 
 ### Extending CSP for customer environments
 
