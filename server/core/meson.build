@@ -126,6 +126,7 @@ yuzu_server_core_lib = static_library(
     'src/migration_runner.cpp',
     'src/rate_limiter.cpp',
     'src/cert_reloader.cpp',
+    'src/security_headers.cpp',
   ),
   include_directories: ['include'],
   cpp_args: https_cpp_args + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),

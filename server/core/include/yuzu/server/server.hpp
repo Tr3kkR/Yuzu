@@ -92,6 +92,12 @@ struct Config {
     // Metrics
     bool metrics_require_auth{true}; // Require auth for remote /metrics access
 
+    // Security response headers (SOC2-C1)
+    // Extra source-list entries appended to script-src, style-src, connect-src,
+    // and img-src CSP directives. Space-separated. Use to whitelist customer
+    // CDNs, monitoring beacons, or analytics endpoints.
+    std::string csp_extra_sources;
+
     // Rate limiting
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP

@@ -116,6 +116,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_result_envelope.cpp` | Result envelope | Structured response formatting |
 | `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
 | `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |
+| `test_security_headers.cpp` | HTTP security headers (SOC2-C1) | `validate_csp_extra_sources` accept/reject grammar (control bytes, semicolons, unsafe keywords, hash/nonce expressions, quoted/unquoted tokens, position tracking), `build_csp` directives + extras + `upgrade-insecure-requests` gating, `build_permissions_policy` deny-all baseline, `build_referrer_policy`, `HeaderBundle::apply` six-header emission, end-to-end integration via `httplib::Server`/`httplib::Client` (38 cases) |
 
 ### Untested Server Components
 
