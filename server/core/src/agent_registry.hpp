@@ -46,6 +46,7 @@ struct PluginMeta {
 
 struct AgentSession {
     std::string agent_id;
+    std::string session_id;  // Unique per connection — used to prevent stale cleanup races
     std::string hostname;
     std::string os;
     std::string arch;
@@ -88,6 +89,13 @@ public:
     void reap_stale_sessions(std::chrono::seconds timeout);
 
     void remove_agent(const std::string& agent_id);
+
+    /// Remove an agent only if its current session_id matches (prevents stale
+    /// Subscribe cleanup from clobbering a newer reconnection).
+    void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
+
+    /// Clear stream only if the session_id matches the current session.
+    void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);
 
     void set_gateway_node(const std::string& agent_id, const std::string& node);
 

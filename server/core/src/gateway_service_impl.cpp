@@ -22,6 +22,17 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
     const auto& info = request->info();
 
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
+
+    // Fast path: agent already enrolled from a prior connection
+    {
+        auto prior = auth_mgr_.get_pending_status(info.agent_id());
+        if (prior && *prior == auth::PendingStatus::approved) {
+            spdlog::info("[gateway] Agent {} re-registering (already enrolled)", info.agent_id());
+            goto gw_enrolled;
+        }
+    }
+
+    {
     const auto& enrollment_token = request->enrollment_token();
 
     if (!enrollment_token.empty()) {
@@ -34,7 +45,14 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
             return grpc::Status::OK;
         }
         spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token", info.agent_id());
-        auth_mgr_.remove_pending_agent(info.agent_id());
+        if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
+                                       info.platform().os(), info.platform().arch(),
+                                       info.agent_version())) {
+            response->set_accepted(false);
+            response->set_reject_reason("enrollment denied by administrator");
+            response->set_enrollment_status("denied");
+            return grpc::Status::OK;
+        }
     } else {
         // Auto-approve policies (no peer IP available from gateway yet)
         auth::ApprovalContext approval_ctx;
@@ -45,7 +63,14 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
         if (!matched_rule.empty()) {
             spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
                          matched_rule);
-            auth_mgr_.remove_pending_agent(info.agent_id());
+            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
+                                           info.platform().os(), info.platform().arch(),
+                                           info.agent_version())) {
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
         } else {
             // Tier 1: pending queue
             auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
@@ -80,7 +105,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
             }
         }
     }
+    } // end enrollment checks
 
+gw_enrolled:
     // -- Enrolled -- register the agent ----------------------------------------
     registry_.register_agent(info);
     // Auto-add to root management group
@@ -92,6 +119,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
     response->set_session_id(session_id);
     response->set_accepted(true);
     response->set_enrollment_status("enrolled");
+
+    // Store session_id on the AgentSession so session-aware cleanup works.
+    // Without this, remove_agent_if_session would always no-op for gateway agents.
+    registry_.map_session(session_id, info.agent_id());
 
     {
         std::lock_guard lock(sessions_mu_);
@@ -208,8 +239,8 @@ grpc::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
         break;
 
     case gw::StreamStatusNotification::DISCONNECTED:
-        registry_.clear_stream(agent_id);
-        registry_.remove_agent(agent_id);
+        registry_.clear_stream_if_session(agent_id, session_id);
+        registry_.remove_agent_if_session(agent_id, session_id);
         {
             std::lock_guard lock(sessions_mu_);
             gateway_sessions_.erase(session_id);

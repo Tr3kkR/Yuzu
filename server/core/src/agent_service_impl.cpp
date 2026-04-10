@@ -52,6 +52,19 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
     // -- Tiered enrollment -------------------------------------------------------
 
+    bool is_reauth = false;  // Track whether this is a reconnection vs first enrollment
+
+    // Fast path: agent already enrolled from a prior connection — skip enrollment
+    {
+        auto prior = auth_mgr_.get_pending_status(info.agent_id());
+        if (prior && *prior == auth::PendingStatus::approved) {
+            spdlog::info("Agent {} re-registering (already enrolled)", info.agent_id());
+            is_reauth = true;
+            goto enrolled;
+        }
+    }
+
+    {
     const auto& enrollment_token = request->enrollment_token();
 
     if (!enrollment_token.empty()) {
@@ -75,8 +88,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             return grpc::Status::OK;
         }
         spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
-        // Remove from pending queue if it was there
-        auth_mgr_.remove_pending_agent(info.agent_id());
+        // Persist enrollment so reconnections don't need a valid token.
+        // Returns false if the agent was explicitly denied by an admin.
+        if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
+                                       info.platform().os(), info.platform().arch(),
+                                       info.agent_version())) {
+            response->set_accepted(false);
+            response->set_reject_reason("enrollment denied by administrator");
+            response->set_enrollment_status("denied");
+            return grpc::Status::OK;
+        }
     } else {
         // Tier 1.5: Auto-approve policies -- check before pending queue
         auth::ApprovalContext approval_ctx;
@@ -102,7 +123,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         auto matched_rule = auto_approve_.evaluate(approval_ctx);
         if (!matched_rule.empty()) {
             spdlog::info("Agent {} auto-approved by policy: {}", info.agent_id(), matched_rule);
-            auth_mgr_.remove_pending_agent(info.agent_id());
+            // Persist enrollment so reconnections skip enrollment entirely.
+            // Returns false if admin-denied — admin denials outrank auto-approve.
+            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
+                                           info.platform().os(), info.platform().arch(),
+                                           info.agent_version())) {
+                response->set_accepted(false);
+                response->set_reject_reason("enrollment denied by administrator");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
             // Fall through to normal registration
         } else {
             // Tier 1: No token, no policy match -- check the pending queue
@@ -162,7 +192,9 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             }
         } // auto-approve else
     }
+    } // end enrollment checks
 
+enrolled:
     // -- Agent is enrolled -- proceed with registration --------------------------
 
     registry_.register_agent(info);
@@ -179,7 +211,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         ae.arch = info.platform().arch();
         ae.agent_version = info.agent_version();
         ae.attributes = {
-            {"enrollment_method", enrollment_token.empty() ? "approval" : "token"}};
+            {"enrollment_method", request->enrollment_token().empty() ? "approval" : "token"},
+            {"enrollment_type", is_reauth ? "reauth" : "initial"}};
         nlohmann::json plugins_list = nlohmann::json::array();
         for (const auto& p : info.plugins()) {
             plugins_list.push_back(p.name());
@@ -494,10 +527,11 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
         }
     }
 
-    // Agent disconnected
-    registry_.clear_stream(agent_id);
-    registry_.remove_agent(agent_id);
-    spdlog::info("Agent subscribe stream closed for {}", agent_id);
+    // Agent disconnected — use session-aware cleanup so a stale Subscribe
+    // handler doesn't clobber a newer connection from the same agent_id.
+    registry_.clear_stream_if_session(agent_id, session_id);
+    registry_.remove_agent_if_session(agent_id, session_id);
+    spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
     if (analytics_store_) {
         auto session_duration = std::chrono::duration_cast<std::chrono::milliseconds>(

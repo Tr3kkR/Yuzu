@@ -829,7 +829,12 @@ public:
             if (!stream) {
                 spdlog::error("Failed to open Subscribe stream");
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
-                return;
+                if (!stop_requested_.load(std::memory_order_acquire)) {
+                    ++reconnect_count;
+                    spdlog::warn("Subscribe failed — will attempt reconnect");
+                    continue;
+                }
+                break;
             }
             spdlog::info("Subscribe stream opened - waiting for commands");
 
@@ -863,24 +868,29 @@ public:
 
             // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
             {
+                heartbeat_stop_.store(false, std::memory_order_release);
                 auto hb_stub = pb::AgentService::NewStub(channel);
                 heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
                     spdlog::info("Heartbeat thread started (interval={}s)",
                                  cfg_.heartbeat_interval.count());
-                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                    auto should_stop = [this]() {
+                        return stop_requested_.load(std::memory_order_acquire) ||
+                               heartbeat_stop_.load(std::memory_order_acquire);
+                    };
+                    while (!should_stop()) {
                         // Sleep in small increments for responsive shutdown
                         auto remaining = cfg_.heartbeat_interval;
-                        while (remaining.count() > 0 &&
-                               !stop_requested_.load(std::memory_order_acquire)) {
+                        while (remaining.count() > 0 && !should_stop()) {
                             auto sleep_time = std::min(remaining, std::chrono::seconds{5});
                             std::this_thread::sleep_for(sleep_time);
                             remaining -= sleep_time;
                         }
-                        if (stop_requested_.load(std::memory_order_acquire))
+                        if (should_stop())
                             break;
 
                         // Build heartbeat with piggybacked metrics
                         grpc::ClientContext ctx;
+                        heartbeat_ctx_.store(&ctx, std::memory_order_release);
                         pb::HeartbeatRequest req;
                         req.set_session_id(session_id_);
                         auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -903,12 +913,14 @@ public:
 
                         pb::HeartbeatResponse resp;
                         auto status = hb_stub->Heartbeat(&ctx, req, &resp);
+                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
                         if (!status.ok()) {
                             spdlog::warn("Heartbeat failed: {}", status.error_message());
                         } else {
                             spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
                         }
                     }
+                    heartbeat_ctx_.store(nullptr, std::memory_order_release);
                     spdlog::info("Heartbeat thread stopped");
                 });
             }
@@ -1119,7 +1131,11 @@ public:
                 update_thread_.join();
             }
 
-            // Stop and join the heartbeat thread
+            // Signal heartbeat thread to exit and cancel any in-flight RPC
+            heartbeat_stop_.store(true, std::memory_order_release);
+            if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
+                hctx->TryCancel();
+            }
             if (heartbeat_thread_.joinable()) {
                 heartbeat_thread_.join();
             }
@@ -1145,6 +1161,7 @@ public:
 
             if (!stop_requested_.load(std::memory_order_acquire)) {
                 ++reconnect_count;
+                metrics_.counter("yuzu_agent_reconnections_total").increment();
                 spdlog::warn("Connection lost — will attempt reconnect");
                 continue; // Back to reconnect loop
             }
@@ -1155,11 +1172,16 @@ public:
 
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
+        heartbeat_stop_.store(true, std::memory_order_release);
         if (updater_)
             updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
+        }
+        // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
+        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
+            hctx->TryCancel();
         }
     }
 
@@ -1179,7 +1201,9 @@ private:
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> heartbeat_stop_{false};
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
+    std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;

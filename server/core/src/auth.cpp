@@ -922,6 +922,36 @@ bool AuthManager::deny_pending_agent(const std::string& agent_id) {
     return true;
 }
 
+bool AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                                  const std::string& os, const std::string& arch,
+                                  const std::string& agent_version) {
+    {
+        std::unique_lock lock(mu_);
+        auto it = pending_agents_.find(agent_id);
+        if (it != pending_agents_.end()) {
+            // Never override an explicit admin denial — tokens don't outrank admins
+            if (it->second.status == PendingStatus::denied) {
+                spdlog::warn("ensure_enrolled: agent {} is admin-denied, refusing to override",
+                             agent_id);
+                return false;
+            }
+            it->second.status = PendingStatus::approved;
+        } else {
+            PendingAgent pa;
+            pa.agent_id = agent_id;
+            pa.hostname = hostname;
+            pa.os = os;
+            pa.arch = arch;
+            pa.agent_version = agent_version;
+            pa.requested_at = std::chrono::system_clock::now();
+            pa.status = PendingStatus::approved;
+            pending_agents_[agent_id] = std::move(pa);
+        }
+    }
+    save_pending();
+    return true;
+}
+
 bool AuthManager::remove_pending_agent(const std::string& agent_id) {
     {
         std::unique_lock lock(mu_);
