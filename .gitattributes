@@ -1,0 +1,16 @@
+# Force LF line endings for all text files
+* text=auto eol=lf
+
+# Explicitly mark binary files
+*.png binary
+*.jpg binary
+*.ico binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.exe binary
+
+# Windows-specific files that need CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf

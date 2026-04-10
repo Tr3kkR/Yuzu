@@ -264,6 +264,7 @@ jobs:
       - name: Cache ccache
         uses: actions/cache@v4
         with:
+          save-always: true
           path: ~/Library/Caches/ccache
           key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -283,6 +284,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
+          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
