@@ -1,4 +1,4 @@
-## Yuzu UAT Stack — Server + Gateway + Observability
+## Yuzu UAT Stack — Self-contained, single-file deployment
 ##
 ## Usage:
 ##   docker compose -f docker-compose.uat.yml up -d
@@ -9,6 +9,165 @@
 ## Grafana:     http://localhost:3000  (admin / admin)
 ## Prometheus:  http://localhost:9090
 ## ClickHouse:  http://localhost:8123  (default / yuzu)
+##
+## Connect an agent:
+##   yuzu-agent --server localhost:50061 --no-tls
+##   (approve the agent in Settings, then restart the agent)
+
+configs:
+  server-cfg:
+    content: |
+      admin:admin:ab3585560da45a7b7da0a220c922dd72:25e957743ebefd48d938b30cdd117ef4487897da209e0e8883dd473363dceb8a
+  gateway-sys-config:
+    content: |
+      [
+          {yuzu_gw, [
+              {agent_listen_addr, "0.0.0.0"},
+              {agent_listen_port, 50051},
+              {mgmt_listen_addr, "0.0.0.0"},
+              {mgmt_listen_port, 50063},
+              {upstream_addr, "server"},
+              {upstream_port, 50055},
+              {upstream_pool_size, 32},
+              {heartbeat_batch_interval_ms, 1000},
+              {default_command_timeout_s, 300},
+              {prometheus_port, 9568},
+              {health_port, 8081},
+              {telemetry_gauge_interval_ms, 10000},
+              {circuit_breaker_failure_threshold, 5},
+              {circuit_breaker_reset_timeout_ms, 10000},
+              {circuit_breaker_max_reset_timeout_ms, 300000},
+              {backpressure_threshold, 1000},
+              {hash_ring_vnodes, 256}
+          ]},
+          {grpcbox, [
+              {client, #{channels => [
+                  {default_channel, [{http, "server", 50055, []}], #{}}
+              ]}},
+              {servers, [
+                  #{grpc_opts => #{
+                      service_protos => [agent_pb],
+                      services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
+                  },
+                  listen_opts => #{port => 50051, ip => {0,0,0,0}}},
+                  #{grpc_opts => #{
+                      service_protos => [management_pb],
+                      services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}
+                  },
+                  listen_opts => #{port => 50063, ip => {0,0,0,0}}}
+              ]}
+          ]},
+          {kernel, [
+              {connect_all, false},
+              {net_ticktime, 30},
+              {logger_level, info},
+              {logger, [
+                  {handler, default, logger_std_h, #{
+                      level => info,
+                      formatter => {logger_formatter, #{
+                          template => [time, " [", level, "] ", pid, " ", msg, "\n"]
+                      }}
+                  }}
+              ]}
+          ]}
+      ].
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 15s
+        evaluation_interval: 15s
+      scrape_configs:
+        - job_name: 'yuzu-server'
+          metrics_path: '/metrics'
+          static_configs:
+            - targets: ['server:8080']
+              labels:
+                component: 'server'
+        - job_name: 'yuzu-gateway'
+          metrics_path: '/metrics'
+          static_configs:
+            - targets: ['gateway:9568']
+              labels:
+                component: 'gateway'
+  grafana-datasource:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+          editable: false
+  grafana-dashboard-provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: Yuzu
+          orgId: 1
+          folder: Yuzu
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+            foldersFromFilesStructure: false
+  clickhouse-init:
+    content: |
+      CREATE DATABASE IF NOT EXISTS yuzu;
+      CREATE TABLE IF NOT EXISTS yuzu.yuzu_events (
+          tenant_id       LowCardinality(String)  DEFAULT 'default',
+          agent_id        String                  DEFAULT '',
+          session_id      String                  DEFAULT '',
+          event_type      LowCardinality(String),
+          event_time      DateTime64(3, 'UTC'),
+          ingest_time     DateTime64(3, 'UTC')    DEFAULT now64(3),
+          plugin          LowCardinality(String)  DEFAULT '',
+          capability      LowCardinality(String)  DEFAULT '',
+          correlation_id  String                  DEFAULT '',
+          severity        Enum8('debug'=0,'info'=1,'warn'=2,'error'=3,'critical'=4) DEFAULT 'info',
+          source          LowCardinality(String)  DEFAULT 'server',
+          hostname        String                  DEFAULT '',
+          os              LowCardinality(String)  DEFAULT '',
+          arch            LowCardinality(String)  DEFAULT '',
+          agent_version   LowCardinality(String)  DEFAULT '',
+          principal       String                  DEFAULT '',
+          principal_role  LowCardinality(String)  DEFAULT '',
+          attributes      String                  DEFAULT '{}',
+          payload         String                  DEFAULT '{}',
+          schema_version  UInt8                   DEFAULT 1
+      ) ENGINE = MergeTree()
+        PARTITION BY toYYYYMM(event_time)
+        ORDER BY (tenant_id, event_type, event_time, agent_id)
+        TTL toDate(event_time) + INTERVAL 365 DAY;
+      ALTER TABLE yuzu.yuzu_events ADD INDEX IF NOT EXISTS idx_agent_id agent_id TYPE bloom_filter GRANULARITY 4;
+      ALTER TABLE yuzu.yuzu_events ADD INDEX IF NOT EXISTS idx_correlation_id correlation_id TYPE bloom_filter GRANULARITY 4;
+      ALTER TABLE yuzu.yuzu_events ADD INDEX IF NOT EXISTS idx_hostname hostname TYPE bloom_filter GRANULARITY 4;
+      CREATE MATERIALIZED VIEW IF NOT EXISTS yuzu.mv_command_duration_hourly
+      ENGINE = AggregatingMergeTree()
+      PARTITION BY toYYYYMM(hour)
+      ORDER BY (tenant_id, plugin, hour)
+      AS SELECT
+          tenant_id, plugin,
+          toStartOfHour(event_time) AS hour,
+          quantileState(0.5)(JSONExtractFloat(payload, 'duration_ms'))  AS p50,
+          quantileState(0.95)(JSONExtractFloat(payload, 'duration_ms')) AS p95,
+          quantileState(0.99)(JSONExtractFloat(payload, 'duration_ms')) AS p99,
+          countState() AS total
+      FROM yuzu.yuzu_events
+      WHERE event_type = 'command.completed'
+      GROUP BY tenant_id, plugin, hour;
+      CREATE MATERIALIZED VIEW IF NOT EXISTS yuzu.mv_agent_activity_daily
+      ENGINE = SummingMergeTree()
+      PARTITION BY toYYYYMM(day)
+      ORDER BY (tenant_id, agent_id, day, event_type)
+      AS SELECT
+          tenant_id, agent_id,
+          toDate(event_time) AS day,
+          event_type,
+          count() AS event_count
+      FROM yuzu.yuzu_events
+      GROUP BY tenant_id, agent_id, day, event_type;
 
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
@@ -51,11 +210,11 @@ services:
       - "default"
       - "--clickhouse-password"
       - "yuzu"
+    configs:
+      - source: server-cfg
+        target: /var/lib/yuzu/yuzu-server.cfg
     volumes:
       - server-data:/var/lib/yuzu
-      - ./deploy/config/uat/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
-    # SQLite databases persist in the server-data named volume.
-    # To inspect: docker volume inspect yuzu_server-data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
       interval: 10s
@@ -77,8 +236,9 @@ services:
       - "9568:9568"     # Prometheus metrics
     environment:
       - YUZU_GW_TLS_ENABLED=false
-    volumes:
-      - ./deploy/config/uat/gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    configs:
+      - source: gateway-sys-config
+        target: /opt/yuzu_gw/releases/0.2.0/sys.config
     healthcheck:
       test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]
       interval: 10s
@@ -92,8 +252,10 @@ services:
     restart: unless-stopped
     ports:
       - "9090:9090"
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
     volumes:
-      - ./deploy/prometheus/prometheus-docker.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     depends_on:
       - server
@@ -108,11 +270,13 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-fleet-dashboard.json
+    configs:
+      - source: grafana-datasource
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+      - source: grafana-dashboard-provider
+        target: /etc/grafana/provisioning/dashboards/yuzu.yml
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./deploy/grafana:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
 
@@ -128,9 +292,11 @@ services:
       - CLICKHOUSE_DB=yuzu
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=yuzu
+    configs:
+      - source: clickhouse-init
+        target: /docker-entrypoint-initdb.d/init.sql
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./deploy/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ulimits:
       nofile:
         soft: 262144
