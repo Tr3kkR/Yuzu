@@ -31,6 +31,13 @@ jobs:
           submodules: recursive
           clean: false
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
+            gcc-13 g++-13 dpkg-dev rpm
+
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf builddir
 
@@ -194,7 +201,7 @@ jobs:
 
       - name: Run EUnit tests
         working-directory: gateway
-        run: rebar3 eunit
+        run: rebar3 as test eunit --dir apps/yuzu_gw/test
 
       - name: Run Dialyzer
         working-directory: gateway
