@@ -89,10 +89,16 @@ fi
 "$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"
 
 # ── Determine cmake_prefix_path for Meson ────────────────────────────────────
+# vcpkg manifest mode installs to <manifest-root>/vcpkg_installed/ (not
+# $VCPKG_ROOT/installed/).  Prefer the manifest-local directory when it exists.
+VCPKG_INSTALLED_ROOT="$PROJECT_ROOT/vcpkg_installed"
+if [[ ! -d "$VCPKG_INSTALLED_ROOT" ]]; then
+  VCPKG_INSTALLED_ROOT="$VCPKG_ROOT/installed"
+fi
 if [[ -n "$TRIPLET" ]]; then
-  VCPKG_INSTALLED="$VCPKG_ROOT/installed/$TRIPLET"
+  VCPKG_INSTALLED="$VCPKG_INSTALLED_ROOT/$TRIPLET"
 else
-  VCPKG_INSTALLED="$VCPKG_ROOT/installed"
+  VCPKG_INSTALLED="$VCPKG_INSTALLED_ROOT"
 fi
 
 # ── Build meson setup command ─────────────────────────────────────────────────

@@ -762,10 +762,96 @@ jobs:
           path: "YuzuAgent-*.pkg"
           retention-days: 3
 
+  # ── Docker images — server + gateway published to GHCR ──────────────
+  # Runs on the self-hosted Linux runner (native dockerd, systemd-managed).
+  # Both images build in parallel via matrix; buildx registry cache persists
+  # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
+  docker-publish:
+    name: "Publish ${{ matrix.image }} image"
+    needs: [build-linux, build-gateway]
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            dockerfile: deploy/docker/Dockerfile.server
+          - image: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          clean: false
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
+          # Tag convention mirrors scripts/docker-release.sh:
+          #   - stable (no -alpha/-beta/-rc suffix): :X.Y.Z + :X.Y + :latest
+          #   - pre-release:                         :X.Y.Z-suffix only
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=yuzu-${{ matrix.image }}
+            org.opencontainers.image.description=Yuzu ${{ matrix.image }} component
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Registry cache lives in GHCR itself under a :buildcache tag.
+          # mode=max caches intermediate layers too (best hit rate).
+          cache-from: type=registry,ref=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}:buildcache,mode=max
+          provenance: false
+
+      - name: Image summary
+        run: |
+          {
+            echo "## Published \`yuzu-${{ matrix.image }}\` image"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"
-    needs: [build-linux, build-gateway, build-windows, build-macos]
+    needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -809,10 +895,14 @@ jobs:
         id: changelog
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION//-/_}"
+          # For pre-release tags (v0.8.0-rc0, v0.8.0-beta1, ...), the CHANGELOG
+          # entry is written under the base version (## [0.8.0]), not the rc
+          # suffix. Strip anything after the first '-' so rc/beta/alpha tags
+          # pull the same section as the eventual stable release.
+          BASE_VERSION="${VERSION%%-*}"
           # Extract the section for this version from CHANGELOG.md
           if [ -f CHANGELOG.md ]; then
-            awk "/^## \[${VERSION}\]/{found=1;next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > changelog_section.md
+            awk "/^## \[${BASE_VERSION}\]/{found=1;next} /^## \[/{if(found) exit} found{print}" CHANGELOG.md > changelog_section.md
           fi
           # Check if we got content
           if [ -s changelog_section.md ]; then
@@ -886,7 +976,7 @@ jobs:
           docker pull ghcr.io/${OWNER}/yuzu-gateway:${TAG}
           \`\`\`
 
-          Architecture: \`linux/amd64\`. Docker images are published separately after the release is created.
+          Architecture: \`linux/amd64\`. Images are published to GHCR by this workflow as part of the release.
 
           ### Verify checksums
 

@@ -1,7 +1,13 @@
+# syntax=docker/dockerfile:1.7
 # Yuzu Gateway — Erlang/OTP Docker build with dependency caching
 #
 # The build uses three stages so that rebar3 dependency fetching and
 # compilation are cached separately from application code.
+#
+# BuildKit cache mounts further accelerate rebuilds:
+#   - /root/.cache/rebar3  — downloaded Hex packages (shared across builds)
+#
+# Requires BuildKit (default since Docker 23). Plain `docker build` works.
 #
 # Quick rebuild (code-only):
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
@@ -20,8 +26,11 @@ WORKDIR /src
 # Copy only dependency manifests — this layer caches until deps change
 COPY gateway/rebar.config gateway/rebar.lock ./
 
-# Fetch and compile deps (but not app code)
-RUN rebar3 compile --deps_only
+# Fetch and compile deps (but not app code). The rebar3 global cache holds
+# downloaded Hex package tarballs; mounting it skips the network round-trip
+# when the layer cache is cold but the packages themselves are unchanged.
+RUN --mount=type=cache,target=/root/.cache/rebar3 \
+    rebar3 compile --deps_only
 
 # ── Stage 2: build — copy app source and build release ────────────────────
 FROM deps AS builder

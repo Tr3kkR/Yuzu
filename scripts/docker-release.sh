@@ -11,6 +11,10 @@
 
 set -euo pipefail
 
+# Enable BuildKit so the Dockerfiles' cache mounts (`RUN --mount=type=cache`)
+# take effect even on older docker versions where BuildKit isn't the default.
+export DOCKER_BUILDKIT=1
+
 # ── Parse flags ───────────────────────────────────────────────────────────
 DRY_RUN=false
 BUILD_ONLY=false
@@ -118,21 +122,37 @@ if ! $DRY_RUN; then
     echo ""
 fi
 
-# ── Build images ─────────────────────────────────────────────────────────
-echo "=== Building yuzu-server ==="
-BUILD_ARGS=(-f deploy/docker/Dockerfile.server --platform linux/amd64)
-for img in "${SERVER_IMAGES[@]}"; do
-    BUILD_ARGS+=(-t "$img")
-done
-run docker build "${BUILD_ARGS[@]}" .
-echo ""
+# ── Build images (in parallel) ───────────────────────────────────────────
+# Server and gateway are fully independent Docker builds. Run them at the
+# same time so wall-clock time is max(server, gateway) instead of the sum.
+# --progress=plain keeps the interleaved output readable (no TTY redraws).
+echo "=== Building yuzu-server and yuzu-gateway in parallel ==="
 
-echo "=== Building yuzu-gateway ==="
-BUILD_ARGS=(-f deploy/docker/Dockerfile.gateway --platform linux/amd64)
-for img in "${GATEWAY_IMAGES[@]}"; do
-    BUILD_ARGS+=(-t "$img")
+SERVER_BUILD_ARGS=(-f deploy/docker/Dockerfile.server --platform linux/amd64 --progress=plain)
+for img in "${SERVER_IMAGES[@]}"; do
+    SERVER_BUILD_ARGS+=(-t "$img")
 done
-run docker build "${BUILD_ARGS[@]}" .
+
+GATEWAY_BUILD_ARGS=(-f deploy/docker/Dockerfile.gateway --platform linux/amd64 --progress=plain)
+for img in "${GATEWAY_IMAGES[@]}"; do
+    GATEWAY_BUILD_ARGS+=(-t "$img")
+done
+
+run docker build "${SERVER_BUILD_ARGS[@]}" . &
+SERVER_PID=$!
+run docker build "${GATEWAY_BUILD_ARGS[@]}" . &
+GATEWAY_PID=$!
+
+SERVER_STATUS=0
+GATEWAY_STATUS=0
+wait "$SERVER_PID" || SERVER_STATUS=$?
+wait "$GATEWAY_PID" || GATEWAY_STATUS=$?
+
+if (( SERVER_STATUS != 0 || GATEWAY_STATUS != 0 )); then
+    echo ""
+    echo "Error: parallel build failed (server=$SERVER_STATUS gateway=$GATEWAY_STATUS)"
+    exit 1
+fi
 echo ""
 
 # ── Push images ──────────────────────────────────────────────────────────

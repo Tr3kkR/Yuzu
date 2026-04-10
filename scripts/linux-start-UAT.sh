@@ -22,7 +22,7 @@
 set -euo pipefail
 
 YUZU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDDIR="$YUZU_ROOT/builddir"
+BUILDDIR="${YUZU_BUILDDIR:-$YUZU_ROOT/builddir}"
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="/tmp/yuzu-uat"
 
