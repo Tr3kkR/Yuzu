@@ -1,0 +1,148 @@
+## Yuzu UAT Stack — Server + Gateway + Observability
+##
+## Usage:
+##   docker compose -f docker-compose.uat.yml up -d
+##   docker compose -f docker-compose.uat.yml logs -f
+##   docker compose -f docker-compose.uat.yml down -v
+##
+## Dashboard:   http://localhost:8080  (admin / adminpassword1)
+## Grafana:     http://localhost:3000  (admin / admin)
+## Prometheus:  http://localhost:9090
+## ClickHouse:  http://localhost:8123  (default / yuzu)
+
+services:
+  # ── Yuzu Server ──────────────────────────────────────────────────────
+  server:
+    image: ghcr.io/tr3kkr/yuzu-server:0.8.0-rc0
+    container_name: yuzu-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"     # Web dashboard + REST API
+      - "50051:50051"   # Agent gRPC (direct-connect agents)
+      - "50052:50052"   # Management gRPC
+      - "50055:50055"   # Gateway upstream
+    environment:
+      - YUZU_LOG_LEVEL=info
+      - YUZU_LOG_FORMAT=json
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--config"
+      - "/var/lib/yuzu/yuzu-server.cfg"
+      - "--gateway-upstream"
+      - "0.0.0.0:50055"
+      - "--gateway-mode"
+      - "--gateway-command-addr"
+      - "gateway:50063"
+      - "--metrics-no-auth"
+      - "--clickhouse-url"
+      - "http://clickhouse:8123"
+      - "--clickhouse-database"
+      - "yuzu"
+      - "--clickhouse-table"
+      - "yuzu_events"
+      - "--clickhouse-user"
+      - "default"
+      - "--clickhouse-password"
+      - "yuzu"
+    volumes:
+      - server-data:/var/lib/yuzu
+      - ./deploy/config/uat/yuzu-server.cfg:/var/lib/yuzu/yuzu-server.cfg:ro
+    # SQLite databases persist in the server-data named volume.
+    # To inspect: docker volume inspect yuzu_server-data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
+  gateway:
+    image: ghcr.io/tr3kkr/yuzu-gateway:0.8.0-rc0
+    container_name: yuzu-gateway
+    restart: unless-stopped
+    ports:
+      - "50061:50051"   # Agent-facing gRPC (mapped to host 50061 to avoid conflict)
+      - "50063:50063"   # Management/command forwarding
+      - "8081:8081"     # Health/readiness
+      - "9568:9568"     # Prometheus metrics
+    environment:
+      - YUZU_GW_TLS_ENABLED=false
+    volumes:
+      - ./deploy/config/uat/gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Prometheus ───────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: yuzu-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus-docker.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - server
+      - gateway
+
+  # ── Grafana ──────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: yuzu-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/yuzu-fleet-dashboard.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  # ── ClickHouse ───────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: yuzu-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"     # HTTP interface
+      - "9000:9000"     # Native protocol
+    environment:
+      - CLICKHOUSE_DB=yuzu
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=yuzu
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./deploy/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--password", "yuzu", "-q", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  server-data:
+  prometheus-data:
+  grafana-data:
+  clickhouse-data:
