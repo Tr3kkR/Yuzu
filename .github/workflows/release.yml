@@ -170,7 +170,7 @@ jobs:
     name: "Build Gateway (Erlang)"
     needs: [build-linux]
     runs-on: [self-hosted, Linux]
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       ImageOS: ubuntu24
 
