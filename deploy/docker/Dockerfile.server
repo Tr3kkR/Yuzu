@@ -1,9 +1,18 @@
+# syntax=docker/dockerfile:1.7
 # Yuzu Server — Multi-stage Docker build with dependency caching
 #
 # The build uses three stages so that the toolchain and vcpkg package
 # compilation (the slow part) are cached in a "deps" image.  Rebuilds
 # that only touch application source code reuse the cached deps layer
 # and only recompile Yuzu's own code.
+#
+# BuildKit cache mounts further accelerate rebuilds:
+#   - /opt/vcpkg/buildtrees  — per-package build artifacts
+#   - /opt/vcpkg/downloads   — upstream source tarballs
+#   - /root/.cache/vcpkg     — vcpkg binary cache (skips recompile entirely)
+#   - /root/.cache/ccache    — C++ ccache for Yuzu's own sources
+#
+# Requires BuildKit (default since Docker 23). Plain `docker build` works.
 #
 # Quick rebuild (code-only changes):
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
@@ -16,7 +25,7 @@
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
+    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
     curl zip unzip tar git ca-certificates python3-pip \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
@@ -33,19 +42,28 @@ WORKDIR /src
 
 # Copy only the vcpkg manifest — this layer is cached until deps change
 COPY vcpkg.json vcpkg-configuration.json ./
-RUN /opt/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
+RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
+    --mount=type=cache,target=/opt/vcpkg/downloads \
+    --mount=type=cache,target=/root/.cache/vcpkg \
+    /opt/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
 
 # ── Stage 2: build — configure + compile (reuses cached deps) ────────────
 FROM deps AS builder
 
+ENV CC="ccache gcc-13" \
+    CXX="ccache g++-13" \
+    CCACHE_DIR=/root/.cache/ccache
+
 COPY . .
-RUN meson setup builddir \
-    --native-file meson/native/linux-gcc13.ini \
-    --buildtype=release \
-    -Dcmake_prefix_path=/src/vcpkg_installed/x64-linux \
-    -Dbuild_tests=false \
-    -Dbuild_agent=false \
-    && meson compile -C builddir
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    meson setup builddir \
+        --native-file meson/native/linux-gcc13.ini \
+        --buildtype=release \
+        -Dcmake_prefix_path=/src/vcpkg_installed/x64-linux \
+        -Dbuild_tests=false \
+        -Dbuild_agent=false \
+    && meson compile -C builddir \
+    && ccache -s
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────
 FROM ubuntu:24.04@sha256:186072bba1b2f436cbb91ef2567abca677337cfc786c86e107d25b7072feef0c

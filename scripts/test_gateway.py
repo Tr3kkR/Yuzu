@@ -39,6 +39,8 @@ if app_ebin.exists():
     shutil.rmtree(app_ebin)
 
 cmd = ["rebar3", "as", "test", suite]
+if suite == "eunit":
+    cmd += ["--dir", "apps/yuzu_gw/test"]
 
 # For CT runs, set minimal perf parameters so the heavyweight perf suite
 # finishes quickly.  The perf suite defaults to 10k agents, 50k heartbeats,
