@@ -41,6 +41,11 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
 
     {
         std::lock_guard lock(mu_);
+        // Clean up stale session_to_agent_ entry from a prior connection
+        auto old = agents_.find(info.agent_id());
+        if (old != agents_.end() && !old->second->session_id.empty()) {
+            session_to_agent_.erase(old->second->session_id);
+        }
         agents_[info.agent_id()] = session;
     }
     metrics_.counter("yuzu_agents_registered_total").increment();
@@ -127,11 +132,55 @@ void AgentRegistry::reap_stale_sessions(std::chrono::seconds timeout) {
 void AgentRegistry::remove_agent(const std::string& agent_id) {
     {
         std::lock_guard lock(mu_);
-        agents_.erase(agent_id);
+        auto it = agents_.find(agent_id);
+        if (it != agents_.end()) {
+            // Clean up session_to_agent_ to prevent leak
+            if (!it->second->session_id.empty()) {
+                session_to_agent_.erase(it->second->session_id);
+            }
+            agents_.erase(it);
+        }
     }
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-offline", agent_id);
     spdlog::info("Agent removed: id={}", agent_id);
+}
+
+void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
+                                            const std::string& session_id) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id) {
+            // Session doesn't match — a newer connection has taken over; do nothing
+            spdlog::debug("Cleanup skipped: session mismatch for agent {} (old={}, current={})",
+                          agent_id, session_id,
+                          it != agents_.end() ? it->second->session_id : "<gone>");
+            return;
+        }
+        session_to_agent_.erase(session_id);
+        agents_.erase(it);
+    }
+    metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
+    bus_.publish("agent-offline", agent_id);
+    spdlog::info("Agent removed: id={} (session={})", agent_id, session_id);
+}
+
+void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
+                                            const std::string& session_id) {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return;
+        session = it->second;
+    }
+    {
+        std::lock_guard slock(session->stream_mu);
+        session->stream = nullptr;
+        session->server_context = nullptr;
+    }
 }
 
 void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::string& node) {
@@ -747,6 +796,10 @@ std::size_t AgentRegistry::agent_count() const {
 void AgentRegistry::map_session(const std::string& session_id, const std::string& agent_id) {
     std::lock_guard lock(mu_);
     session_to_agent_[session_id] = agent_id;
+    auto it = agents_.find(agent_id);
+    if (it != agents_.end()) {
+        it->second->session_id = session_id;
+    }
 }
 
 std::shared_ptr<AgentSession> AgentRegistry::find_by_session(std::string_view session_id) const {

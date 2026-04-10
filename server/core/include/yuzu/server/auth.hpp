@@ -134,6 +134,15 @@ public:
                            const std::string& os, const std::string& arch,
                            const std::string& agent_version);
 
+    /// Mark an agent as enrolled (approved). Creates the entry if it doesn't
+    /// exist, or sets an existing entry to approved. This ensures reconnecting
+    /// agents are recognized without re-enrollment.
+    /// Returns false if the agent has been explicitly denied by an admin —
+    /// tokens do not override admin denials.
+    bool ensure_enrolled(const std::string& agent_id, const std::string& hostname,
+                         const std::string& os, const std::string& arch,
+                         const std::string& agent_version);
+
     /// Check if an agent_id is pending, approved, or denied.
     std::optional<PendingStatus> get_pending_status(const std::string& agent_id) const;
 

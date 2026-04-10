@@ -709,7 +709,15 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
-    auto agents = auth_mgr_->list_pending_agents();
+    auto all_agents = auth_mgr_->list_pending_agents();
+    // Filter out enrolled (approved) agents — they don't need admin attention.
+    // Only show pending and denied entries in the approval queue.
+    std::vector<auth::PendingAgent> agents;
+    for (auto& a : all_agents) {
+        if (a.status != auth::PendingStatus::approved) {
+            agents.push_back(std::move(a));
+        }
+    }
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Agent ID</th><th>Hostname</th><th>OS</th>"
                        "  <th>Version</th><th>Status</th><th></th></tr></thead>"
