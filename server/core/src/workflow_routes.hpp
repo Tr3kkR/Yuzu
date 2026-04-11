@@ -58,7 +58,8 @@ public:
                          ProductPackStore* product_pack_store,
                          InstructionStore* instruction_store,
                          PolicyStore* policy_store,
-                         CommandDispatchFn command_dispatch_fn);
+                         CommandDispatchFn command_dispatch_fn,
+                         ApprovalManager* approval_manager = nullptr);
 };
 
 } // namespace yuzu::server

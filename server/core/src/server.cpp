@@ -2884,11 +2884,26 @@ private:
                 def.type = j.value("type", "");
                 def.plugin = j.value("plugin", "");
                 def.action = j.value("action", "");
+                // Normalize action to lowercase — agent plugins match case-sensitively
+                for (auto& c : def.action)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 def.description = j.value("description", "");
                 def.enabled = j.value("enabled", true);
                 def.instruction_set_id = j.value("instruction_set_id", "");
                 def.gather_ttl_seconds = j.value("gather_ttl_seconds", 300);
                 def.response_ttl_days = j.value("response_ttl_days", 90);
+                def.approval_mode = j.value("approval_mode", "auto");
+                // Validate approval_mode
+                if (def.approval_mode != "auto" &&
+                    def.approval_mode != "role-gated" &&
+                    def.approval_mode != "always") {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", "invalid approval_mode: " + def.approval_mode +
+                            " (must be auto, role-gated, or always)"}}).dump(),
+                        "application/json");
+                    return;
+                }
 
                 auto token = extract_session_cookie(req);
                 auto session = auth_mgr_.validate_session(token);
@@ -2967,16 +2982,43 @@ private:
             auto id = req.matches[1].str();
             try {
                 auto j = nlohmann::json::parse(req.body);
-                InstructionDefinition def;
-                def.id = id;
-                def.name = j.value("name", "");
-                def.version = j.value("version", "1.0");
-                def.type = j.value("type", "");
-                def.plugin = j.value("plugin", "");
-                def.action = j.value("action", "");
-                def.description = j.value("description", "");
-                def.enabled = j.value("enabled", true);
-                def.instruction_set_id = j.value("instruction_set_id", "");
+
+                // Read existing definition to preserve fields not in the update
+                auto existing = instruction_store_->get_definition(id);
+                if (!existing) {
+                    res.status = 404;
+                    res.set_content(R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})", "application/json");
+                    return;
+                }
+
+                InstructionDefinition def = *existing;
+                if (j.contains("name")) def.name = j["name"].get<std::string>();
+                if (j.contains("version")) def.version = j["version"].get<std::string>();
+                if (j.contains("type")) def.type = j["type"].get<std::string>();
+                if (j.contains("plugin")) def.plugin = j["plugin"].get<std::string>();
+                if (j.contains("action")) {
+                    def.action = j["action"].get<std::string>();
+                    // Normalize action to lowercase
+                    for (auto& c : def.action)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                if (j.contains("description")) def.description = j["description"].get<std::string>();
+                if (j.contains("enabled")) def.enabled = j["enabled"].get<bool>();
+                if (j.contains("instruction_set_id"))
+                    def.instruction_set_id = j["instruction_set_id"].get<std::string>();
+                if (j.contains("approval_mode")) {
+                    def.approval_mode = j["approval_mode"].get<std::string>();
+                    if (def.approval_mode != "auto" &&
+                        def.approval_mode != "role-gated" &&
+                        def.approval_mode != "always") {
+                        res.status = 400;
+                        res.set_content(
+                            nlohmann::json({{"error", "invalid approval_mode: " + def.approval_mode +
+                                " (must be auto, role-gated, or always)"}}).dump(),
+                            "application/json");
+                        return;
+                    }
+                }
 
                 auto result = instruction_store_->update_definition(def);
                 if (!result) {
@@ -3807,10 +3849,25 @@ private:
                 def.version = extract("version");
                 def.plugin = extract("plugin");
                 def.action = extract("action");
+                // Normalize action to lowercase — agent plugins match case-sensitively
+                for (auto& c : def.action)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 def.type = extract("type");
                 def.description = extract("description");
                 def.concurrency_mode = extract("concurrency");
                 def.approval_mode = extract("approval");
+                // Validate approval_mode — reject unknown values at creation time
+                if (!def.approval_mode.empty() &&
+                    def.approval_mode != "auto" &&
+                    def.approval_mode != "role-gated" &&
+                    def.approval_mode != "always") {
+                    res.set_content(
+                        "<div class=\"alert alert-error\">Invalid approval mode: &quot;" +
+                        html_escape(def.approval_mode) +
+                        "&quot;. Must be auto, role-gated, or always.</div>",
+                        "text/html");
+                    return;
+                }
                 def.yaml_source = yaml_source;
                 def.created_by = session->username;
                 def.enabled = true;
@@ -4215,12 +4272,17 @@ private:
                    const std::vector<std::string>& agent_ids,
                    const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
+                // Normalize action to lowercase — agent plugins register actions
+                // in lowercase and match case-sensitively.
+                auto norm_action = action;
+                for (auto& c : norm_action)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 auto command_id = plugin + "-" +
                     auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
                 detail::pb::CommandRequest cmd;
                 cmd.set_command_id(command_id);
                 cmd.set_plugin(plugin);
-                cmd.set_action(action);
+                cmd.set_action(norm_action);
                 for (const auto& [k, v] : parameters)
                     (*cmd.mutable_parameters())[k] = v;
                 agent_service_.record_send_time(command_id);
@@ -4250,7 +4312,8 @@ private:
                 if (sent > 0)
                     metrics_.counter("yuzu_commands_dispatched_total").increment();
                 return {command_id, sent};
-            });
+            },
+            approval_manager_.get());
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();

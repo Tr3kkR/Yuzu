@@ -225,7 +225,7 @@ spec:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `plugin` | string | -- | Plugin identifier (must match a registered plugin's `name`). |
-| `action` | string | -- | Action name (must exist in the plugin's `actions[]` array). |
+| `action` | string | -- | Action name (must exist in the plugin's `actions[]` array). Case-insensitive; normalized to lowercase at creation time and at dispatch. |
 | `concurrency` | string | `per-device` | One of: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. |
 | `stagger.maxDelaySeconds` | int | `0` | Max random delay per agent before execution. `0` = no stagger. |
 | `stagger.fixedDelaySeconds` | int | `0` | Fixed delay per agent before execution, added before the random stagger. `0` = no fixed delay. Total wait = `fixedDelaySeconds` + random(`0`, `maxDelaySeconds`). |
@@ -454,6 +454,16 @@ spec:
   approval:
     mode: role-gated    # auto | role-gated | always
 ```
+
+### Executor-Side Behavior
+
+When a user (or MCP tool) executes an instruction that requires approval:
+
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
+2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
+3. **Approvals tab.** The pending request is visible in the **Approvals** tab of the dashboard. The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.
+
+The submitter cannot approve their own request. A different user with the appropriate role must review it.
 
 ### Approval API
 
@@ -965,6 +975,8 @@ curl -s -b cookies.txt \
   -H "Content-Type: application/json" \
   -d '{"params":{"path":"C:\\Windows"},"scope":""}'
 ```
+
+> **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
 
 #### List definitions (v1 endpoint)
 

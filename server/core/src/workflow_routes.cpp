@@ -25,7 +25,8 @@ void WorkflowRoutes::register_routes(
     ProductPackStore* product_pack_store,
     InstructionStore* instruction_store,
     PolicyStore* policy_store,
-    CommandDispatchFn command_dispatch_fn) {
+    CommandDispatchFn command_dispatch_fn,
+    ApprovalManager* approval_manager) {
 
     auto cmd_dispatch = std::move(command_dispatch_fn);
 
@@ -321,7 +322,8 @@ void WorkflowRoutes::register_routes(
 
     // POST /api/workflows/:id/execute -- execute workflow against agents
     svr.Post(R"(/api/workflows/([^/]+)/execute)",
-        [perm_fn, audit_fn, emit_fn, workflow_engine, instruction_store, cmd_dispatch](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, emit_fn, workflow_engine, instruction_store,
+         cmd_dispatch, approval_manager](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Execute"))
                 return;
             if (!workflow_engine || !workflow_engine->is_open()) {
@@ -350,6 +352,55 @@ void WorkflowRoutes::register_routes(
                 res.status = 400;
                 res.set_content(R"({"error":{"code":400,"message":"agent_ids array is required"},"meta":{"api_version":"v1"}})", "application/json");
                 return;
+            }
+
+            // --- Pre-validate approval gates on all workflow steps ---------------
+            // If any instruction in the workflow requires approval, reject the
+            // entire execution rather than allowing partial bypass.
+            if (approval_manager && instruction_store && instruction_store->is_open()) {
+                auto workflow = workflow_engine->get_workflow(workflow_id);
+                if (workflow) {
+                    auto session = auth_fn(req, res);
+                    if (!session)
+                        return;
+                    for (const auto& step : workflow->steps) {
+                        auto step_def = instruction_store->get_definition(step.instruction_id);
+                        if (!step_def) {
+                            res.status = 400;
+                            res.set_content(
+                                nlohmann::json({{"error", {{"code", 400},
+                                    {"message", "workflow step '" + step.label +
+                                     "' references unknown instruction: " +
+                                     step.instruction_id}}},
+                                    {"meta", {{"api_version", "v1"}}}}).dump(),
+                                "application/json");
+                            return;
+                        }
+                        if (step_def->approval_mode == "auto")
+                            continue;
+                        bool blocked = false;
+                        if (step_def->approval_mode == "always") {
+                            blocked = true;
+                        } else if (step_def->approval_mode == "role-gated") {
+                            blocked = (session->role != auth::Role::admin);
+                        } else {
+                            blocked = true; // unknown mode — fail closed
+                        }
+                        if (blocked) {
+                            res.status = 403;
+                            res.set_content(
+                                nlohmann::json({{"error", {{"code", 403},
+                                    {"message", "workflow step '" + step.label +
+                                     "' references instruction '" + step.instruction_id +
+                                     "' which requires approval (mode: " +
+                                     step_def->approval_mode +
+                                     "). Submit each instruction individually for approval."}}},
+                                    {"meta", {{"api_version", "v1"}}}}).dump(),
+                                "application/json");
+                            return;
+                        }
+                    }
+                }
             }
 
             // Create a dispatch function that uses the real command dispatch
@@ -472,7 +523,8 @@ void WorkflowRoutes::register_routes(
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     svr.Post(R"(/api/instructions/([^/]+)/execute)",
-        [perm_fn, audit_fn, emit_fn, instruction_store, cmd_dispatch, execution_tracker](
+        [auth_fn, perm_fn, audit_fn, emit_fn, instruction_store, cmd_dispatch,
+         execution_tracker, approval_manager](
             const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Execution", "Execute"))
                 return;
@@ -512,6 +564,69 @@ void WorkflowRoutes::register_routes(
                 return;
             }
 
+            // Resolve the authenticated user once for audit and approval.
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+
+            // --- Approval gate ---------------------------------------------------
+            // If the definition requires approval and the approval manager is
+            // available, create a pending approval instead of dispatching immediately.
+            // Unknown approval_mode values are treated as requiring approval
+            // (fail-closed) to prevent typos from silently bypassing the gate.
+            if (!approval_manager && def->approval_mode != "auto") {
+                spdlog::error("instruction '{}' requires approval (mode={}) but "
+                              "approval_manager is not available — rejecting execution",
+                              def_id, def->approval_mode);
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"approval system unavailable — cannot execute approval-gated instruction"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (approval_manager && def->approval_mode != "auto") {
+                bool needs_approval = false;
+                if (def->approval_mode == "always") {
+                    needs_approval = true;
+                } else if (def->approval_mode == "role-gated") {
+                    // role-gated: admins bypass, all others need approval
+                    needs_approval = (session->role != auth::Role::admin);
+                } else {
+                    // Unknown mode — fail closed (require approval)
+                    spdlog::warn("instruction '{}' has unrecognized approval_mode '{}' "
+                                 "— requiring approval (fail-closed)",
+                                 def_id, def->approval_mode);
+                    needs_approval = true;
+                }
+
+                if (needs_approval) {
+                    auto result = approval_manager->submit(
+                        def_id, session->username, scope_expr);
+                    if (!result) {
+                        spdlog::error("approval submit failed for '{}': {}",
+                                      def_id, result.error());
+                        res.status = 500;
+                        res.set_content(
+                            R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
+                            "application/json");
+                        return;
+                    }
+                    audit_fn(req, "instruction.approval_required", "pending",
+                             "instruction", def_id,
+                             "approval_id=" + *result + " mode=" + def->approval_mode);
+                    emit_fn("approval.created", req);
+                    res.set_header("HX-Trigger",
+                        R"({"showToast":{"message":"Approval required — request submitted","level":"warning"}})");
+                    res.status = 202;
+                    res.set_content(
+                        nlohmann::json({{"status", "pending_approval"},
+                                        {"approval_id", *result},
+                                        {"definition_id", def_id}}).dump(),
+                        "application/json");
+                    return;
+                }
+            }
+
             // Empty agent_ids + empty scope = broadcast to all agents
 
             // Dispatch
@@ -541,7 +656,7 @@ void WorkflowRoutes::register_routes(
                 exec.scope_expression = scope_expr;
                 exec.parameter_values = nlohmann::json(params).dump();
                 exec.agents_targeted = sent;
-                exec.dispatched_by = "api";
+                exec.dispatched_by = session->username;
                 execution_tracker->create_execution(exec);
             }
 
@@ -650,11 +765,21 @@ void WorkflowRoutes::register_routes(
                     if (def.type.empty()) def.type = "question";
                     def.plugin = ProductPackStore::extract_yaml_value(yaml_source, "plugin");
                     def.action = ProductPackStore::extract_yaml_value(yaml_source, "action");
+                    // Normalize action to lowercase — agent plugins match case-sensitively
+                    for (auto& c : def.action)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                     def.description = ProductPackStore::extract_yaml_value(yaml_source, "description");
                     def.yaml_source = yaml_source;
                     def.platforms = ProductPackStore::extract_yaml_value(yaml_source, "platforms");
                     def.approval_mode = ProductPackStore::extract_yaml_value(yaml_source, "mode");
                     if (def.approval_mode.empty()) def.approval_mode = "auto";
+                    // Validate approval_mode — reject unknown values at creation time
+                    if (def.approval_mode != "auto" &&
+                        def.approval_mode != "role-gated" &&
+                        def.approval_mode != "always") {
+                        return std::unexpected("invalid approval mode: " + def.approval_mode +
+                                               " (must be auto, role-gated, or always)");
+                    }
                     return instruction_store->create_definition(def);
                 } else if (kind == "PolicyFragment") {
                     if (!policy_store || !policy_store->is_open())
