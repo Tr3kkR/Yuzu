@@ -277,9 +277,10 @@ jobs:
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
+  # No needs: — runs on a separate self-hosted runner (same physical box,
+  # different OS) so it can build in parallel with build-linux + build-gateway.
   build-windows:
     name: "Build Windows x64"
-    needs: [build-gateway]
     runs-on: [self-hosted, Windows]
     timeout-minutes: 60
     env:
