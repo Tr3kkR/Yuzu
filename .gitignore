@@ -73,3 +73,4 @@ build_log.txt
 .claude/settings.local.json
 .uat-sanitizer/
 *.local.md
+docker-compose.local.yml
