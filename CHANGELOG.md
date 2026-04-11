@@ -78,6 +78,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
+## [Unreleased]
+
+### Added
+
+#### Testing
+- **Comprehensive MCP protocol test suite** (`scripts/e2e-mcp-test.sh`, 140 tests) — exercises all 22 read-only tools, 3 resources, 4 prompts, JSON-RPC protocol methods (initialize, ping, notifications), parameter validation, authentication enforcement, audit trail verification, Phase 2 write tool guards, response format validation, and sequential call state isolation.
+- **Expanded REST API E2E test suite** (`scripts/e2e-api-test.sh`, 153 tests) — 26 new sections covering execution statistics, help system, webhook/policy/workflow/instruction-set CRUD, YAML validation, approvals, execution lifecycle with response polling, notifications, agent properties, runtime config, analytics, NVD, inventory queries, directory/discovery, scope engine, 17 settings fragments, 5 dashboard fragments, SSE stream connectivity, static asset delivery, security header verification, MCP endpoint reachability, topology, statistics, license, software deployment, and patch management.
+- **Expanded plugin command test** (`scripts/uat-command-test.sh`, ~115 commands across 36 groups) — 12 new plugin groups: example plugin (ping/echo), asset tags, network actions, storage KV CRUD, tags CRUD, TAR extended (sql/configure), vulnerability scanning extended (scan/cve_scan/config_scan), Wake-on-LAN check, chargen traffic generation, HTTP client extended, certificates, and Windows update patch connectivity. Filesystem and IOC tests auto-detect Linux vs Windows and use appropriate paths.
+
+#### Infrastructure
+- **Docker Compose local UAT stack** (`docker-compose.local.yml`, gitignored) — uses locally-built images (`yuzu-server:local`, `yuzu-gateway:local`) with full observability (Prometheus, Grafana, ClickHouse). Dashboards provisioned via Docker configs. Separate from `docker-compose.uat.yml` which references ghcr.io images for remote testers.
+
+### Fixed
+
+#### Server
+- **Web server connection drops under modest load** — increased cpp-httplib TCP listen backlog from 5 to 128 via `-DCPPHTTPLIB_LISTEN_BACKLOG=128` compile flag. The default backlog of 5 caused the kernel to reject incoming TCP connections when more than 5 were queued for acceptance, resulting in HTTP 000 (connection refused) errors during serial API testing at ~50 requests. Also increased socket read/write timeouts from 5s to 30s to prevent in-progress connections from being dropped under load.
+- **Parameterized instruction definitions returning "Unknown Action"** — agent plugins register actions in lowercase but instruction definitions preserved the original case from YAML. Added `std::tolower` normalization at all three creation paths (JSON POST, YAML POST, and the `CommandDispatchFn` adapter).
+- **Approval gate not enforced on instruction execution** — `ApprovalManager` was fully implemented but never wired into `workflow_routes::register_routes`. Added approval_mode validation on create/update, fail-closed gate on execute (auto/always/role-gated/unknown), and 202 response for pending approvals.
+- **PUT /api/instructions/:id resetting approval_mode** — full-object replacement was overwriting existing fields including `approval_mode`. Changed to partial update preserving unspecified fields.
+- **Agent heartbeat deadlock and session races** — fixed heartbeat processing deadlock, session race conditions during re-enrollment, and gateway connection lifecycle issues.
+
+#### Gateway
+- **EUnit test cascade failure** (7 modules, 47 tests) — root cause was `yuzu_gw_scale_tests` starting `yuzu_gw_router` and `yuzu_gw_heartbeat_buffer` in test functions without stopping them in cleanup. Fixed cleanup to stop all started processes, added defensive `catch meck:unload` before `meck:new` in all test setups, and defensive `case whereis` for `start_link` calls.
+- **`compute_scheduler_util` undef in gauge tests** — function was behind `-ifdef(TEST)` guard but rebar3 test profile didn't propagate `{d, 'TEST'}` to umbrella app compilation. Fixed by unconditionally exporting the function.
+- **`agent_count/0` returning `undefined`** — `ets:info(Table, size)` returns `undefined` for nonexistent tables. Added guard clause in `yuzu_gw_registry.erl`.
+
+### Documentation
+- `docs/user-manual/rest-api.md` — added 202 response documentation for instruction execute endpoint.
+- `docs/user-manual/instructions.md` — documented approval executor-side behavior and action case-insensitivity.
+- `docs/yaml-dsl-spec.md` — added case-insensitivity note to action field specification.
+
 ## [0.8.0] - 2026-04-09
 
 ### Added
