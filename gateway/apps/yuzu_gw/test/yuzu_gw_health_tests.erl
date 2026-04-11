@@ -45,6 +45,8 @@ setup() ->
     NeedUpstream = (whereis(yuzu_gw_upstream) =:= undefined),
     UpPid = case NeedUpstream of
         true ->
+            catch meck:unload(grpcbox_client),
+            catch meck:unload(telemetry),
             meck:new(grpcbox_client, [non_strict, no_link]),
             meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
                 {ok, #{}, #{}}

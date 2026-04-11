@@ -79,7 +79,9 @@ tick_setup() ->
     end,
     %% Use ETS to collect telemetry events (EUnit runs setup and tests
     %% in different processes, so mailbox messaging won't work).
+    catch ets:delete(gauge_test_events),
     ets:new(gauge_test_events, [named_table, bag, public]),
+    catch meck:unload(telemetry),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(EventName, Measurements, Meta) ->
         ets:insert(gauge_test_events, {EventName, Measurements, Meta}),

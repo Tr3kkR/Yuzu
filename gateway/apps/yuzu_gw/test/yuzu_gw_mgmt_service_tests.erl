@@ -72,6 +72,8 @@ ctx_setup() ->
         undefined -> {ok, _} = yuzu_gw_registry:start_link();
         _ -> ok
     end,
+    catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(telemetry),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
     meck:new(telemetry, [passthrough, no_link]),
@@ -79,7 +81,8 @@ ctx_setup() ->
     ok.
 
 ctx_cleanup(_) ->
-    meck:unload([yuzu_gw_upstream, telemetry]),
+    catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(telemetry),
     ok.
 
 list_agents_ctx() ->

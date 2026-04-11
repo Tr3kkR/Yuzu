@@ -57,6 +57,9 @@ setup() ->
         undefined -> {ok, _} = yuzu_gw_registry:start_link();
         _ -> ok
     end,
+    %% Clean up stale mocks from prior modules.
+    catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(telemetry),
     %% Mock external deps.
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status,

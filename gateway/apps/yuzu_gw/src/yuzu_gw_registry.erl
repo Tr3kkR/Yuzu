@@ -90,7 +90,10 @@ agents_for_plugin(PluginName) ->
 %% @doc Total number of connected agents on this node.
 -spec agent_count() -> non_neg_integer().
 agent_count() ->
-    ets:info(?TABLE, size).
+    case ets:info(?TABLE, size) of
+        undefined -> 0;
+        N -> N
+    end.
 
 %% @doc Paginated agent listing for dashboard queries.
 %% Returns {Agents, NextCursor} where Agents is a list of maps.
