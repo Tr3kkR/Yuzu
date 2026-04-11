@@ -130,7 +130,7 @@ yuzu_server_core_lib = static_library(
     'src/security_headers.cpp',
   ),
   include_directories: ['include'],
-  cpp_args: https_cpp_args + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+  cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
 )
