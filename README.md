@@ -11,7 +11,7 @@ Yuzu gives operations and security teams a single control plane to query, comman
 - **Continuous compliance** — Define desired-state policies ("BitLocker must be enabled") that agents evaluate locally on triggers (file change, service crash, interval) and auto-remediate.
 - **Security response** — Quarantine compromised devices, check indicators of compromise, inventory certificates, and collect forensic data.
 - **Plugin extensibility** — A stable C ABI means plugins can be written in any language that produces a shared library. 44 plugins ship out of the box covering hardware, network, security, software, and more.
-- **AI integration** — An embedded MCP (Model Context Protocol) server exposes 22 tools for AI-driven fleet querying, compliance reporting, and supervised command execution.
+- **AI integration** — An embedded MCP (Model Context Protocol) server exposes 23 tools for AI-driven fleet querying, compliance reporting, and supervised command execution.
 
 ## Instruction Engine
 

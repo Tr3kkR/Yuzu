@@ -105,6 +105,14 @@ public:
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 
+    /// Set an explicit data directory for runtime state files (enrollment
+    /// tokens, pending agents). If not set, defaults to cfg_path_ parent.
+    void set_data_dir(const std::filesystem::path& dir) { data_dir_ = dir; }
+
+    /// Re-load enrollment tokens and pending agents from the current state_dir().
+    /// Call after set_data_dir() to pick up files from the new location.
+    void reload_state() { load_tokens(); load_pending(); }
+
     // -- Enrollment tokens (Tier 2) ---------------------------------------
 
     /// Create a new enrollment token. Returns the raw token string (show once).
@@ -183,8 +191,14 @@ private:
     /// Load pending agents from disk.
     bool load_pending();
 
+    /// Returns the directory for runtime state files.
+    std::filesystem::path state_dir() const {
+        return data_dir_.empty() ? cfg_path_.parent_path() : data_dir_;
+    }
+
     mutable std::shared_mutex mu_;
     std::filesystem::path cfg_path_;
+    std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;
 

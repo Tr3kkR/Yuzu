@@ -31,7 +31,7 @@ inline bool tier_allows(std::string_view mcp_tier,
         if (securable_type == "Tag" && (operation == "Write" || operation == "Delete"))
             return true;
         if (securable_type == "Execution" && operation == "Execute")
-            return true;  // Further restricted to auto-approved defs in the tool handler
+            return true;  // Operator tier executes without approval (auto-approved)
         return false;
     }
 
@@ -65,10 +65,10 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
     }
 
-    // ── operator tier: executions always require approval ───────────────
+    // ── operator tier: tag deletes require approval, executions are auto-approved ──
     if (mcp_tier == "operator") {
-        if (securable_type == "Execution" && operation == "Execute") return true;
         if (securable_type == "Tag" && operation == "Delete") return true;
+        // Execution/Execute is auto-approved for operator tier (no approval needed).
     }
 
     return false;

@@ -78,6 +78,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
+## [0.9.0] - 2026-04-11
+
+### Added
+
+#### Server
+- **`--data-dir` CLI flag** (env: `YUZU_DATA_DIR`) — separates SQLite database storage from the config file location. Required for containerized deployments where the config is mounted read-only but databases need a writable volume. Path is resolved to canonical form at startup (symlinks followed). A writable probe runs at startup to fail fast if the directory is not writable, rather than deferring to the first DB open.
+- **`execute_instruction` MCP tool** — dispatches plugin commands to agents via MCP JSON-RPC. Accepts `plugin`, `action`, `params`, `scope`, and `agent_ids`. Returns a `command_id` for asynchronous result polling via `query_responses`. Plugin and action names are normalized to lowercase before dispatch. MCP tool count: 22 → 23.
+  - `operator` tier: executes immediately (auto-approved).
+  - `supervised` tier: returns `-32006 APPROVAL_REQUIRED` with an explicit message that approval-gated MCP execution is not yet implemented.
+  - `readonly` tier: blocked.
+  - If neither `scope` nor `agent_ids` is provided, defaults to all agents (documented in tool description as a warning).
+
+#### Testing
+- **Puppeteer E2E test expanded** (`Synthetic-UAT-Puppeteer.js`) — 70 → 115 non-destructive commands. Cross-platform path support via `YUZU_AGENT_OS` env var. Added: `network_config dns_cache`, `network_actions ping/flush_dns`, `users group_members`, `filesystem search/search_dir/create_temp/create_temp_dir`, `vuln_scan cve_scan/config_scan/inventory`, `storage set/get/list`, `tags set/get/get_all/check/count`, `agent_actions set_log_level`, TAR extended, `chargen start/stop`, `wol check`, registry read-only (Windows), `windows_updates` extended.
+- **REST API command test expanded** (`scripts/uat-command-test.sh`) — 145 → 151 dispatches. Added: `agent_actions set_log_level`, `network_actions flush_dns`, `filesystem create_temp/create_temp_dir`, `interaction notify`. Removed destructive `status switch`.
+- **MCP Haiku subagent test framework** — stdio-to-HTTP MCP adapter (`scripts/mcp-http-adapter.js`), Claude Code agent definition (`.claude/agents/mcp-uat-tester.md`), and test harness (`scripts/e2e-mcp-haiku-test.sh`) that invokes Haiku to exercise all MCP tools end-to-end.
+- **15 `execute_instruction` unit tests** (`tests/unit/server/test_mcp_server.cpp`) — happy dispatch, null dispatch_fn, missing params, zero agents, default scope, explicit agent_ids, params forwarding, non-string params, read_only_mode, readonly/operator/supervised tier enforcement, audit trail on success and failure.
+- **`--setup` flag on all E2E test scripts** — optional Docker Compose lifecycle management. Default: health-check and fail fast. `--setup`: bring up `docker-compose.local.yml`, wait for health, then run.
+- Tool count assertions changed from exact equality to `>= 23` minimum with named presence checks — no more magic numbers that break when tools are added.
+
+#### Deployment
+- **`docker-compose.local.yml` port topology** — gateway owns host port 50051 (agent-facing), server agent port is container-internal only. Agents connect to `localhost:50051` with default settings.
+- **`docker-compose.local.yml` uses `--data-dir /var/lib/yuzu`** — config at `/etc/yuzu/yuzu-server.cfg` (read-only Docker config mount), databases at `/var/lib/yuzu` (writable volume).
+
+### Changed
+- `AuthManager::state_dir()` — enrollment tokens and pending agents now written to `--data-dir` when set, instead of always using the config file's parent directory. `reload_state()` re-loads from the new location after `set_data_dir()`.
+- `Config::db_dir()` helper method — all ~25 DB path derivations in `server.cpp` use `cfg_.db_dir()` instead of `cfg_.auth_config_path.parent_path()`.
+- MCP `read_only_mode` and `mcp_disabled` flags captured by reference (not value) so runtime toggle via Settings UI takes effect without server restart.
+- MCP operator tier no longer requires approval for `Execution/Execute` — matches documented "auto-approved" behavior.
+- MCP approval-gated operations return `-32006 APPROVAL_REQUIRED` (was `-32603 Internal Error`). Audit status logged as `"approval_required"` instead of `"failure"`.
+- `linux-start-UAT.sh` gateway startup changed from `erl` direct to rebar3 prod release binary.
+- Default password in test scripts updated to `adminpassword1` (Docker UAT default) with `YUZU_PASS` env var override.
+
+### Documentation
+- `docs/user-manual/server-admin.md` — `--data-dir` flag added to CLI flags table and Data Storage section.
+- `docs/user-manual/mcp.md` — `execute_instruction` tool added (#23), tool count updated, tier authorization table corrected (operator execution is auto-approved), approval workflow table updated, troubleshooting section clarified.
+- `CLAUDE.md` — MCP Phase 1 updated (23 tools, `execute_instruction` documented), Phase 2 reduced to 5 remaining tools.
+- `.claude/agents/release-deploy.md` — UAT environment knowledge documented (port topology, data directory separation, Docker file/directory race condition, Grafana dashboard packaging gap, enrollment token API).
+
 ## [0.8.1] - 2026-04-11
 
 ### Added

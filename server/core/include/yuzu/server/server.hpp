@@ -37,6 +37,15 @@ struct Config {
     // Authentication
     std::filesystem::path auth_config_path; // yuzu-server.cfg path
 
+    // Data directory (for all SQLite DBs and runtime state).
+    // If empty, defaults to auth_config_path's parent directory.
+    std::filesystem::path data_dir;
+
+    /// Returns the directory where DBs and runtime state should be written.
+    [[nodiscard]] std::filesystem::path db_dir() const {
+        return data_dir.empty() ? auth_config_path.parent_path() : data_dir;
+    }
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding

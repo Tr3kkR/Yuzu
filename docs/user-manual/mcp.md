@@ -43,7 +43,7 @@ Key characteristics:
   (checked second). A token must pass both.
 - **Audit**: Every tool invocation is recorded in the audit log with an
   `mcp.<tool_name>` action.
-- **Capabilities**: 22 tools, 3 resources, 4 prompts.
+- **Capabilities**: 23 tools, 3 resources, 4 prompts.
 
 The MCP server reuses the same authentication middleware, RBAC engine, and
 audit pipeline as the REST API. No separate ports or processes are required.
@@ -154,7 +154,7 @@ all writes.
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
 | `readonly` | Yes | No | No | No | No |
-| `operator` | Yes | Yes | Yes (via approval) | No | Tags only (via approval) |
+| `operator` | Yes | Yes | Yes (auto-approved) | No | Tags only (via approval) |
 | `supervised` | Yes | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
 
 ### Tier details
@@ -164,9 +164,9 @@ assistant can list agents, query inventory, check compliance, read the audit
 log, and browse instruction definitions. It cannot make any changes.
 
 **operator** -- Adds the ability to write and delete tags, and to execute
-instructions. Instruction executions are routed through the approval workflow
-(an admin must approve before the command runs). Tag deletions also require
-approval. Suitable for day-to-day operational use with human oversight.
+instructions. Instruction executions are auto-approved (they run immediately
+without admin approval). Tag deletions still require approval. Suitable for
+day-to-day operational use.
 
 **supervised** -- Full access to all operations, but destructive actions
 require admin approval before taking effect. This includes:
@@ -239,7 +239,7 @@ curl -s -b cookies.txt -X DELETE https://localhost:8080/api/v1/tokens/a1b2c3d4
 
 ## Available Tools
 
-The MCP server exposes 22 tools. Each tool maps to a specific RBAC
+The MCP server exposes 23 tools. Each tool maps to a specific RBAC
 securable type and operation. The tier check and RBAC check both must pass
 for the tool to execute.
 
@@ -267,6 +267,12 @@ for the tool to execute.
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
+| 23 | `execute_instruction` | Execute a plugin action on agents. Returns a `command_id`; poll results with `query_responses`. | `Execution:Execute` |
+
+> **`execute_instruction` tier behavior:**
+> - `readonly` tier: blocked.
+> - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
+> - `supervised` tier: not yet implemented (returns an error). Use the REST API or dashboard for supervised-tier execution until the approval re-dispatch path is built.
 
 ### Tool parameters
 
@@ -406,7 +412,7 @@ The following table shows which operations require approval, by tier:
 
 | Operation | `operator` tier | `supervised` tier |
 |-----------|----------------|-------------------|
-| Execute instruction | Yes | Yes |
+| Execute instruction | No (auto-approved) | Yes |
 | Delete tag | Yes | Yes |
 | Delete (any resource) | -- | Yes |
 | Write policy | -- | Yes |
@@ -462,7 +468,7 @@ rotation schedule:
 | Use Case | Recommended Tier |
 |----------|-----------------|
 | Read-only dashboards, reporting, investigation | `readonly` |
-| Day-to-day operations with AI assistance (tagging, approved executions) | `operator` |
+| Day-to-day operations with AI assistance (tagging, auto-approved executions) | `operator` |
 | Automation pipelines with human approval gates | `supervised` |
 | Unattended, unsupervised AI access | Not recommended. Use `readonly` at most. |
 
@@ -529,8 +535,9 @@ or use a different tool that is within the current tier's permissions.
 **Symptom**: A tool call returns error code `-32006` with an approval ID.
 
 **Cause**: The operation requires admin approval before it can proceed. This
-is expected behavior for write/execute operations on `operator` and
-`supervised` tier tokens.
+is expected behavior for destructive operations on `supervised` tier tokens,
+and for tag deletions on `operator` tier tokens. Note that `operator` tier
+executions are auto-approved and do not trigger this error.
 
 **Fix**: An administrator must approve the request via the dashboard or REST
 API. After approval, retry the operation.
