@@ -193,7 +193,7 @@ services:
       - "--web-port"
       - "8080"
       - "--config"
-      - "/var/lib/yuzu/yuzu-server.cfg"
+      - "/etc/yuzu/yuzu-server.cfg"
       - "--gateway-upstream"
       - "0.0.0.0:50055"
       - "--gateway-mode"
@@ -212,7 +212,7 @@ services:
       - "yuzu"
     configs:
       - source: server-cfg
-        target: /var/lib/yuzu/yuzu-server.cfg
+        target: /etc/yuzu/yuzu-server.cfg
     volumes:
       - server-data:/var/lib/yuzu
     healthcheck:
@@ -276,6 +276,7 @@ services:
       - source: grafana-dashboard-provider
         target: /etc/grafana/provisioning/dashboards/yuzu.yml
     volumes:
+      - ./deploy/grafana:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
