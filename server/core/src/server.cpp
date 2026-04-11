@@ -1305,6 +1305,12 @@ private:
         web_server_->set_keep_alive_timeout(120);
         web_server_->set_keep_alive_max_count(std::numeric_limits<size_t>::max());
 
+        // Increase socket read/write timeouts from the 5s defaults.
+        // Under load, slow responses can hit the 5s deadline and drop
+        // in-progress connections; 30s gives adequate headroom.
+        web_server_->set_read_timeout(30);
+        web_server_->set_write_timeout(30);
+
         // -- Auth middleware (pre-routing) -----------------------------------
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,

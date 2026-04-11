@@ -289,14 +289,30 @@ echo ""
 
 # ── Group 12: Filesystem ────────────────────────────────────────────────
 echo -e "${BOLD}[Filesystem]${NC}"
-dispatch_and_poll filesystem exists '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
-dispatch_and_poll filesystem list_dir '{"path":"C:\\\\Windows"}'
-dispatch_and_poll filesystem file_hash '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
-dispatch_and_poll filesystem read '{"path":"C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts"}'
-dispatch_and_poll filesystem get_acl '{"path":"C:\\\\Windows\\\\System32"}'
-dispatch_and_poll filesystem get_signature '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
-dispatch_and_poll filesystem search_dir '{"root":"C:\\\\Windows\\\\Temp","pattern":"*.log"}'
-dispatch_and_poll filesystem find_by_hash '{"directory":"C:\\\\Windows\\\\System32","sha256":"dummy_will_not_match"}'
+# Detect OS and use appropriate paths
+if [ -f /etc/os-release ] || [ "$(uname)" = "Linux" ] || [ "$(uname)" = "Darwin" ]; then
+    dispatch_and_poll filesystem exists '{"path":"/etc/hosts"}'
+    dispatch_and_poll filesystem list_dir '{"path":"/tmp"}'
+    dispatch_and_poll filesystem file_hash '{"path":"/etc/hosts"}'
+    dispatch_and_poll filesystem read '{"path":"/etc/hosts"}'
+    dispatch_and_poll filesystem get_acl '{"path":"/tmp"}'
+    dispatch_and_poll filesystem get_signature '{"path":"/usr/bin/env"}'
+    dispatch_and_poll filesystem search_dir '{"root":"/tmp","pattern":"*"}'
+    dispatch_and_poll filesystem find_by_hash '{"directory":"/tmp","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}'
+    dispatch_and_poll filesystem search '{"root":"/etc","pattern":"host*","max_depth":"1"}'
+    dispatch_and_poll filesystem get_version_info '{"path":"/usr/bin/env"}'
+else
+    dispatch_and_poll filesystem exists '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+    dispatch_and_poll filesystem list_dir '{"path":"C:\\\\Windows"}'
+    dispatch_and_poll filesystem file_hash '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+    dispatch_and_poll filesystem read '{"path":"C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts"}'
+    dispatch_and_poll filesystem get_acl '{"path":"C:\\\\Windows\\\\System32"}'
+    dispatch_and_poll filesystem get_signature '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+    dispatch_and_poll filesystem search_dir '{"root":"C:\\\\Windows\\\\Temp","pattern":"*.log"}'
+    dispatch_and_poll filesystem find_by_hash '{"directory":"C:\\\\Windows\\\\System32","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}'
+    dispatch_and_poll filesystem search '{"root":"C:\\\\Windows\\\\System32","pattern":"notepad*","max_depth":"1"}'
+    dispatch_and_poll filesystem get_version_info '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+fi
 echo ""
 
 # ── Group 13: Registry ──────────────────────────────────────────────────
@@ -365,12 +381,96 @@ echo ""
 
 # ── Group 23: IOC Check ─────────────────────────────────────────────────
 echo -e "${BOLD}[IOC Check]${NC}"
-dispatch_and_poll ioc check '{"ip_addresses":"8.8.8.8","domains":"example.com","file_paths":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+if [ -f /etc/os-release ] || [ "$(uname)" = "Linux" ] || [ "$(uname)" = "Darwin" ]; then
+    dispatch_and_poll ioc check '{"ip_addresses":"8.8.8.8","domains":"example.com","file_paths":"/etc/hosts"}'
+else
+    dispatch_and_poll ioc check '{"ip_addresses":"8.8.8.8","domains":"example.com","file_paths":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
+fi
 echo ""
 
 # ── Group 24: Discovery ─────────────────────────────────────────────────
 echo -e "${BOLD}[Discovery]${NC}"
 dispatch_and_poll discovery scan_subnet '{"subnet":"192.168.1.0/30"}'
+echo ""
+
+# ── Group 25: Example Plugin ───────────────────────────────────────────
+echo -e "${BOLD}[Example Plugin]${NC}"
+dispatch_and_poll example ping
+dispatch_and_poll example echo '{"message":"UAT test message"}'
+echo ""
+
+# ── Group 26: Asset Tags ──────────────────────────────────────────────
+echo -e "${BOLD}[Asset Tags]${NC}"
+dispatch_and_poll asset_tags status
+dispatch_and_poll asset_tags get
+dispatch_and_poll asset_tags changes
+echo ""
+
+# ── Group 27: Network Actions ─────────────────────────────────────────
+echo -e "${BOLD}[Network Actions]${NC}"
+dispatch_and_poll network_actions ping '{"host":"127.0.0.1"}'
+echo ""
+
+# ── Group 28: Storage (Agent KV Store) ────────────────────────────────
+echo -e "${BOLD}[Storage (KV Store)]${NC}"
+dispatch_and_poll storage set '{"key":"uat_test_key","value":"uat_test_value"}'
+dispatch_and_poll storage get '{"key":"uat_test_key"}'
+dispatch_and_poll storage list
+dispatch_and_poll storage delete '{"key":"uat_test_key"}'
+echo ""
+
+# ── Group 29: Tags (Agent Local Tags) ─────────────────────────────────
+echo -e "${BOLD}[Tags (Local Agent)]${NC}"
+dispatch_and_poll tags set '{"key":"uat_env","value":"testing"}'
+dispatch_and_poll tags get '{"key":"uat_env"}'
+dispatch_and_poll tags check '{"key":"uat_env"}'
+dispatch_and_poll tags get_all
+dispatch_and_poll tags count
+dispatch_and_poll tags delete '{"key":"uat_env"}'
+echo ""
+
+# ── Group 30: TAR Extended (Telemetry & Response) ─────────────────────
+echo -e "${BOLD}[TAR Extended]${NC}"
+dispatch_and_poll tar status
+dispatch_and_poll tar sql '{"query":"SELECT count(*) as cnt FROM events LIMIT 1"}'
+dispatch_and_poll tar configure '{"interval":"60"}'
+echo ""
+
+# ── Group 31: Vulnerability Scanning Extended ─────────────────────────
+echo -e "${BOLD}[Vulnerability Scanning Extended]${NC}"
+dispatch_and_poll vuln_scan summary
+dispatch_and_poll vuln_scan inventory
+dispatch_and_poll vuln_scan scan
+dispatch_and_poll vuln_scan cve_scan '{"cve":"CVE-2021-44228"}'
+dispatch_and_poll vuln_scan config_scan
+echo ""
+
+# ── Group 32: Wake-on-LAN ─────────────────────────────────────────────
+echo -e "${BOLD}[Wake-on-LAN]${NC}"
+dispatch_and_poll wol check '{"host":"127.0.0.1"}'
+echo ""
+
+# ── Group 33: Chargen (Test Traffic) ──────────────────────────────────
+echo -e "${BOLD}[Chargen]${NC}"
+dispatch_and_poll chargen chargen_start '{"duration":"2","rate":"10"}'
+sleep 3
+dispatch_and_poll chargen chargen_stop
+echo ""
+
+# ── Group 34: HTTP Client Extended ────────────────────────────────────
+echo -e "${BOLD}[HTTP Client Extended]${NC}"
+dispatch_and_poll http_client get '{"url":"http://localhost:8080/livez"}'
+dispatch_and_poll http_client head '{"url":"http://localhost:8080/livez"}'
+echo ""
+
+# ── Group 35: Certificates Extended ───────────────────────────────────
+echo -e "${BOLD}[Certificates Extended]${NC}"
+dispatch_and_poll certificates list
+echo ""
+
+# ── Group 36: Windows-Specific Patches ────────────────────────────────
+echo -e "${BOLD}[Windows Updates Extended]${NC}"
+dispatch_and_poll windows_updates patch_connectivity
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────
