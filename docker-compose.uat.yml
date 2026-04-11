@@ -112,6 +112,14 @@ configs:
           options:
             path: /var/lib/grafana/dashboards
             foldersFromFilesStructure: false
+  grafana-dashboard-main:
+    file: deploy/grafana/yuzu-dashboard.json
+  grafana-dashboard-fleet:
+    file: deploy/grafana/yuzu-fleet-dashboard.json
+  grafana-dashboard-gateway:
+    file: deploy/grafana/yuzu-gateway-dashboard.json
+  grafana-dashboard-analytics:
+    file: deploy/grafana/yuzu-analytics-dashboard.json
   clickhouse-init:
     content: |
       CREATE DATABASE IF NOT EXISTS yuzu;
@@ -275,8 +283,15 @@ services:
         target: /etc/grafana/provisioning/datasources/prometheus.yml
       - source: grafana-dashboard-provider
         target: /etc/grafana/provisioning/dashboards/yuzu.yml
+      - source: grafana-dashboard-main
+        target: /var/lib/grafana/dashboards/yuzu-dashboard.json
+      - source: grafana-dashboard-fleet
+        target: /var/lib/grafana/dashboards/yuzu-fleet-dashboard.json
+      - source: grafana-dashboard-gateway
+        target: /var/lib/grafana/dashboards/yuzu-gateway-dashboard.json
+      - source: grafana-dashboard-analytics
+        target: /var/lib/grafana/dashboards/yuzu-analytics-dashboard.json
     volumes:
-      - ./deploy/grafana:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
