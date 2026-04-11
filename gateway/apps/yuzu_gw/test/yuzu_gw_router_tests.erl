@@ -36,10 +36,17 @@ setup() ->
         undefined -> {ok, _} = yuzu_gw_registry:start_link();
         _ -> ok
     end,
-    %% Mock telemetry to no-op.
+    %% Clean up stale mocks from prior modules before creating new ones.
+    catch meck:unload(telemetry),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
-    {ok, RouterPid} = yuzu_gw_router:start_link(),
+    RouterPid = case whereis(yuzu_gw_router) of
+        undefined ->
+            {ok, P} = yuzu_gw_router:start_link(),
+            P;
+        Existing ->
+            Existing
+    end,
     RouterPid.
 
 cleanup(RouterPid) ->

@@ -43,6 +43,8 @@ circuit_breaker_nf_test_() ->
      ]}.
 
 setup() ->
+    catch meck:unload(grpcbox_client),
+    catch meck:unload(telemetry),
     meck:new(grpcbox_client, [non_strict, no_link]),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{}, #{}}
@@ -56,6 +58,10 @@ setup() ->
     application:set_env(yuzu_gw, circuit_breaker_failure_threshold, 3),
     application:set_env(yuzu_gw, circuit_breaker_reset_timeout_ms, 100),
     application:set_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, 500),
+    case whereis(yuzu_gw_upstream) of
+        undefined -> ok;
+        Old -> catch unlink(Old), catch gen_server:stop(Old, shutdown, 1000)
+    end,
     {ok, Pid} = yuzu_gw_upstream:start_link(),
     Pid.
 

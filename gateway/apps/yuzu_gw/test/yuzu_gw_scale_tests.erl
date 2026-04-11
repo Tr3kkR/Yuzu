@@ -94,7 +94,21 @@ cleanup(_) ->
     catch
         _:_ -> ok
     end,
+    %% Stop processes started inside individual test functions
+    %% (fanout_throughput starts yuzu_gw_router, heartbeat_batch_scale
+    %% starts yuzu_gw_heartbeat_buffer).  If they're not running, the
+    %% catch swallows the error.
+    lists:foreach(fun(Name) ->
+        case whereis(Name) of
+            undefined -> ok;
+            Pid ->
+                catch unlink(Pid),
+                catch gen_server:stop(Pid, shutdown, 1000)
+        end
+    end, [yuzu_gw_router, yuzu_gw_heartbeat_buffer]),
     catch meck:unload(telemetry),
+    catch meck:unload(grpcbox_channel),
+    catch meck:unload(grpcbox_client),
     ok.
 
 %%%===================================================================

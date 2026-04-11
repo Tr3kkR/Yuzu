@@ -80,12 +80,15 @@ heartbeats_batched() ->
     ?assertEqual(0, length(BatchCalls)).
 
 flush_sends_batch() ->
-    %% Flush any stale heartbeats from prior tests.
+    %% Drain any stale heartbeats from prior tests by flushing twice
+    %% with enough time for the gen_server to process.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
     whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(50),
+    timer:sleep(100),
+    whereis(yuzu_gw_heartbeat_buffer) ! flush,
+    timer:sleep(100),
     %% Now reset and set up the real assertion mock.
     meck:reset(grpcbox_client),
     meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->

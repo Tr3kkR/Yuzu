@@ -29,6 +29,8 @@ heartbeat_metrics_test_() ->
      ]}.
 
 setup() ->
+    catch meck:unload(grpcbox_client),
+    catch meck:unload(telemetry),
     meck:new(grpcbox_client, [non_strict, no_link]),
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
@@ -38,6 +40,10 @@ setup() ->
     %% Use a long interval so flushes don't happen automatically during tests.
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 600000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 100),
+    case whereis(yuzu_gw_heartbeat_buffer) of
+        undefined -> ok;
+        Old -> catch unlink(Old), catch gen_server:stop(Old, shutdown, 1000)
+    end,
     {ok, Pid} = yuzu_gw_heartbeat_buffer:start_link(),
     Pid.
 
