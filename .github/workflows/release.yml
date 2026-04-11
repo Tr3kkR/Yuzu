@@ -49,6 +49,7 @@ jobs:
       - name: Cache ccache
         uses: actions/cache@v4
         with:
+          save-always: true
           path: ~/.cache/ccache
           key: ccache-release-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -186,6 +187,7 @@ jobs:
       - name: Cache rebar3 dependencies
         uses: actions/cache@v4
         with:
+          save-always: true
           path: gateway/_build/default/lib
           key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
           restore-keys: |
@@ -194,6 +196,7 @@ jobs:
       - name: Cache Dialyzer PLT
         uses: actions/cache@v4
         with:
+          save-always: true
           path: gateway/_build/default/*_plt*
           key: dialyzer-plt-otp27-${{ hashFiles('gateway/rebar.lock') }}
           restore-keys: |
@@ -302,6 +305,7 @@ jobs:
       - name: Cache ccache
         uses: actions/cache@v4
         with:
+          save-always: true
           path: ~\AppData\Local\ccache
           key: ccache-release-windows-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -320,6 +324,7 @@ jobs:
       - name: Cache vcpkg installed packages
         uses: actions/cache@v4
         with:
+          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |

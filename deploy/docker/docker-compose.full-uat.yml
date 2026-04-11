@@ -34,7 +34,9 @@ services:
       - "info"
       - "--metrics-no-auth"
       - "--config"
-      - "/var/lib/yuzu/yuzu-server.cfg"
+      - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
       - "--clickhouse-url"
       - "http://clickhouse:8123"
       - "--clickhouse-database"
@@ -52,7 +54,8 @@ services:
       - "50052:50052"   # gRPC (management)
       - "50055:50055"   # gRPC (gateway upstream — internal)
     volumes:
-      - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
+      - ${UAT_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
+      - server-data:/var/lib/yuzu
       - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
     depends_on:
       clickhouse:
@@ -127,6 +130,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  server-data:
   prometheus-uat-data:
   grafana-uat-data:
   clickhouse-uat-data:

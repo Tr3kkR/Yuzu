@@ -139,13 +139,9 @@ start_all() {
         echo "    Run: meson compile -C builddir"
         exit 1
     fi
-    if [ ! -d "$GATEWAY_DIR/_build/default/lib/yuzu_gw/ebin" ]; then
-        fail "Gateway not compiled at $GATEWAY_DIR/_build"
-        echo "    Run: cd gateway && rebar3 compile"
-        exit 1
-    fi
-    if ! command -v erl > /dev/null 2>&1; then
-        fail "erl not found in PATH"
+    if [ ! -d "$GATEWAY_DIR/_build/prod/rel/yuzu_gw" ]; then
+        fail "Gateway release not built at $GATEWAY_DIR/_build/prod/rel/yuzu_gw"
+        echo "    Run: cd gateway && rebar3 as prod release"
         exit 1
     fi
 
