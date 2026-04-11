@@ -78,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
 
-## [Unreleased]
+## [0.8.1] - 2026-04-11
 
 ### Added
 
