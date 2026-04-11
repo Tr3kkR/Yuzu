@@ -180,7 +180,7 @@ configs:
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:0.8.0-rc0
+    image: ghcr.io/tr3kkr/yuzu-server:0.8.1-rc0
     container_name: yuzu-server
     restart: unless-stopped
     ports:
@@ -234,7 +234,7 @@ services:
 
   # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway:0.8.0-rc0
+    image: ghcr.io/tr3kkr/yuzu-gateway:0.8.1-rc0
     container_name: yuzu-gateway
     restart: unless-stopped
     ports:
