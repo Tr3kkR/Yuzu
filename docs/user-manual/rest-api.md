@@ -2557,7 +2557,19 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 }
 ```
 
-**Errors:** 404 (definition not found), 400 (invalid body), 503 (no agents reached or store unavailable).
+**Response (202 -- Approval Required):**
+
+Returned when the definition's `approval_mode` is `role-gated` or `always` and the caller does not have direct-execute permission. The execution is queued for approval.
+
+```json
+{
+  "status": "pending_approval",
+  "approval_id": "abc123...",
+  "definition_id": "def456..."
+}
+```
+
+**Errors:** 404 (definition not found), 400 (invalid body), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 503 (no agents reached or store unavailable).
 
 ---
 

@@ -115,7 +115,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Plugin identifier (must match a registered plugin's `name` field). |
-| `action` | string | Yes | -- | Action name (must exist in the plugin's `actions[]` array). |
+| `action` | string | Yes | -- | Action name (must exist in the plugin's `actions[]` array). Case-insensitive; normalized to lowercase at creation time and at dispatch. |
 | `concurrency` | string | No | `per-device` | Concurrency mode. Values: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. See [Section 12](#12-concurrency-model). |
 | `stagger` | object | No | -- | Stagger configuration for large-fleet dispatch. |
 | `minSuccessPercent` | integer | No | `100` | Minimum percentage of agents that must succeed. `0` = best-effort, `100` = all must succeed. |
