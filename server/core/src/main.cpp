@@ -84,6 +84,9 @@ int main(int argc, char* argv[]) {
 
     app.add_option("--config", config_file, "Path to yuzu-server.cfg")
         ->envname("YUZU_CONFIG");
+    app.add_option("--data-dir", cfg.data_dir,
+                   "Data directory for SQLite DBs (default: same directory as config file)")
+        ->envname("YUZU_DATA_DIR");
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
@@ -417,6 +420,45 @@ int main(int argc, char* argv[]) {
     }
 
     cfg.auth_config_path = cfg_path;
+
+    // If --data-dir was specified, ensure it exists and resolve to canonical path
+    if (!cfg.data_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(cfg.data_dir, ec);
+        if (ec) {
+            spdlog::error("Cannot create data directory {}: {}", cfg.data_dir.string(),
+                          ec.message());
+            return EXIT_FAILURE;
+        }
+        // Resolve symlinks to prevent privileged write redirection
+        auto canonical = std::filesystem::canonical(cfg.data_dir, ec);
+        if (ec) {
+            spdlog::error("Cannot resolve data directory {}: {}", cfg.data_dir.string(),
+                          ec.message());
+            return EXIT_FAILURE;
+        }
+        cfg.data_dir = canonical;
+
+        // Writable probe — fail startup if directory is not writable rather than
+        // deferring to the first DB open (which would leave the server running
+        // but returning 503 on every store operation).
+        auto probe = cfg.data_dir / ".yuzu-probe";
+        {
+            std::ofstream f(probe);
+            if (!f.is_open()) {
+                spdlog::error("Data directory {} is not writable", cfg.data_dir.string());
+                return EXIT_FAILURE;
+            }
+        }
+        std::filesystem::remove(probe, ec); // best-effort cleanup
+
+        auth_mgr.set_data_dir(cfg.data_dir);
+        // Re-load tokens and pending agents from the new data directory.
+        // The initial load_config() loaded them from cfg_path_ parent (the old
+        // location) because set_data_dir() hadn't been called yet.
+        auth_mgr.reload_state();
+        spdlog::info("Data directory: {}", cfg.data_dir.string());
+    }
 
     // -- Batch token generation mode (exits without starting server) ----------
 

@@ -39,6 +39,12 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
     using AgentsJsonFn = std::function<nlohmann::json()>;
 
+    /// Send command callback — dispatches a command and returns (command_id, agents_reached).
+    using DispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters)>;
+
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          AgentsJsonFn agents_fn,
                          RbacStore* rbac_store,
@@ -53,7 +59,8 @@ public:
                          ApprovalManager* approval_manager,
                          ScheduleEngine* schedule_engine,
                          const bool& read_only_mode,
-                         const bool& mcp_disabled);
+                         const bool& mcp_disabled,
+                         DispatchFn dispatch_fn = nullptr);
 };
 
 } // namespace yuzu::server::mcp

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # e2e-mcp-test.sh — Comprehensive MCP (Model Context Protocol) test suite
 #
-# Tests every MCP protocol method, all 22 read-only tools, 3 resources,
+# Tests every MCP protocol method, all 23 tools, 3 resources,
 # 4 prompts, error handling, read-only enforcement, and kill switch.
 #
 # Usage:
@@ -251,10 +251,10 @@ assert_eq "ping has no error" "no" "$HAS_ERR"
 log ""
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. TOOLS LIST — verify all 22 tools present
+# 2. TOOLS LIST — verify all 23 tools present
 # ══════════════════════════════════════════════════════════════════════
 log "═══════════════════════════════════════════"
-log "  2. tools/list — Verify All 22 Tools"
+log "  2. tools/list — Verify All 23 Tools"
 log "═══════════════════════════════════════════"
 
 mcp_call "tools/list" "{}"
@@ -268,7 +268,11 @@ if isinstance(r, str):
     r = json.loads(r)
 print(len(r.get('tools', [])))
 " 2>/dev/null || echo "0")
-assert_eq "tools/list returns 22 tools" "22" "$TOOL_COUNT"
+if [ "$TOOL_COUNT" -ge 23 ]; then
+    pass "tools/list returns at least 23 tools (got $TOOL_COUNT)"
+else
+    fail "tools/list returns at least 23 tools (got $TOOL_COUNT)"
+fi
 
 EXPECTED_TOOLS=(
     list_agents get_agent_details query_audit_log
@@ -279,6 +283,7 @@ EXPECTED_TOOLS=(
     list_management_groups
     get_execution_status list_executions list_schedules
     validate_scope preview_scope_targets list_pending_approvals
+    execute_instruction
 )
 
 for tool_name in "${EXPECTED_TOOLS[@]}"; do

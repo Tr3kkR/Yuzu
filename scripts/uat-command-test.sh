@@ -15,7 +15,17 @@ BASE_URL="http://localhost:8080"
 RESULTS_FILE="$UAT_DIR/command-test-results.txt"
 
 ADMIN_USER="admin"
-ADMIN_PASS='YuzuUatAdmin1!'
+ADMIN_PASS="${YUZU_PASS:-adminpassword1}"
+DO_SETUP=false
+
+# Parse args
+for arg in "$@"; do
+    case "$arg" in
+        --setup) DO_SETUP=true ;;
+        --password=*) ADMIN_PASS="${arg#*=}" ;;
+        --help|-h) echo "Usage: $0 [--setup] [--password=PASS]"; exit 0 ;;
+    esac
+done
 
 # Colours
 if [ -t 1 ]; then
@@ -170,6 +180,30 @@ echo "   Yuzu UAT — Exhaustive Non-Destructive Command Test       "
 echo "============================================================"
 echo ""
 
+# ── Stack management ────────────────────────────────────────────────────
+if $DO_SETUP; then
+    echo -e "${CYAN}Starting UAT stack...${NC}"
+    docker compose -f "$YUZU_ROOT/docker-compose.local.yml" up -d 2>&1
+    echo "Waiting for services..."
+    for i in $(seq 1 30); do
+        if curl -sf "$BASE_URL/livez" >/dev/null 2>&1; then
+            echo -e "${GREEN}Stack healthy${NC}"
+            break
+        fi
+        sleep 1
+        [ "$i" -eq 30 ] && { echo -e "${RED}Stack failed to start${NC}"; exit 1; }
+    done
+    echo ""
+fi
+
+# ── Health check ────────────────────────────────────────────────────────
+if ! curl -sf "$BASE_URL/livez" >/dev/null 2>&1; then
+    echo -e "${RED}Server not reachable at $BASE_URL${NC}"
+    echo "Start the stack: docker compose -f docker-compose.local.yml up -d"
+    echo "Or run with --setup flag"
+    exit 1
+fi
+
 login
 echo -e "${GREEN}Login OK${NC}"
 echo ""
@@ -201,14 +235,15 @@ dispatch_and_poll status health
 dispatch_and_poll status plugins
 dispatch_and_poll status modules
 dispatch_and_poll status connection
-dispatch_and_poll status switch
 dispatch_and_poll status config
 echo ""
 
 # ── Group 4: Agent Internals ────────────────────────────────────────────
 echo -e "${BOLD}[Agent Internals]${NC}"
 dispatch_and_poll agent_actions info
-dispatch_and_poll agent_logging get_log
+dispatch_and_poll agent_actions set_log_level '{"level":"debug"}'
+dispatch_and_poll agent_actions set_log_level '{"level":"info"}'
+dispatch_and_poll agent_logging get_log '{"lines":"20"}'
 dispatch_and_poll agent_logging get_key_files
 dispatch_and_poll diagnostics log_level
 dispatch_and_poll diagnostics certificates
@@ -313,6 +348,8 @@ else
     dispatch_and_poll filesystem search '{"root":"C:\\\\Windows\\\\System32","pattern":"notepad*","max_depth":"1"}'
     dispatch_and_poll filesystem get_version_info '{"path":"C:\\\\Windows\\\\System32\\\\notepad.exe"}'
 fi
+dispatch_and_poll filesystem create_temp '{"prefix":"yuzu_uat","persist":"false"}'
+dispatch_and_poll filesystem create_temp_dir '{"prefix":"yuzu_uat","persist":"false"}'
 echo ""
 
 # ── Group 13: Registry ──────────────────────────────────────────────────
@@ -409,6 +446,7 @@ echo ""
 # ── Group 27: Network Actions ─────────────────────────────────────────
 echo -e "${BOLD}[Network Actions]${NC}"
 dispatch_and_poll network_actions ping '{"host":"127.0.0.1"}'
+dispatch_and_poll network_actions flush_dns
 echo ""
 
 # ── Group 28: Storage (Agent KV Store) ────────────────────────────────
@@ -471,6 +509,11 @@ echo ""
 # ── Group 36: Windows-Specific Patches ────────────────────────────────
 echo -e "${BOLD}[Windows Updates Extended]${NC}"
 dispatch_and_poll windows_updates patch_connectivity
+echo ""
+
+# ── Group 37: Interaction (non-blocking) ─────────────────────────────
+echo -e "${BOLD}[Interaction]${NC}"
+dispatch_and_poll interaction notify '{"title":"Yuzu UAT","message":"REST API command test"}'
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────────

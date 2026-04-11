@@ -24,7 +24,9 @@
 
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <string>
+#include <unordered_map>
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
@@ -171,8 +173,8 @@ TEST_CASE("MCP Policy: readonly never requires approval", "[mcp][policy]") {
     CHECK(!requires_approval("readonly", "Execution", "Execute"));
 }
 
-TEST_CASE("MCP Policy: operator requires approval for Execute and Tag Delete", "[mcp][policy]") {
-    CHECK(requires_approval("operator", "Execution", "Execute"));
+TEST_CASE("MCP Policy: operator auto-approves Execute, requires approval for Tag Delete", "[mcp][policy]") {
+    CHECK(!requires_approval("operator", "Execution", "Execute")); // auto-approved
     CHECK(requires_approval("operator", "Tag", "Delete"));
     CHECK(!requires_approval("operator", "Tag", "Write"));
     CHECK(!requires_approval("operator", "Infrastructure", "Read"));
@@ -475,7 +477,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 // Integration tests — full HTTP dispatch through McpServer
 //
 // Addresses CRITICAL C6: "No integration test through HTTP dispatch —
-// 0 of 22 tools tested end-to-end."
+// 0 of 23 tools tested end-to-end."
 //
 // Each test starts an httplib::Server on a random port, registers MCP routes
 // with mock callbacks, sends actual HTTP POST requests with JSON-RPC payloads,
@@ -505,6 +507,13 @@ struct McpTestServer {
     std::vector<std::string> audit_log; // records "action|result" pairs
     bool read_only_mode_{false};     // Must outlive register_routes (captured by ref)
     bool mcp_disabled_{false};       // Must outlive register_routes (captured by ref)
+
+    // Dispatch mock state — captured args from last dispatch call
+    std::string last_dispatch_plugin;
+    std::string last_dispatch_action;
+    std::vector<std::string> last_dispatch_agent_ids;
+    std::string last_dispatch_scope;
+    std::unordered_map<std::string, std::string> last_dispatch_params;
 
     yuzu::server::mcp::McpServer mcp;
 
@@ -568,6 +577,72 @@ struct McpTestServer {
                             read_only_mode_,
                             mcp_disabled_);
 
+        bind_and_listen();
+    }
+
+    /// Start with a dispatch function (for execute_instruction tests).
+    void start_with_dispatch(yuzu::server::mcp::McpServer::DispatchFn dispatch_fn,
+                             const std::string& tier = "") {
+        mock_tier = tier;
+
+        auto auth_fn = [this](const httplib::Request& /*req*/,
+                              httplib::Response& res)
+            -> std::optional<yuzu::server::auth::Session> {
+            if (!mock_auth_enabled) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return std::nullopt;
+            }
+            yuzu::server::auth::Session s;
+            s.username = "test-user";
+            s.role = yuzu::server::auth::Role::admin;
+            s.mcp_tier = mock_tier;
+            return s;
+        };
+
+        auto perm_fn = [](const httplib::Request&, httplib::Response&,
+                          const std::string& /*securable_type*/,
+                          const std::string& /*operation*/) -> bool {
+            return true;
+        };
+
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& /*target_type*/,
+                               const std::string& /*target_id*/,
+                               const std::string& /*detail*/) {
+            audit_log.push_back(action + "|" + result);
+        };
+
+        auto agents_fn = []() -> nlohmann::json {
+            return nlohmann::json::array({
+                {{"agent_id", "agent-001"}, {"hostname", "web-01"}, {"os", "linux"},
+                 {"arch", "x64"}, {"agent_version", "0.1.3"}},
+                {{"agent_id", "agent-002"}, {"hostname", "db-01"}, {"os", "windows"},
+                 {"arch", "x64"}, {"agent_version", "0.1.3"}}
+            });
+        };
+
+        mcp.register_routes(svr, auth_fn, perm_fn, audit_fn, agents_fn,
+                            /*rbac_store=*/nullptr,
+                            /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr,
+                            /*response_store=*/nullptr,
+                            /*audit_store=*/nullptr,
+                            /*tag_store=*/nullptr,
+                            /*inventory_store=*/nullptr,
+                            /*policy_store=*/nullptr,
+                            /*mgmt_store=*/nullptr,
+                            /*approval_manager=*/nullptr,
+                            /*schedule_engine=*/nullptr,
+                            read_only_mode_,
+                            mcp_disabled_,
+                            dispatch_fn);
+
+        bind_and_listen();
+    }
+
+private:
+    void bind_and_listen() {
         // Bind to a random available port
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
@@ -582,6 +657,8 @@ struct McpTestServer {
         }
         REQUIRE(svr.is_running());
     }
+
+public:
 
     ~McpTestServer() {
         svr.stop();
@@ -641,9 +718,9 @@ TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
     CHECK(body["result"].empty()); // {}
 }
 
-// ── 3. tools/list — verify 22 tools ─────────────────────────────────────────
+// ── 3. tools/list — verify 23 tools ─────────────────────────────────────────
 
-TEST_CASE("MCP Integration: tools/list returns 22 tools", "[mcp][integration]") {
+TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
@@ -657,7 +734,14 @@ TEST_CASE("MCP Integration: tools/list returns 22 tools", "[mcp][integration]") 
     REQUIRE(result.contains("tools"));
     auto& tools = result["tools"];
     REQUIRE(tools.is_array());
-    CHECK(tools.size() == 22);
+    CHECK(tools.size() >= 23);  // At least 23; don't break when new tools are added
+
+    // Verify key tools are present
+    std::set<std::string> names;
+    for (const auto& t : tools) names.insert(t["name"].get<std::string>());
+    CHECK(names.count("list_agents") == 1);
+    CHECK(names.count("execute_instruction") == 1);
+    CHECK(names.count("query_responses") == 1);
 
     // Verify each tool has required fields
     for (const auto& tool : tools) {
@@ -1057,7 +1141,7 @@ TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integratio
     REQUIRE(r3);
     CHECK(r3->status == 200);
     auto b3 = nlohmann::json::parse(r3->body);
-    CHECK(b3["result"]["tools"].size() == 22);
+    CHECK(b3["result"]["tools"].size() >= 23);
 
     // Request 4: tools/call
     auto r4 = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":103,"params":{"name":"list_agents"}})");
@@ -1065,4 +1149,372 @@ TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integratio
     CHECK(r4->status == 200);
     auto b4 = nlohmann::json::parse(r4->body);
     CHECK(b4.contains("result"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// execute_instruction — Phase 2 write tool tests
+//
+// Tests cover: happy dispatch, null dispatch_fn, validation, scope defaults,
+// agent_ids forwarding, params forwarding, tier enforcement, and audit trail.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── 23. Happy dispatch ────────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& agent_ids,
+                        const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_plugin = plugin;
+        ts.last_dispatch_action = action;
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_scope = scope_expr;
+        ts.last_dispatch_params = params;
+        return {"cmd-abc", 2};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":23,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["command_id"] == "cmd-abc");
+    CHECK(text["agents_reached"] == 2);
+    CHECK(text["plugin"] == "os_info");
+    CHECK(text["action"] == "version");
+}
+
+// ── 24. Null dispatch_fn ──────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction null dispatch_fn", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    // Use start() which does not pass a dispatch_fn (defaults to nullptr)
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":24,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("Command dispatch unavailable") != std::string::npos);
+}
+
+// ── 25. Missing plugin ───────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"", 0}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // Only action, no plugin
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":25,"params":{"name":"execute_instruction","arguments":{"action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("plugin") != std::string::npos);
+}
+
+// ── 26. Missing action ───────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"", 0}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // Only plugin, no action
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":26,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("action") != std::string::npos);
+}
+
+// ── 27. Zero agents reached ──────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction zero agents reached", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-xyz", 0}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":27,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+
+    auto text_str = content[0]["text"].get<std::string>();
+    CHECK(text_str.find("No agents reachable") != std::string::npos);
+}
+
+// ── 28. Default scope to __all__ ─────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction default scope __all__", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& agent_ids,
+                        const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_scope = scope_expr;
+        ts.last_dispatch_agent_ids = agent_ids;
+        return {"cmd-default", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // Neither scope nor agent_ids provided
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":28,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(ts.last_dispatch_scope == "__all__");
+    CHECK(ts.last_dispatch_agent_ids.empty());
+}
+
+// ── 29. Explicit agent_ids ───────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction explicit agent_ids", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>& agent_ids,
+                        const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_scope = scope_expr;
+        return {"cmd-agents", 2};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":29,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["a1","a2"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(ts.last_dispatch_agent_ids.size() == 2);
+    CHECK(ts.last_dispatch_agent_ids[0] == "a1");
+    CHECK(ts.last_dispatch_agent_ids[1] == "a2");
+}
+
+// ── 30. Params forwarding ────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_params = params;
+        return {"cmd-params", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"key":"val"}}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(ts.last_dispatch_params.size() == 1);
+    CHECK(ts.last_dispatch_params.at("key") == "val");
+}
+
+// ── 31. Non-string params (v.dump()) ─────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>& params)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_params = params;
+        return {"cmd-nonstr", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"count":5}}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(ts.last_dispatch_params.count("count") == 1);
+    CHECK(ts.last_dispatch_params.at("count") == "5");
+}
+
+// ── 32. read_only_mode blocks ────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    ts.read_only_mode_ = true;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-ro", 1}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":32,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("read-only") != std::string::npos);
+}
+
+// ── 33. readonly tier blocked ────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-ro", 1}; };
+    ts.start_with_dispatch(dispatch, "readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":33,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+}
+
+// ── 34. operator tier allowed ────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction operator tier proceeds", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_plugin = plugin;
+        ts.last_dispatch_action = action;
+        return {"cmd-op", 3};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":34,"params":{"name":"execute_instruction","arguments":{"plugin":"hardware","action":"list"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(!body.contains("error"));
+
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["command_id"] == "cmd-op");
+    CHECK(text["agents_reached"] == 3);
+    CHECK(ts.last_dispatch_plugin == "hardware");
+    CHECK(ts.last_dispatch_action == "list");
+}
+
+// ── 35. supervised tier returns not-implemented ──────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-sup", 1}; };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":35,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(body["error"]["message"].get<std::string>().find("approval") != std::string::npos);
+}
+
+// ── 36. Audit on success ─────────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-audit", 2}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":36,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+
+    REQUIRE(ts.audit_log.size() >= 1);
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|success");
+}
+
+// ── 37. Audit on no-agents ───────────────────────────────────────────────
+
+TEST_CASE("MCP Integration: execute_instruction audit on no-agents", "[mcp][integration][execute]") {
+    McpTestServer ts;
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&)
+        -> std::pair<std::string, int> { return {"cmd-empty", 0}; };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":37,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    REQUIRE(ts.audit_log.size() >= 1);
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|failure");
 }

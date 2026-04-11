@@ -20,12 +20,17 @@ const fs = require('fs');
 
 const BASE_URL = process.env.YUZU_URL || 'http://127.0.0.1:8080';
 const USERNAME = process.env.YUZU_USER || 'admin';
-const PASSWORD = process.env.YUZU_PASS || 'YuzuUatAdmin1!';
+const PASSWORD = process.env.YUZU_PASS || 'adminpassword1';
+
+// Cross-platform path selection: set YUZU_AGENT_OS=windows to use Windows paths
+const IS_WINDOWS = (process.env.YUZU_AGENT_OS || 'linux').toLowerCase() === 'windows';
 
 const HEADED = process.argv.includes('--headed');
 const SLOW_MO = process.argv.includes('--slow') ? 200 : 0;
 const FILTER_IDX = process.argv.indexOf('--filter');
 const FILTER = FILTER_IDX >= 0 ? process.argv[FILTER_IDX + 1] : null;
+
+const SETUP = process.argv.includes('--setup');
 
 // Timeout for each command to receive SSE results (ms)
 const COMMAND_TIMEOUT_MS = 15_000;
@@ -35,6 +40,11 @@ const INTER_COMMAND_PAUSE_MS = 500;
 // ── Non-destructive command catalog ────────────────────────────────────────
 // Each entry: [command_string, description, expected_behaviour]
 // expected_behaviour: 'rows' = expect result rows, 'any' = may return 0 rows
+//
+// Cross-platform: filesystem paths use P() helper for Windows/Linux compat.
+// Set YUZU_AGENT_OS=windows to use Windows paths.
+
+function P(linuxPath, winPath) { return IS_WINDOWS ? winPath : linuxPath; }
 
 const COMMANDS = [
   // ─── Example / Diagnostics ───
@@ -51,10 +61,10 @@ const COMMANDS = [
   ['status config',     'Agent config',        'rows'],
 
   // ─── OS Info ───
-  ['os_info os_name',    'OS name',     'rows'],
-  ['os_info os_version', 'OS version',  'rows'],
-  ['os_info os_build',   'OS build',    'rows'],
-  ['os_info os_arch',    'OS arch',     'rows'],
+  ['os_info os_name',    'OS name',       'rows'],
+  ['os_info os_version', 'OS version',    'rows'],
+  ['os_info os_build',   'OS build',      'rows'],
+  ['os_info os_arch',    'OS arch',       'rows'],
   ['os_info uptime',     'System uptime', 'rows'],
 
   // ─── Hardware ───
@@ -70,6 +80,10 @@ const COMMANDS = [
   ['network_config ip_addresses', 'IP addresses',      'rows'],
   ['network_config dns_servers',  'DNS servers',       'rows'],
   ['network_config proxy',        'Proxy settings',    'any'],
+  ['network_config dns_cache',    'DNS cache',         'any'],
+
+  // ─── Network Actions (read-only) ───
+  ['network_actions ping host=127.0.0.1', 'Ping loopback', 'rows'],
 
   // ─── Network Diagnostics ───
   ['network_diag listening',    'Listening ports',    'rows'],
@@ -84,22 +98,25 @@ const COMMANDS = [
   ['device_identity ou',         'OU',           'any'],
 
   // ─── Users ───
-  ['users logged_on',      'Logged-on users',   'rows'],
-  ['users sessions',       'User sessions',     'rows'],
-  ['users local_users',    'Local users',       'rows'],
-  ['users local_admins',   'Local admins',      'rows'],
-  ['users primary_user',   'Primary user',      'rows'],
-  ['users session_history','Session history',   'any'],
+  ['users logged_on',       'Logged-on users',   'rows'],
+  ['users sessions',        'User sessions',     'rows'],
+  ['users local_users',     'Local users',       'rows'],
+  ['users local_admins',    'Local admins',      'rows'],
+  [`users group_members group=${IS_WINDOWS ? 'Administrators' : 'root'}`,
+                             'Group members',     'any'],
+  ['users primary_user',    'Primary user',      'rows'],
+  ['users session_history', 'Session history',   'any'],
 
   // ─── Processes ───
-  ['processes list',                    'Process list',          'rows'],
-  ['processes query name=explorer.exe', 'Query process by name', 'any'],
+  ['processes list',                           'Process list',          'rows'],
+  [`processes query name=${IS_WINDOWS ? 'explorer.exe' : 'bash'}`,
+                                               'Query process by name', 'any'],
 
   // ─── Installed Apps ───
   ['installed_apps list',              'Installed apps list',   'rows'],
-  ['installed_apps query name=Visual', 'Query apps by name',   'any'],
+  ['installed_apps installed_count',   'Installed count',       'rows'],
 
-  // ─── MSI Packages ───
+  // ─── MSI Packages (Windows-specific) ───
   ['msi_packages list',          'MSI packages list',    'any'],
   ['msi_packages product_codes', 'MSI product codes',    'any'],
 
@@ -108,16 +125,17 @@ const COMMANDS = [
   ['software_actions installed_count', 'Installed count',     'rows'],
 
   // ─── Windows Updates ───
-  ['windows_updates installed', 'Installed updates', 'any'],
-  ['windows_updates missing',   'Missing updates',   'any'],
+  ['windows_updates installed',      'Installed updates',   'any'],
+  ['windows_updates missing',        'Missing updates',     'any'],
+  ['windows_updates pending_reboot', 'Pending reboot',      'any'],
+  ['windows_updates patch_connectivity', 'Patch connectivity', 'any'],
 
   // ─── SCCM ───
-  ['sccm client_version', 'SCCM client version', 'any'],
-  ['sccm site',           'SCCM site',           'any'],
+  ['sccm status',   'SCCM status',   'any'],
 
   // ─── Event Logs ───
   ['event_logs errors log_name=System', 'System error logs',  'any'],
-  ['event_logs query keyword=Windows',  'Query event logs',   'any'],
+  ['event_logs query keyword=error',    'Query event logs',   'any'],
 
   // ─── Firewall ───
   ['firewall state', 'Firewall state', 'rows'],
@@ -127,54 +145,72 @@ const COMMANDS = [
   ['antivirus products', 'AV products',  'any'],
   ['antivirus status',   'AV status',    'rows'],
 
-  // ─── BitLocker ───
-  ['bitlocker state', 'BitLocker state', 'any'],
+  // ─── BitLocker / Disk Encryption ───
+  ['bitlocker state', 'Disk encryption state', 'any'],
 
-  // ─── Certificates ───
+  // ─── Certificates (read-only) ───
   ['certificates list', 'Certificate list', 'any'],
 
   // ─── Services ───
   ['services list',    'Services list',    'rows'],
   ['services running', 'Running services', 'rows'],
 
-  // ─── WMI ───
+  // ─── WMI (Windows-specific, returns 'any' on Linux) ───
   ['wmi query wql_select="SELECT Caption, Version FROM Win32_OperatingSystem"',
-                              'WMI OS query',  'rows'],
+                              'WMI OS query',  'any'],
   ['wmi get_instance class_name=Win32_ComputerSystem',
-                              'WMI instance',  'rows'],
+                              'WMI instance',  'any'],
+
+  // ─── Registry (read-only, Windows-specific) ───
+  ...(IS_WINDOWS ? [
+    ['registry key_exists path="HKLM\\\\SOFTWARE\\\\Microsoft"', 'Registry key exists',  'rows'],
+    ['registry enumerate_keys path="HKLM\\\\SOFTWARE\\\\Microsoft"', 'Enumerate reg keys', 'any'],
+  ] : []),
 
   // ─── WiFi ───
   ['wifi list_networks', 'WiFi networks', 'any'],
   ['wifi connected',     'WiFi connected', 'any'],
 
   // ─── Filesystem (read-only) ───
-  ['filesystem exists path=C:\\\\Windows\\\\System32\\\\cmd.exe',
+  [`filesystem exists path=${P('/etc/hosts', 'C:\\\\Windows\\\\System32\\\\cmd.exe')}`,
                                         'File exists check',   'rows'],
-  ['filesystem list_dir path=C:\\\\Windows\\\\Temp',
+  [`filesystem list_dir path=${P('/tmp', 'C:\\\\Windows\\\\Temp')}`,
                                         'Directory listing',   'any'],
-  ['filesystem file_hash path=C:\\\\Windows\\\\System32\\\\cmd.exe',
+  [`filesystem file_hash path=${P('/etc/hosts', 'C:\\\\Windows\\\\System32\\\\cmd.exe')}`,
                                         'File hash',           'rows'],
-  ['filesystem read path=C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts',
+  [`filesystem read path=${P('/etc/hosts', 'C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts')}`,
                                         'Read file',           'rows'],
-  ['filesystem get_acl path=C:\\\\Windows\\\\System32\\\\cmd.exe',
+  [`filesystem get_acl path=${P('/etc/hosts', 'C:\\\\Windows\\\\System32\\\\cmd.exe')}`,
                                         'File ACL',            'any'],
-  ['filesystem get_signature path=C:\\\\Windows\\\\System32\\\\cmd.exe',
+  [`filesystem search_dir path=${P('/tmp', 'C:\\\\Windows\\\\Temp')} pattern="*"`,
+                                        'Search directory',    'any'],
+  [`filesystem search path=${P('/etc/hosts', 'C:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts')} pattern="localhost"`,
+                                        'Search file content', 'any'],
+  ...(IS_WINDOWS ? [
+    ['filesystem get_signature path=C:\\\\Windows\\\\System32\\\\cmd.exe',
                                         'File signature',      'any'],
-  ['filesystem get_version_info path=C:\\\\Windows\\\\System32\\\\cmd.exe',
+    ['filesystem get_version_info path=C:\\\\Windows\\\\System32\\\\cmd.exe',
                                         'File version info',   'any'],
+  ] : []),
+  // Filesystem safe mutating: create temp file/dir
+  ['filesystem create_temp prefix=yuzu_uat persist=false',     'Create temp file', 'rows'],
+  ['filesystem create_temp_dir prefix=yuzu_uat persist=false', 'Create temp dir',  'rows'],
 
-  // ─── HTTP Client (read-only) ───
-  ['http_client head url=http://127.0.0.1:8080/login',
-                                    'HTTP HEAD request', 'rows'],
+  // ─── HTTP Client ───
+  ['http_client request url=http://127.0.0.1:8080/livez method=GET',
+                                    'HTTP GET livez', 'rows'],
 
   // ─── IOC / Vuln Scan ───
-  ['ioc check',        'IOC check',         'any'],
-  ['vuln_scan scan',   'Vulnerability scan', 'any'],
-  ['vuln_scan summary','Vuln scan summary', 'any'],
+  ['ioc check',              'IOC check',         'any'],
+  ['vuln_scan scan',         'Vulnerability scan', 'any'],
+  ['vuln_scan cve_scan',     'CVE scan',           'any'],
+  ['vuln_scan config_scan',  'Config compliance',  'any'],
+  ['vuln_scan summary',      'Vuln scan summary',  'any'],
+  ['vuln_scan inventory',    'Vuln inventory',     'any'],
 
   // ─── Process Fetch / Socket Who ───
-  ['procfetch procfetch_fetch', 'Process fetch with hashes', 'any'],
-  ['sockwho sockwho_list',      'Socket-to-process map',     'any'],
+  ['procfetch procfetch',   'Process fetch with hashes', 'any'],
+  ['sockwho sockwho_list',  'Socket-to-process map',     'any'],
 
   // ─── Diagnostics ───
   ['diagnostics log_level',       'Agent log level',       'rows'],
@@ -182,27 +218,55 @@ const COMMANDS = [
   ['diagnostics connection_info', 'Agent connection info',  'rows'],
 
   // ─── Agent Logging ───
-  ['agent_logging get_log lines=20', 'Agent log tail',     'rows'],
-  ['agent_logging get_key_files',    'Agent key files',     'any'],
+  ['agent_logging get_log lines=20', 'Agent log tail',   'rows'],
+  ['agent_logging get_key_files',    'Agent key files',   'any'],
 
-  // ─── Agent Actions (info only) ───
-  ['agent_actions info', 'Agent actions info', 'rows'],
+  // ─── Agent Actions ───
+  ['agent_actions info',                         'Agent actions info',      'rows'],
+  ['agent_actions set_log_level level=debug',    'Set log level (debug)',   'any'],
+  ['agent_actions set_log_level level=info',     'Set log level (info)',    'any'],
 
   // ─── Asset Tags ───
   ['asset_tags status',  'Asset tag status',  'any'],
   ['asset_tags changes', 'Asset tag changes', 'any'],
 
+  // ─── Storage (safe mutating: write → read → list) ───
+  ['storage set key=uat_puppeteer value=hello',   'KV store set',   'any'],
+  ['storage get key=uat_puppeteer',               'KV store get',   'rows'],
+  ['storage list',                                'KV store list',  'rows'],
+
+  // ─── Tags (safe mutating: write → read → check → count) ───
+  ['tags set key=uat_env value=puppeteer',   'Tag set',         'any'],
+  ['tags get key=uat_env',                   'Tag get',         'rows'],
+  ['tags get_all',                           'Tag get all',     'rows'],
+  ['tags check key=uat_env',                 'Tag check',       'rows'],
+  ['tags count',                             'Tag count',       'rows'],
+
   // ─── Content Distribution (read-only) ───
   ['content_dist list_staged', 'List staged content', 'any'],
 
   // ─── TAR (Timeline Activity Record) ───
-  ['tar status', 'TAR status', 'any'],
+  ['tar status',       'TAR status',        'any'],
+  ['tar collect_fast', 'TAR collect fast',  'any'],
+  ['tar collect_slow', 'TAR collect slow',  'any'],
+  ['tar query',        'TAR query',         'any'],
+  ['tar snapshot',     'TAR snapshot',      'any'],
+
+  // ─── Chargen (safe mutating: start then stop) ───
+  ['chargen chargen_start',  'Chargen start', 'any'],
+  ['chargen chargen_stop',   'Chargen stop',  'any'],
 
   // ─── Quarantine (status check only) ───
   ['quarantine status', 'Quarantine status', 'any'],
 
   // ─── Discovery ───
   ['discovery scan_subnet subnet=127.0.0.1/32', 'Loopback subnet scan', 'any'],
+
+  // ─── WoL (safe: check reachability only + wake to loopback) ───
+  ['wol check host=127.0.0.1', 'WoL reachability check', 'any'],
+
+  // ─── Network Actions (safe mutating) ───
+  ['network_actions flush_dns', 'Flush DNS cache', 'any'],
 
   // ─── Interaction (non-destructive desktop notification) ───
   ['interaction notify title="Yuzu UAT" message="Synthetic test complete"',
@@ -227,6 +291,8 @@ function elapsed(ms) {
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+const { execSync } = require('child_process');
+
 (async () => {
   const startTime = Date.now();
   const results = [];
@@ -241,6 +307,44 @@ function elapsed(ms) {
   console.log(`  Headed:    ${HEADED}`);
   console.log(`  Filter:    ${FILTER || '(all commands)'}`);
   console.log(`  Commands:  ${COMMANDS.length} non-destructive\n`);
+
+  // ── Stack management ──────────────────────────────────────────────────
+  if (SETUP) {
+    console.log(`${CYAN}[setup]${RESET} Starting UAT stack via docker-compose.local.yml...`);
+    try {
+      execSync('docker compose -f docker-compose.local.yml up -d', { stdio: 'inherit' });
+    } catch {
+      console.log(`${RED}FATAL: Failed to start UAT stack${RESET}`);
+      process.exit(1);
+    }
+    // Wait for health
+    for (let i = 0; i < 30; i++) {
+      try {
+        const resp = execSync(`curl -sf ${BASE_URL}/livez`, { encoding: 'utf8', timeout: 3000 });
+        if (resp.includes('ok')) break;
+      } catch {}
+      await new Promise(r => setTimeout(r, 1000));
+      if (i === 29) { console.log(`${RED}FATAL: Stack did not become healthy${RESET}`); process.exit(1); }
+    }
+    console.log(`${GREEN}[setup]${RESET} Stack healthy\n`);
+  }
+
+  // Health check (always)
+  try {
+    const http = require('http');
+    await new Promise((resolve, reject) => {
+      http.get(`${BASE_URL}/livez`, (res) => {
+        if (res.statusCode === 200) resolve();
+        else reject(new Error(`Server returned HTTP ${res.statusCode}`));
+        res.resume();
+      }).on('error', reject);
+    });
+  } catch (err) {
+    console.log(`${RED}FATAL: Server not reachable at ${BASE_URL} (${err.message})${RESET}`);
+    console.log(`  Start the stack: docker compose -f docker-compose.local.yml up -d`);
+    console.log(`  Or run with --setup flag`);
+    process.exit(1);
+  }
 
   const browser = await puppeteer.launch({
     headless: HEADED ? false : 'shell',

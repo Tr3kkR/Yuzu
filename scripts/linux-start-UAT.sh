@@ -197,13 +197,16 @@ start_all() {
     # ── 2. Gateway ──────────────────────────────────────────────────────
     echo ""
     echo "[2/3] Starting Erlang gateway..."
-    (cd "$GATEWAY_DIR" && erl \
-        -pa _build/default/lib/*/ebin \
-        -config config/sys \
-        -eval "application:ensure_all_started(yuzu_gw)" \
-        -noshell \
-        > "$UAT_DIR/gateway.log" 2>&1) &
-    local gw_pid=$!
+    local gw_rel="$GATEWAY_DIR/_build/prod/rel/yuzu_gw"
+    if [ -x "$gw_rel/bin/yuzu_gw" ]; then
+        ("$gw_rel/bin/yuzu_gw" foreground \
+            > "$UAT_DIR/gateway.log" 2>&1) &
+        local gw_pid=$!
+    else
+        fail "Gateway release not found at $gw_rel"
+        fail "Run: cd gateway && rebar3 as prod release"
+        exit 1
+    fi
 
     if ! wait_for_port 50051 "gateway (agent-facing)" 15; then
         fail "Gateway failed to start. Check $UAT_DIR/gateway.log"

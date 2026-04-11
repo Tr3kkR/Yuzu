@@ -442,13 +442,14 @@ Yuzu embeds an MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. This 
 
 ### Phase 1 (Implemented)
 - 22 read-only tools: `list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`
+- 1 write/execute tool: `execute_instruction` — dispatches plugin commands to agents. Auto-approved for `operator` tier; `supervised` tier returns "not implemented" (approval re-dispatch path not yet built). If neither `scope` nor `agent_ids` is provided, targets all agents.
 - 3 resources: `yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`
 - 4 prompts: `fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`
 - Settings UI section with enable/disable and read-only toggles
 
 ### Phase 2 (Planned)
-- 6 write/execute tools: `set_tag`, `delete_tag`, `execute_instruction`, `approve_request`, `reject_request`, `quarantine_device`
-- Approval workflow integration for destructive operations
+- 5 remaining write tools: `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device`
+- Approval workflow re-dispatch (supervised tier execution after admin approval)
 - SSE streaming for execution progress
 
 Certificate setup instructions: `scripts/Certificate Instructions.txt`.

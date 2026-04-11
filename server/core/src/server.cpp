@@ -252,7 +252,7 @@ public:
         }
 
         // Load auto-approve policies
-        auto approve_path = cfg_.auth_config_path.parent_path() / "auto-approve.cfg";
+        auto approve_path = cfg_.db_dir() / "auto-approve.cfg";
         auto_approve_.load(approve_path);
 
         // Initialize OIDC provider if configured
@@ -317,7 +317,7 @@ public:
         }
 
         // Initialize NVD CVE database
-        auto nvd_path = cfg_.auth_config_path.parent_path() / "nvd_cves.db";
+        auto nvd_path = cfg_.db_dir() / "nvd_cves.db";
         nvd_db_ = std::make_shared<NvdDatabase>(nvd_path);
 
         if (cfg_.nvd_sync_enabled && nvd_db_->is_open()) {
@@ -328,9 +328,9 @@ public:
 
         // Initialize OTA update registry
         if (cfg_.ota_enabled) {
-            auto update_db_path = cfg_.auth_config_path.parent_path() / "update_packages.db";
+            auto update_db_path = cfg_.db_dir() / "update_packages.db";
             auto update_dir = cfg_.update_dir.empty()
-                                  ? cfg_.auth_config_path.parent_path() / "agent-updates"
+                                  ? cfg_.db_dir() / "agent-updates"
                                   : cfg_.update_dir;
             std::error_code ec;
             std::filesystem::create_directories(update_dir, ec);
@@ -343,7 +343,7 @@ public:
 
         // Initialize response store
         {
-            auto resp_db = cfg_.auth_config_path.parent_path() / "responses.db";
+            auto resp_db = cfg_.db_dir() / "responses.db";
             response_store_ =
                 std::make_unique<ResponseStore>(resp_db, cfg_.response_retention_days);
             if (response_store_->is_open()) {
@@ -353,7 +353,7 @@ public:
 
         // Initialize audit store
         {
-            auto audit_db = cfg_.auth_config_path.parent_path() / "audit.db";
+            auto audit_db = cfg_.db_dir() / "audit.db";
             audit_store_ = std::make_unique<AuditStore>(audit_db, cfg_.audit_retention_days);
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
@@ -362,13 +362,13 @@ public:
 
         // Initialize tag store
         {
-            auto tag_db = cfg_.auth_config_path.parent_path() / "tags.db";
+            auto tag_db = cfg_.db_dir() / "tags.db";
             tag_store_ = std::make_unique<TagStore>(tag_db);
         }
 
         // Initialize analytics event store
         if (cfg_.analytics_enabled) {
-            auto analytics_db = cfg_.auth_config_path.parent_path() / "analytics.db";
+            auto analytics_db = cfg_.db_dir() / "analytics.db";
             analytics_store_ = std::make_unique<AnalyticsEventStore>(
                 analytics_db, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
             if (analytics_store_->is_open()) {
@@ -400,7 +400,7 @@ public:
 
         // Initialize instruction store (Phase 2)
         {
-            auto instr_db = cfg_.auth_config_path.parent_path() / "instructions.db";
+            auto instr_db = cfg_.db_dir() / "instructions.db";
             instruction_store_ = std::make_unique<InstructionStore>(instr_db);
             if (instruction_store_ && instruction_store_->is_open()) {
                 // RAII pool owns the shared connection (fixes G3-ARCH-T2-002).
@@ -422,11 +422,11 @@ public:
 
         // Initialize Phase 3: Security & RBAC stores
         {
-            auto rbac_db = cfg_.auth_config_path.parent_path() / "rbac.db";
+            auto rbac_db = cfg_.db_dir() / "rbac.db";
             rbac_store_ = std::make_unique<RbacStore>(rbac_db);
         }
         {
-            auto mgmt_db = cfg_.auth_config_path.parent_path() / "management-groups.db";
+            auto mgmt_db = cfg_.db_dir() / "management-groups.db";
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
             // Ensure root "All Devices" group exists
             if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
@@ -449,17 +449,17 @@ public:
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
         }
         {
-            auto token_db = cfg_.auth_config_path.parent_path() / "api-tokens.db";
+            auto token_db = cfg_.db_dir() / "api-tokens.db";
             api_token_store_ = std::make_unique<ApiTokenStore>(token_db);
         }
         {
-            auto quar_db = cfg_.auth_config_path.parent_path() / "quarantine.db";
+            auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
 
         // Phase 5: Policy Engine
         {
-            auto policy_db = cfg_.auth_config_path.parent_path() / "policies.db";
+            auto policy_db = cfg_.db_dir() / "policies.db";
             policy_store_ = std::make_unique<PolicyStore>(policy_db);
             if (policy_store_ && policy_store_->is_open()) {
                 spdlog::info("PolicyStore initialized at {}", policy_db.string());
@@ -468,7 +468,7 @@ public:
 
         // Phase 7: Runtime Configuration + Custom Properties
         {
-            auto rtcfg_db = cfg_.auth_config_path.parent_path() / "runtime-config.db";
+            auto rtcfg_db = cfg_.db_dir() / "runtime-config.db";
             runtime_config_store_ = std::make_unique<RuntimeConfigStore>(rtcfg_db);
             if (runtime_config_store_ && runtime_config_store_->is_open()) {
                 // Apply stored overrides on startup
@@ -476,13 +476,13 @@ public:
             }
         }
         {
-            auto props_db = cfg_.auth_config_path.parent_path() / "custom-properties.db";
+            auto props_db = cfg_.db_dir() / "custom-properties.db";
             custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
         }
 
         // Phase 7: Workflow Engine
         {
-            auto wf_db = cfg_.auth_config_path.parent_path() / "workflows.db";
+            auto wf_db = cfg_.db_dir() / "workflows.db";
             workflow_engine_ = std::make_unique<WorkflowEngine>(wf_db);
             if (workflow_engine_ && workflow_engine_->is_open()) {
                 spdlog::info("WorkflowEngine initialized at {}", wf_db.string());
@@ -491,7 +491,7 @@ public:
 
         // Phase 7: Product Pack Store
         {
-            auto pack_db = cfg_.auth_config_path.parent_path() / "product-packs.db";
+            auto pack_db = cfg_.db_dir() / "product-packs.db";
             product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
             if (product_pack_store_ && product_pack_store_->is_open()) {
                 spdlog::info("ProductPackStore initialized at {}", pack_db.string());
@@ -500,17 +500,17 @@ public:
 
         // Notification & Webhook stores
         {
-            auto notif_db = cfg_.auth_config_path.parent_path() / "notifications.db";
+            auto notif_db = cfg_.db_dir() / "notifications.db";
             notification_store_ = std::make_unique<NotificationStore>(notif_db);
         }
         {
-            auto webhook_db = cfg_.auth_config_path.parent_path() / "webhooks.db";
+            auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
         }
 
         // Phase 7: Inventory Store (Issue 7.17)
         {
-            auto inv_db = cfg_.auth_config_path.parent_path() / "inventory.db";
+            auto inv_db = cfg_.db_dir() / "inventory.db";
             inventory_store_ = std::make_unique<InventoryStore>(inv_db);
             if (inventory_store_ && inventory_store_->is_open()) {
                 spdlog::info("InventoryStore initialized at {}", inv_db.string());
@@ -521,7 +521,7 @@ public:
 
         // Phase 7: Directory Sync (AD/Entra integration)
         {
-            auto dirsync_db = cfg_.auth_config_path.parent_path() / "directory-sync.db";
+            auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
             directory_sync_ = std::make_unique<DirectorySync>(dirsync_db);
             if (directory_sync_ && directory_sync_->is_open()) {
                 spdlog::info("DirectorySync initialized at {}", dirsync_db.string());
@@ -530,7 +530,7 @@ public:
 
         // Phase 7: Patch Manager
         {
-            auto patch_db = cfg_.auth_config_path.parent_path() / "patches.db";
+            auto patch_db = cfg_.db_dir() / "patches.db";
             patch_manager_ = std::make_unique<PatchManager>(patch_db);
             if (patch_manager_ && patch_manager_->is_open()) {
                 spdlog::info("PatchManager initialized at {}", patch_db.string());
@@ -539,7 +539,7 @@ public:
 
         // Phase 7: Deployment Jobs (Issue 7.7)
         {
-            auto deploy_db = cfg_.auth_config_path.parent_path() / "deployment-jobs.db";
+            auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
             deployment_store_ = std::make_unique<DeploymentStore>(deploy_db);
             if (deployment_store_ && deployment_store_->is_open()) {
                 spdlog::info("DeploymentStore initialized at {}", deploy_db.string());
@@ -548,7 +548,7 @@ public:
 
         // Phase 7: Device Discovery (Issue 7.18)
         {
-            auto discovery_db = cfg_.auth_config_path.parent_path() / "discovery.db";
+            auto discovery_db = cfg_.db_dir() / "discovery.db";
             discovery_store_ = std::make_unique<DiscoveryStore>(discovery_db);
             if (discovery_store_ && discovery_store_->is_open()) {
                 spdlog::info("DiscoveryStore initialized at {}", discovery_db.string());
@@ -4414,7 +4414,51 @@ private:
                 response_store_.get(), audit_store_.get(), tag_store_.get(),
                 inventory_store_.get(), policy_store_.get(), mgmt_group_store_.get(),
                 approval_manager_.get(), schedule_engine_.get(),
-                cfg_.mcp_read_only, cfg_.mcp_disable);
+                cfg_.mcp_read_only, cfg_.mcp_disable,
+                // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction
+                [this](const std::string& plugin, const std::string& action,
+                       const std::vector<std::string>& agent_ids,
+                       const std::string& scope_expr,
+                       const std::unordered_map<std::string, std::string>& parameters)
+                    -> std::pair<std::string, int> {
+                    auto command_id = plugin + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+                    detail::pb::CommandRequest cmd;
+                    cmd.set_command_id(command_id);
+                    cmd.set_plugin(plugin);
+                    cmd.set_action(action);
+                    for (const auto& [k, v] : parameters)
+                        (*cmd.mutable_parameters())[k] = v;
+                    agent_service_.record_send_time(command_id);
+
+                    int sent = 0;
+                    if (!scope_expr.empty() && scope_expr != "__all__" && scope_expr.starts_with("group:")) {
+                        auto group_id = scope_expr.substr(6);
+                        if (mgmt_group_store_) {
+                            for (const auto& m : mgmt_group_store_->get_members(group_id))
+                                if (registry_.send_to(m.agent_id, cmd)) ++sent;
+                        }
+                    } else if (!scope_expr.empty() && scope_expr != "__all__") {
+                        auto parsed = yuzu::scope::parse(scope_expr);
+                        if (parsed) {
+                            for (const auto& aid : registry_.evaluate_scope(
+                                     *parsed, tag_store_.get(), custom_properties_store_.get()))
+                                if (registry_.send_to(aid, cmd)) ++sent;
+                        }
+                    } else if (agent_ids.empty()) {
+                        sent = registry_.send_to_all(cmd);
+                    } else {
+                        for (const auto& aid : agent_ids)
+                            if (registry_.send_to(aid, cmd)) ++sent;
+                    }
+
+                    forward_gateway_pending();
+                    if (sent > 0)
+                        metrics_.counter("yuzu_commands_dispatched_total").increment();
+                    spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action, sent);
+                    return {command_id, sent};
+                });
         }
 
         // -- Listen -----------------------------------------------------------

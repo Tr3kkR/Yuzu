@@ -205,13 +205,27 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals",
      "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
+
+    // Phase 2 write tool
+    {"execute_instruction",
+     "Execute a plugin action on one or more agents. Returns a command_id; poll results with query_responses. "
+     "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected agents.",
+     R"j({"type":"object","properties":{)j"
+     R"j("plugin":{"type":"string","description":"Plugin name (e.g. os_info, hardware)"},)j"
+     R"j("action":{"type":"string","description":"Action name (e.g. version, list)"},)j"
+     R"j("params":{"type":"object","additionalProperties":{"type":"string"},"description":"Key-value parameters"},)j"
+     R"j("scope":{"type":"string","description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
+     R"j("agent_ids":{"type":"array","items":{"type":"string"},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j(},"required":["plugin","action"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 
-// ── Phase 2 write tools (blocked by read_only_mode) ───────────────────────
-// These tool names will perform Write/Execute/Delete operations when they are
-// implemented in Phase 2. The read_only_mode guard rejects them proactively.
+// ── Write/execute tools (blocked by read_only_mode) ──────────────────────
+// These tool names perform Write/Execute/Delete operations.
+// The read_only_mode guard rejects them proactively.
+//   Implemented: set_tag, delete_tag, execute_instruction
+//   Planned:     approve_request, reject_request, quarantine_device
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag", "delete_tag", "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
@@ -249,10 +263,11 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"validate_scope",         {"Infrastructure",          "Read"}},
     {"preview_scope_targets",  {"Infrastructure",          "Read"}},
     {"list_pending_approvals", {"Approval",                "Read"}},
-    // Phase 2 write tools (not yet implemented, but security metadata is pre-registered)
+    // Implemented write tools
     {"set_tag",                {"Tag",                     "Write"}},
     {"delete_tag",             {"Tag",                     "Delete"}},
     {"execute_instruction",    {"Execution",               "Execute"}},
+    // Planned write tools (security metadata pre-registered)
     {"approve_request",        {"Approval",                "Write"}},
     {"reject_request",         {"Approval",                "Write"}},
     {"quarantine_device",      {"Security",                "Write"}},
@@ -318,12 +333,14 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ApprovalManager* approval_manager,
                                 ScheduleEngine* schedule_engine,
                                 const bool& read_only_mode,
-                                const bool& mcp_disabled) {
+                                const bool& mcp_disabled,
+                                DispatchFn dispatch_fn) {
 
-    // Copy reference parameters to locals so the lambda captures values,
-    // not dangling references to register_routes() parameters.
-    const bool is_read_only = read_only_mode;
-    const bool is_disabled  = mcp_disabled;
+    // Capture by reference so runtime changes (e.g., settings UI toggle)
+    // take effect without server restart. The references point to cfg_ members
+    // which outlive the lambda (owned by the server impl).
+    const bool& is_read_only = read_only_mode;
+    const bool& is_disabled  = mcp_disabled;
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
     svr.Post("/mcp/v1/", [=](const httplib::Request& req, httplib::Response& res) {
@@ -575,30 +592,16 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 }
 
                 if (requires_approval(tier, sec_type, sec_op)) {
-                    if (!approval_manager) {
-                        res.set_content(error_response(id, kInternalError,
-                                       "Approval manager unavailable"),
-                                       "application/json");
-                        return;
-                    }
-                    auto approval_result = approval_manager->submit(
-                        tool_name, session->username,
-                        "MCP tool call: " + tool_name);
-                    if (approval_result) {
-                        auto body = JObj()
-                            .add("status", "pending_approval")
-                            .add("approval_id", *approval_result)
-                            .add("message",
-                                 "This operation requires admin approval before execution")
-                            .str();
-                        res.set_content(success_response(id, body), "application/json");
-                        mcp_audit("pending_approval", "approval_id=" + *approval_result);
-                    } else {
-                        res.set_content(error_response(id, kInternalError,
-                                       approval_result.error()),
-                                       "application/json");
-                        mcp_audit("failure", "approval submit error");
-                    }
+                    // Approval-gated MCP execution is not yet implemented:
+                    // the approval workflow can record the request but has no
+                    // re-dispatch path to resume execution after admin approval.
+                    // Return an explicit error rather than silently queuing.
+                    res.set_content(error_response(id, kApprovalRequired,
+                        "This operation requires approval, but approval-gated "
+                        "MCP execution is not yet implemented. Use the REST API "
+                        "or dashboard for operations that require the supervised tier."),
+                        "application/json");
+                    mcp_audit("approval_required", "approval-gated execution not implemented");
                     return;
                 }
             }
@@ -1295,6 +1298,70 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                         .add("scope_expression", a.scope_expression));
                 }
                 auto result = JObj().raw("content", JArr().add(JObj().add("type", "text").add("text", arr.str())).str()).str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── execute_instruction ───────────────────────────────────────
+            // Tier check handled by generic C8 block above (kToolSecurity).
+            if (tool_name == "execute_instruction") {
+                if (!perm_fn(req, res, "Execution", "Execute")) return;
+                if (!dispatch_fn) {
+                    res.set_content(error_response(id, kInternalError, "Command dispatch unavailable"), "application/json");
+                    return;
+                }
+
+                auto plugin = param_str(args, "plugin");
+                auto action = param_str(args, "action");
+                // Agent plugins register actions in lowercase and match
+                // case-sensitively. Normalize to prevent silent dispatch misses
+                // when an AI model sends mixed-case action names.
+                std::transform(plugin.begin(), plugin.end(), plugin.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                std::transform(action.begin(), action.end(), action.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (plugin.empty() || action.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "plugin and action are required"), "application/json");
+                    return;
+                }
+
+                // Extract params as string map
+                std::unordered_map<std::string, std::string> params;
+                if (args.contains("params") && args["params"].is_object()) {
+                    for (auto& [k, v] : args["params"].items()) {
+                        params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                    }
+                }
+
+                auto scope = param_str(args, "scope");
+                std::vector<std::string> agent_ids;
+                if (args.contains("agent_ids") && args["agent_ids"].is_array()) {
+                    for (const auto& v : args["agent_ids"]) {
+                        if (v.is_string()) agent_ids.push_back(v.get<std::string>());
+                    }
+                }
+
+                // Default scope to __all__ if neither scope nor agent_ids provided
+                if (scope.empty() && agent_ids.empty()) scope = "__all__";
+
+                auto [command_id, agents_reached] = dispatch_fn(plugin, action, agent_ids, scope, params);
+
+                if (agents_reached == 0) {
+                    auto result = JObj().raw("content", JArr().add(
+                        JObj().add("type", "text").add("text", "No agents reachable for command dispatch")).str()).str();
+                    mcp_audit("failure", "no agents reachable");
+                    res.set_content(success_response(id, result), "application/json");
+                    return;
+                }
+
+                auto result_obj = JObj()
+                    .add("command_id", command_id)
+                    .add("agents_reached", agents_reached)
+                    .add("plugin", plugin)
+                    .add("action", action);
+                auto result = JObj().raw("content", JArr().add(
+                    JObj().add("type", "text").add("text", result_obj.str())).str()).str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
                 return;

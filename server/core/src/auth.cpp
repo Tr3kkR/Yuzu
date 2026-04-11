@@ -717,7 +717,7 @@ bool AuthManager::revoke_enrollment_token(const std::string& token_id) {
 // ── Enrollment token persistence ────────────────────────────────────────────
 
 bool AuthManager::save_tokens() const {
-    auto path = cfg_path_.parent_path() / "enrollment-tokens.cfg";
+    auto path = state_dir() / "enrollment-tokens.cfg";
 
     std::shared_lock lock(mu_);
 
@@ -769,7 +769,7 @@ bool AuthManager::save_tokens() const {
 }
 
 bool AuthManager::load_tokens() {
-    auto path = cfg_path_.parent_path() / "enrollment-tokens.cfg";
+    auto path = state_dir() / "enrollment-tokens.cfg";
 
     std::ifstream f(path);
     if (!f.is_open())
@@ -965,7 +965,7 @@ bool AuthManager::remove_pending_agent(const std::string& agent_id) {
 // ── Pending agent persistence ───────────────────────────────────────────────
 
 bool AuthManager::save_pending() const {
-    auto path = cfg_path_.parent_path() / "pending-agents.cfg";
+    auto path = state_dir() / "pending-agents.cfg";
 
     std::shared_lock lock(mu_);
 
@@ -1010,7 +1010,7 @@ bool AuthManager::save_pending() const {
 }
 
 bool AuthManager::load_pending() {
-    auto path = cfg_path_.parent_path() / "pending-agents.cfg";
+    auto path = state_dir() / "pending-agents.cfg";
 
     std::ifstream f(path);
     if (!f.is_open())

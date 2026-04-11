@@ -33,6 +33,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | Flag | Default | Description |
 |---|---|---|
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the default location next to the binary. |
+| `--data-dir` | *(config dir)* | Directory for SQLite databases and runtime state files (enrollment tokens, pending agents). Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but databases need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
@@ -404,7 +405,7 @@ OIDC-authenticated users are mapped to Yuzu roles based on claims or group membe
 
 ## Data Storage and Encryption
 
-Yuzu stores persistent data in SQLite databases, including the response store, analytics event store, audit log, and RBAC store. These database files reside in the server's working directory alongside the binary.
+Yuzu stores persistent data in SQLite databases, including the response store, analytics event store, audit log, and RBAC store. By default, database files are created in the same directory as the `yuzu-server.cfg` config file. Use `--data-dir` to place databases in a separate writable directory (required for containerized deployments where the config file is on a read-only mount).
 
 > **Important: SQLite databases are not encrypted at rest.** The `.db` files contain query results, audit logs, and agent metadata in plaintext on disk. Any user or process with read access to the filesystem can read this data.
 
