@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -57,6 +58,16 @@ public:
     /// Delete a token permanently.
     bool delete_token(const std::string& token_id);
 
+    /// Cumulative count of validate_token calls served from the in-memory cache.
+    /// Exposed for Prometheus scraping; set via gauge in server.cpp's periodic loop.
+    uint64_t cache_hits() const noexcept { return cache_hits_.load(std::memory_order_relaxed); }
+
+    /// Cumulative count of validate_token calls that fell through to SQLite.
+    uint64_t cache_misses() const noexcept { return cache_misses_.load(std::memory_order_relaxed); }
+
+    /// Current number of distinct tokens cached in memory.
+    std::size_t cache_size() const;
+
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex db_mtx_; // protects all db_ access (G2-SEC-A2-002)
@@ -69,6 +80,10 @@ private:
     mutable std::mutex cache_mtx_;
     mutable std::unordered_map<std::string, CachedToken> token_cache_;
     static constexpr auto kTokenCacheTtl = std::chrono::seconds(60);
+
+    // Cache hit/miss counters (atomic, lock-free read for Prometheus scraping).
+    mutable std::atomic<uint64_t> cache_hits_{0};
+    mutable std::atomic<uint64_t> cache_misses_{0};
 
     void create_tables();
     std::string generate_raw_token() const;

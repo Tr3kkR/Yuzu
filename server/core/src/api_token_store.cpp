@@ -224,14 +224,18 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
                 auto now = now_epoch();
                 if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
                     token_cache_.erase(it);
+                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
                     return std::nullopt;
                 }
+                cache_hits_.fetch_add(1, std::memory_order_relaxed);
                 return cached;
             }
             // Expired cache entry — remove and fall through to DB lookup
             token_cache_.erase(it);
         }
     }
+
+    cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
     // Cache miss — query SQLite (lock db for the read + update sequence)
     std::unique_lock db_lock(db_mtx_);
@@ -296,6 +300,11 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
 void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
     std::lock_guard cache_lock(cache_mtx_);
     token_cache_.erase(token_hash);
+}
+
+std::size_t ApiTokenStore::cache_size() const {
+    std::lock_guard cache_lock(cache_mtx_);
+    return token_cache_.size();
 }
 
 std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {

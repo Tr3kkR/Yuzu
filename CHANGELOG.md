@@ -5,6 +5,43 @@ All notable changes to Yuzu are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- New Prometheus metrics for the auth and audit subsystems:
+  `yuzu_server_token_cache_hits_total`, `yuzu_server_token_cache_misses_total`,
+  and `yuzu_server_token_cache_size` expose API-token cache effectiveness so
+  cold-cache stampedes after restart are visible to operators.
+  `yuzu_server_audit_events_total{result}` counts audit-event writes bucketed
+  by `success`/`failure`/`denied`/`other`.
+
+### Changed
+
+- `AuthRoutes` exposes a public `resolve_session(req)` helper that performs the
+  three-tier auth resolution (cookie → `Authorization: Bearer` → `X-Yuzu-Token`)
+  used by `require_auth`, `make_audit_event`, and `emit_event`, plus the eight
+  call sites in `server.cpp` that previously inlined fragments of the same logic.
+  Removes a shadow copy of `extract_session_cookie` from `server.cpp`.
+
+### Fixed
+
+- **Audit Trail Integrity Fix (YZA-2026-001)** — Audit log and analytics event
+  rows for requests authenticated via `Authorization: Bearer` or `X-Yuzu-Token`
+  now populate the `principal` and `principal_role` fields. Previously these
+  helpers resolved the principal from the session cookie only, so every
+  API-token-authenticated request — including every MCP tool call — wrote audit
+  rows with empty `principal`, breaking attribution for SOC 2 evidence purposes.
+  The same gap affected `def.created_by` on instruction creation,
+  `sched.created_by` on schedule creation, the `user` recorded by execution
+  rerun/cancel, and the `reviewer` recorded by approval approve/reject.
+
+  This is a forward-only fix: pre-fix audit rows are not backfilled. Operators
+  auditing a window that spans v0.9.0 (released 2026-04-11) and v0.10.0 should
+  expect a bimodal `principal` distribution split at the merge date — pre-fix
+  token-authenticated rows will have empty `principal`. Cookie auth and login
+  flows are unchanged.
+
 ## [0.1.0] - 2026-03-21
 
 ### Added

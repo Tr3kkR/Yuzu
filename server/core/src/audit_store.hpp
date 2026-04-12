@@ -55,6 +55,10 @@ public:
     std::vector<AuditEvent> query(const AuditQuery& q = {}) const;
     std::size_t total_count() const;
 
+    /// Cumulative audit-event write counts grouped by `result` value. Exposed for
+    /// Prometheus scraping; reset at process start. Lock-free reads.
+    uint64_t events_written(const std::string& result) const noexcept;
+
     void start_cleanup();
     void stop_cleanup();
 
@@ -63,6 +67,12 @@ private:
     int retention_days_;
     int cleanup_interval_min_;
     mutable std::shared_mutex mtx_;
+
+    // Cumulative event write counters bucketed by `result` field. Lock-free.
+    std::atomic<uint64_t> events_success_{0};
+    std::atomic<uint64_t> events_failure_{0};
+    std::atomic<uint64_t> events_denied_{0};
+    std::atomic<uint64_t> events_other_{0};
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else

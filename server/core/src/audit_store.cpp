@@ -107,6 +107,27 @@ void AuditStore::log(const AuditEvent& event) {
 
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+
+    // Bucket the write into a Prometheus-friendly counter so the audit subsystem
+    // is observable from the /metrics scrape. Result vocabulary is open-ended at
+    // call sites — collapse anything we don't recognise into "other" rather than
+    // letting cardinality grow unbounded.
+    if (event.result == "success")
+        events_success_.fetch_add(1, std::memory_order_relaxed);
+    else if (event.result == "failure")
+        events_failure_.fetch_add(1, std::memory_order_relaxed);
+    else if (event.result == "denied")
+        events_denied_.fetch_add(1, std::memory_order_relaxed);
+    else
+        events_other_.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t AuditStore::events_written(const std::string& result) const noexcept {
+    if (result == "success") return events_success_.load(std::memory_order_relaxed);
+    if (result == "failure") return events_failure_.load(std::memory_order_relaxed);
+    if (result == "denied")  return events_denied_.load(std::memory_order_relaxed);
+    if (result == "other")   return events_other_.load(std::memory_order_relaxed);
+    return 0;
 }
 
 std::vector<AuditEvent> AuditStore::query(const AuditQuery& q) const {

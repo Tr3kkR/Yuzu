@@ -97,8 +97,7 @@ auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
     return synth;
 }
 
-std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,
-                                                      httplib::Response& res) {
+std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
     auto session = auth_mgr_.validate_session(token);
@@ -123,6 +122,14 @@ std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& re
         if (api_token)
             return synthesize_token_session(*api_token);
     }
+
+    return std::nullopt;
+}
+
+std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,
+                                                      httplib::Response& res) {
+    if (auto session = resolve_session(req))
+        return session;
 
     res.status = 401;
     res.set_content(
@@ -294,13 +301,13 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     event.source_ip = req.remote_addr;
     event.user_agent = req.get_header_value("User-Agent");
 
-    // Extract principal from session
-    auto token = extract_session_cookie(req);
-    auto session = auth_mgr_.validate_session(token);
-    if (session) {
+    // Resolve principal via cookie / Bearer token / X-Yuzu-Token (same as require_auth).
+    // Without this, audit rows for API-token-authenticated requests (REST API automation
+    // and every MCP tool call) would have an empty `principal`, breaking the audit trail.
+    if (auto session = resolve_session(req)) {
         event.principal = session->username;
         event.principal_role = auth::role_to_string(session->role);
-        event.session_id = token;
+        event.session_id = extract_session_cookie(req);
     }
     return event;
 }
@@ -328,12 +335,10 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
     ae.attributes = attrs;
     ae.payload = payload_data;
 
-    auto token = extract_session_cookie(req);
-    auto session = auth_mgr_.validate_session(token);
-    if (session) {
+    if (auto session = resolve_session(req)) {
         ae.principal = session->username;
         ae.principal_role = auth::role_to_string(session->role);
-        ae.session_id = token;
+        ae.session_id = extract_session_cookie(req);
     }
     analytics_store_->emit(std::move(ae));
 }

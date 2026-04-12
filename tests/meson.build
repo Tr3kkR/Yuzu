@@ -50,6 +50,7 @@ if build_server
     'yuzu_server_tests',
     files(
       'unit/server/test_auth.cpp',
+      'unit/server/test_auth_routes.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_update_registry.cpp',

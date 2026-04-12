@@ -5,6 +5,14 @@ provides a tamper-evident trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
+> **Known issue in v0.9.0 (advisory YZA-2026-001):** audit rows for requests
+> authenticated via `Authorization: Bearer` or `X-Yuzu-Token` (every MCP tool
+> call and every REST automation using an API token) had an empty `principal`
+> field. Cookie-authenticated dashboard activity was unaffected. Fixed forward
+> in v0.10.0; pre-fix rows are not backfilled. Operators auditing a window that
+> spans the v0.9.0 → v0.10.0 boundary should expect a bimodal `principal`
+> distribution. See `CHANGELOG.md` for full remediation context.
+
 ## Storage
 
 Audit events are persisted in a dedicated SQLite database using WAL
@@ -30,7 +38,7 @@ Every audit event contains the following fields:
 | `detail` | string | Human-readable description or the new value |
 | `source_ip` | string | IP address of the client that initiated the request |
 | `user_agent` | string | HTTP User-Agent header value |
-| `session_id` | string | Session cookie identifier |
+| `session_id` | string | Session cookie identifier (empty for API-token / Bearer / `X-Yuzu-Token` requests, which have no cookie) |
 | `result` | string | Outcome: `success` or `failure` |
 
 ## Logged actions

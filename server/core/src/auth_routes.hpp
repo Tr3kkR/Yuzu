@@ -52,6 +52,14 @@ public:
     std::optional<auth::Session> require_auth(const httplib::Request& req,
                                               httplib::Response& res);
 
+    /// Resolve the authenticated session from a request without writing a response.
+    /// Tries cookie, then `Authorization: Bearer`, then `X-Yuzu-Token`. Returns
+    /// nullopt if none match. Use this when you need the principal name for
+    /// provenance (e.g. `created_by`, audit event annotation) on a code path
+    /// that has already cleared its authorization gate via require_auth or
+    /// require_permission and just needs to know who's calling.
+    std::optional<auth::Session> resolve_session(const httplib::Request& req);
+
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
     bool require_admin(const httplib::Request& req, httplib::Response& res);
