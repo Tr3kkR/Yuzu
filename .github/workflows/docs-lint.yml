@@ -1,0 +1,39 @@
+name: Docs Lint
+
+# Lightweight hygiene checks for documentation and the changelog. Runs on
+# markdown-only changes (which ci.yml deliberately skips via paths-ignore).
+# Keep this workflow fast and dependency-light — no build, no vcpkg, no caches.
+on:
+  push:
+    branches: [main, dev, "feature/**", "fix/**"]
+    paths:
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'tests/test_changelog_order.py'
+      - '.github/workflows/docs-lint.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'CHANGELOG.md'
+      - 'docs/**'
+      - 'tests/test_changelog_order.py'
+      - '.github/workflows/docs-lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changelog-order:
+    name: CHANGELOG order
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify CHANGELOG.md is in reverse chronological order
+        run: python3 tests/test_changelog_order.py

@@ -112,3 +112,11 @@ test('proto gen_proto version check',
   suite: 'proto',
   timeout: 30,
 )
+
+# ── Repo hygiene tests ─────────────────────────────────────────────────────
+test('changelog order',
+  _python3_test,
+  args: [files('test_changelog_order.py')],
+  suite: 'docs',
+  timeout: 10,
+)
