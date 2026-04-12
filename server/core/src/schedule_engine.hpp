@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <expected>
 #include <string>
-#include <shared_mutex>
 #include <vector>
 
 namespace yuzu::server {
@@ -55,7 +54,9 @@ public:
 
 private:
     sqlite3* db_;
-    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    // No application-level mutex: every method prepare-and-finalizes its
+    // statements, so SQLITE_OPEN_FULLMUTEX on the shared instructions.db
+    // connection is sufficient. Cached prepared statements would change this.
 };
 
 } // namespace yuzu::server
