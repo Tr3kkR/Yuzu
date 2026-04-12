@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Docker-compose UAT image tags parameterized** — `docker-compose.uat.yml`
+  was shipping with hardcoded `ghcr.io/tr3kkr/yuzu-{server,gateway}:0.8.1-rc0`
+  references that were not updated when the version bumped to 0.9.0, so a
+  tester running the file fresh would pull the wrong images. The tags are
+  now parameterized as `${YUZU_VERSION:-0.9.0}` so operators can override at
+  `docker compose up` time, and a new `scripts/check-compose-versions.sh`
+  runs as the first step of the release workflow's `release:` job — it
+  rejects any hardcoded `yuzu-{server,gateway,agent}:X.Y.Z` references in
+  tracked compose files and verifies the parameterized default matches the
+  tag being released, so a stale default blocks the release before any
+  assets are published. A corrected `docker-compose.uat.yml` was uploaded as
+  a v0.9.0 GitHub release asset to unblock current UAT testers.
+
 - Login page no longer renders `[object Object]` on bad credentials. The inline
   JS in `login_ui.cpp` was reading `resp.error` directly from the structured
   error envelope (`{"error":{"code":N,"message":"..."}}`) and assigning the

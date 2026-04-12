@@ -897,6 +897,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Validate docker-compose image versions
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/check-compose-versions.sh "$VERSION"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
