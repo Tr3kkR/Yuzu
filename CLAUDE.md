@@ -94,8 +94,8 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian** f
 2. `git pull` — fast-forward to latest dev.
 3. `git diff HEAD~N..HEAD --stat` — review what changed.
 4. Identify which previous Darwin fixes are still present in the new tree.
-5. `meson setup builddir --reconfigure ...` if `meson.build` changed.
-6. `meson compile -C builddir` — fix any new compile errors.
+5. `meson setup build-macos --reconfigure ...` if `meson.build` changed.
+6. `meson compile -C build-macos` — fix any new compile errors.
 7. `bash scripts/run-tests.sh all` — fix any new test failures.
 8. Commit clean with a Darwin-fix commit message.
 
@@ -301,14 +301,14 @@ The script runs `vcpkg install` then `meson setup` automatically.
 # 1. Install vcpkg packages
 vcpkg install --triplet x64-linux --x-manifest-root=.
 
-# 2. Configure
-meson setup builddir \
+# 2. Configure (use the per-OS canonical name — see "Per-OS build directory convention" below)
+meson setup build-linux \
   --buildtype=debug \
   -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux \
   -Dbuild_tests=true
 
 # 3. Build
-meson compile -C builddir
+meson compile -C build-linux
 ```
 
 ### Build options
@@ -324,9 +324,35 @@ meson compile -C builddir
 
 Sanitizers and LTO use Meson built-in options (`b_lto`, `b_sanitize`).
 
+### Per-OS build directory convention
+
+The same source tree is built from multiple hosts (WSL2 Linux + native
+Windows on the same physical machine, plus a separate macOS dev box). To
+keep them from clobbering each other, `scripts/setup.sh` selects a
+**per-OS canonical build directory**:
+
+| Host    | Build dir       |
+|---------|-----------------|
+| Linux   | `build-linux`   |
+| Windows | `build-windows` |
+| macOS   | `build-macos`   |
+
+Always use `scripts/setup.sh` (which picks the right dir automatically) or
+pass `-C build-<os>` explicitly to `meson compile` / `meson test`. If
+`scripts/setup.sh` finds an existing dir whose recorded source path looks
+like a different host's, it refuses to reconfigure unless `--wipe` is
+passed — this prevents the opaque ninja "dyndep is not an input" / Windows-
+path failures you get when a Windows-configured `builddir` is reused under
+WSL2 (and vice versa). All `build-*/` and legacy `builddir*/` paths are in
+`.gitignore`.
+
+`./scripts/setup.sh` no longer auto-wipes an existing build directory —
+pass `--wipe` if you actually want to start from scratch, otherwise it
+runs `meson setup --reconfigure` and preserves prior compilation state.
+
 ## Test
 ```bash
-meson test -C builddir --print-errorlogs
+meson test -C build-linux --print-errorlogs    # or build-windows / build-macos
 ```
 Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
 
@@ -410,7 +436,7 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 ```bash
 source ./setup_msvc_env.sh           # MSVC paths
 source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
-meson compile -C builddir
+meson compile -C build-windows       # canonical Windows dir; coexists with build-linux from WSL2
 ```
 
 **IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.

@@ -1,7 +1,10 @@
 # Build directories
+# Convention: build-{linux,windows,macos} are the per-OS canonical dirs
+# created by scripts/setup.sh. Legacy names are kept ignored for old checkouts.
 build/
 build-*/
 builddir/
+builddir-*/
 clion-build/
 cmake-build-*/
 out/
