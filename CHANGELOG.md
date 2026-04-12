@@ -23,6 +23,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`CLAUDE.md` slimmed from 571 → 484 lines** by splitting three
+  implementation-detail sections into dedicated `docs/` files and
+  compressing four already-linked sections to pointers. The Auth &
+  Authorization feature history (inventory of mTLS, OIDC, AD/Entra,
+  Windows cert store, CSP construction, etc.) moved to
+  `docs/auth-architecture.md`; only the hard invariants that every
+  session must respect (mTLS, HTTPS default, localhost bind,
+  `/metrics` auth, owner-scoped token revoke) remain in CLAUDE.md.
+  The MCP server architecture and 22-tool inventory moved to
+  `docs/mcp-server.md`; only the tier-before-RBAC rule, kill-switch
+  flags, audit pattern, and `JObj`/`JArr` serialization rule remain.
+  The Windows build toolchain path table moved to
+  `docs/windows-build.md`; CLAUDE.md keeps the "MSYS2 bash +
+  `setup_msvc_env.sh`, NOT `vcvars64.bat`" rule. Instruction Engine,
+  Enterprise Readiness / SOC 2, Development Roadmap, and CI matrix
+  sections were compressed to pointers since the target docs already
+  exist. Build, Deploy, Release, Erlang Gateway, UAT Environment,
+  Darwin Compatibility, and Agent Team / Governance sections stay
+  resident intact — churning subsystems and areas that repeatedly
+  need re-loading belong in CLAUDE.md, not in `docs/`.
+
 - `AuthRoutes` exposes a public `resolve_session(req)` helper that performs the
   three-tier auth resolution (cookie → `Authorization: Bearer` → `X-Yuzu-Token`)
   used by `require_auth`, `make_audit_event`, and `emit_event`, plus the eight
