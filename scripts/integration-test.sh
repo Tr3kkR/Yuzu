@@ -10,8 +10,8 @@
 #   ./scripts/integration-test.sh --agents 100 --tls # 100 agents with mTLS
 #
 # Prerequisites:
-#   - C++ binaries built:  builddir/server/core/yuzu-server
-#                           builddir/agents/core/yuzu-agent
+#   - C++ binaries built:  build-<os>/server/core/yuzu-server
+#                           build-<os>/agents/core/yuzu-agent
 #   - Erlang gateway:      gateway/ with rebar3 release
 #   - curl, grpcurl (optional, for gRPC probing)
 
@@ -22,22 +22,33 @@ AGENT_COUNT=1
 USE_TLS=false
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILDDIR="$PROJECT_ROOT/builddir"
+
+# Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
+if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
+    BUILDDIR="$YUZU_BUILDDIR"
+elif [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-windows"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-macos"
+else
+    BUILDDIR="$PROJECT_ROOT/build-linux"
+fi
 GATEWAY_DIR="$PROJECT_ROOT/gateway"
 WORK_DIR=""
 SERVER_PID=""
 GATEWAY_PID=""
 AGENT_PIDS=()
 
-# Server ports (C++ server listens on 50050 in gateway mode)
-SERVER_AGENT_PORT=50050
+# Port matrix — single-host layout that gives every binder its own port.
+# Server side uses 5005x, gateway side uses 5006x.
+SERVER_AGENT_PORT=50050   # C++ server agent gRPC (no direct connects in gateway mode)
 SERVER_MGMT_PORT=50053
-SERVER_GW_PORT=50051     # GatewayUpstream service port (gateway connects here)
+SERVER_GW_PORT=50055      # GatewayUpstream service (gateway connects here)
 SERVER_WEB_PORT=8090
 
 # Gateway ports (agents connect here)
-GW_AGENT_PORT=50051
-GW_MGMT_PORT=50052
+GW_AGENT_PORT=50061
+GW_MGMT_PORT=50063
 GW_METRICS_PORT=9568
 
 # ── Argument parsing ─────────────────────────────────────────────────
@@ -54,7 +65,7 @@ done
 check_binary() {
     if [[ ! -x "$1" ]]; then
         echo "FAIL: $1 not found or not executable"
-        echo "      Run: meson compile -C builddir"
+        echo "      Run: meson compile -C $(basename "$BUILDDIR")"
         exit 1
     fi
 }
@@ -156,9 +167,11 @@ cleanup() {
     done
     [[ -n "$GATEWAY_PID" ]] && kill -9 "$GATEWAY_PID" 2>/dev/null || true
     [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    # Clean temp dir
-    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    # Clean temp dir (preserve when YUZU_KEEP_WORK_DIR is set, for debugging)
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" && -z "${YUZU_KEEP_WORK_DIR:-}" ]]; then
         rm -rf "$WORK_DIR"
+    elif [[ -n "${YUZU_KEEP_WORK_DIR:-}" ]]; then
+        log "Preserving work dir: $WORK_DIR"
     fi
     log "Cleanup done."
 }
@@ -209,10 +222,10 @@ SERVER_DATA_DIR="$WORK_DIR/server-data"
 mkdir -p "$SERVER_DATA_DIR"
 SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
 log "Running first-run setup to generate server config..."
-printf 'admin\npassword\npassword\nuser\npassword\npassword\n' | \
+printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
-        --no-tls --listen "127.0.0.1:$SERVER_AGENT_PORT" \
+        --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
         --management "127.0.0.1:$SERVER_MGMT_PORT" \
         --web-port "$SERVER_WEB_PORT" \
         > "$WORK_DIR/setup.log" 2>&1 &

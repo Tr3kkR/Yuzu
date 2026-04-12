@@ -14,7 +14,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILDDIR="$PROJECT_ROOT/builddir"
+
+# Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
+# Override with YUZU_BUILDDIR=path if you maintain a non-standard layout.
+if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
+    BUILDDIR="$YUZU_BUILDDIR"
+elif [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-windows"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-macos"
+else
+    BUILDDIR="$PROJECT_ROOT/build-linux"
+fi
 GATEWAY_DIR="$PROJECT_ROOT/gateway"
 TIER="${1:-all}"
 
@@ -32,7 +43,7 @@ run_cpp_unit() {
     banner "C++ UNIT TESTS (Catch2)"
 
     if [[ ! -d "$BUILDDIR" ]]; then
-        fail "Build directory not found. Run: meson setup builddir -Dbuild_tests=true"
+        fail "Build directory not found at $BUILDDIR. Run: ./scripts/setup.sh --tests"
         return
     fi
 
@@ -73,7 +84,11 @@ run_erlang_unit() {
 
     cd "$GATEWAY_DIR"
     echo "  Running EUnit tests..."
-    if rebar3 eunit 2>&1 | tail -20; then
+    # rebar3 3.27 auto-discovery rejects test modules without a 1:1 src/
+    # counterpart (e.g., yuzu_gw_circuit_breaker_tests has no
+    # yuzu_gw_circuit_breaker.erl). Pass --dir to scan the test/ directory
+    # directly instead.
+    if rebar3 eunit --dir=apps/yuzu_gw/test 2>&1 | tail -20; then
         pass "Erlang EUnit tests"
     else
         fail "Erlang EUnit tests"
