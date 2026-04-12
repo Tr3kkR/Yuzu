@@ -325,10 +325,35 @@ pass `--wipe` if you actually want to start from scratch, otherwise it
 runs `meson setup --reconfigure` and preserves prior compilation state.
 
 ## Test
+
+Every test target carries a short `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly — no more guessing `"yuzu:server unit tests"`:
+
 ```bash
-meson test -C build-linux --print-errorlogs    # or build-windows / build-macos
+meson test -C build-linux --suite server --print-errorlogs
+meson test -C build-linux --suite agent --print-errorlogs
+meson test -C build-linux --suite tar --print-errorlogs
+meson test -C build-linux --print-errorlogs              # everything
 ```
+
 Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
+
+### Direct binary invocation
+
+For Catch2 tag filtering (`[rest][token]`, `[mgmt][cycle]`, etc.) or when you want raw output, call the test binary directly. `scripts/link-tests.sh` maintains symlinks at a stable top-level path per component and triplet so you never have to remember the build-dir layout:
+
+```bash
+tests-build-server-linux_x64/yuzu_server_tests "[rest][token]"
+tests-build-agent-linux_x64/yuzu_agent_tests "[metrics]"
+tests-build-tar-linux_x64/yuzu_tar_tests
+```
+
+The symlinks are created automatically at the end of `scripts/setup.sh`. If you build from a fresh checkout with plain `meson setup`, run `bash scripts/link-tests.sh` once after the first successful `meson compile` to populate them. Triplet suffix is derived from the host (`linux_x64`, `linux_arm64`, `macos_arm64`, `windows_x64`). Binaries stay live because the symlinks point at the real build output — no need to re-run the script after every rebuild.
+
+`tests-build-*/` is gitignored.
+
+### Third-party warning suppression
+
+Every `dependency()` in `meson.build` and subdirectory files is marked `include_type: 'system'` so vcpkg / gRPC / abseil / protobuf / Catch2 deprecation warnings are treated as `-isystem` and silenced. Our own code is still under `warning_level=3`. **Do not remove `include_type: 'system'`** when adding new dependencies — it's load-bearing for build-log readability.
 
 ## Project layout
 ```

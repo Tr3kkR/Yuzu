@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Friction pass on build / test workflow** — four developer-experience
+  fixes from the governance-run retrospective:
+  - **Third-party warnings silenced.** Every `dependency()` in the
+    top-level `meson.build` and each subdirectory file now carries
+    `include_type: 'system'`, so vcpkg / gRPC / abseil / protobuf /
+    Catch2 deprecation warnings become `-isystem` includes and no
+    longer appear in compile output. Our own code remains under
+    `warning_level=3`. Compile logs dropped by dozens of lines per
+    incremental build without a wrapper script in the way.
+  - **Short test suite names.** `tests/meson.build` now attaches
+    `suite: 'agent' | 'server' | 'tar'` to each `test()` call, so
+    `meson test -C build-linux --suite server` works directly — no
+    more guessing `"yuzu:server unit tests"` or `"unit tests"`.
+  - **Stable top-level test binary paths.** New
+    `scripts/link-tests.sh` creates
+    `/tests-build-<component>-<triplet>/` directories (e.g.
+    `tests-build-server-linux_x64/yuzu_server_tests`) as symlinks
+    to the real build output. `scripts/setup.sh` runs it
+    automatically after configure. Gitignored. Binaries stay live
+    across rebuilds because the symlinks point at paths, not
+    contents. Catch2 tag filtering (e.g. `[token][owner]`) is now
+    one line from the repo root without remembering the build-dir
+    layout.
+  - **`.gitignore` cleanup.** Added `.codex`, `test_output.txt`,
+    `test_xml.txt`, `update.finished`, `node_modules/`,
+    `__pycache__/`, `gateway/.deps_cache/`, `gateway/ebin/`, and
+    `/tests-build-*/` so `git status` no longer carries session
+    noise from dev-machine artifacts.
+
 - **`CLAUDE.md` slimmed from 571 → 484 lines** by splitting three
   implementation-detail sections into dedicated `docs/` files and
   compressing four already-linked sections to pointers. The Auth &

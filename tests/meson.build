@@ -1,4 +1,4 @@
-catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true)
+catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
 
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 agent_test_exe = executable(
@@ -23,7 +23,7 @@ agent_test_exe = executable(
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
 )
-test('agent unit tests', agent_test_exe, timeout: 120)
+test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 120)
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
@@ -42,7 +42,7 @@ tar_test_exe = executable(
   ],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe)
+test('tar unit tests', tar_test_exe, suite: 'tar')
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -102,7 +102,7 @@ if build_server
     ],
     dependencies: [yuzu_server_core_dep, catch2_dep],
   )
-  test('server unit tests', server_test_exe, timeout: 120)
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

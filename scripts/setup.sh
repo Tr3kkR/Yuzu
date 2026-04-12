@@ -184,9 +184,18 @@ echo "── Running: meson ${MESON_ARGS[*]} ──"
 cd "$PROJECT_ROOT"
 meson "${MESON_ARGS[@]}"
 
+# Refresh the /tests-build-<component>-<triplet>/ convenience symlinks so
+# the test binaries are discoverable at the top level. On fresh setups
+# the script is a no-op (no binaries yet) — re-run after `meson compile`
+# to materialize the links.
+if [[ -x "$SCRIPT_DIR/link-tests.sh" ]]; then
+  "$SCRIPT_DIR/link-tests.sh" --builddir "$BUILDDIR" || true
+fi
+
 echo ""
 echo "Build configured. Next steps:"
 echo "  meson compile -C $BUILDDIR"
 if $TESTS; then
-  echo "  meson test -C $BUILDDIR --print-errorlogs"
+  echo "  meson test -C $BUILDDIR --suite server --print-errorlogs"
+  echo "  bash scripts/link-tests.sh        # refresh tests-build-* symlinks"
 fi

@@ -2,7 +2,7 @@ procfetch_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
 
 # Windows: bcrypt.lib linked via #pragma comment(lib) in source
 if host_machine.system() != 'windows'
-  openssl_dep = dependency('openssl', required: true)
+  openssl_dep = dependency('openssl', required: true, include_type: 'system')
   procfetch_deps += openssl_dep
 endif
 

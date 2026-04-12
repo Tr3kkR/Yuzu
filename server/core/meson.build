@@ -3,7 +3,7 @@
 if host_machine.system() == 'windows'
   auth_crypto_deps = []
 else
-  openssl_dep = dependency('openssl', required: true)
+  openssl_dep = dependency('openssl', required: true, include_type: 'system')
   auth_crypto_deps = [openssl_dep]
 endif
 
@@ -11,7 +11,7 @@ endif
 # On Linux/macOS, openssl_dep is already declared above.
 # On Windows, OpenSSL is available transitively via gRPC/vcpkg.
 if host_machine.system() == 'windows'
-  openssl_dep = dependency('openssl', method: 'cmake', modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'], required: false)
+  openssl_dep = dependency('openssl', method: 'cmake', modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'], required: false, include_type: 'system')
   if not openssl_dep.found()
     # Fallback: try pkg-config or find_library
     _ssl_lib = cxx.find_library('libssl', required: false)
@@ -31,19 +31,19 @@ if not is_disabler(openssl_dep) and openssl_dep.found()
   https_deps = [openssl_dep]
 endif
 
-sqlite3_dep = dependency('sqlite3', required: false)
+sqlite3_dep = dependency('sqlite3', required: false, include_type: 'system')
 if not sqlite3_dep.found()
-  sqlite3_dep = dependency('unofficial-sqlite3', method: 'cmake', modules: ['unofficial::sqlite3::sqlite3'], required: false)
+  sqlite3_dep = dependency('unofficial-sqlite3', method: 'cmake', modules: ['unofficial::sqlite3::sqlite3'], required: false, include_type: 'system')
 endif
 if not sqlite3_dep.found()
   sqlite3_dep = cxx.find_library('sqlite3')
 endif
-nlohmann_json_dep = dependency('nlohmann_json', required: true)
+nlohmann_json_dep = dependency('nlohmann_json', required: true, include_type: 'system')
 
 # RE2 for linear-time regex (replaces std::regex to prevent ReDoS)
-re2_dep = dependency('re2', method: 'cmake', modules: ['re2::re2'], required: false)
+re2_dep = dependency('re2', method: 'cmake', modules: ['re2::re2'], required: false, include_type: 'system')
 if not re2_dep.found()
-  re2_dep = dependency('re2', required: false)
+  re2_dep = dependency('re2', required: false, include_type: 'system')
 endif
 if not re2_dep.found()
   re2_dep = cxx.find_library('re2')

@@ -4,7 +4,7 @@ if host_machine.system() == 'windows'
   # Try to find OpenSSL on Windows for HTTPS support
   _http_openssl = dependency('openssl', method: 'cmake',
                               modules: ['OpenSSL::SSL', 'OpenSSL::Crypto'],
-                              required: false)
+                              required: false, include_type: 'system')
   if not _http_openssl.found()
     _http_ssl_lib = cxx.find_library('libssl', required: false)
     _http_crypto_lib = cxx.find_library('libcrypto', required: false)
@@ -19,7 +19,7 @@ if host_machine.system() == 'windows'
     http_extra_deps = []
   endif
 else
-  _http_openssl = dependency('openssl', required: true)
+  _http_openssl = dependency('openssl', required: true, include_type: 'system')
   http_extra_deps = [_http_openssl]
   http_cpp_args = ['-DCPPHTTPLIB_OPENSSL_SUPPORT']
 endif
