@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call sites in `server.cpp` that previously inlined fragments of the same logic.
   Removes a shadow copy of `extract_session_cookie` from `server.cpp`.
 
+- **Per-OS canonical build directory** — `scripts/setup.sh` now defaults the
+  build directory to `build-linux`, `build-windows`, or `build-macos` based on
+  the host OS so the same source tree can be configured concurrently from
+  WSL2 and a native Windows shell — and a separate macOS dev box — without
+  the build dirs trampling each other. The script refuses to reuse a build
+  dir whose `meson-info.json` source path was recorded on a different host
+  unless `--wipe` is passed (catches the opaque "ninja dyndep is not an
+  input" / Windows-path failures from cross-host reuse). It also stops
+  auto-wiping existing dirs — `--wipe` is now opt-in; default behaviour is
+  `meson setup --reconfigure` to preserve prior compilation state. The
+  legacy `builddir/` is gone from the tree; CLAUDE.md documents the
+  convention. `YUZU_BUILDDIR` env var still overrides everywhere.
+
 ### Fixed
 
 - Login page no longer renders `[object Object]` on bad credentials. The inline
@@ -37,6 +50,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   object to `textContent`. It now reads `resp.error.message`, with a string
   fallback for legacy responses and a status-keyed default if parsing fails.
   Fixes #333.
+
+- **`ConcurrencyManager::try_acquire` TOCTOU race** — the count-then-insert
+  sequence used a separate `SELECT COUNT(*)` and `INSERT OR IGNORE`, so two
+  concurrent callers could each read `count < limit`, each insert, and exceed
+  the configured `global:N` or `per-definition` cap. `SQLITE_OPEN_FULLMUTEX`
+  serializes individual API calls but does not bind two-statement sequences
+  together, so it could not catch this. Fix collapses the check and write
+  into a single atomic statement: `INSERT OR IGNORE … SELECT … WHERE
+  (SELECT COUNT(*) …) < ?`. The COUNT subquery and the INSERT execute as
+  one statement under SQLite's per-statement write lock, so the cap is now
+  honored under contention. Idempotent re-acquire of the same
+  `(definition_id, execution_id)` is preserved via a follow-up existence
+  check on the no-op path. Removes the dead `std::shared_mutex mtx_` member
+  in `ConcurrencyManager` and `ScheduleEngine` (declared but never acquired
+  by any method) — both classes prepare-and-finalize their statements per
+  call, so the application-level mutex is unnecessary on top of FULLMUTEX.
+  Fixes #330.
 
 - **Audit Trail Integrity Fix (YZA-2026-001)** — Audit log and analytics event
   rows for requests authenticated via `Authorization: Bearer` or `X-Yuzu-Token`
@@ -53,6 +83,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expect a bimodal `principal` distribution split at the merge date — pre-fix
   token-authenticated rows will have empty `principal`. Cookie auth and login
   flows are unchanged.
+
+### Tests
+
+Test-suite changes are listed separately so other teams can follow test
+development independently from the primary software changelog.
+
+- **TOCTOU regression test for `ConcurrencyManager`** — new `[threading]`
+  cases in `tests/unit/server/test_concurrency_manager.cpp` race 64 threads
+  against `try_acquire("global:3")` and `per-definition` on a
+  `SQLITE_OPEN_FULLMUTEX` `:memory:` connection, asserting that exactly the
+  configured limit wins. Adds a `TestDbMt` RAII helper for thread-safe
+  in-memory connections, and a non-threaded idempotent re-acquire case.
+  Server unit-test count: 1112 → 1128 cases.
+
+- **`scripts/run-tests.sh` (and integration / UAT scripts) honour the per-OS
+  canonical build directory** — `build-linux` / `build-windows` / `build-macos`
+  selected from `uname` (and overridable via `YUZU_BUILDDIR`). Removes the
+  hard-coded `builddir/` path that broke under WSL2 once the Windows-side
+  build dir disappeared.
+
+- **`run-tests.sh erlang-unit` invokes `rebar3 eunit --dir=apps/yuzu_gw/test`**
+  — works around rebar3 3.27 auto-discovery rejecting test modules whose name
+  has no 1:1 src/ counterpart (`circuit_breaker_tests`, `env_override_tests`,
+  `scale_tests`, every `*_SUITE` file, etc.). The bare `rebar3 eunit`
+  invocation would error out with "Module … not found in project" before
+  running any test. Tracking issue: #337.
+
+- **`scripts/integration-test.sh` fixes** — admin password bumped from 8 to
+  12 characters to satisfy the post-v0.9 length requirement; `--no-https`
+  added so the server starts without TLS in test mode; port matrix split so
+  single-host gateway + server no longer collide on 50051 (server `5005x`,
+  gateway `5006x`); `YUZU_KEEP_WORK_DIR=1` env var preserves
+  `/tmp/yuzu-integration.*` after teardown for post-mortem of failed runs.
+
+- **`scripts/linux-start-UAT.sh` `kill_stale` matches the gateway** —
+  `pgrep -f "beam.smp"` is replaced with `pgrep -f "yuzu_gw[/_]"` because
+  the rebar3 release wrapper rewrites `cmdline` so the binary name doesn't
+  appear in `/proc/$pid/cmdline`. Previous behaviour leaked the gateway
+  beam between UAT runs and tied up port 9568 / 50063 indefinitely.
+
+- **`scripts/e2e-security-test.sh` no longer skips on missing creds** —
+  honours `YUZU_ADMIN_PASS` env var, then auto-detects against the canonical
+  UAT password (`YuzuUatAdmin1!`) and the post-tightening `adminpassword1`
+  before falling back to legacy short passwords. Hard-fails if no candidate
+  works rather than silently skipping the auth-bearing test categories.
+  Brings the security suite from 33 → 60 tests against a live UAT stack.
 
 ## [0.9.0] - 2026-04-11
 
