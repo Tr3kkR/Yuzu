@@ -97,11 +97,28 @@ if [ -z "$_yz_activated" ] && command -v kerl >/dev/null 2>&1; then
         }' | sort -V | tail -n1 | cut -f2-)
 
     if [ -n "$_yz_kerl_match" ] && [ -f "$_yz_kerl_match/activate" ]; then
+        # kerl's activate script (4.4.0) is not strict-mode safe: add_cleanup
+        # references $_KERL_CLEANUP unbound on first call, which kills any
+        # caller running under `set -u`; it also enables `set -o allexport`
+        # and never restores it. Snapshot the caller's option state, relax
+        # the strict modes for the duration of the source, then restore so
+        # callers like scripts/release-preflight.sh that run under
+        # `set -euo pipefail` aren't aborted mid-source. `$(set +o)` emits
+        # every shell option's current state as `set -o foo` / `set +o foo`
+        # lines, which eval restores verbatim — covers errexit, nounset,
+        # allexport, pipefail, and anything else the caller set.
+        _yz_saved_opts=$(set +o)
+        set +eu
         # shellcheck disable=SC1090
-        if source "$_yz_kerl_match/activate" 2>/dev/null && _yz_have_erl; then
+        source "$_yz_kerl_match/activate" 2>/dev/null
+        _yz_kerl_src_rc=$?
+        eval "$_yz_saved_opts"
+        unset _yz_saved_opts
+        if [ "$_yz_kerl_src_rc" -eq 0 ] && _yz_have_erl; then
             _yz_log "kerl activated: $_yz_kerl_match"
             _yz_activated="kerl"
         fi
+        unset _yz_kerl_src_rc
     fi
 fi
 

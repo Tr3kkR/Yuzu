@@ -82,20 +82,48 @@ if [ "$FULL" = "--full" ]; then
     echo ""
     echo "  --- Full build validation ---"
 
+    # Per-OS canonical build directory (mirrors scripts/setup.sh).
+    if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
+        BUILDDIR="build-windows"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        BUILDDIR="build-macos"
+    else
+        BUILDDIR="build-linux"
+    fi
+
+    # Erlang toolchain — required by both the standalone rebar3 step and the
+    # gateway custom_target inside meson, so it must be on PATH before the C++
+    # compile too. ensure-erlang.sh probes kerl, asdf, Homebrew, and the MSYS2
+    # installer paths in turn; it always returns 0, so we verify with command -v.
+    # The explicit "28" arg is load-bearing: a sourced script inherits the
+    # caller's positional args, so without it the helper would receive "$1"
+    # from THIS script (e.g. "v0.10.0") and search for a kerl install with
+    # that name. Pass the major version explicitly to track release.yml's
+    # erlef/setup-beam otp-version.
+    # shellcheck source=ensure-erlang.sh
+    source "$(dirname "$0")/ensure-erlang.sh" 28
+    HAVE_ERL=0
+    if command -v erl > /dev/null 2>&1; then
+        HAVE_ERL=1
+        pass "Erlang on PATH ($(erl -version 2>&1 | tr -d '\n'))"
+    else
+        fail "Erlang not on PATH after ensure-erlang.sh — install via kerl/asdf/brew or activate manually"
+    fi
+
     # C++ compile
-    if [ -d "builddir" ]; then
-        echo "  Compiling C++ (meson compile -C builddir)..."
-        if meson compile -C builddir > /dev/null 2>&1; then
+    if [ -d "$BUILDDIR" ]; then
+        echo "  Compiling C++ (meson compile -C $BUILDDIR)..."
+        if meson compile -C "$BUILDDIR" > /dev/null 2>&1; then
             pass "C++ compiles"
         else
             fail "C++ compilation failed"
         fi
     else
-        fail "No builddir found — run meson setup first"
+        fail "No $BUILDDIR found — run scripts/setup.sh first"
     fi
 
-    # Erlang compile + dialyzer
-    if [ -d "gateway" ]; then
+    # Erlang compile + dialyzer (skipped if erl missing — already failed above)
+    if [ "$HAVE_ERL" -eq 1 ] && [ -d "gateway" ]; then
         echo "  Compiling Erlang (rebar3 compile + dialyzer)..."
         if (cd gateway && rebar3 compile > /dev/null 2>&1); then
             pass "Erlang compiles"
@@ -107,7 +135,7 @@ if [ "$FULL" = "--full" ]; then
         else
             fail "Dialyzer failed"
         fi
-    else
+    elif [ ! -d "gateway" ]; then
         fail "No gateway directory found"
     fi
 fi
