@@ -10,7 +10,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -20,6 +23,21 @@ struct TestDb {
     sqlite3* db = nullptr;
     TestDb() { sqlite3_open(":memory:", &db); }
     ~TestDb() {
+        if (db)
+            sqlite3_close(db);
+    }
+};
+
+// Threadsafe variant: opens with SQLITE_OPEN_FULLMUTEX so multiple threads
+// can hold the manager and call try_acquire on the same connection.
+struct TestDbMt {
+    sqlite3* db = nullptr;
+    TestDbMt() {
+        sqlite3_open_v2(":memory:", &db,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                        nullptr);
+    }
+    ~TestDbMt() {
         if (db)
             sqlite3_close(db);
     }
@@ -180,4 +198,80 @@ TEST_CASE("ConcurrencyManager: is_valid_mode rejects invalid strings", "[concurr
     CHECK(ConcurrencyManager::is_valid_mode("global:abc") == false);
     CHECK(ConcurrencyManager::is_valid_mode("PER-DEVICE") == false);
     CHECK(ConcurrencyManager::is_valid_mode("serial") == false);
+}
+
+// ── TOCTOU regression (#330) ───────────────────────────────────────────────
+//
+// Many threads race try_acquire on the same definition with a small global
+// limit. Without the atomic conditional INSERT, the SELECT-then-INSERT
+// sequence is interleavable: threads can each read count<limit and each
+// insert, blowing through the cap. The fix collapses the check + write into
+// one SQL statement so SQLite's per-statement write lock holds them together.
+
+TEST_CASE("ConcurrencyManager: try_acquire is race-free under contention",
+          "[concurrency_manager][threading]") {
+    TestDbMt tdb;
+    REQUIRE(tdb.db != nullptr);
+    ConcurrencyManager mgr(tdb.db);
+    mgr.create_tables();
+
+    constexpr int kLimit = 3;
+    constexpr int kThreads = 64;
+    std::atomic<int> winners{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            std::string exec_id = "exec-" + std::to_string(i);
+            if (mgr.try_acquire("def-race", exec_id, "global:3")) {
+                winners.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    CHECK(winners.load() == kLimit);
+    CHECK(mgr.active_count("def-race") == kLimit);
+}
+
+TEST_CASE("ConcurrencyManager: per-definition is race-free under contention",
+          "[concurrency_manager][threading]") {
+    TestDbMt tdb;
+    REQUIRE(tdb.db != nullptr);
+    ConcurrencyManager mgr(tdb.db);
+    mgr.create_tables();
+
+    constexpr int kThreads = 64;
+    std::atomic<int> winners{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            std::string exec_id = "exec-" + std::to_string(i);
+            if (mgr.try_acquire("def-only-one", exec_id, "per-definition")) {
+                winners.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+
+    CHECK(winners.load() == 1);
+    CHECK(mgr.active_count("def-only-one") == 1);
+}
+
+TEST_CASE("ConcurrencyManager: re-acquire with same execution_id is idempotent",
+          "[concurrency_manager]") {
+    TestDb tdb;
+    ConcurrencyManager mgr(tdb.db);
+    mgr.create_tables();
+
+    CHECK(mgr.try_acquire("def-1", "exec-1", "global:5") == true);
+    // Same (def, exec) pair: idempotent re-acquire returns true without
+    // double-counting in active_count.
+    CHECK(mgr.try_acquire("def-1", "exec-1", "global:5") == true);
+    CHECK(mgr.active_count("def-1") == 1);
 }
