@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/governance` skill** at `.claude/skills/governance/SKILL.md` — a
+  reusable prompt-writing runbook for the Gate 1–7 governance pipeline
+  defined in CLAUDE.md. Provides parameterized agent preambles, the
+  Gate 3 domain-triggered decision matrix, conditional Gate 5 chaos
+  analysis, and a "Known patterns" section seeded with the five
+  failure modes caught in the #222/#224 governance run (sibling IDOR,
+  cycle-safe parity, error-branch info disclosure, enumeration oracle,
+  readiness probe coverage). Default range is `dev..HEAD` because
+  Yuzu's main working branch is `dev`, not `main`. Invoke with
+  `/governance <commit-range>` — the skill doesn't fully automate
+  (judgment calls on Gate 3 fan-out and Gate 5 skip still required)
+  but cuts per-run prompt-writing overhead roughly in half.
+
 - New Prometheus metrics for the auth and audit subsystems:
   `yuzu_server_token_cache_hits_total`, `yuzu_server_token_cache_misses_total`,
   and `yuzu_server_token_cache_size` expose API-token cache effectiveness so
@@ -22,6 +35,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CHANGELOG drift is now caught in CI rather than discovered months later.
 
 ### Changed
+
+- **CodeQL workflow is manual-only and runs on the self-hosted Linux
+  runner.** `.github/workflows/codeql.yml` previously ran on
+  `ubuntu-24.04` via `push` to `main` + weekly schedule, consuming
+  GitHub-hosted Actions minutes on every merge. It now targets
+  `[self-hosted, Linux]` (same runner as `release.yml`) and triggers
+  only on `workflow_dispatch` — fire via the Actions UI or
+  `gh workflow run codeql.yml`. No `push`/`pull_request`/`schedule`
+  triggers, so it cannot gate PR merges and is not listed in any
+  branch protection required check. Output lands in the GitHub
+  Security tab under "Code scanning alerts" for informational review.
+  Preflight now uses the same `gcc-13 / cmake / ninja / meson / ccache`
+  dependency-check pattern as `release.yml`, uses the runner's
+  pre-installed vcpkg (drops `lukka/run-vcpkg@v11`), and wraps the
+  compiler with ccache for fast repeat runs. Private-repo caveat:
+  if the repo ever flips private, CodeQL will require GitHub
+  Advanced Security — the action enforces the entitlement check
+  server-side regardless of where the job runs.
+
+- **`integration-test.sh` — sleep-assert sweep, gateway-crash regex,
+  env-overridable ports.** Three drift fixes to
+  `scripts/integration-test.sh` that together reduce per-run
+  wall-clock and eliminate two assertion false positives:
+  1. **Heartbeat metric wait is now loop-poll, not sleep-assert.**
+     The previous `sleep 10` started before the agent finished
+     enrolling (which can take ~12s on a cold run with enrollment-
+     token retry backoff), so by the time the sleep ended the
+     agent's 5s-interval heartbeat thread hadn't fired yet and the
+     `yuzu_heartbeats_received_total` assertion failed with no
+     signal that the wait budget was wrong. Now a 30s loop-poll on
+     `/metrics` that exits the instant the counter appears — sub-
+     second on warm runs, still succeeds within 30s on cold runs.
+  2. **Gateway-stability regex tightened.** The old
+     `grep -qi "crash\|supervisor.*error\|SIGTERM"` tripped on
+     benign `[info]`-level diagnostic log lines of the form
+     `[info] crash: class=exit exception={noproc,...}` that the
+     gateway emits when an agent's first registration attempt
+     races the upstream `gen_server` startup (the agent's built-in
+     exponential backoff resolves it in ~6s). The regex now
+     matches only actual Erlang crash markers:
+     `CRASH REPORT|=ERROR REPORT|Supervisor: .* terminating|\[error\].*SIGTERM`.
+  3. **Env-overridable port defaults.** Every `SERVER_*_PORT` and
+     `GW_*_PORT` now uses `${VAR:-default}` so the script can
+     coexist with other live stacks — notably the docker UAT from
+     `scripts/docker-start-UAT.sh`, which binds `50055` and `50063`
+     on the host. Override pattern:
+     `SERVER_GW_PORT=50155 GW_MGMT_PORT=50163 bash scripts/integration-test.sh`.
+  Bonus sweep: replaced `sleep 3` gateway grpcbox startup with
+  `wait_for_port $GW_AGENT_PORT`, and `sleep 2` agent-disconnect
+  propagation with a 2s poll on `kill -0` of the killed PID.
+  Verified: 22/22 PASS on first run with zero flakes.
 
 - **Friction pass on build / test workflow** — four developer-experience
   fixes from the governance-run retrospective:
@@ -107,6 +171,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/user-manual/server-admin.md` "Upgrade Notes" for details.
 
 ### Fixed
+
+- **UAT script `python` vs `python3` drift.**
+  `scripts/docker-start-UAT.sh` (8 inline sites) and
+  `scripts/uat-command-test.sh` (2 inline sites) both invoked
+  `python -c` for JSON / regex parsing. WSL2 Ubuntu has no `python`
+  symlink — only `python3` — so every inline parser silently
+  returned empty string, and every downstream numeric check
+  degraded without error:
+  - `docker-start-UAT.sh`: the 10 embedded connectivity tests
+    (server registered count, gateway connected count, Prometheus
+    target count, ClickHouse event count, os_info round-trip
+    parsing) all read "0" or empty strings and reported test
+    failures against a stack that was actually working.
+  - `uat-command-test.sh`: every command dispatch reported
+    `dispatch error` because the `cmd_id` extraction returned
+    empty. All 138 test cases failed. After the fix: 136 PASS /
+    0 FAIL / 2 legitimate long-running-plugin timeouts
+    (`firewall.rules`, `chargen.chargen_start`).
+
+  Both scripts now use `python3 -c` via a mechanical sed fix.
+  Worth a broader audit:
+  `grep -rn '\bpython -c' scripts/` would surface any remaining
+  sites that were missed.
+
+- **`scripts/docker-start-UAT.sh` build dir detection.** The
+  script hardcoded `BUILDDIR=$YUZU_ROOT/builddir`, which predates
+  the per-OS build dir convention that landed in `830ba7c`. On a
+  fresh clone configured via `scripts/setup.sh`, the agent binary
+  now lives at `build-linux/agents/core/yuzu-agent` (or
+  `build-macos` / `build-windows`), and the preflight check
+  reported "yuzu-agent not found — run: meson compile -C builddir"
+  even though the binary existed under the new name. Fixed by
+  detecting the host OS and selecting `build-<os>`, falling back
+  to the legacy `builddir/` path for older trees. Also added
+  `Bash(bash scripts/docker-start-UAT.sh:*)` and the `./` variant
+  to the project allowlist at `.claude/settings.json`.
 
 - **Governance Gate 4 follow-up hardening** — Gate 4 unhappy-path and
   consistency-auditor surfaced three new BLOCKING items on the prior
