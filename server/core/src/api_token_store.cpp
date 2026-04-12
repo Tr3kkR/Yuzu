@@ -345,6 +345,39 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
     return result;
 }
 
+std::optional<ApiToken> ApiTokenStore::get_token(const std::string& token_id) const {
+    if (!db_ || token_id.empty())
+        return std::nullopt;
+
+    std::shared_lock db_lock(db_mtx_);
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT token_id, name, principal_id, scope_service, created_at, "
+                           "expires_at, last_used_at, revoked, mcp_tier FROM api_tokens "
+                           "WHERE token_id = ?;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ApiToken> result;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        ApiToken t;
+        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        t.created_at = sqlite3_column_int64(s, 4);
+        t.expires_at = sqlite3_column_int64(s, 5);
+        t.last_used_at = sqlite3_column_int64(s, 6);
+        t.revoked = sqlite3_column_int(s, 7) != 0;
+        t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 8)));
+        result = std::move(t);
+    }
+    sqlite3_finalize(s);
+    return result;
+}
+
 bool ApiTokenStore::revoke_token(const std::string& token_id) {
     if (!db_)
         return false;

@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **API token revocation is now owner-scoped (#222)** — `DELETE
+  /api/v1/tokens/:token_id` previously required only `ApiToken:Delete`
+  permission without verifying ownership, so any user with that
+  permission could enumerate token IDs (the handler always returned 404
+  for unknown IDs but 200 for any real token) and revoke other users'
+  tokens. The handler now looks up the token via a new
+  `ApiTokenStore::get_token(token_id)` method, rejects cross-user
+  revokes with `403` and a `denied` audit event, and only allows the
+  bypass for callers holding the global `admin` role. Owner-scoped
+  audit detail (`owner=<principal>`) is logged on both success and
+  denial paths so forensics can distinguish intent.
+
 - **`get_descendant_ids` is cycle-safe; `update_group` validates
   `parent_id` (#224)** — the management-group BFS traversal had no
   visited-node tracking and no depth cap, so any existing cycle in

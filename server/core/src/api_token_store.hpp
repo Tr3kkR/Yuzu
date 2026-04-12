@@ -52,6 +52,12 @@ public:
     /// List all tokens (for admin UI). Raw token values are never returned.
     std::vector<ApiToken> list_tokens(const std::string& principal_id = {}) const;
 
+    /// Look up a single token by its short display ID. The raw token and
+    /// `token_hash` are NOT populated — only metadata. Used by the REST API
+    /// to verify ownership before revoke so a caller with `ApiToken:Delete`
+    /// cannot revoke another user's token by guessing its ID.
+    std::optional<ApiToken> get_token(const std::string& token_id) const;
+
     /// Revoke a token by ID.
     bool revoke_token(const std::string& token_id);
 

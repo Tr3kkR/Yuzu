@@ -168,3 +168,60 @@ TEST_CASE("ApiTokenStore: revoke nonexistent token", "[token][crud]") {
     bool revoked = store.revoke_token("nonexistent");
     CHECK(!revoked);
 }
+
+// ── get_token: metadata lookup for owner-scoped revoke (#222) ────────────────
+
+TEST_CASE("ApiTokenStore: get_token returns metadata for ownership check",
+          "[token][crud][owner]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    auto raw = store.create_token("Alice's token", "alice");
+    REQUIRE(raw.has_value());
+    auto listing = store.list_tokens("alice");
+    REQUIRE(listing.size() == 1);
+    auto token_id = listing[0].token_id;
+
+    auto looked_up = store.get_token(token_id);
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->token_id == token_id);
+    CHECK(looked_up->principal_id == "alice");
+    CHECK(looked_up->name == "Alice's token");
+    CHECK(looked_up->revoked == false);
+    // The raw hash must never surface through metadata lookups.
+    CHECK(looked_up->token_hash.empty());
+}
+
+TEST_CASE("ApiTokenStore: get_token returns nullopt for unknown id",
+          "[token][crud][owner]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    CHECK(!store.get_token("does-not-exist").has_value());
+    CHECK(!store.get_token("").has_value());
+}
+
+TEST_CASE("ApiTokenStore: get_token distinguishes owners for IDOR defense",
+          "[token][crud][owner]") {
+    // This test encodes the core invariant that the REST DELETE handler
+    // relies on to close #222: looking up a token by id must surface the
+    // owning principal_id so the handler can reject cross-user revokes.
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    REQUIRE(store.create_token("alice-key", "alice").has_value());
+    REQUIRE(store.create_token("bob-key", "bob").has_value());
+
+    auto alice_tokens = store.list_tokens("alice");
+    auto bob_tokens = store.list_tokens("bob");
+    REQUIRE(alice_tokens.size() == 1);
+    REQUIRE(bob_tokens.size() == 1);
+
+    auto alice_looked_up = store.get_token(alice_tokens[0].token_id);
+    auto bob_looked_up = store.get_token(bob_tokens[0].token_id);
+    REQUIRE(alice_looked_up.has_value());
+    REQUIRE(bob_looked_up.has_value());
+    CHECK(alice_looked_up->principal_id == "alice");
+    CHECK(bob_looked_up->principal_id == "bob");
+    CHECK(alice_looked_up->principal_id != bob_looked_up->principal_id);
+}
