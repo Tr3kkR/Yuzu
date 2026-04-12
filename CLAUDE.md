@@ -126,6 +126,49 @@ rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 
 **Always run `rebar3 dialyzer` after any Erlang change.** Compilation succeeding is not enough — dialyzer catches type violations, dead code, and missing dependencies that the compiler silently accepts. The project uses `warnings_as_errors` for compile but dialyzer warnings are separate.
 
+### Toolchain activation (Erlang on PATH)
+
+The gateway and the meson custom_target that drives `rebar3 compile` both
+require `erl` on PATH. WSL2 / Linux dev shells typically rely on
+[kerl](https://github.com/kerl/kerl) and need `source $(kerl path <ver>)/activate`
+before any build; macOS uses Homebrew or asdf; MSYS2 bash on Windows reads the
+native installer (`C:\Program Files\Erlang OTP\bin` on modern installers,
+`C:\Program Files\erl-<ver>\bin` on older ones). Forgetting to activate is a
+common cause of phantom `.gateway_built` failures from `meson compile` even
+though the C++ targets succeed.
+
+**Use the helper.** Before any gateway work — `rebar3`, `meson compile`, or any
+script that touches `gateway/` — source the cross-platform helper and verify
+`erl` is on PATH:
+
+```bash
+source scripts/ensure-erlang.sh           # default: latest 28.x
+source scripts/ensure-erlang.sh 28.4.2    # exact pin
+command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
+```
+
+The script is a no-op if `erl` is already on PATH **and runs** (it probes with
+`erl -version`, so broken symlinks and wrong-arch binaries don't pass the
+check). Otherwise it tries, in order:
+
+1. **kerl** — matches the requested version exactly or as a major-version
+   prefix (so `28` finds `28.4.2`); falls back to the highest installed `28.x`.
+2. **asdf** — uses `asdf which erl` (works on both classic and the 0.16+
+   rewrite that dropped `asdf where`).
+3. **Homebrew** — *macOS only*, via `brew --prefix erlang`.
+4. **MSYS2 Windows installer probe** — *MSYS2 bash on Windows only*, scans
+   both `Program Files` locations for the latest installed OTP.
+
+The helper **always returns 0** — a sourced script that returns non-zero would
+trip the parent shell's `set -e`. Callers MUST verify `command -v erl`
+themselves (see usage above). If no detector succeeds, the helper prints
+actionable install instructions to stderr.
+
+The default version argument tracks `.github/workflows/release.yml`'s
+`erlef/setup-beam` `otp-version`; bump both together. Native `cmd.exe` /
+PowerShell sessions are out of scope — Yuzu's documented Windows build path is
+MSYS2 bash (see `setup_msvc_env.sh`, the sibling MSVC activation helper).
+
 ### Standing Erlang pitfalls
 
 | Area | Issue |
@@ -365,11 +408,14 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 
 ### Windows build (from MSYS2 bash)
 ```bash
-source ./setup_msvc_env.sh
+source ./setup_msvc_env.sh           # MSVC paths
+source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
 meson compile -C builddir
 ```
 
 **IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
+
+`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" under the Erlang gateway section). Source both before invoking meson if your build touches the gateway custom_target.
 
 ### Cross-compilation
 ```bash
