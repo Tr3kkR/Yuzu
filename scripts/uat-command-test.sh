@@ -83,7 +83,7 @@ dispatch_and_poll() {
         -d "$body" 2>/dev/null)
 
     local cmd_id
-    cmd_id=$(echo "$resp" | python -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null || echo "")
+    cmd_id=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null || echo "")
 
     if [ -z "$cmd_id" ]; then
         echo -e "  ${RED}FAIL${NC} ${label} — dispatch error: $resp"
@@ -106,7 +106,7 @@ dispatch_and_poll() {
         # Check if we have responses with actual output data
         # The server sends two responses: status=1 (ack, empty) and status=0 (data)
         local has_response
-        has_response=$(echo "$poll_resp" | python -c "
+        has_response=$(echo "$poll_resp" | python3 -c "
 import sys,json
 try:
     d=json.load(sys.stdin)

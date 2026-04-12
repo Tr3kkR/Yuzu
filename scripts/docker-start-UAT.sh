@@ -21,7 +21,24 @@
 set -euo pipefail
 
 YUZU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDDIR="$YUZU_ROOT/builddir"
+
+# Per-OS build directory, matching scripts/setup.sh and CLAUDE.md convention.
+# Falls back to the legacy `builddir` path for older trees that haven't
+# adopted the convention yet.
+case "$(uname -s)" in
+    Linux*)  _default_builddir="build-linux"  ;;
+    Darwin*) _default_builddir="build-macos"  ;;
+    MINGW*|MSYS*|CYGWIN*) _default_builddir="build-windows" ;;
+    *)       _default_builddir="build-linux"  ;;
+esac
+if [ -d "$YUZU_ROOT/$_default_builddir" ]; then
+    BUILDDIR="$YUZU_ROOT/$_default_builddir"
+elif [ -d "$YUZU_ROOT/builddir" ]; then
+    BUILDDIR="$YUZU_ROOT/builddir"
+else
+    BUILDDIR="$YUZU_ROOT/$_default_builddir"  # let the preflight fail cleanly
+fi
+
 UAT_DIR="$YUZU_ROOT/.uat"
 COMPOSE_FILE="$YUZU_ROOT/deploy/docker/docker-compose.full-uat.yml"
 
@@ -100,7 +117,7 @@ kill_docker() {
 }
 
 generate_config() {
-    python -c "
+    python3 -c "
 import hashlib, os
 salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', '${ADMIN_PASS}'.encode(), salt, 100000, dklen=32)
@@ -311,7 +328,7 @@ start_all() {
         token_html=$(curl -s -L -b "$UAT_DIR/cookies.txt" \
             -X POST http://localhost:8080/api/settings/enrollment-tokens \
             -d "label=uat-auto&max_uses=1000&ttl=86400" 2>/dev/null) || true
-        enroll_token=$(echo "$token_html" | python -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null) || true
+        enroll_token=$(echo "$token_html" | python3 -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null) || true
 
         if [ -n "$enroll_token" ]; then
             break
@@ -361,7 +378,7 @@ start_all() {
     done
     local session_id
     session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | \
-        python -c "import sys,re; lines=sys.stdin.read(); m=re.findall(r'session=[^ ,)]+', lines); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
+        python3 -c "import sys,re; lines=sys.stdin.read(); m=re.findall(r'session=[^ ,)]+', lines); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
     ok "Agent up ($session_id)"
 
     if echo "$session_id" | grep -q "gw-session"; then
@@ -402,7 +419,7 @@ start_all() {
     tests_total=$((tests_total + 1))
     local reg_count
     reg_count=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
-        python -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
+        python3 -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
     if [ "$reg_count" -ge 1 ]; then
         ok "Server sees $reg_count registered agent(s)"
         tests_passed=$((tests_passed + 1))
@@ -414,7 +431,7 @@ start_all() {
     tests_total=$((tests_total + 1))
     local gw_agents
     gw_agents=$(curl -s http://localhost:9568/metrics 2>/dev/null | \
-        python -c "import sys,re; m=re.search(r'yuzu_gw_agents_connected_total\{[^}]*\} (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
+        python3 -c "import sys,re; m=re.search(r'yuzu_gw_agents_connected_total\{[^}]*\} (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
     if [ "$gw_agents" -ge 1 ]; then
         ok "Gateway shows $gw_agents connected agent(s)"
         tests_passed=$((tests_passed + 1))
@@ -427,7 +444,7 @@ start_all() {
     sleep 3
     local up_count
     up_count=$(curl -s http://localhost:9090/api/v1/targets 2>/dev/null | \
-        python -c "
+        python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -489,7 +506,7 @@ except: print(0)
         -H "Content-Type: application/json" \
         -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null)
     local cmd_id
-    cmd_id=$(echo "$cmd_resp" | python -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null || true)
+    cmd_id=$(echo "$cmd_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))" 2>/dev/null || true)
 
     if [ -z "$cmd_id" ]; then
         fail "os_info: failed to dispatch (response: $cmd_resp)"
@@ -501,7 +518,7 @@ except: print(0)
             poll_count=$((poll_count + 1))
             os_result=$(curl -s -b "$UAT_DIR/cookies.txt" \
                 "http://localhost:8080/api/responses/$cmd_id" 2>/dev/null | \
-                python -c "
+                python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 for r in d.get('responses',[]):
