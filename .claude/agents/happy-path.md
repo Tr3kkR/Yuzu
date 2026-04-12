@@ -1,3 +1,10 @@
+---
+name: happy-path
+description: Happy-path reviewer — normal-condition correctness and logic completeness
+tools: Read, Grep, Glob, Bash
+model: sonnet
+---
+
 # Yuzu Happy Path Reviewer (Agent Definition)
 
 ## Agent ID

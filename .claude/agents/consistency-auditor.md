@@ -1,3 +1,9 @@
+---
+name: consistency-auditor
+description: Consistency auditor — cross-component state, schema, and contract consistency
+tools: Read, Grep, Glob, Bash
+---
+
 # Yuzu Consistency Auditor (Agent Definition)
 
 ## Agent ID

@@ -1,3 +1,9 @@
+---
+name: unhappy-path
+description: Unhappy-path reviewer — failure-mode interrogation, builds risk register for chaos-injector
+tools: Read, Grep, Glob, Bash
+---
+
 # Yuzu Unhappy Path Code Reviewer (Agent Definition)
 
 ## Agent ID

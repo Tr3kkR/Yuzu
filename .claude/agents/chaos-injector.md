@@ -1,3 +1,9 @@
+---
+name: chaos-injector
+description: Chaos injector — generates controlled failure scenarios from identified risks
+tools: Read, Grep, Glob, Bash
+---
+
 # Yuzu Chaos Injector (Agent Definition)
 
 ## Agent ID
