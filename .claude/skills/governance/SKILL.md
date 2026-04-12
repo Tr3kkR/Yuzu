@@ -15,11 +15,12 @@ Runbook for the full Yuzu governance pipeline defined in CLAUDE.md. This skill i
 
 Examples:
 - `/governance HEAD~4..HEAD` — last four commits
-- `/governance origin/main..HEAD` — everything ahead of main
+- `/governance dev..HEAD` — everything on this branch not yet in dev (feature branch workflow)
+- `/governance origin/dev..HEAD` — commits on local dev not yet pushed (direct-to-dev workflow)
 - `/governance 82f7eb8..9c50bce` — a specific PR range
 - `/governance HEAD` — single-commit review (shorthand, treated as `HEAD~1..HEAD`)
 
-If no range is provided, default to `origin/main..HEAD`.
+If no range is provided, default to `dev..HEAD`. Yuzu's main working branch is `dev` (not `main`), so governance runs normally review "what's new on this branch relative to dev" before merging or pushing. If the current branch IS `dev`, `dev..HEAD` is empty — in that case prompt the operator with `origin/dev..HEAD` (commits ahead of the remote) as the likely intent, or ask them to specify.
 
 ## Workflow summary
 
