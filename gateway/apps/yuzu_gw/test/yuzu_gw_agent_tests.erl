@@ -53,13 +53,31 @@ setup() ->
         undefined -> pg:start_link(yuzu_gw);
         _ -> ok
     end,
+    %% A bare whereis check is not enough — health_nf_tests leaves a
+    %% mock_loop process registered as yuzu_gw_registry on cleanup
+    %% (see #336). Detect that case and replace it with a real registry
+    %% so register_agent doesn't hang on a process that swallows calls.
     case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _ -> ok
+        undefined ->
+            {ok, _} = yuzu_gw_registry:start_link();
+        Existing ->
+            case proc_lib:initial_call(Existing) of
+                {gen_server, init_it, _} ->
+                    ok;
+                _NotAGenServer ->
+                    catch unregister(yuzu_gw_registry),
+                    catch exit(Existing, kill),
+                    {ok, _} = yuzu_gw_registry:start_link()
+            end
     end,
     %% Clean up stale mocks from prior modules.
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(telemetry),
+    %% Fail loud at the boundary if a prior test leaked the real
+    %% yuzu_gw_upstream gen_server. Otherwise the meck stub installed
+    %% below would silently coexist with the registered process and
+    %% the next test would time out opaquely. See issue #336.
+    ?assertEqual(undefined, whereis(yuzu_gw_upstream)),
     %% Mock external deps.
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
     meck:expect(yuzu_gw_upstream, notify_stream_status,

@@ -110,6 +110,38 @@ development independently from the primary software changelog.
   invocation would error out with "Module … not found in project" before
   running any test. Tracking issue: #337.
 
+- **Gateway eunit fixture leak: `agent_tests:starts_streaming` cancellation**
+  — `yuzu_gw_health_nf_tests:cleanup/1` only killed the mock pids it captured
+  in `setup/0`, but the `readyz_503_dead_process` test kills the original
+  `yuzu_gw_registry` mock and re-registers a fresh `mock_loop/0` pid that the
+  cleanup tracking never sees. The leaked mock survived into every subsequent
+  test module; downstream tests checked `whereis(yuzu_gw_registry)` and
+  reused it as if it were the real gen_server. When `agent_tests:setup`
+  fired, `yuzu_gw_agent:init/1` issued `gen_server:call(yuzu_gw_registry,
+  {register, …})` against the mock, which received the message and silently
+  recursed without replying — eunit cancelled the call at its 5-second limit
+  and the rest of `agent_tests` (14 tests) never ran. The full eunit suite
+  reported "Passed: 132. One or more tests were cancelled" instead of the
+  expected 148. Fixes:
+  - `health_nf_tests:cleanup/1` now looks up the *current* registered pid
+    via `whereis/1` for each name it owned at setup time, so re-registered
+    mocks are killed too.
+  - `agent_tests:setup/0` defensively detects a stale mock under
+    `yuzu_gw_registry` (anything whose `proc_lib:initial_call/1` is not
+    `{gen_server, init_it, _}`), unregisters it, and starts a real
+    registry — guarding against the same class of leak from any future
+    test module.
+  - `agent_tests:setup/0` also asserts `whereis(yuzu_gw_upstream) =:=
+    undefined` so meck-coexisting-with-a-live-gen_server failures fail
+    loudly at the boundary instead of producing opaque downstream timeouts.
+  - `circuit_breaker_nf_tests`, `circuit_breaker_tests`, and
+    `upstream_tests` cleanup paths now use synchronous
+    `gen_server:stop(Pid, shutdown, 5000)` instead of `exit(Pid, shutdown)
+    + timer:sleep(50)`. The sleep was racy on busy boxes (WSL2 in
+    particular) and could leave the upstream gen_server alive into the
+    next test module. Eunit count: 133 passing (with all 15 `agent_tests`
+    cases cancelled) → 148 passing. Fixes #336.
+
 - **`scripts/integration-test.sh` fixes** — admin password bumped from 8 to
   12 characters to satisfy the post-v0.9 length requirement; `--no-https`
   added so the server starts without TLS in test mode; port matrix split so

@@ -49,9 +49,9 @@ setup() ->
     Pid.
 
 cleanup(Pid) ->
+    %% Synchronous stop — see issue #336 for the race exit/sleep replaces.
     catch unlink(Pid),
-    catch exit(Pid, shutdown),
-    timer:sleep(50),
+    catch gen_server:stop(Pid, shutdown, 5000),
     meck:unload([grpcbox_client, telemetry]),
     ok.
 

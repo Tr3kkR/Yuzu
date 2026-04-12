@@ -54,11 +54,16 @@ setup() ->
     {HBPid, UpPid}.
 
 cleanup({HBPid, UpPid}) ->
+    %% Synchronous stop. notify_no_crash uses spawn_monitor inside the
+    %% upstream process to fan out NotifyStreamStatus RPCs; killing the
+    %% upstream gen_server with exit(_, shutdown) does not wait for
+    %% those children, so they keep logging into the next test module
+    %% and the heartbeat buffer keeps draining failed batches. The
+    %% earlier sleep(50) was not enough on busy boxes — see #336.
     catch unlink(HBPid),
     catch unlink(UpPid),
-    catch exit(HBPid, shutdown),
-    catch exit(UpPid, shutdown),
-    timer:sleep(50),
+    catch gen_server:stop(UpPid, shutdown, 5000),
+    catch gen_server:stop(HBPid, shutdown, 5000),
     meck:unload([grpcbox_client, telemetry]),
     ok.
 
