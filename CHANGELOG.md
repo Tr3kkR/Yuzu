@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Login page no longer renders `[object Object]` on bad credentials. The inline
+  JS in `login_ui.cpp` was reading `resp.error` directly from the structured
+  error envelope (`{"error":{"code":N,"message":"..."}}`) and assigning the
+  object to `textContent`. It now reads `resp.error.message`, with a string
+  fallback for legacy responses and a status-keyed default if parsing fails.
+  Fixes #333.
+
 - **Audit Trail Integrity Fix (YZA-2026-001)** — Audit log and analytics event
   rows for requests authenticated via `Authorization: Bearer` or `X-Yuzu-Token`
   now populate the `principal` and `principal_role` fields. Previously these
