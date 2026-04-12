@@ -543,6 +543,7 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 | `deploy/docker/Dockerfile.gateway` | Erlang/OTP build for the gateway node |
 | `deploy/docker/docker-compose.yml` | Standalone stack (server + agent + monitoring) |
 | `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
+| `docker-compose.uat.yml` | Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse) |
 
 **Usage:**
 
@@ -552,6 +553,16 @@ docker compose up -d          # start all services
 docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
+
+**Pinning a specific release with `docker-compose.uat.yml`:**
+
+The top-level UAT compose file parameterises its `ghcr.io/.../yuzu-server` and `yuzu-gateway` tags through `${YUZU_VERSION:-<default>}`. The default tracks the latest published release, but operators testing an earlier or newer image can override at the command line:
+
+```bash
+YUZU_VERSION=0.9.0 docker compose -f docker-compose.uat.yml up -d
+```
+
+A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first step of the release workflow and blocks asset publication if any tracked compose file carries a hardcoded `X.Y.Z` tag or a `${YUZU_VERSION:-...}` default that does not match the release tag — so the default in the checked-in file is guaranteed to match the latest shipped release.
 
 **Exposed ports:**
 

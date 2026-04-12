@@ -84,7 +84,11 @@
       "Bash(file:*)",
       "Bash(du:*)",
       "Bash(df:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)"
     ]
   }
 }

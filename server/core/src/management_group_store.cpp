@@ -118,6 +118,11 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
 
     // Validate no circular parent reference
     if (!group.parent_id.empty()) {
+        // Caller-supplied IDs must not self-parent. The ID-generation path
+        // is safe because generate_id() produces a fresh random ID that
+        // cannot collide with a caller-supplied parent_id.
+        if (!group.id.empty() && group.parent_id == group.id)
+            return std::unexpected("group cannot be its own parent");
         auto parent = get_group(group.parent_id);
         if (!parent)
             return std::unexpected("parent group not found");
@@ -462,8 +467,19 @@ std::vector<std::string> ManagementGroupStore::get_ancestor_ids(const std::strin
     if (!db_)
         return ancestors;
 
+    // Cycle protection (#224 follow-up, gov-Gate2 H2): the original
+    // implementation had only a depth cap of 10, so on a cyclic DB it would
+    // return up to 10 alternating garbage IDs like [B,A,B,A,...]. That's
+    // load-bearing because `RbacStore::check_scoped_permission` unions
+    // ancestors into the set of groups used for role resolution — phantom
+    // ancestors from a cycle would produce spurious permission grants.
+    // The visited set short-circuits on any revisit; the depth cap is
+    // retained as belt-and-suspenders.
+    std::unordered_set<std::string> visited;
+    visited.insert(group_id);
+
     auto current = group_id;
-    for (int depth = 0; depth < 10; ++depth) { // safety limit
+    for (int depth = 0; depth < 10; ++depth) {
         sqlite3_stmt* s = nullptr;
         if (sqlite3_prepare_v2(db_, "SELECT parent_id FROM management_groups WHERE id = ?;", -1, &s,
                                nullptr) != SQLITE_OK)
@@ -472,9 +488,15 @@ std::vector<std::string> ManagementGroupStore::get_ancestor_ids(const std::strin
         if (sqlite3_step(s) == SQLITE_ROW) {
             auto* pid = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
             if (pid && pid[0] != '\0') {
-                current = pid;
-                ancestors.push_back(current);
+                std::string parent(pid);
                 sqlite3_finalize(s);
+                if (!visited.insert(parent).second) {
+                    spdlog::warn("get_ancestor_ids: cycle detected at '{}' while walking from '{}'",
+                                 parent, group_id);
+                    break;
+                }
+                ancestors.push_back(parent);
+                current = std::move(parent);
                 continue;
             }
         }

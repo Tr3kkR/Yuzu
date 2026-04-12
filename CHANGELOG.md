@@ -44,6 +44,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Governance hardening round for #222 and #224** — Gate 2 security review
+  on the original fixes surfaced two HIGH sibling findings that are
+  addressed here:
+  - **Dashboard IDOR** — `DELETE /api/settings/api-tokens/:token_id` (the
+    HTMX Settings path) had the same ownership gap as the REST handler
+    closed by #222. It now looks up the token, rejects cross-user revokes
+    with a generic 404 fragment, and emits a `denied` audit event with
+    `detail=owner=<principal>` so forensics can tell an enumeration probe
+    from a real not-found.
+  - **`get_ancestor_ids` cycle safety** — the companion BFS-upward walk
+    in `ManagementGroupStore` still had no visited-node tracking, only a
+    depth-10 cap. `RbacStore::check_scoped_permission` unions ancestors
+    into the set of groups used for role resolution, so on a cyclic DB a
+    user could inherit spurious permissions from phantom ancestors
+    reported by the cycle's alternating output. `get_ancestor_ids` now
+    carries the same `unordered_set<std::string> visited` + warning-log
+    pattern as `get_descendant_ids`.
+  - **Enumeration oracle closed on REST `DELETE /api/v1/tokens/:id`** —
+    the original fix returned `403 "cannot revoke another user's API
+    token"` for cross-user revokes, which let a non-owner with
+    `ApiToken:Delete` distinguish "token does not exist" (404) from
+    "exists but not yours" (403) and enumerate valid token ids. Both
+    paths now return `404 "token not found"` with an identical response
+    body; the audit log still carries the distinction server-side via
+    `result=denied` + `detail=owner=<principal>`.
+  - **`create_group` self-parent** — the create path accepted a
+    caller-supplied `group.id == group.parent_id` and produced an
+    immediate 1-row self-cycle. It now returns
+    `"group cannot be its own parent"` from the same layer as
+    `update_group`.
+  - **REST-handler test coverage (#222 follow-up)** — the original fix
+    landed with store-level coverage only. A new
+    `tests/unit/server/test_rest_api_tokens.cpp` spins up a real
+    `httplib::Server` on a random port, registers `RestApiV1` routes
+    with mock `auth_fn`/`perm_fn`/`audit_fn`, and exercises all four
+    paths end-to-end: owner self-revoke, admin cross-user bypass,
+    non-owner → 404 (no oracle), unknown id → 404 (no audit). 5 HTTP
+    cases, 55 assertions, plus the existing store-level cases.
+  - **Store-test fixture parallelism** — both
+    `test_management_group_store.cpp` and `test_api_token_store.cpp`
+    used hardcoded SQLite paths (`/tmp/test_mgmt_groups.db`,
+    `/tmp/test_api_tokens.db`) that would collide under
+    `meson test --num-processes N`. Each `TempDb` now builds a unique
+    path per instance from `std::thread::id` + `steady_clock`, matching
+    the `unique_temp_path` pattern already used in
+    `test_rest_api_t2.cpp`.
+  - **Deep / self-loop cycle regression tests** — the original fix
+    only tested a 2-node cycle. New cases exercise a 3-node A→B→C→A
+    cycle and the degenerate self-loop `parent_id == id` on a single
+    row. A reparent-to-root regression test guards the null-bind
+    branch in `update_group` that the cycle/depth block now gates on.
+
 - **API token revocation is now owner-scoped (#222)** — `DELETE
   /api/v1/tokens/:token_id` previously required only `ApiToken:Delete`
   permission without verifying ownership, so any user with that

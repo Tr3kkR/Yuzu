@@ -2464,6 +2464,38 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                    if (!session)
                        return;
                    auto token_id = req.matches[1].str();
+
+                   // Owner-scoped revocation (fixes the sibling IDOR to #222 on
+                   // the HTMX dashboard path). A caller with ApiToken:Delete
+                   // may only revoke their own tokens; the global admin role
+                   // is the only bypass. We return a generic "not found"
+                   // fragment in both the missing-id and the not-owner cases
+                   // so the dashboard does not become an enumeration oracle.
+                   auto existing = api_token_store_->get_token(token_id);
+                   bool denied =
+                       existing && existing->principal_id != session->username &&
+                       session->role != auth::Role::admin;
+                   if (!existing || denied) {
+                       if (denied && audit_store_) {
+                           audit_store_->log(
+                               {.principal = session->username,
+                                .principal_role = "admin",
+                                .action = "api_token.revoke",
+                                .target_type = "ApiToken",
+                                .target_id = token_id,
+                                .detail = "owner=" + existing->principal_id,
+                                .source_ip = req.remote_addr,
+                                .result = "denied"});
+                       }
+                       res.status = 404;
+                       res.set_header(
+                           "HX-Trigger",
+                           R"({"showToast":{"message":"Token not found","level":"error"}})");
+                       res.set_content(render_api_tokens_fragment(),
+                                       "text/html; charset=utf-8");
+                       return;
+                   }
+
                    api_token_store_->revoke_token(token_id);
 
                    spdlog::info("API token '{}' revoked by {}", token_id, session->username);
@@ -2474,6 +2506,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                                            .action = "api_token.revoke",
                                            .target_type = "ApiToken",
                                            .target_id = token_id,
+                                           .detail = "owner=" + existing->principal_id,
                                            .source_ip = req.remote_addr,
                                            .result = "success"});
                    }

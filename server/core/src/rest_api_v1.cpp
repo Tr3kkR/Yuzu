@@ -931,20 +931,24 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         // not sufficient — callers must either own the token or hold the
         // global admin role. Without this a user with Delete permission
         // could enumerate and revoke any other user's tokens (IDOR).
+        //
+        // Both the missing-id and the not-owner cases return 404 with an
+        // identical response body so the endpoint does not become an
+        // enumeration oracle (gov-Gate2 sec-M3). The audit log still
+        // distinguishes the two cases via the `result` field (`denied`
+        // vs. no event) and the `owner=` detail so forensics can see who
+        // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
-        if (!existing) {
+        bool denied =
+            existing && existing->principal_id != session->username &&
+            session->role != auth::Role::admin;
+        if (!existing || denied) {
+            if (denied) {
+                audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
+                         "owner=" + existing->principal_id);
+            }
             res.status = 404;
             res.set_content(error_json("token not found"), "application/json");
-            return;
-        }
-        if (existing->principal_id != session->username &&
-            session->role != auth::Role::admin) {
-            audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
-                     "owner=" + existing->principal_id);
-            res.status = 403;
-            res.set_content(
-                error_json("cannot revoke another user's API token", 403),
-                "application/json");
             return;
         }
 
