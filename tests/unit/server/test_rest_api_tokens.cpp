@@ -134,9 +134,12 @@ struct RestTokensHarness {
     std::string create_token_for(const std::string& owner, const std::string& name) {
         auto raw = token_store->create_token(name, owner);
         REQUIRE(raw.has_value());
+        // list_tokens orders by `created_at DESC`, so the newest token is
+        // front(). Using back() would return the oldest and break if a test
+        // ever creates multiple tokens per owner on the same harness.
         auto listing = token_store->list_tokens(owner);
         REQUIRE(!listing.empty());
-        return listing.back().token_id;
+        return listing.front().token_id;
     }
 
     httplib::Result delete_token(const std::string& token_id) {

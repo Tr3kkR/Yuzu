@@ -135,6 +135,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ---
 
+## Upgrade Notes
+
+### v0.10.0 — API token revocation is owner-scoped
+
+Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
+
+**If your deployment uses a non-admin service account to rotate tokens for other principals** — for example, a shared `ops` role that recycles service-account tokens on a schedule — those rotations will begin receiving `HTTP 404 token not found` after upgrade. To restore the behavior, either:
+
+1. Assign the rotation account the global `admin` role, or
+2. Refactor the rotation so each principal owns and rotates its own token.
+
+Option (2) is the recommended long-term posture because it aligns with least-privilege. The same ownership constraint applies to both the REST path `DELETE /api/v1/tokens/{id}` and the HTMX dashboard path `DELETE /api/settings/api-tokens/{id}`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so operators can distinguish an enumeration probe from a legitimate self-revoke.
+
+Both paths return `HTTP 404 token not found` on a cross-user revoke attempt — identical to the response for a truly-nonexistent token — to prevent the endpoint from being used as an enumeration oracle.
+
+---
+
 ## Settings Page
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.

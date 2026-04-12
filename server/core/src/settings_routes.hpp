@@ -76,7 +76,16 @@ private:
     std::string render_tls_fragment();
     std::string render_users_fragment();
     std::string render_tokens_fragment(const std::string& new_raw_token = {});
-    std::string render_api_tokens_fragment(const std::string& new_raw_token = {});
+    /// Render the API tokens settings fragment.
+    ///
+    /// @param new_raw_token   Raw token value just minted (displayed once), or empty.
+    /// @param filter_principal When non-empty, list only tokens owned by this
+    ///                         principal. Empty = show every token (admin view).
+    ///                         Callers must pass session->username for non-admin
+    ///                         sessions to prevent cross-user token enumeration
+    ///                         (governance Gate 4 finding C1).
+    std::string render_api_tokens_fragment(const std::string& new_raw_token = {},
+                                           const std::string& filter_principal = {});
     std::string render_pending_fragment();
     std::string render_auto_approve_fragment();
     std::string render_tag_compliance_fragment();

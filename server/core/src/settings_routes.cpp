@@ -569,7 +569,8 @@ std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_to
     return html;
 }
 
-std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token) {
+std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token,
+                                                        const std::string& filter_principal) {
     if (!api_token_store_ || !api_token_store_->is_open()) {
         return "<span style=\"color:#484f58\">API token store unavailable.</span>";
     }
@@ -589,7 +590,13 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
         return std::string(buf) + " UTC";
     };
 
-    auto tokens = api_token_store_->list_tokens();
+    // Scope by caller principal for non-admin sessions. list_tokens already
+    // supports a principal_id filter — the same one used by
+    // `GET /api/v1/tokens` at rest_api_v1.cpp:826 — so admins get the full
+    // fleet view while regular users see only their own tokens. Closes the
+    // cross-user token enumeration path that governance Gate 4 consistency
+    // auditor flagged as BLOCKING (finding C1).
+    auto tokens = api_token_store_->list_tokens(filter_principal);
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Owner</th>"
                        "  <th>Created</th><th>Expires</th><th>Last Used</th>"
@@ -1783,7 +1790,15 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ApiToken", "Read"))
                     return;
-                res.set_content(render_api_tokens_fragment(), "text/html; charset=utf-8");
+                auto session = auth_fn_(req, res);
+                if (!session)
+                    return;
+                // Non-admins see only their own tokens (Gate 4 finding C1).
+                std::string filter = session->role == auth::Role::admin
+                                         ? std::string{}
+                                         : session->username;
+                res.set_content(render_api_tokens_fragment({}, filter),
+                                "text/html; charset=utf-8");
             });
 
     svr.Get("/fragments/settings/management-groups",
@@ -2442,7 +2457,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
         if (audit_store_) {
             audit_store_->log({.principal = session->username,
-                               .principal_role = "admin",
+                               .principal_role = auth::role_to_string(session->role),
                                .action = "api_token.create",
                                .target_type = "ApiToken",
                                .target_id = name,
@@ -2452,7 +2467,9 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
         res.set_header("HX-Trigger",
             R"({"showToast":{"message":"API token created","level":"success"}})");
-        res.set_content(render_api_tokens_fragment(result.value()),
+        std::string filter = session->role == auth::Role::admin ? std::string{}
+                                                                : session->username;
+        res.set_content(render_api_tokens_fragment(result.value(), filter),
                         "text/html; charset=utf-8");
     });
 
@@ -2479,7 +2496,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                        if (denied && audit_store_) {
                            audit_store_->log(
                                {.principal = session->username,
-                                .principal_role = "admin",
+                                .principal_role = auth::role_to_string(session->role),
                                 .action = "api_token.revoke",
                                 .target_type = "ApiToken",
                                 .target_id = token_id,
@@ -2487,12 +2504,24 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                                 .source_ip = req.remote_addr,
                                 .result = "denied"});
                        }
+                       // Return a minimal error-only fragment with zero token
+                       // data. An earlier iteration of this fix rendered the
+                       // full token table via render_api_tokens_fragment(),
+                       // which leaked every user's token IDs to a denied
+                       // probe — see governance Gate 4 unhappy-path UP-11.
+                       // The pre-existing "success path renders all tokens"
+                       // bug on `list_tokens()` with no owner filter is a
+                       // separate follow-up (tracked: render_api_tokens_fragment
+                       // must be scoped to the caller's principal or the
+                       // panel must become admin-only).
                        res.status = 404;
                        res.set_header(
                            "HX-Trigger",
                            R"({"showToast":{"message":"Token not found","level":"error"}})");
-                       res.set_content(render_api_tokens_fragment(),
-                                       "text/html; charset=utf-8");
+                       res.set_content(
+                           "<div class=\"error-fragment\" style=\"color:#f85149\">"
+                           "Token not found.</div>",
+                           "text/html; charset=utf-8");
                        return;
                    }
 
@@ -2502,7 +2531,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
                    if (audit_store_) {
                        audit_store_->log({.principal = session->username,
-                                           .principal_role = "admin",
+                                           .principal_role = auth::role_to_string(session->role),
                                            .action = "api_token.revoke",
                                            .target_type = "ApiToken",
                                            .target_id = token_id,
@@ -2513,7 +2542,11 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
                    res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"API token revoked","level":"success"}})");
-                   res.set_content(render_api_tokens_fragment(), "text/html; charset=utf-8");
+                   std::string filter = session->role == auth::Role::admin
+                                            ? std::string{}
+                                            : session->username;
+                   res.set_content(render_api_tokens_fragment({}, filter),
+                                   "text/html; charset=utf-8");
                });
 
     // -- Settings API: Pending agents (admin only, HTMX) -----------------------

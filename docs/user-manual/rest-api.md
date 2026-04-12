@@ -1116,7 +1116,7 @@ Query audit events.
 | `management_group.assign_role` | Role assigned on group |
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
-| `api_token.revoke` | API token revoked |
+| `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |

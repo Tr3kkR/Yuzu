@@ -211,6 +211,50 @@ TEST_CASE("ApiTokenStore: get_token returns nullopt for unknown id",
     CHECK(!store.get_token("").has_value());
 }
 
+TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
+          "[token][crud][owner]") {
+    // Gate 4 consistency auditor finding C1: the Settings dashboard
+    // `render_api_tokens_fragment` previously called list_tokens() with no
+    // principal filter, rendering every user's token IDs, names, owners,
+    // timestamps, and MCP tiers in the HTMX response body to anyone
+    // holding `ApiToken:Read`. The fix scopes the fragment by
+    // `session->username` for non-admin sessions. This test pins the
+    // underlying store contract the fix depends on: list_tokens(principal)
+    // must return ONLY that principal's tokens, with no leakage across
+    // owners.
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    REQUIRE(store.create_token("alice-a", "alice").has_value());
+    REQUIRE(store.create_token("alice-b", "alice").has_value());
+    REQUIRE(store.create_token("bob-a", "bob").has_value());
+    REQUIRE(store.create_token("root-a", "root").has_value());
+
+    auto alice_tokens = store.list_tokens("alice");
+    auto bob_tokens = store.list_tokens("bob");
+    auto root_tokens = store.list_tokens("root");
+    auto all_tokens = store.list_tokens();
+
+    REQUIRE(alice_tokens.size() == 2);
+    REQUIRE(bob_tokens.size() == 1);
+    REQUIRE(root_tokens.size() == 1);
+    REQUIRE(all_tokens.size() == 4);
+
+    // Every token returned for alice is owned by alice — no cross-contamination.
+    for (const auto& t : alice_tokens)
+        CHECK(t.principal_id == "alice");
+    for (const auto& t : bob_tokens)
+        CHECK(t.principal_id == "bob");
+    for (const auto& t : root_tokens)
+        CHECK(t.principal_id == "root");
+
+    // Bob's name does not appear in alice's listing under any column.
+    for (const auto& t : alice_tokens) {
+        CHECK(t.name != "bob-a");
+        CHECK(t.name != "root-a");
+    }
+}
+
 TEST_CASE("ApiTokenStore: get_token distinguishes owners for IDOR defense",
           "[token][crud][owner]") {
     // This test encodes the core invariant that the REST DELETE handler

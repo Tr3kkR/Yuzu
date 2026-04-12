@@ -1558,7 +1558,8 @@ private:
 
             bool stores_ok = (response_store_ && response_store_->is_open()) &&
                              (audit_store_ && audit_store_->is_open()) &&
-                             (instruction_store_ && instruction_store_->is_open());
+                             (instruction_store_ && instruction_store_->is_open()) &&
+                             (api_token_store_ && api_token_store_->is_open());
 
             if (stores_ok) {
                 res.set_content(R"({"status":"ready"})", "application/json");

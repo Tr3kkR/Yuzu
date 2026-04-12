@@ -42,7 +42,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy `builddir/` is gone from the tree; CLAUDE.md documents the
   convention. `YUZU_BUILDDIR` env var still overrides everywhere.
 
+### Breaking
+
+- **API token revocation is owner-scoped** — non-admin users can no longer
+  revoke API tokens they do not own. A caller holding `ApiToken:Delete` may
+  revoke only tokens whose `principal_id` matches their session username;
+  the global `admin` role is the sole bypass. Deployments that used a
+  shared non-admin service account to rotate tokens for other principals
+  will begin receiving `HTTP 404 token not found` after upgrade. Either
+  grant the rotation account the global `admin` role, or refactor the
+  rotation so each principal owns its own token (recommended). The same
+  constraint applies to both `DELETE /api/v1/tokens/{id}` and
+  `DELETE /api/settings/api-tokens/{id}`. See
+  `docs/user-manual/server-admin.md` "Upgrade Notes" for details.
+
 ### Fixed
+
+- **Governance Gate 4 follow-up hardening** — Gate 4 unhappy-path and
+  consistency-auditor surfaced three new BLOCKING items on the prior
+  hardening round; all are addressed here:
+  - **Denied-branch token-table leak regression (UP-11)** — the prior
+    hardening round's new 404 denied branch on
+    `DELETE /api/settings/api-tokens/:id` called
+    `render_api_tokens_fragment()` which lists ALL users' tokens with no
+    principal filter. A non-owner probe therefore received a 404
+    response with a complete fleet-wide token table in the HTML body —
+    worse than the IDOR the round was closing. The denied branch now
+    returns a minimal static error fragment with no token data.
+  - **`render_api_tokens_fragment` cross-user enumeration (C1)** — the
+    same underlying `list_tokens()` leak affected the success-path
+    re-render (`POST`, `DELETE` success) and the `GET
+    /fragments/settings/api-tokens` panel load. The fragment now takes
+    a `filter_principal` argument. All four call sites pass
+    `session->username` for non-admin sessions and empty (full view)
+    for admins, matching the `GET /api/v1/tokens` scoping that
+    `rest_api_v1.cpp` already enforced. A new
+    `ApiTokenStore: list_tokens(principal) scopes results to owner`
+    unit test pins the store contract the fix relies on.
+  - **Audit-trail integrity, `principal_role` hardcoded `"admin"`
+    (C2, Gate 4 unhappy-path UP-9, Gate 4 happy-path SHOULD, Gate 2
+    re-review NICE)** — three audit emission sites in
+    `settings_routes.cpp` (token create, token revoke success, token
+    revoke denied) hardcoded `.principal_role = "admin"`. This was
+    benign when the panel was admin-only but became a forensic lie
+    once the hardening round opened the handlers to non-admin callers
+    with `ApiToken:Delete`. All three sites now read
+    `auth::role_to_string(session->role)`, matching the convention in
+    `auth_routes.cpp`.
+  - **Test fixture brittleness** — `create_token_for` in
+    `test_rest_api_tokens.cpp` used `listing.back()`, but
+    `list_tokens` orders by `created_at DESC`, so `.back()` is the
+    oldest token. Swapped to `.front()` with a comment so future
+    multi-token tests in the same harness do not silently regress.
 
 - **Governance hardening round for #222 and #224** — Gate 2 security review
   on the original fixes surfaced two HIGH sibling findings that are
