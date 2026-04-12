@@ -4,8 +4,11 @@
 
 #include "management_group_store.hpp"
 
+#include <sqlite3.h>
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <string>
 
@@ -268,6 +271,143 @@ TEST_CASE("ManagementGroupStore: find_group_by_name", "[mgmt][crud]") {
 
     auto not_found = store.find_group_by_name("Service: ERP");
     CHECK(!not_found.has_value());
+}
+
+TEST_CASE("ManagementGroupStore: update_group rejects self-parent", "[mgmt][hierarchy][cycle]") {
+    TempDb tmp;
+    ManagementGroupStore store(tmp.path);
+
+    ManagementGroup g;
+    g.name = "Self";
+    g.membership_type = "static";
+    auto id = store.create_group(g);
+    REQUIRE(id.has_value());
+
+    ManagementGroup updated;
+    updated.id = *id;
+    updated.name = "Self";
+    updated.membership_type = "static";
+    updated.parent_id = *id; // attempt to become its own parent
+
+    auto result = store.update_group(updated);
+    REQUIRE(!result.has_value());
+    CHECK(result.error().find("own parent") != std::string::npos);
+}
+
+TEST_CASE("ManagementGroupStore: update_group rejects re-parenting cycle",
+          "[mgmt][hierarchy][cycle]") {
+    TempDb tmp;
+    ManagementGroupStore store(tmp.path);
+
+    ManagementGroup a;
+    a.name = "A";
+    a.membership_type = "static";
+    auto a_id = store.create_group(a);
+    REQUIRE(a_id.has_value());
+
+    ManagementGroup b;
+    b.name = "B";
+    b.membership_type = "static";
+    b.parent_id = *a_id;
+    auto b_id = store.create_group(b);
+    REQUIRE(b_id.has_value());
+
+    // Attempt to set A.parent = B, which would form the cycle A->B->A.
+    ManagementGroup a_update;
+    a_update.id = *a_id;
+    a_update.name = "A";
+    a_update.membership_type = "static";
+    a_update.parent_id = *b_id;
+
+    auto result = store.update_group(a_update);
+    REQUIRE(!result.has_value());
+    CHECK(result.error().find("cycle") != std::string::npos);
+}
+
+TEST_CASE("ManagementGroupStore: update_group rejects depth overflow",
+          "[mgmt][hierarchy][cycle]") {
+    TempDb tmp;
+    ManagementGroupStore store(tmp.path);
+
+    // Build a 5-deep chain: root -> L1 -> L2 -> L3 -> L4.
+    std::string prev;
+    std::vector<std::string> chain;
+    for (int i = 0; i < 5; ++i) {
+        ManagementGroup g;
+        g.name = "L" + std::to_string(i);
+        g.membership_type = "static";
+        g.parent_id = prev;
+        auto result = store.create_group(g);
+        REQUIRE(result.has_value());
+        chain.push_back(*result);
+        prev = *result;
+    }
+
+    // Create an orphan and try to attach it under L4 — that would make it
+    // the 6th level, exceeding the depth limit of 5.
+    ManagementGroup orphan;
+    orphan.name = "Orphan";
+    orphan.membership_type = "static";
+    auto orphan_id = store.create_group(orphan);
+    REQUIRE(orphan_id.has_value());
+
+    ManagementGroup reparent;
+    reparent.id = *orphan_id;
+    reparent.name = "Orphan";
+    reparent.membership_type = "static";
+    reparent.parent_id = chain.back();
+
+    auto result = store.update_group(reparent);
+    REQUIRE(!result.has_value());
+    CHECK(result.error().find("depth") != std::string::npos);
+}
+
+TEST_CASE("ManagementGroupStore: get_descendant_ids terminates on injected cycle",
+          "[mgmt][hierarchy][cycle]") {
+    TempDb tmp;
+
+    std::string a_id;
+    std::string b_id;
+    {
+        ManagementGroupStore store(tmp.path);
+
+        ManagementGroup a;
+        a.name = "Cycle-A";
+        a.membership_type = "static";
+        auto r1 = store.create_group(a);
+        REQUIRE(r1.has_value());
+        a_id = *r1;
+
+        ManagementGroup b;
+        b.name = "Cycle-B";
+        b.membership_type = "static";
+        b.parent_id = a_id;
+        auto r2 = store.create_group(b);
+        REQUIRE(r2.has_value());
+        b_id = *r2;
+    } // store closed — release locks before we reach around with raw sqlite3.
+
+    // Inject an A->B->A cycle by setting A.parent_id = B directly, bypassing
+    // the store's validation. This mirrors the on-disk state an attacker or
+    // legacy bug could produce.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.path.c_str(), &raw) == SQLITE_OK);
+        std::string sql = "UPDATE management_groups SET parent_id = '" + b_id +
+                          "' WHERE id = '" + a_id + "';";
+        REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    // Re-open the store and walk descendants from A. The BFS must terminate
+    // (not hang) and must include B without repeating it.
+    ManagementGroupStore store(tmp.path);
+    auto descendants = store.get_descendant_ids(a_id);
+    CHECK(std::find(descendants.begin(), descendants.end(), b_id) != descendants.end());
+    // Every entry should be unique — the visited set guarantees no repeats.
+    std::vector<std::string> sorted = descendants;
+    std::sort(sorted.begin(), sorted.end());
+    CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
 }
 
 TEST_CASE("ManagementGroupStore: cascade delete removes members and roles", "[mgmt][cascade]") {

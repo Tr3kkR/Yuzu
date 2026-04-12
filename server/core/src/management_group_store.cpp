@@ -2,8 +2,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <random>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -281,6 +283,26 @@ ManagementGroupStore::get_children(const std::string& parent_id) const {
 std::expected<void, std::string> ManagementGroupStore::update_group(const ManagementGroup& group) {
     if (!db_)
         return std::unexpected("database not open");
+
+    // Validate parent_id at the store layer — the REST handler has its own
+    // checks but any direct caller (admin tooling, future endpoints, tests)
+    // would otherwise be able to introduce a cycle. Keeping validation here
+    // means get_descendant_ids/get_ancestor_ids never have to traverse bad
+    // data produced through this entry point.
+    if (!group.parent_id.empty()) {
+        if (group.parent_id == group.id)
+            return std::unexpected("group cannot be its own parent");
+        auto parent = get_group(group.parent_id);
+        if (!parent)
+            return std::unexpected("parent group not found");
+        auto ancestors = get_ancestor_ids(group.parent_id);
+        if (std::find(ancestors.begin(), ancestors.end(), group.id) != ancestors.end())
+            return std::unexpected("re-parenting would create a cycle");
+        // +1 because `group` itself becomes a new level below `parent`.
+        if (ancestors.size() + 1 >= 5)
+            return std::unexpected("maximum hierarchy depth (5) exceeded");
+    }
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(
             db_,
@@ -468,9 +490,17 @@ ManagementGroupStore::get_descendant_ids(const std::string& group_id) const {
     if (!db_)
         return descendants;
 
-    // BFS traversal
+    // BFS traversal with cycle protection. Cyclic parent_id chains (e.g.
+    // A->B->A) previously sent this loop into an infinite walk, hanging the
+    // server thread. `visited` short-circuits revisits; `kMaxNodes` is a
+    // belt-and-suspenders cap that also bounds the worst case if the
+    // database has grown unexpectedly large.
+    constexpr size_t kMaxNodes = 10'000;
+    std::unordered_set<std::string> visited;
+    visited.insert(group_id);
+
     std::vector<std::string> queue = {group_id};
-    while (!queue.empty()) {
+    while (!queue.empty() && visited.size() < kMaxNodes) {
         auto current = queue.back();
         queue.pop_back();
 
@@ -481,12 +511,20 @@ ManagementGroupStore::get_descendant_ids(const std::string& group_id) const {
         sqlite3_bind_text(s, 1, current.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(s) == SQLITE_ROW) {
             auto* cid = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-            if (cid) {
-                descendants.emplace_back(cid);
-                queue.emplace_back(cid);
-            }
+            if (!cid)
+                continue;
+            std::string child_id(cid);
+            if (!visited.insert(child_id).second)
+                continue; // already seen — cycle or diamond
+            descendants.push_back(child_id);
+            queue.push_back(std::move(child_id));
         }
         sqlite3_finalize(s);
+    }
+    if (visited.size() >= kMaxNodes) {
+        spdlog::warn("get_descendant_ids: hit {} node cap while walking from '{}' — possible "
+                     "cycle in management_groups.parent_id",
+                     kMaxNodes, group_id);
     }
     return descendants;
 }

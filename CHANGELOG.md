@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`get_descendant_ids` is cycle-safe; `update_group` validates
+  `parent_id` (#224)** — the management-group BFS traversal had no
+  visited-node tracking and no depth cap, so any existing cycle in
+  `management_groups.parent_id` (injectable via legacy tooling or
+  bugs) would hang the server thread indefinitely. It now carries an
+  `unordered_set<std::string> visited` and a `10_000` node safety cap,
+  logging a warning if the cap is hit. Independently,
+  `ManagementGroupStore::update_group` now rejects self-parent,
+  parent-not-found, cycle-forming, and depth-exceeding updates at the
+  store layer so non-REST callers (admin tooling, tests, future
+  endpoints) cannot bypass the checks that previously only lived in
+  the REST handler. Store unit tests cover injected-cycle termination
+  via a direct SQLite write that mimics on-disk corruption.
+
 - **Docker-compose UAT image tags parameterized** — `docker-compose.uat.yml`
   was shipping with hardcoded `ghcr.io/tr3kkr/yuzu-{server,gateway}:0.8.1-rc0`
   references that were not updated when the version bumped to 0.9.0, so a
