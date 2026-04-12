@@ -1,9 +1,10 @@
 name: "CodeQL"
 
-# Informational-only analysis run on the self-hosted Linux runner. This
-# workflow:
-#   - runs on weekly schedule + push to main + manual dispatch
-#   - does NOT run on pull_request, so it never gates PR merges
+# Informational-only CodeQL C++ analysis on the self-hosted Linux runner.
+# Manual trigger only — this workflow:
+#   - runs ONLY on workflow_dispatch (manual invocation from Actions UI
+#     or `gh workflow run codeql.yml`)
+#   - does NOT run on push, pull_request, or any schedule
 #   - is not listed in branch protection required checks
 #   - shares the self-hosted runner with release.yml and ci.yml, which
 #     naturally serializes runs (one job at a time per runner instance)
@@ -12,12 +13,6 @@ name: "CodeQL"
 # review, not in any status check.
 
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
-  schedule:
-    # Weekly on Sundays at 04:00 UTC
-    - cron: '0 4 * * 0'
   workflow_dispatch:
 
 concurrency:
