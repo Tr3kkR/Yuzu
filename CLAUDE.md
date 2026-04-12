@@ -118,13 +118,19 @@ The gateway (`gateway/`) is a standalone rebar3 project. It compiles independent
 ### Build & verify commands
 ```bash
 cd gateway
-rebar3 compile                # compile
-rebar3 eunit                  # unit tests (148 tests)
-rebar3 dialyzer               # type analysis — must be warning-free
+rebar3 compile                               # compile
+rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (148 tests)
+rebar3 dialyzer                              # type analysis — must be warning-free
 rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 ```
 
 **Always run `rebar3 dialyzer` after any Erlang change.** Compilation succeeding is not enough — dialyzer catches type violations, dead code, and missing dependencies that the compiler silently accepts. The project uses `warnings_as_errors` for compile but dialyzer warnings are separate.
+
+**`--dir apps/yuzu_gw/test` is mandatory on `rebar3 eunit`**, not optional. Without it, rebar3 3.27 intersects discovered test modules against the `src/`-derived `modules` list in `yuzu_gw.app` and rejects every orphan test module (`*_tests` without a 1:1 src counterpart, every `*_SUITE` file, helpers) with `Module X not found in project` before running a single test. Tracked as **#337**; `scripts/run-tests.sh erlang-unit` already applies the workaround, but if you invoke rebar3 directly you must pass the flag yourself.
+
+**`rebar3 eunit --module X` does NOT give you test isolation.** It runs the full `--dir` phase first, then the module filter, **in the same BEAM VM**. The second run inherits polluted state — meck mocks, registered names, leaked processes, send_after timers — from the first, so a passing filtered run does not prove the test is order-independent, and a failing filtered run may be failing because of pollution rather than the test itself. For real isolation, `rm -rf gateway/_build/test` between runs (forces a fresh BEAM) or drop into `erl -pa _build/test/lib/yuzu_gw/ebin -pa _build/test/lib/*/ebin` and call test functions directly. This gotcha wasted meaningful debugging time on #336.
+
+Use the `gateway-eunit` and `gateway-dialyzer` skills (in `.claude/skills/`) for routine invocations — they bundle the toolchain activation, the `--dir` flag, and result interpretation.
 
 ### Toolchain activation (Erlang on PATH)
 

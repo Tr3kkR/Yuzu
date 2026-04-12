@@ -10,10 +10,7 @@
 
       "Bash(./scripts/setup.sh:*)",
       "Bash(bash scripts/setup.sh:*)",
-      "Bash(source scripts/ensure-erlang.sh:*)",
-      "Bash(source ./scripts/ensure-erlang.sh:*)",
-      "Bash(source setup_msvc_env.sh:*)",
-      "Bash(source ./setup_msvc_env.sh:*)",
+      "Bash(source:*)",
 
       "Bash(./tests/yuzu_agent_tests:*)",
       "Bash(./tests/yuzu_server_tests:*)",
