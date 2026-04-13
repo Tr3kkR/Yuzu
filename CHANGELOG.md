@@ -595,6 +595,7 @@ development independently from the primary software changelog.
 - `docs/user-manual/rest-api.md` cross-links to the new HTTP Security Response Headers section.
 - `docs/user-manual/server-admin.md` documents the new `--csp-extra-sources` flag with rejection grammar.
 
+
 ## [0.7.1] - 2026-04-08
 
 ### Added
