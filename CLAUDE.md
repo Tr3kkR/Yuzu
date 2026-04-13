@@ -236,6 +236,22 @@ The script generates a fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed credent
 
 If the server is restarted against an existing data directory (stale SQLite databases from a prior run), session authentication breaks: `authenticate()` succeeds (HTTP 200, Set-Cookie returned) but `validate_session()` fails on subsequent requests (HTTP 401). The UAT script works around this by doing `rm -rf /tmp/yuzu-uat` before each run. This bug should be investigated — the in-memory `sessions_` map and the database state may be interacting incorrectly on restart.
 
+## Pre-commit testing with /test
+
+The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate. It compiles HEAD, stands up the previous released image (`v0.10.0` from `ghcr.io/tr3kkr/yuzu-*`), upgrades it to HEAD, verifies data preservation and migrations, then runs the standard test surface (unit + EUnit + dialyzer + CT + integration + e2e + synthetic UAT + puppeteer). Every gate result and sub-step timing is persisted to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` so operators can compare runs over time, spot flaky gates, and trend upgrade durations.
+
+Three modes:
+
+- `/test --quick` — sanity check (~10 min): build + unit + EUnit + dialyzer + synthetic UAT
+- `/test` (default, ~30-45 min): build + upgrade test + standard gates + fresh stack
+- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers (PR2, dispatched to `yuzu-wsl2-linux`), coverage enforce + perf enforce (PR2)
+
+Query historical runs via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend timing=phase2.image-swap|--flaky --days 14|--export RUN_ID|--prune 100`. Power users can `python3 scripts/test/test_db.py query ...` directly.
+
+The DB lives outside the repo (XDG data dir) so it persists across `git clean` and survives repo re-clones. Override with `YUZU_TEST_DB=path`.
+
+PR1 lands the skill scaffold + upgrade test path + standard Phase 5 gates. PR2 will land the coverage/perf/sanitizer gates + baselines. PR3 will land the cross-platform OTA self-exec tests + Windows agent build dispatch on `yuzu-local-windows`.
+
 ## Instruction Engine
 
 The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack` with typed parameter and result schemas, executed via the `CommandRequest` wire protocol. DSL: `apiVersion: yuzu.io/v1alpha1`, six `kind` values (`InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`). Definitions are persisted with verbatim `yaml_source` as the source of truth plus denormalized columns for queries.

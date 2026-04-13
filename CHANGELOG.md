@@ -7,8 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/test` skill scaffold + upgrade test path (PR1 of 3).** New
+  `.claude/skills/test/SKILL.md` operator-facing runbook plus
+  `scripts/test/` helper directory that orchestrates a pre-commit /
+  pre-push test pipeline. Three modes: `--quick` (~10 min sanity check),
+  default (~30-45 min build + upgrade test + standard gates), `--full`
+  (~60-120 min adds OTA + sanitizers + perf + coverage enforce). The
+  default-mode headline is **Phase 2 upgrade test**: pulls
+  `ghcr.io/tr3kkr/yuzu-server:0.10.0`, populates fixture data, swaps to
+  the local HEAD image (built in Phase 1 as `yuzu-server:0.10.1-test-${RUN_ID}`),
+  verifies migrations ran via `/readyz` (uses the #339 compound-fix
+  `failed_stores` body field), and re-checks fixture preservation. PR1
+  ships Phases 0, 1, 2, 4, 5, 8 fully wired; Phases 3 (OTA), 6
+  (sanitizers), 7 (coverage + perf) are stubbed with SKIP rows pending
+  PR2/PR3.
+
+- **Persistent test-runs SQLite database** at
+  `~/.local/share/yuzu/test-runs.db` (override via `YUZU_TEST_DB`).
+  Schema v1 has 4 tables: `test_runs` (per-invocation aggregate),
+  `test_gates` (per-gate pass/fail + duration), `test_timings`
+  (millisecond sub-step durations like `phase2.image-swap`,
+  `phase3-linux.ota-download`, `synthetic-uat.os_info-roundtrip`),
+  and `test_metrics` (quantitative measurements with units). Uses
+  the `schema_meta` pattern from #339 so future schema changes can
+  land via versioned migrations. New scripts:
+  `scripts/test/test_db.py` (Python source of truth) plus thin
+  bash wrappers `test-db-init.sh`, `test-db-write.sh`,
+  `test-db-query.sh`. The query wrapper supports
+  `--latest`, `--last N`, `--diff RUN_A RUN_B`,
+  `--trend metric=NAME` / `--trend timing=GATE.STEP`,
+  `--flaky --days N`, `--branch B`, `--export RUN_ID`,
+  `--prune KEEP_N` (with `--dry-run` preview).
+  Power users can `python3 scripts/test/test_db.py query ...`
+  directly or run any sqlite query against the DB.
+
+- **`scripts/test/preflight.sh`** — Phase 0 sanity checks (toolchains,
+  ports, disk, docker context, dangling test containers, git state,
+  test-runs DB initialization). `--force-cleanup` flag tears down
+  dangling `yuzu-test-*` compose projects.
+
+- **`scripts/test/synthetic-uat-tests.sh`** — extracts the 6
+  connectivity tests from `linux-start-UAT.sh` (dashboard reachable,
+  gateway readyz, server registered agents metric, gateway connected
+  agents metric, help command round-trip, os_info command round-trip)
+  into a standalone script that takes URLs as arguments and records
+  per-command latencies into `test_timings`.
+
+- **`scripts/test/test-fixtures-{write,verify}.sh`** — minimum-viable
+  fixture set written before the upgrade and re-verified after, so the
+  upgrade test can detect data loss. Records what's preserved /
+  lost / skipped to a `fixtures-verify.json` report file.
+
+- **`scripts/test/test-upgrade-stack.sh`** — Phase 2 orchestrator. Uses
+  a purpose-built `scripts/test/docker-compose.upgrade-test.yml` that
+  drops the `container_name:` declarations from
+  `deploy/docker/docker-compose.reference.yml` so multiple parallel
+  test runs can coexist via `--project-name` isolation. Records
+  sub-step timings: `pull-old-images`, `stack-up-old`, `fixtures-write`,
+  `image-swap`, `ready-after-upgrade`, `fixtures-verify`,
+  `synthetic-uat-against-upgraded`. Counts `MigrationRunner` log events
+  as a `phase2_migration_events` metric.
+
+- **`scripts/test/teardown.sh`** — Phase 8. Stops every
+  `yuzu-test-${RUN_ID}-*` compose project, removes the
+  `/tmp/yuzu-test-${RUN_ID}/` scratch dir, finalizes the `test_runs`
+  row with computed `overall_status` from gate aggregates.
+
 ### Fixed
 
+- **`scripts/linux-start-UAT.sh` now exits non-zero on connectivity test
+  failure.** Previously the script always exited 0 after the stack stood
+  up, regardless of whether the 6 inline connectivity tests passed. The
+  /test Phase 4 gate relied on the exit code to detect a broken stack
+  and was therefore a false-positive trap. `start_all()` now captures
+  the result into `UAT_TEST_RESULT` and returns it, which the script
+  propagates as its exit code. **This is a breaking change for any
+  caller that assumed the script always exits 0** — in practice there
+  are no such callers in-tree, but operators with external scripts that
+  pipe to `|| true` should verify they actually want to swallow the
+  failure.
 - **`ci(release)`: filter `actions/download-artifact@v4` to `yuzu-*`
   pattern.** The auto-generated `*.dockerbuild` provenance metadata files
   (uploaded by docker buildx attestation) consistently failed download
