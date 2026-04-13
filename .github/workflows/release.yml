@@ -906,6 +906,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          # Skip docker buildx attestation/provenance artifacts (auto-named
+          # `<owner>~<repo>~<random>.dockerbuild`). They consistently fail
+          # to download with `Artifact download failed after 5 retries` and
+          # the Create Release job needs none of them — the release assets
+          # are all `yuzu-*`. This filter killed the v0.10.0 release before
+          # it could publish; v0.10.0 had to be assembled manually.
+          pattern: 'yuzu-*'
 
       - name: Generate SHA256SUMS
         run: |
