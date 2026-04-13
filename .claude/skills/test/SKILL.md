@@ -41,7 +41,7 @@ Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothin
 
 **Every phase emits structured timing data into the test-runs DB.** Top-level gate timings land in `test_gates.duration_seconds`; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in `test_timings`. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.
 
-> **PR1 status (this is the first ship of the skill).** Phases 0, 1, 2, 4, 5, 8 land in PR1. Phases 3 (cross-platform OTA), 6 (sanitizers via runner dispatch), and 7 (coverage + perf with baselines) are stubbed in `--full` mode with a "planned for PR2/PR3" message and recorded as `SKIP` rows in `test_gates`. The skill remains useful in default mode because the upgrade test path — the user's stated headline priority — is fully wired.
+> **PR2 status.** Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 (coverage + perf) runs locally against `tests/coverage-baseline.json` and `tests/perf-baselines.json` — PR2 ships these as **permissive seeds**, and the first operator run on a new dev box should use `--capture-baselines` to lock real numbers then commit the updated JSON alongside their next change.
 
 ## Step 0 — Initialise run state
 
@@ -335,35 +335,66 @@ wait
 
 `--quick` runs only the unit / EUnit / dialyzer subset (NO synthetic UAT — quick mode skips Phase 4 and has no live stack). `--full` adds the optional MCP agent gate (invokes `mcp-uat-tester` via the Agent tool against the live stack).
 
-## Phase 6 — Sanitizers (PR2, stubbed in PR1)
+## Phase 6 — Sanitizers (PR2)
+
+Sanitizer rebuilds are dispatched to the `yuzu-wsl2-linux` self-hosted runner via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 6 --gate "Sanitizers (ASan+UBSan)" \
-        --status SKIP --duration 0 --notes "planned for PR2 — dispatch to yuzu-wsl2-linux"
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 6 --gate "Sanitizers (TSan)" \
-        --status SKIP --duration 0 --notes "planned for PR2 — dispatch to yuzu-wsl2-linux"
+    bash scripts/test/sanitizer-gate.sh --run-id "$RUN_ID"
 fi
 ```
 
-Once PR2 lands, replace with `bash scripts/test/sanitizer-gate.sh --run-id "$RUN_ID"`. The sanitizer gate dispatches a workflow on `yuzu-wsl2-linux` via `dispatch-runner-job.sh`, polls for completion, downloads logs, parses results, and writes `test_gates` rows.
+The gate script:
+1. Resolves the current commit (`git rev-parse HEAD`) and dispatches `.github/workflows/sanitizer-tests.yml` via `scripts/test/dispatch-runner-job.sh`
+2. Polls the run to completion (default 90 min budget — covers queued + compile + test)
+3. Downloads `sanitizer-asan*` and `sanitizer-tsan*` artifacts into `/tmp/yuzu-test-${RUN_ID}/sanitizer/`
+4. Parses each sanitizer log for `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`, `ThreadSanitizer: data race`, `runtime error:`
+5. Writes two Phase 6 rows to `test_gates`: `Sanitizers (ASan+UBSan)` and `Sanitizers (TSan)`
 
-## Phase 7 — Coverage + Perf (PR2, stubbed in PR1)
+**Runner-offline path (WARN, not FAIL).** If `yuzu-wsl2-linux` is offline or the dispatch times out, both gates record `WARN` with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.
+
+**Workflow-file requirement.** `workflow_dispatch` evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have `sanitizer-tests.yml` yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.
+
+**Suite selection.** Default runs both (ASan+UBSan and TSan). Override with `--suite asan` or `--suite tsan` on the gate script — useful when diagnosing a single finding and you don't want the second rebuild to compete for runner time.
+
+## Phase 7 — Coverage + Perf (PR2)
+
+Both gates run locally on the operator's dev box. Coverage uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact); perf drives `rebar3 ct --suite=yuzu_gw_perf_SUITE`.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
-    bash scripts/test/test-db-write.sh gate \
-        --run-id "$RUN_ID" --phase 7 --gate "Coverage" \
-        --status SKIP --duration 0 --notes "planned for PR2 — locked baseline + 0.5pp slack"
+    bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"
+    bash scripts/test/perf-gate.sh     --run-id "$RUN_ID"
+elif [[ "$MODE" == "default" ]]; then
+    # Default mode: coverage in report-only (metric recorded, no enforce);
+    # perf skipped (default-mode budget is too tight for the ~3-5 min
+    # CT suite plus registry churn).
+    bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 7 --gate "Perf" \
-        --status SKIP --duration 0 --notes "planned for PR2 — locked baseline + 10% tolerance"
+        --status SKIP --duration 0 --notes "perf gate runs in --full only"
 fi
 ```
 
-Once PR2 lands, replace with `bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"` and `bash scripts/test/perf-gate.sh --run-id "$RUN_ID"`.
+**Coverage enforcement.** The gate parses gcovr `--json-summary` (filter set mirrored from `.github/workflows/ci.yml` so local/CI numbers match Codecov; gate also passes `--native-file meson/native/linux-gcc13.ini` so the compiler matches CI's coverage job), records `branch_coverage_overall` and `line_coverage_overall` metrics, and compares against `tests/coverage-baseline.json`. In `--full` mode the gate fails if branch coverage drops below `baseline.branch_percent - slack_pp` (default 0.5 pp). Default mode records the metric but doesn't enforce — `--report-only` short-circuits the comparison. The default-mode invocation wraps the script in `|| true` so a transient gcovr or build failure writes its own WARN row and does not block the rest of the run; in `--full` mode the gate is called without `|| true`, so build or parse failures surface as FAIL.
+
+**Perf enforcement.** The gate runs the `registration,heartbeat,fanout,churn` CT groups (endurance deliberately excluded — it runs for 5 minutes and belongs in a scheduled nightly), parses throughput and latency metrics from `ct:pal` output, records them as `perf_*` metrics (ops/sec for throughput, ms or ms/agent for latency), and compares against `tests/perf-baselines.json` with a 10% tolerance. Throughput metrics (`*_ops_sec`) regress when current < baseline × 0.9; latency metrics (`*_ms`, `*_ms_per_agent`) regress when current > baseline × 1.1.
+
+**Hardware fingerprint guard.** The perf baseline records the hardware fingerprint (CPU model + RAM) of the machine that captured it. When the current fingerprint doesn't match, the gate auto-downgrades to WARN regardless of regressions — a 30% delta between the 5950X dev box and the Apple Silicon MBP is not a real regression. Both baselines need a separate capture per machine.
+
+**Baseline update workflow.**
+1. Make a change you believe deserves a new baseline (coverage up, perf up, or an accepted trade-off).
+2. **Pre-flight**: run `bash scripts/test/preflight.sh` and a clean `meson test -C build-linux-coverage` (for coverage) or a clean `rebar3 ct --suite yuzu_gw_perf_SUITE` (for perf). If tests are failing, the gate will now refuse `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` — this is the UP-18 guard protecting you from anchoring a broken-environment baseline.
+3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines` and/or `bash scripts/test/perf-gate.sh --run-id manual --capture-baselines`. Both rewrite the JSON file with current numbers + `captured_at` + `captured_commit` + (perf only) hardware fingerprint, AND print a diff of old-vs-new values before overwrite so you can sanity-check the direction.
+4. `git add tests/coverage-baseline.json tests/perf-baselines.json` alongside your feature commit. `git blame` on those files is the audit trail.
+5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
+
+**Baseline refresh cadence.** Recapture both baselines at every `vX.Y.0` release tag on the canonical dev box (5950X for perf, any Linux with GCC 13 for coverage). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data; perf drift across hardware generations is silenced by the hardware-fingerprint auto-downgrade, so recapture-at-release keeps each train's perf baseline honest for its target hardware.
+
+**Seed baseline quirk (PR2 landing only).** PR2 ships `tests/coverage-baseline.json` with `branch_percent=0` and `slack_pp=100` and `__seed: true`, and `tests/perf-baselines.json` with an empty `metrics` map and `__seed: true`. **Both gate scripts honor the `__seed: true` sentinel and emit WARN (not silent PASS) until the operator runs `--capture-baselines`** — this guarantees no audit window runs on a permissively-seeded baseline without an operator-visible signal. The first operator to capture on a clean dev box locks real numbers that replace the seeds.
+
+**Concurrent --full runs on the same ref.** The sanitizer workflow's `concurrency: cancel-in-progress: false` group means a second dispatch queues behind the first until it completes (Phase 6 only — coverage/perf run locally and have their own coverage-gate race behavior). If you re-run `/test --full` immediately after a successful run on the same commit, expect Phase 6 to sit queued. Use `--suite asan` or `--suite tsan` on the gate script to halve runtime when re-running a specific finding.
 
 ## Phase 8 — Teardown + Summary
 

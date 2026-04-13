@@ -1,0 +1,237 @@
+name: Sanitizer tests
+
+# Workflow dispatched by scripts/test/sanitizer-gate.sh (Phase 6 of /test).
+#
+# Runs ASan+UBSan and TSan rebuilds + test suites on the yuzu-wsl2-linux
+# self-hosted runner. The runner is on Nathan's desktop (WSL2 Ubuntu 24.04)
+# per the memory note; sanitizer rebuilds are too slow to run on the
+# operator's interactive dev box, so /test --full dispatches here instead.
+#
+# ASAN_OPTIONS / TSAN_OPTIONS mirror .github/workflows/ci.yml so local
+# runs match CI semantics (any findings fail the job).
+#
+# Job results are surfaced via:
+#   - exit codes (success/failure at the workflow level)
+#   - sanitizer-asan.log / sanitizer-tsan.log artifacts (gate parser reads these)
+#   - testlog.junit.xml artifacts (standard meson format)
+#
+# Note on dispatch: workflow_dispatch requires the workflow file to exist
+# on the target ref. The gate passes --ref $(git rev-parse HEAD), so this
+# file must be committed and pushed before /test --full can dispatch
+# against a new commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which sanitizer to run (asan, tsan, both)"
+        required: false
+        default: "both"
+        type: choice
+        options: [asan, tsan, both]
+      run_id:
+        description: "/test run ID for correlation (appears in artifact names)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizer-tests-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  MESON_VERSION: "1.9.2"
+  CCACHE_MAXSIZE: "500M"
+  CCACHE_COMPRESS: "true"
+
+jobs:
+  asan-ubsan:
+    name: "Sanitizers (ASan+UBSan)"
+    if: ${{ inputs.suite == 'asan' || inputs.suite == 'both' || inputs.suite == '' }}
+    runs-on: [self-hosted, yuzu-wsl2-linux]
+    timeout-minutes: 75
+    env:
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Assert toolchain available
+        run: |
+          # The self-hosted runner is long-lived on WSL2 and has its
+          # toolchain baked in. Fail loudly if anything is missing so
+          # the gate operator can fix the runner rather than accept
+          # silent misconfiguration.
+          for tool in meson ninja gcc-13 g++-13 ccache python3; do
+              if ! command -v "$tool" >/dev/null; then
+                  echo "::error::$tool not on PATH on yuzu-wsl2-linux runner"
+                  exit 1
+              fi
+          done
+          meson --version
+          gcc-13 --version | head -1
+          ccache --version | head -1
+
+      # sre-5: fail fast if the runner is out of disk before we sink
+      # time into a 15-min compile that's going to die with ENOSPC.
+      # Full sanitizer build + vcpkg + checkout + ccache ≈ 30 GB.
+      - name: Assert runner disk (≥30 GB free)
+        run: |
+          free_gb=$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G",""); print $4}')
+          echo "runner disk free: ${free_gb}G on $GITHUB_WORKSPACE"
+          if [[ -z "$free_gb" ]] || (( free_gb < 30 )); then
+              echo "::error::runner disk ${free_gb}G < 30 GB required for sanitizer build"
+              exit 1
+          fi
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + ASan/UBSan)
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+        run: |
+          rm -rf build-linux-asan
+          meson setup build-linux-asan \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_sanitize=address,undefined
+
+      - name: Build (ASan+UBSan)
+        run: meson compile -C build-linux-asan 2>&1 | tee sanitizer-asan-build.log
+
+      - name: Test (ASan+UBSan)
+        # Capture both stdout and the meson testlog as artifacts so the
+        # gate parser can distinguish "build failed" from "one test
+        # leaked 48 bytes". --no-stdsplit keeps ASan output interleaved
+        # with the test harness output so the ERROR line is visible.
+        run: |
+          set -o pipefail
+          meson test -C build-linux-asan --print-errorlogs --no-stdsplit \
+              2>&1 | tee sanitizer-asan.log
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Upload ASan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-asan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
+          path: |
+            sanitizer-asan.log
+            sanitizer-asan-build.log
+            build-linux-asan/meson-logs/testlog.junit.xml
+            build-linux-asan/meson-logs/testlog.txt
+          if-no-files-found: warn
+
+  tsan:
+    name: "Sanitizers (TSan)"
+    if: ${{ inputs.suite == 'tsan' || inputs.suite == 'both' || inputs.suite == '' }}
+    runs-on: [self-hosted, yuzu-wsl2-linux]
+    timeout-minutes: 75
+    env:
+      TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Assert toolchain available
+        run: |
+          for tool in meson ninja gcc-13 g++-13 ccache python3; do
+              if ! command -v "$tool" >/dev/null; then
+                  echo "::error::$tool not on PATH on yuzu-wsl2-linux runner"
+                  exit 1
+              fi
+          done
+          meson --version
+          gcc-13 --version | head -1
+          ccache --version | head -1
+
+      - name: Assert runner disk (≥30 GB free)
+        run: |
+          free_gb=$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G",""); print $4}')
+          echo "runner disk free: ${free_gb}G on $GITHUB_WORKSPACE"
+          if [[ -z "$free_gb" ]] || (( free_gb < 30 )); then
+              echo "::error::runner disk ${free_gb}G < 30 GB required for sanitizer build"
+              exit 1
+          fi
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Install vcpkg packages
+        run: |
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + TSan)
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+        run: |
+          rm -rf build-linux-tsan
+          meson setup build-linux-tsan \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_sanitize=thread
+
+      - name: Build (TSan)
+        run: meson compile -C build-linux-tsan 2>&1 | tee sanitizer-tsan-build.log
+
+      - name: Test (TSan)
+        run: |
+          set -o pipefail
+          meson test -C build-linux-tsan --print-errorlogs --no-stdsplit \
+              2>&1 | tee sanitizer-tsan.log
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Upload TSan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-tsan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
+          path: |
+            sanitizer-tsan.log
+            sanitizer-tsan-build.log
+            build-linux-tsan/meson-logs/testlog.junit.xml
+            build-linux-tsan/meson-logs/testlog.txt
+          if-no-files-found: warn

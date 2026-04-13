@@ -243,14 +243,18 @@ The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-com
 Three modes:
 
 - `/test --quick` — sanity check (~10 min): build + unit + EUnit + dialyzer + synthetic UAT
-- `/test` (default, ~30-45 min): build + upgrade test + standard gates + fresh stack
-- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers (PR2, dispatched to `yuzu-wsl2-linux`), coverage enforce + perf enforce (PR2)
+- `/test` (default, ~30-45 min): build + upgrade test + standard gates + fresh stack + coverage report
+- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers dispatched to `yuzu-wsl2-linux`, coverage enforce + perf enforce
 
 Query historical runs via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend timing=phase2.image-swap|--flaky --days 14|--export RUN_ID|--prune 100`. Power users can `python3 scripts/test/test_db.py query ...` directly.
 
 The DB lives outside the repo (XDG data dir) so it persists across `git clean` and survives repo re-clones. Override with `YUZU_TEST_DB=path`.
 
-PR1 lands the skill scaffold + upgrade test path + standard Phase 5 gates. PR2 will land the coverage/perf/sanitizer gates + baselines. PR3 will land the cross-platform OTA self-exec tests + Windows agent build dispatch on `yuzu-local-windows`.
+**Coverage / perf baselines.** `--full` enforces `tests/coverage-baseline.json` (0.5 pp branch coverage slack once a real baseline is captured; PR2 ships a permissive seed `__seed: true` with `slack_pp=100` that the gate detects and reports as WARN rather than silent PASS — capture via `--capture-baselines` to enable enforcement) and `tests/perf-baselines.json` (10 % tolerance, throughput and latency; same seed-then-capture workflow). The perf baseline records hardware fingerprint (CPU + RAM); mismatch auto-downgrades the gate to WARN so a Nathan-desktop baseline doesn't produce false failures on the MBP and vice versa. Both gates refuse `--capture-baselines` when the underlying test suite exited non-zero, so a broken environment cannot permanently anchor a bad baseline. Regenerate on the target box with `bash scripts/test/{coverage,perf}-gate.sh --run-id manual --capture-baselines` after a clean test run, and commit the updated JSON alongside the change that earned it — `git blame` is the audit trail.
+
+**Sanitizers.** `--full` Phase 6 dispatches `.github/workflows/sanitizer-tests.yml` on the `yuzu-wsl2-linux` self-hosted runner via `scripts/test/dispatch-runner-job.sh`. Local runs would pin the dev box for ~15 min per sanitizer rebuild; the runner absorbs that cost in the background. Runner offline → WARN, not FAIL, with operator retry instructions in the gate notes.
+
+PR1 landed the skill scaffold + upgrade test + standard Phase 5 gates + test-runs DB. PR2 lands Phase 6 (sanitizer runner dispatch), Phase 7 (coverage + perf with enforceable baselines), and the `dispatch-runner-job.sh` helper. PR3 will land the cross-platform OTA self-exec tests + Windows agent build dispatch on `yuzu-local-windows`.
 
 ## Instruction Engine
 

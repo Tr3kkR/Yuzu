@@ -9,6 +9,187 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/test` skill coverage + perf + sanitizer gates (PR2 of 3).** Phase 6
+  and Phase 7 of the `/test` pipeline are now wired. `--full` mode
+  dispatches `.github/workflows/sanitizer-tests.yml` on the
+  `yuzu-wsl2-linux` self-hosted runner (ASan+UBSan and TSan rebuilds +
+  test runs), downloads the artifacts, parses them for sanitizer
+  findings + meson test failures, and records two Phase 6 rows to
+  `test_gates`. Runner offline → WARN (not FAIL) with operator retry
+  instructions in the notes, so the rest of the run continues. Phase 7
+  runs `coverage-gate.sh` (gcovr with the same filter set and
+  `--native-file meson/native/linux-gcc13.ini` as
+  `.github/workflows/ci.yml`, branch coverage compared against
+  `tests/coverage-baseline.json` with 0.5 pp slack) and `perf-gate.sh`
+  (rebar3 ct `yuzu_gw_perf_SUITE` groups `registration,heartbeat,fanout,churn`
+  — endurance excluded — with 10 % throughput / latency tolerance
+  against `tests/perf-baselines.json`). Hardware fingerprint mismatch
+  on the perf baseline auto-downgrades to WARN so a 5950X-captured
+  baseline doesn't produce false failures on the Apple Silicon MBP.
+  Both gates record `perf_*` / `branch_coverage_overall` /
+  `line_coverage_overall` metrics to `test_metrics` for trend analysis
+  via `test-db-query.sh --trend metric=...`.
+
+  **PR2 governance hardening round (folded into the same commit).** A
+  full 6-gate governance pass on the initial PR2 working tree produced
+  10 BLOCKING findings (ca-B1/UP-1 grep arithmetic, UP-2 gcovr schema,
+  UP-6/UP-7 sanitizer false-PASS cluster, UP-9 run-id path traversal,
+  UP-10 `__seed` sentinel silently disabled enforcement, UP-14 /
+  hp-B2 dispatch concurrent race, UP-18 broken-env baseline anchoring,
+  qa-B1 perf CT exit code not propagated, hp-B1 perf seed → WARN
+  propagating through SKILL.md, sec-M1 `rm -rf "$BUILD_DIR"` on
+  operator-controlled path) plus associated high-value SHOULDs (bci-S5
+  native-file parity, qa-S1 min-metrics threshold, qa-S4 partial-data
+  flagging, sre-5 runner disk pre-check, ca-S3 unit column width,
+  doc-S1/S2/sre-6/sre-7/er-5). All resolved in this same PR2 commit:
+
+  - `dispatch-runner-job.sh` now uses a createdAt timestamp + headSha
+    filter for run discovery instead of the single newest-ID compare,
+    so concurrent operators dispatching the same workflow no longer
+    attribute each other's runs. Rejects multiline values in the
+    `--inputs` JSON to block split-injection into `--raw-field`.
+  - `sanitizer-gate.sh` distinguishes dispatch exit codes 0/1/2/3
+    (success/config-error/workflow-failed/runner-offline) so a
+    workflow that concluded `failure` now writes FAIL rows rather
+    than parsing possibly-degraded artifacts into a silent PASS.
+    Empty sanitizer logs (runner disk full, upload truncation) are
+    caught by a size+marker guard that WARNs instead of reading them
+    as "0 findings". The `grep -cE ... || echo 0` idiom that produced
+    `"0\n0"` and broke `(( n > 0 ))` was replaced with a single-value
+    capture that whitespace-strips defensively. The meson test FAIL
+    detector now uses POSIX `[[:space:]]FAIL` instead of the GNU-only
+    `\<FAIL\>` word boundary.
+  - `coverage-gate.sh` honors the `__seed: true` sentinel and emits
+    WARN ("seed baseline active — run --capture-baselines to enable
+    enforcement") rather than silent PASS against the permissive seed.
+    Refuses `--capture-baselines` when `meson test` exited non-zero
+    so a broken env can no longer anchor a false-low baseline. Prints
+    an old-vs-new diff before overwriting any existing baseline.
+    Adds `--native-file meson/native/linux-gcc13.ini` to the
+    `meson setup` call so local coverage numbers match Codecov's
+    gcc-13 baseline. Validates `--build-dir` is under `$YUZU_ROOT/build-*`
+    or `/tmp/build-*` before the reconfigure-failure `rm -rf` path
+    can fire. Partial-data runs (`TEST_RC != 0`) tag the metric notes
+    with `(partial: meson test exit=N)` so trend queries can filter
+    out contaminated points. The gcovr JSON parser now handles both
+    the top-level and `{"root": {...}}` wrapping shapes and supports
+    the gcovr 6.x+ `branches_covered`/`branches_valid` key names (the
+    pre-hardening code used `branch_covered`/`branch_total` which
+    don't exist in modern gcovr, producing a silent 0 %).
+  - `perf-gate.sh` propagates `rebar3 ct` exit code to gate outcome:
+    `CT_RC=1` (test assertion failed) → FAIL; `CT_RC > 1` (compile
+    or tooling failure) → WARN. Adds a minimum-metrics-parsed
+    threshold (≥ 3 of the 6 expected labels) so parser drift produces
+    a FAIL with a specific message instead of a silent "no metrics
+    parsed" WARN. Honors `__seed: true` with exit-0 PASS (not WARN)
+    so SKILL.md full-mode doesn't abort Phase 7 on the first run
+    against a seed baseline. Refuses `--capture-baselines` when
+    fewer than 3 metrics were parsed. Guards the compare math
+    against non-finite / zero / negative baseline values (sec-L4).
+    Emits WARN when the current run is missing baseline metrics
+    (UP-13 — prevents silent "only 1/6 checked" PASSes). Strips
+    ANSI escape sequences from `ct:pal` lines before regex matching
+    so colorized rebar3 output does not silently break metric
+    extraction.
+  - All three gate scripts validate `--run-id` against
+    `^[A-Za-z0-9._-]+$` before constructing any filesystem path,
+    closing the `--run-id "../../../tmp/evil"` traversal and
+    whitespace-only-ID path.
+  - `.github/workflows/sanitizer-tests.yml` gains a
+    "≥30 GB free" disk-check step right after toolchain assertion,
+    so a full runner fails fast with `::error::runner disk` instead
+    of hitting `ninja: No space left on device` 15 minutes into
+    the sanitizer build (sre-5 / UP-6 upstream of the false-PASS path).
+  - `scripts/test/test_db.py` `--trend` output column widened from 6
+    to 10 characters so `ops/sec` and `ms/agent` units no longer
+    push the run_id column out of alignment.
+  - `tests/shell/test_pr2_gates.sh` (NEW) — chaos-injector regression
+    harness covering P0 scenarios CH-2 (grep arithmetic), CH-3
+    (capture refuses broken env), CH-4 (gcovr root-wrap schema),
+    CH-6 (perf parser drift), CH-8 (`__seed` honored on both gates),
+    CH-15 (invalid run-ids), and CH-16 (sec-h-1 regression test for
+    Python code injection via `--baseline` path with embedded quote).
+    7 scenarios, 9 assertions, all green on the hardened tree. CH-1
+    (clean-log + workflow-failure → FAIL) is deferred to PR2.1 because
+    it needs a gh CLI mock harness.
+
+  **Pattern C catch — second security pass on the hardening round**
+  surfaced three new issues introduced by the hardening itself:
+
+  - **sec-h-1 (HIGH, BLOCKING)** — `coverage-gate.sh` `--capture-baselines`
+    diff and `__seed` detection paths interpolated the operator-controlled
+    `--baseline` file path into single-quoted Python literals inside
+    `python3 -c "..."` shell strings. A baseline path containing a single
+    quote would break out of the Python literal and execute arbitrary code.
+    Fix: all three call sites (lines 366, 367, 424) rewritten as quoted
+    heredocs (`python3 - "$BASELINE" <<'PY'`) that receive the path via
+    `sys.argv[1]`. CH-16 in the chaos harness regression-tests this by
+    placing a real baseline under a directory name containing `'`.
+
+  - **sec-h-2 (MEDIUM)** — `dispatch-runner-job.sh` fell back to
+    `echo "$REF"` when `git rev-parse` failed, which allowed an
+    unresolvable ref to be spliced verbatim into a jq filter
+    (`--jq "... select(.headSha == \"$TARGET_SHA\")"`). Fix: strictly
+    resolve ref via `git rev-parse --verify "$REF^{commit}"` and refuse
+    the dispatch on failure; also require `TARGET_SHA` to match a
+    hex[40-64] regex before it reaches jq. The jq filter now uses
+    `env.DISPATCH_TS` and `env.TARGET_SHA` through environment
+    variables instead of shell-interpolated jq syntax.
+
+  - **sec-h-3 (MEDIUM)** — `tests/shell/test_pr2_gates.sh` helper
+    functions `db_gate_status` / `db_gate_notes` / CH-4 metric read
+    used the same shell-interpolation-into-Python anti-pattern as
+    sec-h-1. Not exploitable today (harness controls all values) but
+    a trap for future contributors. Fixed to pass values via
+    `sys.argv` in quoted heredocs so the harness teaches the right
+    pattern.
+
+  The re-review clears the commit for landing. Low/INFO items from
+  both security passes (sec-L2, sec-L4, sec-L5, sec-h-4, sec-h-5)
+  are deferred to follow-up issues and captured in memory for the
+  next hardening wave.
+  - SKILL.md, CLAUDE.md updated to describe the `__seed` semantics,
+    the `--capture-baselines` pre-flight requirement (clean
+    `meson test` / `rebar3 ct` before capture), the sanitizer queue
+    behavior under concurrent full-mode runs, and the baseline
+    refresh cadence (recapture at every `vX.Y.0` tag on the
+    canonical dev box).
+
+  **New files:**
+  - `scripts/test/dispatch-runner-job.sh` — shared `gh workflow run` + poll +
+    download + parse helper with distinct exit codes for success / fail /
+    runner-unavailable so callers can map to PASS / FAIL / WARN.
+    Reused by PR3 for the Windows agent build dispatch.
+  - `scripts/test/sanitizer-gate.sh` — Phase 6 orchestrator. Parses
+    `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`,
+    `ThreadSanitizer: data race`, `runtime error:` out of the downloaded
+    sanitizer logs and counts meson test FAIL lines separately.
+  - `scripts/test/coverage-gate.sh` — Phase 7 coverage orchestrator.
+    Configures `build-linux-coverage/` with `-Db_coverage=true` (separate
+    from the main `build-linux/` so ccache hit rates stay intact), runs
+    `meson test`, runs gcovr with `--json-summary`, and enforces the
+    baseline with `--capture-baselines` / `--report-only` / default
+    enforce modes.
+  - `scripts/test/perf-gate.sh` — Phase 7 perf orchestrator. Parses
+    `ct:pal` throughput lines (`Registration: N ops in M ms (O ops/sec)`),
+    fanout latency lines (`Fanout to N agents: M ms`), and session
+    cleanup latency (`Cleanup N agents: M ms (K ms/agent)`).
+  - `.github/workflows/sanitizer-tests.yml` — `workflow_dispatch`-only
+    workflow pinned to `[self-hosted, yuzu-wsl2-linux]`. Uses the same
+    `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`,
+    `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`, and
+    `TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1` as the
+    existing CI sanitize jobs for parity. Uploads
+    `sanitizer-{asan,tsan}.log`, their build logs, and
+    `build-linux-{asan,tsan}/meson-logs/testlog.junit.xml` as artifacts.
+  - `tests/coverage-baseline.json`, `tests/perf-baselines.json` —
+    shipped as **permissive seeds** (`branch_percent=0 + slack_pp=100`,
+    empty `metrics` map) with a `__seed: true` flag. PR2 must not break
+    /test --full on merge day, so the seeds pass trivially; first
+    operator run with `--capture-baselines` locks real numbers that
+    replace the seeds. The `git blame` on these files is the audit
+    trail for who raised/lowered the baseline and why.
+
 - **`/test` skill scaffold + upgrade test path (PR1 of 3).** New
   `.claude/skills/test/SKILL.md` operator-facing runbook plus
   `scripts/test/` helper directory that orchestrates a pre-commit /

@@ -1,0 +1,10 @@
+{
+  "__doc": "Seed baseline shipped with PR2 of the /test skill. Run 'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' on the target dev box to lock a real baseline, then commit the updated file alongside the change that earned it. The seed accepts any non-zero coverage (branch_percent=0, slack_pp=100) so PR2 doesn't trip on first run; real enforcement kicks in after first capture.",
+  "__schema": "coverage-baseline/v1",
+  "__seed": true,
+  "branch_percent": 0.0,
+  "captured_at": 1776200000,
+  "captured_commit": "seed",
+  "line_percent": 0.0,
+  "slack_pp": 100.0
+}

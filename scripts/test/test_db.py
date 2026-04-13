@@ -524,12 +524,14 @@ def cmd_query(args: argparse.Namespace) -> int:
                 print(f"(no data for {args.trend})")
                 return 0
             print(f"=== trend {args.trend} ===")
-            print(f"{'started':<20} {'branch':<20} {'commit':<10} {'value':>14} {'unit':<6} run_id")
+            # Unit column widened to 10 chars so "ops/sec" (7) and
+            # "ms/agent" (8) don't push run_id right (ca-S3).
+            print(f"{'started':<20} {'branch':<20} {'commit':<10} {'value':>14} {'unit':<10} run_id")
             for r in rows:
                 started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["started_at"]))
                 print(
                     f"{started:<20} {r['branch'][:20]:<20} {r['commit_sha'][:8]:<10} "
-                    f"{r['v']:>14.3f} {(r['u'] or ''):<6} {r['run_id']}"
+                    f"{r['v']:>14.3f} {(r['u'] or ''):<10} {r['run_id']}"
                 )
             return 0
 
