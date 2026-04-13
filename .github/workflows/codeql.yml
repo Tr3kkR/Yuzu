@@ -1,53 +1,61 @@
 name: "CodeQL"
 
-# CodeQL C++ + GitHub Actions static analysis on the yuzu-wsl2-linux
-# self-hosted runner (labels: self-hosted/Linux/X64, name: yuzu-wsl2-linux).
+# CodeQL C++ + GitHub Actions static analysis across BOTH self-hosted
+# runners, running in parallel:
+#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64)  — gcc-13 build
+#   - yuzu-local-windows (labels: self-hosted/Windows/X64) — MSVC build
+#
+# The two runs are separate matrix legs with `fail-fast: false`, so a
+# quirk on one platform doesn't kill the other. Each leg uploads SARIF
+# with a distinct category (`c-cpp-linux` vs `c-cpp-windows`) so
+# findings in platform-specific `#ifdef` branches stay attributed to
+# the correct analysis.
 #
 # History:
-#   2026-03-23 → 2026-04-13: prior iterations used 90-min timeout and
-#     every run was cancelled before CodeQL finished. Original diagnosis
-#     assumed the runner was slow; actual diagnosis (first successful run
-#     2026-04-13, dev@9b16d3c) proved the runner is fast but the 90-min
-#     budget was still hit by something else — likely a stuck ccache-less
-#     cold build on an older ccache-codeql-* cache key that never
-#     populated.
-#   2026-04-13: first successful run at 14m49s with security-extended +
-#     build_tests=false. ccache stats: 155/156 real compiles (cold cache),
-#     parallelized across 32 threads. Coverage was only 231/364 (63%) of
-#     C++ files because -Dbuild_tests=false skipped tests/.
+#   2026-03-23 → 2026-04-13: 7 consecutive cancelled runs on 90-min
+#     timeout (Linux-only, single-runner setup).
+#   2026-04-13: first successful Linux run in 14m49s (security-extended,
+#     build_tests=false, 231/364 C++ files scanned, 0 alerts). Verified
+#     the runner is fast and the tracer actually observes compiles.
+#   2026-04-13 (same day): coverage knobs flipped to security-and-quality
+#     + build_tests=true + languages c-cpp,actions, and the workflow
+#     matrixed across Linux + Windows runners to close the #ifdef _WIN32
+#     gap that a Linux-only analysis physically cannot reach.
 #
-# Current coverage knob setup (maximize CodeQL findings):
-#   - queries: +security-and-quality (strict superset of security-extended;
-#     adds memory leak, UAF, null-deref, dead-code, inconsistent-error
-#     queries that are security-adjacent on C++ codebases)
-#   - languages: c-cpp,actions (cpp primary + .github/workflows/*.yml
-#     template-injection / untrusted-interpolation analysis)
-#   - -Dbuild_tests=true (recovers the ~50-100 tests/unit/*.cpp files
-#     that were missing from the initial run)
-#   - dedicated build-linux-codeql/ directory so the instrumented build
-#     doesn't collide with build-linux/, build-linux-{asan,tsan,coverage}/
-#   - pre-build runner disk-free assertion (≥40 GB, matches sanitizer-tests.yml)
-#   - weekly scheduled run (Sunday 04:00 UTC, low-activity window)
-#   - manual workflow_dispatch
+# Coverage-knob setup (maximize findings on both platforms):
+#   - queries: +security-and-quality (superset of security-extended;
+#     on C++, the "quality" queries are security-adjacent: memory leaks,
+#     UAF, null deref, dead code hiding logic bugs, inconsistent error
+#     handling — not style noise like it would be for JS/Python)
+#   - languages: c-cpp,actions on Linux; c-cpp only on Windows (no need
+#     to double-scan the same .github/workflows/*.yml)
+#   - -Dbuild_tests=true so the CodeQL tracer observes tests/unit/*.cpp
+#   - Dedicated per-OS build dirs (build-linux-codeql/ + build-windows-codeql/)
+#     isolated from operator's interactive builds and from
+#     build-{linux,windows}-{asan,tsan,coverage}/
+#   - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB Windows;
+#     MSVC debug builds are chunkier)
+#   - Weekly scheduled run (Sunday 04:00 UTC, low-activity window)
+#   - Manual workflow_dispatch
 #
-# Known coverage gaps (filed as tracking issues):
-#   - Windows-only #ifdef _WIN32 agent plugin code — needs a parallel
-#     Windows-host CodeQL job (filed separately)
+# Known remaining coverage gaps:
 #   - Yuzu-specific attack patterns (plugin command execution, audit
-#     field drift, RBAC bypass) — need a custom .ql query pack (filed
-#     separately)
+#     field drift, RBAC bypass) — need a custom .ql query pack (tracked
+#     in issue #371)
 #
-# Output lands in the Security tab under "Code scanning alerts". Not a
-# required status check — merge decisions do not depend on CodeQL
-# finishing. Concurrency group's cancel-in-progress: true lets a queued
-# newer run supersede a stale one.
+# Output lands in the Security tab under "Code scanning alerts" with
+# distinct categories. Not a required status check — merge decisions do
+# not depend on CodeQL finishing. Concurrency group's cancel-in-progress:
+# true lets a queued newer run supersede a stale one (cancels BOTH
+# matrix legs together).
 
 on:
   workflow_dispatch:
   schedule:
-    # Weekly on Sunday at 04:00 UTC — off-hours, low runner contention.
-    # If sanitizer-tests.yml or another dispatched job is running on the
-    # same runner, CodeQL will queue behind it (single-slot self-hosted).
+    # Weekly Sunday 04:00 UTC — off-hours, both runners available.
+    # Both Linux and Windows runs start simultaneously on their
+    # respective runners (no queue contention between them; they're
+    # different physical hosts on the same desktop).
     - cron: "0 4 * * 0"
 
 concurrency:
@@ -66,76 +74,117 @@ env:
 
 jobs:
   analyze:
-    name: Analyze C++
-    # Runner labels (2026-04-13): yuzu-wsl2-linux (id 30) advertises
-    # ["self-hosted","X64","Linux"] via gh api /repos/.../actions/runners.
-    # The runner's NAME is yuzu-wsl2-linux but there is no custom label
-    # with that string — runs-on matches against labels, not names. Use
-    # the default triple so this workflow actually schedules. If a second
-    # self-hosted Linux runner is added for a different purpose later,
-    # add a custom label to the dedicated runner and tighten this.
-    runs-on: [self-hosted, Linux, X64]
-    # Verified run (2026-04-13, dev@9b16d3c, security-extended, build_tests=false):
-    # total wall-clock 14m49s with 155/156 cacheable compiles being real misses.
-    # Runner is 32-thread / 60 GB so full build parallelizes hard.
-    # Current config (security-and-quality + build_tests=true + c-cpp,actions)
-    # should fit comfortably under 90 min even cold.
+    name: "Analyze (${{ matrix.os }})"
+    # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
+    # build_tests=false): 14m49s with 155/156 compiles being real misses
+    # on a 32-thread runner. Current config (+security-and-quality +
+    # build_tests=true + c-cpp,actions) should fit under 60 min on
+    # Linux. Windows is typically 1.5-2x slower per TU under MSVC —
+    # budget extra headroom. 90 min covers both.
     timeout-minutes: 90
+    strategy:
+      # fail-fast: false so Linux completes its SARIF upload even if
+      # Windows hits a quirk (and vice versa). Each leg's findings land
+      # in the Security tab independently.
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: [self-hosted, Linux, X64]
+            triplet: x64-linux
+            vcpkg_bin: vcpkg
+            build_dir: build-linux-codeql
+            category: "/language:c-cpp-linux"
+            languages: "c-cpp,actions"
+            ccache_path: ~/.cache/ccache
+            ccache_key_prefix: ccache-codeql-linux
+            disk_min_gb: 40
+            cmake_prefix: ${{ github.workspace }}/vcpkg_installed/x64-linux
+          - os: windows
+            runner: [self-hosted, Windows, X64]
+            triplet: x64-windows
+            vcpkg_bin: vcpkg.exe
+            build_dir: build-windows-codeql
+            category: "/language:c-cpp-windows"
+            # c-cpp only — no need to double-scan the same
+            # .github/workflows/*.yml files; the Linux leg covers
+            # actions.
+            languages: "c-cpp"
+            ccache_path: ~\AppData\Local\ccache
+            ccache_key_prefix: ccache-codeql-windows
+            disk_min_gb: 45
+            cmake_prefix: ${{ github.workspace }}/vcpkg_installed/x64-windows
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        # bash on both platforms. Windows self-hosted runner must have
+        # MSYS2 or git-bash on PATH (per CLAUDE.md, MSYS2 bash is the
+        # documented Windows development shell). Using bash everywhere
+        # keeps the assertion/disk-check/compile steps portable.
+        shell: bash
+
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           clean: false
 
+      # ─── MSVC environment (Windows only) ──────────────────────────
+      # CLAUDE.md forbids direct use of vcvars64.bat because it returns
+      # exit 1 on optional extension failures. The ilammy/msvc-dev-cmd
+      # action wraps vcvarsall.bat and handles the exit code correctly
+      # — this is the same action the existing ci.yml Windows job uses
+      # and is the sanctioned path for GHA workflows (distinct from
+      # setup_msvc_env.sh which is for interactive MSYS2 bash sessions).
+      - name: Setup MSVC (windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Assert toolchain available
         run: |
-          # Match the assertion style of sanitizer-tests.yml — fail fast
-          # on a missing runner dep rather than crash 20 minutes into
-          # vcpkg install with an opaque error.
-          for tool in meson ninja gcc-13 g++-13 ccache python3 cmake pkg-config; do
-              if ! command -v "$tool" >/dev/null; then
-                  echo "::error::$tool not on PATH on yuzu-wsl2-linux runner"
-                  exit 1
-              fi
+          set -e
+          if [[ "${{ matrix.os }}" == "linux" ]]; then
+            TOOLS="meson ninja gcc-13 g++-13 ccache python3 cmake pkg-config"
+          else
+            # MSVC cl is on PATH after ilammy/msvc-dev-cmd. Self-hosted
+            # runner must have meson/ninja/ccache/cmake/python pre-baked.
+            TOOLS="meson ninja cl ccache cmake python"
+          fi
+          for tool in $TOOLS; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::$tool not on PATH on ${{ matrix.os }} runner"
+              exit 1
+            fi
           done
           meson --version
-          gcc-13 --version | head -1
           ccache --version | head -1
 
-      - name: Assert runner disk (≥40 GB free)
+      - name: Assert runner disk (>= ${{ matrix.disk_min_gb }} GB free)
         run: |
-          # CodeQL needs: vcpkg_installed (~6 GB) + build-linux-codeql
-          # (instrumented debug build ~12 GB — larger than non-CodeQL
-          # because every object file carries the CodeQL database
-          # payload) + ~/.cache/ccache (500 MB) + ~/.codeql cache
-          # (1-2 GB) + the CodeQL database itself (several GB). 40 GB
-          # is the conservative floor.
-          free_gb=$(df -BG "$GITHUB_WORKSPACE" | awk 'NR==2 {gsub("G",""); print $4}')
+          # POSIX df -k works on both Linux and MSYS2/git-bash (df -BG
+          # is a GNU extension not available in git-bash on Windows).
+          free_gb=$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {printf "%d", $4/1024/1024}')
           echo "runner disk free: ${free_gb}G on $GITHUB_WORKSPACE"
-          if [[ -z "$free_gb" ]] || (( free_gb < 40 )); then
-              echo "::error::runner disk ${free_gb}G < 40 GB required for CodeQL + full build"
-              exit 1
+          if [[ -z "$free_gb" ]] || (( free_gb < ${{ matrix.disk_min_gb }} )); then
+            echo "::error::runner disk ${free_gb}G < ${{ matrix.disk_min_gb }} GB required"
+            exit 1
           fi
 
       - name: Clean stale codeql build dir (preserve vcpkg_installed + ccache)
         run: |
-          # build-linux-codeql is isolated from build-linux/ so the
-          # operator's interactive build state is never touched. The
-          # codeql tracer needs a fresh build to observe every compile,
-          # so we wipe this dir each run.
-          rm -rf build-linux-codeql
+          # CodeQL tracer must observe every compile; stale incremental
+          # state would cause ccache-hit TUs to be missing from the
+          # database. Wipe the build dir each run.
+          rm -rf ${{ matrix.build_dir }}
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           save-always: true
-          path: ~/.cache/ccache
-          # Separate cache namespace from ci.yml / sanitizer-tests.yml /
-          # coverage — CodeQL-instrumented compiles produce different
-          # object hashes so cross-pollution is useless.
-          key: ccache-codeql-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          path: ${{ matrix.ccache_path }}
+          key: ${{ matrix.ccache_key_prefix }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
-            ccache-codeql-linux-
+            ${{ matrix.ccache_key_prefix }}-
 
       - name: Reset ccache stats
         run: ccache -z
@@ -155,68 +204,76 @@ jobs:
 
       - name: Install vcpkg packages
         run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
+          ${{ github.workspace }}/vcpkg/${{ matrix.vcpkg_bin }} install \
+            --triplet ${{ matrix.triplet }} \
             --x-manifest-root=${{ github.workspace }}
 
-      - name: Ensure Erlang on PATH (gateway custom_target)
+      - name: Ensure Erlang on PATH (gateway custom_target, linux only)
+        if: matrix.os == 'linux'
         run: |
           # The meson `gateway` custom_target fires when rebar3 is
           # detected. If it is, set up the Erlang toolchain so the
-          # compile step doesn't fail on `.gateway_built`. See CLAUDE.md
-          # "Toolchain activation (Erlang on PATH)".
+          # compile step doesn't fail on `.gateway_built`. Gateway is
+          # Erlang and doesn't contribute to C++ CodeQL, but the
+          # custom_target must succeed or meson compile fails. Linux
+          # only — Windows CodeQL leg does not build the gateway.
           if command -v rebar3 >/dev/null 2>&1; then
             source scripts/ensure-erlang.sh
             command -v erl >/dev/null || {
-              echo "::warning::ensure-erlang.sh did not resolve erl on PATH; gateway target may be skipped"
+              echo "::warning::ensure-erlang.sh did not resolve erl on PATH"
             }
           else
-            echo "rebar3 not installed on runner — gateway custom_target will be skipped"
+            echo "rebar3 not installed — gateway target will be skipped"
           fi
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          # c-cpp: primary analysis (agent + server + SDK + plugins)
-          # actions: scans .github/workflows/*.yml for GHA-specific bugs
-          #   (e.g., untrusted ${{ github.event.* }} interpolation into run:
-          #   bodies, the well-known template-injection attack class)
-          languages: c-cpp,actions
-          # security-and-quality is a strict superset of security-extended.
-          # For C/C++ specifically, the "quality" half adds security-adjacent
-          # queries (memory leaks, null deref, UAF, dead-code hiding logic
-          # bugs, inconsistent error handling) rather than pure style — worth
-          # the additional runtime. Verification run (2026-04-13) showed
-          # security-extended alone finished in 14m49s, so the broader suite
-          # still fits comfortably in the 90-min budget.
+          languages: ${{ matrix.languages }}
           queries: +security-and-quality
 
-      - name: Configure (Meson debug)
+      - name: Configure (Meson debug) — linux
+        if: matrix.os == 'linux'
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux
+          CMAKE_PREFIX_PATH: ${{ matrix.cmake_prefix }}
         run: |
-          # build_tests=true so CodeQL's tracer observes the Catch2 test
-          # .cpp files under tests/unit/. Without this, the 2026-04-13
-          # verification run scanned only 231/364 (63%) of C++ files;
-          # flipping this recovers the ~50-100 test files that were
-          # missing and brings coverage to ~85%+. Test helpers ARE a
-          # legit attack surface because they can leak into production
-          # via shared utility libraries.
-          meson setup build-linux-codeql \
+          # build_tests=true recovers tests/unit/*.cpp coverage (the
+          # 2026-04-13 baseline run scanned only 231/364 files because
+          # tests was skipped).
+          meson setup ${{ matrix.build_dir }} \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dcmake_prefix_path=${{ matrix.cmake_prefix }} \
+            -Dbuild_tests=true
+
+      - name: Configure (Meson debug) — windows
+        if: matrix.os == 'windows'
+        env:
+          CC: ccache cl
+          CXX: ccache cl
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ matrix.cmake_prefix }}
+        run: |
+          # -Dcpp_std=vc++latest matches the existing ci.yml Windows job.
+          # No --native-file — MSVC defaults pick up cl from the MSVC
+          # environment set by ilammy/msvc-dev-cmd above.
+          # Note: the gateway custom_target may fail on Windows if
+          # rebar3/erl aren't installed on the runner; meson will skip
+          # it via the `if command -v rebar3` guard inside meson.build.
+          meson setup ${{ matrix.build_dir }} \
+            --buildtype=debug \
+            -Dcpp_std=vc++latest \
+            -Dcmake_prefix_path=${{ matrix.cmake_prefix }} \
             -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)
         # CodeQL's tracer wraps this step's compile invocations to build
-        # its database. meson compile must run the full graph — no
-        # --no-rebuild, no partial target selection — so every translation
-        # unit is observed.
-        run: meson compile -C build-linux-codeql
+        # its database. Full graph traversal required — no --no-rebuild,
+        # no partial target selection.
+        run: meson compile -C ${{ matrix.build_dir }}
 
       - name: ccache stats
         if: always()
@@ -225,4 +282,4 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
         with:
-          category: "/language:c-cpp"
+          category: "${{ matrix.category }}"
