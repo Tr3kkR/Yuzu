@@ -184,14 +184,20 @@ fi
 info "verifying enrollment tokens preserved"
 ENROLL_PRESENT_BEFORE=$(read_state enrollment_token_present)
 if [[ "$ENROLL_PRESENT_BEFORE" == "True" ]]; then
+    # The public list endpoint is the HTMX fragment at
+    # /fragments/settings/tokens — there is no REST v1 list for enrollment
+    # tokens. Fragment body is an HTML <table>; a row per token is
+    # "<tr><td><code>ID</code>...". An empty table renders a colspan row
+    # with the "No tokens created" placeholder. Look for the <code> cell
+    # — it only appears when at least one real token row exists.
     ENROLL_LIST=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-        "$DASHBOARD_URL/api/settings/enrollment-tokens" 2>/dev/null || echo "")
-    ENROLL_COUNT=$(echo "$ENROLL_LIST" | grep -oP '[a-f0-9]{64}' | wc -l)
+        "$DASHBOARD_URL/fragments/settings/tokens" 2>/dev/null || echo "")
+    ENROLL_COUNT=$(echo "$ENROLL_LIST" | grep -oE '<td><code>[a-f0-9]+</code></td>' | wc -l)
     if (( ENROLL_COUNT >= 1 )); then
         ok "enrollment tokens preserved ($ENROLL_COUNT present)"
         set_result "enrollment_tokens" "preserved ($ENROLL_COUNT)"
     else
-        fl "enrollment tokens lost (had ≥ 1, now 0)"
+        fl "enrollment tokens lost (had >= 1, now 0)"
         set_result "enrollment_tokens" "lost"
     fi
 else
@@ -204,11 +210,25 @@ fi
 info "verifying API tokens preserved"
 API_PRESENT_BEFORE=$(read_state api_token_present)
 if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
+    # API tokens ARE exposed via REST v1 — use that instead of the
+    # HTMX fragment. The v1 envelope is {"data":[...], "meta":{}}.
     API_LIST=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
-        "$DASHBOARD_URL/api/settings/api-tokens" 2>/dev/null || echo "")
+        "$DASHBOARD_URL/api/v1/tokens" 2>/dev/null || echo "")
     if [[ -n "$API_LIST" && "$API_LIST" != *"\"error\""* ]]; then
-        ok "API tokens endpoint responsive (post-upgrade)"
-        set_result "api_tokens" "preserved"
+        # Count tokens in data[] — a successful upgrade keeps at least 1.
+        API_COUNT=$(echo "$API_LIST" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(len(d.get('data', [])))
+except: print(0)" 2>/dev/null || echo "0")
+        if (( API_COUNT >= 1 )); then
+            ok "API tokens preserved ($API_COUNT present)"
+            set_result "api_tokens" "preserved ($API_COUNT)"
+        else
+            fl "API tokens lost (had >= 1, now 0)"
+            set_result "api_tokens" "lost"
+        fi
     else
         fl "API tokens endpoint failed or returned error: ${API_LIST:0:200}"
         set_result "api_tokens" "lost or endpoint broken"

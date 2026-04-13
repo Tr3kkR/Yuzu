@@ -156,6 +156,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/test/` harness bugs discovered running `/test --full`
+  against uncommitted #339.** Three PR1 harness fixes that landed the
+  headline upgrade test at green:
+  (a) `test-upgrade-stack.sh` wrote the upgrade-test admin credentials
+  with `chmod 600` owned by the test runner's UID. `Dockerfile.server`
+  drops to `USER yuzu` (unprivileged) before reading the config, so
+  the file was invisible inside the container and v0.10.0 fell through
+  to first-run-setup and exited. Now `chmod 644` on the cred file and
+  `chmod 700` on the parent `/tmp/yuzu-test-${RUN_ID}/` dir — the
+  parent-dir restriction prevents host-side leakage and the 644 on
+  the file lets the container yuzu user read it. Also fixes the
+  fallback `docker compose logs` diagnostic in the /readyz-timeout
+  branch which was missing the required `YUZU_VERSION` and
+  `YUZU_TEST_CONFIG` env vars, producing a confusing
+  "empty section between colons" error instead of the actual logs.
+  (b) `test-fixtures-verify.sh` hit `/api/settings/enrollment-tokens`
+  and `/api/settings/api-tokens` as JSON list endpoints — neither
+  exists; enrollment tokens are only exposed via the HTMX fragment at
+  `/fragments/settings/tokens`. The verifier now reads the fragment
+  HTML and counts `<code>...</code>` token-id cells; API tokens are
+  verified through the proper `/api/v1/tokens` REST endpoint and
+  parsed as JSON.
+  (c) `test-fixtures-write.sh` POSTed to `/api/settings/api-tokens`
+  with `label=` and `ttl=` form fields, but the handler expects
+  `name=` and `ttl_hours=` and silently returns an HTML error
+  fragment on mismatch. The writer now uses the correct field names
+  and inspects the response body for `feedback-error` before accepting
+  the write. (#339 /test verification)
 - **`scripts/linux-start-UAT.sh` now exits non-zero on connectivity test
   failure.** Previously the script always exited 0 after the stack stood
   up, regardless of whether the 6 inline connectivity tests passed. The

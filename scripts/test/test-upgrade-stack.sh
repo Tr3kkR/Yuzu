@@ -121,11 +121,14 @@ salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000, dklen=32)
 sys.stdout.write(f'{user}:admin:{salt.hex()}:{dk.hex()}\n')
 PY
-# 600 not 644 — matches CLAUDE.md's secure-default expectation for
-# credential-bearing files. Docker bind mounts read the file with
-# whatever UID the container runs as (root inside the test image), so
-# 600 with the test runner's UID still works because dockerd is root.
-chmod 600 "$CONFIG_FILE"
+# 644 is required, not 600: Dockerfile.server drops to USER yuzu
+# (unprivileged) before reading the config. A 600 file owned by the
+# test runner's UID is invisible to the in-container yuzu user even
+# though dockerd is root. The parent /tmp/yuzu-test-${RUN_ID}/ is
+# already 700 owned by the test runner, so 644 on the config file
+# inside that dir does not expose it to other host users.
+chmod 644 "$CONFIG_FILE"
+chmod 700 "$PHASE2_DIR"
 
 # Output helpers + colours
 if [ -t 1 ]; then
@@ -241,8 +244,9 @@ done
 record_timing "stack-up-old" "$(elapsed_ms "$T_START")"
 if [[ $READY -eq 0 ]]; then
     fl "OLD stack never reported /readyz ready (waited ${WAITED}s)"
-    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
-        --project-name "$PROJECT_NAME" logs server | tail -50 >> "$LOG_FILE"
+    YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+        --project-name "$PROJECT_NAME" logs server 2>&1 | tail -50 >> "$LOG_FILE"
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "old /readyz timeout"
     exit 1
 fi

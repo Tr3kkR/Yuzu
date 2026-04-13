@@ -165,18 +165,29 @@ fi
 # --- API token ------------------------------------------------------------
 
 info "creating API token"
+# Field names match settings_routes.cpp POST /api/settings/api-tokens:
+# name=<label>, ttl_hours=<hours> — NOT label/ttl (those field names are
+# for enrollment tokens). Getting these wrong silently produces a 200
+# with an HTML error fragment, which looks like success until verify.
 API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/api-tokens" \
-    -d "label=fixture-api-${RANDOM}&ttl=3600" 2>/dev/null || echo "__HTTP__000")
+    -d "name=fixture-api-${RANDOM}&ttl_hours=1" 2>/dev/null || echo "__HTTP__000")
 API_TOKEN_HTTP=$(echo "$API_TOKEN_BODY" | grep -oP '__HTTP__\K[0-9]+' | tail -1)
 API_TOKEN_RAW=$(echo "$API_TOKEN_BODY" | sed '/__HTTP__/d')
-API_TOKEN_PREFIX=$(echo "$API_TOKEN_RAW" | grep -oP '[a-zA-Z0-9_-]{16,}' | head -1 || echo "")
-if [[ "$API_TOKEN_HTTP" =~ ^2 && -n "$API_TOKEN_PREFIX" ]]; then
-    ok "API token created"
-    WROTE=$((WROTE + 1))
-    HAS_API_TOKEN=1
+# The success fragment embeds the raw token once. It's long (>=32 url-safe
+# chars). An error fragment contains "feedback-error" and no token.
+if [[ "$API_TOKEN_HTTP" =~ ^[23] && "$API_TOKEN_RAW" != *"feedback-error"* ]]; then
+    API_TOKEN_PREFIX=$(echo "$API_TOKEN_RAW" | grep -oP '[a-zA-Z0-9_-]{32,}' | head -1 || echo "")
+    if [[ -n "$API_TOKEN_PREFIX" ]]; then
+        ok "API token created"
+        WROTE=$((WROTE + 1))
+        HAS_API_TOKEN=1
+    else
+        warn "API token POST succeeded but no token in body: ${API_TOKEN_RAW:0:200}"
+        HAS_API_TOKEN=0
+    fi
 else
-    warn "API token creation HTTP $API_TOKEN_HTTP (endpoint may differ in this version)"
+    warn "API token creation HTTP $API_TOKEN_HTTP: ${API_TOKEN_RAW:0:200}"
     HAS_API_TOKEN=0
 fi
 
