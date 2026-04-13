@@ -1,31 +1,46 @@
 name: "CodeQL"
 
-# CodeQL C++ static analysis on the `yuzu-wsl2-linux` self-hosted runner.
+# CodeQL C++ + GitHub Actions static analysis on the yuzu-wsl2-linux
+# self-hosted runner (labels: self-hosted/Linux/X64, name: yuzu-wsl2-linux).
 #
-# History (2026-04-13): prior iterations targeted `[self-hosted, Linux]`
-# with a 90-minute timeout, and every run since 2026-03-23 was cancelled
-# by the timeout expiring before CodeQL finished. A full Yuzu build with
-# the CodeQL tracer instrumenting every cl/gcc invocation takes 2-3 hours
-# even on a warm vcpkg+ccache state; a cold build is closer to 4 hours.
-# This revision:
-#   - pins the runner label to `yuzu-wsl2-linux` (explicit, matches the
-#     sanitizer-tests.yml convention — both dispatched workflows target
-#     the same physical host)
-#   - bumps timeout-minutes to 240 (4 hours)
-#   - uses a dedicated `build-linux-codeql/` directory so the instrumented
-#     build doesn't collide with the operator's interactive `build-linux/`
-#     or with `build-linux-asan/` / `build-linux-tsan/` / `build-linux-coverage/`
-#     from other dispatched workflows
-#   - adds a pre-build disk-free assertion (matches sanitizer-tests.yml)
-#   - adds a scheduled weekly run (Sundays 04:00 UTC, low-activity window)
-#     plus manual workflow_dispatch
-#   - keeps `cancel-in-progress: true` on the concurrency group so a
-#     queued newer run supersedes a stale one, but NOT `cancel-in-progress`
-#     on the timeout itself (the new 240-min budget should be sufficient)
+# History:
+#   2026-03-23 → 2026-04-13: prior iterations used 90-min timeout and
+#     every run was cancelled before CodeQL finished. Original diagnosis
+#     assumed the runner was slow; actual diagnosis (first successful run
+#     2026-04-13, dev@9b16d3c) proved the runner is fast but the 90-min
+#     budget was still hit by something else — likely a stuck ccache-less
+#     cold build on an older ccache-codeql-* cache key that never
+#     populated.
+#   2026-04-13: first successful run at 14m49s with security-extended +
+#     build_tests=false. ccache stats: 155/156 real compiles (cold cache),
+#     parallelized across 32 threads. Coverage was only 231/364 (63%) of
+#     C++ files because -Dbuild_tests=false skipped tests/.
 #
-# Output lands in the Security tab under "Code scanning alerts". This is
-# not a required status check; merge decisions do not depend on CodeQL
-# finishing.
+# Current coverage knob setup (maximize CodeQL findings):
+#   - queries: +security-and-quality (strict superset of security-extended;
+#     adds memory leak, UAF, null-deref, dead-code, inconsistent-error
+#     queries that are security-adjacent on C++ codebases)
+#   - languages: c-cpp,actions (cpp primary + .github/workflows/*.yml
+#     template-injection / untrusted-interpolation analysis)
+#   - -Dbuild_tests=true (recovers the ~50-100 tests/unit/*.cpp files
+#     that were missing from the initial run)
+#   - dedicated build-linux-codeql/ directory so the instrumented build
+#     doesn't collide with build-linux/, build-linux-{asan,tsan,coverage}/
+#   - pre-build runner disk-free assertion (≥40 GB, matches sanitizer-tests.yml)
+#   - weekly scheduled run (Sunday 04:00 UTC, low-activity window)
+#   - manual workflow_dispatch
+#
+# Known coverage gaps (filed as tracking issues):
+#   - Windows-only #ifdef _WIN32 agent plugin code — needs a parallel
+#     Windows-host CodeQL job (filed separately)
+#   - Yuzu-specific attack patterns (plugin command execution, audit
+#     field drift, RBAC bypass) — need a custom .ql query pack (filed
+#     separately)
+#
+# Output lands in the Security tab under "Code scanning alerts". Not a
+# required status check — merge decisions do not depend on CodeQL
+# finishing. Concurrency group's cancel-in-progress: true lets a queued
+# newer run supersede a stale one.
 
 on:
   workflow_dispatch:
@@ -60,7 +75,12 @@ jobs:
     # self-hosted Linux runner is added for a different purpose later,
     # add a custom label to the dedicated runner and tighten this.
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 240  # 4 hours — covers cold-cache full build + CodeQL analyze
+    # Verified run (2026-04-13, dev@9b16d3c, security-extended, build_tests=false):
+    # total wall-clock 14m49s with 155/156 cacheable compiles being real misses.
+    # Runner is 32-thread / 60 GB so full build parallelizes hard.
+    # Current config (security-and-quality + build_tests=true + c-cpp,actions)
+    # should fit comfortably under 90 min even cold.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
         with:
@@ -157,8 +177,19 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: c-cpp
-          queries: +security-extended
+          # c-cpp: primary analysis (agent + server + SDK + plugins)
+          # actions: scans .github/workflows/*.yml for GHA-specific bugs
+          #   (e.g., untrusted ${{ github.event.* }} interpolation into run:
+          #   bodies, the well-known template-injection attack class)
+          languages: c-cpp,actions
+          # security-and-quality is a strict superset of security-extended.
+          # For C/C++ specifically, the "quality" half adds security-adjacent
+          # queries (memory leaks, null deref, UAF, dead-code hiding logic
+          # bugs, inconsistent error handling) rather than pure style — worth
+          # the additional runtime. Verification run (2026-04-13) showed
+          # security-extended alone finished in 14m49s, so the broader suite
+          # still fits comfortably in the 90-min budget.
+          queries: +security-and-quality
 
       - name: Configure (Meson debug)
         env:
@@ -167,11 +198,18 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux
         run: |
+          # build_tests=true so CodeQL's tracer observes the Catch2 test
+          # .cpp files under tests/unit/. Without this, the 2026-04-13
+          # verification run scanned only 231/364 (63%) of C++ files;
+          # flipping this recovers the ~50-100 test files that were
+          # missing and brings coverage to ~85%+. Test helpers ARE a
+          # legit attack surface because they can leak into production
+          # via shared utility libraries.
           meson setup build-linux-codeql \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=false
+            -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)
         # CodeQL's tracer wraps this step's compile invocations to build
