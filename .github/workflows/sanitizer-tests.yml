@@ -51,7 +51,7 @@ jobs:
   asan-ubsan:
     name: "Sanitizers (ASan+UBSan)"
     if: ${{ inputs.suite == 'asan' || inputs.suite == 'both' || inputs.suite == '' }}
-    runs-on: [self-hosted, yuzu-wsl2-linux]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 75
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
@@ -151,7 +151,7 @@ jobs:
   tsan:
     name: "Sanitizers (TSan)"
     if: ${{ inputs.suite == 'tsan' || inputs.suite == 'both' || inputs.suite == '' }}
-    runs-on: [self-hosted, yuzu-wsl2-linux]
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 75
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
