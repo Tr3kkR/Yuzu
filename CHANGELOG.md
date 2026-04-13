@@ -5,78 +5,487 @@ All notable changes to Yuzu are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-03-21
+## [Unreleased]
+
+### Fixed
+
+- **`ci(release)`: filter `actions/download-artifact@v4` to `yuzu-*`
+  pattern.** The auto-generated `*.dockerbuild` provenance metadata files
+  (uploaded by docker buildx attestation) consistently failed download
+  with `Artifact download failed after 5 retries`, killing the Create
+  Release job for v0.10.0 on both the initial run and a `--failed`
+  retry. The v0.10.0 release was published manually from local instead,
+  at the cost of the `SHA256SUMS.bundle` cosign keyless attestation
+  (which requires the GitHub-Actions OIDC issuer
+  `token.actions.githubusercontent.com` and cannot be replicated from a
+  developer machine). The filter restores the cosign signature for
+  v0.10.1+ by skipping the broken artifacts entirely; the 10 `yuzu-*`
+  release binaries are unaffected.
+
+### Known issues
+
+- **#354** — Linux build job bundles a stale `yuzu-gateway 0.9.0`
+  package alongside the fresh `0.10.0` agent and server packages in the
+  `yuzu-linux-deb` and `yuzu-linux-rpm` artifacts. Discovered during the
+  manual v0.10.0 release on 2026-04-13. **The artifact-download flake
+  above masked this** — without the flake, v0.10.0 would have shipped a
+  corrupted release with mixed-version `.deb` / `.rpm` files
+  (`yuzu-gateway_0.9.0_amd64.deb` next to `yuzu-server_0.10.0_amd64.deb`).
+  The manual v0.10.0 release explicitly excluded the stale packages
+  when assembling assets locally. Root cause not yet investigated;
+  suspected ccache reuse from the v0.9.0 release run, hardcoded version
+  in a packaging script, or duplicate gateway packaging in the linux
+  build job that should defer to the dedicated `Build Gateway (Erlang)`
+  job. P1.
+
+## [0.10.0] - 2026-04-12
 
 ### Added
 
-#### Server
-- HTMX-based web dashboard with dark theme, role-based context bar, command palette
-- REST API v1 with CORS support and OpenAPI documentation (133+ endpoints)
-- Server-side response persistence with filtering, pagination, and aggregation (SQLite)
-- Audit trail system with structured JSON events and configurable retention
-- Device tagging system with hierarchical scope expression engine (AND/OR/NOT/LIKE/IN)
-- Instruction engine: YAML-defined definitions, sets, scheduling, approval workflows
-- Workflow primitives (if, foreach, retry) for multi-step instruction chains
-- Policy engine with CEL-like compliance expressions and fleet compliance dashboard
-- Granular RBAC with 6 roles, 14 securable types, per-operation permissions
-- Management groups for hierarchical device grouping and access scoping
-- OIDC SSO integration (tested with Microsoft Entra ID)
-- Token-based API authentication (Bearer and X-Yuzu-Token)
-- System notifications (in-app) and event subscriptions (webhooks with HMAC-SHA256)
-- Product packs with Ed25519 signature verification for bundled YAML distribution
-- Active Directory / Entra ID integration via Microsoft Graph API
-- Agent deployment jobs and patch deployment workflow orchestration
-- Device discovery (subnet scanning with ARP + ping sweep)
-- Custom properties on devices with schema validation
-- Runtime configuration API with safe key whitelist
-- Inventory table enumeration and item lookup
-- NVD CVE feed sync with vulnerability matching
-- ClickHouse and JSONL analytics event drains
-- Prometheus /metrics endpoint with fleet health gauges and request histograms
-- CSV and JSON data export
-- HTTPS for web dashboard with HTTP→HTTPS redirect
-- Error code taxonomy (1xxx-4xxx)
-- Concurrency enforcement (5 modes)
+- **`/governance` skill** at `.claude/skills/governance/SKILL.md` — a
+  reusable prompt-writing runbook for the Gate 1–7 governance pipeline
+  defined in CLAUDE.md. Provides parameterized agent preambles, the
+  Gate 3 domain-triggered decision matrix, conditional Gate 5 chaos
+  analysis, and a "Known patterns" section seeded with the five
+  failure modes caught in the #222/#224 governance run (sibling IDOR,
+  cycle-safe parity, error-branch info disclosure, enumeration oracle,
+  readiness probe coverage). Default range is `dev..HEAD` because
+  Yuzu's main working branch is `dev`, not `main`. Invoke with
+  `/governance <commit-range>` — the skill doesn't fully automate
+  (judgment calls on Gate 3 fan-out and Gate 5 skip still required)
+  but cuts per-run prompt-writing overhead roughly in half.
 
-#### Agent
-- Plugin architecture with stable C ABI (version 2, min 1) and C++ CRTP wrapper
-- 44 plugins: hardware, network, security, filesystem, registry, WMI, WiFi, WoL, and more
-- Trigger engine: interval, file_change, service_status, event_log, registry_change, startup
-- Agent-side key-value storage (SQLite-backed, per-plugin namespaces)
-- HTTP client plugin (cpp-httplib, no shell) with SSRF protection
-- Content staging and execution (CreateProcessW/fork+execvp, no system())
-- Desktop user interaction: notifications, questions, surveys, DND mode (Windows)
-- Timeline Activity Record (TAR): persistent process tree, network, service, user session tracking
-- OTA auto-update with hash verification and rollback
-- Bounded thread pool (4-32 workers, 1000 max queue) with output buffering
-- Windows certificate store integration (CryptoAPI/CNG)
-- Tiered agent enrollment (manual approval, pre-shared tokens, platform trust stubs)
+- New Prometheus metrics for the auth and audit subsystems:
+  `yuzu_server_token_cache_hits_total`, `yuzu_server_token_cache_misses_total`,
+  and `yuzu_server_token_cache_size` expose API-token cache effectiveness so
+  cold-cache stampedes after restart are visible to operators.
+  `yuzu_server_audit_events_total{result}` counts audit-event writes bucketed
+  by `success`/`failure`/`denied`/`other`.
+- `tests/test_changelog_order.py` enforces reverse-chronological ordering of
+  CHANGELOG sections (Keep a Changelog convention). Wired in as a meson test
+  (`changelog order`, suite `docs`) and as a new lightweight GitHub Actions
+  workflow (`Docs Lint`) that triggers on `CHANGELOG.md` / `docs/**` edits —
+  CHANGELOG drift is now caught in CI rather than discovered months later.
 
-#### Gateway
-- Erlang/OTP gateway node with process-per-agent supervision
-- Heartbeat buffer (dedicated gen_server, batched upstream flush)
-- Consistent hash ring for multi-gateway deployments
-- Prometheus metrics endpoint
+### Changed
 
-#### Infrastructure
-- Meson + vcpkg build system with cross-platform support (Windows/Linux/macOS/ARM64)
-- CI matrix: GCC 13, Clang 18, MSVC, Apple Clang, ARM64 cross-compile
-- AddressSanitizer, ThreadSanitizer, and code coverage CI jobs
-- Docker deployment (3 multi-stage Dockerfiles, docker-compose.yml)
-- Systemd service units with security hardening
-- GitHub Actions release workflow (3 platforms, SHA256 checksums)
-- 628+ unit test cases across 44 test files
+- **CodeQL workflow is manual-only and runs on the self-hosted Linux
+  runner.** `.github/workflows/codeql.yml` previously ran on
+  `ubuntu-24.04` via `push` to `main` + weekly schedule, consuming
+  GitHub-hosted Actions minutes on every merge. It now targets
+  `[self-hosted, Linux]` (same runner as `release.yml`) and triggers
+  only on `workflow_dispatch` — fire via the Actions UI or
+  `gh workflow run codeql.yml`. No `push`/`pull_request`/`schedule`
+  triggers, so it cannot gate PR merges and is not listed in any
+  branch protection required check. Output lands in the GitHub
+  Security tab under "Code scanning alerts" for informational review.
+  Preflight now uses the same `gcc-13 / cmake / ninja / meson / ccache`
+  dependency-check pattern as `release.yml`, uses the runner's
+  pre-installed vcpkg (drops `lukka/run-vcpkg@v11`), and wraps the
+  compiler with ccache for fast repeat runs. Private-repo caveat:
+  if the repo ever flips private, CodeQL will require GitHub
+  Advanced Security — the action enforces the entitlement check
+  server-side regardless of where the job runs.
 
-### Security
-- 51 security findings identified and fixed (5 CRITICAL, 15 HIGH, 15 MEDIUM, 16 LOW)
-- Eliminated 4 CRITICAL command injection vulnerabilities (replaced system()/popen() with safe alternatives)
-- mTLS for agent-server gRPC with certificate chain validation
-- PBKDF2 password hashing for local authentication
-- Command-line redaction in TAR (configurable patterns)
-- SSRF protection with private IP range blocking
-- Input validation on all REST API endpoints
-- Registry sensitive path audit logging
-- PRAGMA secure_delete on TAR database
+- **`integration-test.sh` — sleep-assert sweep, gateway-crash regex,
+  env-overridable ports.** Three drift fixes to
+  `scripts/integration-test.sh` that together reduce per-run
+  wall-clock and eliminate two assertion false positives:
+  1. **Heartbeat metric wait is now loop-poll, not sleep-assert.**
+     The previous `sleep 10` started before the agent finished
+     enrolling (which can take ~12s on a cold run with enrollment-
+     token retry backoff), so by the time the sleep ended the
+     agent's 5s-interval heartbeat thread hadn't fired yet and the
+     `yuzu_heartbeats_received_total` assertion failed with no
+     signal that the wait budget was wrong. Now a 30s loop-poll on
+     `/metrics` that exits the instant the counter appears — sub-
+     second on warm runs, still succeeds within 30s on cold runs.
+  2. **Gateway-stability regex tightened.** The old
+     `grep -qi "crash\|supervisor.*error\|SIGTERM"` tripped on
+     benign `[info]`-level diagnostic log lines of the form
+     `[info] crash: class=exit exception={noproc,...}` that the
+     gateway emits when an agent's first registration attempt
+     races the upstream `gen_server` startup (the agent's built-in
+     exponential backoff resolves it in ~6s). The regex now
+     matches only actual Erlang crash markers:
+     `CRASH REPORT|=ERROR REPORT|Supervisor: .* terminating|\[error\].*SIGTERM`.
+  3. **Env-overridable port defaults.** Every `SERVER_*_PORT` and
+     `GW_*_PORT` now uses `${VAR:-default}` so the script can
+     coexist with other live stacks — notably the docker UAT from
+     `scripts/docker-start-UAT.sh`, which binds `50055` and `50063`
+     on the host. Override pattern:
+     `SERVER_GW_PORT=50155 GW_MGMT_PORT=50163 bash scripts/integration-test.sh`.
+  Bonus sweep: replaced `sleep 3` gateway grpcbox startup with
+  `wait_for_port $GW_AGENT_PORT`, and `sleep 2` agent-disconnect
+  propagation with a 2s poll on `kill -0` of the killed PID.
+  Verified: 22/22 PASS on first run with zero flakes.
+
+- **Friction pass on build / test workflow** — four developer-experience
+  fixes from the governance-run retrospective:
+  - **Third-party warnings silenced.** Every `dependency()` in the
+    top-level `meson.build` and each subdirectory file now carries
+    `include_type: 'system'`, so vcpkg / gRPC / abseil / protobuf /
+    Catch2 deprecation warnings become `-isystem` includes and no
+    longer appear in compile output. Our own code remains under
+    `warning_level=3`. Compile logs dropped by dozens of lines per
+    incremental build without a wrapper script in the way.
+  - **Short test suite names.** `tests/meson.build` now attaches
+    `suite: 'agent' | 'server' | 'tar'` to each `test()` call, so
+    `meson test -C build-linux --suite server` works directly — no
+    more guessing `"yuzu:server unit tests"` or `"unit tests"`.
+  - **Stable top-level test binary paths.** New
+    `scripts/link-tests.sh` creates
+    `/tests-build-<component>-<triplet>/` directories (e.g.
+    `tests-build-server-linux_x64/yuzu_server_tests`) as symlinks
+    to the real build output. `scripts/setup.sh` runs it
+    automatically after configure. Gitignored. Binaries stay live
+    across rebuilds because the symlinks point at paths, not
+    contents. Catch2 tag filtering (e.g. `[token][owner]`) is now
+    one line from the repo root without remembering the build-dir
+    layout.
+  - **`.gitignore` cleanup.** Added `.codex`, `test_output.txt`,
+    `test_xml.txt`, `update.finished`, `node_modules/`,
+    `__pycache__/`, `gateway/.deps_cache/`, `gateway/ebin/`, and
+    `/tests-build-*/` so `git status` no longer carries session
+    noise from dev-machine artifacts.
+
+- **`CLAUDE.md` slimmed from 571 → 484 lines** by splitting three
+  implementation-detail sections into dedicated `docs/` files and
+  compressing four already-linked sections to pointers. The Auth &
+  Authorization feature history (inventory of mTLS, OIDC, AD/Entra,
+  Windows cert store, CSP construction, etc.) moved to
+  `docs/auth-architecture.md`; only the hard invariants that every
+  session must respect (mTLS, HTTPS default, localhost bind,
+  `/metrics` auth, owner-scoped token revoke) remain in CLAUDE.md.
+  The MCP server architecture and 22-tool inventory moved to
+  `docs/mcp-server.md`; only the tier-before-RBAC rule, kill-switch
+  flags, audit pattern, and `JObj`/`JArr` serialization rule remain.
+  The Windows build toolchain path table moved to
+  `docs/windows-build.md`; CLAUDE.md keeps the "MSYS2 bash +
+  `setup_msvc_env.sh`, NOT `vcvars64.bat`" rule. Instruction Engine,
+  Enterprise Readiness / SOC 2, Development Roadmap, and CI matrix
+  sections were compressed to pointers since the target docs already
+  exist. Build, Deploy, Release, Erlang Gateway, UAT Environment,
+  Darwin Compatibility, and Agent Team / Governance sections stay
+  resident intact — churning subsystems and areas that repeatedly
+  need re-loading belong in CLAUDE.md, not in `docs/`.
+
+- `AuthRoutes` exposes a public `resolve_session(req)` helper that performs the
+  three-tier auth resolution (cookie → `Authorization: Bearer` → `X-Yuzu-Token`)
+  used by `require_auth`, `make_audit_event`, and `emit_event`, plus the eight
+  call sites in `server.cpp` that previously inlined fragments of the same logic.
+  Removes a shadow copy of `extract_session_cookie` from `server.cpp`.
+
+- **Per-OS canonical build directory** — `scripts/setup.sh` now defaults the
+  build directory to `build-linux`, `build-windows`, or `build-macos` based on
+  the host OS so the same source tree can be configured concurrently from
+  WSL2 and a native Windows shell — and a separate macOS dev box — without
+  the build dirs trampling each other. The script refuses to reuse a build
+  dir whose `meson-info.json` source path was recorded on a different host
+  unless `--wipe` is passed (catches the opaque "ninja dyndep is not an
+  input" / Windows-path failures from cross-host reuse). It also stops
+  auto-wiping existing dirs — `--wipe` is now opt-in; default behaviour is
+  `meson setup --reconfigure` to preserve prior compilation state. The
+  legacy `builddir/` is gone from the tree; CLAUDE.md documents the
+  convention. `YUZU_BUILDDIR` env var still overrides everywhere.
+
+### Breaking
+
+- **API token revocation is owner-scoped** — non-admin users can no longer
+  revoke API tokens they do not own. A caller holding `ApiToken:Delete` may
+  revoke only tokens whose `principal_id` matches their session username;
+  the global `admin` role is the sole bypass. Deployments that used a
+  shared non-admin service account to rotate tokens for other principals
+  will begin receiving `HTTP 404 token not found` after upgrade. Either
+  grant the rotation account the global `admin` role, or refactor the
+  rotation so each principal owns its own token (recommended). The same
+  constraint applies to both `DELETE /api/v1/tokens/{id}` and
+  `DELETE /api/settings/api-tokens/{id}`. See
+  `docs/user-manual/server-admin.md` "Upgrade Notes" for details.
+
+### Fixed
+
+- **UAT script `python` vs `python3` drift.**
+  `scripts/docker-start-UAT.sh` (8 inline sites) and
+  `scripts/uat-command-test.sh` (2 inline sites) both invoked
+  `python -c` for JSON / regex parsing. WSL2 Ubuntu has no `python`
+  symlink — only `python3` — so every inline parser silently
+  returned empty string, and every downstream numeric check
+  degraded without error:
+  - `docker-start-UAT.sh`: the 10 embedded connectivity tests
+    (server registered count, gateway connected count, Prometheus
+    target count, ClickHouse event count, os_info round-trip
+    parsing) all read "0" or empty strings and reported test
+    failures against a stack that was actually working.
+  - `uat-command-test.sh`: every command dispatch reported
+    `dispatch error` because the `cmd_id` extraction returned
+    empty. All 138 test cases failed. After the fix: 136 PASS /
+    0 FAIL / 2 legitimate long-running-plugin timeouts
+    (`firewall.rules`, `chargen.chargen_start`).
+
+  Both scripts now use `python3 -c` via a mechanical sed fix.
+  Worth a broader audit:
+  `grep -rn '\bpython -c' scripts/` would surface any remaining
+  sites that were missed.
+
+- **`scripts/docker-start-UAT.sh` build dir detection.** The
+  script hardcoded `BUILDDIR=$YUZU_ROOT/builddir`, which predates
+  the per-OS build dir convention that landed in `830ba7c`. On a
+  fresh clone configured via `scripts/setup.sh`, the agent binary
+  now lives at `build-linux/agents/core/yuzu-agent` (or
+  `build-macos` / `build-windows`), and the preflight check
+  reported "yuzu-agent not found — run: meson compile -C builddir"
+  even though the binary existed under the new name. Fixed by
+  detecting the host OS and selecting `build-<os>`, falling back
+  to the legacy `builddir/` path for older trees. Also added
+  `Bash(bash scripts/docker-start-UAT.sh:*)` and the `./` variant
+  to the project allowlist at `.claude/settings.json`.
+
+- **Governance Gate 4 follow-up hardening** — Gate 4 unhappy-path and
+  consistency-auditor surfaced three new BLOCKING items on the prior
+  hardening round; all are addressed here:
+  - **Denied-branch token-table leak regression (UP-11)** — the prior
+    hardening round's new 404 denied branch on
+    `DELETE /api/settings/api-tokens/:id` called
+    `render_api_tokens_fragment()` which lists ALL users' tokens with no
+    principal filter. A non-owner probe therefore received a 404
+    response with a complete fleet-wide token table in the HTML body —
+    worse than the IDOR the round was closing. The denied branch now
+    returns a minimal static error fragment with no token data.
+  - **`render_api_tokens_fragment` cross-user enumeration (C1)** — the
+    same underlying `list_tokens()` leak affected the success-path
+    re-render (`POST`, `DELETE` success) and the `GET
+    /fragments/settings/api-tokens` panel load. The fragment now takes
+    a `filter_principal` argument. All four call sites pass
+    `session->username` for non-admin sessions and empty (full view)
+    for admins, matching the `GET /api/v1/tokens` scoping that
+    `rest_api_v1.cpp` already enforced. A new
+    `ApiTokenStore: list_tokens(principal) scopes results to owner`
+    unit test pins the store contract the fix relies on.
+  - **Audit-trail integrity, `principal_role` hardcoded `"admin"`
+    (C2, Gate 4 unhappy-path UP-9, Gate 4 happy-path SHOULD, Gate 2
+    re-review NICE)** — three audit emission sites in
+    `settings_routes.cpp` (token create, token revoke success, token
+    revoke denied) hardcoded `.principal_role = "admin"`. This was
+    benign when the panel was admin-only but became a forensic lie
+    once the hardening round opened the handlers to non-admin callers
+    with `ApiToken:Delete`. All three sites now read
+    `auth::role_to_string(session->role)`, matching the convention in
+    `auth_routes.cpp`.
+  - **Test fixture brittleness** — `create_token_for` in
+    `test_rest_api_tokens.cpp` used `listing.back()`, but
+    `list_tokens` orders by `created_at DESC`, so `.back()` is the
+    oldest token. Swapped to `.front()` with a comment so future
+    multi-token tests in the same harness do not silently regress.
+
+- **Governance hardening round for #222 and #224** — Gate 2 security review
+  on the original fixes surfaced two HIGH sibling findings that are
+  addressed here:
+  - **Dashboard IDOR** — `DELETE /api/settings/api-tokens/:token_id` (the
+    HTMX Settings path) had the same ownership gap as the REST handler
+    closed by #222. It now looks up the token, rejects cross-user revokes
+    with a generic 404 fragment, and emits a `denied` audit event with
+    `detail=owner=<principal>` so forensics can tell an enumeration probe
+    from a real not-found.
+  - **`get_ancestor_ids` cycle safety** — the companion BFS-upward walk
+    in `ManagementGroupStore` still had no visited-node tracking, only a
+    depth-10 cap. `RbacStore::check_scoped_permission` unions ancestors
+    into the set of groups used for role resolution, so on a cyclic DB a
+    user could inherit spurious permissions from phantom ancestors
+    reported by the cycle's alternating output. `get_ancestor_ids` now
+    carries the same `unordered_set<std::string> visited` + warning-log
+    pattern as `get_descendant_ids`.
+  - **Enumeration oracle closed on REST `DELETE /api/v1/tokens/:id`** —
+    the original fix returned `403 "cannot revoke another user's API
+    token"` for cross-user revokes, which let a non-owner with
+    `ApiToken:Delete` distinguish "token does not exist" (404) from
+    "exists but not yours" (403) and enumerate valid token ids. Both
+    paths now return `404 "token not found"` with an identical response
+    body; the audit log still carries the distinction server-side via
+    `result=denied` + `detail=owner=<principal>`.
+  - **`create_group` self-parent** — the create path accepted a
+    caller-supplied `group.id == group.parent_id` and produced an
+    immediate 1-row self-cycle. It now returns
+    `"group cannot be its own parent"` from the same layer as
+    `update_group`.
+  - **REST-handler test coverage (#222 follow-up)** — the original fix
+    landed with store-level coverage only. A new
+    `tests/unit/server/test_rest_api_tokens.cpp` spins up a real
+    `httplib::Server` on a random port, registers `RestApiV1` routes
+    with mock `auth_fn`/`perm_fn`/`audit_fn`, and exercises all four
+    paths end-to-end: owner self-revoke, admin cross-user bypass,
+    non-owner → 404 (no oracle), unknown id → 404 (no audit). 5 HTTP
+    cases, 55 assertions, plus the existing store-level cases.
+  - **Store-test fixture parallelism** — both
+    `test_management_group_store.cpp` and `test_api_token_store.cpp`
+    used hardcoded SQLite paths (`/tmp/test_mgmt_groups.db`,
+    `/tmp/test_api_tokens.db`) that would collide under
+    `meson test --num-processes N`. Each `TempDb` now builds a unique
+    path per instance from `std::thread::id` + `steady_clock`, matching
+    the `unique_temp_path` pattern already used in
+    `test_rest_api_t2.cpp`.
+  - **Deep / self-loop cycle regression tests** — the original fix
+    only tested a 2-node cycle. New cases exercise a 3-node A→B→C→A
+    cycle and the degenerate self-loop `parent_id == id` on a single
+    row. A reparent-to-root regression test guards the null-bind
+    branch in `update_group` that the cycle/depth block now gates on.
+
+- **API token revocation is now owner-scoped (#222)** — `DELETE
+  /api/v1/tokens/:token_id` previously required only `ApiToken:Delete`
+  permission without verifying ownership, so any user with that
+  permission could enumerate token IDs (the handler always returned 404
+  for unknown IDs but 200 for any real token) and revoke other users'
+  tokens. The handler now looks up the token via a new
+  `ApiTokenStore::get_token(token_id)` method, rejects cross-user
+  revokes with `403` and a `denied` audit event, and only allows the
+  bypass for callers holding the global `admin` role. Owner-scoped
+  audit detail (`owner=<principal>`) is logged on both success and
+  denial paths so forensics can distinguish intent.
+
+- **`get_descendant_ids` is cycle-safe; `update_group` validates
+  `parent_id` (#224)** — the management-group BFS traversal had no
+  visited-node tracking and no depth cap, so any existing cycle in
+  `management_groups.parent_id` (injectable via legacy tooling or
+  bugs) would hang the server thread indefinitely. It now carries an
+  `unordered_set<std::string> visited` and a `10_000` node safety cap,
+  logging a warning if the cap is hit. Independently,
+  `ManagementGroupStore::update_group` now rejects self-parent,
+  parent-not-found, cycle-forming, and depth-exceeding updates at the
+  store layer so non-REST callers (admin tooling, tests, future
+  endpoints) cannot bypass the checks that previously only lived in
+  the REST handler. Store unit tests cover injected-cycle termination
+  via a direct SQLite write that mimics on-disk corruption.
+
+- **Docker-compose UAT image tags parameterized** — `docker-compose.uat.yml`
+  was shipping with hardcoded `ghcr.io/tr3kkr/yuzu-{server,gateway}:0.8.1-rc0`
+  references that were not updated when the version bumped to 0.9.0, so a
+  tester running the file fresh would pull the wrong images. The tags are
+  now parameterized as `${YUZU_VERSION:-0.9.0}` so operators can override at
+  `docker compose up` time, and a new `scripts/check-compose-versions.sh`
+  runs as the first step of the release workflow's `release:` job — it
+  rejects any hardcoded `yuzu-{server,gateway,agent}:X.Y.Z` references in
+  tracked compose files and verifies the parameterized default matches the
+  tag being released, so a stale default blocks the release before any
+  assets are published. A corrected `docker-compose.uat.yml` was uploaded as
+  a v0.9.0 GitHub release asset to unblock current UAT testers.
+
+- Login page no longer renders `[object Object]` on bad credentials. The inline
+  JS in `login_ui.cpp` was reading `resp.error` directly from the structured
+  error envelope (`{"error":{"code":N,"message":"..."}}`) and assigning the
+  object to `textContent`. It now reads `resp.error.message`, with a string
+  fallback for legacy responses and a status-keyed default if parsing fails.
+  Fixes #333.
+
+- **`ConcurrencyManager::try_acquire` TOCTOU race** — the count-then-insert
+  sequence used a separate `SELECT COUNT(*)` and `INSERT OR IGNORE`, so two
+  concurrent callers could each read `count < limit`, each insert, and exceed
+  the configured `global:N` or `per-definition` cap. `SQLITE_OPEN_FULLMUTEX`
+  serializes individual API calls but does not bind two-statement sequences
+  together, so it could not catch this. Fix collapses the check and write
+  into a single atomic statement: `INSERT OR IGNORE … SELECT … WHERE
+  (SELECT COUNT(*) …) < ?`. The COUNT subquery and the INSERT execute as
+  one statement under SQLite's per-statement write lock, so the cap is now
+  honored under contention. Idempotent re-acquire of the same
+  `(definition_id, execution_id)` is preserved via a follow-up existence
+  check on the no-op path. Removes the dead `std::shared_mutex mtx_` member
+  in `ConcurrencyManager` and `ScheduleEngine` (declared but never acquired
+  by any method) — both classes prepare-and-finalize their statements per
+  call, so the application-level mutex is unnecessary on top of FULLMUTEX.
+  Fixes #330.
+
+- **Audit Trail Integrity Fix (YZA-2026-001)** — Audit log and analytics event
+  rows for requests authenticated via `Authorization: Bearer` or `X-Yuzu-Token`
+  now populate the `principal` and `principal_role` fields. Previously these
+  helpers resolved the principal from the session cookie only, so every
+  API-token-authenticated request — including every MCP tool call — wrote audit
+  rows with empty `principal`, breaking attribution for SOC 2 evidence purposes.
+  The same gap affected `def.created_by` on instruction creation,
+  `sched.created_by` on schedule creation, the `user` recorded by execution
+  rerun/cancel, and the `reviewer` recorded by approval approve/reject.
+
+  This is a forward-only fix: pre-fix audit rows are not backfilled. Operators
+  auditing a window that spans v0.9.0 (released 2026-04-11) and v0.10.0 should
+  expect a bimodal `principal` distribution split at the merge date — pre-fix
+  token-authenticated rows will have empty `principal`. Cookie auth and login
+  flows are unchanged.
+
+### Tests
+
+Test-suite changes are listed separately so other teams can follow test
+development independently from the primary software changelog.
+
+- **TOCTOU regression test for `ConcurrencyManager`** — new `[threading]`
+  cases in `tests/unit/server/test_concurrency_manager.cpp` race 64 threads
+  against `try_acquire("global:3")` and `per-definition` on a
+  `SQLITE_OPEN_FULLMUTEX` `:memory:` connection, asserting that exactly the
+  configured limit wins. Adds a `TestDbMt` RAII helper for thread-safe
+  in-memory connections, and a non-threaded idempotent re-acquire case.
+  Server unit-test count: 1112 → 1128 cases.
+
+- **`scripts/run-tests.sh` (and integration / UAT scripts) honour the per-OS
+  canonical build directory** — `build-linux` / `build-windows` / `build-macos`
+  selected from `uname` (and overridable via `YUZU_BUILDDIR`). Removes the
+  hard-coded `builddir/` path that broke under WSL2 once the Windows-side
+  build dir disappeared.
+
+- **`run-tests.sh erlang-unit` invokes `rebar3 eunit --dir=apps/yuzu_gw/test`**
+  — works around rebar3 3.27 auto-discovery rejecting test modules whose name
+  has no 1:1 src/ counterpart (`circuit_breaker_tests`, `env_override_tests`,
+  `scale_tests`, every `*_SUITE` file, etc.). The bare `rebar3 eunit`
+  invocation would error out with "Module … not found in project" before
+  running any test. Tracking issue: #337.
+
+- **Gateway eunit fixture leak: `agent_tests:starts_streaming` cancellation**
+  — `yuzu_gw_health_nf_tests:cleanup/1` only killed the mock pids it captured
+  in `setup/0`, but the `readyz_503_dead_process` test kills the original
+  `yuzu_gw_registry` mock and re-registers a fresh `mock_loop/0` pid that the
+  cleanup tracking never sees. The leaked mock survived into every subsequent
+  test module; downstream tests checked `whereis(yuzu_gw_registry)` and
+  reused it as if it were the real gen_server. When `agent_tests:setup`
+  fired, `yuzu_gw_agent:init/1` issued `gen_server:call(yuzu_gw_registry,
+  {register, …})` against the mock, which received the message and silently
+  recursed without replying — eunit cancelled the call at its 5-second limit
+  and the rest of `agent_tests` (14 tests) never ran. The full eunit suite
+  reported "Passed: 132. One or more tests were cancelled" instead of the
+  expected 148. Fixes:
+  - `health_nf_tests:cleanup/1` now looks up the *current* registered pid
+    via `whereis/1` for each name it owned at setup time, so re-registered
+    mocks are killed too.
+  - `agent_tests:setup/0` defensively detects a stale mock under
+    `yuzu_gw_registry` (anything whose `proc_lib:initial_call/1` is not
+    `{gen_server, init_it, _}`), unregisters it, and starts a real
+    registry — guarding against the same class of leak from any future
+    test module.
+  - `agent_tests:setup/0` also asserts `whereis(yuzu_gw_upstream) =:=
+    undefined` so meck-coexisting-with-a-live-gen_server failures fail
+    loudly at the boundary instead of producing opaque downstream timeouts.
+  - `circuit_breaker_nf_tests`, `circuit_breaker_tests`, and
+    `upstream_tests` cleanup paths now use synchronous
+    `gen_server:stop(Pid, shutdown, 5000)` instead of `exit(Pid, shutdown)
+    + timer:sleep(50)`. The sleep was racy on busy boxes (WSL2 in
+    particular) and could leave the upstream gen_server alive into the
+    next test module. Eunit count: 133 passing (with all 15 `agent_tests`
+    cases cancelled) → 148 passing. Fixes #336.
+
+- **`scripts/integration-test.sh` fixes** — admin password bumped from 8 to
+  12 characters to satisfy the post-v0.9 length requirement; `--no-https`
+  added so the server starts without TLS in test mode; port matrix split so
+  single-host gateway + server no longer collide on 50051 (server `5005x`,
+  gateway `5006x`); `YUZU_KEEP_WORK_DIR=1` env var preserves
+  `/tmp/yuzu-integration.*` after teardown for post-mortem of failed runs.
+
+- **`scripts/linux-start-UAT.sh` `kill_stale` matches the gateway** —
+  `pgrep -f "beam.smp"` is replaced with `pgrep -f "yuzu_gw[/_]"` because
+  the rebar3 release wrapper rewrites `cmdline` so the binary name doesn't
+  appear in `/proc/$pid/cmdline`. Previous behaviour leaked the gateway
+  beam between UAT runs and tied up port 9568 / 50063 indefinitely.
+
+- **`scripts/e2e-security-test.sh` no longer skips on missing creds** —
+  honours `YUZU_ADMIN_PASS` env var, then auto-detects against the canonical
+  UAT password (`YuzuUatAdmin1!`) and the post-tightening `adminpassword1`
+  before falling back to legacy short passwords. Hard-fails if no candidate
+  works rather than silently skipping the auth-bearing test categories.
+  Brings the security suite from 33 → 60 tests against a live UAT stack.
 
 ## [0.9.0] - 2026-04-11
 
@@ -185,6 +594,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/test-coverage.md` registers the new `test_security_headers.cpp` and `test_static_js_bundle.cpp` suites.
 - `docs/user-manual/rest-api.md` cross-links to the new HTTP Security Response Headers section.
 - `docs/user-manual/server-admin.md` documents the new `--csp-extra-sources` flag with rejection grammar.
+
 
 ## [0.7.1] - 2026-04-08
 
@@ -464,3 +874,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Documentation
 - macOS x64 limitation documented in README and user manual
 - cliff.toml added for git-cliff changelog automation
+
+## [0.1.0] - 2026-03-21
+
+### Added
+
+#### Server
+- HTMX-based web dashboard with dark theme, role-based context bar, command palette
+- REST API v1 with CORS support and OpenAPI documentation (133+ endpoints)
+- Server-side response persistence with filtering, pagination, and aggregation (SQLite)
+- Audit trail system with structured JSON events and configurable retention
+- Device tagging system with hierarchical scope expression engine (AND/OR/NOT/LIKE/IN)
+- Instruction engine: YAML-defined definitions, sets, scheduling, approval workflows
+- Workflow primitives (if, foreach, retry) for multi-step instruction chains
+- Policy engine with CEL-like compliance expressions and fleet compliance dashboard
+- Granular RBAC with 6 roles, 14 securable types, per-operation permissions
+- Management groups for hierarchical device grouping and access scoping
+- OIDC SSO integration (tested with Microsoft Entra ID)
+- Token-based API authentication (Bearer and X-Yuzu-Token)
+- System notifications (in-app) and event subscriptions (webhooks with HMAC-SHA256)
+- Product packs with Ed25519 signature verification for bundled YAML distribution
+- Active Directory / Entra ID integration via Microsoft Graph API
+- Agent deployment jobs and patch deployment workflow orchestration
+- Device discovery (subnet scanning with ARP + ping sweep)
+- Custom properties on devices with schema validation
+- Runtime configuration API with safe key whitelist
+- Inventory table enumeration and item lookup
+- NVD CVE feed sync with vulnerability matching
+- ClickHouse and JSONL analytics event drains
+- Prometheus /metrics endpoint with fleet health gauges and request histograms
+- CSV and JSON data export
+- HTTPS for web dashboard with HTTP→HTTPS redirect
+- Error code taxonomy (1xxx-4xxx)
+- Concurrency enforcement (5 modes)
+
+#### Agent
+- Plugin architecture with stable C ABI (version 2, min 1) and C++ CRTP wrapper
+- 44 plugins: hardware, network, security, filesystem, registry, WMI, WiFi, WoL, and more
+- Trigger engine: interval, file_change, service_status, event_log, registry_change, startup
+- Agent-side key-value storage (SQLite-backed, per-plugin namespaces)
+- HTTP client plugin (cpp-httplib, no shell) with SSRF protection
+- Content staging and execution (CreateProcessW/fork+execvp, no system())
+- Desktop user interaction: notifications, questions, surveys, DND mode (Windows)
+- Timeline Activity Record (TAR): persistent process tree, network, service, user session tracking
+- OTA auto-update with hash verification and rollback
+- Bounded thread pool (4-32 workers, 1000 max queue) with output buffering
+- Windows certificate store integration (CryptoAPI/CNG)
+- Tiered agent enrollment (manual approval, pre-shared tokens, platform trust stubs)
+
+#### Gateway
+- Erlang/OTP gateway node with process-per-agent supervision
+- Heartbeat buffer (dedicated gen_server, batched upstream flush)
+- Consistent hash ring for multi-gateway deployments
+- Prometheus metrics endpoint
+
+#### Infrastructure
+- Meson + vcpkg build system with cross-platform support (Windows/Linux/macOS/ARM64)
+- CI matrix: GCC 13, Clang 18, MSVC, Apple Clang, ARM64 cross-compile
+- AddressSanitizer, ThreadSanitizer, and code coverage CI jobs
+- Docker deployment (3 multi-stage Dockerfiles, docker-compose.yml)
+- Systemd service units with security hardening
+- GitHub Actions release workflow (3 platforms, SHA256 checksums)
+- 628+ unit test cases across 44 test files
+
+### Security
+- 51 security findings identified and fixed (5 CRITICAL, 15 HIGH, 15 MEDIUM, 16 LOW)
+- Eliminated 4 CRITICAL command injection vulnerabilities (replaced system()/popen() with safe alternatives)
+- mTLS for agent-server gRPC with certificate chain validation
+- PBKDF2 password hashing for local authentication
+- Command-line redaction in TAR (configurable patterns)
+- SSRF protection with private IP range blocking
+- Input validation on all REST API endpoints
+- Registry sensitive path audit logging
+- PRAGMA secure_delete on TAR database
+

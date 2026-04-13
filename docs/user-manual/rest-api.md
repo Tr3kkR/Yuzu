@@ -329,8 +329,11 @@ Update a management group. Only the fields provided in the request body are chan
 **Validation rules:**
 
 - The root group (`000000000000`, "All Devices") cannot be re-parented. Attempting to set `parent_id` on the root group returns `400`.
+- **Self-parent:** A group cannot be set as its own parent. Returns `400`.
 - **Cycle detection:** The new parent must not be a descendant of the group being updated. Moving a group under one of its own children would create a circular hierarchy and returns `400`.
 - **Depth limit:** Re-parenting must not exceed the maximum hierarchy depth of 5 levels. Returns `400` if exceeded.
+
+All validation runs at the `ManagementGroupStore` layer as well as the REST handler, so non-REST administrative callers cannot bypass cycle or depth checks.
 
 **Response:**
 
@@ -346,6 +349,24 @@ Update a management group. Only the fields provided in the request body are chan
 ```json
 {
   "error": "re-parenting would create a cycle",
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- self-parent:**
+
+```json
+{
+  "error": "group cannot be its own parent",
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- depth exceeded:**
+
+```json
+{
+  "error": "maximum hierarchy depth (5) exceeded",
   "meta": { "api_version": "v1" }
 }
 ```
@@ -604,11 +625,27 @@ Revoke an API token. The token becomes immediately unusable.
 
 **Permission:** `ApiToken:Delete`
 
+**Ownership constraint:** A caller with `ApiToken:Delete` may only revoke tokens they created. The global `admin` role is the sole bypass and may revoke any token. Attempting to revoke another user's token returns `404 token not found` — identical to the response for a token that does not exist — so the endpoint cannot be used as an enumeration oracle by a non-owner with `ApiToken:Delete`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so forensics can distinguish a probe from a legitimate self-revoke.
+
+The same ownership constraint applies to the HTMX dashboard path `DELETE /api/settings/api-tokens/{token_id}`.
+
 **Response:**
 
 ```json
 {
   "data": { "revoked": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (404) -- token not found or not owned by caller:**
+
+```json
+{
+  "error": {
+    "code": 404,
+    "message": "token not found"
+  },
   "meta": { "api_version": "v1" }
 }
 ```
@@ -1079,7 +1116,7 @@ Query audit events.
 | `management_group.assign_role` | Role assigned on group |
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
-| `api_token.revoke` | API token revoked |
+| `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |

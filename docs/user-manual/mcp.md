@@ -484,13 +484,21 @@ rotation schedule:
 ### Audit trail
 
 Every MCP tool invocation is logged in the audit trail with action
-`mcp.<tool_name>` (e.g., `mcp.list_agents`, `mcp.query_audit_log`). Use the
-`query_audit_log` tool or the REST API to review MCP activity:
+`mcp.<tool_name>` (e.g., `mcp.list_agents`, `mcp.query_audit_log`). The acting
+operator (the token owner) is recorded in the `principal` field of each
+`mcp.*` event. Use the `query_audit_log` tool or the REST API to review MCP
+activity:
 
 ```bash
 curl -s -b cookies.txt \
   'https://localhost:8080/api/v1/audit?action=mcp.&limit=100'
 ```
+
+> **Known issue in v0.9.0 (advisory YZA-2026-001):** `mcp.*` audit rows in
+> v0.9.0 had an empty `principal` field due to a bug in the audit-event
+> construction path. Rows still recorded the action and target, but could not
+> attribute the call to a specific token. Fixed forward in v0.10.0; pre-fix
+> rows are not backfilled. See `CHANGELOG.md` for the full remediation note.
 
 ---
 

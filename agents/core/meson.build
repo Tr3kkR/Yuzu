@@ -1,7 +1,7 @@
 # Platform-specific crypto for updater SHA-256 verification
 # Windows: bcrypt.lib linked via #pragma comment(lib) in source files
 if host_machine.system() != 'windows'
-  agent_openssl_dep = dependency('openssl', required: true)
+  agent_openssl_dep = dependency('openssl', required: true, include_type: 'system')
   agent_crypto_deps = [agent_openssl_dep]
 else
   agent_crypto_deps = []

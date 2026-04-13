@@ -106,20 +106,34 @@ fi
 log "Server reachable (login page returned $PREFLIGHT)."
 
 # ── Preflight: determine admin password ────────────────────────────────
-# Try common default passwords; use whichever succeeds.
+# YUZU_ADMIN_PASS env var wins. Otherwise try the canonical UAT password
+# first, then fall back to historical defaults. Server enforces ≥12 chars,
+# so anything shorter is dead weight (kept here only for legacy compat).
 log "Detecting admin credentials..."
-for candidate_pass in "password" "admin" "Password1" "changeme"; do
+if [[ -n "${YUZU_ADMIN_PASS:-}" ]]; then
     LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
         -X POST "${SERVER_URL}/login" \
-        -d "username=${ADMIN_USER}&password=${candidate_pass}" 2>/dev/null || echo "000")
+        -d "username=${ADMIN_USER}&password=${YUZU_ADMIN_PASS}" 2>/dev/null || echo "000")
     if [[ "$LOGIN_STATUS" == "200" ]]; then
-        ADMIN_PASS="$candidate_pass"
-        break
+        ADMIN_PASS="$YUZU_ADMIN_PASS"
     fi
-done
+fi
+if [[ -z "$ADMIN_PASS" ]]; then
+    for candidate_pass in "YuzuUatAdmin1!" "adminpassword1" "Password1234" "password" "admin" "Password1" "changeme"; do
+        LOGIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${SERVER_URL}/login" \
+            -d "username=${ADMIN_USER}&password=${candidate_pass}" 2>/dev/null || echo "000")
+        if [[ "$LOGIN_STATUS" == "200" ]]; then
+            ADMIN_PASS="$candidate_pass"
+            break
+        fi
+    done
+fi
 
 if [[ -z "$ADMIN_PASS" ]]; then
-    log "WARNING: Could not auto-detect admin password. Some tests requiring auth will be skipped."
+    echo "FAIL: Could not auto-detect admin password." >&2
+    echo "      Set YUZU_ADMIN_PASS=<password> and rerun, or check the running server's config." >&2
+    exit 1
 else
     log "Admin credentials detected (user=$ADMIN_USER)."
 fi

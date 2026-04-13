@@ -22,7 +22,17 @@
 set -euo pipefail
 
 YUZU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDDIR="${YUZU_BUILDDIR:-$YUZU_ROOT/builddir}"
+
+# Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
+# This script is named linux-start-UAT.sh but defaults sensibly on macOS too;
+# WSL2 falls under Linux. Override with YUZU_BUILDDIR=path.
+if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
+    BUILDDIR="$YUZU_BUILDDIR"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    BUILDDIR="$YUZU_ROOT/build-macos"
+else
+    BUILDDIR="$YUZU_ROOT/build-linux"
+fi
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="/tmp/yuzu-uat"
 
@@ -57,12 +67,14 @@ kill_stale() {
         fi
     done
 
-    # Erlang BEAM (gateway)
+    # Erlang BEAM (gateway). Match by yuzu_gw release path or node name
+    # rather than beam.smp — release scripts rewrite cmdline so the binary
+    # name doesn't appear in /proc/$pid/cmdline.
     local beam_pids
-    beam_pids=$(pgrep -f "beam.smp" 2>/dev/null || true)
+    beam_pids=$(pgrep -f "yuzu_gw[/_]" 2>/dev/null || true)
     if [ -n "$beam_pids" ]; then
         echo "$beam_pids" | xargs kill -9 2>/dev/null || true
-        ok "Killed gateway/beam.smp (PIDs: $(echo $beam_pids | tr '\n' ' '))"
+        ok "Killed yuzu_gw beam (PIDs: $(echo $beam_pids | tr '\n' ' '))"
         killed=$((killed + 1))
     fi
 
@@ -131,12 +143,12 @@ start_all() {
     # ── Preflight checks ────────────────────────────────────────────────
     if [ ! -f "$BUILDDIR/server/core/yuzu-server" ]; then
         fail "yuzu-server not found at $BUILDDIR/server/core/yuzu-server"
-        echo "    Run: meson compile -C builddir"
+        echo "    Run: meson compile -C $(basename "$BUILDDIR")"
         exit 1
     fi
     if [ ! -f "$BUILDDIR/agents/core/yuzu-agent" ]; then
         fail "yuzu-agent not found at $BUILDDIR/agents/core/yuzu-agent"
-        echo "    Run: meson compile -C builddir"
+        echo "    Run: meson compile -C $(basename "$BUILDDIR")"
         exit 1
     fi
     if [ ! -d "$GATEWAY_DIR/_build/prod/rel/yuzu_gw" ]; then

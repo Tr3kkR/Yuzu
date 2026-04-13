@@ -88,10 +88,21 @@ cleanup({_Port, HealthPid, UpPid, MockPids}) ->
     %% Synchronous shutdown — wait for actual death via monitors.
     sync_stop(HealthPid),
     sync_stop(UpPid),
+    %% For each mock name we owned at setup time, kill whatever is
+    %% currently registered under that name. readyz_503_dead_process
+    %% kills the original mock and re-registers a fresh mock_loop pid;
+    %% the original Pid in MockPids is already dead by then, so we have
+    %% to look up the *current* registered pid via whereis/1 to avoid
+    %% leaking the second mock into later test modules. See #336.
     lists:foreach(fun
-        ({Name, Pid, true}) ->
-            catch unregister(Name),
-            catch exit(Pid, kill);
+        ({Name, _OrigPid, true}) ->
+            case whereis(Name) of
+                undefined ->
+                    ok;
+                CurrentPid ->
+                    catch unregister(Name),
+                    catch exit(CurrentPid, kill)
+            end;
         ({_Name, _Pid, false}) ->
             ok
     end, MockPids),

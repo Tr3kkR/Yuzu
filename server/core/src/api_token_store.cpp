@@ -224,14 +224,18 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
                 auto now = now_epoch();
                 if (cached.revoked || (cached.expires_at > 0 && now > cached.expires_at)) {
                     token_cache_.erase(it);
+                    cache_misses_.fetch_add(1, std::memory_order_relaxed);
                     return std::nullopt;
                 }
+                cache_hits_.fetch_add(1, std::memory_order_relaxed);
                 return cached;
             }
             // Expired cache entry — remove and fall through to DB lookup
             token_cache_.erase(it);
         }
     }
+
+    cache_misses_.fetch_add(1, std::memory_order_relaxed);
 
     // Cache miss — query SQLite (lock db for the read + update sequence)
     std::unique_lock db_lock(db_mtx_);
@@ -298,6 +302,11 @@ void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
     token_cache_.erase(token_hash);
 }
 
+std::size_t ApiTokenStore::cache_size() const {
+    std::lock_guard cache_lock(cache_mtx_);
+    return token_cache_.size();
+}
+
 std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id) const {
     std::vector<ApiToken> result;
     if (!db_)
@@ -331,6 +340,39 @@ std::vector<ApiToken> ApiTokenStore::list_tokens(const std::string& principal_id
         t.revoked = sqlite3_column_int(s, 8) != 0;
         t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 9)));
         result.push_back(std::move(t));
+    }
+    sqlite3_finalize(s);
+    return result;
+}
+
+std::optional<ApiToken> ApiTokenStore::get_token(const std::string& token_id) const {
+    if (!db_ || token_id.empty())
+        return std::nullopt;
+
+    std::shared_lock db_lock(db_mtx_);
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT token_id, name, principal_id, scope_service, created_at, "
+                           "expires_at, last_used_at, revoked, mcp_tier FROM api_tokens "
+                           "WHERE token_id = ?;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::optional<ApiToken> result;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        ApiToken t;
+        t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+        t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
+        t.scope_service = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
+        t.created_at = sqlite3_column_int64(s, 4);
+        t.expires_at = sqlite3_column_int64(s, 5);
+        t.last_used_at = sqlite3_column_int64(s, 6);
+        t.revoked = sqlite3_column_int(s, 7) != 0;
+        t.mcp_tier = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 8)));
+        result = std::move(t);
     }
     sqlite3_finalize(s);
     return result;

@@ -911,7 +911,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    svr.Delete(R"(/api/v1/tokens/(.+))", [perm_fn, audit_fn, token_store](
+    svr.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
                                              const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -921,14 +921,47 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             return;
         }
 
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+
         auto token_id = req.matches[1].str();
-        bool revoked = token_store->revoke_token(token_id);
-        if (!revoked) {
+
+        // Owner-scoped revocation (fixes #222). `ApiToken:Delete` alone is
+        // not sufficient — callers must either own the token or hold the
+        // global admin role. Without this a user with Delete permission
+        // could enumerate and revoke any other user's tokens (IDOR).
+        //
+        // Both the missing-id and the not-owner cases return 404 with an
+        // identical response body so the endpoint does not become an
+        // enumeration oracle (gov-Gate2 sec-M3). The audit log still
+        // distinguishes the two cases via the `result` field (`denied`
+        // vs. no event) and the `owner=` detail so forensics can see who
+        // tried to revoke whose token.
+        auto existing = token_store->get_token(token_id);
+        bool denied =
+            existing && existing->principal_id != session->username &&
+            session->role != auth::Role::admin;
+        if (!existing || denied) {
+            if (denied) {
+                audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
+                         "owner=" + existing->principal_id);
+            }
             res.status = 404;
             res.set_content(error_json("token not found"), "application/json");
             return;
         }
-        audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id, "");
+
+        bool revoked = token_store->revoke_token(token_id);
+        if (!revoked) {
+            // Either the token vanished between get and revoke, or the
+            // revoke call itself failed. Treat as not-found for the client.
+            res.status = 404;
+            res.set_content(error_json("token not found"), "application/json");
+            return;
+        }
+        audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
+                 "owner=" + existing->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
 

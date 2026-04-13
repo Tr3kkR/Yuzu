@@ -135,6 +135,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ---
 
+## Upgrade Notes
+
+### v0.10.0 — API token revocation is owner-scoped
+
+Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
+
+**If your deployment uses a non-admin service account to rotate tokens for other principals** — for example, a shared `ops` role that recycles service-account tokens on a schedule — those rotations will begin receiving `HTTP 404 token not found` after upgrade. To restore the behavior, either:
+
+1. Assign the rotation account the global `admin` role, or
+2. Refactor the rotation so each principal owns and rotates its own token.
+
+Option (2) is the recommended long-term posture because it aligns with least-privilege. The same ownership constraint applies to both the REST path `DELETE /api/v1/tokens/{id}` and the HTMX dashboard path `DELETE /api/settings/api-tokens/{id}`. Denied attempts are recorded in the audit log with `action=api_token.revoke`, `result=denied`, and `detail=owner=<real owner>` so operators can distinguish an enumeration probe from a legitimate self-revoke.
+
+Both paths return `HTTP 404 token not found` on a cross-user revoke attempt — identical to the response for a truly-nonexistent token — to prevent the endpoint from being used as an enumeration oracle.
+
+---
+
 ## Settings Page
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
@@ -543,6 +560,7 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 | `deploy/docker/Dockerfile.gateway` | Erlang/OTP build for the gateway node |
 | `deploy/docker/docker-compose.yml` | Standalone stack (server + agent + monitoring) |
 | `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
+| `docker-compose.uat.yml` | Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse) |
 
 **Usage:**
 
@@ -552,6 +570,16 @@ docker compose up -d          # start all services
 docker compose logs -f        # follow logs
 docker compose down           # stop all services
 ```
+
+**Pinning a specific release with `docker-compose.uat.yml`:**
+
+The top-level UAT compose file parameterises its `ghcr.io/.../yuzu-server` and `yuzu-gateway` tags through `${YUZU_VERSION:-<default>}`. The default tracks the latest published release, but operators testing an earlier or newer image can override at the command line:
+
+```bash
+YUZU_VERSION=0.9.0 docker compose -f docker-compose.uat.yml up -d
+```
+
+A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first step of the release workflow and blocks asset publication if any tracked compose file carries a hardcoded `X.Y.Z` tag or a `${YUZU_VERSION:-...}` default that does not match the release tag — so the default in the checked-in file is guaranteed to match the latest shipped release.
 
 **Exposed ports:**
 

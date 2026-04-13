@@ -94,8 +94,8 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian** f
 2. `git pull` — fast-forward to latest dev.
 3. `git diff HEAD~N..HEAD --stat` — review what changed.
 4. Identify which previous Darwin fixes are still present in the new tree.
-5. `meson setup builddir --reconfigure ...` if `meson.build` changed.
-6. `meson compile -C builddir` — fix any new compile errors.
+5. `meson setup build-macos --reconfigure ...` if `meson.build` changed.
+6. `meson compile -C build-macos` — fix any new compile errors.
 7. `bash scripts/run-tests.sh all` — fix any new test failures.
 8. Commit clean with a Darwin-fix commit message.
 
@@ -118,13 +118,62 @@ The gateway (`gateway/`) is a standalone rebar3 project. It compiles independent
 ### Build & verify commands
 ```bash
 cd gateway
-rebar3 compile                # compile
-rebar3 eunit                  # unit tests (148 tests)
-rebar3 dialyzer               # type analysis — must be warning-free
+rebar3 compile                               # compile
+rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (148 tests)
+rebar3 dialyzer                              # type analysis — must be warning-free
 rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
 ```
 
 **Always run `rebar3 dialyzer` after any Erlang change.** Compilation succeeding is not enough — dialyzer catches type violations, dead code, and missing dependencies that the compiler silently accepts. The project uses `warnings_as_errors` for compile but dialyzer warnings are separate.
+
+**`--dir apps/yuzu_gw/test` is mandatory on `rebar3 eunit`**, not optional. Without it, rebar3 3.27 intersects discovered test modules against the `src/`-derived `modules` list in `yuzu_gw.app` and rejects every orphan test module (`*_tests` without a 1:1 src counterpart, every `*_SUITE` file, helpers) with `Module X not found in project` before running a single test. Tracked as **#337**; `scripts/run-tests.sh erlang-unit` already applies the workaround, but if you invoke rebar3 directly you must pass the flag yourself.
+
+**`rebar3 eunit --module X` does NOT give you test isolation.** It runs the full `--dir` phase first, then the module filter, **in the same BEAM VM**. The second run inherits polluted state — meck mocks, registered names, leaked processes, send_after timers — from the first, so a passing filtered run does not prove the test is order-independent, and a failing filtered run may be failing because of pollution rather than the test itself. For real isolation, `rm -rf gateway/_build/test` between runs (forces a fresh BEAM) or drop into `erl -pa _build/test/lib/yuzu_gw/ebin -pa _build/test/lib/*/ebin` and call test functions directly. This gotcha wasted meaningful debugging time on #336.
+
+Use the `gateway-eunit` and `gateway-dialyzer` skills (in `.claude/skills/`) for routine invocations — they bundle the toolchain activation, the `--dir` flag, and result interpretation.
+
+### Toolchain activation (Erlang on PATH)
+
+The gateway and the meson custom_target that drives `rebar3 compile` both
+require `erl` on PATH. WSL2 / Linux dev shells typically rely on
+[kerl](https://github.com/kerl/kerl) and need `source $(kerl path <ver>)/activate`
+before any build; macOS uses Homebrew or asdf; MSYS2 bash on Windows reads the
+native installer (`C:\Program Files\Erlang OTP\bin` on modern installers,
+`C:\Program Files\erl-<ver>\bin` on older ones). Forgetting to activate is a
+common cause of phantom `.gateway_built` failures from `meson compile` even
+though the C++ targets succeed.
+
+**Use the helper.** Before any gateway work — `rebar3`, `meson compile`, or any
+script that touches `gateway/` — source the cross-platform helper and verify
+`erl` is on PATH:
+
+```bash
+source scripts/ensure-erlang.sh           # default: latest 28.x
+source scripts/ensure-erlang.sh 28.4.2    # exact pin
+command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
+```
+
+The script is a no-op if `erl` is already on PATH **and runs** (it probes with
+`erl -version`, so broken symlinks and wrong-arch binaries don't pass the
+check). Otherwise it tries, in order:
+
+1. **kerl** — matches the requested version exactly or as a major-version
+   prefix (so `28` finds `28.4.2`); falls back to the highest installed `28.x`.
+2. **asdf** — uses `asdf which erl` (works on both classic and the 0.16+
+   rewrite that dropped `asdf where`).
+3. **Homebrew** — *macOS only*, via `brew --prefix erlang`.
+4. **MSYS2 Windows installer probe** — *MSYS2 bash on Windows only*, scans
+   both `Program Files` locations for the latest installed OTP.
+
+The helper **always returns 0** — a sourced script that returns non-zero would
+trip the parent shell's `set -e`. Callers MUST verify `command -v erl`
+themselves (see usage above). If no detector succeeds, the helper prints
+actionable install instructions to stderr.
+
+The default version argument tracks `.github/workflows/release.yml`'s
+`erlef/setup-beam` `otp-version`; bump both together. Native `cmd.exe` /
+PowerShell sessions are out of scope — Yuzu's documented Windows build path is
+MSYS2 bash (see `setup_msvc_env.sh`, the sibling MSVC activation helper).
 
 ### Standing Erlang pitfalls
 
@@ -189,51 +238,19 @@ If the server is restarted against an existing data directory (stale SQLite data
 
 ## Instruction Engine
 
-The instruction engine is the content plane — everything flows through YAML-defined InstructionDefinitions with typed parameter/result schemas, executed via the existing `CommandRequest` wire protocol. The content model is:
+The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack` with typed parameter and result schemas, executed via the `CommandRequest` wire protocol. DSL: `apiVersion: yuzu.io/v1alpha1`, six `kind` values (`InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`). Definitions are persisted with verbatim `yaml_source` as the source of truth plus denormalized columns for queries.
 
-```
-ProductPack → InstructionSet → InstructionDefinition
-                                 ├── Parameter Schema (JSON Schema subset)
-                                 ├── Result Schema (typed columns)
-                                 └── Execution Spec (plugin + action)
-```
-
-Key design documents:
-- `docs/Instruction-Engine.md` — Full architecture blueprint
-- `docs/yaml-dsl-spec.md` — YAML DSL formal specification (6 content kinds)
-- `docs/getting-started.md` — Beginner's guide with tutorial
-
-The YAML DSL uses `apiVersion: yuzu.io/v1alpha1` and supports 6 `kind` values: `InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`. Definitions are stored with `yaml_source` (verbatim YAML, source of truth) plus denormalized columns for queries.
+- Architecture: `docs/Instruction-Engine.md`
+- DSL spec: `docs/yaml-dsl-spec.md`
+- Beginner tutorial: `docs/getting-started.md`
 
 ## Enterprise Readiness and SOC 2
 
-The enterprise readiness plan (`docs/enterprise-readiness-soc2-first-customer.md`) defines the path from feature-complete to enterprise-deployable. It covers 7 workstreams:
-
-- **A. GRC** — Control framework, risk register, policy suite, evidence automation
-- **B. Identity & Access** — SSO enforcement, MFA for approvals, session governance, token lifecycle
-- **C. Application & Infrastructure Security** — TLS enforcement, security headers, supply chain signing, vuln management
-- **D. Reliability & Operations** — SLOs, alerting, backup/restore drills, incident response, capacity planning
-- **E. Data Governance** — Data classification, retention policies, deletion workflows, encryption
-- **F. Secure SDLC** — Branch protection, mandatory review, CI gates, change traceability, env segregation
-- **G. Customer Assurance** — Security whitepaper, questionnaire responses, pen-test summaries, DPA templates
-
-Every code change should be evaluated against this plan. The compliance-officer, sre, and enterprise-readiness agents enforce this in the governance pipeline.
+The path from feature-complete to enterprise-deployable is scoped in `docs/enterprise-readiness-soc2-first-customer.md` across 7 workstreams (A GRC, B Identity, C AppSec, D Reliability, E Data, F Secure SDLC, G Customer Assurance). Every code change is evaluated against this plan by the compliance-officer, sre, and enterprise-readiness agents during Gate 6 of the governance pipeline.
 
 ## Development Roadmap
 
-The full roadmap is in `docs/roadmap.md` with 72 issues across 7 phases (all complete). The capability map (`docs/capability-map.md`) tracks 184 capabilities. Current progress: 165/184 done (90%).
-
-**Phase execution order (all complete):**
-0. Foundation completion (HTTPS, OTA updates, SDK utilities) — **Done**
-1. Server data infrastructure (response store, audit, tags, scope engine) — **Done**
-2. Instruction system (definitions, sets, scheduling, approvals, workflows) — **Done**
-3. Security & RBAC (granular permissions, management groups, OIDC, REST API) — **Done**
-4. Agent infrastructure (KV storage, triggers, content distribution, user interaction) — **Done**
-5. Policy engine (rules, deployment, compliance dashboard) — **Done**
-6. Windows depth (registry, WMI, per-user operations) — **Done**
-7. Scale & integration (gateway, health monitoring, AD/Entra, patches, webhooks) — **Done**
-
-When working on any issue, check the roadmap for dependencies and the capability map for context on what we're building toward.
+Roadmap: `docs/roadmap.md`. Capability map: `docs/capability-map.md`. Headline progress figure in the capability map is overstated — treat with skepticism (see memory `project_capability_map_accuracy.md`). When working on an issue, check the roadmap for dependencies and the capability map for target context.
 
 ## Build
 
@@ -258,14 +275,14 @@ The script runs `vcpkg install` then `meson setup` automatically.
 # 1. Install vcpkg packages
 vcpkg install --triplet x64-linux --x-manifest-root=.
 
-# 2. Configure
-meson setup builddir \
+# 2. Configure (use the per-OS canonical name — see "Per-OS build directory convention" below)
+meson setup build-linux \
   --buildtype=debug \
   -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux \
   -Dbuild_tests=true
 
 # 3. Build
-meson compile -C builddir
+meson compile -C build-linux
 ```
 
 ### Build options
@@ -281,11 +298,62 @@ meson compile -C builddir
 
 Sanitizers and LTO use Meson built-in options (`b_lto`, `b_sanitize`).
 
+### Per-OS build directory convention
+
+The same source tree is built from multiple hosts (WSL2 Linux + native
+Windows on the same physical machine, plus a separate macOS dev box). To
+keep them from clobbering each other, `scripts/setup.sh` selects a
+**per-OS canonical build directory**:
+
+| Host    | Build dir       |
+|---------|-----------------|
+| Linux   | `build-linux`   |
+| Windows | `build-windows` |
+| macOS   | `build-macos`   |
+
+Always use `scripts/setup.sh` (which picks the right dir automatically) or
+pass `-C build-<os>` explicitly to `meson compile` / `meson test`. If
+`scripts/setup.sh` finds an existing dir whose recorded source path looks
+like a different host's, it refuses to reconfigure unless `--wipe` is
+passed — this prevents the opaque ninja "dyndep is not an input" / Windows-
+path failures you get when a Windows-configured `builddir` is reused under
+WSL2 (and vice versa). All `build-*/` and legacy `builddir*/` paths are in
+`.gitignore`.
+
+`./scripts/setup.sh` no longer auto-wipes an existing build directory —
+pass `--wipe` if you actually want to start from scratch, otherwise it
+runs `meson setup --reconfigure` and preserves prior compilation state.
+
 ## Test
+
+Every test target carries a short `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly — no more guessing `"yuzu:server unit tests"`:
+
 ```bash
-meson test -C builddir --print-errorlogs
+meson test -C build-linux --suite server --print-errorlogs
+meson test -C build-linux --suite agent --print-errorlogs
+meson test -C build-linux --suite tar --print-errorlogs
+meson test -C build-linux --print-errorlogs              # everything
 ```
+
 Tests require `-Dbuild_tests=true`. The Catch2 dependency is only installed by vcpkg on `x64 | arm64` platforms. The ARM64 cross-compile CI job intentionally skips tests.
+
+### Direct binary invocation
+
+For Catch2 tag filtering (`[rest][token]`, `[mgmt][cycle]`, etc.) or when you want raw output, call the test binary directly. `scripts/link-tests.sh` maintains symlinks at a stable top-level path per component and triplet so you never have to remember the build-dir layout:
+
+```bash
+tests-build-server-linux_x64/yuzu_server_tests "[rest][token]"
+tests-build-agent-linux_x64/yuzu_agent_tests "[metrics]"
+tests-build-tar-linux_x64/yuzu_tar_tests
+```
+
+The symlinks are created automatically at the end of `scripts/setup.sh`. If you build from a fresh checkout with plain `meson setup`, run `bash scripts/link-tests.sh` once after the first successful `meson compile` to populate them. Triplet suffix is derived from the host (`linux_x64`, `linux_arm64`, `macos_arm64`, `windows_x64`). Binaries stay live because the symlinks point at the real build output — no need to re-run the script after every rebuild.
+
+`tests-build-*/` is gitignored.
+
+### Third-party warning suppression
+
+Every `dependency()` in `meson.build` and subdirectory files is marked `include_type: 'system'` so vcpkg / gRPC / abseil / protobuf / Catch2 deprecation warnings are treated as `-isystem` and silenced. Our own code is still under `warning_level=3`. **Do not remove `include_type: 'system'`** when adding new dependencies — it's load-bearing for build-log readability.
 
 ## Project layout
 ```
@@ -322,15 +390,21 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - `schannel` is NOT a vcpkg port — don't add it. It's a Windows system library.
 
-## CI matrix (`.github/workflows/ci.yml`)
-| Job | Runner | Compiler | Triplet |
-|---|---|---|---|
-| linux | ubuntu-24.04 | GCC 13, Clang 18 | x64-linux |
-| windows | windows-2022 | MSVC (VS 17 2022) | x64-windows |
-| macos | macos-14 (Apple Silicon) | Apple Clang | arm64-osx |
-| arm64-cross | ubuntu-24.04 | aarch64-linux-gnu gcc | arm64-linux |
+## CI matrix
 
-vcpkg binary cache: `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash.
+Defined in `.github/workflows/ci.yml` — four jobs: linux (ubuntu-24.04, GCC 13 + Clang 18), windows (windows-2022, MSVC VS 17), macos (macos-14 Apple Silicon, Apple Clang), arm64-cross (ubuntu-24.04, aarch64-linux-gnu gcc, tests skipped). vcpkg binary cache is `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash.
+
+## Release workflow gates
+
+The `release:` job in `.github/workflows/release.yml` runs `scripts/check-compose-versions.sh` as its **first step**, before any artifact download. The script walks an explicit list of tracked compose files and rejects any `ghcr.io/<owner>/yuzu-{server,gateway,agent}:X.Y.Z` reference that is (a) a bare numeric tag rather than `${YUZU_VERSION:-...}`, or (b) a parameterised default that does not equal the tag being released (`${GITHUB_REF_NAME#v}`). Floating tags (`latest`, `local`, sha-pinned) are ignored.
+
+**Before tagging a release**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file to the new version and verify locally:
+
+```bash
+bash scripts/check-compose-versions.sh 0.10.0
+```
+
+The release job will otherwise fail after all build matrix jobs have run, wasting ~30–60 min of runner time without publishing anything. When adding a new compose file to the repo, also add it to the `FILES` array at the top of `scripts/check-compose-versions.sh` — auto-discovery is deliberately off so opt-in is explicit.
 
 ## Documentation requirements
 
@@ -365,11 +439,14 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 
 ### Windows build (from MSYS2 bash)
 ```bash
-source ./setup_msvc_env.sh
-meson compile -C builddir
+source ./setup_msvc_env.sh           # MSVC paths
+source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
+meson compile -C build-windows       # canonical Windows dir; coexists with build-linux from WSL2
 ```
 
 **IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
+
+`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" under the Erlang gateway section). Source both before invoking meson if your build touches the gateway custom_target.
 
 ### Cross-compilation
 ```bash
@@ -378,81 +455,32 @@ meson compile -C builddir
 Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
 
 ### Windows toolchain requirements
-All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Program Files\LLVM\bin`) — must use cl.exe/MSVC.
-| Tool | Path |
-|---|---|
-| cl.exe | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe` |
-| cmake.exe | `C:\Program Files\CMake\bin\cmake.exe` (needed by Meson's cmake dep method) |
-| ninja.exe | Installed with CMake or VS BuildTools |
-| python | `C:\Python314\python.exe` (system-wide, installed via Chocolatey) |
-| meson | `C:\Python314\Scripts\meson.exe` (`pip install meson==1.9.2`) |
-| vcpkg | `C:\vcpkg` (`VCPKG_ROOT`) |
-| protoc | `C:\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
-| grpc_cpp_plugin | `C:\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
+
+Full path inventory (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin) lives in `docs/windows-build.md`. All of it is configured automatically by `setup_msvc_env.sh`. Hard rule: **do not use Clang** (`C:\Program Files\LLVM\bin`) — must use cl.exe / MSVC.
 
 ## Authentication & Authorization
 
-### Implemented
-- **mTLS** for agent ↔ server gRPC connections.
-- **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Two roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
-- **Login page** — dark-themed, with greyed-out OIDC SSO stub ("Coming soon").
-- **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, greyed-out AD/Entra section.
-- **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
-- **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
-- **Tiered agent enrollment**:
-  - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
-  - **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
-  - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
-- **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
-- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
-- **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
-- **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
-- **HTTPS by default** — `https_enabled` defaults to `true`. Operators must provide `--https-cert` and `--https-key`, or use `--no-https` for development. The `--https` flag was replaced with `--no-https`.
-- **Secure bind default** — Web UI binds to `127.0.0.1` by default (not `0.0.0.0`). A startup warning is logged if overridden to all interfaces.
-- **Metrics auth** — `/metrics` allows unauthenticated access from localhost only. Remote access requires authentication. `--metrics-no-auth` overrides for monitoring infrastructure.
-- **Private key permission validation** — Server refuses to start if TLS private key files are group/others-readable on Unix. Uses `std::filesystem::perms` check. Skipped on Windows.
-- **CORS on all API endpoints** — CORS headers applied via `set_post_routing_handler` for all `/api/` paths.
-- **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.
-- **Certificate hot-reload** — HTTPS cert/key PEM files are polled for changes (default 60s interval) and hot-swapped without server restart. Validates PEM parse, cert/key match, and key file permissions before applying. gRPC TLS reload not supported. CLI: `--no-cert-reload`, `--cert-reload-interval`. Audit action: `cert.reload`. Metrics: `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total`.
-- **HTTP security response headers (SOC2-C1)** — All HTTP responses (dashboard, REST API, MCP, metrics, health probes) carry six headers: `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` (deny-all baseline for camera/mic/geo/usb/etc.), and `Strict-Transport-Security: max-age=31536000; includeSubDomains` (HTTPS only, per RFC 6797). The CSP is fully `'self'`-only with no external CDN allowance because the HTMX runtime and SSE extension are embedded in the server binary (`server/core/src/static_js_bundle.cpp`) and served from `/static/htmx.js` and `/static/sse.js` — the dashboard works in air-gapped deployments. The CSP uses `'unsafe-inline'` for `script-src`/`style-src` because the dashboard has inline `<script>`, `onclick=` handlers, and `<style>` blocks; tightening to nonce-based CSP requires a separate dashboard refactor. `upgrade-insecure-requests` is appended to the CSP only on HTTPS deployments. Operators can extend the CSP via `--csp-extra-sources "https://cdn.example.com https://beacon.example.com"` (space-separated, validated at CLI parse — control bytes / semicolons / `'unsafe-eval'` are rejected at startup with a clear error). The flag's value is appended to `script-src`/`style-src`/`connect-src`/`img-src` only. Header construction lives in `server/core/src/security_headers.{hpp,cpp}` (`yuzu::server::security` namespace) — the production server and the unit/integration tests in `tests/unit/server/test_security_headers.cpp` (38 cases) share the same `HeaderBundle::make()`/`apply()` code path. The resolved bundle is logged at INFO at startup so operators can confirm activation: `Security headers active: CSP=N bytes, HSTS=on/off, Referrer-Policy="...", Permissions-Policy=N bytes`.
+Full feature history, OIDC/AD details, tiered agent enrollment, and CSP/security-header construction live in `docs/auth-architecture.md`. Hard invariants that every session must respect:
 
-### Also Implemented (Phase 3 + Phase 7)
-- **Granular RBAC** — 6 roles, 14 securable types, per-operation permissions, deny-override logic.
-- **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
-- **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens with mandatory expiration.
-- **AD/Entra integration** — Microsoft Graph API for user/group import.
+- **mTLS** for agent ↔ server gRPC is mandatory; there is no plain-gRPC path.
+- **HTTPS default** — `https_enabled` defaults to `true`. `--no-https` is dev-only.
+- **Secure bind default** — Web UI binds to `127.0.0.1`; overriding to `0.0.0.0` logs a startup warning.
+- **Metrics auth** — `/metrics` is localhost-only unauthenticated; remote scrapes require auth unless `--metrics-no-auth` is set for monitoring infra.
+- **Private key perms** — server refuses to start if a TLS private key file is group/others-readable on Unix.
+- **Error envelope** — all API responses use `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}`; health probes use `{"status":"..."}`.
+- **HTTP security headers** — CSP, HSTS (HTTPS-only), X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy are emitted on every response. Construction lives in `server/core/src/security_headers.{hpp,cpp}`. CSP extensions go through `--csp-extra-sources` which is validated at CLI parse. Never hand-roll header emission elsewhere — route through `HeaderBundle::make()`/`apply()`.
+- **Owner-scoped API token revocation (#222)** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` reject cross-user revoke attempts with 404 unless the caller holds the global `admin` role. Every new token-lifecycle endpoint must follow the same owner-check pattern.
 
 ## MCP (Model Context Protocol) Server
 
-Yuzu embeds an MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. This allows AI models (e.g., Claude Desktop) to securely query fleet status, check compliance, investigate agents, and — with appropriate authorization — execute instructions on endpoints.
+Full architecture, tier policy, tool list, and Phase 2 roadmap live in `docs/mcp-server.md`. Load-bearing rules:
 
-### Architecture
-- **Embedded in existing server** — MCP runs inside the same cpp-httplib server as the REST API and dashboard. It reuses auth middleware, RBAC, rate limiting, CORS, and audit logging with zero duplication.
-- **Module:** `server/core/src/mcp_server.hpp` / `mcp_server.cpp` — mirrors `RestApiV1` pattern (injected store pointers, same callback signatures).
-- **JSON-RPC helpers:** `mcp_jsonrpc.hpp` (header-only) — parse/build JSON-RPC 2.0 envelopes.
-- **Tier policy:** `mcp_policy.hpp` (header-only) — static allow-lists per tier, checked before RBAC.
-- **Output serialization:** Uses local `JObj`/`JArr` string builders (same pattern as `rest_api_v1.cpp`) to avoid the 56GB nlohmann template bloat. `nlohmann::json` is used for parsing only.
-
-### Security Model
-- **Three authorization tiers** enforced *before* RBAC: `readonly` (read only), `operator` (+ tag writes, auto-approved executions), `supervised` (all ops via approval workflow).
-- **MCP tokens** use the existing API token system (`api_token_store`) with a new `mcp_tier` column. MCP tokens require mandatory expiration (max 90 days).
-- **Approval workflow** — Operations that `requires_approval(tier, type, op)` returns true for are routed to the `ApprovalManager`. Admins approve/reject via Settings UI or REST API. All admins see all pending approvals (both AI-initiated and human-initiated).
-- **Kill switch:** `--mcp-disable` rejects all `/mcp/v1/` requests with `kMcpDisabled` JSON-RPC error. `--mcp-read-only` blocks non-read tools.
-- **Audit:** Every MCP tool call logged with `action: "mcp.<tool_name>"` and `mcp_tool` field on `AuditEvent`.
-
-### Phase 1 (Implemented)
-- 22 read-only tools: `list_agents`, `get_agent_details`, `query_audit_log`, `list_definitions`, `get_definition`, `query_responses`, `aggregate_responses`, `query_inventory`, `list_inventory_tables`, `get_agent_inventory`, `get_tags`, `search_agents_by_tag`, `list_policies`, `get_compliance_summary`, `get_fleet_compliance`, `list_management_groups`, `get_execution_status`, `list_executions`, `list_schedules`, `validate_scope`, `preview_scope_targets`, `list_pending_approvals`
-- 1 write/execute tool: `execute_instruction` — dispatches plugin commands to agents. Auto-approved for `operator` tier; `supervised` tier returns "not implemented" (approval re-dispatch path not yet built). If neither `scope` nor `agent_ids` is provided, targets all agents.
-- 3 resources: `yuzu://server/health`, `yuzu://compliance/fleet`, `yuzu://audit/recent`
-- 4 prompts: `fleet_overview`, `investigate_agent`, `compliance_report`, `audit_investigation`
-- Settings UI section with enable/disable and read-only toggles
-
-### Phase 2 (Planned)
-- 5 remaining write tools: `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device`
-- Approval workflow re-dispatch (supervised tier execution after admin approval)
-- SSE streaming for execution progress
-
-Certificate setup instructions: `scripts/Certificate Instructions.txt`.
+- **Embed point:** `POST /mcp/v1/` inside the same httplib server as REST and dashboard. Module lives at `server/core/src/mcp_server.{hpp,cpp}` and mirrors `RestApiV1` — injected store pointers, same callback signatures.
+- **Tier check runs BEFORE RBAC.** `mcp_policy.hpp` enforces static allow-lists per tier (`readonly`, `operator`, `supervised`); RBAC is a second gate, not the first. Never skip the tier check.
+- **MCP tokens** piggyback on `api_token_store` with the `mcp_tier` column and mandatory expiry (≤90 days). The owner-scoped revocation rules from the Auth section apply.
+- **Kill switches:** `--mcp-disable` (rejects all `/mcp/v1/` with `kMcpDisabled`), `--mcp-read-only` (blocks non-read tools). Respect both in every new endpoint.
+- **Audit pattern:** every MCP tool call emits `action="mcp.<tool_name>"` and populates the `mcp_tool` field on `AuditEvent`. Don't log MCP traffic through any other path.
+- **Output serialization:** use the local `JObj`/`JArr` string builders, not `nlohmann::json` output (56GB template bloat). `nlohmann::json` is OK for parsing only.
 
 ## Data architecture for analytics integration
 

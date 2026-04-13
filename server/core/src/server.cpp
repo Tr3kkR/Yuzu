@@ -222,6 +222,17 @@ public:
                           "Total successful certificate hot-reloads", "gauge");
         metrics_.describe("yuzu_server_cert_reload_failures_total",
                           "Total failed certificate hot-reload attempts", "gauge");
+        metrics_.describe("yuzu_server_token_cache_hits_total",
+                          "API token validate_token calls served from in-memory cache",
+                          "counter");
+        metrics_.describe("yuzu_server_token_cache_misses_total",
+                          "API token validate_token calls that fell through to SQLite",
+                          "counter");
+        metrics_.describe("yuzu_server_token_cache_size",
+                          "Distinct API tokens currently held in the validate_token cache",
+                          "gauge");
+        metrics_.describe("yuzu_server_audit_events_total",
+                          "Audit events written, bucketed by result", "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent",
                           "Server process CPU usage percentage", "gauge");
@@ -669,6 +680,27 @@ public:
                     metrics_.gauge("yuzu_server_cert_reload_failures_total")
                         .set(static_cast<double>(cert_reloader_->failure_count()));
                 }
+                // Publish token cache observability so SRE can verify cache effectiveness
+                // and detect cold-cache stampedes (gate-6 SRE finding HIGH-1).
+                if (api_token_store_) {
+                    metrics_.gauge("yuzu_server_token_cache_hits_total")
+                        .set(static_cast<double>(api_token_store_->cache_hits()));
+                    metrics_.gauge("yuzu_server_token_cache_misses_total")
+                        .set(static_cast<double>(api_token_store_->cache_misses()));
+                    metrics_.gauge("yuzu_server_token_cache_size")
+                        .set(static_cast<double>(api_token_store_->cache_size()));
+                }
+                // Publish audit event write rate so the audit subsystem is observable.
+                if (audit_store_) {
+                    metrics_.gauge("yuzu_server_audit_events_total", {{"result", "success"}})
+                        .set(static_cast<double>(audit_store_->events_written("success")));
+                    metrics_.gauge("yuzu_server_audit_events_total", {{"result", "failure"}})
+                        .set(static_cast<double>(audit_store_->events_written("failure")));
+                    metrics_.gauge("yuzu_server_audit_events_total", {{"result", "denied"}})
+                        .set(static_cast<double>(audit_store_->events_written("denied")));
+                    metrics_.gauge("yuzu_server_audit_events_total", {{"result", "other"}})
+                        .set(static_cast<double>(audit_store_->events_written("other")));
+                }
                 // Process health sampling (22.1)
                 {
                     auto ph = process_health_sampler_.sample();
@@ -987,18 +1019,6 @@ private:
     }
 
     // -- Auth helpers for HTTP ------------------------------------------------
-
-    static std::string extract_session_cookie(const httplib::Request& req) {
-        auto cookie = req.get_header_value("Cookie");
-        // Find yuzu_session=<token>
-        const std::string prefix = "yuzu_session=";
-        auto pos = cookie.find(prefix);
-        if (pos == std::string::npos)
-            return {};
-        pos += prefix.size();
-        auto end = cookie.find(';', pos);
-        return cookie.substr(pos, end == std::string::npos ? end : end - pos);
-    }
 
     static std::string url_decode(const std::string& s) {
         std::string out;
@@ -1349,25 +1369,7 @@ private:
                     // Remote callers fall through to normal auth check below
                 }
 
-                // Check session cookie
-                auto token = extract_session_cookie(req);
-                auto session = auth_mgr_.validate_session(token);
-
-                // If no session cookie, try API token auth (Bearer or X-Yuzu-Token)
-                if (!session && api_token_store_) {
-                    auto auth_header = req.get_header_value("Authorization");
-                    if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
-                        auto api_token = api_token_store_->validate_token(auth_header.substr(7));
-                        if (api_token) session = synthesize_token_session(*api_token);
-                    }
-                    if (!session) {
-                        auto custom_header = req.get_header_value("X-Yuzu-Token");
-                        if (!custom_header.empty()) {
-                            auto api_token = api_token_store_->validate_token(custom_header);
-                            if (api_token) session = synthesize_token_session(*api_token);
-                        }
-                    }
-                }
+                auto session = auth_routes_->resolve_session(req);
 
                 if (!session) {
                     // API calls and MCP endpoint get 401 JSON, pages get redirect
@@ -1528,24 +1530,7 @@ private:
             // Process health (22.1) — only include for authenticated requests
             // to avoid leaking process internals to unauthenticated callers.
             // Check auth without returning 401 (health probe must stay open).
-            bool is_authenticated = false;
-            {
-                auto ck = extract_session_cookie(req);
-                if (auth_mgr_.validate_session(ck))
-                    is_authenticated = true;
-                if (!is_authenticated) {
-                    auto ah = req.get_header_value("Authorization");
-                    if (ah.size() > 7 && ah.substr(0, 7) == "Bearer " && api_token_store_) {
-                        if (api_token_store_->validate_token(ah.substr(7)))
-                            is_authenticated = true;
-                    }
-                }
-                if (!is_authenticated) {
-                    auto xh = req.get_header_value("X-Yuzu-Token");
-                    if (!xh.empty() && api_token_store_ && api_token_store_->validate_token(xh))
-                        is_authenticated = true;
-                }
-            }
+            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
             if (is_authenticated) {
                 auto ph = process_health_sampler_.sample();
                 health["system"] = {
@@ -1573,7 +1558,8 @@ private:
 
             bool stores_ok = (response_store_ && response_store_->is_open()) &&
                              (audit_store_ && audit_store_->is_open()) &&
-                             (instruction_store_ && instruction_store_->is_open());
+                             (instruction_store_ && instruction_store_->is_open()) &&
+                             (api_token_store_ && api_token_store_->is_open());
 
             if (stores_ok) {
                 res.set_content(R"({"status":"ready"})", "application/json");
@@ -2911,9 +2897,7 @@ private:
                     return;
                 }
 
-                auto token = extract_session_cookie(req);
-                auto session = auth_mgr_.validate_session(token);
-                if (session)
+                if (auto session = auth_routes_->resolve_session(req))
                     def.created_by = session->username;
 
                 auto result = instruction_store_->create_definition(def);
@@ -3310,8 +3294,7 @@ private:
             auto scope_filter = extract_json_string(req.body, "scope");
             bool failed_only = (scope_filter == "failed_only");
 
-            auto token = extract_session_cookie(req);
-            auto session = auth_mgr_.validate_session(token);
+            auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
 
             auto result = execution_tracker_->create_rerun(id, user, failed_only);
@@ -3340,8 +3323,7 @@ private:
                               }
 
                               auto id = req.matches[1].str();
-                              auto token = extract_session_cookie(req);
-                              auto session = auth_mgr_.validate_session(token);
+                              auto session = auth_routes_->resolve_session(req);
                               auto user = session ? session->username : "unknown";
 
                               execution_tracker_->mark_cancelled(id, user);
@@ -3429,9 +3411,7 @@ private:
                 sched.scope_expression = j.value("scope_expression", "");
                 sched.requires_approval = j.value("requires_approval", false);
 
-                auto token = extract_session_cookie(req);
-                auto session = auth_mgr_.validate_session(token);
-                if (session)
+                if (auto session = auth_routes_->resolve_session(req))
                     sched.created_by = session->username;
 
                 auto result = schedule_engine_->create_schedule(sched);
@@ -3546,8 +3526,7 @@ private:
 
             auto id = req.matches[1].str();
             auto comment = extract_json_string(req.body, "comment");
-            auto token = extract_session_cookie(req);
-            auto session = auth_mgr_.validate_session(token);
+            auto session = auth_routes_->resolve_session(req);
             auto reviewer = session ? session->username : "unknown";
 
             auto result = approval_manager_->approve(id, reviewer, comment);
@@ -3576,8 +3555,7 @@ private:
 
             auto id = req.matches[1].str();
             auto comment = extract_json_string(req.body, "comment");
-            auto token = extract_session_cookie(req);
-            auto session = auth_mgr_.validate_session(token);
+            auto session = auth_routes_->resolve_session(req);
             auto reviewer = session ? session->username : "unknown";
 
             auto result = approval_manager_->reject(id, reviewer, comment);

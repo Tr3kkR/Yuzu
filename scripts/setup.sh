@@ -4,10 +4,15 @@
 # Wraps vcpkg install + meson setup into a single command.
 # On Windows, source setup_msvc_env.sh first.
 #
+# This script picks a per-OS default build directory (build-linux,
+# build-windows, build-macos) so the same source tree can be configured
+# concurrently from WSL2 and a native Windows shell — and from a separate
+# macOS host — without the build dirs trampling each other.
+#
 # Usage:
 #   ./scripts/setup.sh [--buildtype debug|release] [--tests] [--lto]
 #                       [--native-file FILE] [--cross-file FILE]
-#                       [--builddir DIR] [-- extra meson args...]
+#                       [--builddir DIR] [--wipe] [-- extra meson args...]
 #
 # Examples:
 #   ./scripts/setup.sh                              # debug build, default compiler
@@ -22,11 +27,30 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# ── Detect platform and vcpkg triplet ────────────────────────────────────────
+# (Detected before BUILDDIR default so the per-OS name is correct.)
+HOST_OS=""
+if [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
+  HOST_OS="windows"
+  TRIPLET="x64-windows"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  HOST_OS="macos"
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    TRIPLET="arm64-osx"
+  else
+    TRIPLET="x64-osx"
+  fi
+else
+  HOST_OS="linux"
+  TRIPLET="x64-linux"
+fi
+
 # ── Defaults ──────────────────────────────────────────────────────────────────
-BUILDDIR="builddir"
+BUILDDIR="build-${HOST_OS}"
 BUILDTYPE="debug"
 TESTS=false
 LTO=false
+WIPE=false
 NATIVE_FILE=""
 CROSS_FILE=""
 EXTRA_ARGS=()
@@ -38,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --buildtype)   BUILDTYPE="$2"; shift 2 ;;
     --tests)       TESTS=true; shift ;;
     --lto)         LTO=true; shift ;;
+    --wipe)        WIPE=true; shift ;;
     --native-file) NATIVE_FILE="$2"; shift 2 ;;
     --cross-file)  CROSS_FILE="$2"; shift 2 ;;
     --)            shift; EXTRA_ARGS+=("$@"); break ;;
@@ -45,25 +70,36 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ── Detect platform and vcpkg triplet ────────────────────────────────────────
+# Cross-compile overrides the host triplet (but keeps the host-named builddir
+# unless the caller passed --builddir explicitly).
 if [[ -n "$CROSS_FILE" ]]; then
-  # Cross-compile: infer triplet from cross file name
   case "$CROSS_FILE" in
     *aarch64*) TRIPLET="arm64-linux" ;;
     *armv7*)   TRIPLET="arm-linux" ;;
-    *)         echo "Warning: could not infer vcpkg triplet from cross file." >&2
-               TRIPLET="" ;;
+    *)         echo "Warning: could not infer vcpkg triplet from cross file." >&2 ;;
   esac
-elif [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
-  TRIPLET="x64-windows"
-elif [[ "$(uname -s)" == "Darwin" ]]; then
-  if [[ "$(uname -m)" == "arm64" ]]; then
-    TRIPLET="arm64-osx"
-  else
-    TRIPLET="x64-osx"
+fi
+
+# ── Reject reusing a build dir from a different host OS ──────────────────────
+# meson-info.json records the absolute source path of the configuring host.
+# Windows builds record "C:\...", POSIX builds record "/mnt/c/..." or "/Users/...".
+# Mixing them produces opaque ninja errors deep into the build, so detect early.
+MESON_INFO="$PROJECT_ROOT/$BUILDDIR/meson-info/meson-info.json"
+if [[ -f "$MESON_INFO" ]] && ! $WIPE; then
+  RECORDED_SRC="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('directories',{}).get('source',''))" "$MESON_INFO" 2>/dev/null || true)"
+  if [[ -n "$RECORDED_SRC" ]]; then
+    case "$HOST_OS" in
+      windows) EXPECTED_PREFIX_RE='^[A-Za-z]:[\\/]' ;;
+      *)       EXPECTED_PREFIX_RE='^/' ;;
+    esac
+    if ! [[ "$RECORDED_SRC" =~ $EXPECTED_PREFIX_RE ]]; then
+      echo "Error: $BUILDDIR was configured from a different host (source=$RECORDED_SRC)." >&2
+      echo "       This script is running on $HOST_OS. Either:" >&2
+      echo "         - re-run with --wipe to start fresh, or" >&2
+      echo "         - re-run with --builddir build-${HOST_OS}-alt to keep both." >&2
+      exit 1
+    fi
   fi
-else
-  TRIPLET="x64-linux"
 fi
 
 # ── vcpkg install ─────────────────────────────────────────────────────────────
@@ -132,20 +168,34 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
   MESON_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-# Wipe existing builddir if present (meson setup fails if it already exists
-# with a different configuration).
+# Reuse the existing build dir if present and same-host: meson reconfigures
+# in place. Only wipe if --wipe was passed (no silent destruction of work).
 if [[ -d "$PROJECT_ROOT/$BUILDDIR" ]]; then
-  echo "── Wiping existing build directory: $BUILDDIR ──"
-  MESON_ARGS+=(--wipe)
+  if $WIPE; then
+    echo "── Wiping existing build directory: $BUILDDIR ──"
+    MESON_ARGS+=(--wipe)
+  else
+    echo "── Reconfiguring existing build directory: $BUILDDIR ──"
+    MESON_ARGS+=(--reconfigure)
+  fi
 fi
 
 echo "── Running: meson ${MESON_ARGS[*]} ──"
 cd "$PROJECT_ROOT"
 meson "${MESON_ARGS[@]}"
 
+# Refresh the /tests-build-<component>-<triplet>/ convenience symlinks so
+# the test binaries are discoverable at the top level. On fresh setups
+# the script is a no-op (no binaries yet) — re-run after `meson compile`
+# to materialize the links.
+if [[ -x "$SCRIPT_DIR/link-tests.sh" ]]; then
+  "$SCRIPT_DIR/link-tests.sh" --builddir "$BUILDDIR" || true
+fi
+
 echo ""
 echo "Build configured. Next steps:"
 echo "  meson compile -C $BUILDDIR"
 if $TESTS; then
-  echo "  meson test -C $BUILDDIR --print-errorlogs"
+  echo "  meson test -C $BUILDDIR --suite server --print-errorlogs"
+  echo "  bash scripts/link-tests.sh        # refresh tests-build-* symlinks"
 fi

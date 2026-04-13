@@ -1,4 +1,4 @@
-catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true)
+catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
 
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 agent_test_exe = executable(
@@ -23,7 +23,7 @@ agent_test_exe = executable(
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
 )
-test('agent unit tests', agent_test_exe, timeout: 120)
+test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 120)
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
@@ -42,7 +42,7 @@ tar_test_exe = executable(
   ],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe)
+test('tar unit tests', tar_test_exe, suite: 'tar')
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -50,6 +50,7 @@ if build_server
     'yuzu_server_tests',
     files(
       'unit/server/test_auth.cpp',
+      'unit/server/test_auth_routes.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_update_registry.cpp',
@@ -92,6 +93,7 @@ if build_server
       'unit/server/test_software_deployment_store.cpp',
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
+      'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_security_headers.cpp',
       'unit/server/test_static_js_bundle.cpp',
     ),
@@ -100,7 +102,7 @@ if build_server
     ],
     dependencies: [yuzu_server_core_dep, catch2_dep],
   )
-  test('server unit tests', server_test_exe, timeout: 120)
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -110,4 +112,12 @@ test('proto gen_proto version check',
   args: [files('test_gen_proto_version.py')],
   suite: 'proto',
   timeout: 30,
+)
+
+# ── Repo hygiene tests ─────────────────────────────────────────────────────
+test('changelog order',
+  _python3_test,
+  args: [files('test_changelog_order.py')],
+  suite: 'docs',
+  timeout: 10,
 )

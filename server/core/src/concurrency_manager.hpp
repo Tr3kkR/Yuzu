@@ -2,7 +2,6 @@
 
 #include <sqlite3.h>
 
-#include <shared_mutex>
 #include <string>
 
 namespace yuzu::server {
@@ -35,7 +34,10 @@ public:
 
 private:
     sqlite3* db_;
-    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    // No application-level mutex: try_acquire/release/active_count each
+    // prepare-and-finalize their statements, so SQLITE_OPEN_FULLMUTEX on the
+    // shared connection is sufficient. Atomicity of the count-then-insert
+    // check is enforced inside SQL via a conditional INSERT statement.
 };
 
 } // namespace yuzu::server

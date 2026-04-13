@@ -1,7 +1,10 @@
 # Build directories
+# Convention: build-{linux,windows,macos} are the per-OS canonical dirs
+# created by scripts/setup.sh. Legacy names are kept ignored for old checkouts.
 build/
 build-*/
 builddir/
+builddir-*/
 clion-build/
 cmake-build-*/
 out/
@@ -9,6 +12,8 @@ out/
 
 # Erlang / rebar3
 gateway/_build/
+gateway/.deps_cache/
+gateway/ebin/
 erl_crash.dump
 *.beam
 
@@ -74,3 +79,13 @@ build_log.txt
 .uat-sanitizer/
 *.local.md
 docker-compose.local.yml
+.codex
+test_output.txt
+test_xml.txt
+update.finished
+node_modules/
+__pycache__/
+
+# Test-binary symlinks created by scripts/link-tests.sh
+# (per-component, per-triplet convenience links — see CLAUDE.md Test section)
+/tests-build-*/

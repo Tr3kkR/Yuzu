@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.9.0',
+  version: '0.10.0',
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
@@ -83,28 +83,38 @@ build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
-grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'], required: false)
+# All third-party includes are marked `include_type: 'system'` so the compiler
+# treats them as `-isystem` paths and suppresses their warnings. This is
+# load-bearing for build log readability — without it the gRPC / abseil /
+# protobuf deprecation warnings drown out our own code warnings and force a
+# grep-for-error filter workflow. Our own code remains under `warning_level=3`.
+grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
+  required: false, include_type: 'system')
 if not grpcpp_dep.found()
-  grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true)
+  grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
+    include_type: 'system')
 endif
 protobuf_cmake_args = []
 if host_os == 'windows'
   protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
 endif
 protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
-  cmake_args: protobuf_cmake_args, required: false)
+  cmake_args: protobuf_cmake_args, required: false, include_type: 'system')
 if not protobuf_dep.found()
-  protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true)
+  protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
+    include_type: 'system')
 endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
-spdlog_dep      = dependency('spdlog',        required: true)
-nlohmann_dep    = dependency('nlohmann_json', required: true)
-cli11_dep       = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'], required: true)
-httplib_dep     = dependency('httplib', required: false)
+spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
+nlohmann_dep    = dependency('nlohmann_json', required: true, include_type: 'system')
+cli11_dep       = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
+  required: true, include_type: 'system')
+httplib_dep     = dependency('httplib', required: false, include_type: 'system')
 if not httplib_dep.found()
-  httplib_dep   = dependency('cpp-httplib', required: true)
+  httplib_dep   = dependency('cpp-httplib', required: true, include_type: 'system')
 endif
-sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'], required: true)
+sqlite3_dep     = dependency('SQLite3', method: 'cmake', modules: ['SQLite::SQLite3'],
+  required: true, include_type: 'system')
 
 # macOS frameworks needed by gRPC, abseil, and cpp-httplib
 if host_os == 'darwin'

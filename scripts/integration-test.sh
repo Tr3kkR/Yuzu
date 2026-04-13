@@ -10,8 +10,8 @@
 #   ./scripts/integration-test.sh --agents 100 --tls # 100 agents with mTLS
 #
 # Prerequisites:
-#   - C++ binaries built:  builddir/server/core/yuzu-server
-#                           builddir/agents/core/yuzu-agent
+#   - C++ binaries built:  build-<os>/server/core/yuzu-server
+#                           build-<os>/agents/core/yuzu-agent
 #   - Erlang gateway:      gateway/ with rebar3 release
 #   - curl, grpcurl (optional, for gRPC probing)
 
@@ -22,23 +22,38 @@ AGENT_COUNT=1
 USE_TLS=false
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUILDDIR="$PROJECT_ROOT/builddir"
+
+# Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
+if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
+    BUILDDIR="$YUZU_BUILDDIR"
+elif [[ "$(uname -s)" == MINGW* ]] || [[ "$(uname -s)" == MSYS* ]] || [[ "${OS:-}" == "Windows_NT" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-windows"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    BUILDDIR="$PROJECT_ROOT/build-macos"
+else
+    BUILDDIR="$PROJECT_ROOT/build-linux"
+fi
 GATEWAY_DIR="$PROJECT_ROOT/gateway"
 WORK_DIR=""
 SERVER_PID=""
 GATEWAY_PID=""
 AGENT_PIDS=()
 
-# Server ports (C++ server listens on 50050 in gateway mode)
-SERVER_AGENT_PORT=50050
-SERVER_MGMT_PORT=50053
-SERVER_GW_PORT=50051     # GatewayUpstream service port (gateway connects here)
-SERVER_WEB_PORT=8090
+# Port matrix — single-host layout that gives every binder its own port.
+# Server side uses 5005x, gateway side uses 5006x. Every port is
+# env-overridable so this script can run alongside other live stacks
+# (e.g. the docker UAT from scripts/docker-start-UAT.sh, which binds
+# 50055 and 50063 on the host). Override pattern:
+#   SERVER_GW_PORT=50155 GW_MGMT_PORT=50163 bash scripts/integration-test.sh
+SERVER_AGENT_PORT="${SERVER_AGENT_PORT:-50050}"   # C++ server agent gRPC (no direct connects in gateway mode)
+SERVER_MGMT_PORT="${SERVER_MGMT_PORT:-50053}"
+SERVER_GW_PORT="${SERVER_GW_PORT:-50055}"         # GatewayUpstream service (gateway connects here)
+SERVER_WEB_PORT="${SERVER_WEB_PORT:-8090}"
 
 # Gateway ports (agents connect here)
-GW_AGENT_PORT=50051
-GW_MGMT_PORT=50052
-GW_METRICS_PORT=9568
+GW_AGENT_PORT="${GW_AGENT_PORT:-50061}"
+GW_MGMT_PORT="${GW_MGMT_PORT:-50063}"
+GW_METRICS_PORT="${GW_METRICS_PORT:-9568}"
 
 # ── Argument parsing ─────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -54,7 +69,7 @@ done
 check_binary() {
     if [[ ! -x "$1" ]]; then
         echo "FAIL: $1 not found or not executable"
-        echo "      Run: meson compile -C builddir"
+        echo "      Run: meson compile -C $(basename "$BUILDDIR")"
         exit 1
     fi
 }
@@ -156,9 +171,11 @@ cleanup() {
     done
     [[ -n "$GATEWAY_PID" ]] && kill -9 "$GATEWAY_PID" 2>/dev/null || true
     [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
-    # Clean temp dir
-    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    # Clean temp dir (preserve when YUZU_KEEP_WORK_DIR is set, for debugging)
+    if [[ -n "$WORK_DIR" && -d "$WORK_DIR" && -z "${YUZU_KEEP_WORK_DIR:-}" ]]; then
         rm -rf "$WORK_DIR"
+    elif [[ -n "${YUZU_KEEP_WORK_DIR:-}" ]]; then
+        log "Preserving work dir: $WORK_DIR"
     fi
     log "Cleanup done."
 }
@@ -209,10 +226,10 @@ SERVER_DATA_DIR="$WORK_DIR/server-data"
 mkdir -p "$SERVER_DATA_DIR"
 SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
 log "Running first-run setup to generate server config..."
-printf 'admin\npassword\npassword\nuser\npassword\npassword\n' | \
+printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
-        --no-tls --listen "127.0.0.1:$SERVER_AGENT_PORT" \
+        --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
         --management "127.0.0.1:$SERVER_MGMT_PORT" \
         --web-port "$SERVER_WEB_PORT" \
         > "$WORK_DIR/setup.log" 2>&1 &
@@ -366,8 +383,16 @@ GATEWAY_PID=$!
 cd "$PROJECT_ROOT"
 log "  Gateway PID: $GATEWAY_PID"
 
-# The gateway needs grpcbox to start listening — give it a moment.
-sleep 3
+# Poll the gateway's agent-facing gRPC port until it's bound. grpcbox
+# startup is usually 1-2s but can be slower on cold BEAM VM — the old
+# `sleep 3` was both too short (flaked on cold runs) and too long (paid
+# full budget on warm runs). wait_for_port returns as soon as the port
+# accepts connections.
+if ! wait_for_port "$GW_AGENT_PORT" "Gateway agent-facing gRPC" 15; then
+    echo "--- gateway.log ---"
+    cat "$WORK_DIR/gateway.log"
+    exit 1
+fi
 if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
     fail "Gateway process died on startup"
     echo "--- gateway.log ---"
@@ -498,10 +523,31 @@ else
 fi
 
 # ── Test 8: Multiple heartbeat cycles ─────────────────────────────────
+# Previously: fixed `sleep 10` from the start of this block. That races
+# with agent startup — if the agent takes > 5s to enroll (normal on cold
+# runs, especially with enrollment-token retry backoff), the sleep ends
+# before the first heartbeat has even fired, and downstream metric
+# assertions silently drift. Now we loop-poll /metrics until
+# yuzu_heartbeats_received_total actually appears. Timeout is generous
+# enough to cover a ~12s cold-cache enrollment plus one 5s interval with
+# headroom.
 if [[ "$AGENT_COUNT" -ge 1 ]]; then
-    log "Test: Heartbeat continuity (waiting 10s for 2+ heartbeat cycles)..."
-    sleep 10
-    # Check agent is still alive after heartbeats
+    log "Test: Heartbeat continuity (polling /metrics up to 30s for heartbeats)..."
+    heartbeat_seen=false
+    for attempt in $(seq 1 30); do
+        METRICS_POLL=$(curl -sf "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
+        if echo "$METRICS_POLL" | grep -q "yuzu_heartbeats_received_total"; then
+            heartbeat_seen=true
+            log "  Heartbeats observed after ${attempt}s"
+            break
+        fi
+        sleep 1
+    done
+    if ! $heartbeat_seen; then
+        log "  WARN: yuzu_heartbeats_received_total not observed in 30s; downstream metric assertions may fail"
+    fi
+
+    # Check agents are still alive after the poll
     STILL_ALIVE=0
     for pid in "${AGENT_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
@@ -648,12 +694,21 @@ if [[ "$AGENT_COUNT" -ge 1 ]]; then
 fi
 
 # ── Test 18: Gateway stability ────────────────────────────────────────
+# Match on actual Erlang crash / supervisor termination markers, not any
+# log line that happens to contain the word "crash". Previously this
+# tripped on benign [info]-level lines like:
+#   [info] crash: class=exit exception={noproc,{gen_server,call,[yuzu_gw_upstream,...]}}
+# which the gateway emits via its own diagnostic logger when an agent's
+# first registration attempt races the upstream gen_server startup (the
+# agent's retry backoff resolves it cleanly within ~6s). Real Erlang
+# crashes always emit a `CRASH REPORT` or `=ERROR REPORT` header, or a
+# `Supervisor: ... terminating` line; we match only those, plus any
+# explicit SIGTERM at [error] level.
 log "Test: Gateway stability throughout test"
 TESTS=$((TESTS + 1))
 if kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    # Check gateway log for any critical errors
     GW_LOG_FINAL=$(cat "$WORK_DIR/gateway.log" 2>/dev/null || echo "")
-    if echo "$GW_LOG_FINAL" | grep -qi "crash\|supervisor.*error\|SIGTERM"; then
+    if echo "$GW_LOG_FINAL" | grep -qE 'CRASH REPORT|=ERROR REPORT|Supervisor: .* terminating|\[error\].*SIGTERM'; then
         fail "Gateway log shows critical errors"
     else
         pass "Gateway remained stable throughout test"
@@ -761,7 +816,14 @@ if [[ "$AGENT_COUNT" -ge 1 ]]; then
         log "Test: Agent disconnect isolation"
         FIRST_PID="${AGENT_PIDS[0]}"
         kill "$FIRST_PID" 2>/dev/null || true
-        sleep 2
+        # Poll until the killed process is actually gone — its death is
+        # what "disconnect" means here. Other agents are independent
+        # processes and don't need any propagation delay to check their
+        # liveness, so no sleep-assert is needed after the reap.
+        for _wait in $(seq 1 20); do
+            if ! kill -0 "$FIRST_PID" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
 
         # Verify other agents are still alive
         REMAINING_ALIVE=0

@@ -122,12 +122,25 @@ extern const char* const kLoginHtml =
         if (xhr.status === 200) {
           window.location.href = '/';
         } else {
+          // Server returns the structured envelope:
+          //   {"error":{"code":N,"message":"..."},"meta":{...}}
+          // Pre-envelope responses used a flat string "error".
+          var msg = '';
           try {
             var resp = JSON.parse(xhr.responseText);
-            errEl.textContent = resp.error || 'Login failed';
-          } catch(ex) {
-            errEl.textContent = 'Login failed';
+            if (resp && resp.error) {
+              if (typeof resp.error === 'string') {
+                msg = resp.error;
+              } else if (typeof resp.error === 'object' && resp.error.message) {
+                msg = resp.error.message;
+              }
+            }
+          } catch(ex) { /* fall through to default */ }
+          if (!msg) {
+            msg = (xhr.status === 401) ? 'Invalid username or password'
+                                       : 'Login failed (' + xhr.status + ')';
           }
+          errEl.textContent = msg;
           btn.disabled = false;
         }
       };

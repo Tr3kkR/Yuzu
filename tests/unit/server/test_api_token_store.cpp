@@ -15,9 +15,19 @@ using namespace yuzu::server;
 
 namespace {
 
+// Per-instance unique path so tests are safe to run under parallel
+// meson test --num-processes N. The prior hardcoded path collided
+// between concurrent test cases.
 struct TempDb {
     std::filesystem::path path;
-    TempDb() : path(std::filesystem::temp_directory_path() / "test_api_tokens.db") {
+    TempDb()
+        : path(std::filesystem::temp_directory_path() /
+               ("test_api_tokens-" +
+                std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
+                               static_cast<size_t>(std::chrono::steady_clock::now()
+                                                       .time_since_epoch()
+                                                       .count())) +
+                ".db")) {
         std::filesystem::remove(path);
     }
     ~TempDb() { std::filesystem::remove(path); }
@@ -167,4 +177,105 @@ TEST_CASE("ApiTokenStore: revoke nonexistent token", "[token][crud]") {
 
     bool revoked = store.revoke_token("nonexistent");
     CHECK(!revoked);
+}
+
+// ── get_token: metadata lookup for owner-scoped revoke (#222) ────────────────
+
+TEST_CASE("ApiTokenStore: get_token returns metadata for ownership check",
+          "[token][crud][owner]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    auto raw = store.create_token("Alice's token", "alice");
+    REQUIRE(raw.has_value());
+    auto listing = store.list_tokens("alice");
+    REQUIRE(listing.size() == 1);
+    auto token_id = listing[0].token_id;
+
+    auto looked_up = store.get_token(token_id);
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->token_id == token_id);
+    CHECK(looked_up->principal_id == "alice");
+    CHECK(looked_up->name == "Alice's token");
+    CHECK(looked_up->revoked == false);
+    // The raw hash must never surface through metadata lookups.
+    CHECK(looked_up->token_hash.empty());
+}
+
+TEST_CASE("ApiTokenStore: get_token returns nullopt for unknown id",
+          "[token][crud][owner]") {
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    CHECK(!store.get_token("does-not-exist").has_value());
+    CHECK(!store.get_token("").has_value());
+}
+
+TEST_CASE("ApiTokenStore: list_tokens(principal) scopes results to owner",
+          "[token][crud][owner]") {
+    // Gate 4 consistency auditor finding C1: the Settings dashboard
+    // `render_api_tokens_fragment` previously called list_tokens() with no
+    // principal filter, rendering every user's token IDs, names, owners,
+    // timestamps, and MCP tiers in the HTMX response body to anyone
+    // holding `ApiToken:Read`. The fix scopes the fragment by
+    // `session->username` for non-admin sessions. This test pins the
+    // underlying store contract the fix depends on: list_tokens(principal)
+    // must return ONLY that principal's tokens, with no leakage across
+    // owners.
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    REQUIRE(store.create_token("alice-a", "alice").has_value());
+    REQUIRE(store.create_token("alice-b", "alice").has_value());
+    REQUIRE(store.create_token("bob-a", "bob").has_value());
+    REQUIRE(store.create_token("root-a", "root").has_value());
+
+    auto alice_tokens = store.list_tokens("alice");
+    auto bob_tokens = store.list_tokens("bob");
+    auto root_tokens = store.list_tokens("root");
+    auto all_tokens = store.list_tokens();
+
+    REQUIRE(alice_tokens.size() == 2);
+    REQUIRE(bob_tokens.size() == 1);
+    REQUIRE(root_tokens.size() == 1);
+    REQUIRE(all_tokens.size() == 4);
+
+    // Every token returned for alice is owned by alice — no cross-contamination.
+    for (const auto& t : alice_tokens)
+        CHECK(t.principal_id == "alice");
+    for (const auto& t : bob_tokens)
+        CHECK(t.principal_id == "bob");
+    for (const auto& t : root_tokens)
+        CHECK(t.principal_id == "root");
+
+    // Bob's name does not appear in alice's listing under any column.
+    for (const auto& t : alice_tokens) {
+        CHECK(t.name != "bob-a");
+        CHECK(t.name != "root-a");
+    }
+}
+
+TEST_CASE("ApiTokenStore: get_token distinguishes owners for IDOR defense",
+          "[token][crud][owner]") {
+    // This test encodes the core invariant that the REST DELETE handler
+    // relies on to close #222: looking up a token by id must surface the
+    // owning principal_id so the handler can reject cross-user revokes.
+    TempDb tmp;
+    ApiTokenStore store(tmp.path);
+
+    REQUIRE(store.create_token("alice-key", "alice").has_value());
+    REQUIRE(store.create_token("bob-key", "bob").has_value());
+
+    auto alice_tokens = store.list_tokens("alice");
+    auto bob_tokens = store.list_tokens("bob");
+    REQUIRE(alice_tokens.size() == 1);
+    REQUIRE(bob_tokens.size() == 1);
+
+    auto alice_looked_up = store.get_token(alice_tokens[0].token_id);
+    auto bob_looked_up = store.get_token(bob_tokens[0].token_id);
+    REQUIRE(alice_looked_up.has_value());
+    REQUIRE(bob_looked_up.has_value());
+    CHECK(alice_looked_up->principal_id == "alice");
+    CHECK(bob_looked_up->principal_id == "bob");
+    CHECK(alice_looked_up->principal_id != bob_looked_up->principal_id);
 }

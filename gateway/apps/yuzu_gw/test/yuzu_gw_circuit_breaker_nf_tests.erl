@@ -66,9 +66,11 @@ setup() ->
     Pid.
 
 cleanup(Pid) ->
+    %% Synchronous stop. exit(Pid, shutdown) + sleep(50) was racy on busy
+    %% boxes (WSL2 in particular) and leaked the upstream into the next
+    %% test module's setup — see issue #336.
     catch unlink(Pid),
-    catch exit(Pid, shutdown),
-    timer:sleep(50),
+    catch gen_server:stop(Pid, shutdown, 5000),
     meck:unload([grpcbox_client, telemetry]),
     ok.
 

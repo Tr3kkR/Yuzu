@@ -748,8 +748,12 @@ mcp_call "tools/call" '{"name":"query_audit_log","arguments":{"action":"mcp.list
 HAS_ERR=$(has_error)
 assert_eq "audit query for mcp.list_agents succeeds" "no" "$HAS_ERR"
 
-# Check that at least one audit entry exists for our MCP calls
-MCP_AUDIT_COUNT=$(echo "$MCP_BODY" | python3 -c "
+# Check that at least one audit entry exists for our MCP calls AND that every
+# returned mcp.* row has a populated principal. The principal-population assertion
+# is a regression net for the bug fixed in the same commit as this assertion:
+# AuthRoutes::make_audit_event used to resolve the principal from session cookies
+# only, so token-authenticated MCP calls logged audit rows with empty principal.
+MCP_AUDIT_REPORT=$(echo "$MCP_BODY" | python3 -c "
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -757,18 +761,25 @@ try:
     if isinstance(r, str): r = json.loads(r)
     content = r.get('content', [])
     if content:
-        text = content[0].get('text', '[]')
-        events = json.loads(text)
-        print(len(events) if isinstance(events, list) else 0)
+        events = json.loads(content[0].get('text', '[]'))
+        if not isinstance(events, list):
+            print('0 0'); sys.exit(0)
+        empty = sum(1 for e in events if not e.get('principal'))
+        print(f'{len(events)} {empty}')
     else:
-        print(0)
+        print('0 0')
 except:
-    print(0)
-" 2>/dev/null || echo "0")
+    print('0 0')
+" 2>/dev/null || echo "0 0")
+
+MCP_AUDIT_COUNT=$(echo "$MCP_AUDIT_REPORT" | awk '{print $1}')
+MCP_AUDIT_EMPTY_PRINCIPAL=$(echo "$MCP_AUDIT_REPORT" | awk '{print $2}')
 
 TESTS=$((TESTS + 1))
-if [[ "$MCP_AUDIT_COUNT" -gt 0 ]]; then
-    pass "MCP tool calls appear in audit log ($MCP_AUDIT_COUNT entries)"
+if [[ "$MCP_AUDIT_COUNT" -gt 0 && "$MCP_AUDIT_EMPTY_PRINCIPAL" -eq 0 ]]; then
+    pass "MCP tool calls appear in audit log with populated principal ($MCP_AUDIT_COUNT entries)"
+elif [[ "$MCP_AUDIT_COUNT" -gt 0 ]]; then
+    fail "MCP audit rows present ($MCP_AUDIT_COUNT) but $MCP_AUDIT_EMPTY_PRINCIPAL have empty principal — token-auth attribution regression"
 else
     # Audit entries may take a moment to flush — acceptable
     pass "MCP audit entries pending flush (non-blocking)"
