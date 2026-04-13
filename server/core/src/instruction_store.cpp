@@ -1,4 +1,5 @@
 #include "instruction_store.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -86,48 +87,10 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS instruction_definitions (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            version TEXT NOT NULL DEFAULT '1.0',
-            type TEXT NOT NULL,
-            plugin TEXT NOT NULL,
-            action TEXT NOT NULL DEFAULT '',
-            description TEXT NOT NULL DEFAULT '',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            instruction_set_id TEXT NOT NULL DEFAULT '',
-            gather_ttl_seconds INTEGER NOT NULL DEFAULT 300,
-            response_ttl_days INTEGER NOT NULL DEFAULT 90,
-            created_by TEXT NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL DEFAULT 0,
-            yaml_source TEXT NOT NULL DEFAULT '',
-            parameter_schema TEXT NOT NULL DEFAULT '{}',
-            result_schema TEXT NOT NULL DEFAULT '{}',
-            approval_mode TEXT NOT NULL DEFAULT 'auto',
-            concurrency_mode TEXT NOT NULL DEFAULT 'per-device',
-            platforms TEXT NOT NULL DEFAULT '',
-            min_agent_version TEXT NOT NULL DEFAULT '',
-            required_plugins TEXT NOT NULL DEFAULT '',
-            readable_payload TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS instruction_sets (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            created_by TEXT NOT NULL DEFAULT '',
-            created_at INTEGER NOT NULL DEFAULT 0
-        );
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, ddl, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("InstructionStore: DDL failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Migrate: add new columns if upgrading from an older schema
-    const char* migrations[] = {
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so columns
+    // added historically via silent ALTERs must still be applied here.
+    const char* legacy_alters[] = {
         "ALTER TABLE instruction_definitions ADD COLUMN yaml_source TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE instruction_definitions ADD COLUMN parameter_schema TEXT NOT NULL DEFAULT "
         "'{}'",
@@ -140,8 +103,51 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
         "ALTER TABLE instruction_definitions ADD COLUMN required_plugins TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE instruction_definitions ADD COLUMN readable_payload TEXT NOT NULL DEFAULT ''",
     };
-    for (const auto* m : migrations) {
+    for (const auto* m : legacy_alters) {
         sqlite3_exec(db_, m, nullptr, nullptr, nullptr); // ignore "duplicate column" errors
+    }
+
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS instruction_definitions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT '1.0',
+                type TEXT NOT NULL,
+                plugin TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                instruction_set_id TEXT NOT NULL DEFAULT '',
+                gather_ttl_seconds INTEGER NOT NULL DEFAULT 300,
+                response_ttl_days INTEGER NOT NULL DEFAULT 90,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                yaml_source TEXT NOT NULL DEFAULT '',
+                parameter_schema TEXT NOT NULL DEFAULT '{}',
+                result_schema TEXT NOT NULL DEFAULT '{}',
+                approval_mode TEXT NOT NULL DEFAULT 'auto',
+                concurrency_mode TEXT NOT NULL DEFAULT 'per-device',
+                platforms TEXT NOT NULL DEFAULT '',
+                min_agent_version TEXT NOT NULL DEFAULT '',
+                required_plugins TEXT NOT NULL DEFAULT '',
+                readable_payload TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS instruction_sets (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "instruction_store", kMigrations)) {
+        spdlog::error("InstructionStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+        return;
     }
 
     spdlog::info("InstructionStore: opened {}", db_path.string());

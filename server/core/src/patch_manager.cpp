@@ -1,4 +1,5 @@
 #include "patch_manager.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -73,7 +74,8 @@ PatchManager::PatchManager(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("PatchManager: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("PatchManager: opened {}", db_path.string());
 }
 
 PatchManager::~PatchManager() {
@@ -88,62 +90,67 @@ bool PatchManager::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void PatchManager::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS patch_inventory (
-            agent_id    TEXT NOT NULL,
-            kb_id       TEXT NOT NULL,
-            title       TEXT NOT NULL DEFAULT '',
-            severity    TEXT NOT NULL DEFAULT 'Unspecified',
-            status      TEXT NOT NULL DEFAULT 'missing',
-            released_at INTEGER NOT NULL DEFAULT 0,
-            scanned_at  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (agent_id, kb_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS patch_deployments (
-            id           TEXT PRIMARY KEY,
-            kb_id        TEXT NOT NULL,
-            title        TEXT NOT NULL DEFAULT '',
-            status       TEXT NOT NULL DEFAULT 'pending',
-            created_by   TEXT NOT NULL DEFAULT '',
-            reboot_needed INTEGER NOT NULL DEFAULT 0,
-            created_at   INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER NOT NULL DEFAULT 0,
-            total_targets    INTEGER NOT NULL DEFAULT 0,
-            completed_targets INTEGER NOT NULL DEFAULT 0,
-            failed_targets   INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS patch_deployment_targets (
-            deployment_id TEXT NOT NULL,
-            agent_id      TEXT NOT NULL,
-            status        TEXT NOT NULL DEFAULT 'pending',
-            error         TEXT NOT NULL DEFAULT '',
-            started_at    INTEGER NOT NULL DEFAULT 0,
-            completed_at  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (deployment_id, agent_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_patch_inv_kb ON patch_inventory(kb_id);
-        CREATE INDEX IF NOT EXISTS idx_patch_inv_status ON patch_inventory(status);
-        CREATE INDEX IF NOT EXISTS idx_patch_inv_agent ON patch_inventory(agent_id);
-        CREATE INDEX IF NOT EXISTS idx_patch_depl_status ON patch_deployments(status);
-        CREATE INDEX IF NOT EXISTS idx_patch_depl_targets ON patch_deployment_targets(deployment_id);
-    )";
-
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("PatchManager: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Schema migration: add reboot orchestration columns (idempotent)
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so reboot
+    // orchestration columns added historically must still be applied here.
     sqlite3_exec(db_,
         "ALTER TABLE patch_deployments ADD COLUMN reboot_delay_seconds INTEGER NOT NULL DEFAULT 300;",
         nullptr, nullptr, nullptr);
     sqlite3_exec(db_,
         "ALTER TABLE patch_deployments ADD COLUMN reboot_at INTEGER NOT NULL DEFAULT 0;",
         nullptr, nullptr, nullptr);
+
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS patch_inventory (
+                agent_id    TEXT NOT NULL,
+                kb_id       TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                severity    TEXT NOT NULL DEFAULT 'Unspecified',
+                status      TEXT NOT NULL DEFAULT 'missing',
+                released_at INTEGER NOT NULL DEFAULT 0,
+                scanned_at  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, kb_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS patch_deployments (
+                id                    TEXT PRIMARY KEY,
+                kb_id                 TEXT NOT NULL,
+                title                 TEXT NOT NULL DEFAULT '',
+                status                TEXT NOT NULL DEFAULT 'pending',
+                created_by            TEXT NOT NULL DEFAULT '',
+                reboot_needed         INTEGER NOT NULL DEFAULT 0,
+                reboot_delay_seconds  INTEGER NOT NULL DEFAULT 300,
+                reboot_at             INTEGER NOT NULL DEFAULT 0,
+                created_at            INTEGER NOT NULL DEFAULT 0,
+                completed_at          INTEGER NOT NULL DEFAULT 0,
+                total_targets         INTEGER NOT NULL DEFAULT 0,
+                completed_targets     INTEGER NOT NULL DEFAULT 0,
+                failed_targets        INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS patch_deployment_targets (
+                deployment_id TEXT NOT NULL,
+                agent_id      TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                error         TEXT NOT NULL DEFAULT '',
+                started_at    INTEGER NOT NULL DEFAULT 0,
+                completed_at  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (deployment_id, agent_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_patch_inv_kb ON patch_inventory(kb_id);
+            CREATE INDEX IF NOT EXISTS idx_patch_inv_status ON patch_inventory(status);
+            CREATE INDEX IF NOT EXISTS idx_patch_inv_agent ON patch_inventory(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_patch_depl_status ON patch_deployments(status);
+            CREATE INDEX IF NOT EXISTS idx_patch_depl_targets ON patch_deployment_targets(deployment_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "patch_manager", kMigrations)) {
+        spdlog::error("PatchManager: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 std::string PatchManager::generate_id() const {

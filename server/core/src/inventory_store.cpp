@@ -1,4 +1,5 @@
 #include "inventory_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -42,7 +43,8 @@ InventoryStore::InventoryStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
-    spdlog::info("InventoryStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("InventoryStore: opened {}", db_path.string());
 }
 
 InventoryStore::~InventoryStore() {
@@ -57,22 +59,24 @@ bool InventoryStore::is_open() const {
 }
 
 void InventoryStore::create_tables() {
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS inventory_data (
-            agent_id TEXT NOT NULL,
-            plugin TEXT NOT NULL,
-            data_json TEXT NOT NULL DEFAULT '{}',
-            collected_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (agent_id, plugin)
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS inventory_data (
+                agent_id TEXT NOT NULL,
+                plugin TEXT NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                collected_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_id, plugin)
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_inventory_plugin ON inventory_data(plugin);
-        CREATE INDEX IF NOT EXISTS idx_inventory_collected ON inventory_data(collected_at);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, ddl, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("InventoryStore: DDL failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE INDEX IF NOT EXISTS idx_inventory_plugin ON inventory_data(plugin);
+            CREATE INDEX IF NOT EXISTS idx_inventory_collected ON inventory_data(collected_at);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "inventory_store", kMigrations)) {
+        spdlog::error("InventoryStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

@@ -1556,16 +1556,49 @@ private:
                 return;
             }
 
-            bool stores_ok = (response_store_ && response_store_->is_open()) &&
-                             (audit_store_ && audit_store_->is_open()) &&
-                             (instruction_store_ && instruction_store_->is_open()) &&
-                             (api_token_store_ && api_token_store_->is_open());
+            // Check every store that is load-bearing for request handling.
+            // A store with a failed migration has had db_ closed and nullified
+            // inside create_tables(), so is_open() will correctly return false.
+            struct StoreCheck {
+                const char* name;
+                bool ok;
+            };
+            std::vector<StoreCheck> checks = {
+                {"response_store", response_store_ && response_store_->is_open()},
+                {"audit_store", audit_store_ && audit_store_->is_open()},
+                {"instruction_store", instruction_store_ && instruction_store_->is_open()},
+                {"api_token_store", api_token_store_ && api_token_store_->is_open()},
+                {"policy_store", policy_store_ && policy_store_->is_open()},
+                {"rbac_store", rbac_store_ && rbac_store_->is_open()},
+                {"tag_store", tag_store_ && tag_store_->is_open()},
+                {"management_group_store",
+                 mgmt_group_store_ && mgmt_group_store_->is_open()},
+                {"runtime_config_store",
+                 runtime_config_store_ && runtime_config_store_->is_open()},
+                {"inventory_store", inventory_store_ && inventory_store_->is_open()},
+                {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
+                {"custom_properties_store",
+                 custom_properties_store_ && custom_properties_store_->is_open()},
+            };
 
-            if (stores_ok) {
+            std::string failed_list;
+            for (const auto& c : checks) {
+                if (!c.ok) {
+                    if (!failed_list.empty())
+                        failed_list += ",";
+                    failed_list += "\"";
+                    failed_list += c.name;
+                    failed_list += "\"";
+                }
+            }
+
+            if (failed_list.empty()) {
                 res.set_content(R"({"status":"ready"})", "application/json");
             } else {
                 res.status = 503;
-                res.set_content(R"({"status":"not ready"})", "application/json");
+                res.set_content("{\"status\":\"not ready\",\"failed_stores\":[" +
+                                    failed_list + "]}",
+                                "application/json");
             }
         });
 

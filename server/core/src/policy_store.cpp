@@ -2,6 +2,7 @@
 
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -317,7 +318,8 @@ PolicyStore::PolicyStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("PolicyStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("PolicyStore: opened {}", db_path.string());
 }
 
 PolicyStore::~PolicyStore() {
@@ -332,84 +334,89 @@ bool PolicyStore::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void PolicyStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS policy_fragments (
-            id                    TEXT PRIMARY KEY,
-            name                  TEXT NOT NULL,
-            description           TEXT NOT NULL DEFAULT '',
-            yaml_source           TEXT NOT NULL,
-            check_instruction     TEXT,
-            check_compliance      TEXT,
-            check_parameters      TEXT NOT NULL DEFAULT '{}',
-            fix_instruction       TEXT,
-            fix_parameters        TEXT NOT NULL DEFAULT '{}',
-            post_check_instruction TEXT,
-            post_check_compliance TEXT,
-            post_check_parameters TEXT NOT NULL DEFAULT '{}',
-            created_at            INTEGER NOT NULL DEFAULT 0,
-            updated_at            INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS policies (
-            id               TEXT PRIMARY KEY,
-            name             TEXT NOT NULL,
-            description      TEXT NOT NULL DEFAULT '',
-            yaml_source      TEXT NOT NULL,
-            fragment_id      TEXT NOT NULL REFERENCES policy_fragments(id),
-            scope_expression TEXT,
-            enabled          INTEGER NOT NULL DEFAULT 1,
-            created_at       INTEGER NOT NULL DEFAULT 0,
-            updated_at       INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS policy_inputs (
-            policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
-            key       TEXT NOT NULL,
-            value     TEXT NOT NULL,
-            PRIMARY KEY(policy_id, key)
-        );
-
-        CREATE TABLE IF NOT EXISTS policy_triggers (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            policy_id    TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
-            trigger_type TEXT NOT NULL,
-            config_json  TEXT NOT NULL DEFAULT '{}'
-        );
-
-        CREATE TABLE IF NOT EXISTS policy_groups (
-            policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
-            group_id  TEXT NOT NULL,
-            PRIMARY KEY(policy_id, group_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS policy_status (
-            policy_id     TEXT NOT NULL,
-            agent_id      TEXT NOT NULL,
-            status        TEXT NOT NULL DEFAULT 'unknown',
-            last_check_at INTEGER NOT NULL DEFAULT 0,
-            last_fix_at   INTEGER NOT NULL DEFAULT 0,
-            check_result  TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY(policy_id, agent_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_policies_fragment
-            ON policies(fragment_id);
-        CREATE INDEX IF NOT EXISTS idx_policies_enabled
-            ON policies(enabled);
-        CREATE INDEX IF NOT EXISTS idx_policy_triggers_policy
-            ON policy_triggers(policy_id);
-        CREATE INDEX IF NOT EXISTS idx_policy_status_status
-            ON policy_status(status);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("PolicyStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Migration: add fix_attempt_count column (G4-UHP-POL-003)
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
+    // fix_attempt_count column (G4-UHP-POL-003) must still be applied here.
     sqlite3_exec(db_, "ALTER TABLE policy_status ADD COLUMN fix_attempt_count INTEGER NOT NULL DEFAULT 0;",
                  nullptr, nullptr, nullptr);
+
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS policy_fragments (
+                id                    TEXT PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                description           TEXT NOT NULL DEFAULT '',
+                yaml_source           TEXT NOT NULL,
+                check_instruction     TEXT,
+                check_compliance      TEXT,
+                check_parameters      TEXT NOT NULL DEFAULT '{}',
+                fix_instruction       TEXT,
+                fix_parameters        TEXT NOT NULL DEFAULT '{}',
+                post_check_instruction TEXT,
+                post_check_compliance TEXT,
+                post_check_parameters TEXT NOT NULL DEFAULT '{}',
+                created_at            INTEGER NOT NULL DEFAULT 0,
+                updated_at            INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS policies (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                description      TEXT NOT NULL DEFAULT '',
+                yaml_source      TEXT NOT NULL,
+                fragment_id      TEXT NOT NULL REFERENCES policy_fragments(id),
+                scope_expression TEXT,
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                created_at       INTEGER NOT NULL DEFAULT 0,
+                updated_at       INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_inputs (
+                policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
+                key       TEXT NOT NULL,
+                value     TEXT NOT NULL,
+                PRIMARY KEY(policy_id, key)
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_triggers (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                policy_id    TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
+                trigger_type TEXT NOT NULL,
+                config_json  TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_groups (
+                policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
+                group_id  TEXT NOT NULL,
+                PRIMARY KEY(policy_id, group_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_status (
+                policy_id         TEXT NOT NULL,
+                agent_id          TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'unknown',
+                last_check_at     INTEGER NOT NULL DEFAULT 0,
+                last_fix_at       INTEGER NOT NULL DEFAULT 0,
+                check_result      TEXT NOT NULL DEFAULT '',
+                fix_attempt_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(policy_id, agent_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_policies_fragment
+                ON policies(fragment_id);
+            CREATE INDEX IF NOT EXISTS idx_policies_enabled
+                ON policies(enabled);
+            CREATE INDEX IF NOT EXISTS idx_policy_triggers_policy
+                ON policy_triggers(policy_id);
+            CREATE INDEX IF NOT EXISTS idx_policy_status_status
+                ON policy_status(status);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "policy_store", kMigrations)) {
+        spdlog::error("PolicyStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 std::string PolicyStore::generate_id() const {

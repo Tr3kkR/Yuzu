@@ -1,4 +1,5 @@
 #include "response_store.hpp"
+#include "migration_runner.hpp"
 #include "result_parsing.hpp"
 
 #include <spdlog/spdlog.h>
@@ -33,7 +34,8 @@ ResponseStore::ResponseStore(const std::filesystem::path& db_path, int retention
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
     prepare_insert_stmt();
-    spdlog::info("ResponseStore: opened {} (retention={}d)", db_path.string(), retention_days_);
+    if (db_)
+        spdlog::info("ResponseStore: opened {} (retention={}d)", db_path.string(), retention_days_);
 }
 
 ResponseStore::~ResponseStore() {
@@ -51,60 +53,53 @@ bool ResponseStore::is_open() const {
 }
 
 void ResponseStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS responses (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            instruction_id  TEXT    NOT NULL,
-            agent_id        TEXT    NOT NULL,
-            timestamp       INTEGER NOT NULL,
-            status          INTEGER NOT NULL,
-            output          TEXT    NOT NULL,
-            error_detail    TEXT,
-            ttl_expires_at  INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_resp_instr_ts
-            ON responses(instruction_id, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_resp_agent_ts
-            ON responses(agent_id, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_resp_ttl
-            ON responses(ttl_expires_at) WHERE ttl_expires_at > 0;
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ResponseStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Migration: add plugin column (idempotent — ignore error if already exists)
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
+    // `plugin` column must still be applied here.
     sqlite3_exec(db_, "ALTER TABLE responses ADD COLUMN plugin TEXT DEFAULT ''",
                  nullptr, nullptr, nullptr);
 
-    // Additional index for filtering by status within an instruction
-    sqlite3_exec(db_, "CREATE INDEX IF NOT EXISTS idx_resp_instr_status"
-                      " ON responses(instruction_id, status)",
-                 nullptr, nullptr, nullptr);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS responses (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                instruction_id  TEXT    NOT NULL,
+                agent_id        TEXT    NOT NULL,
+                timestamp       INTEGER NOT NULL,
+                status          INTEGER NOT NULL,
+                output          TEXT    NOT NULL,
+                error_detail    TEXT,
+                ttl_expires_at  INTEGER DEFAULT 0,
+                plugin          TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_resp_instr_ts
+                ON responses(instruction_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_resp_agent_ts
+                ON responses(agent_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_resp_ttl
+                ON responses(ttl_expires_at) WHERE ttl_expires_at > 0;
+            CREATE INDEX IF NOT EXISTS idx_resp_instr_status
+                ON responses(instruction_id, status);
 
-    // Faceted index for server-side result filtering at scale
-    const char* facets_sql = R"(
-        CREATE TABLE IF NOT EXISTS response_facets (
-            response_id    INTEGER NOT NULL,
-            instruction_id TEXT    NOT NULL,
-            agent_id       TEXT    NOT NULL,
-            col_idx        INTEGER NOT NULL,
-            value          TEXT    NOT NULL,
-            line_count     INTEGER DEFAULT 1,
-            PRIMARY KEY (response_id, col_idx, value)
-        );
-        CREATE INDEX IF NOT EXISTS idx_facets_query
-            ON response_facets(instruction_id, col_idx, value);
-        CREATE INDEX IF NOT EXISTS idx_facets_agent
-            ON response_facets(instruction_id, agent_id);
-    )";
-    err = nullptr;
-    if (sqlite3_exec(db_, facets_sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ResponseStore: create response_facets failed: {}",
-                      err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE TABLE IF NOT EXISTS response_facets (
+                response_id    INTEGER NOT NULL,
+                instruction_id TEXT    NOT NULL,
+                agent_id       TEXT    NOT NULL,
+                col_idx        INTEGER NOT NULL,
+                value          TEXT    NOT NULL,
+                line_count     INTEGER DEFAULT 1,
+                PRIMARY KEY (response_id, col_idx, value)
+            );
+            CREATE INDEX IF NOT EXISTS idx_facets_query
+                ON response_facets(instruction_id, col_idx, value);
+            CREATE INDEX IF NOT EXISTS idx_facets_agent
+                ON response_facets(instruction_id, agent_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "response_store", kMigrations)) {
+        spdlog::error("ResponseStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

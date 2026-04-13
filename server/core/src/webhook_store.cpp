@@ -1,4 +1,5 @@
 #include "webhook_store.hpp"
+#include "migration_runner.hpp"
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
@@ -125,32 +126,35 @@ bool WebhookStore::is_open() const {
 }
 
 void WebhookStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS webhooks (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            url         TEXT    NOT NULL,
-            event_types TEXT    NOT NULL DEFAULT '*',
-            secret      TEXT    NOT NULL DEFAULT '',
-            enabled     INTEGER NOT NULL DEFAULT 1,
-            created_at  INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS webhook_deliveries (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            webhook_id  INTEGER NOT NULL,
-            event_type  TEXT    NOT NULL,
-            payload     TEXT    NOT NULL,
-            status_code INTEGER NOT NULL DEFAULT 0,
-            delivered_at INTEGER NOT NULL,
-            error       TEXT    NOT NULL DEFAULT '',
-            FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_delivery_webhook_ts
-            ON webhook_deliveries(webhook_id, delivered_at);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("WebhookStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS webhooks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                url         TEXT    NOT NULL,
+                event_types TEXT    NOT NULL DEFAULT '*',
+                secret      TEXT    NOT NULL DEFAULT '',
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                created_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                webhook_id  INTEGER NOT NULL,
+                event_type  TEXT    NOT NULL,
+                payload     TEXT    NOT NULL,
+                status_code INTEGER NOT NULL DEFAULT 0,
+                delivered_at INTEGER NOT NULL,
+                error       TEXT    NOT NULL DEFAULT '',
+                FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_webhook_ts
+                ON webhook_deliveries(webhook_id, delivered_at);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "webhook_store", kMigrations)) {
+        spdlog::error("WebhookStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+        return;
     }
     // Enable foreign keys
     sqlite3_exec(db_, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);

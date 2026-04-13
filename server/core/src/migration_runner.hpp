@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,9 +9,21 @@ struct sqlite3;
 namespace yuzu::server {
 
 /// A single schema migration step.
+///
+/// `sql` is a `std::string` (owning) rather than `std::string_view` to guard
+/// against future callers constructing migrations from non-null-terminated
+/// views — `sqlite3_exec` requires a null-terminated C string. Static
+/// string-literal construction (`{1, R"(...)"}`) still works because
+/// `std::string` has an implicit constructor from `const char*`.
+///
+/// Future-evolution note: `ALTER TABLE` ops that rewrite the whole table
+/// (DROP COLUMN, some RENAME variants, type changes) are O(N) and will
+/// block server startup for the duration of the rewrite on large tables.
+/// If you need one, route it through a dedicated background-migration
+/// pattern instead of adding it as a standard `Migration` entry.
 struct Migration {
-    int version;          ///< Target version after this migration runs.
-    std::string_view sql; ///< SQL statement(s) to execute.
+    int version;     ///< Target version after this migration runs.
+    std::string sql; ///< SQL statement(s) to execute.
 };
 
 /**

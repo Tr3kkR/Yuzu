@@ -75,6 +75,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/tmp/yuzu-test-${RUN_ID}/` scratch dir, finalizes the `test_runs`
   row with computed `overall_status` from gate aggregates.
 
+- **Schema migrations wired into every server-side SQLite store (#339).**
+  The `MigrationRunner` framework at
+  `server/core/src/migration_runner.{hpp,cpp}` existed since earlier
+  releases but had not been called by any store — every store relied on
+  `CREATE TABLE IF NOT EXISTS` plus silent `ALTER TABLE` fallbacks, and
+  the upgrade docs incorrectly claimed "automatic schema migrations"
+  since v0.1.0. This change threads `MigrationRunner::run()` through the
+  `create_tables()` method of all 30 stores and managers:
+  `analytics_event_store`, `api_token_store`, `approval_manager`,
+  `audit_store`, `concurrency_manager`, `custom_properties_store`,
+  `deployment_store`, `device_token_store`, `directory_sync`,
+  `discovery_store`, `execution_tracker`, `instruction_store`,
+  `inventory_store`, `license_store`, `management_group_store`,
+  `notification_store`, `nvd_db`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `quarantine_store`, `rbac_store`,
+  `response_store`, `runtime_config_store`, `schedule_engine`,
+  `software_deployment_store`, `tag_store`, `update_registry`,
+  `webhook_store`, `workflow_engine`. Every database now stamps its
+  schema version in the shared `schema_meta` table and future schema
+  changes go through versioned migrations with transactional rollback.
+- **`deploy/docker/docker-compose.reference.yml`** — copyable
+  deployment template that pulls pinned
+  `ghcr.io/tr3kkr/yuzu-{server,agent}:${YUZU_VERSION:-0.10.0}` images,
+  uses a named `server-data` volume for all mutable state, and carries
+  inline TLS hardening + backup + rollback + restore commentary.
+  Covered by `scripts/check-compose-versions.sh` so release tags cannot
+  drift from the compose default. Named "reference" rather than
+  "production" because the image's default CMD is dev-friendly
+  (`--no-tls --no-https --web-address 0.0.0.0`) and the template
+  requires operator hardening before production use (#339).
+- **Legacy compatibility shims in six stores** — `api_token_store`,
+  `instruction_store`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `response_store`. These run the historical
+  silent `ALTER TABLE ADD COLUMN` statements once before
+  `MigrationRunner::run()` so databases created by pre-v0.10 releases
+  that never received those columns still converge to schema v1.
+  Kept for one release cycle; removable after v0.11.
+
+### Changed
+
+- **Migration failure now closes the affected store (#339).** When
+  `MigrationRunner::run()` returns false for a store that owns its
+  SQLite handle (26 of 30 stores), the store's `create_tables()` closes
+  the handle and sets `db_ = nullptr`, so `is_open()` correctly returns
+  false. Previously a migration failure was logged but the store kept
+  reporting itself as open, and `ResponseStore::store()` would silently
+  no-op on inserts because `insert_stmt_` was null — agent results
+  reached the server, were "accepted" over gRPC, and disappeared. This
+  change ensures a migration failure surfaces loudly via `/readyz` and
+  causes reads/writes to fail fast instead of dropping data. (Closes
+  UP-1 / UP-2 / UP-9 / UP-20 compound finding from the #339 governance
+  run.)
+- **`/readyz` reports per-store status with failed store names (#339).**
+  The readiness probe now walks 12 load-bearing stores (response, audit,
+  instruction, api_token, policy, rbac, tag, management_group,
+  runtime_config, inventory, workflow_engine, custom_properties) and
+  returns a JSON body of the form
+  `{"status":"not ready","failed_stores":["..."]}` on 503 so operators
+  can diagnose upgrade failures without digging through logs.
+- **`MigrationRunner` hardening**: explicit `ROLLBACK;` on COMMIT
+  failure so shared-connection callers (`InstructionDbPool`) don't
+  inherit a half-open transaction; removed redundant `ensure_meta_table`
+  call in `current_version()`; `Migration::sql` is now `std::string`
+  (owning) instead of `std::string_view` to guard against future callers
+  constructing migrations from non-null-terminated views.
+- **`docs/user-manual/upgrading.md`** rewritten (#339): Docker section
+  references the new `docker-compose.reference.yml`, real `ghcr.io`
+  image path, backup recipe with a dedicated backup directory, explicit
+  Docker rollback recipe, `schema_meta` query for operator-side
+  verification, and truthful failure-mode guidance that points at
+  `/readyz` (not `/livez`) as the upgrade-success signal. The "Schema
+  Migrations" section describes the real mechanism, which stores carry
+  legacy shims, and what the log burst on first upgrade looks like.
+  Drops the inaccurate "since v0.1.0" claim. Version compat table now
+  spans 0.5.x → 0.9.x as a single row so the 0.10.x jump reads cleanly.
+- **`docs/user-manual/server-admin.md`** Docker compose table now
+  includes `docker-compose.reference.yml` with the "requires operator
+  hardening" caveat.
+
 ### Fixed
 
 - **`scripts/linux-start-UAT.sh` now exits non-zero on connectivity test
@@ -115,6 +194,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run; this is self-healing. See #356 for the watch list — the
   underlying meson+vcpkg+`CMAKE_BUILD_TYPE` interaction may need a
   follow-up fix if the symptom recurs.
+
+### Tests
+
+- **`tests/unit/server/test_migration_runner.cpp`** — four new cases
+  tagged `[migration][adoption]` exercise the adoption and hardening
+  paths: (a) running v1 on a database that already has tables populated
+  with data preserves rows and stamps `schema_meta`, (b) a fresh DB gets
+  the full latest schema, (c) the legacy compat shim + v1 combination
+  stays idempotent across simulated server restarts, (d) a bad migration
+  statement rolls back cleanly and leaves the shared connection usable
+  for subsequent migrations on other stores (#339). `TestDb` now uses
+  `sqlite3_open_v2` with `SQLITE_OPEN_FULLMUTEX` to match the flags
+  every production store opens with; `count_rows` and `column_exists`
+  helpers now `REQUIRE` that `sqlite3_prepare_v2` succeeds so a test
+  typo cannot mask itself as a false-green.
+
+### Deferred follow-ups from #339 governance
+
+- **#358** — Chaos regression tests for the migration runner
+  hardening: concurrent-server race (CH-B), mid-startup SIGKILL
+  (CH-E), forward-version DB downgrade protection (CH-F / UP-6).
+- **#359** — Per-shim-store adoption test coverage: targeted tests
+  for the six legacy-compat-shim stores (`api_token_store`,
+  `instruction_store`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `response_store`) plus `schema_meta` stamp
+  assertions in existing store tests and test coverage for the
+  eleven stores that currently have none.
+- **#360** — Migration observability + SRE hardening: Prometheus
+  counters for migration events (OBS-3), log-burst summary line
+  (OBS-4), independent `migration.log` audit trail (compliance-F4),
+  hot backup via SQLite online backup API (REC-1), CI lint for
+  migration runner wiring invariants (UP-17), and compile-time
+  `static_assert` for legacy shim removal (arch-SH2).
 
 ### Known issues
 

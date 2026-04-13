@@ -1,4 +1,5 @@
 #include "directory_sync.hpp"
+#include "migration_runner.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -102,7 +103,8 @@ DirectorySync::DirectorySync(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("DirectorySync: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("DirectorySync: opened {}", db_path.string());
 }
 
 DirectorySync::~DirectorySync() {
@@ -117,54 +119,55 @@ bool DirectorySync::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void DirectorySync::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS directory_users (
-            id           TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL DEFAULT '',
-            email        TEXT NOT NULL DEFAULT '',
-            upn          TEXT NOT NULL DEFAULT '',
-            enabled      INTEGER NOT NULL DEFAULT 1,
-            synced_at    INTEGER NOT NULL DEFAULT 0
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS directory_users (
+                id           TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                email        TEXT NOT NULL DEFAULT '',
+                upn          TEXT NOT NULL DEFAULT '',
+                enabled      INTEGER NOT NULL DEFAULT 1,
+                synced_at    INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS directory_groups (
-            id           TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL DEFAULT '',
-            description  TEXT NOT NULL DEFAULT '',
-            mapped_role  TEXT NOT NULL DEFAULT '',
-            synced_at    INTEGER NOT NULL DEFAULT 0
-        );
+            CREATE TABLE IF NOT EXISTS directory_groups (
+                id           TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                description  TEXT NOT NULL DEFAULT '',
+                mapped_role  TEXT NOT NULL DEFAULT '',
+                synced_at    INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS directory_memberships (
-            user_id  TEXT NOT NULL,
-            group_id TEXT NOT NULL,
-            PRIMARY KEY (user_id, group_id)
-        );
+            CREATE TABLE IF NOT EXISTS directory_memberships (
+                user_id  TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, group_id)
+            );
 
-        CREATE TABLE IF NOT EXISTS directory_group_role_mappings (
-            group_id  TEXT PRIMARY KEY,
-            role_name TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS directory_group_role_mappings (
+                group_id  TEXT PRIMARY KEY,
+                role_name TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS directory_sync_status (
-            provider     TEXT PRIMARY KEY,
-            status       TEXT NOT NULL DEFAULT 'idle',
-            last_sync_at INTEGER NOT NULL DEFAULT 0,
-            next_sync_at INTEGER NOT NULL DEFAULT 0,
-            user_count   INTEGER NOT NULL DEFAULT 0,
-            group_count  INTEGER NOT NULL DEFAULT 0,
-            last_error   TEXT NOT NULL DEFAULT ''
-        );
+            CREATE TABLE IF NOT EXISTS directory_sync_status (
+                provider     TEXT PRIMARY KEY,
+                status       TEXT NOT NULL DEFAULT 'idle',
+                last_sync_at INTEGER NOT NULL DEFAULT 0,
+                next_sync_at INTEGER NOT NULL DEFAULT 0,
+                user_count   INTEGER NOT NULL DEFAULT 0,
+                group_count  INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT NOT NULL DEFAULT ''
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_dir_users_email ON directory_users(email);
-        CREATE INDEX IF NOT EXISTS idx_dir_users_upn ON directory_users(upn);
-        CREATE INDEX IF NOT EXISTS idx_dir_memberships_group ON directory_memberships(group_id);
-    )";
-
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("DirectorySync: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE INDEX IF NOT EXISTS idx_dir_users_email ON directory_users(email);
+            CREATE INDEX IF NOT EXISTS idx_dir_users_upn ON directory_users(upn);
+            CREATE INDEX IF NOT EXISTS idx_dir_memberships_group ON directory_memberships(group_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "directory_sync", kMigrations)) {
+        spdlog::error("DirectorySync: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

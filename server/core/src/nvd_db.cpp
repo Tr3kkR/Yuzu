@@ -1,4 +1,5 @@
 #include "nvd_db.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -231,7 +232,8 @@ NvdDatabase::NvdDatabase(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
-    spdlog::info("NvdDatabase: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("NvdDatabase: opened {}", db_path.string());
 }
 
 NvdDatabase::~NvdDatabase() {
@@ -249,33 +251,33 @@ void NvdDatabase::create_tables() {
     if (!db_)
         return;
 
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS cve (
-            cve_id        TEXT PRIMARY KEY,
-            product       TEXT NOT NULL,
-            vendor        TEXT,
-            affected_below TEXT NOT NULL,
-            fixed_in      TEXT,
-            severity      TEXT NOT NULL,
-            description   TEXT NOT NULL,
-            published     TEXT,
-            last_modified TEXT,
-            source        TEXT DEFAULT 'nvd'
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS cve (
+                cve_id        TEXT PRIMARY KEY,
+                product       TEXT NOT NULL,
+                vendor        TEXT,
+                affected_below TEXT NOT NULL,
+                fixed_in      TEXT,
+                severity      TEXT NOT NULL,
+                description   TEXT NOT NULL,
+                published     TEXT,
+                last_modified TEXT,
+                source        TEXT DEFAULT 'nvd'
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_cve_product ON cve(product);
+            CREATE INDEX IF NOT EXISTS idx_cve_product ON cve(product);
 
-        CREATE TABLE IF NOT EXISTS sync_meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-    )";
-
-    char* err_msg = nullptr;
-    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("NvdDatabase: create_tables failed: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
+            CREATE TABLE IF NOT EXISTS sync_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "nvd_database", kMigrations)) {
+        spdlog::error("NvdDatabase: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

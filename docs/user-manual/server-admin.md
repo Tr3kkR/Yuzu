@@ -558,7 +558,8 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 |---|---|
 | `deploy/docker/Dockerfile.server` | Multi-stage build for the Yuzu server binary |
 | `deploy/docker/Dockerfile.gateway` | Erlang/OTP build for the gateway node |
-| `deploy/docker/docker-compose.yml` | Standalone stack (server + agent + monitoring) |
+| `deploy/docker/docker-compose.yml` | Build-from-source dev stack (server + agent + monitoring) |
+| `deploy/docker/docker-compose.reference.yml` | Copyable deployment template — pulls pinned ghcr.io images, uses a named `server-data` volume, carries inline TLS hardening + backup + rollback commentary. Requires operator hardening (TLS, bind address) before production use. |
 | `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
 | `docker-compose.uat.yml` | Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse) |
 

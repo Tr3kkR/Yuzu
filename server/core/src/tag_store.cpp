@@ -1,4 +1,5 @@
 #include "tag_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -39,7 +40,8 @@ TagStore::TagStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("TagStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("TagStore: opened {}", db_path.string());
 }
 
 TagStore::~TagStore() {
@@ -52,22 +54,24 @@ bool TagStore::is_open() const {
 }
 
 void TagStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS tags (
-            agent_id    TEXT NOT NULL,
-            key         TEXT NOT NULL,
-            value       TEXT NOT NULL,
-            source      TEXT NOT NULL DEFAULT 'server',
-            updated_at  INTEGER NOT NULL,
-            PRIMARY KEY (agent_id, key)
-        );
-        CREATE INDEX IF NOT EXISTS idx_tags_key_value
-            ON tags(key, value);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("TagStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS tags (
+                agent_id    TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                source      TEXT NOT NULL DEFAULT 'server',
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (agent_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_key_value
+                ON tags(key, value);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "tag_store", kMigrations)) {
+        spdlog::error("TagStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

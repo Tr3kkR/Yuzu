@@ -1,4 +1,5 @@
 #include "workflow_engine.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -207,7 +208,8 @@ WorkflowEngine::WorkflowEngine(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
-    spdlog::info("WorkflowEngine: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("WorkflowEngine: opened {}", db_path.string());
 }
 
 WorkflowEngine::~WorkflowEngine() {
@@ -222,61 +224,63 @@ bool WorkflowEngine::is_open() const {
 }
 
 void WorkflowEngine::create_tables() {
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS workflows (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            yaml_source TEXT NOT NULL,
-            created_at INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL DEFAULT 0
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                yaml_source TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS workflow_steps (
-            workflow_id TEXT NOT NULL,
-            step_index INTEGER NOT NULL,
-            instruction_id TEXT NOT NULL,
-            condition TEXT NOT NULL DEFAULT '',
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            retry_delay_seconds INTEGER NOT NULL DEFAULT 5,
-            foreach_source TEXT NOT NULL DEFAULT '',
-            label TEXT NOT NULL DEFAULT '',
-            on_failure TEXT NOT NULL DEFAULT 'abort',
-            PRIMARY KEY (workflow_id, step_index),
-            FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
-        );
+            CREATE TABLE IF NOT EXISTS workflow_steps (
+                workflow_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                instruction_id TEXT NOT NULL,
+                condition TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                retry_delay_seconds INTEGER NOT NULL DEFAULT 5,
+                foreach_source TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                on_failure TEXT NOT NULL DEFAULT 'abort',
+                PRIMARY KEY (workflow_id, step_index),
+                FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS workflow_executions (
-            id TEXT PRIMARY KEY,
-            workflow_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            agent_ids_json TEXT NOT NULL DEFAULT '[]',
-            started_at INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER,
-            current_step INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (workflow_id) REFERENCES workflows(id)
-        );
+            CREATE TABLE IF NOT EXISTS workflow_executions (
+                id TEXT PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                agent_ids_json TEXT NOT NULL DEFAULT '[]',
+                started_at INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER,
+                current_step INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (workflow_id) REFERENCES workflows(id)
+            );
 
-        CREATE TABLE IF NOT EXISTS workflow_step_results (
-            execution_id TEXT NOT NULL,
-            step_index INTEGER NOT NULL,
-            instruction_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            result_json TEXT NOT NULL DEFAULT '{}',
-            started_at INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER,
-            attempt INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (execution_id, step_index),
-            FOREIGN KEY (execution_id) REFERENCES workflow_executions(id) ON DELETE CASCADE
-        );
+            CREATE TABLE IF NOT EXISTS workflow_step_results (
+                execution_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                instruction_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                started_at INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (execution_id, step_index),
+                FOREIGN KEY (execution_id) REFERENCES workflow_executions(id) ON DELETE CASCADE
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_wf_exec_workflow ON workflow_executions(workflow_id);
-        CREATE INDEX IF NOT EXISTS idx_wf_step_results_exec ON workflow_step_results(execution_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, ddl, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("WorkflowEngine: DDL failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE INDEX IF NOT EXISTS idx_wf_exec_workflow ON workflow_executions(workflow_id);
+            CREATE INDEX IF NOT EXISTS idx_wf_step_results_exec ON workflow_step_results(execution_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "workflow_engine", kMigrations)) {
+        spdlog::error("WorkflowEngine: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

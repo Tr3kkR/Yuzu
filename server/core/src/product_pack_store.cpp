@@ -1,4 +1,5 @@
 #include "product_pack_store.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -287,7 +288,8 @@ ProductPackStore::ProductPackStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
-    spdlog::info("ProductPackStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("ProductPackStore: opened {}", db_path.string());
 }
 
 ProductPackStore::~ProductPackStore() {
@@ -302,38 +304,42 @@ bool ProductPackStore::is_open() const {
 }
 
 void ProductPackStore::create_tables() {
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS product_packs (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            version TEXT NOT NULL DEFAULT '1.0.0',
-            description TEXT NOT NULL DEFAULT '',
-            yaml_source TEXT NOT NULL,
-            installed_at INTEGER NOT NULL DEFAULT 0,
-            verified INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS product_pack_items (
-            pack_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            name TEXT NOT NULL DEFAULT '',
-            yaml_source TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (pack_id, item_id),
-            FOREIGN KEY (pack_id) REFERENCES product_packs(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_pack_items_pack ON product_pack_items(pack_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, ddl, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ProductPackStore: DDL failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Migration: add `verified` column for databases created before 7.13
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
+    // `verified` column (added in 7.13) must still be applied here.
     sqlite3_exec(db_, "ALTER TABLE product_packs ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;",
                  nullptr, nullptr, nullptr);
+
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS product_packs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT '1.0.0',
+                description TEXT NOT NULL DEFAULT '',
+                yaml_source TEXT NOT NULL,
+                installed_at INTEGER NOT NULL DEFAULT 0,
+                verified INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS product_pack_items (
+                pack_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                yaml_source TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (pack_id, item_id),
+                FOREIGN KEY (pack_id) REFERENCES product_packs(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pack_items_pack ON product_pack_items(pack_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "product_pack_store", kMigrations)) {
+        spdlog::error("ProductPackStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 std::string ProductPackStore::generate_id() const {

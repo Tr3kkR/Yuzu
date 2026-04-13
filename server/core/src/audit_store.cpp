@@ -1,4 +1,5 @@
 #include "audit_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -26,7 +27,8 @@ AuditStore::AuditStore(const std::filesystem::path& db_path, int retention_days,
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("AuditStore: opened {} (retention={}d)", db_path.string(), retention_days_);
+    if (db_)
+        spdlog::info("AuditStore: opened {} (retention={}d)", db_path.string(), retention_days_);
 }
 
 AuditStore::~AuditStore() {
@@ -40,35 +42,37 @@ bool AuditStore::is_open() const {
 }
 
 void AuditStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS audit_events (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp       INTEGER NOT NULL,
-            principal       TEXT    NOT NULL,
-            principal_role  TEXT    NOT NULL,
-            action          TEXT    NOT NULL,
-            target_type     TEXT,
-            target_id       TEXT,
-            detail          TEXT,
-            source_ip       TEXT,
-            user_agent      TEXT,
-            session_id      TEXT,
-            result          TEXT    NOT NULL,
-            ttl_expires_at  INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_audit_ts
-            ON audit_events(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_audit_principal_ts
-            ON audit_events(principal, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_audit_action_ts
-            ON audit_events(action, timestamp);
-        CREATE INDEX IF NOT EXISTS idx_audit_target_ts
-            ON audit_events(target_type, target_id, timestamp);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("AuditStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       INTEGER NOT NULL,
+                principal       TEXT    NOT NULL,
+                principal_role  TEXT    NOT NULL,
+                action          TEXT    NOT NULL,
+                target_type     TEXT,
+                target_id       TEXT,
+                detail          TEXT,
+                source_ip       TEXT,
+                user_agent      TEXT,
+                session_id      TEXT,
+                result          TEXT    NOT NULL,
+                ttl_expires_at  INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_ts
+                ON audit_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_principal_ts
+                ON audit_events(principal, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_action_ts
+                ON audit_events(action, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_audit_target_ts
+                ON audit_events(target_type, target_id, timestamp);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "audit_store", kMigrations)) {
+        spdlog::error("AuditStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

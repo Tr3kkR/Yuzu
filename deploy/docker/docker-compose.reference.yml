@@ -1,0 +1,149 @@
+## Yuzu — Reference Docker Compose template
+##
+## ⚠  THIS IS A COPYABLE REFERENCE, NOT A PRODUCTION-READY DEPLOYMENT AS-IS.
+##
+## The image's default CMD runs `--no-tls --no-https --web-address 0.0.0.0`
+## for first-run convenience, which is NOT secure. Before you expose this
+## stack to any untrusted network you must:
+##   1. Generate TLS certificates (server.pem, server.key, ca.pem)
+##   2. Uncomment the `command:` block below and mount the `./certs` directory
+##   3. Verify with `curl -k https://localhost:8080/readyz`
+##
+## CLAUDE.md invariants: mTLS for agent ↔ server gRPC is mandatory, HTTPS is
+## the default transport for the dashboard, and the web UI should bind to
+## 127.0.0.1 unless you know what you're doing. The default image command
+## violates all three for convenience — fix that before you trust this stack.
+##
+## Purpose:
+##   A minimal, upgrade-safe deployment that pulls pre-built images from
+##   ghcr.io. Copy this file into your deployment directory, harden per the
+##   checklist above, and adjust paths, passwords, and TLS material to match
+##   your environment.
+##
+## Usage:
+##   export YUZU_VERSION=0.10.0
+##   docker compose -f docker-compose.reference.yml up -d
+##   docker compose -f docker-compose.reference.yml logs -f server
+##
+## Upgrade (data-preserving):
+##   export YUZU_VERSION=0.11.0     # pick the new release tag
+##   docker compose -f docker-compose.reference.yml pull
+##   docker compose -f docker-compose.reference.yml up -d
+##
+## The `server-data` volume survives container replacement, and the server
+## runs schema migrations automatically at startup via the MigrationRunner
+## (each SQLite store tracks its version in the `schema_meta` table and
+## applies pending migrations in a transaction). No manual steps are
+## required. See docs/user-manual/upgrading.md for full upgrade + rollback
+## procedures.
+##
+## CAUTION: `docker compose down -v` deletes the `server-data` volume and
+## ALL server state (credentials, agents, audit log, instruction history).
+## Always back up `server-data` before any destructive operation.
+##
+## Backup (run from a dedicated backup directory so $PWD is predictable):
+##   mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
+##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
+##     tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+##
+## Restore (with server stopped):
+##   docker compose -f docker-compose.reference.yml down server
+##   docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
+##     tar xzf "/backup/yuzu-data-YYYY-MM-DD.tar.gz" -C /data
+##   docker compose -f docker-compose.reference.yml up -d server
+
+services:
+  # ── Yuzu Server ──────────────────────────────────────────────────────
+  server:
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
+    container_name: yuzu-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"     # Web dashboard + REST API
+      - "50051:50051"   # Agent gRPC (direct-connect agents)
+      - "50052:50052"   # Management gRPC
+    volumes:
+      # Single writable volume for all server state:
+      #   - SQLite databases (response, audit, policy, RBAC, etc.)
+      #   - yuzu-server.cfg (admin credentials, hashed)
+      #   - enrollment-tokens.cfg, pending-agents.cfg, auto-approve.cfg
+      #   - agent-updates/ OTA binaries
+      # The server's default CMD points --config and --data-dir here,
+      # so everything in this volume is preserved across upgrades.
+      - server-data:/var/lib/yuzu
+      # Read-only TLS material — keep certs in source control or a secrets
+      # manager, not in the data volume. Uncomment after generating certs:
+      # - ./certs:/etc/yuzu/certs:ro
+    # Production TLS — UNCOMMENT this block and remove the default CMD's
+    # --no-tls/--no-https flags before running in any environment where
+    # untrusted clients can reach the ports above.
+    # command:
+    #   - "--listen"
+    #   - "0.0.0.0:50051"
+    #   - "--web-address"
+    #   - "127.0.0.1"      # or 0.0.0.0 + front with a reverse proxy
+    #   - "--web-port"
+    #   - "8080"
+    #   - "--config"
+    #   - "/var/lib/yuzu/yuzu-server.cfg"
+    #   - "--data-dir"
+    #   - "/var/lib/yuzu"
+    #   - "--https-cert"
+    #   - "/etc/yuzu/certs/server.pem"
+    #   - "--https-key"
+    #   - "/etc/yuzu/certs/server.key"
+    #   - "--tls-ca-cert"
+    #   - "/etc/yuzu/certs/ca.pem"
+    #
+    # Healthcheck uses bash's /dev/tcp pseudo-device to verify /readyz
+    # returns 200 OK without requiring curl in the runtime image.
+    #
+    # CRITICAL: must invoke `bash` explicitly — `CMD-SHELL` uses /bin/sh
+    # which on ubuntu:24.04 is `dash`, and dash does NOT implement
+    # /dev/tcp. Using `["CMD", "bash", "-c", ...]` forces bash, which
+    # IS present in the runtime image.
+    #
+    # /readyz (not /livez) is intentional — it reflects migration
+    # success, not just HTTP listener readiness. The agent sidecar's
+    # `depends_on: service_healthy` will not fire until every store in
+    # the readiness conjunction has completed its schema migration.
+    healthcheck:
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── Yuzu Agent (optional — comment out if agents run outside Docker) ─
+  #
+  # Most production deployments install agents on the managed endpoints
+  # themselves, not as a sidecar to the server. This service is included
+  # as a first-deploy smoke test so you can verify server↔agent roundtrip
+  # without leaving the compose file. For real fleet rollout see
+  # docs/user-manual/agent-install.md.
+  agent:
+    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.10.0}
+    container_name: yuzu-agent
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - agent-data:/var/lib/yuzu-agent
+    command:
+      - "--server"
+      - "server:50051"
+      - "--no-tls"          # dev-only — enforce TLS for real deployments
+      - "--data-dir"
+      - "/var/lib/yuzu-agent"
+
+volumes:
+  # Named volumes for server/agent state — must persist across
+  # `docker compose down`. Do NOT use `docker compose down -v` unless
+  # you intend to destroy state.
+  server-data:
+  agent-data:

@@ -1,4 +1,5 @@
 #include "execution_tracker.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -63,52 +64,44 @@ void ExecutionTracker::create_tables() {
         return;
     // No lock needed: DDL is idempotent and runs once at construction
 
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS executions (
-            id TEXT PRIMARY KEY,
-            definition_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            scope_expression TEXT NOT NULL DEFAULT '',
-            parameter_values TEXT NOT NULL DEFAULT '',
-            dispatched_by TEXT NOT NULL DEFAULT '',
-            dispatched_at INTEGER NOT NULL DEFAULT 0,
-            agents_targeted INTEGER NOT NULL DEFAULT 0,
-            agents_responded INTEGER NOT NULL DEFAULT 0,
-            agents_success INTEGER NOT NULL DEFAULT 0,
-            agents_failure INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER NOT NULL DEFAULT 0,
-            parent_id TEXT NOT NULL DEFAULT '',
-            rerun_of TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS agent_exec_status (
-            execution_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            dispatched_at INTEGER NOT NULL DEFAULT 0,
-            first_response_at INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER NOT NULL DEFAULT 0,
-            exit_code INTEGER NOT NULL DEFAULT 0,
-            error_detail TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (execution_id, agent_id)
-        );
-    )";
-    sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
-
-    // Index for status-based queries (used every 15s for metrics)
-    sqlite3_exec(db_,
-        "CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);",
-        nullptr, nullptr, nullptr);
-
-    // Indexes for execution statistics (capability 1.9)
-    sqlite3_exec(db_,
-        "CREATE INDEX IF NOT EXISTS idx_agent_exec_agent ON agent_exec_status(agent_id);",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(db_,
-        "CREATE INDEX IF NOT EXISTS idx_executions_dispatched ON executions(dispatched_at);",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(db_,
-        "CREATE INDEX IF NOT EXISTS idx_executions_definition ON executions(definition_id);",
-        nullptr, nullptr, nullptr);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS executions (
+                id TEXT PRIMARY KEY,
+                definition_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                scope_expression TEXT NOT NULL DEFAULT '',
+                parameter_values TEXT NOT NULL DEFAULT '',
+                dispatched_by TEXT NOT NULL DEFAULT '',
+                dispatched_at INTEGER NOT NULL DEFAULT 0,
+                agents_targeted INTEGER NOT NULL DEFAULT 0,
+                agents_responded INTEGER NOT NULL DEFAULT 0,
+                agents_success INTEGER NOT NULL DEFAULT 0,
+                agents_failure INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER NOT NULL DEFAULT 0,
+                parent_id TEXT NOT NULL DEFAULT '',
+                rerun_of TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS agent_exec_status (
+                execution_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                dispatched_at INTEGER NOT NULL DEFAULT 0,
+                first_response_at INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER NOT NULL DEFAULT 0,
+                exit_code INTEGER NOT NULL DEFAULT 0,
+                error_detail TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (execution_id, agent_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
+            CREATE INDEX IF NOT EXISTS idx_agent_exec_agent ON agent_exec_status(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_executions_dispatched ON executions(dispatched_at);
+            CREATE INDEX IF NOT EXISTS idx_executions_definition ON executions(definition_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "execution_tracker", kMigrations)) {
+        spdlog::error("ExecutionTracker: schema migration failed");
+    }
 }
 
 // ---------------------------------------------------------------------------

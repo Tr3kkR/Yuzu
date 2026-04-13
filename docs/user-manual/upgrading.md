@@ -8,6 +8,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 |---|---|---|---|
 | 0.1.x | 0.1.0 | 0.1.0 | Initial release family |
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
+| 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
+| 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
@@ -59,19 +61,56 @@ curl -s http://localhost:8080/livez
 
 ### Docker
 
+The reference deployment template lives at `deploy/docker/docker-compose.reference.yml` — copy it into your deployment directory next to a `.env` file, set `YUZU_VERSION`, and harden per the inline TLS checklist in the file header **before** exposing the stack to any untrusted network. The compose file declares a named volume (`server-data`) that survives container replacement and holds every piece of mutable state: `yuzu-server.cfg`, all SQLite databases, `enrollment-tokens.cfg`, `pending-agents.cfg`, `auto-approve.cfg`, and OTA binaries.
+
+An upgrade is a pull-and-restart:
+
 ```bash
-# 1. Pull the new image
-docker pull ghcr.io/<owner>/yuzu-server:v0.1.1
+# 1. Back up first (see below) — the old data is the only recovery path
+#    if a migration fails on your specific DB.
 
-# 2. Stop and replace
-docker compose down
-# Edit docker-compose.yml to reference new tag
-docker compose up -d
+# 2. Pick the new release tag (use an .env file or export)
+export YUZU_VERSION=0.10.1
 
-# 3. Verify
-docker compose logs yuzu-server | tail -20
-curl -s http://localhost:8080/livez
+# 3. Pull the new image and recreate the container
+docker compose -f docker-compose.reference.yml pull server
+docker compose -f docker-compose.reference.yml up -d server
+
+# 4. Verify the new version came up and schema migrations ran
+docker compose -f docker-compose.reference.yml logs server | tail -40
+docker compose -f docker-compose.reference.yml ps server    # should be "healthy"
 ```
+
+Schema migrations execute automatically during the first `up` with the new image — look for `MigrationRunner: <store> migrated to v<N>` lines in the log (one per store on first upgrade, silent on subsequent restarts). The healthcheck used by `depends_on: service_healthy` probes `/readyz`, which returns 200 only after every store in the readiness conjunction has successfully migrated — so a healthy server container genuinely reflects migration success, not just liveness.
+
+**Back up before upgrading** (run from a dedicated backup directory so `$PWD` is predictable):
+
+```bash
+mkdir -p ~/yuzu-backups && cd ~/yuzu-backups
+docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
+  tar czf "/backup/yuzu-data-$(date +%F).tar.gz" -C /data .
+```
+
+> **Note:** this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level `tar` of a live database may capture a torn snapshot. For strong consistency, `docker compose -f docker-compose.reference.yml stop server` before backup (seconds of downtime) and `start` after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap.
+
+**Rollback if a migration fails** (Docker):
+
+```bash
+# 1. Stop the new server (KEEPING the named volume — do NOT use -v)
+docker compose -f docker-compose.reference.yml down server
+
+# 2. Restore the previous backup over the existing volume
+docker run --rm -v server-data:/data -v "$PWD":/backup alpine \
+  sh -c 'rm -rf /data/* && tar xzf /backup/yuzu-data-YYYY-MM-DD.tar.gz -C /data'
+
+# 3. Pin the previous release
+export YUZU_VERSION=0.9.0
+
+# 4. Start the previous version
+docker compose -f docker-compose.reference.yml up -d server
+```
+
+**Never** run `docker compose down -v` unless you intend to delete `server-data` and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
 
 ### Windows
 
@@ -132,19 +171,44 @@ For large fleets, upgrade in stages:
 
 ## Schema Migrations
 
-Starting with v0.1.0, Yuzu uses automatic schema migrations:
+Starting with **v0.10.0**, every server-side SQLite store is wired through a single `MigrationRunner` that tracks schema version per store and applies pending migrations in a transaction. Prior releases relied on `CREATE TABLE IF NOT EXISTS` plus silent `ALTER TABLE ADD COLUMN` statements, which made rollbacks opaque and left no audit trail of what had been applied.
 
-- Each SQLite store tracks its schema version in a `schema_meta` table
-- On startup, stores automatically migrate from old to new schema
-- Migrations run in transactions -- if one fails, it rolls back cleanly
-- Migration progress is logged at `info` level
+How it works:
 
-**No manual migration steps are required.** Just replace the binary and start.
+- Each store declares an ordered `std::vector<Migration>` where each entry is `{version, sql}`.
+- On startup, the runner creates the `schema_meta` table if missing, reads the current version for the store, and runs any migration with a higher version number inside a `BEGIN IMMEDIATE` / `COMMIT` transaction.
+- If a migration SQL statement fails, the transaction rolls back and the store stays at its previous version — the server logs `MigrationRunner: migration v<N> failed for <store>: <sqlite error>` and the corresponding store constructor logs `<Store>: schema migration failed`.
+- Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.
+- Multiple stores share one database connection but keep independent version counters.
+
+**Upgrading from v0.9.x or earlier** is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`) also runs a one-time legacy compatibility shim that re-applies the historical `ALTER TABLE` statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.
+
+**No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
+
+```
+[info] MigrationRunner: audit_store migrated to v1
+[info] MigrationRunner: rbac_store migrated to v1
+...
+```
+
+**Expect a log burst on first startup after upgrade.** 30+ `MigrationRunner: <store> migrated to v1` info lines appear on the first run against a pre-v0.10 database — one per store. On every subsequent restart the runner is silent at info level. If your log-shipping pipeline has per-second rate limits, widen them for the upgrade window or filter this single line pattern.
+
+**Verifying migration state after startup**, query the per-store audit trail directly:
+
+```bash
+docker exec -i yuzu-server sqlite3 /var/lib/yuzu/audit.db \
+  "SELECT store, version, datetime(upgraded_at, 'unixepoch') FROM schema_meta ORDER BY upgraded_at;"
+```
+
+Every store that has ever run through the migration runner has a row here with its current version and the wall-clock timestamp of the last stamp. This is the operator-side audit trail for schema evolution.
 
 If a migration fails:
-1. Check the log for the specific error
-2. Restore from backup
-3. Report the issue
+
+1. Check the log for `MigrationRunner: migration v<N> failed for <store>: <sqlite error>` and note both the store name and the SQLite error.
+2. The server will have **closed the failing store's database handle**, so `/readyz` returns 503 with the failed store name in the `failed_stores` body field — the probe accurately reflects degraded state. Don't rely on `/livez` for readiness; it only checks process liveness, not schema integrity.
+3. Stop the server and restore the **affected** database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens.
+4. Start the previous server version against the restored data.
+5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Rollback
 

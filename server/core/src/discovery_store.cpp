@@ -1,4 +1,5 @@
 #include "discovery_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -35,7 +36,8 @@ DiscoveryStore::DiscoveryStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("DiscoveryStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("DiscoveryStore: opened {}", db_path.string());
 }
 
 DiscoveryStore::~DiscoveryStore() {
@@ -48,27 +50,29 @@ bool DiscoveryStore::is_open() const {
 }
 
 void DiscoveryStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS discovered_devices (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            ip_address      TEXT NOT NULL UNIQUE,
-            mac_address     TEXT NOT NULL DEFAULT '',
-            hostname        TEXT NOT NULL DEFAULT '',
-            managed         INTEGER NOT NULL DEFAULT 0,
-            agent_id        TEXT NOT NULL DEFAULT '',
-            discovered_by   TEXT NOT NULL DEFAULT '',
-            discovered_at   INTEGER NOT NULL DEFAULT 0,
-            last_seen       INTEGER NOT NULL DEFAULT 0,
-            subnet          TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_discovery_ip ON discovered_devices(ip_address);
-        CREATE INDEX IF NOT EXISTS idx_discovery_managed ON discovered_devices(managed);
-        CREATE INDEX IF NOT EXISTS idx_discovery_subnet ON discovered_devices(subnet);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("DiscoveryStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS discovered_devices (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address      TEXT NOT NULL UNIQUE,
+                mac_address     TEXT NOT NULL DEFAULT '',
+                hostname        TEXT NOT NULL DEFAULT '',
+                managed         INTEGER NOT NULL DEFAULT 0,
+                agent_id        TEXT NOT NULL DEFAULT '',
+                discovered_by   TEXT NOT NULL DEFAULT '',
+                discovered_at   INTEGER NOT NULL DEFAULT 0,
+                last_seen       INTEGER NOT NULL DEFAULT 0,
+                subnet          TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_discovery_ip ON discovered_devices(ip_address);
+            CREATE INDEX IF NOT EXISTS idx_discovery_managed ON discovered_devices(managed);
+            CREATE INDEX IF NOT EXISTS idx_discovery_subnet ON discovered_devices(subnet);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "discovery_store", kMigrations)) {
+        spdlog::error("DiscoveryStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 
