@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   developer machine). The filter restores the cosign signature for
   v0.10.1+ by skipping the broken artifacts entirely; the 10 `yuzu-*`
   release binaries are unaffected.
+- **`ci(cache)`: include `matrix.build_type` in Windows vcpkg cache
+  key.** The Windows MSVC matrix runs both debug and release builds
+  against the same `vcpkg-x64-windows-${hashFiles(...)}` cache key.
+  Whichever job populated the cache first won, and the other job linked
+  user code (compiled with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`) against
+  `absl_*.lib` variants built with `/MD` and `_ITERATOR_DEBUG_LEVEL=0`,
+  producing dozens of `LNK2038` "RuntimeLibrary mismatch" errors. The
+  flake hit PR #355's CI matrix and required an admin override to merge.
+  Adding `${{ matrix.build_type }}` to the cache key gives debug and
+  release independent slots; the legacy build-type-less restore key was
+  intentionally **not** preserved so a poisoned cache can't be silently
+  restored. Both matrix jobs will populate fresh caches on their next
+  run; this is self-healing. See #356 for the watch list — the
+  underlying meson+vcpkg+`CMAKE_BUILD_TYPE` interaction may need a
+  follow-up fix if the symptom recurs.
 
 ### Known issues
 
@@ -37,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a packaging script, or duplicate gateway packaging in the linux
   build job that should defer to the dedicated `Build Gateway (Erlang)`
   job. P1.
+- **#356** — Watch issue for the Windows MSVC debug `LNK2038` flake
+  fixed by the cache-key change above. The cache-key fix prevents one
+  class of cross-variant cache contamination, but the bug class can
+  recur if (a) anyone reverts the discriminator, (b) Linux/macOS jobs
+  hit the same pattern (latent — only Windows manifests because of
+  MSVC's `_ITERATOR_DEBUG_LEVEL` ABI), or (c) the actual root cause is
+  meson's CMake dependency resolver not propagating `CMAKE_BUILD_TYPE`
+  into vcpkg's exported port-config files (in which case the cache-key
+  fix is incomplete and the next CI run will still fail). Watch list in
+  the issue body and follow-up comment. P2.
 
 ## [0.10.0] - 2026-04-12
 

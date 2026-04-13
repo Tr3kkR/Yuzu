@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.10.0',
+  version: '0.10.1',
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
