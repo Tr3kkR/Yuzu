@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ci(release)`: filter `actions/download-artifact@v4` to `yuzu-*`
+  pattern.** The auto-generated `*.dockerbuild` provenance metadata files
+  (uploaded by docker buildx attestation) consistently failed download
+  with `Artifact download failed after 5 retries`, killing the Create
+  Release job for v0.10.0 on both the initial run and a `--failed`
+  retry. The v0.10.0 release was published manually from local instead,
+  at the cost of the `SHA256SUMS.bundle` cosign keyless attestation
+  (which requires the GitHub-Actions OIDC issuer
+  `token.actions.githubusercontent.com` and cannot be replicated from a
+  developer machine). The filter restores the cosign signature for
+  v0.10.1+ by skipping the broken artifacts entirely; the 10 `yuzu-*`
+  release binaries are unaffected.
+
+### Known issues
+
+- **#354** — Linux build job bundles a stale `yuzu-gateway 0.9.0`
+  package alongside the fresh `0.10.0` agent and server packages in the
+  `yuzu-linux-deb` and `yuzu-linux-rpm` artifacts. Discovered during the
+  manual v0.10.0 release on 2026-04-13. **The artifact-download flake
+  above masked this** — without the flake, v0.10.0 would have shipped a
+  corrupted release with mixed-version `.deb` / `.rpm` files
+  (`yuzu-gateway_0.9.0_amd64.deb` next to `yuzu-server_0.10.0_amd64.deb`).
+  The manual v0.10.0 release explicitly excluded the stale packages
+  when assembling assets locally. Root cause not yet investigated;
+  suspected ccache reuse from the v0.9.0 release run, hardcoded version
+  in a packaging script, or duplicate gateway packaging in the linux
+  build job that should defer to the dedicated `Build Gateway (Erlang)`
+  job. P1.
+
 ## [0.10.0] - 2026-04-12
 
 ### Added
