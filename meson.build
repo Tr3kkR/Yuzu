@@ -109,8 +109,12 @@ if host_os == 'windows'
   # Strategic escape (P1): #376 "Migrate transport off gRPC to QUIC".
 
   _cxx = meson.get_compiler('cpp')
-  _vcpkg_root_win    = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'
-  _vcpkg_include_win = _vcpkg_root_win / 'include'
+  _vcpkg_root_win = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'
+  # include_directories() rejects absolute paths inside the source tree,
+  # so the include dir has to be a relative-to-source-root string.
+  # Headers are the same across debug and release variants, so this
+  # points at the shared include/ regardless of buildtype.
+  _vcpkg_include_win_rel = 'vcpkg_installed/x64-windows/include'
   if get_option('buildtype') == 'debug'
     _vcpkg_lib_win = _vcpkg_root_win / 'debug' / 'lib'
     _pbd = 'd'   # vcpkg convention: libprotobufd.lib / libprotobuf-lited.lib / libprotocd.lib / libupbd.lib
@@ -163,14 +167,14 @@ if host_os == 'windows'
   # method: 'cmake')` calls that Linux/macOS use — those paths are
   # unreachable on Windows.
   protobuf_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win, is_system: true),
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
     dependencies: [
       _libprotobuf, _libprotobuf_lite, _libprotoc, _libupb,
       _libutf8_range, _libutf8_validity,
     ] + _absl_deps,
   )
   grpcpp_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win, is_system: true),
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
     dependencies: [
       _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
       _libre2, _libcares,
