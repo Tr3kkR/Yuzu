@@ -48,7 +48,7 @@ recreate, the new PR numbers go in the **Recreated As** column.
 
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
-| 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | pending |
+| 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
 | 0b | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
@@ -237,17 +237,15 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** start Tasks #1 and #2 in parallel. They block the
-> rest of the rollout but don't block each other.
->
-> Task #1 requires a shell on each self-hosted runner box and is
-> blocked on operator availability.
+> **Next action:** Task #2 (recreate the 7 PRs at `dev`). Task #1 is
+> already done — both self-hosted runners verified at 2.333.1 from
+> codeql run logs, no operator action was required.
 >
 > Task #2 can run unattended via the `gh pr comment` loop in Phase 0b.
 >
 > After #2 completes, capture the new PR numbers in the Tier Table
 > "Recreated As" column and update this Resume Pointer to point at the
-> next unblocked task.
+> next unblocked task (Tier 1: #3 and #4 in either order).
 
 ## Sub-agent delegation pattern
 
@@ -281,7 +279,17 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
-- **2026-04-14 05:?? UTC** · Claude session · Rollout doc created. Phase 0
+- **2026-04-14 ~05:30 UTC** · Claude session · Task #1 (runner version
+  gate) **completed without operator action**. Both `yuzu-wsl2-linux`
+  and `yuzu-local-windows` confirmed on runner version `2.333.1` —
+  well above the 2.327.1 floor required by Node 24 actions. Evidence:
+  codeql.yml run `24380031360` (dev branch) — both matrix jobs logged
+  `Current runner version: '2.333.1'` at "Set up job" step on
+  2026-04-14T03:52:23Z. Memory `project_github_runners.md` had this
+  for the Linux box from 2026-04-10; the in-progress codeql run
+  confirmed Windows is matched. Tasks #6, #7, #8, #9 are now blocked
+  only on #2 (recreate cycle), not on the runner gate.
+- **2026-04-14 ~05:00 UTC** · Claude session · Rollout doc created. Phase 0
   not yet started. Tasks #1–#11 created in TaskList. PR #372 (the
   foundation that added `target-branch: dev` and the `pip` ecosystem)
   is the only completed work.
