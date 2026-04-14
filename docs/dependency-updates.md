@@ -17,6 +17,16 @@ tells you where it belongs.
 | rebar3 deps       | `gateway/rebar.config`                        | **Manual quarterly review** — see "Rebar3 review checklist" below                              |
 | Git submodules    | —                                             | No submodules; nothing to track                                                               |
 
+### Base branch
+
+Every Dependabot entry sets `target-branch: dev`. Yuzu's release flow is
+feature work → `dev` → reconcile PR → `main`, which means `main` lags
+`dev` for hours-to-days at a time. Opening dependency PRs against
+`main` races the reconcile cadence and repeatedly fails CI against a
+stale base — the LNK2038 Windows fix lived on `dev` for ~24h before the
+reconcile PR, during which every open Dependabot PR targeting `main`
+kept failing Windows CI. Targeting `dev` eliminates the race.
+
 ## Python tooling (meson, etc.)
 
 Yuzu's CI pipeline pins meson because subtle backend rewrites between
