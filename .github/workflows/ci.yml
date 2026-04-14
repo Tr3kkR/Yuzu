@@ -199,9 +199,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          # Include matrix.build_type in the cache key so debug and release
+          # jobs don't share a slot. Without this, the first job to populate
+          # the cache wins and the other job links its user code (compiled
+          # with /MDd vs /MD and _ITERATOR_DEBUG_LEVEL=2 vs =0) against the
+          # wrong absl_*.lib variant, producing dozens of LNK2038 errors.
+          # The legacy build-type-less restore key is intentionally NOT in
+          # restore-keys so we can't silently fall back to a poisoned cache.
+          key: vcpkg-x64-windows-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-windows-
+            vcpkg-x64-windows-${{ matrix.build_type }}-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11

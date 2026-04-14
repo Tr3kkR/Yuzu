@@ -1,4 +1,5 @@
 #include "concurrency_manager.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -23,15 +24,19 @@ void ConcurrencyManager::create_tables() {
     if (!db_)
         return;
 
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS concurrency_locks (
-            definition_id TEXT NOT NULL,
-            execution_id TEXT NOT NULL,
-            acquired_at INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (definition_id, execution_id)
-        );
-    )";
-    sqlite3_exec(db_, ddl, nullptr, nullptr, nullptr);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS concurrency_locks (
+                definition_id TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                acquired_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (definition_id, execution_id)
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "concurrency_manager", kMigrations)) {
+        spdlog::error("ConcurrencyManager: schema migration failed");
+    }
 }
 
 bool ConcurrencyManager::try_acquire(const std::string& definition_id,

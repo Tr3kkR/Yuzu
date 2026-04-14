@@ -1,4 +1,5 @@
 #include "quarantine_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -35,7 +36,8 @@ QuarantineStore::QuarantineStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("QuarantineStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("QuarantineStore: opened {}", db_path.string());
 }
 
 QuarantineStore::~QuarantineStore() {
@@ -48,24 +50,26 @@ bool QuarantineStore::is_open() const {
 }
 
 void QuarantineStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS quarantine_records (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id        TEXT NOT NULL,
-            status          TEXT NOT NULL DEFAULT 'active',
-            quarantined_by  TEXT,
-            quarantined_at  INTEGER NOT NULL DEFAULT 0,
-            released_at     INTEGER NOT NULL DEFAULT 0,
-            whitelist       TEXT NOT NULL DEFAULT '',
-            reason          TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_quarantine_agent ON quarantine_records(agent_id);
-        CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine_records(status);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("QuarantineStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS quarantine_records (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id        TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'active',
+                quarantined_by  TEXT,
+                quarantined_at  INTEGER NOT NULL DEFAULT 0,
+                released_at     INTEGER NOT NULL DEFAULT 0,
+                whitelist       TEXT NOT NULL DEFAULT '',
+                reason          TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_quarantine_agent ON quarantine_records(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine_records(status);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "quarantine_store", kMigrations)) {
+        spdlog::error("QuarantineStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

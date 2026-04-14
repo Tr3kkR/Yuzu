@@ -1,0 +1,10 @@
+{
+  "__doc": "Seed baseline shipped with PR2 of the /test skill. Run 'bash scripts/test/perf-gate.sh --run-id manual --capture-baselines' on the target dev box to lock a real baseline, then commit the updated file alongside the change that earned it. The seed is intentionally empty (no metrics) so PR2 doesn't trip on first run; real enforcement kicks in after first capture. Hardware fingerprint mismatch between the machine that captured the baseline and the one running the gate auto-downgrades to WARN.",
+  "__schema": "perf-baseline/v1",
+  "__seed": true,
+  "captured_at": 1776200000,
+  "captured_commit": "seed",
+  "hardware_fingerprint": "seed (will be replaced on first --capture-baselines)",
+  "metrics": {},
+  "tolerance_pct": 10.0
+}

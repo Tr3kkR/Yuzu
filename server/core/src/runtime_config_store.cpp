@@ -1,4 +1,5 @@
 #include "runtime_config_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -50,7 +51,8 @@ RuntimeConfigStore::RuntimeConfigStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("RuntimeConfigStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("RuntimeConfigStore: opened {}", db_path.string());
 }
 
 RuntimeConfigStore::~RuntimeConfigStore() {
@@ -63,18 +65,20 @@ bool RuntimeConfigStore::is_open() const {
 }
 
 void RuntimeConfigStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS runtime_config (
-            key         TEXT PRIMARY KEY,
-            value       TEXT NOT NULL,
-            updated_by  TEXT NOT NULL DEFAULT '',
-            updated_at  INTEGER NOT NULL
-        );
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("RuntimeConfigStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS runtime_config (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL,
+                updated_by  TEXT NOT NULL DEFAULT '',
+                updated_at  INTEGER NOT NULL
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "runtime_config_store", kMigrations)) {
+        spdlog::error("RuntimeConfigStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

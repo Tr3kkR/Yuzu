@@ -1,0 +1,87 @@
+## docker-compose.upgrade-test.yml — purpose-built for /test Phase 2.
+##
+## This is a minimal copy of deploy/docker/docker-compose.reference.yml
+## tailored to the upgrade test:
+##
+##   - NO `container_name:` so multiple parallel test runs (different
+##     --project-name values) do not collide with each other or with a
+##     running production stack
+##   - NO agent service — the data-preservation test only needs the server.
+##     Agent OTA testing happens in Phase 3 with its own harness.
+##   - Bind-mount the credentials file from a host path under /etc/yuzu/
+##     (NOT under /var/lib/yuzu/ — see CRITICAL note below).
+##   - Explicit `command:` block that overrides the Dockerfile CMD so
+##     --config points at /etc/yuzu/yuzu-server.cfg, not the in-volume path.
+##   - Same bash /dev/tcp healthcheck that targets /readyz (compound-fix
+##     readiness contract from #339).
+##
+## CRITICAL: The cred file MUST mount to /etc/yuzu/, not /var/lib/yuzu/.
+## Mounting a file inside a directory that's also covered by a named
+## volume is a documented Docker race: the volume creates the directory,
+## then Docker's mount resolution may either (a) place the bind-mount
+## inside the volume directory (works) or (b) interpret the bind-mount
+## target as a directory and silently shadow the file (fails). The
+## existing deploy/docker/docker-compose.full-uat.yml uses the same
+## /etc/yuzu/ split and is the model to mirror.
+##
+## Required environment:
+##   YUZU_VERSION         — image tag to pull/run (0.10.0 for old, 0.10.1-test for new)
+##   YUZU_TEST_CONFIG     — host path to a pre-generated yuzu-server.cfg
+##
+## Invocation by /test:
+##   docker compose -f scripts/test/docker-compose.upgrade-test.yml \
+##                  --project-name "yuzu-test-${RUN_ID}-upgrade" \
+##                  up -d
+##
+## Volumes are scoped to the project name automatically, so two parallel
+## runs each get their own server-data volume that survives container
+## recreation but is isolated from siblings.
+##
+## DO NOT INVOKE THIS COMPOSE FILE DIRECTLY. It depends on
+## YUZU_TEST_CONFIG being a valid host path (validated by the orchestrator)
+## and on per-RUN_ID --project-name isolation. Always go through
+## scripts/test/test-upgrade-stack.sh.
+
+services:
+  server:
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
+    restart: "no"
+    ports:
+      - "8080"     # web dashboard + REST API (random host port via compose)
+      - "50051"   # agent gRPC
+      - "50052"   # management gRPC
+    volumes:
+      - server-data:/var/lib/yuzu
+      # Pre-bootstrapped admin credentials, mounted read-only at /etc/yuzu/
+      # (NOT inside /var/lib/yuzu — see CRITICAL note in the header).
+      - ${YUZU_TEST_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
+    # Override the Dockerfile CMD to point --config at the bind-mount path
+    # rather than the in-volume default. --data-dir stays in the volume so
+    # all SQLite databases persist across the image swap (the whole point
+    # of the upgrade test).
+    command:
+      - "--listen"
+      - "0.0.0.0:50051"
+      - "--no-tls"
+      - "--no-https"
+      - "--web-address"
+      - "0.0.0.0"
+      - "--web-port"
+      - "8080"
+      - "--config"
+      - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
+    healthcheck:
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  server-data:

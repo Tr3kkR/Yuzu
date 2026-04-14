@@ -37,6 +37,7 @@ EXPECTED="$1"
 FILES=(
   docker-compose.uat.yml
   deploy/docker/docker-compose.yml
+  deploy/docker/docker-compose.reference.yml
   deploy/docker/docker-compose.uat.yml
   deploy/docker/docker-compose.full-uat.yml
   deploy/docker/docker-compose.sanitizer-uat.yml

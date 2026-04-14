@@ -89,3 +89,13 @@ __pycache__/
 # Test-binary symlinks created by scripts/link-tests.sh
 # (per-component, per-triplet convenience links — see CLAUDE.md Test section)
 /tests-build-*/
+
+# /test pipeline scratch state (per-run RUN_ID directories)
+# Persistent test-runs DB lives outside the repo at
+# ~/.local/share/yuzu/test-runs.db — see .claude/skills/test/SKILL.md
+/tests/.last-test-run/
+
+# Future PR2 artifacts (coverage + sanitizer build dirs)
+/build-linux-coverage/
+/build-linux-asan/
+/build-linux-tsan/

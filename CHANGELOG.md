@@ -7,8 +7,375 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/test` skill coverage + perf + sanitizer gates (PR2 of 3).** Phase 6
+  and Phase 7 of the `/test` pipeline are now wired. `--full` mode
+  dispatches `.github/workflows/sanitizer-tests.yml` on the
+  `yuzu-wsl2-linux` self-hosted runner (ASan+UBSan and TSan rebuilds +
+  test runs), downloads the artifacts, parses them for sanitizer
+  findings + meson test failures, and records two Phase 6 rows to
+  `test_gates`. Runner offline → WARN (not FAIL) with operator retry
+  instructions in the notes, so the rest of the run continues. Phase 7
+  runs `coverage-gate.sh` (gcovr with the same filter set and
+  `--native-file meson/native/linux-gcc13.ini` as
+  `.github/workflows/ci.yml`, branch coverage compared against
+  `tests/coverage-baseline.json` with 0.5 pp slack) and `perf-gate.sh`
+  (rebar3 ct `yuzu_gw_perf_SUITE` groups `registration,heartbeat,fanout,churn`
+  — endurance excluded — with 10 % throughput / latency tolerance
+  against `tests/perf-baselines.json`). Hardware fingerprint mismatch
+  on the perf baseline auto-downgrades to WARN so a 5950X-captured
+  baseline doesn't produce false failures on the Apple Silicon MBP.
+  Both gates record `perf_*` / `branch_coverage_overall` /
+  `line_coverage_overall` metrics to `test_metrics` for trend analysis
+  via `test-db-query.sh --trend metric=...`.
+
+  **PR2 governance hardening round (folded into the same commit).** A
+  full 6-gate governance pass on the initial PR2 working tree produced
+  10 BLOCKING findings (ca-B1/UP-1 grep arithmetic, UP-2 gcovr schema,
+  UP-6/UP-7 sanitizer false-PASS cluster, UP-9 run-id path traversal,
+  UP-10 `__seed` sentinel silently disabled enforcement, UP-14 /
+  hp-B2 dispatch concurrent race, UP-18 broken-env baseline anchoring,
+  qa-B1 perf CT exit code not propagated, hp-B1 perf seed → WARN
+  propagating through SKILL.md, sec-M1 `rm -rf "$BUILD_DIR"` on
+  operator-controlled path) plus associated high-value SHOULDs (bci-S5
+  native-file parity, qa-S1 min-metrics threshold, qa-S4 partial-data
+  flagging, sre-5 runner disk pre-check, ca-S3 unit column width,
+  doc-S1/S2/sre-6/sre-7/er-5). All resolved in this same PR2 commit:
+
+  - `dispatch-runner-job.sh` now uses a createdAt timestamp + headSha
+    filter for run discovery instead of the single newest-ID compare,
+    so concurrent operators dispatching the same workflow no longer
+    attribute each other's runs. Rejects multiline values in the
+    `--inputs` JSON to block split-injection into `--raw-field`.
+  - `sanitizer-gate.sh` distinguishes dispatch exit codes 0/1/2/3
+    (success/config-error/workflow-failed/runner-offline) so a
+    workflow that concluded `failure` now writes FAIL rows rather
+    than parsing possibly-degraded artifacts into a silent PASS.
+    Empty sanitizer logs (runner disk full, upload truncation) are
+    caught by a size+marker guard that WARNs instead of reading them
+    as "0 findings". The `grep -cE ... || echo 0` idiom that produced
+    `"0\n0"` and broke `(( n > 0 ))` was replaced with a single-value
+    capture that whitespace-strips defensively. The meson test FAIL
+    detector now uses POSIX `[[:space:]]FAIL` instead of the GNU-only
+    `\<FAIL\>` word boundary.
+  - `coverage-gate.sh` honors the `__seed: true` sentinel and emits
+    WARN ("seed baseline active — run --capture-baselines to enable
+    enforcement") rather than silent PASS against the permissive seed.
+    Refuses `--capture-baselines` when `meson test` exited non-zero
+    so a broken env can no longer anchor a false-low baseline. Prints
+    an old-vs-new diff before overwriting any existing baseline.
+    Adds `--native-file meson/native/linux-gcc13.ini` to the
+    `meson setup` call so local coverage numbers match Codecov's
+    gcc-13 baseline. Validates `--build-dir` is under `$YUZU_ROOT/build-*`
+    or `/tmp/build-*` before the reconfigure-failure `rm -rf` path
+    can fire. Partial-data runs (`TEST_RC != 0`) tag the metric notes
+    with `(partial: meson test exit=N)` so trend queries can filter
+    out contaminated points. The gcovr JSON parser now handles both
+    the top-level and `{"root": {...}}` wrapping shapes and supports
+    the gcovr 6.x+ `branches_covered`/`branches_valid` key names (the
+    pre-hardening code used `branch_covered`/`branch_total` which
+    don't exist in modern gcovr, producing a silent 0 %).
+  - `perf-gate.sh` propagates `rebar3 ct` exit code to gate outcome:
+    `CT_RC=1` (test assertion failed) → FAIL; `CT_RC > 1` (compile
+    or tooling failure) → WARN. Adds a minimum-metrics-parsed
+    threshold (≥ 3 of the 6 expected labels) so parser drift produces
+    a FAIL with a specific message instead of a silent "no metrics
+    parsed" WARN. Honors `__seed: true` with exit-0 PASS (not WARN)
+    so SKILL.md full-mode doesn't abort Phase 7 on the first run
+    against a seed baseline. Refuses `--capture-baselines` when
+    fewer than 3 metrics were parsed. Guards the compare math
+    against non-finite / zero / negative baseline values (sec-L4).
+    Emits WARN when the current run is missing baseline metrics
+    (UP-13 — prevents silent "only 1/6 checked" PASSes). Strips
+    ANSI escape sequences from `ct:pal` lines before regex matching
+    so colorized rebar3 output does not silently break metric
+    extraction.
+  - All three gate scripts validate `--run-id` against
+    `^[A-Za-z0-9._-]+$` before constructing any filesystem path,
+    closing the `--run-id "../../../tmp/evil"` traversal and
+    whitespace-only-ID path.
+  - `.github/workflows/sanitizer-tests.yml` gains a
+    "≥30 GB free" disk-check step right after toolchain assertion,
+    so a full runner fails fast with `::error::runner disk` instead
+    of hitting `ninja: No space left on device` 15 minutes into
+    the sanitizer build (sre-5 / UP-6 upstream of the false-PASS path).
+  - `scripts/test/test_db.py` `--trend` output column widened from 6
+    to 10 characters so `ops/sec` and `ms/agent` units no longer
+    push the run_id column out of alignment.
+  - `tests/shell/test_pr2_gates.sh` (NEW) — chaos-injector regression
+    harness covering P0 scenarios CH-2 (grep arithmetic), CH-3
+    (capture refuses broken env), CH-4 (gcovr root-wrap schema),
+    CH-6 (perf parser drift), CH-8 (`__seed` honored on both gates),
+    CH-15 (invalid run-ids), and CH-16 (sec-h-1 regression test for
+    Python code injection via `--baseline` path with embedded quote).
+    7 scenarios, 9 assertions, all green on the hardened tree. CH-1
+    (clean-log + workflow-failure → FAIL) is deferred to PR2.1 because
+    it needs a gh CLI mock harness.
+
+  **Pattern C catch — second security pass on the hardening round**
+  surfaced three new issues introduced by the hardening itself:
+
+  - **sec-h-1 (HIGH, BLOCKING)** — `coverage-gate.sh` `--capture-baselines`
+    diff and `__seed` detection paths interpolated the operator-controlled
+    `--baseline` file path into single-quoted Python literals inside
+    `python3 -c "..."` shell strings. A baseline path containing a single
+    quote would break out of the Python literal and execute arbitrary code.
+    Fix: all three call sites (lines 366, 367, 424) rewritten as quoted
+    heredocs (`python3 - "$BASELINE" <<'PY'`) that receive the path via
+    `sys.argv[1]`. CH-16 in the chaos harness regression-tests this by
+    placing a real baseline under a directory name containing `'`.
+
+  - **sec-h-2 (MEDIUM)** — `dispatch-runner-job.sh` fell back to
+    `echo "$REF"` when `git rev-parse` failed, which allowed an
+    unresolvable ref to be spliced verbatim into a jq filter
+    (`--jq "... select(.headSha == \"$TARGET_SHA\")"`). Fix: strictly
+    resolve ref via `git rev-parse --verify "$REF^{commit}"` and refuse
+    the dispatch on failure; also require `TARGET_SHA` to match a
+    hex[40-64] regex before it reaches jq. The jq filter now uses
+    `env.DISPATCH_TS` and `env.TARGET_SHA` through environment
+    variables instead of shell-interpolated jq syntax.
+
+  - **sec-h-3 (MEDIUM)** — `tests/shell/test_pr2_gates.sh` helper
+    functions `db_gate_status` / `db_gate_notes` / CH-4 metric read
+    used the same shell-interpolation-into-Python anti-pattern as
+    sec-h-1. Not exploitable today (harness controls all values) but
+    a trap for future contributors. Fixed to pass values via
+    `sys.argv` in quoted heredocs so the harness teaches the right
+    pattern.
+
+  The re-review clears the commit for landing. Low/INFO items from
+  both security passes (sec-L2, sec-L4, sec-L5, sec-h-4, sec-h-5)
+  are deferred to follow-up issues and captured in memory for the
+  next hardening wave.
+  - SKILL.md, CLAUDE.md updated to describe the `__seed` semantics,
+    the `--capture-baselines` pre-flight requirement (clean
+    `meson test` / `rebar3 ct` before capture), the sanitizer queue
+    behavior under concurrent full-mode runs, and the baseline
+    refresh cadence (recapture at every `vX.Y.0` tag on the
+    canonical dev box).
+
+  **New files:**
+  - `scripts/test/dispatch-runner-job.sh` — shared `gh workflow run` + poll +
+    download + parse helper with distinct exit codes for success / fail /
+    runner-unavailable so callers can map to PASS / FAIL / WARN.
+    Reused by PR3 for the Windows agent build dispatch.
+  - `scripts/test/sanitizer-gate.sh` — Phase 6 orchestrator. Parses
+    `ERROR: AddressSanitizer`, `ERROR: LeakSanitizer`, `WARNING: ThreadSanitizer`,
+    `ThreadSanitizer: data race`, `runtime error:` out of the downloaded
+    sanitizer logs and counts meson test FAIL lines separately.
+  - `scripts/test/coverage-gate.sh` — Phase 7 coverage orchestrator.
+    Configures `build-linux-coverage/` with `-Db_coverage=true` (separate
+    from the main `build-linux/` so ccache hit rates stay intact), runs
+    `meson test`, runs gcovr with `--json-summary`, and enforces the
+    baseline with `--capture-baselines` / `--report-only` / default
+    enforce modes.
+  - `scripts/test/perf-gate.sh` — Phase 7 perf orchestrator. Parses
+    `ct:pal` throughput lines (`Registration: N ops in M ms (O ops/sec)`),
+    fanout latency lines (`Fanout to N agents: M ms`), and session
+    cleanup latency (`Cleanup N agents: M ms (K ms/agent)`).
+  - `.github/workflows/sanitizer-tests.yml` — `workflow_dispatch`-only
+    workflow pinned to `[self-hosted, yuzu-wsl2-linux]`. Uses the same
+    `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1`,
+    `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`, and
+    `TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1` as the
+    existing CI sanitize jobs for parity. Uploads
+    `sanitizer-{asan,tsan}.log`, their build logs, and
+    `build-linux-{asan,tsan}/meson-logs/testlog.junit.xml` as artifacts.
+  - `tests/coverage-baseline.json`, `tests/perf-baselines.json` —
+    shipped as **permissive seeds** (`branch_percent=0 + slack_pp=100`,
+    empty `metrics` map) with a `__seed: true` flag. PR2 must not break
+    /test --full on merge day, so the seeds pass trivially; first
+    operator run with `--capture-baselines` locks real numbers that
+    replace the seeds. The `git blame` on these files is the audit
+    trail for who raised/lowered the baseline and why.
+
+- **`/test` skill scaffold + upgrade test path (PR1 of 3).** New
+  `.claude/skills/test/SKILL.md` operator-facing runbook plus
+  `scripts/test/` helper directory that orchestrates a pre-commit /
+  pre-push test pipeline. Three modes: `--quick` (~10 min sanity check),
+  default (~30-45 min build + upgrade test + standard gates), `--full`
+  (~60-120 min adds OTA + sanitizers + perf + coverage enforce). The
+  default-mode headline is **Phase 2 upgrade test**: pulls
+  `ghcr.io/tr3kkr/yuzu-server:0.10.0`, populates fixture data, swaps to
+  the local HEAD image (built in Phase 1 as `yuzu-server:0.10.1-test-${RUN_ID}`),
+  verifies migrations ran via `/readyz` (uses the #339 compound-fix
+  `failed_stores` body field), and re-checks fixture preservation. PR1
+  ships Phases 0, 1, 2, 4, 5, 8 fully wired; Phases 3 (OTA), 6
+  (sanitizers), 7 (coverage + perf) are stubbed with SKIP rows pending
+  PR2/PR3.
+
+- **Persistent test-runs SQLite database** at
+  `~/.local/share/yuzu/test-runs.db` (override via `YUZU_TEST_DB`).
+  Schema v1 has 4 tables: `test_runs` (per-invocation aggregate),
+  `test_gates` (per-gate pass/fail + duration), `test_timings`
+  (millisecond sub-step durations like `phase2.image-swap`,
+  `phase3-linux.ota-download`, `synthetic-uat.os_info-roundtrip`),
+  and `test_metrics` (quantitative measurements with units). Uses
+  the `schema_meta` pattern from #339 so future schema changes can
+  land via versioned migrations. New scripts:
+  `scripts/test/test_db.py` (Python source of truth) plus thin
+  bash wrappers `test-db-init.sh`, `test-db-write.sh`,
+  `test-db-query.sh`. The query wrapper supports
+  `--latest`, `--last N`, `--diff RUN_A RUN_B`,
+  `--trend metric=NAME` / `--trend timing=GATE.STEP`,
+  `--flaky --days N`, `--branch B`, `--export RUN_ID`,
+  `--prune KEEP_N` (with `--dry-run` preview).
+  Power users can `python3 scripts/test/test_db.py query ...`
+  directly or run any sqlite query against the DB.
+
+- **`scripts/test/preflight.sh`** — Phase 0 sanity checks (toolchains,
+  ports, disk, docker context, dangling test containers, git state,
+  test-runs DB initialization). `--force-cleanup` flag tears down
+  dangling `yuzu-test-*` compose projects.
+
+- **`scripts/test/synthetic-uat-tests.sh`** — extracts the 6
+  connectivity tests from `linux-start-UAT.sh` (dashboard reachable,
+  gateway readyz, server registered agents metric, gateway connected
+  agents metric, help command round-trip, os_info command round-trip)
+  into a standalone script that takes URLs as arguments and records
+  per-command latencies into `test_timings`.
+
+- **`scripts/test/test-fixtures-{write,verify}.sh`** — minimum-viable
+  fixture set written before the upgrade and re-verified after, so the
+  upgrade test can detect data loss. Records what's preserved /
+  lost / skipped to a `fixtures-verify.json` report file.
+
+- **`scripts/test/test-upgrade-stack.sh`** — Phase 2 orchestrator. Uses
+  a purpose-built `scripts/test/docker-compose.upgrade-test.yml` that
+  drops the `container_name:` declarations from
+  `deploy/docker/docker-compose.reference.yml` so multiple parallel
+  test runs can coexist via `--project-name` isolation. Records
+  sub-step timings: `pull-old-images`, `stack-up-old`, `fixtures-write`,
+  `image-swap`, `ready-after-upgrade`, `fixtures-verify`,
+  `synthetic-uat-against-upgraded`. Counts `MigrationRunner` log events
+  as a `phase2_migration_events` metric.
+
+- **`scripts/test/teardown.sh`** — Phase 8. Stops every
+  `yuzu-test-${RUN_ID}-*` compose project, removes the
+  `/tmp/yuzu-test-${RUN_ID}/` scratch dir, finalizes the `test_runs`
+  row with computed `overall_status` from gate aggregates.
+
+- **Schema migrations wired into every server-side SQLite store (#339).**
+  The `MigrationRunner` framework at
+  `server/core/src/migration_runner.{hpp,cpp}` existed since earlier
+  releases but had not been called by any store — every store relied on
+  `CREATE TABLE IF NOT EXISTS` plus silent `ALTER TABLE` fallbacks, and
+  the upgrade docs incorrectly claimed "automatic schema migrations"
+  since v0.1.0. This change threads `MigrationRunner::run()` through the
+  `create_tables()` method of all 30 stores and managers:
+  `analytics_event_store`, `api_token_store`, `approval_manager`,
+  `audit_store`, `concurrency_manager`, `custom_properties_store`,
+  `deployment_store`, `device_token_store`, `directory_sync`,
+  `discovery_store`, `execution_tracker`, `instruction_store`,
+  `inventory_store`, `license_store`, `management_group_store`,
+  `notification_store`, `nvd_db`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `quarantine_store`, `rbac_store`,
+  `response_store`, `runtime_config_store`, `schedule_engine`,
+  `software_deployment_store`, `tag_store`, `update_registry`,
+  `webhook_store`, `workflow_engine`. Every database now stamps its
+  schema version in the shared `schema_meta` table and future schema
+  changes go through versioned migrations with transactional rollback.
+- **`deploy/docker/docker-compose.reference.yml`** — copyable
+  deployment template that pulls pinned
+  `ghcr.io/tr3kkr/yuzu-{server,agent}:${YUZU_VERSION:-0.10.0}` images,
+  uses a named `server-data` volume for all mutable state, and carries
+  inline TLS hardening + backup + rollback + restore commentary.
+  Covered by `scripts/check-compose-versions.sh` so release tags cannot
+  drift from the compose default. Named "reference" rather than
+  "production" because the image's default CMD is dev-friendly
+  (`--no-tls --no-https --web-address 0.0.0.0`) and the template
+  requires operator hardening before production use (#339).
+- **Legacy compatibility shims in six stores** — `api_token_store`,
+  `instruction_store`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `response_store`. These run the historical
+  silent `ALTER TABLE ADD COLUMN` statements once before
+  `MigrationRunner::run()` so databases created by pre-v0.10 releases
+  that never received those columns still converge to schema v1.
+  Kept for one release cycle; removable after v0.11.
+
+### Changed
+
+- **Migration failure now closes the affected store (#339).** When
+  `MigrationRunner::run()` returns false for a store that owns its
+  SQLite handle (26 of 30 stores), the store's `create_tables()` closes
+  the handle and sets `db_ = nullptr`, so `is_open()` correctly returns
+  false. Previously a migration failure was logged but the store kept
+  reporting itself as open, and `ResponseStore::store()` would silently
+  no-op on inserts because `insert_stmt_` was null — agent results
+  reached the server, were "accepted" over gRPC, and disappeared. This
+  change ensures a migration failure surfaces loudly via `/readyz` and
+  causes reads/writes to fail fast instead of dropping data. (Closes
+  UP-1 / UP-2 / UP-9 / UP-20 compound finding from the #339 governance
+  run.)
+- **`/readyz` reports per-store status with failed store names (#339).**
+  The readiness probe now walks 12 load-bearing stores (response, audit,
+  instruction, api_token, policy, rbac, tag, management_group,
+  runtime_config, inventory, workflow_engine, custom_properties) and
+  returns a JSON body of the form
+  `{"status":"not ready","failed_stores":["..."]}` on 503 so operators
+  can diagnose upgrade failures without digging through logs.
+- **`MigrationRunner` hardening**: explicit `ROLLBACK;` on COMMIT
+  failure so shared-connection callers (`InstructionDbPool`) don't
+  inherit a half-open transaction; removed redundant `ensure_meta_table`
+  call in `current_version()`; `Migration::sql` is now `std::string`
+  (owning) instead of `std::string_view` to guard against future callers
+  constructing migrations from non-null-terminated views.
+- **`docs/user-manual/upgrading.md`** rewritten (#339): Docker section
+  references the new `docker-compose.reference.yml`, real `ghcr.io`
+  image path, backup recipe with a dedicated backup directory, explicit
+  Docker rollback recipe, `schema_meta` query for operator-side
+  verification, and truthful failure-mode guidance that points at
+  `/readyz` (not `/livez`) as the upgrade-success signal. The "Schema
+  Migrations" section describes the real mechanism, which stores carry
+  legacy shims, and what the log burst on first upgrade looks like.
+  Drops the inaccurate "since v0.1.0" claim. Version compat table now
+  spans 0.5.x → 0.9.x as a single row so the 0.10.x jump reads cleanly.
+- **`docs/user-manual/server-admin.md`** Docker compose table now
+  includes `docker-compose.reference.yml` with the "requires operator
+  hardening" caveat.
+
 ### Fixed
 
+- **`scripts/test/` harness bugs discovered running `/test --full`
+  against uncommitted #339.** Three PR1 harness fixes that landed the
+  headline upgrade test at green:
+  (a) `test-upgrade-stack.sh` wrote the upgrade-test admin credentials
+  with `chmod 600` owned by the test runner's UID. `Dockerfile.server`
+  drops to `USER yuzu` (unprivileged) before reading the config, so
+  the file was invisible inside the container and v0.10.0 fell through
+  to first-run-setup and exited. Now `chmod 644` on the cred file and
+  `chmod 700` on the parent `/tmp/yuzu-test-${RUN_ID}/` dir — the
+  parent-dir restriction prevents host-side leakage and the 644 on
+  the file lets the container yuzu user read it. Also fixes the
+  fallback `docker compose logs` diagnostic in the /readyz-timeout
+  branch which was missing the required `YUZU_VERSION` and
+  `YUZU_TEST_CONFIG` env vars, producing a confusing
+  "empty section between colons" error instead of the actual logs.
+  (b) `test-fixtures-verify.sh` hit `/api/settings/enrollment-tokens`
+  and `/api/settings/api-tokens` as JSON list endpoints — neither
+  exists; enrollment tokens are only exposed via the HTMX fragment at
+  `/fragments/settings/tokens`. The verifier now reads the fragment
+  HTML and counts `<code>...</code>` token-id cells; API tokens are
+  verified through the proper `/api/v1/tokens` REST endpoint and
+  parsed as JSON.
+  (c) `test-fixtures-write.sh` POSTed to `/api/settings/api-tokens`
+  with `label=` and `ttl=` form fields, but the handler expects
+  `name=` and `ttl_hours=` and silently returns an HTML error
+  fragment on mismatch. The writer now uses the correct field names
+  and inspects the response body for `feedback-error` before accepting
+  the write. (#339 /test verification)
+- **`scripts/linux-start-UAT.sh` now exits non-zero on connectivity test
+  failure.** Previously the script always exited 0 after the stack stood
+  up, regardless of whether the 6 inline connectivity tests passed. The
+  /test Phase 4 gate relied on the exit code to detect a broken stack
+  and was therefore a false-positive trap. `start_all()` now captures
+  the result into `UAT_TEST_RESULT` and returns it, which the script
+  propagates as its exit code. **This is a breaking change for any
+  caller that assumed the script always exits 0** — in practice there
+  are no such callers in-tree, but operators with external scripts that
+  pipe to `|| true` should verify they actually want to swallow the
+  failure.
 - **`ci(release)`: filter `actions/download-artifact@v4` to `yuzu-*`
   pattern.** The auto-generated `*.dockerbuild` provenance metadata files
   (uploaded by docker buildx attestation) consistently failed download
@@ -21,6 +388,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   developer machine). The filter restores the cosign signature for
   v0.10.1+ by skipping the broken artifacts entirely; the 10 `yuzu-*`
   release binaries are unaffected.
+- **`ci(cache)`: include `matrix.build_type` in Windows vcpkg cache
+  key.** The Windows MSVC matrix runs both debug and release builds
+  against the same `vcpkg-x64-windows-${hashFiles(...)}` cache key.
+  Whichever job populated the cache first won, and the other job linked
+  user code (compiled with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`) against
+  `absl_*.lib` variants built with `/MD` and `_ITERATOR_DEBUG_LEVEL=0`,
+  producing dozens of `LNK2038` "RuntimeLibrary mismatch" errors. The
+  flake hit PR #355's CI matrix and required an admin override to merge.
+  Adding `${{ matrix.build_type }}` to the cache key gives debug and
+  release independent slots; the legacy build-type-less restore key was
+  intentionally **not** preserved so a poisoned cache can't be silently
+  restored. Both matrix jobs will populate fresh caches on their next
+  run; this is self-healing. See #356 for the watch list — the
+  underlying meson+vcpkg+`CMAKE_BUILD_TYPE` interaction may need a
+  follow-up fix if the symptom recurs.
+
+### Tests
+
+- **`tests/unit/server/test_migration_runner.cpp`** — four new cases
+  tagged `[migration][adoption]` exercise the adoption and hardening
+  paths: (a) running v1 on a database that already has tables populated
+  with data preserves rows and stamps `schema_meta`, (b) a fresh DB gets
+  the full latest schema, (c) the legacy compat shim + v1 combination
+  stays idempotent across simulated server restarts, (d) a bad migration
+  statement rolls back cleanly and leaves the shared connection usable
+  for subsequent migrations on other stores (#339). `TestDb` now uses
+  `sqlite3_open_v2` with `SQLITE_OPEN_FULLMUTEX` to match the flags
+  every production store opens with; `count_rows` and `column_exists`
+  helpers now `REQUIRE` that `sqlite3_prepare_v2` succeeds so a test
+  typo cannot mask itself as a false-green.
+
+### Deferred follow-ups from #339 governance
+
+- **#358** — Chaos regression tests for the migration runner
+  hardening: concurrent-server race (CH-B), mid-startup SIGKILL
+  (CH-E), forward-version DB downgrade protection (CH-F / UP-6).
+- **#359** — Per-shim-store adoption test coverage: targeted tests
+  for the six legacy-compat-shim stores (`api_token_store`,
+  `instruction_store`, `patch_manager`, `policy_store`,
+  `product_pack_store`, `response_store`) plus `schema_meta` stamp
+  assertions in existing store tests and test coverage for the
+  eleven stores that currently have none.
+- **#360** — Migration observability + SRE hardening: Prometheus
+  counters for migration events (OBS-3), log-burst summary line
+  (OBS-4), independent `migration.log` audit trail (compliance-F4),
+  hot backup via SQLite online backup API (REC-1), CI lint for
+  migration runner wiring invariants (UP-17), and compile-time
+  `static_assert` for legacy shim removal (arch-SH2).
 
 ### Known issues
 
@@ -37,6 +452,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in a packaging script, or duplicate gateway packaging in the linux
   build job that should defer to the dedicated `Build Gateway (Erlang)`
   job. P1.
+- **#356** — Watch issue for the Windows MSVC debug `LNK2038` flake
+  fixed by the cache-key change above. The cache-key fix prevents one
+  class of cross-variant cache contamination, but the bug class can
+  recur if (a) anyone reverts the discriminator, (b) Linux/macOS jobs
+  hit the same pattern (latent — only Windows manifests because of
+  MSVC's `_ITERATOR_DEBUG_LEVEL` ABI), or (c) the actual root cause is
+  meson's CMake dependency resolver not propagating `CMAKE_BUILD_TYPE`
+  into vcpkg's exported port-config files (in which case the cache-key
+  fix is incomplete and the next CI run will still fail). Watch list in
+  the issue body and follow-up comment. P2.
 
 ## [0.10.0] - 2026-04-12
 

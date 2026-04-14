@@ -1,4 +1,5 @@
 #include "software_deployment_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -64,7 +65,8 @@ SoftwareDeploymentStore::SoftwareDeploymentStore(const std::filesystem::path& db
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("SoftwareDeploymentStore: opened {}", canonical_path.string());
+    if (db_)
+        spdlog::info("SoftwareDeploymentStore: opened {}", canonical_path.string());
 }
 
 SoftwareDeploymentStore::~SoftwareDeploymentStore() {
@@ -77,60 +79,62 @@ bool SoftwareDeploymentStore::is_open() const {
 }
 
 void SoftwareDeploymentStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS software_packages (
-            id               TEXT PRIMARY KEY,
-            name             TEXT NOT NULL,
-            version          TEXT NOT NULL DEFAULT '',
-            platform         TEXT NOT NULL DEFAULT '',
-            installer_type   TEXT NOT NULL DEFAULT '',
-            content_hash     TEXT NOT NULL DEFAULT '',
-            content_url      TEXT NOT NULL DEFAULT '',
-            silent_args      TEXT NOT NULL DEFAULT '',
-            verify_command   TEXT NOT NULL DEFAULT '',
-            rollback_command TEXT NOT NULL DEFAULT '',
-            size_bytes       INTEGER NOT NULL DEFAULT 0,
-            created_at       INTEGER NOT NULL DEFAULT 0,
-            created_by       TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_swpkg_name ON software_packages(name);
-        CREATE INDEX IF NOT EXISTS idx_swpkg_platform ON software_packages(platform);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS software_packages (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                version          TEXT NOT NULL DEFAULT '',
+                platform         TEXT NOT NULL DEFAULT '',
+                installer_type   TEXT NOT NULL DEFAULT '',
+                content_hash     TEXT NOT NULL DEFAULT '',
+                content_url      TEXT NOT NULL DEFAULT '',
+                silent_args      TEXT NOT NULL DEFAULT '',
+                verify_command   TEXT NOT NULL DEFAULT '',
+                rollback_command TEXT NOT NULL DEFAULT '',
+                size_bytes       INTEGER NOT NULL DEFAULT 0,
+                created_at       INTEGER NOT NULL DEFAULT 0,
+                created_by       TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_swpkg_name ON software_packages(name);
+            CREATE INDEX IF NOT EXISTS idx_swpkg_platform ON software_packages(platform);
 
-        CREATE TABLE IF NOT EXISTS software_deployments (
-            id               TEXT PRIMARY KEY,
-            package_id       TEXT NOT NULL,
-            scope_expression TEXT NOT NULL DEFAULT '',
-            status           TEXT NOT NULL DEFAULT 'staged',
-            created_by       TEXT NOT NULL DEFAULT '',
-            created_at       INTEGER NOT NULL DEFAULT 0,
-            started_at       INTEGER NOT NULL DEFAULT 0,
-            completed_at     INTEGER NOT NULL DEFAULT 0,
-            agents_targeted  INTEGER NOT NULL DEFAULT 0,
-            agents_success   INTEGER NOT NULL DEFAULT 0,
-            agents_failure   INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (package_id) REFERENCES software_packages(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_swdep_status ON software_deployments(status);
-        CREATE INDEX IF NOT EXISTS idx_swdep_package ON software_deployments(package_id);
-        CREATE INDEX IF NOT EXISTS idx_swdep_created ON software_deployments(created_at);
+            CREATE TABLE IF NOT EXISTS software_deployments (
+                id               TEXT PRIMARY KEY,
+                package_id       TEXT NOT NULL,
+                scope_expression TEXT NOT NULL DEFAULT '',
+                status           TEXT NOT NULL DEFAULT 'staged',
+                created_by       TEXT NOT NULL DEFAULT '',
+                created_at       INTEGER NOT NULL DEFAULT 0,
+                started_at       INTEGER NOT NULL DEFAULT 0,
+                completed_at     INTEGER NOT NULL DEFAULT 0,
+                agents_targeted  INTEGER NOT NULL DEFAULT 0,
+                agents_success   INTEGER NOT NULL DEFAULT 0,
+                agents_failure   INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (package_id) REFERENCES software_packages(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_swdep_status ON software_deployments(status);
+            CREATE INDEX IF NOT EXISTS idx_swdep_package ON software_deployments(package_id);
+            CREATE INDEX IF NOT EXISTS idx_swdep_created ON software_deployments(created_at);
 
-        CREATE TABLE IF NOT EXISTS agent_software_status (
-            deployment_id TEXT NOT NULL,
-            agent_id      TEXT NOT NULL,
-            status        TEXT NOT NULL DEFAULT 'pending',
-            started_at    INTEGER NOT NULL DEFAULT 0,
-            completed_at  INTEGER NOT NULL DEFAULT 0,
-            error         TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (deployment_id, agent_id),
-            FOREIGN KEY (deployment_id) REFERENCES software_deployments(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_agentstatus_dep ON agent_software_status(deployment_id);
-        CREATE INDEX IF NOT EXISTS idx_agentstatus_agent ON agent_software_status(agent_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("SoftwareDeploymentStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE TABLE IF NOT EXISTS agent_software_status (
+                deployment_id TEXT NOT NULL,
+                agent_id      TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                started_at    INTEGER NOT NULL DEFAULT 0,
+                completed_at  INTEGER NOT NULL DEFAULT 0,
+                error         TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (deployment_id, agent_id),
+                FOREIGN KEY (deployment_id) REFERENCES software_deployments(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agentstatus_dep ON agent_software_status(deployment_id);
+            CREATE INDEX IF NOT EXISTS idx_agentstatus_agent ON agent_software_status(agent_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "software_deployment_store", kMigrations)) {
+        spdlog::error("SoftwareDeploymentStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

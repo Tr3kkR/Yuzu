@@ -1,5 +1,6 @@
 #include "update_registry.hpp"
 
+#include "migration_runner.hpp"
 #include "nvd_db.hpp" // compare_versions()
 
 #include <spdlog/spdlog.h>
@@ -39,7 +40,8 @@ UpdateRegistry::UpdateRegistry(const std::filesystem::path& db_path,
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
     create_tables();
-    spdlog::info("UpdateRegistry: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("UpdateRegistry: opened {}", db_path.string());
 }
 
 UpdateRegistry::~UpdateRegistry() {
@@ -57,26 +59,26 @@ void UpdateRegistry::create_tables() {
     if (!db_)
         return;
 
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS update_packages (
-            platform    TEXT    NOT NULL,
-            arch        TEXT    NOT NULL,
-            version     TEXT    NOT NULL,
-            sha256      TEXT    NOT NULL,
-            filename    TEXT    NOT NULL,
-            mandatory   INTEGER DEFAULT 0,
-            rollout_pct INTEGER DEFAULT 100,
-            uploaded_at TEXT,
-            file_size   INTEGER DEFAULT 0,
-            PRIMARY KEY (platform, arch, version)
-        );
-    )";
-
-    char* err_msg = nullptr;
-    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("UpdateRegistry: create_tables failed: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS update_packages (
+                platform    TEXT    NOT NULL,
+                arch        TEXT    NOT NULL,
+                version     TEXT    NOT NULL,
+                sha256      TEXT    NOT NULL,
+                filename    TEXT    NOT NULL,
+                mandatory   INTEGER DEFAULT 0,
+                rollout_pct INTEGER DEFAULT 100,
+                uploaded_at TEXT,
+                file_size   INTEGER DEFAULT 0,
+                PRIMARY KEY (platform, arch, version)
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "update_registry", kMigrations)) {
+        spdlog::error("UpdateRegistry: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

@@ -1,4 +1,5 @@
 #include "deployment_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -49,7 +50,8 @@ DeploymentStore::DeploymentStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("DeploymentStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("DeploymentStore: opened {}", db_path.string());
 }
 
 DeploymentStore::~DeploymentStore() {
@@ -62,25 +64,27 @@ bool DeploymentStore::is_open() const {
 }
 
 void DeploymentStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS deployment_jobs (
-            id              TEXT PRIMARY KEY,
-            target_host     TEXT NOT NULL,
-            os              TEXT NOT NULL DEFAULT 'linux',
-            method          TEXT NOT NULL DEFAULT 'manual',
-            status          TEXT NOT NULL DEFAULT 'pending',
-            created_at      INTEGER NOT NULL DEFAULT 0,
-            started_at      INTEGER NOT NULL DEFAULT 0,
-            completed_at    INTEGER NOT NULL DEFAULT 0,
-            error           TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_deployment_status ON deployment_jobs(status);
-        CREATE INDEX IF NOT EXISTS idx_deployment_created ON deployment_jobs(created_at);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("DeploymentStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS deployment_jobs (
+                id              TEXT PRIMARY KEY,
+                target_host     TEXT NOT NULL,
+                os              TEXT NOT NULL DEFAULT 'linux',
+                method          TEXT NOT NULL DEFAULT 'manual',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                created_at      INTEGER NOT NULL DEFAULT 0,
+                started_at      INTEGER NOT NULL DEFAULT 0,
+                completed_at    INTEGER NOT NULL DEFAULT 0,
+                error           TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_deployment_status ON deployment_jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_deployment_created ON deployment_jobs(created_at);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "deployment_store", kMigrations)) {
+        spdlog::error("DeploymentStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

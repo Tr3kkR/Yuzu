@@ -1,4 +1,5 @@
 #include "license_store.hpp"
+#include "migration_runner.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -72,7 +73,8 @@ LicenseStore::LicenseStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("LicenseStore: opened {}", canonical_path.string());
+    if (db_)
+        spdlog::info("LicenseStore: opened {}", canonical_path.string());
 }
 
 LicenseStore::~LicenseStore() {
@@ -87,36 +89,38 @@ bool LicenseStore::is_open() const {
 // -- DDL ----------------------------------------------------------------------
 
 void LicenseStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS licenses (
-            id              TEXT PRIMARY KEY,
-            license_key_hash TEXT NOT NULL UNIQUE,
-            organization    TEXT NOT NULL DEFAULT '',
-            seat_count      INTEGER NOT NULL DEFAULT 0,
-            issued_at       INTEGER NOT NULL DEFAULT 0,
-            expires_at      INTEGER NOT NULL DEFAULT 0,
-            edition         TEXT NOT NULL DEFAULT 'community',
-            features_json   TEXT NOT NULL DEFAULT '[]',
-            status          TEXT NOT NULL DEFAULT 'active',
-            activated_at    INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_license_status ON licenses(status);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS licenses (
+                id              TEXT PRIMARY KEY,
+                license_key_hash TEXT NOT NULL UNIQUE,
+                organization    TEXT NOT NULL DEFAULT '',
+                seat_count      INTEGER NOT NULL DEFAULT 0,
+                issued_at       INTEGER NOT NULL DEFAULT 0,
+                expires_at      INTEGER NOT NULL DEFAULT 0,
+                edition         TEXT NOT NULL DEFAULT 'community',
+                features_json   TEXT NOT NULL DEFAULT '[]',
+                status          TEXT NOT NULL DEFAULT 'active',
+                activated_at    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_license_status ON licenses(status);
 
-        CREATE TABLE IF NOT EXISTS license_alerts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_id      TEXT NOT NULL,
-            alert_type      TEXT NOT NULL,
-            message         TEXT NOT NULL DEFAULT '',
-            triggered_at    INTEGER NOT NULL DEFAULT 0,
-            acknowledged    INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_license_alert_lic ON license_alerts(license_id);
-        CREATE INDEX IF NOT EXISTS idx_license_alert_ack ON license_alerts(acknowledged, triggered_at);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("LicenseStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE TABLE IF NOT EXISTS license_alerts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                license_id      TEXT NOT NULL,
+                alert_type      TEXT NOT NULL,
+                message         TEXT NOT NULL DEFAULT '',
+                triggered_at    INTEGER NOT NULL DEFAULT 0,
+                acknowledged    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_license_alert_lic ON license_alerts(license_id);
+            CREATE INDEX IF NOT EXISTS idx_license_alert_ack ON license_alerts(acknowledged, triggered_at);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "license_store", kMigrations)) {
+        spdlog::error("LicenseStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

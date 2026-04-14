@@ -1,4 +1,5 @@
 #include "custom_properties_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -27,7 +28,8 @@ CustomPropertiesStore::CustomPropertiesStore(const std::filesystem::path& db_pat
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("CustomPropertiesStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("CustomPropertiesStore: opened {}", db_path.string());
 }
 
 CustomPropertiesStore::~CustomPropertiesStore() {
@@ -40,30 +42,32 @@ bool CustomPropertiesStore::is_open() const {
 }
 
 void CustomPropertiesStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS custom_properties (
-            agent_id    TEXT NOT NULL,
-            key         TEXT NOT NULL,
-            value       TEXT NOT NULL,
-            type        TEXT NOT NULL DEFAULT 'string',
-            updated_at  INTEGER NOT NULL,
-            PRIMARY KEY (agent_id, key)
-        );
-        CREATE INDEX IF NOT EXISTS idx_custom_props_agent
-            ON custom_properties(agent_id);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS custom_properties (
+                agent_id    TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                type        TEXT NOT NULL DEFAULT 'string',
+                updated_at  INTEGER NOT NULL,
+                PRIMARY KEY (agent_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_custom_props_agent
+                ON custom_properties(agent_id);
 
-        CREATE TABLE IF NOT EXISTS custom_property_schemas (
-            key               TEXT PRIMARY KEY,
-            display_name      TEXT,
-            type              TEXT NOT NULL DEFAULT 'string',
-            description       TEXT,
-            validation_regex  TEXT
-        );
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("CustomPropertiesStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE TABLE IF NOT EXISTS custom_property_schemas (
+                key               TEXT PRIMARY KEY,
+                display_name      TEXT,
+                type              TEXT NOT NULL DEFAULT 'string',
+                description       TEXT,
+                validation_regex  TEXT
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "custom_properties_store", kMigrations)) {
+        spdlog::error("CustomPropertiesStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

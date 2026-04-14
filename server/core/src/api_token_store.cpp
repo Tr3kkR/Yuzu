@@ -1,5 +1,6 @@
 #include "api_token_store.hpp"
 #include "mcp_policy.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -53,7 +54,8 @@ ApiTokenStore::ApiTokenStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("ApiTokenStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("ApiTokenStore: opened {}", db_path.string());
 }
 
 ApiTokenStore::~ApiTokenStore() {
@@ -68,33 +70,37 @@ bool ApiTokenStore::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void ApiTokenStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS api_tokens (
-            token_id      TEXT PRIMARY KEY,
-            token_hash    TEXT NOT NULL UNIQUE,
-            name          TEXT NOT NULL,
-            principal_id  TEXT NOT NULL,
-            scope_service TEXT NOT NULL DEFAULT '',
-            created_at    INTEGER NOT NULL DEFAULT 0,
-            expires_at    INTEGER NOT NULL DEFAULT 0,
-            last_used_at  INTEGER NOT NULL DEFAULT 0,
-            revoked       INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
-        CREATE INDEX IF NOT EXISTS idx_api_tokens_principal ON api_tokens(principal_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ApiTokenStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
-    }
-
-    // Migration: add scope_service column if missing (existing databases)
+    // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
+    // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so any
+    // columns added historically via silent ALTERs must still be applied here.
     sqlite3_exec(db_, "ALTER TABLE api_tokens ADD COLUMN scope_service TEXT NOT NULL DEFAULT '';",
                  nullptr, nullptr, nullptr);
-    // Migration: add mcp_tier column for MCP token support
     sqlite3_exec(db_, "ALTER TABLE api_tokens ADD COLUMN mcp_tier TEXT NOT NULL DEFAULT '';",
                  nullptr, nullptr, nullptr);
+
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                token_id      TEXT PRIMARY KEY,
+                token_hash    TEXT NOT NULL UNIQUE,
+                name          TEXT NOT NULL,
+                principal_id  TEXT NOT NULL,
+                scope_service TEXT NOT NULL DEFAULT '',
+                mcp_tier      TEXT NOT NULL DEFAULT '',
+                created_at    INTEGER NOT NULL DEFAULT 0,
+                expires_at    INTEGER NOT NULL DEFAULT 0,
+                last_used_at  INTEGER NOT NULL DEFAULT 0,
+                revoked       INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_principal ON api_tokens(principal_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "api_token_store", kMigrations)) {
+        spdlog::error("ApiTokenStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 // ── Token generation and hashing ─────────────────────────────────────────────

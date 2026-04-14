@@ -26,6 +26,13 @@ bool MigrationRunner::ensure_meta_table(sqlite3* db) {
 }
 
 int MigrationRunner::current_version(sqlite3* db, std::string_view store_name) {
+    // Idempotently ensure `schema_meta` exists. `run()` also calls this once
+    // at its entry, so there is a redundant call on the hot path — the cost
+    // is one `CREATE TABLE IF NOT EXISTS` (sub-millisecond on warm cache).
+    // Defense-in-depth: `current_version` is a public static method, and
+    // external callers (e.g. a future per-store version status endpoint)
+    // would silently see `-1`-as-error instead of `0`-as-never-migrated
+    // if we relied on `run()` to have been called first.
     if (!ensure_meta_table(db))
         return -1;
 
@@ -97,7 +104,7 @@ bool MigrationRunner::run(sqlite3* db, std::string_view store_name,
             return false;
         }
 
-        rc = sqlite3_exec(db, m.sql.data(), nullptr, nullptr, &err);
+        rc = sqlite3_exec(db, m.sql.c_str(), nullptr, nullptr, &err);
         if (rc != SQLITE_OK) {
             spdlog::error("MigrationRunner: migration v{} failed for {}: {}", m.version,
                           store_name, err ? err : "unknown");
@@ -118,6 +125,11 @@ bool MigrationRunner::run(sqlite3* db, std::string_view store_name,
             spdlog::error("MigrationRunner: COMMIT failed for {}: {}", store_name,
                           err ? err : "unknown");
             sqlite3_free(err);
+            // Explicit ROLLBACK even though a failed COMMIT already aborts
+            // the transaction in WAL mode — required so shared-connection
+            // callers (InstructionDbPool) don't inherit a half-open
+            // transaction state on the next store's BEGIN IMMEDIATE.
+            sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
             return false;
         }
 

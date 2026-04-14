@@ -1,4 +1,5 @@
 #include "notification_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -37,7 +38,8 @@ NotificationStore::NotificationStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("NotificationStore: opened {}", canonical_path.string());
+    if (db_)
+        spdlog::info("NotificationStore: opened {}", canonical_path.string());
 }
 
 NotificationStore::~NotificationStore() {
@@ -50,23 +52,25 @@ bool NotificationStore::is_open() const {
 }
 
 void NotificationStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS notifications (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   INTEGER NOT NULL,
-            level       TEXT    NOT NULL DEFAULT 'info',
-            title       TEXT    NOT NULL,
-            message     TEXT    NOT NULL DEFAULT '',
-            read        INTEGER NOT NULL DEFAULT 0,
-            dismissed   INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_notif_read_ts
-            ON notifications(read, timestamp);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("NotificationStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS notifications (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   INTEGER NOT NULL,
+                level       TEXT    NOT NULL DEFAULT 'info',
+                title       TEXT    NOT NULL,
+                message     TEXT    NOT NULL DEFAULT '',
+                read        INTEGER NOT NULL DEFAULT 0,
+                dismissed   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_notif_read_ts
+                ON notifications(read, timestamp);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "notification_store", kMigrations)) {
+        spdlog::error("NotificationStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

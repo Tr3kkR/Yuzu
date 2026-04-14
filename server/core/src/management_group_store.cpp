@@ -1,4 +1,5 @@
 #include "management_group_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -40,7 +41,8 @@ ManagementGroupStore::ManagementGroupStore(const std::filesystem::path& db_path)
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     create_tables();
-    spdlog::info("ManagementGroupStore: opened {}", db_path.string());
+    if (db_)
+        spdlog::info("ManagementGroupStore: opened {}", db_path.string());
 }
 
 ManagementGroupStore::~ManagementGroupStore() {
@@ -55,44 +57,46 @@ bool ManagementGroupStore::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void ManagementGroupStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS management_groups (
-            id               TEXT PRIMARY KEY,
-            name             TEXT NOT NULL UNIQUE,
-            description      TEXT NOT NULL DEFAULT '',
-            parent_id        TEXT REFERENCES management_groups(id) ON DELETE CASCADE,
-            membership_type  TEXT NOT NULL DEFAULT 'static',
-            scope_expression TEXT,
-            created_by       TEXT,
-            created_at       INTEGER NOT NULL DEFAULT 0,
-            updated_at       INTEGER NOT NULL DEFAULT 0
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS management_groups (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL UNIQUE,
+                description      TEXT NOT NULL DEFAULT '',
+                parent_id        TEXT REFERENCES management_groups(id) ON DELETE CASCADE,
+                membership_type  TEXT NOT NULL DEFAULT 'static',
+                scope_expression TEXT,
+                created_by       TEXT,
+                created_at       INTEGER NOT NULL DEFAULT 0,
+                updated_at       INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS management_group_members (
-            group_id  TEXT NOT NULL REFERENCES management_groups(id) ON DELETE CASCADE,
-            agent_id  TEXT NOT NULL,
-            source    TEXT NOT NULL DEFAULT 'static',
-            added_at  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (group_id, agent_id)
-        );
+            CREATE TABLE IF NOT EXISTS management_group_members (
+                group_id  TEXT NOT NULL REFERENCES management_groups(id) ON DELETE CASCADE,
+                agent_id  TEXT NOT NULL,
+                source    TEXT NOT NULL DEFAULT 'static',
+                added_at  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, agent_id)
+            );
 
-        CREATE TABLE IF NOT EXISTS management_group_roles (
-            group_id       TEXT NOT NULL REFERENCES management_groups(id) ON DELETE CASCADE,
-            principal_type TEXT NOT NULL,
-            principal_id   TEXT NOT NULL,
-            role_name      TEXT NOT NULL,
-            PRIMARY KEY (group_id, principal_type, principal_id, role_name)
-        );
+            CREATE TABLE IF NOT EXISTS management_group_roles (
+                group_id       TEXT NOT NULL REFERENCES management_groups(id) ON DELETE CASCADE,
+                principal_type TEXT NOT NULL,
+                principal_id   TEXT NOT NULL,
+                role_name      TEXT NOT NULL,
+                PRIMARY KEY (group_id, principal_type, principal_id, role_name)
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_mgmt_members_agent
-            ON management_group_members(agent_id);
-        CREATE INDEX IF NOT EXISTS idx_mgmt_groups_parent
-            ON management_groups(parent_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ManagementGroupStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE INDEX IF NOT EXISTS idx_mgmt_members_agent
+                ON management_group_members(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_mgmt_groups_parent
+                ON management_groups(parent_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "management_group_store", kMigrations)) {
+        spdlog::error("ManagementGroupStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

@@ -1,6 +1,7 @@
 #include "rbac_store.hpp"
 
 #include "management_group_store.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
@@ -30,6 +31,8 @@ RbacStore::RbacStore(const std::filesystem::path& db_path) {
     sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
     create_tables();
+    if (!db_)
+        return;
     seed_defaults();
     load_enabled_flag();
     spdlog::info("RbacStore: opened {}", db_path.string());
@@ -47,66 +50,68 @@ bool RbacStore::is_open() const {
 // ── DDL ──────────────────────────────────────────────────────────────────────
 
 void RbacStore::create_tables() {
-    const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS securable_types (
-            name        TEXT PRIMARY KEY,
-            description TEXT NOT NULL DEFAULT '',
-            is_system   INTEGER NOT NULL DEFAULT 0
-        );
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS securable_types (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS operations (
-            id          TEXT PRIMARY KEY,
-            description TEXT NOT NULL DEFAULT '',
-            is_system   INTEGER NOT NULL DEFAULT 0
-        );
+            CREATE TABLE IF NOT EXISTS operations (
+                id          TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS roles (
-            name        TEXT PRIMARY KEY,
-            description TEXT NOT NULL DEFAULT '',
-            is_system   INTEGER NOT NULL DEFAULT 0,
-            created_at  INTEGER NOT NULL DEFAULT 0
-        );
+            CREATE TABLE IF NOT EXISTS roles (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS role_permissions (
-            role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-            securable_type  TEXT NOT NULL REFERENCES securable_types(name),
-            operation       TEXT NOT NULL REFERENCES operations(id),
-            effect          TEXT NOT NULL DEFAULT 'allow',
-            PRIMARY KEY (role_name, securable_type, operation)
-        );
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
+                operation       TEXT NOT NULL REFERENCES operations(id),
+                effect          TEXT NOT NULL DEFAULT 'allow',
+                PRIMARY KEY (role_name, securable_type, operation)
+            );
 
-        CREATE TABLE IF NOT EXISTS principal_roles (
-            principal_type  TEXT NOT NULL,
-            principal_id    TEXT NOT NULL,
-            role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-            PRIMARY KEY (principal_type, principal_id, role_name)
-        );
-        CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
-            ON principal_roles(principal_type, principal_id);
+            CREATE TABLE IF NOT EXISTS principal_roles (
+                principal_type  TEXT NOT NULL,
+                principal_id    TEXT NOT NULL,
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                PRIMARY KEY (principal_type, principal_id, role_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
+                ON principal_roles(principal_type, principal_id);
 
-        CREATE TABLE IF NOT EXISTS groups (
-            name        TEXT PRIMARY KEY,
-            description TEXT NOT NULL DEFAULT '',
-            source      TEXT NOT NULL DEFAULT 'local',
-            external_id TEXT,
-            created_at  INTEGER NOT NULL DEFAULT 0
-        );
+            CREATE TABLE IF NOT EXISTS groups (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                source      TEXT NOT NULL DEFAULT 'local',
+                external_id TEXT,
+                created_at  INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS group_members (
-            group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-            username    TEXT NOT NULL,
-            PRIMARY KEY (group_name, username)
-        );
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+                username    TEXT NOT NULL,
+                PRIMARY KEY (group_name, username)
+            );
 
-        CREATE TABLE IF NOT EXISTS rbac_config (
-            key     TEXT PRIMARY KEY,
-            value   TEXT NOT NULL
-        );
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("RbacStore: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+            CREATE TABLE IF NOT EXISTS rbac_config (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            );
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "rbac_store", kMigrations)) {
+        spdlog::error("RbacStore: schema migration failed, closing database");
+        sqlite3_close(db_);
+        db_ = nullptr;
     }
 }
 

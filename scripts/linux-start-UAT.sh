@@ -397,8 +397,10 @@ for r in d.get('responses',[]):
     echo ""
     if [ "$tests_passed" -eq "$tests_total" ]; then
         echo -e "${GREEN}=== All $tests_total/$tests_total tests passed ===${NC}"
+        UAT_TEST_RESULT=0
     else
         echo -e "${RED}=== $tests_passed/$tests_total tests passed ===${NC}"
+        UAT_TEST_RESULT=1
     fi
 
     echo ""
@@ -416,6 +418,11 @@ for r in d.get('responses',[]):
     echo "║  Logs:  $UAT_DIR/{server,gateway,agent}.log     ║"
     echo "║  Stop:  bash scripts/linux-start-UAT.sh stop    ║"
     echo "╚══════════════════════════════════════════════════╝"
+
+    # Exit non-zero if any connectivity test failed. Callers (notably the
+    # /test skill's Phase 4) rely on the exit code to determine whether the
+    # stack is genuinely healthy or just listening on its ports.
+    return ${UAT_TEST_RESULT:-0}
 }
 
 # ── Main ────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 #include "approval_manager.hpp"
+#include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -53,29 +54,29 @@ void ApprovalManager::create_tables() {
     if (!db_)
         return;
 
-    const char* ddl = R"(
-        CREATE TABLE IF NOT EXISTS approvals (
-            id TEXT PRIMARY KEY,
-            definition_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            submitted_by TEXT NOT NULL DEFAULT '',
-            submitted_at INTEGER NOT NULL DEFAULT 0,
-            reviewed_by TEXT NOT NULL DEFAULT '',
-            reviewed_at INTEGER NOT NULL DEFAULT 0,
-            review_comment TEXT NOT NULL DEFAULT '',
-            scope_expression TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_approvals_status
-            ON approvals(status);
-        CREATE INDEX IF NOT EXISTS idx_approvals_submitted_at
-            ON approvals(submitted_at);
-        CREATE INDEX IF NOT EXISTS idx_approvals_definition
-            ON approvals(definition_id);
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db_, ddl, nullptr, nullptr, &err) != SQLITE_OK) {
-        spdlog::error("ApprovalManager: create_tables failed: {}", err ? err : "unknown");
-        sqlite3_free(err);
+    static const std::vector<Migration> kMigrations = {
+        {1, R"(
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                definition_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                submitted_by TEXT NOT NULL DEFAULT '',
+                submitted_at INTEGER NOT NULL DEFAULT 0,
+                reviewed_by TEXT NOT NULL DEFAULT '',
+                reviewed_at INTEGER NOT NULL DEFAULT 0,
+                review_comment TEXT NOT NULL DEFAULT '',
+                scope_expression TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_approvals_status
+                ON approvals(status);
+            CREATE INDEX IF NOT EXISTS idx_approvals_submitted_at
+                ON approvals(submitted_at);
+            CREATE INDEX IF NOT EXISTS idx_approvals_definition
+                ON approvals(definition_id);
+        )"},
+    };
+    if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
+        spdlog::error("ApprovalManager: schema migration failed");
     }
 }
 
