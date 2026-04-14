@@ -1,0 +1,127 @@
+name: vcpkg baseline update
+
+# Dependabot does not understand vcpkg. This workflow is our automation for
+# option (b) in docs/dependency-updates.md: monthly PR that bumps the vcpkg
+# builtin-baseline (and the VCPKG_COMMIT workflow env var that must stay in
+# sync) to the current vcpkg master HEAD. CI on the PR re-resolves every
+# port against the new baseline so regressions are caught before merge.
+
+on:
+  schedule:
+    # 10:00 UTC on the 1st of each month.
+    - cron: '0 10 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  propose-bump:
+    name: Propose vcpkg baseline bump
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve latest vcpkg master SHA
+        id: latest
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote https://github.com/microsoft/vcpkg.git HEAD | awk '{print $1}')
+          if [[ ! "$sha" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::git ls-remote returned unexpected value: $sha"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Read current pin
+        id: current
+        run: |
+          set -euo pipefail
+          sha=$(jq -r '.["builtin-baseline"]' vcpkg.json)
+          if [[ ! "$sha" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::vcpkg.json builtin-baseline is not a 40-char hex: $sha"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Short-circuit if up to date
+        id: check
+        run: |
+          if [[ "${{ steps.latest.outputs.sha }}" == "${{ steps.current.outputs.sha }}" ]]; then
+            echo "vcpkg baseline already at ${{ steps.latest.outputs.sha }} — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply bump
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          old="${{ steps.current.outputs.sha }}"
+          new="${{ steps.latest.outputs.sha }}"
+          # Every tracked reference of the baseline SHA. Keep in sync with
+          # the "grep -rl" check at the bottom of docs/dependency-updates.md.
+          files=(
+            vcpkg.json
+            vcpkg-configuration.json
+            qodana.yaml
+            CLAUDE.md
+            .github/workflows/ci.yml
+            .github/workflows/release.yml
+            .github/workflows/codeql.yml
+            .github/workflows/sanitizer-tests.yml
+            deploy/docker/Dockerfile.ci-linux
+            deploy/docker/Dockerfile.runner-linux
+            deploy/docker/Dockerfile.ci
+          )
+          # sed -i works because SHAs are globally unique 40-char strings.
+          sed -i "s/${old}/${new}/g" "${files[@]}"
+          echo "Updated files:"
+          grep -l "${new}" "${files[@]}" || true
+          # Fail loudly if any tracked file still carries the old SHA —
+          # that means a file was added to the list without existing on
+          # disk, or the sed silently did nothing.
+          if grep -l "${old}" "${files[@]}" 2>/dev/null; then
+            echo "::error::One or more files still reference the old SHA after sed"
+            exit 1
+          fi
+
+      - name: Create pull request
+        if: steps.check.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
+          branch: "deps/vcpkg-baseline-${{ steps.latest.outputs.sha }}"
+          delete-branch: true
+          title: "build(deps): bump vcpkg baseline"
+          body: |
+            Automated monthly vcpkg baseline update — see
+            [docs/dependency-updates.md](../blob/main/docs/dependency-updates.md)
+            for the strategy.
+
+            - Old: `${{ steps.current.outputs.sha }}`
+            - New: `${{ steps.latest.outputs.sha }}`
+
+            Updates every tracked reference of the baseline SHA:
+            - `vcpkg.json` `builtin-baseline`
+            - `vcpkg-configuration.json` default registry `baseline`
+            - `qodana.yaml` vcpkg fetch step
+            - `CLAUDE.md` vcpkg documentation line
+            - `.github/workflows/ci.yml` `VCPKG_COMMIT`
+            - `.github/workflows/release.yml` `VCPKG_COMMIT`
+            - `.github/workflows/codeql.yml` `VCPKG_COMMIT`
+            - `.github/workflows/sanitizer-tests.yml` `VCPKG_COMMIT`
+            - `deploy/docker/Dockerfile.ci-linux` `VCPKG_COMMIT` ARG
+            - `deploy/docker/Dockerfile.runner-linux` `VCPKG_COMMIT` ARG
+            - `deploy/docker/Dockerfile.ci` `VCPKG_COMMIT` ENV
+
+            CI will re-resolve every vcpkg port against the new baseline. If
+            any downstream port now fails to build, **revert this PR** and
+            file an issue — do not force-merge. The binary cache on the
+            self-hosted runner will also need to be warmed on the new SHA.
+          labels: |
+            dependencies
+            ci

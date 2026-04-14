@@ -15,3 +15,14 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+
+  # Python tooling consumed by CI (meson, and whatever else lands in
+  # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
+  # scheduled workflows — see docs/dependency-updates.md.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
