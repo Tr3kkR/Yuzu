@@ -239,53 +239,95 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Session handoff 2026-04-14 ~18:25 UTC.** Option D C++ link is
+> **Session handoff 2026-04-14 ~22:00 UTC.** Option D C++ link is
 > solid on Windows MSVC — every C++ target compiles and links on
 > both debug and release, every C++ test passes. The last blocking
 > gate is `yuzu:gateway eunit` / `yuzu:gateway ct` on Windows, and
-> the latest iteration of `scripts/test_gateway.py` (commit `6d8aa5a`,
-> pushed at handoff) removes the `b33f1df` pre-fetch step that was
-> itself causing a Windows-only regression. The in-flight fix chain
-> is now: `220e7bd` (option D C++ clean, gateway EUnit hex.pm flake)
-> → `b33f1df` (pre-fetch retry added, **regressed** on Windows with
-> cover-races-compile on `gateway_pb.beam`) → `d20852b` (docs-only
-> handoff) → `6d8aa5a` (drop `--deps_only` pre-fetch, bump actual
-> test retry to 4 attempts).
+> the latest iteration (commit `f0b84c7`, pushed at handoff) gives
+> each suite its own `REBAR_BASE_DIR` so two parallel rebar3
+> processes can never race on the same `_build/test/lib/<dep>/`
+> ebin tree. The full in-flight fix chain is now:
+> `220e7bd` (option D C++ clean, gateway EUnit hex.pm flake) →
+> `b33f1df` (pre-fetch retry added, **regressed** on Windows with
+> cover-races-compile on `gateway_pb.beam`) →
+> `d20852b` (docs-only handoff) →
+> `6d8aa5a` (drop `--deps_only` pre-fetch, fixes cover race — eunit
+> started passing but exposed the parallel-compile race) →
+> `fea3702` (docs-only handoff) →
+> `f0b84c7` (per-suite `_build_eunit`/`_build_ct` to end the race).
 >
-> **Windows failure that `6d8aa5a` fixes.** On push CI run
-> `24412646165` the `b33f1df` pre-fetch produced a consistent ~10s
-> failure in BOTH Windows MSVC variants:
-> - release → gateway **EUNIT** failed at 10.40s with
+> **The two Windows failures that `6d8aa5a` and `f0b84c7` fix.**
+>
+> **(1) Cover-races-compile on `gateway_pb.beam`, fixed in `6d8aa5a`.**
+> On push CI run `24412646165` the `b33f1df` pre-fetch produced a
+> consistent ~10s failure in BOTH Windows MSVC variants:
+> - release → gateway EUNIT failed at 10.40s with
 >   `{cover,get_abstract_code,...,{file_error,".../gateway_pb.beam",enoent}}`
-> - debug → gateway **CT** failed at 10.50s with the same cover
->   stack (just a different test crossed the cover race first).
+> - debug → gateway CT failed at 10.50s with the same cover stack.
 >
-> Root cause per the `6d8aa5a` commit message: the test profile has
-> `cover_enabled => true`, so eunit/ct fire cover instrumentation
-> immediately after `===> Compiling yuzu_gw`. On Linux/macOS the
-> `_build/test/lib/yuzu_gw/src/` is a symlink to `apps/yuzu_gw/src/`
-> and the compile pipeline is synchronous, so cover always sees a
-> consistent ebin. On Windows symlinks are out, the pre-fetch leaves
-> `_build/test/lib/yuzu_gw/` in a state where the subsequent
-> incremental compile races cover's `pmap_spawn` scan — `gateway_pb`
-> (the gpb-generated proto module) is in cover's module list but
-> `gateway_pb.beam` is not yet on disk when cover's `beam_lib` read
-> fires, and cover blows up before the parallel compile worker
-> finishes writing. Dropping the pre-fetch eliminates the state
-> handoff and keeps `run_with_retry` on the actual test invocation
-> for hex.pm flake coverage. The `yuzu-local-windows` hex cache is
-> already warm from prior runs so pre-fetch was redundant.
+> The test profile has `cover_enabled => true`, so eunit/ct fire
+> cover instrumentation immediately after `===> Compiling yuzu_gw`.
+> On Linux/macOS `_build/test/lib/yuzu_gw/src/` is a symlink to
+> `apps/yuzu_gw/src/` and the compile pipeline is synchronous, so
+> cover always sees a consistent ebin. On Windows symlinks are out,
+> the pre-fetch leaves `_build/test/lib/yuzu_gw/` in a state where
+> the subsequent incremental compile races cover's `pmap_spawn`
+> scan — `gateway_pb` is in cover's module list but its `.beam` is
+> not yet on disk when cover's `beam_lib` read fires. `6d8aa5a`
+> drops the pre-fetch (redundant on the persistent runner whose
+> hex cache is warm) and keeps `run_with_retry` on the actual test
+> invocation with `max_attempts=4`.
 >
-> **Next action:** wait for the push CI run on `6d8aa5a` (and the
-> paired PR run on the same head — once pushed they should be the
-> latest entries in `gh run list --workflow=ci.yml --limit=5`).
+> **(2) Parallel-compile race between eunit and ct, fixed in
+> `f0b84c7`.** On push CI run `24419434652` the `6d8aa5a` fix
+> green-lit gateway eunit, but exposed a SECOND distinct failure
+> flipping between the two suites:
+> - push release: eunit FAIL 8.98s, ct OK 55.65s
+> - push debug:   ct    FAIL 4.32s, eunit OK 30.75s
+> - PR debug:     eunit FAIL 8.77s, ct OK 55.49s
+>
+> The failing suite flips based on which rebar3 process loses the
+> race. Error signature in the loser's compile:
+>
+>     ===> Compiling _build/test/lib/proper/src/proper_orddict.erl failed
+>     _build/test/lib/proper/ebin/proper_orddict.beam:none: failed to
+>       rename .../proper_orddict.bea# to .../proper_orddict.beam:
+>       no such file or directory
+>
+> Root cause: meson's default parallel test scheduling runs
+> `gateway eunit` and `gateway ct` simultaneously, both invoking
+> `test_gateway.py`, both running `rebar3 as test <suite>` against
+> the SAME `_build/test/lib/<dep>/` tree. rebar3's compile worker
+> writes `<name>.bea#` then atomically renames to `<name>.beam`;
+> when two processes collide on the same dep (`proper` is first,
+> being the largest), whichever renames first wins and the loser's
+> rename fails with ENOENT. Linux/macOS tolerate the race via
+> atomic POSIX rename and symlinked source trees; Windows does not.
+>
+> `f0b84c7` sets a distinct `REBAR_BASE_DIR` per suite
+> (`_build_eunit` vs `_build_ct`) in `meson.build`, with
+> `test_gateway.py` honoring the env var when computing its
+> ebin wipe path. Two disjoint build trees, no shared ebin, no
+> possible race. The cost is a one-time extra compile of deps
+> (meck, proper, covertool ≈ 10-15 s) in whichever suite starts
+> second from a cold-cache state, paid once per fresh runner and
+> then cached by rebar3's user-level hex cache for subsequent runs.
+>
+> **Next action:** wait for the push CI run on `f0b84c7` head-commit
+> (whichever commit is actually at the tip of dev when the fix lands
+> — should be a docs commit on top of `f0b84c7`). The paired PR run
+> appears on the same head. Use
+> `gh run list --workflow=ci.yml --branch=dev --limit=3` to find
+> the live run IDs.
+>
 > Expected outcome on Windows:
-> - Vcpkg install: cache hit (only script change since 220e7bd)
+> - Vcpkg install: cache hit (only meson.build + script + .gitignore
+>   changes since 220e7bd)
 > - Configure / build: same as 220e7bd, debug + release link clean
-> - gateway EUNIT: **148/148 PASS** (validated locally with edited
->   script, 24s elapsed)
-> - gateway CT: PASS, or 6/7 with the existing OTP 25 CT I/O race
->   detection swallowing a teardown crash
+> - gateway EUNIT: **148/148 PASS** in ~30s (validated locally)
+> - gateway CT: PASS in ~55s (per the earlier successful runs on
+>   f0b84c7's precursor 6d8aa5a — only the suite that won the race
+>   got to ~55s then)
 >
 > If green: **merge PR #373** (squash or merge-commit, see #369 for
 > the reconcile pattern), **close #375** with a pointer at
@@ -294,34 +336,45 @@ For every breakage encountered during any tier:
 > the dependabot recreate cycle. Tasks #3 → #9 unblock in tier
 > order per the Tier Table.
 >
-> If red on the same cover error: the `6d8aa5a` hypothesis is wrong
-> and the issue is pre-existing rebar3/cover-on-Windows behavior,
-> not the pre-fetch. Next step would be adding `--jobs 1` to the
-> rebar3 test commands to force serialized compilation, OR adding
-> an explicit `rebar3 as test compile` step between the wipe and
-> the eunit invocation (i.e., put the pre-fetch back but without
-> `--deps_only`).
+> If red on a THIRD distinct failure mode: the parallel-compile
+> race wasn't the last Windows-specific gotcha. Next step in order
+> of escalation is:
+> 1. Add `is_parallel: false` to both gateway test() entries in
+>    meson.build. This strict-serializes the gateway tests with
+>    respect to ALL other meson tests (extra ~30s test-time cost),
+>    which eliminates ANY possible race on any shared resource,
+>    not just the `_build/` tree.
+> 2. If that still fails, suspect the OTP 28 rebar3 compile worker
+>    pool on Windows has non-race-related issues (e.g. file handle
+>    leaks, temp dir collision on `%TEMP%`). At that point drop
+>    into `gh run view <job> --log` and read the full captured
+>    output — there may be a prior WARNING that got truncated in
+>    the grep filter.
 >
 > If red on a new C++ link error: it's a new transitive lib
 > surfacing in option D's hand-rolled `cxx.find_library()` list.
 > Apply the iteration pattern from the a61a787 → 713ae8c → 46ea61f
-> → 220e7bd chain.
+> → 220e7bd chain — see `.claude/agents/build-ci.md` "Windows MSVC
+> static-link history and #375" for the long form.
 >
 > Tasks #1 and #14 done. Tasks #2-#9 (dependabot rollout) **PAUSED**
-> pending #375 closure on the `6d8aa5a` CI cycle. Tasks #11-#13
-> unblocked anytime. Task #15 (hex.pm hardening) is now on hold —
-> the `run_with_retry` helper is retained and hex.pm flakes still
-> retry on the actual test invocation, but the explicit pre-fetch
-> step experiment failed and is not being reattempted in this form.
-> Task #16 (move off gRPC) deferred per P1 #376.
+> pending #375 closure on the `f0b84c7` CI cycle. Tasks #11-#13
+> unblocked anytime. Task #15 (hex.pm hardening) is on hold — the
+> `run_with_retry` helper is retained and hex.pm flakes still retry
+> on the actual test invocation, but the explicit pre-fetch step
+> experiment failed and is not being reattempted. Task #16 (move
+> off gRPC) deferred per P1 #376.
 >
-> Canary commits on `dev`: `b33f1df` (pre-fetch, regressed)
-> `d20852b` (docs-only) `6d8aa5a` (pre-fetch drop, this session's
-> fix). The earlier `24412648443` PR run in an older version of
-> this Resume Pointer is stale — the PR head moved when `d20852b`
-> landed, and then again when `6d8aa5a` landed. Use
-> `gh pr view 373 --json statusCheckRollup` to get the live PR CI
-> run ID before diagnosing.
+> Canary commits on `dev`:
+> `b33f1df` (pre-fetch, regressed) →
+> `d20852b` (docs-only) →
+> `6d8aa5a` (pre-fetch drop, fixed cover race) →
+> `fea3702` (docs-only) →
+> `f0b84c7` (per-suite `_build/`, fixes parallel-compile race).
+> The earlier `24412648443` and `24419435949` PR run IDs in older
+> versions of this Resume Pointer are stale. Always use
+> `gh pr view 373 --json statusCheckRollup` to get the live PR
+> CI run ID before diagnosing.
 
 ## Sub-agent delegation pattern
 
@@ -355,6 +408,37 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~22:00 UTC** · Claude session · **Parallel-compile
+  race between gateway eunit and gateway ct fixed in `f0b84c7`.**
+  Push CI run `24419434652` on `fea3702` (the `6d8aa5a` pre-fetch
+  drop + docs handoff) confirmed the cover-race fix: gateway
+  **eunit** now passes on Windows MSVC debug (30.75s, 148 tests).
+  But it exposed a SECOND distinct Windows-only failure — the two
+  gateway test suites race each other on `_build/test/lib/<dep>/`
+  because meson schedules them in parallel by default. Whichever
+  rebar3 process loses the race fails fast (~5-9s) in `proper`'s
+  compile with
+  `failed to rename proper_orddict.bea# to proper_orddict.beam:
+   no such file or directory`,
+  while the winning suite finishes cleanly at ~30-55s. The failing
+  suite flipped between eunit and ct across the three Windows
+  variants — release ran eunit fast-fail + ct green, debug ran ct
+  fast-fail + eunit green, PR debug ran eunit fast-fail + ct green.
+  Root cause is Windows file-system semantics — POSIX atomic
+  rename on Linux/macOS survives the race, Windows `MoveFileEx`
+  can fail if another process already consumed the temp file.
+  Fix in `f0b84c7`: set a distinct `REBAR_BASE_DIR` per suite in
+  `meson.build` (`_build_eunit` vs `_build_ct`), `test_gateway.py`
+  honors the env var when computing its ebin wipe path, and
+  `.gitignore` gets the two new dirs. Two disjoint `_build/` trees
+  cannot race. Local Linux repro with
+  `REBAR_BASE_DIR=.../gateway/_build_eunit`: 148/148 PASS in 24s,
+  identical to the default base-dir runtime. Fallback if `f0b84c7`
+  still fails: add `is_parallel: false` to both gateway test()
+  entries in meson.build (strict serialization, ~30s extra test
+  time). Push + PR CI on `f0b84c7` head queued at handoff — the
+  Windows runner cycle takes ~90 minutes for all three Windows
+  jobs to drain through the one self-hosted runner.
 - **2026-04-14 ~18:25 UTC** · Claude session · **`b33f1df` pre-fetch
   regression diagnosed and fixed in `6d8aa5a`.** Push CI run
   `24412646165` on `b33f1df` failed BOTH Windows MSVC variants on
