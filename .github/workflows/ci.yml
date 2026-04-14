@@ -18,7 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MESON_VERSION: "1.9.2"
+  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
+  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
   CCACHE_MAXSIZE: "500M"
@@ -86,7 +88,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -171,7 +173,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install Meson
-        run: pip install meson==${{ env.MESON_VERSION }}
+        run: pip install -r requirements-ci.txt
 
       - name: Install ccache
         run: choco install ccache --yes
@@ -275,7 +277,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install meson==${{ env.MESON_VERSION }}
+          pipx install "$(grep '^meson==' requirements-ci.txt)"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -363,7 +365,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -447,7 +449,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -529,7 +531,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }} gcovr
+          pip3 install -r requirements-ci.txt gcovr
 
       - name: Cache ccache
         uses: actions/cache@v4

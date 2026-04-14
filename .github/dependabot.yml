@@ -1,7 +1,13 @@
 version: 2
 updates:
+  # All Dependabot PRs target `dev` — that's Yuzu's integration branch.
+  # `main` only receives dev→main reconcile PRs, so opening dependency
+  # bumps against main would race the reconcile cadence and repeatedly
+  # fail CI against a stale base (e.g. the LNK2038 Windows fix that
+  # lived on dev for a day before the reconcile).
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     labels:
@@ -10,8 +16,21 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/deploy/docker"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     labels:
       - "dependencies"
       - "docker"
+
+  # Python tooling consumed by CI (meson, and whatever else lands in
+  # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
+  # scheduled workflows — see docs/dependency-updates.md.
+  - package-ecosystem: "pip"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"

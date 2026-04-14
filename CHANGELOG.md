@@ -19,6 +19,47 @@ patch._
 
 ### Added
 
+- **Dependency automation — `pip` ecosystem + scheduled vcpkg baseline
+  bumps (closes #363).** `requirements-ci.txt` at the repo root becomes
+  the single source of truth for Python tooling pins (currently just
+  `meson==1.9.2`), consumed directly by every `pip`/`pip3`/`pipx install`
+  call site in `.github/workflows/ci.yml` (6 sites) and
+  `.github/workflows/release.yml` (2 sites). The hardcoded
+  `MESON_VERSION: "1.9.2"` env var is removed from all three tracked
+  workflows (`ci.yml`, `release.yml`, and the dead reference in
+  `sanitizer-tests.yml`) — the pin now lives in exactly one place.
+  `.github/dependabot.yml` gains a `pip` ecosystem entry so Dependabot
+  opens a weekly PR against `requirements-ci.txt` if a newer meson
+  release lands, and CI re-runs on the PR so breaking changes stall
+  instead of silently merging.
+
+  **vcpkg baseline** — Dependabot does not understand vcpkg, so
+  `.github/workflows/vcpkg-baseline-update.yml` is a new scheduled
+  workflow (10:00 UTC on the 1st of each month, plus
+  `workflow_dispatch`) that: resolves `git ls-remote vcpkg HEAD`,
+  compares to the current `vcpkg.json` `builtin-baseline`, and if
+  different, `sed`s the new SHA into every tracked reference
+  (`vcpkg.json`, `vcpkg-configuration.json`, `qodana.yaml`, `CLAUDE.md`,
+  all four workflow `VCPKG_COMMIT` env vars, and all three Dockerfile
+  ARG/ENV references), failing loudly if any listed file still carries
+  the old SHA after the replace, then opens a PR via
+  `peter-evans/create-pull-request@v7` with `dependencies,ci` labels.
+
+  **rebar3** — gateway dependencies stay on a manual quarterly review
+  cadence, documented in the new `docs/dependency-updates.md`. The doc
+  is also the reference for the full dependency-update strategy —
+  ecosystem table, staleness query per ecosystem, and the known
+  Dockerfile-meson duplication follow-up.
+
+  **Why the Dockerfiles aren't centralized yet** — five Dockerfiles
+  under `deploy/docker/` (`agent`, `server`, `ci`, `ci-linux`,
+  `runner-linux`) still carry a hardcoded `meson==1.9.2` string in
+  their build-stage `RUN` commands. Centralizing them on
+  `COPY requirements-ci.txt` is tracked as a follow-up in
+  `docs/dependency-updates.md`. Until then, the manual merge checklist
+  for a Dependabot meson bump includes bumping the literal string in
+  those five files (`grep -rn 'meson==' deploy/docker/` finds them all).
+
 - **`/test` skill coverage + perf + sanitizer gates (PR2 of 3).** Phase 6
   and Phase 7 of the `/test` pipeline are now wired. `--full` mode
   dispatches `.github/workflows/sanitizer-tests.yml` on the
