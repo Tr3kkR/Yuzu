@@ -49,7 +49,8 @@ recreate, the new PR numbers go in the **Recreated As** column.
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
 | 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
-| 0b | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
+| 0b | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | in progress (folded into #373) |
+| 0c | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
 | 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
@@ -237,15 +238,16 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** Task #2 (recreate the 7 PRs at `dev`). Task #1 is
-> already done — both self-hosted runners verified at 2.333.1 from
-> codeql run logs, no operator action was required.
+> **Next action:** wait for PR #373 (the reconcile, now also carrying
+> the ci.yml Windows MSVC self-hosted migration) to land. The new CI
+> cycle on `dev` will be the first run of `ci.yml` Windows MSVC on
+> `yuzu-local-windows` and is the canary for the migration. If it goes
+> green, merge #373 and proceed to Task #2 (recreate the 7 Dependabot
+> PRs against `dev`). If it goes red, triage the runner-migration
+> failure mode under issue #374 and Task #10.
 >
-> Task #2 can run unattended via the `gh pr comment` loop in Phase 0b.
->
-> After #2 completes, capture the new PR numbers in the Tier Table
-> "Recreated As" column and update this Resume Pointer to point at the
-> next unblocked task (Tier 1: #3 and #4 in either order).
+> Task #1 is done. Task #2 (recreate cycle) is still pending and is
+> the next gate after #373 + Phase 0b merge.
 
 ## Sub-agent delegation pattern
 
@@ -279,6 +281,23 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~06:50 UTC** · Claude session · **Sequencing correction.**
+  Operator caught that the runner-migration work (issue #374) is a
+  force-multiplier for the rest of the rollout, not a follow-up: each
+  of the 7 Dependabot PRs needs a Windows MSVC debug cycle, and on the
+  github-hosted 4-vCPU `windows-2022` runner gRPC alone takes ~90 min;
+  on the 32-core / 48 GB self-hosted host the same compile finishes in
+  a fraction of the time. The original "let #373 finish first" plan was
+  sunk-cost reasoning. Course-corrected: cancelled #373's in-flight CI
+  on `cd190f2`, folded the ci.yml Windows MSVC migration to
+  `[self-hosted, Windows, X64]` into the reconcile (drop pip+choco
+  install, add toolchain assertion + 45 GB disk check, drop ccache and
+  vcpkg_installed actions/cache, add Force-fresh-vcpkg-on-triplet-drift
+  step, MSYS2 bash shell, build dir → `build-windows-ci/`). New tier
+  **0b** added between 0a and the recreate cycle. pre-release.yml
+  Windows installer smoke test deferred to a follow-up because the
+  install/uninstall side effects need an isolated install path on the
+  persistent host before it can move.
 - **2026-04-14 ~05:30 UTC** · Claude session · Task #1 (runner version
   gate) **completed without operator action**. Both `yuzu-wsl2-linux`
   and `yuzu-local-windows` confirmed on runner version `2.333.1` —
