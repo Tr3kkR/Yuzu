@@ -172,6 +172,15 @@ if host_os == 'windows'
   _libssl    = _cxx.find_library('libssl',    dirs: [_vcpkg_lib_win], required: true)
   _libcrypto = _cxx.find_library('libcrypto', dirs: [_vcpkg_lib_win], required: true)
 
+  # zlib — grpc.lib(message_compress.cc.obj) has unresolved references to
+  # __imp_deflate / __imp_inflate / __imp_deflateInit2_ / __imp_inflateInit2_
+  # etc. gRPC's message compression code path uses zlib for gzip-compressed
+  # messages, and the `__imp_` prefix tells us zlib is built as a DLL
+  # (vcpkg default) so we're linking zlib's import lib. Failure mode seen:
+  # LNK2019 "unresolved external symbol __imp_deflate referenced in function
+  # zlib_compress" from the option D first canary on commit 713ae8c.
+  _libzlib = _cxx.find_library('zlib', dirs: [_vcpkg_lib_win], required: true)
+
   # Construct the meson dep objects yuzu's build graph consumes. These
   # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
   # method: 'cmake')` calls that Linux/macOS use — those paths are
@@ -189,6 +198,7 @@ if host_os == 'windows'
       _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
       _libre2, _libcares,
       _libssl, _libcrypto,
+      _libzlib,
       # grpc transitively uses protobuf and upb; include them so consumers
       # that only pull in grpcpp_dep still see protobuf's symbols.
       _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,
