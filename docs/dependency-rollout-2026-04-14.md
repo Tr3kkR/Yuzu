@@ -1,0 +1,287 @@
+# Dependabot Rollout — April 2026
+
+**Status:** in progress
+**Started:** 2026-04-14
+**Owner:** TBD per tier (see Resume Pointer)
+**Closes:** #363 (rollout completion), #366 follow-up (CODEOWNERS)
+**Driver PR (foundation):** #372 (merged 2026-04-14)
+
+## Why this doc exists
+
+This is a long, multi-tier rollout with expected breakages — primarily
+node20 → node24 runner-version interactions on self-hosted hosts. Yuzu's
+context window will not survive the entire rollout in one session, so
+this file is the **durable state of record**. Every Claude session
+working on this rollout should:
+
+1. Read this file end-to-end before doing anything.
+2. Update the **Resume Pointer** before context handoff.
+3. Append to the **Event Log** at the bottom on every state change.
+4. Cross-link tasks via the in-session TaskList (`TaskList` tool) and the
+   GitHub PR numbers in the **Tier Table**.
+
+When this rollout closes, the doc converts to a brief lessons-learned
+addendum and the live tracking sections collapse.
+
+## Background
+
+Yuzu had 7 open Dependabot PRs targeting `main` against a stale base
+that lacked the `0fe5eac` LNK2038 Windows debug fix (still on `dev` as
+of 2026-04-14, awaiting the next dev→main reconcile). All 7 had failing
+or stale CI for that reason. Four are major Node 24 action bumps
+(`actions/cache@v5`, `actions/upload-artifact@v7`,
+`actions/download-artifact@v8`, `actions/github-script@v8`,
+`codecov/codecov-action@v6`) that require GitHub Actions Runner
+≥ 2.327.1 on every host that executes them — including the self-hosted
+`yuzu-wsl2-linux` and `yuzu-local-windows` runners.
+
+#372 (merged 2026-04-14) added `target-branch: dev` to every
+Dependabot ecosystem entry so future PRs route correctly, plus the
+`pip` ecosystem + scheduled vcpkg baseline workflow that closed the
+automation gap from #363. The 7 existing PRs still target `main` until
+they are explicitly recreated.
+
+## Tier Table
+
+PR numbers in **bold** are the *original* PRs against `main`. After
+recreate, the new PR numbers go in the **Recreated As** column.
+
+| Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
+|---|---|---|---|---|---|---|---|
+| 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | pending |
+| 0b | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
+| 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
+| 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
+| 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
+| 3  | #6  | **#243** | TBD | `actions/github-script` 7 → 8 | Med-High | **Yes** | pending |
+| 3  | #7  | **#241** | TBD | `actions/cache` 4 → 5 | High (19 sites) | **Yes** | pending |
+| 4  | #8  | **#242** | TBD | `actions/upload-artifact` 4 → 7 | High | **Yes** | pending |
+| 4  | #9  | **#250** | TBD | `actions/download-artifact` 4 → 8 | **Highest** (digest=error) | **Yes** | pending |
+| 5  | #11 | n/a  | — | Centralize Dockerfile meson pins | Low | n/a | pending |
+| —  | #10 | n/a  | — | Standing breakage triage | n/a | n/a | pending |
+
+Task IDs (`#N`) refer to the in-session `TaskList`, **not** GitHub
+issues. `gh issue view <number>` and `gh pr view <number>` are
+unambiguous because they share the same numeric space — task IDs are
+always single or double-digit and namespaced to the rollout doc.
+
+## Phase 0 — Gates
+
+### 0a · Verify self-hosted runner versions (Task #1)
+
+**Goal:** confirm both `yuzu-wsl2-linux` and `yuzu-local-windows`
+runners are at ≥ 2.327.1 (Node 24 minimum). The GitHub API does not
+expose runner binary version, so this requires a shell on each box.
+
+**Commands (run by operator):**
+```bash
+# yuzu-wsl2-linux (WSL2 on Shulgi 5950X)
+cd ~/actions-runner && ./config.sh --version
+
+# yuzu-local-windows (native Windows on Shulgi 5950X)
+cd "$HOME/actions-runner" ; ./config.cmd --version  # PowerShell
+# or in MSYS2 bash:
+cd ~/actions-runner && ./config.sh --version
+```
+
+**If either is < 2.327.1:**
+1. Verify the runner is idle: `gh api repos/Tr3kkR/Yuzu/actions/runners`
+   → `busy:false`. **Do not upgrade while busy** — a mid-job
+   reinstall corrupts the workdir and any in-flight CI.
+2. Stop the runner service.
+3. Download the latest runner package from
+   https://github.com/actions/runner/releases.
+4. Re-bootstrap with the same registration token (no
+   `./config.sh remove` needed for in-place upgrades — see runner docs).
+5. Restart the service and confirm with `./config.sh --version`.
+6. Capture the before/after versions in the Event Log.
+
+**Blocks:** Tasks #6, #7, #8, #9 (Tier 3 + Tier 4).
+
+### 0b · Recreate Dependabot PRs against dev (Task #2)
+
+**Goal:** retarget the 7 existing PRs at `dev` so they pick up the
+LNK2038 fix and any other pending dev-only changes on rebase.
+
+**Commands:**
+```bash
+for n in 241 242 243 248 250 300 335; do
+  gh pr comment "$n" --body "@dependabot recreate"
+done
+```
+
+**Expected outcome:** Dependabot closes each PR within ~5 min and
+opens a new PR against `dev`. The new PR numbers go in the
+**Recreated As** column above and feed into the per-tier merge tasks.
+
+**Blocks:** Tasks #3 through #9.
+
+## Phase 1 — Docker base bumps (Tasks #3, #4)
+
+Lowest-risk tier. Both bumps are docker-only, no Node 24 exposure.
+Independent — can merge in either order once green.
+
+- **#3 (was #335)** — `ubuntu:24.04` digest bump for Dockerfile.agent +
+  Dockerfile.server. Risk: apt package version drift on the new digest.
+- **#4 (was #248)** — `alpine 3.22 → 3.23` for Dockerfile.gateway
+  runtime stage. Risk: musl/openssl/libstdc++ minor version bump that
+  the gateway release links against. Local sanity: `docker build -f
+  deploy/docker/Dockerfile.gateway -t yuzu-gw-test .`.
+
+**Validation gate before merging:** the recreated PR's CI run on the
+`dev` base must be fully green (Linux, Windows, macOS). If any platform
+fails, that's the breakage — file under Task #10 and triage before
+merging.
+
+## Phase 2 — Single-site github-hosted Node 24 (Task #5)
+
+- **#5 (was #300)** — `codecov-action 5 → 6`. Single call site at
+  `ci.yml:607` in the Coverage (GCC 13) job, runs on `ubuntu-24.04`
+  (github-hosted, auto-updated runner — Node 24 already supported).
+  No self-hosted exposure. The recreate against `dev` should turn
+  the historical "all 4 jobs FAIL" into clean green.
+
+**Why this tier exists separately:** it lets the rollout build
+confidence on a real Node 24 action without yet exposing self-hosted
+runners. If codecov@v6 surfaces an unexpected secret/input rename, that
+breakage is github-hosted-only and easy to revert.
+
+## Phase 3 — Multi-site Node 24 (Tasks #6, #7)
+
+This is where self-hosted runner exposure begins. **Task #1 must
+complete before either of these merges.**
+
+### #6 (was #243) — actions/github-script 7 → 8
+
+- 11 call sites: ci.yml (6 github-hosted), codeql.yml (1, **matrix
+  including self-hosted Windows**), release.yml (4, self-hosted Linux × 3 +
+  github-hosted Windows × 1).
+- Post-merge validation:
+  ```bash
+  gh workflow run codeql.yml --ref dev
+  gh run watch  # follow the most recent run
+  ```
+  Watch the self-hosted Windows matrix slot — that's the canary for the
+  runner-version gate. Expected fail mode: `Error: This action requires
+  a GitHub Actions runner of version 2.327.1 or higher`. If that fires,
+  immediately `gh pr revert <new-num> --base dev`, file the breakage
+  under Task #10, and reopen Task #1 to upgrade the runner.
+- release.yml self-hosted exposure won't be exercised until the next
+  release tag — flag a follow-up watch in the Event Log.
+
+### #7 (was #241) — actions/cache 4 → 5
+
+- 19 call sites — highest blast radius of the cache-class actions.
+- Same self-hosted exposure pattern as #6 plus an additional cache-key
+  compatibility concern. cache@v5 should be backward-compat on cache
+  reads but watch for unexplained cache-miss surges in the next CI run
+  (signal that key derivation changed).
+- Post-merge validation: dispatch codeql.yml again. By this point the
+  runner-version gate should be settled.
+
+## Phase 4 — Artifact actions (Tasks #8, #9)
+
+Highest-impact tier. These touch the release path.
+
+### #8 (was #242) — actions/upload-artifact 4 → 7
+
+- 18 call sites: ci.yml × 1, pre-release.yml × 7, release.yml × 8,
+  **sanitizer-tests.yml × 2 (self-hosted yuzu-wsl2-linux)**.
+- v6 = Node 24, v7 = ESM module + opt-in `archive: false` direct upload
+  (we don't use it).
+- Post-merge validation:
+  ```bash
+  gh workflow run sanitizer-tests.yml --ref dev -f suite=both
+  gh run watch
+  ```
+  Watch the artifact upload step on both ASan and TSan jobs — that
+  exercises upload-artifact@v7 against the self-hosted Linux runner.
+  Failure mode: ESM resolution errors on the runner's bundled node, or
+  the same runner-version error.
+
+### #9 (was #250) — actions/download-artifact 4 → 8
+
+- 6 call sites, all in release path: pre-release.yml × 5, release.yml × 1.
+- **v8 changes `digest-mismatch` default from warning to error.** Any
+  artifact whose hash doesn't match the server's recorded hash will now
+  fail the job hard. Previously this was silently logged.
+- Post-merge validation: the next pre-release run is the canary. If any
+  artifact fails with "digest mismatch" that is a real artifact
+  corruption signal that was previously masked — **do not just downgrade
+  to warning**, investigate root cause (network truncation, upload
+  retry race, etc.). If no pre-release is queued, manually dispatch:
+  ```bash
+  gh workflow run pre-release.yml --ref dev
+  ```
+
+## Phase 5 — Cleanup (Task #11)
+
+After all tiers merge, centralize the 5 Dockerfile meson pins
+(`deploy/docker/Dockerfile.{agent,server,ci,ci-linux,runner-linux}`)
+on `requirements-ci.txt` so future Dependabot meson bumps propagate
+without manual sync. Also remove the `ARG MESON_VERSION=1.9.2`
+declarations from `Dockerfile.ci-linux` and `Dockerfile.runner-linux`,
+and add `requirements-ci.txt` to the `ci-runner-image.yml` paths
+trigger.
+
+## Standing — Breakage triage (Task #10)
+
+For every breakage encountered during any tier:
+1. File a GitHub issue with title `[deps-rollout] <action>: <symptom>`.
+2. Tag with `regression`, `dependencies`, and the relevant tier label.
+3. Capture: workflow + job, error message, surface area, proposed fix,
+   whether the breakage was in the action itself or in an interaction
+   with our setup.
+4. Cross-reference the issue from this doc's Event Log.
+5. Decide: hotfix-and-continue, revert-and-defer, or accept-as-known.
+
+## Resume Pointer
+
+> **Next action:** start Tasks #1 and #2 in parallel. They block the
+> rest of the rollout but don't block each other.
+>
+> Task #1 requires a shell on each self-hosted runner box and is
+> blocked on operator availability.
+>
+> Task #2 can run unattended via the `gh pr comment` loop in Phase 0b.
+>
+> After #2 completes, capture the new PR numbers in the Tier Table
+> "Recreated As" column and update this Resume Pointer to point at the
+> next unblocked task.
+
+## Sub-agent delegation pattern
+
+Each tier merge is a self-contained unit of work that fits the
+`build-ci` agent's domain. The pattern for delegating a tier to a
+sub-agent:
+
+1. Read this doc (the agent inherits no session memory).
+2. Pick the tier task by ID and re-read the relevant Phase section.
+3. Execute the validation gate + merge + post-merge validation.
+4. Append a structured event-log entry.
+5. Update the Tier Table status column.
+6. Return a ≤ 200-word summary to the parent session.
+
+A typical delegation prompt skeleton:
+
+```
+Read docs/dependency-rollout-2026-04-14.md end-to-end, then execute
+Tier <N> Task #<id> for <action>. Validation gate is <X>; merge if
+green; post-merge validation is <Y>. If any step fails, do NOT
+attempt to fix it — instead, append a breakage entry to the Event Log,
+file the triage issue per Task #10, and return.
+```
+
+Use the `build-ci` agent for action bumps and Dockerfile work; use the
+`cross-platform` agent for Dockerfile changes that affect the agent or
+gateway runtime; use the `general-purpose` agent if neither fits.
+
+## Event Log
+
+Append-only. Newest entries at the top. Format:
+`YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
+
+- **2026-04-14 05:?? UTC** · Claude session · Rollout doc created. Phase 0
+  not yet started. Tasks #1–#11 created in TaskList. PR #372 (the
+  foundation that added `target-branch: dev` and the `pip` ecosystem)
+  is the only completed work.
