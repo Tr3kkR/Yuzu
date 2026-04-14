@@ -1,6 +1,6 @@
 # Yuzu CI Gateway — Erlang/OTP build environment for GitHub Actions
 #
-# Based on official erlang:27 with rebar3 and CI tooling pre-installed.
+# Based on official erlang:28 with rebar3 and CI tooling pre-installed.
 # Eliminates the 2-5 min erlef/setup-beam install step.
 #
 # Push to ghcr.io/tr3kkr/yuzu-ci-gateway:latest
@@ -11,7 +11,7 @@
 #       runs-on: ubuntu-24.04
 #       container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
 
-FROM erlang:27
+FROM erlang:28
 
 ARG REBAR3_VERSION=3.24.0
 
@@ -50,5 +50,5 @@ RUN git config --global --add safe.directory '*'
 
 # ── Labels ────────────────────────────────────────────────────────────
 LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
-LABEL org.opencontainers.image.description="Yuzu CI gateway build environment (Erlang/OTP 27 + rebar3)"
+LABEL org.opencontainers.image.description="Yuzu CI gateway build environment (Erlang/OTP 28 + rebar3)"
 LABEL org.opencontainers.image.licenses="Apache-2.0"

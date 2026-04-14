@@ -306,6 +306,24 @@ patch._
 
 ### Changed
 
+- **`Dockerfile.ci-gateway` aligned to Erlang/OTP 28 (closes #334).**
+  The CI gateway image was still pinned to `erlang:27` while every
+  other Erlang surface — `release.yml`'s `erlef/setup-beam` step,
+  `scripts/ensure-erlang.sh`'s default, and the runtime
+  `Dockerfile.gateway` (`erlang:28-alpine`) — had moved to OTP 28.
+  CLAUDE.md is explicit that these must move together; leaving the
+  CI image behind meant the GitHub Actions gateway build was
+  exercising rebar3/dialyzer against an OTP version older than the
+  one the release ships, and any 28-only behavioural change would
+  have been invisible to CI until a release tag was cut.
+  `Dockerfile.gateway`'s `erlang:28-alpine` digest pin was also
+  rolled forward to the current build (`f36705c5…`) as part of the
+  same dependabot bundle. Originally proposed by dependabot in
+  PR #334 against `main`; landed directly on `dev` because PR #334's
+  Windows MSVC failure was the unrelated vcpkg LNK2038 cache issue
+  fixed in PR #355 after dependabot opened its branch. Dependabot
+  will close #334 automatically on its next scan.
+
 - **CodeQL workflow hardened to actually finish + parallel Windows
   coverage (closes #370).** Every CodeQL run from 2026-03-23 to
   2026-04-13 was cancelled by the 90-min timeout — 7 consecutive
