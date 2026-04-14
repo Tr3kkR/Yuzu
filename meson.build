@@ -88,13 +88,32 @@ build_tests    = get_option('build_tests')
 # load-bearing for build log readability — without it the gRPC / abseil /
 # protobuf deprecation warnings drown out our own code warnings and force a
 # grep-for-error filter workflow. Our own code remains under `warning_level=3`.
+# Windows needs CMAKE_BUILD_TYPE forced in meson's cmake dep probe so
+# vcpkg's static-imported targets (protobuf::libprotobuf, gRPC::grpc++)
+# select IMPORTED_LOCATION_DEBUG vs IMPORTED_LOCATION_RELEASE to match
+# the /MDd vs /MD user code. Without this, meson's cmake probe reads
+# IMPORTED_LOCATION_RELEASE regardless of --buildtype and debug builds
+# link against release static libs, tripping LNK2038 RuntimeLibrary /
+# _ITERATOR_DEBUG_LEVEL mismatches (#375). Linux/macOS are fine without
+# this because gcc/clang don't have MSVC's runtime-library variant ABI
+# — debug user code can safely link against release-built .a static libs.
+if host_os == 'windows'
+  if get_option('buildtype') == 'debug'
+    cmake_windows_build_type = ['-DCMAKE_BUILD_TYPE=Debug']
+  else
+    cmake_windows_build_type = ['-DCMAKE_BUILD_TYPE=Release']
+  endif
+else
+  cmake_windows_build_type = []
+endif
+
 grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
-  required: false, include_type: 'system')
+  cmake_args: cmake_windows_build_type, required: false, include_type: 'system')
 if not grpcpp_dep.found()
   grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
     include_type: 'system')
 endif
-protobuf_cmake_args = []
+protobuf_cmake_args = cmake_windows_build_type
 if host_os == 'windows'
   protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
 endif

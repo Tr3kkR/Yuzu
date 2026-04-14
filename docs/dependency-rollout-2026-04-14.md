@@ -48,9 +48,10 @@ recreate, the new PR numbers go in the **Recreated As** column.
 
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
-| 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
-| 0b | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | in progress (folded into #373) |
-| 0c | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
+| 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
+| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | plumbing done (commit `3960f46`); exposed #375 |
+| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option B: explicit CMAKE_BUILD_TYPE in meson cmake dep probe | **Gate (P0)** | Yes | in progress (folded into #373) |
+| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
 | 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
@@ -238,16 +239,28 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** wait for PR #373 (the reconcile, now also carrying
-> the ci.yml Windows MSVC self-hosted migration) to land. The new CI
-> cycle on `dev` will be the first run of `ci.yml` Windows MSVC on
-> `yuzu-local-windows` and is the canary for the migration. If it goes
-> green, merge #373 and proceed to Task #2 (recreate the 7 Dependabot
-> PRs against `dev`). If it goes red, triage the runner-migration
-> failure mode under issue #374 and Task #10.
+> **Next action:** wait for PR #373's next CI cycle (after the option B
+> `meson.build` fix) to validate that Windows MSVC debug links cleanly
+> against the debug variant of vcpkg's static protobuf. This cycle uses
+> the shared `x64-windows` triplet (which builds both variants in one
+> tree), so it avoids the catch2 portfile bug entirely — catch2's
+> release pkgconfig file exists, and the debug one exists, and both
+> are fine. The only question is whether meson's cmake probe honors
+> the explicit `-DCMAKE_BUILD_TYPE=Debug` and picks the right static
+> libprotobuf at link time.
 >
-> Task #1 is done. Task #2 (recreate cycle) is still pending and is
-> the next gate after #373 + Phase 0b merge.
+> If green: merge #373, close #375, resume the rollout from Task #2
+> (recreate the 7 Dependabot PRs against `dev`).
+>
+> If red: the LNK2038 is still there, meaning meson's cmake probe
+> ignores our explicit build type. Fall back to **option C**: drop
+> meson's cmake dep method for protobuf/grpc and use explicit
+> `cxx.find_library()` calls with build-type-conditional paths. More
+> invasive but bypasses the cmake probe quirk entirely.
+>
+> Task #1 is done. Tasks #2–#9 (dependabot rollout) are **PAUSED**
+> until #375 is fixed. Tasks #11–#13 are unblocked and can run in
+> parallel if anyone has cycles.
 
 ## Sub-agent delegation pattern
 
@@ -281,6 +294,51 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~10:45 UTC** · Claude session · **Per-build-type triplets
+  reverted; switching to option B.** Commit `413a281` (per-build-type
+  `x64-windows-debug` / `x64-windows-release` triplets) reverted via
+  `git revert` (commit `895336e`) after the canary CI cycle exposed
+  two independent vcpkg-side problems:
+  (1) The `catch2` port's `portfile.cmake` is not `VCPKG_BUILD_TYPE=debug`
+  safe — it calls `vcpkg_replace_string` on a release-side pkgconfig
+  file that doesn't exist in a debug-only install tree, failing BUILD
+  at catch2 install time for `x64-windows-debug`. This is a vcpkg port
+  bug; fixing it upstream is out of scope for the rollout.
+  (2) The `x64-windows-release` install got far enough for `protobuf`
+  and `grpc` to install successfully, but meson's cmake dep probe
+  rejected the install with `gRPC could not be found because dependency
+  Protobuf could not be found`. Filesystem inspection via
+  `/mnt/c/Users/natha/inspect-vcpkg.sh` confirmed the debug tree was
+  wiped by `actions/checkout` on the subsequent debug job before I
+  could diagnose the release-side state in detail, but the cmake trace
+  pattern (version file loads, but no `protobuf-config.cmake` follows)
+  is consistent with a version-file compatibility-check rejection in
+  the single-variant install — possibly meson's cmake TryCompile-style
+  probe not setting `CMAKE_SIZEOF_VOID_P` and the version file's arch
+  check flipping `PACKAGE_VERSION_UNSUITABLE=TRUE`. Either way, the
+  per-build-type approach is fighting vcpkg's manifest-mode behavior
+  on two fronts.
+  **Course correction — option B.** New commit adds explicit
+  `cmake_args: ['-DCMAKE_BUILD_TYPE=Debug'|'Release']` to
+  `meson.build`'s `dependency('protobuf', method: 'cmake', ...)` and
+  `dependency('gRPC', method: 'cmake', ...)` calls, Windows only.
+  This forces meson's cmake probe to explicitly request the matching
+  config, so vcpkg's imported targets select
+  `IMPORTED_LOCATION_{DEBUG,RELEASE}` to match the user code's
+  `/MDd` vs `/MD` CRT variant. The shared `triplets/x64-windows.cmake`
+  (which builds both variants) stays as-is — the option B fix is a
+  meson.build change only. New tier 0bb replaces the prior 0bb in the
+  Tier Table. Task #14 re-scoped to track the option B canary.
+- **2026-04-14 ~08:40 UTC** · Claude session · **Rollout PAUSED on P0 #375.**
+  The Phase 0b runner migration canary (commit `3960f46` on dev,
+  in PR #373) succeeded on every plumbing step — toolchain assertion,
+  45 GB disk check, force-fresh-vcpkg, vcpkg install, meson configure,
+  379 of 380 ninja steps. Then `tests/yuzu_server_tests.exe` linking
+  failed with LNK2038 release/debug variant mismatches against
+  `libprotobuf.lib`. The `0fe5eac` LNK2038 fix was triplet-only and
+  incomplete. Initially attempted per-build-type triplets (#375 option
+  A) as the fix — see the newer 10:45 UTC entry above for why that
+  approach was abandoned and option B took over.
 - **2026-04-14 ~06:50 UTC** · Claude session · **Sequencing correction.**
   Operator caught that the runner-migration work (issue #374) is a
   force-multiplier for the rest of the rollout, not a follow-up: each
