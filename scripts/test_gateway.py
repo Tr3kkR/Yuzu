@@ -61,7 +61,15 @@ suite = sys.argv[2]  # "eunit" or "ct"
 # Erlang's cover module during instrumentation.  Only the app ebin is
 # removed — dependency beams (meck, proper, grpcbox, …) are kept so they
 # don't need to be recompiled on every run.
-app_ebin = Path(gateway_dir) / "_build" / "test" / "lib" / "yuzu_gw" / "ebin"
+#
+# REBAR_BASE_DIR selects the rebar3 `_build/` root; meson.build sets
+# it per-suite (`_build_eunit` vs `_build_ct`) so the two gateway
+# suites never race on the same ebin tree. Absolute paths win over
+# relative — meson hands us an absolute `_build_<suite>`; fall back to
+# `<gateway>/_build` when the env var is unset (e.g. direct script
+# invocation for local debugging).
+_base = os.environ.get("REBAR_BASE_DIR") or str(Path(gateway_dir) / "_build")
+app_ebin = Path(_base) / "test" / "lib" / "yuzu_gw" / "ebin"
 if app_ebin.exists():
     shutil.rmtree(app_ebin)
 

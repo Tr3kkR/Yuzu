@@ -336,17 +336,33 @@ if _rebar3.found()
   _python3 = find_program('python3')
   # The test script prepends OTP 28 / rebar3 paths to PATH internally,
   # handling the case where Meson inherits a system PATH with OTP 25.
+  #
+  # Each suite gets its own REBAR_BASE_DIR so the eunit and ct tests
+  # never share `_build/test/lib/<dep>/` on disk. Meson schedules
+  # tests in parallel by default, and two rebar3 processes writing
+  # to the same ebin tree racing each other's `.bea#`→`.beam` rename
+  # fired consistently on Windows MSVC as
+  #     "failed to rename proper_orddict.bea# to proper_orddict.beam:
+  #      no such file or directory"
+  # (in `proper`, because parallel compile workers in both processes
+  # both wrote temp files and one renamed before the other read).
+  # Linux/macOS tolerated the race through atomic POSIX rename; the
+  # isolation fix applies unconditionally so the race can't come
+  # back if Linux kernel semantics ever change. `test_gateway.py`
+  # honors REBAR_BASE_DIR when computing the ebin wipe path.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 120,
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 300,
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
   )
   message('Erlang gateway: enabled (rebar3 found)')
 else
