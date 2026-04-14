@@ -161,8 +161,20 @@ A one-off diagnostic script lives at `/mnt/c/Users/natha/inspect-vcpkg.sh` (outs
 
     bash /mnt/c/Users/natha/inspect-vcpkg.sh > /tmp/vcpkg-state.txt 2>&1
 
-### Separate Windows issue: gateway CT hex.pm fetch failure
+### hex.pm flake on the gateway CT test (Windows and Linux alike)
 
-Discovered during #375 option H's successful canary: 6 of 7 Windows MSVC debug tests pass, but `yuzu:gateway ct` fails because rebar3 on Windows can't fetch `meck v0.9.2` from `hex.pm`. This is an Erlang toolchain issue on Windows (likely OTP trust store / CA certs), not a C++ build issue. The gateway is a Linux-deployed service and Windows has no operational need to run its Common Test suite — the Linux CI already covers it.
+**The gateway is a supported Windows target.** `meson.build:213-248` declares the gateway custom_target and its `gateway eunit` / `gateway ct` tests unconditionally whenever `rebar3` is found on PATH, and yuzu-local-windows has rebar3 pre-installed so both fire on every Windows CI run. `gateway eunit` passes on Windows (the option H canary ran it in 30.28s, all green). There has never been a decision to drop Windows gateway support and there must not be one lurking in this document.
 
-**Fix (pending)**: gate the `yuzu:gateway ct` test declaration in `tests/meson.build` on `host_machine.system() != 'windows'`. `yuzu:gateway eunit` should keep running on Windows (it passes — no hex.pm fetch required). Track as a separate follow-up from the #375 rollout closure.
+What actually happens: `gateway ct` activates rebar3's `test` profile which pulls in `meck 0.9.2` and `proper 1.4.0` as profile-only deps (see `gateway/rebar.config`'s `{profiles, [{test, [{deps, [{meck, ...}, {proper, ...}]}]}]}` block). Those deps are fetched from `hex.pm`, and **hex.pm is known to be intermittently flaky** — occasional HTTP 502/timeout/TCP-RST that kills the fetch. When the fetch fails, rebar3 prints the `Failed to fetch and copy dep: {pkg,<<"meck">>,...}` error and exits non-zero, failing the Windows (or Linux) `gateway ct` test even though nothing is actually wrong with Yuzu.
+
+**Prior art for pre-fetching** lives in `deploy/docker/Dockerfile.ci-gateway` — the CI image runs `rebar3 compile --deps_only` at image build time in a clone of the gateway, then copies `_build/` into `/opt/rebar3_deps/_build`. Subsequent rebar3 runs inside the image find meck/proper/etc. locally and never hit hex.pm. This mitigation applies to any containerized Linux CI path that uses the ci-gateway image.
+
+**The self-hosted runners are bare-metal** (`yuzu-wsl2-linux`, `yuzu-local-windows`), not containerized, so they don't benefit from the ci-gateway image's pre-fetch. The equivalent runner-side mitigations are:
+
+1. **Runner-level rebar3 cache seeding** — run `rebar3 as test compile --deps_only` once inside a clone of `gateway/` on the runner. Rebar3 caches the fetched hex packages at `~/.cache/rebar3/hex/hexpm/packages/` (Linux/WSL2) or `%LOCALAPPDATA%\rebar3\hex\hexpm\packages\` (native Windows). This cache is persistent across CI runs and `git clean -ffdx` in `$GITHUB_WORKSPACE` doesn't touch it. One-time bootstrap per runner.
+2. **Retry wrapper in `scripts/test_gateway.py`** — wrap the `rebar3 as test ct` invocation in a bounded retry loop that re-runs on rebar3's fetch-failure exit code. This handles flake transparently without any runner-side state.
+3. **Vendored deps via `rebar3 unlock + local_fs`** — heavier option, not recommended unless hex.pm flake becomes persistent.
+
+Option 2 is the most portable — it works on any runner (self-hosted or ephemeral github-hosted) without needing runner bootstrap, so it also hardens the Linux CI path against hex.pm flake. Option 1 is a strict speedup for runs where deps haven't changed. They can be combined.
+
+The `gateway ct` flake that surfaced during #375 option H validation on Windows is **not a Windows regression** — it's hex.pm being hex.pm. If you see `Failed to fetch and copy dep: {pkg,<<"meck">>...}` in a CI log, the diagnosis is hex.pm flake, and the fix is a retry wrapper (scripts side) or runner-side cache seeding, not a Windows-specific workaround and definitely not gating the test off on Windows.
