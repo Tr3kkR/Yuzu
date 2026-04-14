@@ -53,6 +53,10 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 | macos | macos-14 | Apple Clang | arm64-osx | Apple Silicon |
 | arm64-cross | ubuntu-24.04 | aarch64-linux-gnu | arm64-linux | Tests skipped |
 
+## Reference Documents
+
+CLAUDE.md no longer carries the Windows toolchain command sequence or path inventory verbatim. Before reviewing any Windows build change (CI matrix, `setup_msvc_env.sh`, vcpkg Windows triplet, MSVC flags), **read `docs/windows-build.md`** — it has the MSYS2 bash activation order, the full tool path table, the `vcvars64.bat` failure mode (exit 1 from optional extensions), and the "no Clang" rule. The Linux/macOS sides remain documented in CLAUDE.md (`## Build`, `## CI matrix`, `## vcpkg`).
+
 ## Review Triggers
 
 You perform a targeted review when a change:

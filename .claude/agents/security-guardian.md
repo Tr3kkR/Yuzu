@@ -44,6 +44,22 @@ You perform a **mandatory deep-dive review of every code change**. You read ever
 - `server/core/src/audit_store.cpp` — Audit event storage
 - `server/core/src/scope_engine.cpp` — Expression parser (injection surface)
 - `server/core/src/instruction_store.cpp` — YAML parsing (deserialization surface)
+- `server/core/src/security_headers.{hpp,cpp}` — `HeaderBundle::make()`/`apply()` (only sanctioned header construction path)
+- `server/core/src/mcp_server.{hpp,cpp}`, `mcp_policy.hpp`, `mcp_jsonrpc.hpp` — MCP embed point and tier policy
+
+## Reference Documents
+
+CLAUDE.md no longer carries the auth or MCP invariants verbatim — they live in the docs below. **Read the relevant doc before producing a security finding** for any change in its domain. These are the source of truth; do not rely on memory or prior CLAUDE.md content.
+
+| Domain | Document | Sections that carry the hard invariants |
+|---|---|---|
+| Auth, RBAC, crypto, security headers, token lifecycle (incl. #222) | `docs/auth-architecture.md` | "HTTPS and bind defaults (hard invariants)", "HTTP security response headers (SOC2-C1)", "API tokens and automation" |
+| MCP server (`/mcp/v1/`, `mcp_server.cpp`, `mcp_policy.hpp`, `mcp_jsonrpc.hpp`) | `docs/mcp-server.md` | "Architecture", "Security Model" |
+
+Triggers for loading each doc:
+
+- **Auth doc** — any modification to `auth.cpp`, `rbac_store.cpp`, `api_token_store.cpp`, `oidc_provider.cpp`, `cert_store.cpp`, `security_headers.{hpp,cpp}`, or any new REST endpoint that touches authentication/authorization/header emission/token lifecycle. Verify mTLS-mandatory, HTTPS-default, 127.0.0.1 bind, metrics localhost-only, private-key perms gate, JSON error envelope, `HeaderBundle::make()`/`apply()` as the only header construction path, and owner-scoped token revocation.
+- **MCP doc** — any change in `server/core/src/mcp_*.{hpp,cpp}`, anything that adds a tool to `mcp_policy.hpp`, or any new REST/MCP path that needs tier classification. Verify tier check **before** RBAC, kill-switch coverage (`--mcp-disable` / `--mcp-read-only`), audit-event shape, and `JObj`/`JArr` output (never `nlohmann::json` output — parse only).
 
 ## Severity Levels
 

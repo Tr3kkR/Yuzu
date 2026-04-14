@@ -457,16 +457,9 @@ All new features must be documented for human usability. **After writing or modi
 
 Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
 
-### Windows build (from MSYS2 bash)
-```bash
-source ./setup_msvc_env.sh           # MSVC paths
-source scripts/ensure-erlang.sh      # Erlang/OTP on PATH (gateway target)
-meson compile -C build-windows       # canonical Windows dir; coexists with build-linux from WSL2
-```
+### Windows build
 
-**IMPORTANT — do NOT use vcvars64.bat.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
-
-`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" under the Erlang gateway section). Source both before invoking meson if your build touches the gateway custom_target.
+`docs/windows-build.md` is the source of truth — MSYS2 bash command sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, the full path inventory (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), and the two hard rules: **never use `vcvars64.bat`** (exit code 1 from optional extension failures corrupts wrapper scripts) and **never use Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe / MSVC). The `cross-platform` and `build-ci` agents load this doc on any Windows-touching change.
 
 ### Cross-compilation
 ```bash
@@ -474,33 +467,13 @@ meson compile -C build-windows       # canonical Windows dir; coexists with buil
 ```
 Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
 
-### Windows toolchain requirements
-
-Full path inventory (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin) lives in `docs/windows-build.md`. All of it is configured automatically by `setup_msvc_env.sh`. Hard rule: **do not use Clang** (`C:\Program Files\LLVM\bin`) — must use cl.exe / MSVC.
-
 ## Authentication & Authorization
 
-Full feature history, OIDC/AD details, tiered agent enrollment, and CSP/security-header construction live in `docs/auth-architecture.md`. Hard invariants that every session must respect:
-
-- **mTLS** for agent ↔ server gRPC is mandatory; there is no plain-gRPC path.
-- **HTTPS default** — `https_enabled` defaults to `true`. `--no-https` is dev-only.
-- **Secure bind default** — Web UI binds to `127.0.0.1`; overriding to `0.0.0.0` logs a startup warning.
-- **Metrics auth** — `/metrics` is localhost-only unauthenticated; remote scrapes require auth unless `--metrics-no-auth` is set for monitoring infra.
-- **Private key perms** — server refuses to start if a TLS private key file is group/others-readable on Unix.
-- **Error envelope** — all API responses use `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}`; health probes use `{"status":"..."}`.
-- **HTTP security headers** — CSP, HSTS (HTTPS-only), X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy are emitted on every response. Construction lives in `server/core/src/security_headers.{hpp,cpp}`. CSP extensions go through `--csp-extra-sources` which is validated at CLI parse. Never hand-roll header emission elsewhere — route through `HeaderBundle::make()`/`apply()`.
-- **Owner-scoped API token revocation (#222)** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` reject cross-user revoke attempts with 404 unless the caller holds the global `admin` role. Every new token-lifecycle endpoint must follow the same owner-check pattern.
+Hard invariants and full feature history live in `docs/auth-architecture.md` — sections **HTTPS and bind defaults (hard invariants)**, **HTTP security response headers (SOC2-C1)**, and **API tokens and automation** are the load-bearing rules (mTLS mandatory, HTTPS default, 127.0.0.1 bind, metrics localhost-only, private-key perms gate, JSON error envelope, `HeaderBundle::make()`/`apply()` as the only header construction path, owner-scoped token revocation per #222). The `security-guardian` agent loads this doc on any auth/RBAC/crypto/header/token change — route reviews through it instead of hand-checking from CLAUDE.md.
 
 ## MCP (Model Context Protocol) Server
 
-Full architecture, tier policy, tool list, and Phase 2 roadmap live in `docs/mcp-server.md`. Load-bearing rules:
-
-- **Embed point:** `POST /mcp/v1/` inside the same httplib server as REST and dashboard. Module lives at `server/core/src/mcp_server.{hpp,cpp}` and mirrors `RestApiV1` — injected store pointers, same callback signatures.
-- **Tier check runs BEFORE RBAC.** `mcp_policy.hpp` enforces static allow-lists per tier (`readonly`, `operator`, `supervised`); RBAC is a second gate, not the first. Never skip the tier check.
-- **MCP tokens** piggyback on `api_token_store` with the `mcp_tier` column and mandatory expiry (≤90 days). The owner-scoped revocation rules from the Auth section apply.
-- **Kill switches:** `--mcp-disable` (rejects all `/mcp/v1/` with `kMcpDisabled`), `--mcp-read-only` (blocks non-read tools). Respect both in every new endpoint.
-- **Audit pattern:** every MCP tool call emits `action="mcp.<tool_name>"` and populates the `mcp_tool` field on `AuditEvent`. Don't log MCP traffic through any other path.
-- **Output serialization:** use the local `JObj`/`JArr` string builders, not `nlohmann::json` output (56GB template bloat). `nlohmann::json` is OK for parsing only.
+Architecture, tier-before-RBAC ordering, kill switches (`--mcp-disable`, `--mcp-read-only`), audit pattern (`action="mcp.<tool_name>"` + `mcp_tool` field), and the JObj/JArr output rule live in `docs/mcp-server.md` — sections **Architecture** and **Security Model**. The `security-guardian` agent loads this doc on any change to `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, or `mcp_policy.hpp`.
 
 ## Data architecture for analytics integration
 

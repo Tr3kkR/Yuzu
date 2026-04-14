@@ -306,6 +306,44 @@ patch._
 
 ### Changed
 
+- **CLAUDE.md second compression pass — Auth/MCP/Windows-build
+  sections trimmed to pure pointers, with reference rules pushed
+  into the relevant agent definitions.** v0.10.0's slimming
+  (`571 → 484 lines`) had crept back to 529 lines as new sections
+  landed. This pass takes it to 502 by removing the inline lists
+  that were already mirrored in `docs/auth-architecture.md`,
+  `docs/mcp-server.md`, and `docs/windows-build.md`. The hard
+  invariants did not move — they're still load-bearing — they're
+  just no longer duplicated between CLAUDE.md and the docs that
+  own them. Drift was the symptom: the Auth invariant list in
+  CLAUDE.md was already 1 item behind `docs/auth-architecture.md`
+  and would silently keep diverging on every doc update.
+
+  To prevent the next compression pass having to relocate the
+  same rules a third time, the relevant agent definitions now
+  carry "Reference Documents" pointers that name the doc and the
+  exact section that holds the invariants:
+
+  - **`.claude/agents/security-guardian.md`** — Reference
+    Documents table mapping (auth/RBAC/crypto/header/token →
+    `docs/auth-architecture.md` "HTTPS and bind defaults",
+    "HTTP security response headers", "API tokens and
+    automation"; MCP → `docs/mcp-server.md` "Architecture",
+    "Security Model"). Adds `security_headers.{hpp,cpp}`,
+    `mcp_server.{hpp,cpp}`, `mcp_policy.hpp`, `mcp_jsonrpc.hpp`
+    to the deep-dive read list. Triggers list per-doc loading
+    rules so the agent loads the right doc on the first relevant
+    file edit instead of recovering invariants from CLAUDE.md.
+  - **`.claude/agents/build-ci.md`** — Reference Documents note
+    pointing at `docs/windows-build.md` for any Windows-touching
+    CI/build change (`setup_msvc_env.sh`, vcpkg Windows triplet,
+    MSVC flags). Linux/macOS build details remain in CLAUDE.md
+    `## Build` / `## CI matrix` / `## vcpkg` sections.
+  - **`.claude/agents/cross-platform.md`** — Reference Documents
+    note for Windows changes plus an explicit "Do NOT use Clang
+    from `C:\Program Files\LLVM\bin`" row in the Standing
+    pitfalls table (was previously buried in CLAUDE.md prose).
+
 - **`Dockerfile.ci-gateway` aligned to Erlang/OTP 28 (closes #334).**
   The CI gateway image was still pinned to `erlang:27` while every
   other Erlang surface — `release.yml`'s `erlef/setup-beam` step,
