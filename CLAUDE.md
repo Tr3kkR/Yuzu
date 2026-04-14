@@ -409,7 +409,7 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 - OpenSSL is skipped on Windows (`"platform": "!windows"`) — gRPC uses the native Windows crypto stack.
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - `schannel` is NOT a vcpkg port — don't add it. It's a Windows system library.
-- **`triplets/x64-windows.cmake` — do NOT re-enable the static-linkage override for the abseil/grpc/protobuf stack.** LNK2038 / #375 saga, meson cmake-dep limitation, timeline, diagnostic script, and the documented option D fallback all live in `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375" — read it before touching Windows vcpkg linkage.
+- **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND `meson.build`'s Windows-specific `cxx.find_library()` hand-wired `protobuf_dep`/`grpcpp_dep` construction are the **only configuration we've found** that simultaneously avoids LNK2038 (meson cmake-dep bug) and LNK2005 (abseil DLL symbol conflicts). Do not simplify either half without reading `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375" — full timeline, every failed approach, and the #376 strategic escape (migrate off gRPC to QUIC) are there. Linux/macOS are unaffected.
 
 ## CI matrix
 

@@ -81,7 +81,13 @@ When reviewing another agent's Change Summary:
 
 ## Windows MSVC static-link history and #375 (LNK2038 / abseil DLL conflicts)
 
-**Hard rule:** Do not force static linkage for abseil/grpc/protobuf/upb/re2/c-ares/utf8-range on the shared `x64-windows` vcpkg triplet. Use dynamic (DLL + import lib) linkage, which is the current state on `main` after #375 / option H. If you find yourself about to add `if(PORT MATCHES "^(abseil|grpc|protobuf|upb|re2|c-ares|utf8-range)$") set(VCPKG_LIBRARY_LINKAGE static)` to `triplets/x64-windows.cmake`, **stop and read this section**.
+**Hard rule:** On Windows, the grpc/protobuf/abseil stack is **caught between two mutually exclusive problems**. Getting it to build requires:
+1. **Keep** the static-linkage override for `abseil/grpc/protobuf/upb/re2/c-ares/utf8-range` in `triplets/x64-windows.cmake` (removing it triggers LNK2005 abseil DLL symbol conflicts — see option H below), AND
+2. **Bypass meson's cmake dependency method** on Windows for protobuf/grpc by declaring the dependency manually via `cxx.find_library()` with **build-type-conditional library search dirs** (leaving the cmake dep in place triggers LNK2038 RuntimeLibrary mismatches — see options A/B below).
+
+This is the state `main` ships. `meson.build` Windows branch constructs `protobuf_dep` and `grpcpp_dep` from scratch using `find_library()` + `declare_dependency()` — Linux/macOS continue to use `dependency('protobuf', method: 'cmake', ...)` unchanged.
+
+If you are about to (a) remove the static-linkage override in the triplet, or (b) simplify `meson.build`'s Windows branch to use `method: 'cmake'`, **stop and read this section**. We've tried those and they don't work. The long-term escape from this trap is **moving off gRPC entirely — tracked as P1 in #376 (Strategic: Migrate transport off gRPC to QUIC)**.
 
 ### Why this rule exists
 
@@ -101,45 +107,80 @@ Result: every Windows debug build tried to link release-CRT (`/MD`, `_ITERATOR_D
 | `0fe5eac` | 2026-04-13 | Reverted `VCPKG_BUILD_TYPE release` but kept the static-linkage override. Build stayed broken — override generated both variants but meson picked release for debug. |
 | #375 option A | 2026-04-14 | Per-build-type triplets `x64-windows-debug` + `x64-windows-release`. Failed on two independent vcpkg-side bugs: (1) `catch2` portfile calls `vcpkg_replace_string` on a release-side pkgconfig file that doesn't exist in a debug-only install tree; (2) a find_package(Protobuf) failure on the release-only install tree that couldn't be fully diagnosed before the tree was wiped by the next job's `actions/checkout`. **Reverted in `895336e`.** |
 | #375 option B | 2026-04-14 | Explicit `cmake_args: ['-DCMAKE_BUILD_TYPE=Debug']` in `meson.build` `dependency()` calls. Made `find_package` succeed (meson Configure goes green) but meson's translator still read `IMPORTED_LOCATION_RELEASE` → same LNK2038 with the same symbols. Change **retained** in `meson.build` as a benign documentation of the attempt. |
-| #375 **option H** | 2026-04-14 | **Worked.** Removed the static-linkage override entirely. vcpkg builds abseil/protobuf/upb/re2/c-ares/utf8-range as DLLs with CRT-neutral import libs. Debug user code links against release-CRT DLL without LNK2038 — the DLL loads its own CRT via `vcruntime*.dll` side-by-side at runtime. grpc is a port-side exception (vcpkg's grpc port prints `-- Note: grpc only supports static library linkage` and builds static regardless), but gRPC's object code that ends up in yuzu's test binaries happens not to surface LNK2038 — either because yuzu's tests don't call the CRT-sensitive code paths, or because gRPC's .obj files that yuzu pulls in are CRT-neutral. |
+| #375 option H | 2026-04-14 | **Initially looked like it worked, then didn't.** Removed the static-linkage override entirely. vcpkg built abseil/protobuf/upb/re2/c-ares/utf8-range as DLLs with CRT-neutral import libs. Windows MSVC **debug** passed (6/7 tests green, only `gateway ct` failed on hex.pm flake — see below). Windows MSVC **release** then failed with **LNK2005 duplicate symbol errors** from `grpc.lib(*.cc.obj)` and `grpc++.lib(*.cc.obj)` defining `absl::lts_20260107::Mutex::Dtor` "already defined in abseil_dll.lib(abseil_dll.dll)". Root cause: vcpkg's grpc port forces static linkage regardless of the triplet, and abseil's inlined template symbols are embedded directly into grpc's object files at grpc's compile time. When the linker pulls in both `grpc.lib` (which has the embedded absl symbols) and `abseil_dll.lib` (which re-exports them from the DLL), LNK2005 fires. The historical "abseil DLL symbol conflicts" warning in the original triplet comment was **accurate and still current** — modern abseil `20260107.1` does not resolve it for the vcpkg grpc port's static-build case. Why debug passed and release failed is unclear (release enables LTO via `-Db_lto=true` which may surface the duplicate stage differently; debug mode may tolerate duplicates via different `/OPT:REF` behavior). We did not investigate further — academic curiosity was not worth another CI cycle against a known-failing approach. **Reverted in the same session.** |
+| #375 **option D** | 2026-04-14 | **Active approach on `main`.** Restore the static-linkage override (avoids LNK2005) AND bypass meson's cmake dep method on Windows for protobuf/grpc by declaring the deps manually via `cxx.find_library()` with build-type-conditional dirs pointing at `vcpkg_installed/x64-windows/{lib,debug/lib}/` (avoids LNK2038). This works by threading both problems simultaneously — static linkage for the abseil-grpc template-embedding issue, explicit per-build-type lib paths for the meson cmake-dep translator issue. Linux/macOS continue to use `dependency('protobuf', method: 'cmake', ...)` unchanged. Invasive — the Windows branch in `meson.build` has to enumerate all ~35-40 transitive `absl_*.lib` dependencies by hand (or via a run_command enumeration). This is the source of the "grep for build-ci.md before you touch grpc/protobuf/abseil on Windows" rule at the top of this section. |
 
 ### What does NOT work (save yourself a CI cycle)
 
 | Approach | Why it fails |
 |---|---|
-| Force static linkage for grpc stack on shared triplet | Meson's cmake probe picks release static libs for debug builds → LNK2038 |
+| Force static linkage for grpc stack on shared triplet, keep `dependency(method: 'cmake')` | Meson's cmake probe picks release static libs for debug builds → LNK2038 |
 | Per-build-type triplets (`x64-windows-debug`, `x64-windows-release`) | `catch2` portfile not `VCPKG_BUILD_TYPE=debug` safe + unexplained find_package release-tree failure |
 | `cmake_args: ['-DCMAKE_BUILD_TYPE=Debug']` in meson `dependency()` | Makes find_package succeed but meson's translator still reads `IMPORTED_LOCATION_RELEASE` |
 | `x64-windows-static` triplet (static CRT `/MT`) | Same meson bug — debug `/MTd` user code vs release `/MT` static lib → LNK2038 |
-| `-DProtobuf_USE_STATIC_LIBS=ON` in protobuf_cmake_args | No-op against vcpkg's `protobuf-config.cmake` (CONFIG mode); only affects CMake's bundled `FindProtobuf` module |
+| `-DProtobuf_USE_STATIC_LIBS=ON` in `protobuf_cmake_args` | No-op against vcpkg's `protobuf-config.cmake` (CONFIG mode); only affects CMake's bundled `FindProtobuf` module |
+| **Drop the static-linkage override (option H)** | Release build fails with LNK2005 abseil DLL symbol conflicts from grpc.lib objects vs abseil_dll.lib — vcpkg's grpc port forces static regardless of triplet, and grpc's .obj files embed abseil template symbols that collide with `abseil_dll.lib`'s exports. Debug mysteriously tolerates the conflict; release with LTO enabled does not. Even if release-with-LTO-off happened to work, it's a "limping production build" that customers should not ship. |
 | Any of the above + setting CMake build type via meson's `-Dcpp_args` or env | Same meson translator limitation — the knob doesn't reach imported target resolution |
 
-### Documented fallback if option H regresses
+### The current fix: option D (active on `main`)
 
-If a future abseil / grpc / protobuf upgrade reintroduces DLL symbol conflicts (the historical reason for the static override in the first place):
+Option D is the **only configuration we've found that simultaneously avoids LNK2038 (the meson cmake-dep translation bug) and LNK2005 (the abseil DLL symbol conflict)**. It's brittle but it ships.
 
-- **Do NOT re-enable the static-linkage override on the shared `x64-windows` triplet.** That path is closed for the reasons above.
-- Instead, drop meson's cmake dep method for protobuf and gRPC **on Windows only** and use explicit `cxx.find_library()` with build-type-conditional search dirs — the documented **option D**. Sketch:
+The approach:
+
+1. **Keep** the static-linkage override in `triplets/x64-windows.cmake`:
+
+        if(PORT MATCHES "^(abseil|grpc|protobuf|upb|re2|c-ares|utf8-range)$")
+            set(VCPKG_LIBRARY_LINKAGE static)
+        endif()
+
+   This tells vcpkg to build these as static libs. grpc's port was already forcing static anyway; the override just brings abseil/protobuf/etc. into the same linkage model, which avoids the cross-boundary duplicate symbol error (grpc.lib's embedded absl symbols don't collide with anything else because there's no DLL variant in the install tree).
+
+2. **On Windows only**, bypass meson's cmake dep method for protobuf and grpc in `meson.build`. Construct `protobuf_dep` and `grpcpp_dep` manually from `cxx.find_library()` calls that target **build-type-conditional directories**:
 
         if host_os == 'windows'
           cxx = meson.get_compiler('cpp')
-          vcpkg_root = meson.current_source_dir() / 'vcpkg_installed' / 'x64-windows'
+          vcpkg_root = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'
           if get_option('buildtype') == 'debug'
             vcpkg_lib = vcpkg_root / 'debug' / 'lib'
-            pb_d = 'd'
+            pb_d = 'd'     # vcpkg's debug-suffix convention for protobuf
           else
             vcpkg_lib = vcpkg_root / 'lib'
             pb_d = ''
           endif
-          libprotobuf = cxx.find_library('libprotobuf' + pb_d, dirs: [vcpkg_lib], required: true)
-          # ... and libprotobuf-lite, libupb, libprotoc, all ~35 absl_*, etc.
+
+          libprotobuf      = cxx.find_library('libprotobuf'      + pb_d, dirs: [vcpkg_lib], required: true)
+          libprotobuf_lite = cxx.find_library('libprotobuf-lite' + pb_d, dirs: [vcpkg_lib], required: true)
+          libupb           = cxx.find_library('libupb'           + pb_d, dirs: [vcpkg_lib], required: true)
+          libprotoc        = cxx.find_library('libprotoc'        + pb_d, dirs: [vcpkg_lib], required: true)
+          # ... plus ~35-40 absl_*.lib + grpc/grpc++/gpr/address_sorting/re2/c-ares/utf8_range etc.
+
           protobuf_dep = declare_dependency(
             include_directories: include_directories(vcpkg_root / 'include', is_system: true),
-            dependencies: [libprotobuf, ...]
+            dependencies: [libprotobuf, libprotobuf_lite, libupb, libprotoc] + absl_deps,
           )
+          grpcpp_dep = declare_dependency(
+            include_directories: include_directories(vcpkg_root / 'include', is_system: true),
+            dependencies: [libgrpcpp, libgrpc, libgpr, libaddress_sorting, libre2] + absl_deps,
+          )
+        else
+          # Linux/macOS use meson's cmake dep method as before
+          grpcpp_dep = dependency('gRPC', method: 'cmake', ...)
+          protobuf_dep = dependency('protobuf', method: 'cmake', ...)
         endif
 
-- Option D is brittle (transitive absl dep list must be maintained by hand) but bypasses both the meson cmake-dep limitation and any DLL symbol conflict class of errors.
+   Linux/macOS stay unchanged because `gcc`/`clang` don't have MSVC's runtime-library variant ABI and don't hit either failure mode.
+
+3. The **transitive `absl_*.lib` list is the brittle bit**. vcpkg installs ~100 absl libraries in `lib/`; the protobuf/grpc transitive closure needs roughly 35-40 of them. Options for keeping the list maintainable:
+   - **Hand-list** the 40 names in `meson.build` — simplest, requires updates when abseil adds/renames libs.
+   - **Enumerate at configure time** via `run_command(['python3', '-c', 'import glob,sys; ...'], check: true)` to glob `vcpkg_lib/absl_*.lib` and return the names — self-adapting, but executes a subprocess during meson configure.
+   - **Maintain the list in a separate `meson/windows-absl-libs.txt`** sidecar file — same as hand-list but less clutter in the main `meson.build`.
+
+   The current implementation uses whichever of these seemed least ugly at commit time; if you're about to add a new absl-using dep, search `meson.build` for `absl_` and follow the pattern there.
+
+### Strategic escape: migrate off gRPC
+
+The long-term plan is to **eliminate the gRPC dependency entirely** — see **P1 #376 "Strategic: Migrate transport off gRPC to QUIC"**. QUIC (via MsQuic or similar) gives us the same reliable multiplexed bidirectional streams without the C++ ABI / CMake ecosystem tax, which would make the entire "Windows MSVC static-link history and #375" section obsolete history. It's deferred until current customer commitments ship because the transport rewrite touches agent, server, gateway, and the SDK — multi-week work that can't happen under a rollout pause.
 
 ### Concurrency-masked breakage pattern
 
