@@ -162,6 +162,16 @@ if host_os == 'windows'
   _libre2              = _cxx.find_library('re2',              dirs: [_vcpkg_lib_win], required: true)
   _libcares            = _cxx.find_library('cares',            dirs: [_vcpkg_lib_win], required: true)
 
+  # OpenSSL — grpc.lib has unresolved references to BIO_*, EVP_*, PEM_*,
+  # X509_*, OPENSSL_sk_* that only libssl + libcrypto can satisfy. vcpkg's
+  # grpc port compiles its TLS / JWT / SPIFFE / PEM code paths against
+  # OpenSSL headers regardless of any triplet or manifest hint that it
+  # "should" use schannel — the schannel path was never wired up in the
+  # upstream grpc port. See CLAUDE.md `## vcpkg` section and .claude/agents/
+  # build-ci.md "Windows MSVC static-link history and #375" for history.
+  _libssl    = _cxx.find_library('libssl',    dirs: [_vcpkg_lib_win], required: true)
+  _libcrypto = _cxx.find_library('libcrypto', dirs: [_vcpkg_lib_win], required: true)
+
   # Construct the meson dep objects yuzu's build graph consumes. These
   # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
   # method: 'cmake')` calls that Linux/macOS use — those paths are
@@ -178,6 +188,7 @@ if host_os == 'windows'
     dependencies: [
       _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
       _libre2, _libcares,
+      _libssl, _libcrypto,
       # grpc transitively uses protobuf and upb; include them so consumers
       # that only pull in grpcpp_dep still see protobuf's symbols.
       _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,

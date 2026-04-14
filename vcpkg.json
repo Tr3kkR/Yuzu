@@ -21,10 +21,7 @@
     "cli11",
     "cpp-httplib",
     "sqlite3",
-    {
-      "name": "openssl",
-      "platform": "!windows"
-    },
+    "openssl",
     {
       "name": "catch2",
       "platform": "x64 | arm64"
