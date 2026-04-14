@@ -179,7 +179,14 @@ if host_os == 'windows'
   # (vcpkg default) so we're linking zlib's import lib. Failure mode seen:
   # LNK2019 "unresolved external symbol __imp_deflate referenced in function
   # zlib_compress" from the option D first canary on commit 713ae8c.
-  _libzlib = _cxx.find_library('zlib', dirs: [_vcpkg_lib_win], required: true)
+  #
+  # Naming quirk: vcpkg's zlib port uses the `d` suffix for debug variants
+  # (lib/zlib.lib + debug/lib/zlibd.lib) — same convention as protobuf's
+  # libprotobufd.lib. libcrypto/libssl above do NOT use the d suffix
+  # (same name in both variant dirs). Check `debug/lib/` layout via the
+  # inspect-vcpkg.sh diagnostic if a new transitive lib surfaces and you
+  # aren't sure which convention it follows.
+  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: true)
 
   # Construct the meson dep objects yuzu's build graph consumes. These
   # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
