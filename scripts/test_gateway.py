@@ -5,16 +5,30 @@ Used by Meson test() because Ninja quotes compound shell commands
 as a single argument, which breaks cmd.exe on Windows.
 
 Two responsibilities beyond the bare rebar3 invocation:
-  1. Pre-fetch rebar3's test-profile deps (meck, proper) with retry,
-     so the actual test invocation never has to talk to hex.pm. hex.pm
-     is intermittently flaky and an HTTP 502 / TCP RST on a single
-     fetch attempt would otherwise fail the test even though Yuzu is
-     fine. After a successful pre-fetch (any attempt), rebar3's user
-     cache (`~/.cache/rebar3/hex/hexpm/packages/` on Linux/WSL2,
-     `%LOCALAPPDATA%\\rebar3\\hex\\hexpm\\packages\\` on Windows) holds
-     the deps and subsequent runs find them locally without a network
-     round-trip. Tracked as #15 in the in-session task list.
+  1. Retry the rebar3 test command up to 4 times when hex.pm fetch
+     fails. hex.pm is intermittently flaky and an HTTP 502 / TCP RST
+     on a single fetch attempt would otherwise fail the test even
+     though Yuzu is fine. The retry helper detects the
+     "Failed to fetch and copy dep:" sentinel and backs off
+     exponentially (5s, 10s, 20s) between attempts. After any
+     successful attempt rebar3's user-level hex cache holds the deps
+     so subsequent runs find them locally without a network
+     round-trip — on the persistent self-hosted Windows runner this
+     means hex.pm is only touched on the very first run.
   2. OTP 25 CT I/O race detection — see comment block below.
+
+A previous iteration (b33f1df) added an explicit pre-fetch step
+running `rebar3 as test compile --deps_only` ahead of the actual
+test invocation, intending to populate the hex cache earlier. On
+Windows this turned out to leave `_build/test/lib/yuzu_gw/` in a
+state where the subsequent `rebar3 as test eunit` compile race-d
+with cover instrumentation, and cover would error with
+`{cover,get_abstract_code,...,enoent,gateway_pb.beam}` on the
+gpb-generated proto module — sometimes during gateway eunit,
+sometimes during gateway ct, depending on which test ran first.
+The pre-fetch was redundant on persistent runners (cache already
+warm) so it was removed in favor of the simpler retry-on-test
+flow. Linux and macOS were unaffected throughout.
 
 Usage:
     test_gateway.py <gateway_dir> eunit   # EUnit tests
@@ -115,35 +129,11 @@ def run_with_retry(args, label, max_attempts=4):
     return result
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Pre-fetch rebar3 test-profile deps (meck, proper, ...) so the actual
-# test invocation never has to round-trip hex.pm. Retries handle the
-# intermittent hex.pm flake. After any successful attempt, the deps
-# land in rebar3's user cache and subsequent runs hit the cache.
-# ──────────────────────────────────────────────────────────────────────
-print(
-    "[test_gateway.py] Pre-fetching rebar3 test-profile deps "
-    "(meck, proper) into the user-level hex cache",
-    file=sys.stderr,
-)
-prefetch_cmd = ["rebar3", "as", "test", "compile", "--deps_only"]
-prefetch = run_with_retry(prefetch_cmd, "prefetch", max_attempts=4)
-if prefetch.returncode != 0:
-    print(
-        "[test_gateway.py] Pre-fetch did not converge after retries. "
-        "Proceeding to test anyway — if hex.pm has been flaky for a "
-        "while the test will fail with the same error and the cache "
-        "stays empty. Re-run later or seed the cache manually via "
-        "`cd gateway && rebar3 as test compile --deps_only` on the runner.",
-        file=sys.stderr,
-    )
-
 # Capture output to detect OTP 25 CT I/O race, but also tee to console.
-# Use the same retry helper for the actual test run too — if rebar3 has
-# to fetch ANY transitive dep at this stage (it shouldn't after pre-fetch
-# but rebar3's incremental dep resolver sometimes surprises us), the
-# retry handles the same hex.pm flake one more time.
-result = run_with_retry(cmd, suite, max_attempts=2)
+# run_with_retry handles hex.pm fetch flakes by detecting the
+# "Failed to fetch and copy dep:" sentinel and backing off between
+# attempts. 4 attempts × ~35s of waits at most before giving up.
+result = run_with_retry(cmd, suite, max_attempts=4)
 output = result.stdout or ""
 
 # OTP 25 has a known race where the CT I/O handler (test_server_io)
