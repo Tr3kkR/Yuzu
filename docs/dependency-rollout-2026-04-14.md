@@ -50,7 +50,7 @@ recreate, the new PR numbers go in the **Recreated As** column.
 |---|---|---|---|---|---|---|---|
 | 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
 | 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | plumbing done (commit `3960f46`); exposed #375 |
-| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option B: explicit CMAKE_BUILD_TYPE in meson cmake dep probe | **Gate (P0)** | Yes | in progress (folded into #373) |
+| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option H: drop static linkage override for grpc stack | **Gate (P0)** | Yes | in progress (folded into #373) |
 | 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
@@ -239,24 +239,23 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** wait for PR #373's next CI cycle (after the option B
-> `meson.build` fix) to validate that Windows MSVC debug links cleanly
-> against the debug variant of vcpkg's static protobuf. This cycle uses
-> the shared `x64-windows` triplet (which builds both variants in one
-> tree), so it avoids the catch2 portfile bug entirely — catch2's
-> release pkgconfig file exists, and the debug one exists, and both
-> are fine. The only question is whether meson's cmake probe honors
-> the explicit `-DCMAKE_BUILD_TYPE=Debug` and picks the right static
-> libprotobuf at link time.
+> **Next action:** wait for PR #373's next CI cycle (after the option H
+> triplet change) to validate that Windows MSVC debug links cleanly
+> now that protobuf/grpc/abseil are DLLs + import libs instead of
+> static libs with CRT-variant baggage. The first cycle is **cold** —
+> vcpkg has to rebuild all the affected ports against the new triplet
+> hash, estimated 30-60 min on the 32-core self-hosted host.
 >
 > If green: merge #373, close #375, resume the rollout from Task #2
 > (recreate the 7 Dependabot PRs against `dev`).
 >
-> If red: the LNK2038 is still there, meaning meson's cmake probe
-> ignores our explicit build type. Fall back to **option C**: drop
-> meson's cmake dep method for protobuf/grpc and use explicit
-> `cxx.find_library()` calls with build-type-conditional paths. More
-> invasive but bypasses the cmake probe quirk entirely.
+> If red with abseil DLL symbol conflicts: fall back to **option D**
+> — drop meson's cmake dep method for protobuf/grpc on Windows only,
+> use `cxx.find_library()` with build-type-conditional search dirs.
+> More invasive (must list ~35 absl_*.lib transitive deps explicitly)
+> but bypasses both the meson cmake-dep translation limitation and
+> the DLL symbol conflict class of errors. Documented in the triplet
+> comment as the next fallback.
 >
 > Task #1 is done. Tasks #2–#9 (dependabot rollout) are **PAUSED**
 > until #375 is fixed. Tasks #11–#13 are unblocked and can run in
@@ -294,6 +293,43 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~11:55 UTC** · Claude session · **Option B failed the same
+  way, switching to option H.** The option B CI cycle (commit `1445cdb`)
+  confirmed the root cause is a **meson cmake-dep translation limitation**,
+  not anything wrong with vcpkg or CMake. Direct filesystem inspection of
+  `vcpkg_installed/x64-windows/share/protobuf/` via the runner-side bash
+  script showed the install tree is correct and complete:
+  - `protobuf-targets.cmake` uses the standard `foreach(include)` glob
+    to load both per-config files
+  - `protobuf-targets-debug.cmake` correctly sets
+    `IMPORTED_LOCATION_DEBUG "${_IMPORT_PREFIX}/debug/lib/libprotobufd.lib"`
+    and appends `DEBUG` to `IMPORTED_CONFIGURATIONS`
+  - `protobuf-targets-release.cmake` correctly sets
+    `IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/lib/libprotobuf.lib"`
+    and appends `RELEASE` to `IMPORTED_CONFIGURATIONS`
+  - Both `libprotobuf.lib` (release, `/lib/`) and `libprotobufd.lib`
+    (debug with `d` suffix, `/debug/lib/`) exist on disk
+  A normal cmake build with `CMAKE_BUILD_TYPE=Debug` would resolve
+  `protobuf::libprotobuf` to `IMPORTED_LOCATION_DEBUG` via generator
+  expression at configure time. Meson's cmake dep probe does NOT —
+  it reads one `IMPORTED_LOCATION_*` property (the release variant)
+  and bakes that path into its meson dependency representation
+  regardless of the active build type. `-DCMAKE_BUILD_TYPE=Debug`
+  (option B) makes `find_package` succeed (which it now does — the
+  Configure step is green) but doesn't influence meson's translation
+  of imported target locations. Known meson limitation.
+  **Option H** — drop the `PORT MATCHES "^(abseil|grpc|protobuf|upb|
+  re2|c-ares|utf8-range)$"` static-linkage override from
+  `triplets/x64-windows.cmake` entirely. With dynamic linkage, vcpkg
+  builds these as DLLs + import libs. Import libs don't carry CRT
+  variant info — they're symbol stubs pointing at DLL entries — so
+  debug user code can link against a release-CRT DLL without LNK2038.
+  DLL itself embeds its own CRT via `vcruntime*.dll` side-by-side at
+  runtime. Known risk: the original override was there to prevent
+  "abseil DLL symbol conflicts"; if modern abseil (in vcpkg as
+  `20260107.1`) reintroduces that, we fall back to option D (explicit
+  `cxx.find_library()` with build-type-conditional dirs) — documented
+  in the triplet comment so the next reader doesn't re-litigate.
 - **2026-04-14 ~10:45 UTC** · Claude session · **Per-build-type triplets
   reverted; switching to option B.** Commit `413a281` (per-build-type
   `x64-windows-debug` / `x64-windows-release` triplets) reverted via
