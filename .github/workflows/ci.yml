@@ -232,7 +232,7 @@ jobs:
       - name: Force fresh vcpkg install when triplet changed
         run: |
           # The persistent runner workspace accumulates a
-          # vcpkg_installed/x64-windows-${{ matrix.build_type }} tree from prior runs. vcpkg's
+          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
           # incremental install keys off the manifest only — it does NOT
           # detect overlay-triplet content edits. A triplet change
           # (e.g. removing `VCPKG_BUILD_TYPE release` to enable debug
@@ -242,17 +242,17 @@ jobs:
           # against absl_*.lib. Reconcile by wiping the install root
           # whenever the recorded triplet hash drifts. Same approach as
           # codeql.yml's mirror step.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows-${{ matrix.build_type }}"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-${{ matrix.build_type }}-triplet.sha256"
-          want=$(sha256sum triplets/x64-windows-${{ matrix.build_type }}.cmake | awk '{print $1}')
+          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
+          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
+          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
           have=$(cat "$sentinel" 2>/dev/null || echo "")
           if [[ "$want" != "$have" ]]; then
-            echo "x64-windows-${{ matrix.build_type }} triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows-${{ matrix.build_type }}"
+            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
             rm -rf "$installed_dir"
             mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
             echo "$want" > "$sentinel"
           else
-            echo "x64-windows-${{ matrix.build_type }} triplet sha256 unchanged — keeping persistent vcpkg_installed/x64-windows-${{ matrix.build_type }}"
+            echo "x64-windows triplet sha256 unchanged — keeping persistent vcpkg_installed/x64-windows"
           fi
 
       - name: Install vcpkg packages
@@ -262,19 +262,19 @@ jobs:
           # the workspace path contains backslashes and bash's escape
           # processing strips them when interpolated as source text.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
-            --triplet x64-windows-${{ matrix.build_type }} \
+            --triplet x64-windows \
             --x-manifest-root="$GITHUB_WORKSPACE"
 
       - name: Configure (Meson)
         env:
           CC: ccache cl
           CXX: ccache cl
-          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-${{ matrix.build_type }}
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
           meson setup build-windows-ci \
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
-            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows-${{ matrix.build_type }}" \
+            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
@@ -283,12 +283,12 @@ jobs:
 
       - name: Test
         run: |
-          # Per-build-type triplets put everything under bin/ — the
-          # legacy debug/bin/ subdir only exists when a single tree
-          # carries both variants (the shared x64-windows triplet).
-          # See #375 for context.
-          install_root="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows-${{ matrix.build_type }}"
-          export PATH="$install_root/bin:$install_root/tools/protobuf:$install_root/tools/grpc:$PATH"
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
           meson test -C build-windows-ci --print-errorlogs
 
       - name: ccache stats

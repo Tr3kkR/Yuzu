@@ -102,12 +102,7 @@ jobs:
             shell: bash
           - os: windows
             runner: [self-hosted, Windows, X64]
-            # Per-build-type triplet — codeql tracer wants debug coverage
-            # (CodeQL builds in debug). Per #375, the shared x64-windows
-            # triplet exposed a meson cmake-dep build-type mismatch. With
-            # the per-build-type split, vcpkg_installed/x64-windows-debug-debug/
-            # contains only debug-CRT static libs, eliminating LNK2038.
-            triplet: x64-windows-debug
+            triplet: x64-windows
             vcpkg_bin: vcpkg.exe
             build_dir: build-windows-codeql
             category: "/language:c-cpp-windows"
@@ -232,26 +227,31 @@ jobs:
         if: matrix.os == 'windows'
         run: |
           # The self-hosted Windows runner has a persistent
-          # vcpkg_installed/${{ matrix.triplet }} tree from prior runs.
-          # vcpkg's incremental install keys off the manifest only — it
-          # does NOT detect overlay-triplet content edits. We reconcile
-          # by wiping the install root whenever the recorded triplet
-          # hash drifts. Sentinel is parameterized on matrix.triplet so
-          # x64-windows-debug and x64-windows-release each get their own
-          # sentinel (and don't collide with the legacy x64-windows
-          # sentinel left over from pre-#375 state).
-          triplet="${{ matrix.triplet }}"
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/$triplet"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.${triplet}-triplet.sha256"
-          want=$(sha256sum "triplets/${triplet}.cmake" | awk '{print $1}')
+          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
+          # incremental install keys off the manifest only — it does NOT
+          # detect overlay-triplet content edits. So a triplet change
+          # like removing `VCPKG_BUILD_TYPE release` (which gates whether
+          # vcpkg builds the debug variant of every package) silently
+          # leaves the existing release-only tree in place, and the
+          # debug build then fails to link with LNK2038
+          # `RuntimeLibrary` / `_ITERATOR_DEBUG_LEVEL` mismatches against
+          # absl_*.lib.
+          #
+          # We reconcile by wiping the install root whenever the recorded
+          # triplet hash drifts from the current `triplets/x64-windows.cmake`
+          # SHA. The sentinel is a 1-line file under vcpkg_installed itself
+          # so it lives and dies with the tree it describes.
+          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
+          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
+          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
           have=$(cat "$sentinel" 2>/dev/null || echo "")
           if [[ "$want" != "$have" ]]; then
-            echo "$triplet sha256 drift: have=$have want=$want — wiping $installed_dir"
+            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
             rm -rf "$installed_dir"
             mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
             echo "$want" > "$sentinel"
           else
-            echo "$triplet sha256 unchanged ($want) — keeping persistent $installed_dir"
+            echo "x64-windows triplet sha256 unchanged ($want) — keeping persistent vcpkg_installed/x64-windows"
           fi
 
       - name: Install vcpkg packages
@@ -332,8 +332,8 @@ jobs:
           # CMake handle Windows-style paths fine. The bash run: block
           # below uses $GITHUB_WORKSPACE so backslash escape processing
           # doesn't strip the path.
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-debug/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows-debug
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
           # -Dcpp_std=vc++latest matches the existing ci.yml Windows job.
           # No --native-file — MSVC defaults pick up cl from the MSVC
@@ -344,7 +344,7 @@ jobs:
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
-            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows-debug" \
+            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
             -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)

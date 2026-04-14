@@ -48,10 +48,9 @@ recreate, the new PR numbers go in the **Recreated As** column.
 
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
-| 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
-| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | done in plumbing (commit `3960f46`); exposed #375 |
-| 0bb | n/a | —    | — | Per-build-type Windows triplets — fix Windows MSVC debug LNK2038 (#375) | **Gate (P0)** | Yes | in progress (folded into #373) |
-| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
+| 0a | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
+| 0b | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | in progress (folded into #373) |
+| 0c | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | pending |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
 | 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
@@ -239,22 +238,16 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** wait for PR #373's next CI cycle (after the
-> per-build-type triplet commit) to validate that Windows MSVC debug
-> AND release both link cleanly against per-triplet
-> `vcpkg_installed/x64-windows-{debug,release}/` trees. The first run
-> is COLD and slow because vcpkg has to build both new triplets from
-> scratch (~30-60 min on the 32-core self-hosted host) — subsequent
-> runs are fast.
+> **Next action:** wait for PR #373 (the reconcile, now also carrying
+> the ci.yml Windows MSVC self-hosted migration) to land. The new CI
+> cycle on `dev` will be the first run of `ci.yml` Windows MSVC on
+> `yuzu-local-windows` and is the canary for the migration. If it goes
+> green, merge #373 and proceed to Task #2 (recreate the 7 Dependabot
+> PRs against `dev`). If it goes red, triage the runner-migration
+> failure mode under issue #374 and Task #10.
 >
-> If the first run goes green, merge #373 and resume the rollout from
-> Task #2 (recreate the 7 Dependabot PRs against `dev`). #375 closes
-> on merge. If it goes red, triage the failure mode under #375 +
-> Task #10 and iterate.
->
-> The dependabot rollout (Tasks #2 through #9) is **PAUSED** until
-> #375 is fixed. Task #1 is done. Tasks #11–#13 are unblocked and can
-> run in parallel if anyone has cycles.
+> Task #1 is done. Task #2 (recreate cycle) is still pending and is
+> the next gate after #373 + Phase 0b merge.
 
 ## Sub-agent delegation pattern
 
@@ -288,37 +281,6 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
-- **2026-04-14 ~08:40 UTC** · Claude session · **Rollout PAUSED on P0 #375.**
-  The Phase 0b runner migration canary (commit `3960f46` on dev,
-  in PR #373) succeeded on every plumbing step — toolchain assertion,
-  45 GB disk check, force-fresh-vcpkg, vcpkg install, meson configure,
-  379 of 380 ninja steps. Then `tests/yuzu_server_tests.exe` linking
-  failed with LNK2038 release/debug variant mismatches against
-  `libprotobuf.lib`. Diagnosis: the `0fe5eac` LNK2038 fix on dev
-  (2026-04-13) was triplet-only and **incomplete** — it removed
-  `VCPKG_BUILD_TYPE release` so vcpkg builds both variants, but
-  meson's cmake dependency probe reads `IMPORTED_LOCATION_RELEASE`
-  from imported targets regardless of `--buildtype=debug`, so the
-  release static `libprotobuf.lib` gets linked into debug user code
-  and trips MSVC's `_ITERATOR_DEBUG_LEVEL` mismatch check. The
-  cancel-in-progress concurrency on dev was masking the failure
-  for an unknown duration: `gh run list --workflow ci.yml --limit
-  50 --jq '[.[] | select(.conclusion == "success")]'` returns an
-  empty array — **no successful ci.yml run on any branch in the
-  last 50 attempts**. Filed P0 issue #375. Course-correcting per
-  user direction (option A + D): pause the rollout, fix the build
-  via per-build-type triplets (`x64-windows-debug.cmake` +
-  `x64-windows-release.cmake`), validate end-to-end on the
-  yuzu-local-windows runner, then resume from a known-green
-  baseline. New tier 0bb added between 0b and 0c. Files added:
-  `triplets/x64-windows-{debug,release}.cmake`. Workflows updated:
-  `ci.yml` (Windows MSVC → matrix-driven triplet + per-triplet
-  install dir + force-fresh sentinel + Test step bin path), `release.yml`
-  (hardcoded `x64-windows-release`), `codeql.yml` (matrix entry
-  pinned to `x64-windows-debug`, force-fresh step parameterized on
-  `matrix.triplet`). The shared `triplets/x64-windows.cmake` is
-  retained as a fallback with an updated comment block pointing at
-  the new files and #375 history.
 - **2026-04-14 ~06:50 UTC** · Claude session · **Sequencing correction.**
   Operator caught that the runner-migration work (issue #374) is a
   force-multiplier for the rest of the rollout, not a follow-up: each
