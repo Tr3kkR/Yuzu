@@ -296,6 +296,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CodeQL workflow hardened to actually finish + parallel Windows
+  coverage (closes #370).** Every CodeQL run from 2026-03-23 to
+  2026-04-13 was cancelled by the 90-min timeout — 7 consecutive
+  cancellations across both manually-dispatched and PR-event-triggered
+  runs. The actual runtime on the `yuzu-wsl2-linux` self-hosted runner
+  is closer to 15 min for a Linux-only single-leg analysis (32-thread
+  WSL2 host, 60 GB RAM), but the prior workflow had been cancelling
+  before completing. Rebuilt as a `strategy.matrix` workflow that fans
+  out to BOTH self-hosted runners in parallel: `yuzu-wsl2-linux`
+  (gcc-13 + `build-linux-codeql/`) and `yuzu-local-windows`
+  (MSVC + `build-windows-codeql/`), with `fail-fast: false` so one
+  leg failing doesn't kill the other. Each leg uploads SARIF with a
+  distinct category (`/language:c-cpp-linux` vs `/language:c-cpp-windows`)
+  so findings in platform-specific `#ifdef _WIN32` branches stay
+  attributed to the analysis that actually observed them. Closes #370.
+
+  Coverage knobs flipped to maximum:
+  - `queries: +security-and-quality` (strict superset of
+    `security-extended`; for C/C++ specifically, the "quality"
+    queries are security-adjacent — memory leaks, UAF, null deref,
+    dead code hiding logic bugs, inconsistent error handling — not
+    style noise like they would be for JS/Python)
+  - `languages: c-cpp,actions` on the Linux leg (Windows leg keeps
+    `c-cpp` only — no need to double-scan the same
+    `.github/workflows/*.yml` files; the `actions` extractor catches
+    the well-known `${{ github.event.* }}` template-injection class
+    in workflow `run:` bodies)
+  - `-Dbuild_tests=true` (recovers the ~50-100 `tests/unit/*.cpp`
+    files that were skipped in the earlier `build_tests=false`
+    baseline run, which scanned only 231/364 C++ files)
+  - Dedicated per-OS build dirs (`build-linux-codeql/` /
+    `build-windows-codeql/`) isolated from operator's interactive
+    `build-{linux,windows}/` and from PR2's
+    `build-linux-{asan,tsan,coverage}/`
+  - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB
+    Windows; MSVC debug builds are chunkier)
+  - Weekly scheduled run (Sunday 04:00 UTC) + manual `workflow_dispatch`
+  - `timeout-minutes` tightened from 240 (speculation based on
+    GitHub-hosted runner assumptions) to 90 (verified comfortably
+    above the real cold runtime)
+
+  Fixes accumulated during the matrix landing — each is a category
+  of GHA / Windows / bash interaction that took a verification run to
+  surface, all preserved in commit history for the next person who
+  hits one:
+  - **`${{ github.workspace }}` doesn't expand inside matrix
+    `include:` values** — collapsed to literal `/vcpkg_installed/x64-linux`
+    on Linux, breaking CMake's protobuf probe with "Preliminary CMake
+    check failed". Fix: inline `${{ github.workspace }}` directly in
+    each step's `env:` block (where it DOES evaluate) or use
+    `$GITHUB_WORKSPACE` in `run:` blocks.
+  - **`defaults.run.shell: bash` on the Windows self-hosted runner
+    resolves to `C:\Windows\system32\bash.EXE`** (WSL bash), which
+    refuses to run as `LOCAL SYSTEM` with
+    `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`. Fix: per-leg `shell:` matrix
+    variable; Windows uses explicit
+    `'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'`
+    (CLAUDE.md's documented Windows development shell).
+  - **`hashFiles('**/*.cpp', '**/*.hpp', '**/*.h')` exceeds GHA's
+    hard 120-second timeout** on the persistent NTFS Windows runner
+    workspace because `vcpkg_installed/` accumulates thousands of
+    vendored headers from gRPC/protobuf/abseil/openssl/etc. across
+    runs. Linux-hosted CI in `ci.yml` doesn't hit the limit because
+    GitHub-hosted runners get a fresh workspace per run. Fix: hash
+    only build-system config files (`meson.build`, `meson_options.txt`,
+    `vcpkg.json`, `vcpkg-configuration.json`, `meson/native/*.ini`,
+    `meson/cross/*.ini`) — small, fast, and the only inputs that
+    should rotate the GHA ccache slot. ccache itself handles
+    source-level invalidation via content addressing.
+  - **`${{ github.workspace }}` interpolated into bash `run:` source
+    has its backslashes stripped by bash's escape processing on
+    Windows** — the path `C:\actions-runner\_work\Yuzu\Yuzu` becomes
+    `C:actions-runner_workYuzuYuzu` because `\a`, `\Y`, `\_` etc. are
+    parsed as escape sequences. Fix: use `$GITHUB_WORKSPACE` (env var
+    read at runtime — no escape processing) instead of
+    `${{ github.workspace }}` (GHA source interpolation at parse time)
+    in bash `run:` blocks.
+  - **`sanitizer-tests.yml` runner label was wrong** —
+    `runs-on: [self-hosted, yuzu-wsl2-linux]` was the original PR2
+    pattern, but the runner's actual labels are
+    `["self-hosted", "X64", "Linux"]` (no custom `yuzu-wsl2-linux`
+    label exists; that string is the runner NAME, not a label). Gate 3
+    build-ci review called the pattern "correct" without verifying
+    against `gh api /runners`. Fixed both `codeql.yml` and
+    `sanitizer-tests.yml` to use `[self-hosted, Linux, X64]` which
+    matches the runner's real label set. The `sanitizer-gate.sh
+    --expect-runner` check compares `runner_name` (not labels) via
+    `gh api /jobs`, which correctly matches `yuzu-wsl2-linux` as the
+    runner's name, so that check is unaffected.
+
 - **Migration failure now closes the affected store (#339).** When
   `MigrationRunner::run()` returns false for a store that owns its
   SQLite handle (26 of 30 stores), the store's `create_tables()` closes
