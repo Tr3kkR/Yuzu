@@ -88,40 +88,114 @@ build_tests    = get_option('build_tests')
 # load-bearing for build log readability — without it the gRPC / abseil /
 # protobuf deprecation warnings drown out our own code warnings and force a
 # grep-for-error filter workflow. Our own code remains under `warning_level=3`.
-# Windows needs CMAKE_BUILD_TYPE forced in meson's cmake dep probe so
-# vcpkg's static-imported targets (protobuf::libprotobuf, gRPC::grpc++)
-# select IMPORTED_LOCATION_DEBUG vs IMPORTED_LOCATION_RELEASE to match
-# the /MDd vs /MD user code. Without this, meson's cmake probe reads
-# IMPORTED_LOCATION_RELEASE regardless of --buildtype and debug builds
-# link against release static libs, tripping LNK2038 RuntimeLibrary /
-# _ITERATOR_DEBUG_LEVEL mismatches (#375). Linux/macOS are fine without
-# this because gcc/clang don't have MSVC's runtime-library variant ABI
-# — debug user code can safely link against release-built .a static libs.
 if host_os == 'windows'
-  if get_option('buildtype') == 'debug'
-    cmake_windows_build_type = ['-DCMAKE_BUILD_TYPE=Debug']
-  else
-    cmake_windows_build_type = ['-DCMAKE_BUILD_TYPE=Release']
-  endif
-else
-  cmake_windows_build_type = []
-endif
+  # ──────────────────────────────────────────────────────────────────────
+  # #375 option D: bypass meson's cmake dep for protobuf/grpc on Windows.
+  # ──────────────────────────────────────────────────────────────────────
+  # Meson's cmake dependency translator reads IMPORTED_LOCATION_RELEASE
+  # from vcpkg's imported targets regardless of --buildtype=debug, so a
+  # debug build with `dependency('protobuf', method: 'cmake', ...)` would
+  # link release-CRT static libs into /MDd debug user code and trip
+  # dozens of LNK2038 RuntimeLibrary mismatches. Dropping the triplet's
+  # static-linkage override doesn't help either — vcpkg's grpc port
+  # forces static regardless, and grpc.lib's embedded abseil template
+  # symbols collide with abseil_dll.lib exports on release builds,
+  # producing LNK2005 duplicate symbol errors. The only configuration
+  # that threads both needles is static linkage in triplets/x64-windows.cmake
+  # + this explicit find_library() wiring with build-type-conditional
+  # search dirs. Keep BOTH halves in sync; neither can be simplified
+  # alone. Full diagnosis:
+  #   .claude/agents/build-ci.md "Windows MSVC static-link history and #375"
+  # Strategic escape (P1): #376 "Migrate transport off gRPC to QUIC".
 
-grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
-  cmake_args: cmake_windows_build_type, required: false, include_type: 'system')
-if not grpcpp_dep.found()
-  grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
-    include_type: 'system')
-endif
-protobuf_cmake_args = cmake_windows_build_type
-if host_os == 'windows'
-  protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
-endif
-protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
-  cmake_args: protobuf_cmake_args, required: false, include_type: 'system')
-if not protobuf_dep.found()
-  protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
-    include_type: 'system')
+  _cxx = meson.get_compiler('cpp')
+  _vcpkg_root_win    = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'
+  _vcpkg_include_win = _vcpkg_root_win / 'include'
+  if get_option('buildtype') == 'debug'
+    _vcpkg_lib_win = _vcpkg_root_win / 'debug' / 'lib'
+    _pbd = 'd'   # vcpkg convention: libprotobufd.lib / libprotobuf-lited.lib / libprotocd.lib / libupbd.lib
+  else
+    _vcpkg_lib_win = _vcpkg_root_win / 'lib'
+    _pbd = ''
+  endif
+
+  # Enumerate absl_*.lib at configure time via python glob. The transitive
+  # absl dep closure of protobuf+grpc is ~40 libs and shifts between
+  # abseil versions; hand-listing would be a maintenance burden. Enumerating
+  # here means a vcpkg abseil bump doesn't need a parallel meson.build edit.
+  _py = find_program('python3')
+  _absl_enum = run_command(
+    _py, '-c',
+    'import glob, os, sys\n' +
+    'for p in sorted(glob.glob(os.path.join(sys.argv[1], "absl_*.lib"))):\n' +
+    '    print(os.path.splitext(os.path.basename(p))[0])\n',
+    _vcpkg_lib_win,
+    check: true,
+  )
+  _absl_names = _absl_enum.stdout().strip().split('\n')
+  if _absl_names.length() == 0 or (_absl_names.length() == 1 and _absl_names[0] == '')
+    error('#375 option D: no absl_*.lib files found in @0@ — vcpkg install may be incomplete'.format(_vcpkg_lib_win))
+  endif
+  message('#375 option D: enumerated @0@ abseil libs from @1@'.format(_absl_names.length(), _vcpkg_lib_win))
+  _absl_deps = []
+  foreach _absl_name : _absl_names
+    _absl_deps += _cxx.find_library(_absl_name, dirs: [_vcpkg_lib_win], required: true)
+  endforeach
+
+  # Protobuf core + transitive utf8_range.
+  _libprotobuf      = _cxx.find_library('libprotobuf'      + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libprotobuf_lite = _cxx.find_library('libprotobuf-lite' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libprotoc        = _cxx.find_library('libprotoc'        + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libupb           = _cxx.find_library('libupb'           + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libutf8_range    = _cxx.find_library('utf8_range',              dirs: [_vcpkg_lib_win], required: true)
+  _libutf8_validity = _cxx.find_library('utf8_validity',           dirs: [_vcpkg_lib_win], required: true)
+
+  # gRPC core + C++ API + transitive re2 / c-ares / address_sorting.
+  _libgrpc             = _cxx.find_library('grpc',             dirs: [_vcpkg_lib_win], required: true)
+  _libgrpcpp           = _cxx.find_library('grpc++',           dirs: [_vcpkg_lib_win], required: true)
+  _libgpr              = _cxx.find_library('gpr',              dirs: [_vcpkg_lib_win], required: true)
+  _libaddress_sorting  = _cxx.find_library('address_sorting',  dirs: [_vcpkg_lib_win], required: true)
+  _libre2              = _cxx.find_library('re2',              dirs: [_vcpkg_lib_win], required: true)
+  _libcares            = _cxx.find_library('cares',            dirs: [_vcpkg_lib_win], required: true)
+
+  # Construct the meson dep objects yuzu's build graph consumes. These
+  # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
+  # method: 'cmake')` calls that Linux/macOS use — those paths are
+  # unreachable on Windows.
+  protobuf_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win, is_system: true),
+    dependencies: [
+      _libprotobuf, _libprotobuf_lite, _libprotoc, _libupb,
+      _libutf8_range, _libutf8_validity,
+    ] + _absl_deps,
+  )
+  grpcpp_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win, is_system: true),
+    dependencies: [
+      _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
+      _libre2, _libcares,
+      # grpc transitively uses protobuf and upb; include them so consumers
+      # that only pull in grpcpp_dep still see protobuf's symbols.
+      _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,
+    ] + _absl_deps,
+  )
+else
+  # Linux/macOS: meson's cmake dep method works correctly because gcc/clang
+  # don't have MSVC's runtime-library variant ABI — debug user code can
+  # safely link against release-built .a static libs, and the cmake dep
+  # translator's IMPORTED_LOCATION_RELEASE bias is harmless.
+  grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
+    required: false, include_type: 'system')
+  if not grpcpp_dep.found()
+    grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
+      include_type: 'system')
+  endif
+  protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
+    required: false, include_type: 'system')
+  if not protobuf_dep.found()
+    protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
+      include_type: 'system')
+  endif
 endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')

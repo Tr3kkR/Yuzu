@@ -50,7 +50,7 @@ recreate, the new PR numbers go in the **Recreated As** column.
 |---|---|---|---|---|---|---|---|
 | 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
 | 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | plumbing done (commit `3960f46`); exposed #375 |
-| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option H: drop static linkage override for grpc stack | **Gate (P0)** | Yes | in progress (folded into #373) |
+| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option D: static triplet + hand-rolled `cxx.find_library()` for grpc/protobuf | **Gate (P0)** | Yes | in progress (folded into #373) |
 | 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
 | 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
 | 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
@@ -239,27 +239,46 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** wait for PR #373's next CI cycle (after the option H
-> triplet change) to validate that Windows MSVC debug links cleanly
-> now that protobuf/grpc/abseil are DLLs + import libs instead of
-> static libs with CRT-variant baggage. The first cycle is **cold** —
-> vcpkg has to rebuild all the affected ports against the new triplet
-> hash, estimated 30-60 min on the 32-core self-hosted host.
+> **Next action:** wait for PR #373's next CI cycle (after the option D
+> commit — triplet static-linkage restored + Windows-only
+> `cxx.find_library()` branch in `meson.build`) to validate that
+> Windows MSVC debug AND release both link cleanly. The first cycle
+> is **cold** — vcpkg has to rebuild everything again against the
+> restored triplet (sha256 drift forces the force-fresh step to wipe
+> `vcpkg_installed/x64-windows`), estimated 30-60 min on the 32-core
+> self-hosted host. Subsequent cycles hit the binary cache and run
+> fast.
 >
-> If green: merge #373, close #375, resume the rollout from Task #2
-> (recreate the 7 Dependabot PRs against `dev`).
+> If green on BOTH debug and release: merge #373, close #375, resume
+> the rollout from Task #2 (recreate the 7 Dependabot PRs against
+> `dev`). Close #375 with a pointer at the build-ci.md option D
+> documentation.
 >
-> If red with abseil DLL symbol conflicts: fall back to **option D**
-> — drop meson's cmake dep method for protobuf/grpc on Windows only,
-> use `cxx.find_library()` with build-type-conditional search dirs.
-> More invasive (must list ~35 absl_*.lib transitive deps explicitly)
-> but bypasses both the meson cmake-dep translation limitation and
-> the DLL symbol conflict class of errors. Documented in the triplet
-> comment as the next fallback.
+> If red: the failure mode is diagnostic, not another round of
+> trial-and-error. Inspect the actual error:
+> - LNK2038 on `libprotobuf*.lib` / `absl_*.lib` → the find_library
+>   wiring isn't picking the right build-type dir. Check that
+>   `_vcpkg_lib_win` was set correctly at configure time and that
+>   `_pbd` carries the `d` suffix for debug.
+> - LNK2005 abseil duplicate symbols → the static override didn't
+>   restore. Check `triplets/x64-windows.cmake` has the `PORT MATCHES`
+>   block back. Check vcpkg rebuilt the install tree (force-fresh
+>   sentinel should have fired on the triplet sha256 drift).
+> - Unresolved external symbol / LNK2019 → the transitive absl list
+>   is missing a lib that yuzu's code actually uses. Check the
+>   symbol in the error message, find which abseil component owns
+>   it (e.g. `absl::base::internal::SpinLockWait` → `absl_spinlock_wait`),
+>   verify it's in `vcpkg_installed/x64-windows/lib/` via the
+>   inspect-vcpkg.sh diagnostic, and if it IS there but not being
+>   picked up by the `glob('absl_*.lib')` enumeration, investigate
+>   why (e.g. naming convention, platform filter).
+> - Something else → new failure mode. Document in build-ci.md
+>   timeline table and iterate.
 >
 > Task #1 is done. Tasks #2–#9 (dependabot rollout) are **PAUSED**
 > until #375 is fixed. Tasks #11–#13 are unblocked and can run in
-> parallel if anyone has cycles.
+> parallel if anyone has cycles. Strategic move off gRPC is tracked
+> as P1 #376, deferred.
 
 ## Sub-agent delegation pattern
 
@@ -293,6 +312,48 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~12:40 UTC** · Claude session · **Option H failed on release
+  with LNK2005, switching to option D.** The option H push CI run on
+  `d3c0b80` completed with a mixed result the PR CI run hadn't shown:
+  Windows MSVC debug passed (6/7 tests green, only gateway CT failed on
+  hex.pm flake), but Windows MSVC release failed with dozens of
+  LNK2005 duplicate symbol errors — `grpc.lib(*.cc.obj)` and
+  `grpc++.lib(*.cc.obj)` defining `absl::lts_20260107::Mutex::Dtor`
+  "already defined in abseil_dll.lib(abseil_dll.dll)". Root cause:
+  vcpkg's grpc port forces static linkage regardless of
+  `VCPKG_LIBRARY_LINKAGE` (it logs `-- Note: grpc only supports static
+  library linkage`), and abseil's inlined template symbols get embedded
+  directly into grpc.lib's object files at grpc's compile time. When
+  the linker pulls in both `grpc.lib` (with embedded absl symbols) and
+  `abseil_dll.lib` (re-exporting them from the DLL), LNK2005 fires.
+  The historical "abseil DLL symbol conflicts" warning in the original
+  triplet comment was **accurate and still current** for abseil
+  `20260107.1` — modern abseil does NOT resolve the conflict for
+  vcpkg's grpc port static-build case. Why debug tolerated the
+  collision and release with LTO did not is unclear; we did not
+  investigate further because (a) academic curiosity wasn't worth
+  another CI cycle against a known-failing approach, and (b) even if
+  debug-with-LTO-off happened to work it would be a "limping
+  production build" customers should not ship. **Option H reverted
+  in `895336e`, then the doc correction + option D planning landed in
+  `ceb7690` + `2916947`.**
+  **Option D** — restore the static-linkage override on the
+  `x64-windows` triplet AND bypass meson's cmake dep method on Windows
+  for protobuf/grpc by declaring the deps manually via
+  `cxx.find_library()` with build-type-conditional search dirs. This
+  threads both failure modes simultaneously: static linkage avoids the
+  LNK2005 abseil-DLL-vs-grpc-embedded-absl conflict (no DLL in the
+  install tree → no cross-boundary duplicate symbol), and the
+  hand-rolled find_library avoids LNK2038 (meson is told exactly which
+  .lib to link for each build type, so the cmake-dep translator's
+  release-path bias doesn't get to choose). Linux/macOS continue to
+  use `dependency('protobuf', method: 'cmake', ...)` unchanged because
+  gcc/clang don't have MSVC's runtime-library variant ABI. The
+  transitive absl closure is enumerated at configure time via
+  `run_command(python3 -c 'import glob; ...' )` so a vcpkg abseil
+  bump doesn't require a parallel meson.build edit. **Strategic escape
+  tracked as P1 issue #376** — migrate transport off gRPC to QUIC,
+  deferred until customer commitments ship.
 - **2026-04-14 ~11:55 UTC** · Claude session · **Option B failed the same
   way, switching to option H.** The option B CI cycle (commit `1445cdb`)
   confirmed the root cause is a **meson cmake-dep translation limitation**,
