@@ -204,9 +204,18 @@ jobs:
           # the cache wins and the other job links its user code (compiled
           # with /MDd vs /MD and _ITERATOR_DEBUG_LEVEL=2 vs =0) against the
           # wrong absl_*.lib variant, producing dozens of LNK2038 errors.
+          #
+          # `triplets/*.cmake` is also in the hash because the triplet
+          # controls VCPKG_BUILD_TYPE / linkage / overlay knobs that
+          # change which variants vcpkg emits into vcpkg_installed/. A
+          # silent triplet edit (e.g. f0bb58b's `VCPKG_BUILD_TYPE release`,
+          # which broke every Windows debug build for 4 days) must bust
+          # this cache or every subsequent run restores the poisoned
+          # release-only tree and re-fails identically.
+          #
           # The legacy build-type-less restore key is intentionally NOT in
           # restore-keys so we can't silently fall back to a poisoned cache.
-          key: vcpkg-x64-windows-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-windows-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
             vcpkg-x64-windows-${{ matrix.build_type }}-
 

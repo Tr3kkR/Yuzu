@@ -455,6 +455,66 @@ patch._
 
 ### Fixed
 
+- **Windows MSVC debug builds: removed `VCPKG_BUILD_TYPE release` from
+  `triplets/x64-windows.cmake`, ending a 4-day Windows debug outage.**
+  Commit `f0bb58b` (2026-04-10, "skip debug vcpkg variants") added
+  `set(VCPKG_BUILD_TYPE release)` to the Windows overlay triplet to
+  halve release-build vcpkg install time. The flag tells vcpkg to skip
+  building the debug variant of every package, leaving only release-CRT
+  binaries (`/MD`, `_ITERATOR_DEBUG_LEVEL=0`) in
+  `vcpkg_installed/x64-windows/`. Our debug build compiles user code
+  with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`, and MSVC's linker refuses
+  to mix the two — every Windows MSVC debug job from `f0bb58b` onward
+  failed with dozens of LNK2038 `RuntimeLibrary` /
+  `_ITERATOR_DEBUG_LEVEL` mismatch errors against `absl_cord.lib`,
+  `absl_cord_internal.lib`, and friends. The CI matrix had **zero
+  successful runs on `dev` for 4 days** (2026-04-10 → 2026-04-14).
+  PR #355's `vcpkg-x64-windows-${{ matrix.build_type }}-…` cache key
+  separation addressed a related cross-job cache contamination but
+  did not fix the underlying triplet — both debug and release jobs
+  still pulled release-only `vcpkg_installed/` trees because that's
+  all the triplet emitted. The CodeQL Windows matrix leg also tripped
+  on this once it got past path/shell quirks.
+
+  Three coordinated changes:
+  - **`triplets/x64-windows.cmake`**: removed
+    `set(VCPKG_BUILD_TYPE release)` and added a doc-comment block
+    explaining why it must NOT be set, with explicit pointer at the
+    f0bb58b regression so the next person tempted by the install-time
+    optimization knows what they'd break. The Linux triplet
+    (`x64-linux-static.cmake`) keeps its `VCPKG_BUILD_TYPE release`
+    because gcc/clang don't have MSVC's runtime-library variant ABI —
+    debug user code links against release-built `.a` static libs
+    without complaint.
+  - **`.github/workflows/ci.yml`**: added `triplets/*.cmake` to the
+    Windows vcpkg cache key's `hashFiles(...)` so the next run busts
+    the cache and pulls a fresh install instead of restoring the
+    release-only tree. Without this, the GHA cache would silently
+    return the poisoned content under the same key and the fix would
+    look like it didn't take. Other vcpkg cache keys (linux, macOS,
+    sanitizer/coverage variants) were left alone because they all use
+    `--triplet x64-linux` / `--triplet arm64-osx` (vcpkg's built-in
+    triplets), not the project's overlay triplets, so triplet-content
+    drift cannot affect them.
+  - **`.github/workflows/codeql.yml`**: added a "Force fresh vcpkg
+    install when triplet changed (windows only)" step that compares
+    `sha256 triplets/x64-windows.cmake` against a sentinel file under
+    `vcpkg_installed/.x64-windows-triplet.sha256` and `rm -rf`s the
+    install root on drift. The CodeQL workflow doesn't use GHA cache
+    for `vcpkg_installed/` — it relies on the persistent self-hosted
+    Windows runner state — so vcpkg's incremental install would
+    otherwise silently reuse the release-only tree on the runner's
+    disk forever. Subsequent runs after the sha256 stabilises return
+    to fast persistent reuse.
+
+  Tradeoff: Windows vcpkg install will now build BOTH debug and
+  release variants of every package, doubling the cold-cache install
+  time. The cost is amortized by the GHA cache (warm restores stay
+  fast) and is the right tradeoff against having no green Windows CI
+  at all. If the install-time optimization is wanted back, do it via
+  per-build-type triplets (`x64-windows-release` for the release
+  matrix leg only) — never on the shared default.
+
 - **`scripts/test/` harness bugs discovered running `/test --full`
   against uncommitted #339.** Three PR1 harness fixes that landed the
   headline upgrade test at green:
