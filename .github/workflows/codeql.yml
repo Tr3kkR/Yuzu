@@ -99,7 +99,7 @@ jobs:
             ccache_path: ~/.cache/ccache
             ccache_key_prefix: ccache-codeql-linux
             disk_min_gb: 40
-            cmake_prefix: ${{ github.workspace }}/vcpkg_installed/x64-linux
+            shell: bash
           - os: windows
             runner: [self-hosted, Windows, X64]
             triplet: x64-windows
@@ -113,15 +113,20 @@ jobs:
             ccache_path: ~\AppData\Local\ccache
             ccache_key_prefix: ccache-codeql-windows
             disk_min_gb: 45
-            cmake_prefix: ${{ github.workspace }}/vcpkg_installed/x64-windows
+            # The default `shell: bash` on a self-hosted Windows runner
+            # resolves to C:\Windows\system32\bash.EXE which is WSL
+            # bash. WSL refuses to run as LOCAL SYSTEM (the runner's
+            # service account) with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED.
+            # Bypass by explicitly pointing at MSYS2 bash, which is
+            # CLAUDE.md's documented Windows development shell and is
+            # already installed on the runner (C:\msys64\usr\bin\bash.exe).
+            shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
-        # bash on both platforms. Windows self-hosted runner must have
-        # MSYS2 or git-bash on PATH (per CLAUDE.md, MSYS2 bash is the
-        # documented Windows development shell). Using bash everywhere
-        # keeps the assertion/disk-check/compile steps portable.
-        shell: bash
+        # Per-leg shell override — see the matrix `shell:` values above
+        # for why Windows can't use the default `bash` keyword.
+        shell: ${{ matrix.shell }}
 
     steps:
       - uses: actions/checkout@v6
@@ -237,8 +242,15 @@ jobs:
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
+          # ${{ github.workspace }} is inlined directly in step env (NOT
+          # via `matrix.cmake_prefix`) because matrix include values do
+          # not expand workflow context expressions. The previous
+          # iteration of this file used matrix.cmake_prefix and CMake's
+          # protobuf probe failed with "Preliminary CMake check failed"
+          # because CMAKE_PREFIX_PATH resolved to literal
+          # "/vcpkg_installed/x64-linux" (workspace prefix dropped).
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ matrix.cmake_prefix }}
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux
         run: |
           # build_tests=true recovers tests/unit/*.cpp coverage (the
           # 2026-04-13 baseline run scanned only 231/364 files because
@@ -246,7 +258,7 @@ jobs:
           meson setup ${{ matrix.build_dir }} \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ matrix.cmake_prefix }} \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
             -Dbuild_tests=true
 
       - name: Configure (Meson debug) — windows
@@ -254,8 +266,10 @@ jobs:
         env:
           CC: ccache cl
           CXX: ccache cl
+          # Same workspace-inline pattern as the linux step above —
+          # matrix include values do not expand ${{ github.workspace }}.
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows/lib/pkgconfig
-          CMAKE_PREFIX_PATH: ${{ matrix.cmake_prefix }}
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
           # -Dcpp_std=vc++latest matches the existing ci.yml Windows job.
           # No --native-file — MSVC defaults pick up cl from the MSVC
@@ -266,7 +280,7 @@ jobs:
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
-            -Dcmake_prefix_path=${{ matrix.cmake_prefix }} \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows \
             -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)
