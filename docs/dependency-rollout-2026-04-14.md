@@ -239,46 +239,69 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Next action:** wait for PR #373's next CI cycle (after the option D
-> commit — triplet static-linkage restored + Windows-only
-> `cxx.find_library()` branch in `meson.build`) to validate that
-> Windows MSVC debug AND release both link cleanly. The first cycle
-> is **cold** — vcpkg has to rebuild everything again against the
-> restored triplet (sha256 drift forces the force-fresh step to wipe
-> `vcpkg_installed/x64-windows`), estimated 30-60 min on the 32-core
-> self-hosted host. Subsequent cycles hit the binary cache and run
-> fast.
+> **Session handoff 2026-04-14 ~16:30 UTC.** Option D fully validated
+> on both Windows MSVC debug AND release on commit `220e7bd` — every
+> C++ target links, every C++ test passes (yuzu:agent unit tests,
+> yuzu:server unit tests, yuzu:gateway ct). The only remaining failure
+> on both variants is `yuzu:gateway eunit` failing on a hex.pm fetch
+> flake (rebar3 intermittently fails to fetch meck 0.9.2 or
+> proper 1.4.0 from hexpm — confirmed not a Yuzu regression). Commit
+> `b33f1df` adds a pre-fetch + retry wrapper to `scripts/test_gateway.py`
+> with exponential backoff, which should close that gap. CI on
+> `b33f1df` is queued as of handoff (push CI run `24412646165`, PR CI
+> run `24412648443`).
 >
-> If green on BOTH debug and release: merge #373, close #375, resume
-> the rollout from Task #2 (recreate the 7 Dependabot PRs against
-> `dev`). Close #375 with a pointer at the build-ci.md option D
-> documentation.
+> **Next action:** wait for the `b33f1df` CI cycle to complete on
+> `yuzu-local-windows`. Expected outcome:
+> - Vcpkg install: cache hit (no triplet drift since 220e7bd, only
+>   change is scripts/test_gateway.py)
+> - Configure (Meson): same enumeration as 220e7bd, success
+> - Build: same as 220e7bd, both debug + release link cleanly
+> - Test: pre-fetch step in test_gateway.py runs `rebar3 as test
+>   compile --deps_only` with retry, populates rebar3 user cache
+>   from hex.pm (with retries handling flake), then the actual
+>   `gateway eunit` and `gateway ct` tests find their deps locally
+>   and run cleanly. Total expected: 7/7 PASS, OR 6/7 with an OTP 25
+>   CT race that the existing test_gateway.py detection swallows.
 >
-> If red: the failure mode is diagnostic, not another round of
-> trial-and-error. Inspect the actual error:
-> - LNK2038 on `libprotobuf*.lib` / `absl_*.lib` → the find_library
->   wiring isn't picking the right build-type dir. Check that
->   `_vcpkg_lib_win` was set correctly at configure time and that
->   `_pbd` carries the `d` suffix for debug.
-> - LNK2005 abseil duplicate symbols → the static override didn't
->   restore. Check `triplets/x64-windows.cmake` has the `PORT MATCHES`
->   block back. Check vcpkg rebuilt the install tree (force-fresh
->   sentinel should have fired on the triplet sha256 drift).
-> - Unresolved external symbol / LNK2019 → the transitive absl list
->   is missing a lib that yuzu's code actually uses. Check the
->   symbol in the error message, find which abseil component owns
->   it (e.g. `absl::base::internal::SpinLockWait` → `absl_spinlock_wait`),
->   verify it's in `vcpkg_installed/x64-windows/lib/` via the
->   inspect-vcpkg.sh diagnostic, and if it IS there but not being
->   picked up by the `glob('absl_*.lib')` enumeration, investigate
->   why (e.g. naming convention, platform filter).
-> - Something else → new failure mode. Document in build-ci.md
->   timeline table and iterate.
+> If green: **merge PR #373** (squash or merge-commit, see #369 for
+> the recent reconcile pattern), **close #375** with a pointer at
+> `.claude/agents/build-ci.md` "Windows MSVC static-link history and
+> #375" as the lessons-learned record, and **dispatch Task #2** —
+> the dependabot recreate cycle. Tasks #3 → #9 are then unblocked
+> in tier order per this doc's Tier Table.
 >
-> Task #1 is done. Tasks #2–#9 (dependabot rollout) are **PAUSED**
-> until #375 is fixed. Tasks #11–#13 are unblocked and can run in
-> parallel if anyone has cycles. Strategic move off gRPC is tracked
-> as P1 #376, deferred.
+> If red on the hex.pm pre-fetch path: the test_gateway.py logic is
+> in the file at `scripts/test_gateway.py` lines ~78-150. Check the
+> CI log for "Pre-fetching rebar3 test-profile deps" — that's the
+> sentinel string from the new pre-fetch step. If you see retries
+> logged but every retry fails, hex.pm is genuinely down (rare); if
+> you see no retries logged, the script change isn't being picked
+> up (cache or build_dir issue). The script is the canonical wrapper
+> for all gateway test invocations, so a fix here propagates to
+> every consumer.
+>
+> If red on a NEW failure mode: it's a new transitive lib surfacing
+> in option D's hand-rolled `cxx.find_library()` list. Apply the
+> same iteration pattern as the option D refinement chain
+> (a61a787 → 713ae8c → 46ea61f → 220e7bd): identify the missing
+> symbol class, locate the corresponding lib in
+> `vcpkg_installed/x64-windows/{lib,debug/lib}/` via the
+> inspect-vcpkg.sh diagnostic, add a find_library call with the
+> right `_pbd` suffix (or no suffix — see meson.build comment at
+> the zlib block for the convention table), commit, push.
+>
+> Task #1 done. Task #14 done (option D validated). Tasks #2-#9
+> (dependabot rollout) **PAUSED** pending #375 closure on this
+> next CI cycle. Tasks #11-#13 unblocked anytime. Task #15
+> (hex.pm hardening) is the in-flight `b33f1df` work. Task #16
+> (move off gRPC) deferred per P1 #376.
+>
+> The session that owned this work from 05:00 to 16:30 UTC handed
+> off to a fresh session here. Welcome — the durable state is in
+> good shape. Read this doc end-to-end, check `.claude/agents/build-ci.md`
+> for the option D long-form, then `gh run view 24412646165` (push)
+> or `24412648443` (PR) to see where the b33f1df cycle landed.
 
 ## Sub-agent delegation pattern
 
@@ -312,6 +335,27 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-14 ~16:30 UTC** · Claude session · **Session handoff. Option D
+  fully validated on commit `220e7bd` for both Windows MSVC debug and
+  release.** End state: every C++ target links cleanly on both variants
+  (no LNK2038, no LNK2005, no LNK2019), every C++ test passes
+  (`yuzu:agent unit tests`, `yuzu:server unit tests`, `yuzu:gateway ct`).
+  The only remaining failure is `yuzu:gateway eunit` failing on
+  intermittent hex.pm fetch flake (rebar3 fails to fetch meck or
+  proper from hexpm — varies per run, classic transient flake).
+  Commit `b33f1df` adds a pre-fetch + retry wrapper to
+  `scripts/test_gateway.py` (4-attempt exponential backoff on hex.pm
+  failures, populates rebar3's user cache before the actual test runs)
+  to close the hex.pm gap. CI for `b33f1df` is queued at handoff —
+  push run `24412646165`, PR run `24412648443`. Next session picks up
+  by watching that cycle, then merging #373 and dispatching Task #2
+  if green. The full option D iteration history (12e40ae → a61a787 →
+  713ae8c → 46ea61f → 220e7bd → b33f1df) demonstrates the pattern
+  for adding new transitive libs to option D's `cxx.find_library()`
+  list — see `.claude/agents/build-ci.md` "Windows MSVC static-link
+  history and #375" for the long form. P1 #376 (move off gRPC to
+  QUIC) remains the strategic escape but is deferred until customer
+  commitments ship.
 - **2026-04-14 ~12:40 UTC** · Claude session · **Option H failed on release
   with LNK2005, switching to option D.** The option H push CI run on
   `d3c0b80` completed with a mixed result the PR CI run hadn't shown:
