@@ -187,7 +187,23 @@ jobs:
         with:
           save-always: true
           path: ${{ matrix.ccache_path }}
-          key: ${{ matrix.ccache_key_prefix }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          # NOTE: the obvious pattern hashFiles('**/*.cpp', '**/*.hpp',
+          # '**/*.h') exceeds GitHub's 120s hashFiles timeout on the
+          # self-hosted Windows runner because the persistent workspace
+          # accumulates vcpkg_installed/ across runs (thousands of
+          # vendored headers from gRPC, protobuf, abseil, etc.) and the
+          # NTFS recursive walk is too slow. ci.yml gets away with the
+          # broad pattern because GitHub-hosted runners have a fresh
+          # workspace per run.
+          #
+          # We hash only the build-system config files (meson.build,
+          # meson_options.txt, vcpkg.json, vcpkg-configuration.json,
+          # meson native/cross files) — these are small, fast, and the
+          # only inputs that should rotate the ccache slot. ccache
+          # handles source-level invalidation internally via content
+          # hashing, so the GHA cache key only needs to differ when the
+          # build configuration meaningfully changes.
+          key: ${{ matrix.ccache_key_prefix }}-${{ hashFiles('meson.build', 'meson_options.txt', 'vcpkg.json', 'vcpkg-configuration.json', 'meson/native/*.ini', 'meson/cross/*.ini') }}
           restore-keys: |
             ${{ matrix.ccache_key_prefix }}-
 
