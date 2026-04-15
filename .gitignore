@@ -85,7 +85,9 @@ build_log.txt
 .uat-sanitizer/
 *.local.md
 docker-compose.local.yml
-.codex
+.codex/*
+!.codex/skills/
+!.codex/skills/**
 test_output.txt
 test_xml.txt
 update.finished

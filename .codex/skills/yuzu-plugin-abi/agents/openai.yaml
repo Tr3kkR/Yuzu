@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yuzu Plugin ABI"
+  short_description: "Protect plugin ABI and descriptor stability."
+  default_prompt: "Use $yuzu-plugin-abi to make plugin or SDK changes without breaking the Yuzu ABI."

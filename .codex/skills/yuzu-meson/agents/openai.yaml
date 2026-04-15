@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yuzu Meson"
+  short_description: "Maintain the Meson build graph correctly."
+  default_prompt: "Use $yuzu-meson to update Meson files, source lists, and build graph rules in Yuzu."

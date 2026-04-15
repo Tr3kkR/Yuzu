@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yuzu Build"
+  short_description: "Build, configure, and test Yuzu safely."
+  default_prompt: "Use $yuzu-build to configure, compile, and validate a Yuzu change."

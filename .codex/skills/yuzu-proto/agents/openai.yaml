@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yuzu Proto"
+  short_description: "Own proto contracts and gateway proto sync."
+  default_prompt: "Use $yuzu-proto to update Yuzu protobuf contracts and keep gateway proto mirrors aligned."
