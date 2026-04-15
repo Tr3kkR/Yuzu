@@ -313,21 +313,32 @@ For every breakage encountered during any tier:
 > second from a cold-cache state, paid once per fresh runner and
 > then cached by rebar3's user-level hex cache for subsequent runs.
 >
-> **Next action:** wait for the push CI run on `f0b84c7` head-commit
-> (whichever commit is actually at the tip of dev when the fix lands
-> — should be a docs commit on top of `f0b84c7`). The paired PR run
-> appears on the same head. Use
-> `gh run list --workflow=ci.yml --branch=dev --limit=3` to find
-> the live run IDs.
+> **2026-04-15 update — code is green, merge gate is a vcpkg flake
+> rerun.** Push CI run `24426124422` on `5b2996c` (docs-only commit
+> on top of `f0b84c7`) completed with **both Windows variants
+> green**: Windows MSVC debug `gateway eunit OK 58.58s` +
+> `gateway ct OK 78.39s`, Windows MSVC release green. Linux gcc-13,
+> Linux clang-19, macOS debug, macOS release all green on both
+> push and PR runs. The parallel-race fix `f0b84c7` is validated
+> end-to-end; **no code change is needed to close #375**.
 >
-> Expected outcome on Windows:
-> - Vcpkg install: cache hit (only meson.build + script + .gitignore
->   changes since 220e7bd)
-> - Configure / build: same as 220e7bd, debug + release link clean
-> - gateway EUNIT: **148/148 PASS** in ~30s (validated locally)
-> - gateway CT: PASS in ~55s (per the earlier successful runs on
->   f0b84c7's precursor 6d8aa5a — only the suite that won the race
->   got to ~55s then)
+> The remaining gate is a PR-run Windows debug job that hit a vcpkg
+> `grpc:x64-windows` build flake in `applocal.ps1` copying deps for
+> `grpc_csharp_plugin.exe`. Root signature in the job log:
+>
+>     error: building grpc:x64-windows failed with: BUILD_FAILED
+>     Elapsed time to handle grpc:x64-windows: 9.8 min
+>     ...applocal.ps1 -targetBinary .../grpc_csharp_plugin.exe... Error code: 1
+>
+> This is unrelated to anything in this PR — the push run on the
+> exact same SHA passed cleanly. Job `71360390333` on PR run
+> `24426126324` was rerun via `gh run rerun 24426126324 --failed`
+> immediately after diagnosis; watch its completion with:
+>
+>     gh run view 24426126324 --json status,conclusion,jobs \
+>       --jq '.jobs[] | select(.name=="Windows MSVC debug")'
+>
+> **Next action:** wait for the rerun to complete.
 >
 > If green: **merge PR #373** (squash or merge-commit, see #369 for
 > the reconcile pattern), **close #375** with a pointer at
@@ -336,20 +347,29 @@ For every breakage encountered during any tier:
 > the dependabot recreate cycle. Tasks #3 → #9 unblock in tier
 > order per the Tier Table.
 >
-> If red on a THIRD distinct failure mode: the parallel-compile
-> race wasn't the last Windows-specific gotcha. Next step in order
-> of escalation is:
-> 1. Add `is_parallel: false` to both gateway test() entries in
->    meson.build. This strict-serializes the gateway tests with
->    respect to ALL other meson tests (extra ~30s test-time cost),
->    which eliminates ANY possible race on any shared resource,
+> If red with the **same** vcpkg grpc applocal signature: rerun one
+> more time (grpc-on-vcpkg is legitimately flaky, 2-try attempts
+> are the documented norm). If it hits the flake a third time,
+> escalate by pushing a trivial no-op commit (docs comment,
+> whitespace) to force a fresh workflow cycle — fresh push run
+> gets the warm cache first, then PR run piggybacks.
+>
+> If red on a **different** failure mode (e.g. the gateway suites
+> regress, or a new C++ link error, or a different vcpkg package):
+> the parallel-compile race wasn't the last gotcha. Escalation:
+> 1. If gateway tests fail: add `is_parallel: false` to both
+>    gateway test() entries in meson.build. Strict-serializes the
+>    gateway tests with respect to ALL other meson tests
+>    (~30s extra test-time), eliminating ANY shared-resource race
 >    not just the `_build/` tree.
-> 2. If that still fails, suspect the OTP 28 rebar3 compile worker
->    pool on Windows has non-race-related issues (e.g. file handle
->    leaks, temp dir collision on `%TEMP%`). At that point drop
->    into `gh run view <job> --log` and read the full captured
->    output — there may be a prior WARNING that got truncated in
->    the grep filter.
+> 2. If vcpkg fails on a different package: check
+>    `gh run view <job> --log | grep -iE "(BUILD_FAILED|error:)"`
+>    to identify the new failing port and file an upstream issue.
+> 3. If a new C++ link error surfaces: a new transitive lib is
+>    missing from option D's hand-rolled `cxx.find_library()` list.
+>    Apply the iteration pattern from a61a787 → 713ae8c → 46ea61f
+>    → 220e7bd — see `.claude/agents/build-ci.md` "Windows MSVC
+>    static-link history and #375" for the long form.
 >
 > If red on a new C++ link error: it's a new transitive lib
 > surfacing in option D's hand-rolled `cxx.find_library()` list.
@@ -408,6 +428,34 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-15 ~12:00 UTC** · Claude session · **Push run Windows green
+  on `5b2996c`; PR run hit vcpkg grpc applocal flake and was rerun.**
+  The `f0b84c7` parallel-race fix is **validated** on Windows: push CI
+  run `24426124422` (Windows MSVC debug + release both on the same
+  SHA `5b2996c`) completed with `gateway eunit OK 58.58s` and
+  `gateway ct OK 78.39s` — the first fully green gateway suite pair
+  on Windows MSVC in this fix chain. Linux gcc-13/clang-19 and macOS
+  debug/release were all green on both the push and PR runs.
+  However, PR run `24426126324` on the same commit hit a **distinct,
+  unrelated** failure: vcpkg's grpc build step failed inside
+  `vcpkg_copy_tool_dependencies` invoking `applocal.ps1` against
+  `grpc_csharp_plugin.exe`, with vcpkg reporting
+  `error: building grpc:x64-windows failed with: BUILD_FAILED`
+  after a full 9.8-minute fresh grpc rebuild. This is a known
+  grpc-on-vcpkg Windows flake class and is orthogonal to any code in
+  this PR — the push run on the same SHA did not hit it because it
+  had a warm vcpkg binary cache, the PR run apparently got a cache
+  miss (push run was `cancelled` at workflow level before its cache
+  write step ran, so the PR run rebuilt from scratch and rolled the
+  dice on the flake). Job
+  `71360390333` rerun dispatched via `gh run rerun 24426126324
+  --failed`. Expected outcome: either a cache-hit short path (if the
+  push run did write some cache layer after all) or a second fresh
+  grpc build that hopefully doesn't roll the flake this time. No
+  code changes. If a second rerun also hits the vcpkg grpc flake,
+  the next escalation is to push a vcpkg binary-cache warmup commit
+  (empty `[ci skip]`-style no-op) so the cache is populated without
+  gating merge on flake-probability.
 - **2026-04-14 ~22:00 UTC** · Claude session · **Parallel-compile
   race between gateway eunit and gateway ct fixed in `f0b84c7`.**
   Push CI run `24419434652` on `fea3702` (the `6d8aa5a` pre-fetch
