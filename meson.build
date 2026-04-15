@@ -1,7 +1,7 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.10.1',
+  version: '0.11.0',
   license: 'Apache-2.0',
   meson_version: '>=1.3.0',
   default_options: [
@@ -88,21 +88,146 @@ build_tests    = get_option('build_tests')
 # load-bearing for build log readability — without it the gRPC / abseil /
 # protobuf deprecation warnings drown out our own code warnings and force a
 # grep-for-error filter workflow. Our own code remains under `warning_level=3`.
-grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
-  required: false, include_type: 'system')
-if not grpcpp_dep.found()
-  grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
-    include_type: 'system')
-endif
-protobuf_cmake_args = []
 if host_os == 'windows'
-  protobuf_cmake_args += ['-DProtobuf_USE_STATIC_LIBS=ON']
-endif
-protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
-  cmake_args: protobuf_cmake_args, required: false, include_type: 'system')
-if not protobuf_dep.found()
-  protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
-    include_type: 'system')
+  # ──────────────────────────────────────────────────────────────────────
+  # #375 option D: bypass meson's cmake dep for protobuf/grpc on Windows.
+  # ──────────────────────────────────────────────────────────────────────
+  # Meson's cmake dependency translator reads IMPORTED_LOCATION_RELEASE
+  # from vcpkg's imported targets regardless of --buildtype=debug, so a
+  # debug build with `dependency('protobuf', method: 'cmake', ...)` would
+  # link release-CRT static libs into /MDd debug user code and trip
+  # dozens of LNK2038 RuntimeLibrary mismatches. Dropping the triplet's
+  # static-linkage override doesn't help either — vcpkg's grpc port
+  # forces static regardless, and grpc.lib's embedded abseil template
+  # symbols collide with abseil_dll.lib exports on release builds,
+  # producing LNK2005 duplicate symbol errors. The only configuration
+  # that threads both needles is static linkage in triplets/x64-windows.cmake
+  # + this explicit find_library() wiring with build-type-conditional
+  # search dirs. Keep BOTH halves in sync; neither can be simplified
+  # alone. Full diagnosis:
+  #   .claude/agents/build-ci.md "Windows MSVC static-link history and #375"
+  # Strategic escape (P1): #376 "Migrate transport off gRPC to QUIC".
+
+  _cxx = meson.get_compiler('cpp')
+  _vcpkg_root_win = meson.project_source_root() / 'vcpkg_installed' / 'x64-windows'
+  # include_directories() rejects absolute paths inside the source tree,
+  # so the include dir has to be a relative-to-source-root string.
+  # Headers are the same across debug and release variants, so this
+  # points at the shared include/ regardless of buildtype.
+  _vcpkg_include_win_rel = 'vcpkg_installed/x64-windows/include'
+  if get_option('buildtype') == 'debug'
+    _vcpkg_lib_win = _vcpkg_root_win / 'debug' / 'lib'
+    _pbd = 'd'   # vcpkg convention: libprotobufd.lib / libprotobuf-lited.lib / libprotocd.lib / libupbd.lib
+  else
+    _vcpkg_lib_win = _vcpkg_root_win / 'lib'
+    _pbd = ''
+  endif
+
+  # Enumerate absl_*.lib at configure time via python glob. The transitive
+  # absl dep closure of protobuf+grpc is ~40 libs and shifts between
+  # abseil versions; hand-listing would be a maintenance burden. Enumerating
+  # here means a vcpkg abseil bump doesn't need a parallel meson.build edit.
+  _py = find_program('python3')
+  _absl_enum = run_command(
+    _py, '-c',
+    'import glob, os, sys\n' +
+    'for p in sorted(glob.glob(os.path.join(sys.argv[1], "absl_*.lib"))):\n' +
+    '    print(os.path.splitext(os.path.basename(p))[0])\n',
+    _vcpkg_lib_win,
+    check: true,
+  )
+  _absl_names = _absl_enum.stdout().strip().split('\n')
+  if _absl_names.length() == 0 or (_absl_names.length() == 1 and _absl_names[0] == '')
+    error('#375 option D: no absl_*.lib files found in @0@ — vcpkg install may be incomplete'.format(_vcpkg_lib_win))
+  endif
+  message('#375 option D: enumerated @0@ abseil libs from @1@'.format(_absl_names.length(), _vcpkg_lib_win))
+  _absl_deps = []
+  foreach _absl_name : _absl_names
+    _absl_deps += _cxx.find_library(_absl_name, dirs: [_vcpkg_lib_win], required: true)
+  endforeach
+
+  # Protobuf core + transitive utf8_range.
+  _libprotobuf      = _cxx.find_library('libprotobuf'      + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libprotobuf_lite = _cxx.find_library('libprotobuf-lite' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libprotoc        = _cxx.find_library('libprotoc'        + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libupb           = _cxx.find_library('libupb'           + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  _libutf8_range    = _cxx.find_library('utf8_range',              dirs: [_vcpkg_lib_win], required: true)
+  _libutf8_validity = _cxx.find_library('utf8_validity',           dirs: [_vcpkg_lib_win], required: true)
+
+  # gRPC core + C++ API + transitive re2 / c-ares / address_sorting.
+  _libgrpc             = _cxx.find_library('grpc',             dirs: [_vcpkg_lib_win], required: true)
+  _libgrpcpp           = _cxx.find_library('grpc++',           dirs: [_vcpkg_lib_win], required: true)
+  _libgpr              = _cxx.find_library('gpr',              dirs: [_vcpkg_lib_win], required: true)
+  _libaddress_sorting  = _cxx.find_library('address_sorting',  dirs: [_vcpkg_lib_win], required: true)
+  _libre2              = _cxx.find_library('re2',              dirs: [_vcpkg_lib_win], required: true)
+  _libcares            = _cxx.find_library('cares',            dirs: [_vcpkg_lib_win], required: true)
+
+  # OpenSSL — grpc.lib has unresolved references to BIO_*, EVP_*, PEM_*,
+  # X509_*, OPENSSL_sk_* that only libssl + libcrypto can satisfy. vcpkg's
+  # grpc port compiles its TLS / JWT / SPIFFE / PEM code paths against
+  # OpenSSL headers regardless of any triplet or manifest hint that it
+  # "should" use schannel — the schannel path was never wired up in the
+  # upstream grpc port. See CLAUDE.md `## vcpkg` section and .claude/agents/
+  # build-ci.md "Windows MSVC static-link history and #375" for history.
+  _libssl    = _cxx.find_library('libssl',    dirs: [_vcpkg_lib_win], required: true)
+  _libcrypto = _cxx.find_library('libcrypto', dirs: [_vcpkg_lib_win], required: true)
+
+  # zlib — grpc.lib(message_compress.cc.obj) has unresolved references to
+  # __imp_deflate / __imp_inflate / __imp_deflateInit2_ / __imp_inflateInit2_
+  # etc. gRPC's message compression code path uses zlib for gzip-compressed
+  # messages, and the `__imp_` prefix tells us zlib is built as a DLL
+  # (vcpkg default) so we're linking zlib's import lib. Failure mode seen:
+  # LNK2019 "unresolved external symbol __imp_deflate referenced in function
+  # zlib_compress" from the option D first canary on commit 713ae8c.
+  #
+  # Naming quirk: vcpkg's zlib port uses the `d` suffix for debug variants
+  # (lib/zlib.lib + debug/lib/zlibd.lib) — same convention as protobuf's
+  # libprotobufd.lib. libcrypto/libssl above do NOT use the d suffix
+  # (same name in both variant dirs). Check `debug/lib/` layout via the
+  # inspect-vcpkg.sh diagnostic if a new transitive lib surfaces and you
+  # aren't sure which convention it follows.
+  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+
+  # Construct the meson dep objects yuzu's build graph consumes. These
+  # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
+  # method: 'cmake')` calls that Linux/macOS use — those paths are
+  # unreachable on Windows.
+  protobuf_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    dependencies: [
+      _libprotobuf, _libprotobuf_lite, _libprotoc, _libupb,
+      _libutf8_range, _libutf8_validity,
+    ] + _absl_deps,
+  )
+  grpcpp_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    dependencies: [
+      _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
+      _libre2, _libcares,
+      _libssl, _libcrypto,
+      _libzlib,
+      # grpc transitively uses protobuf and upb; include them so consumers
+      # that only pull in grpcpp_dep still see protobuf's symbols.
+      _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,
+    ] + _absl_deps,
+  )
+else
+  # Linux/macOS: meson's cmake dep method works correctly because gcc/clang
+  # don't have MSVC's runtime-library variant ABI — debug user code can
+  # safely link against release-built .a static libs, and the cmake dep
+  # translator's IMPORTED_LOCATION_RELEASE bias is harmless.
+  grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
+    required: false, include_type: 'system')
+  if not grpcpp_dep.found()
+    grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
+      include_type: 'system')
+  endif
+  protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
+    required: false, include_type: 'system')
+  if not protobuf_dep.found()
+    protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
+      include_type: 'system')
+  endif
 endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
@@ -211,17 +336,33 @@ if _rebar3.found()
   _python3 = find_program('python3')
   # The test script prepends OTP 28 / rebar3 paths to PATH internally,
   # handling the case where Meson inherits a system PATH with OTP 25.
+  #
+  # Each suite gets its own REBAR_BASE_DIR so the eunit and ct tests
+  # never share `_build/test/lib/<dep>/` on disk. Meson schedules
+  # tests in parallel by default, and two rebar3 processes writing
+  # to the same ebin tree racing each other's `.bea#`→`.beam` rename
+  # fired consistently on Windows MSVC as
+  #     "failed to rename proper_orddict.bea# to proper_orddict.beam:
+  #      no such file or directory"
+  # (in `proper`, because parallel compile workers in both processes
+  # both wrote temp files and one renamed before the other read).
+  # Linux/macOS tolerated the race through atomic POSIX rename; the
+  # isolation fix applies unconditionally so the race can't come
+  # back if Linux kernel semantics ever change. `test_gateway.py`
+  # honors REBAR_BASE_DIR when computing the ebin wipe path.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
     timeout: 120,
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 300,
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct'},
   )
   message('Erlang gateway: enabled (rebar3 found)')
 else

@@ -406,7 +406,8 @@ TEST_CASE("ManagementGroupStore: get_descendant_ids terminates on injected cycle
     // use sqlite3_prepare_v2 + sqlite3_bind_text.
     {
         sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(tmp.path.c_str(), &raw) == SQLITE_OK);
+        const auto path_str = tmp.path.string();
+        REQUIRE(sqlite3_open(path_str.c_str(), &raw) == SQLITE_OK);
         std::string sql = "UPDATE management_groups SET parent_id = '" + b_id +
                           "' WHERE id = '" + a_id + "';";
         REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
@@ -455,7 +456,8 @@ TEST_CASE("ManagementGroupStore: get_descendant_ids terminates on 3-node cycle",
     // Inject A.parent = C to form A->B->C->A.
     {
         sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(tmp.path.c_str(), &raw) == SQLITE_OK);
+        const auto path_str = tmp.path.string();
+        REQUIRE(sqlite3_open(path_str.c_str(), &raw) == SQLITE_OK);
         std::string sql = "UPDATE management_groups SET parent_id = '" + c_id +
                           "' WHERE id = '" + a_id + "';";
         REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
@@ -498,7 +500,8 @@ TEST_CASE("ManagementGroupStore: get_descendant_ids terminates on self-loop row"
     // parent_id = id — the degenerate 1-row cycle.
     {
         sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(tmp.path.c_str(), &raw) == SQLITE_OK);
+        const auto path_str = tmp.path.string();
+        REQUIRE(sqlite3_open(path_str.c_str(), &raw) == SQLITE_OK);
         std::string sql = "UPDATE management_groups SET parent_id = '" + a_id +
                           "' WHERE id = '" + a_id + "';";
         REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);

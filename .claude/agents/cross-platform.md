@@ -19,8 +19,8 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 - **Platform guards** — Review `#ifdef` blocks in all plugins and core code. Ensure platform-specific code is properly guarded and has fallbacks.
 - **Build system** — Maintain `meson/cross/` cross-compilation files, `meson/native/` native files, and `setup_msvc_env.sh`.
 - **CI matrix** — Ensure `.github/workflows/ci.yml` covers all 4 targets with correct toolchain configuration.
-- **vcpkg platform filters** — Maintain platform filters in `vcpkg.json` (e.g., OpenSSL `!windows`, Catch2 `x64 | arm64`).
-- **Windows-specific** — Windows crypto stack (SChannel) instead of OpenSSL for gRPC. Windows certificate store integration. Windows service APIs.
+- **vcpkg platform filters** — Maintain platform filters in `vcpkg.json` (e.g., Catch2 `x64 | arm64`). OpenSSL is explicitly **not** platform-filtered — it is a required dep on every platform including Windows (vcpkg's gRPC port compiles TLS / JWT / PEM code paths against OpenSSL headers regardless of any schannel aspiration, so `grpc.lib` needs `libssl` + `libcrypto` at final link time; see #375).
+- **Windows-specific** — Windows certificate store integration (system cert trust for mTLS). Windows service APIs. OpenSSL links just like every other platform — the "gRPC uses SChannel on Windows" story was aspirational and never wired up upstream; see CLAUDE.md `## vcpkg` and `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375".
 - **macOS-specific** — `fs::canonical()` for path comparisons. SQLite mutex requirements. Erlang rebar3 ct `--dir` requirement.
 - **ARM64** — Cross-compilation works. Tests intentionally skipped on ARM64 cross-compile.
 
@@ -43,10 +43,15 @@ You inherit the **Darwin compatibility guardian** role and extend it to all plat
 | macOS | SQLite | Multi-threaded stores need mutex on `db_` handle. |
 | macOS | Erlang | `rebar3 ct` requires `--dir apps/yuzu_gw/test` with `--suite` flags. |
 | Windows | Build | Do NOT use `vcvars64.bat`. Use `setup_msvc_env.sh` only. |
-| Windows | Crypto | gRPC uses native SChannel, not OpenSSL. `schannel` is NOT a vcpkg port. |
+| Windows | Compiler | Do NOT use Clang from `C:\Program Files\LLVM\bin`. Must be cl.exe / MSVC. |
+| Windows | Crypto | gRPC links OpenSSL (`libssl.lib` + `libcrypto.lib`) on Windows same as every other platform. Despite vcpkg's grpc port flagging "grpc only supports static library linkage", its TLS / JWT / PEM / X.509 code paths have hard references to OpenSSL that no amount of triplet tweaking avoids. See `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
 | Windows | Paths | Use `std::filesystem::path` for all path operations. Never hardcode `/` or `\`. |
 | Linux | Compiler | GCC 13 and Clang 18 have different warning sets. Fix warnings for both. |
 | ARM64 | Tests | Cross-compile CI skips tests. Catch2 only on `x64 | arm64` native. |
+
+## Reference Documents
+
+CLAUDE.md no longer carries the Windows toolchain commands or path inventory verbatim. Before reviewing any Windows-touching change, **read `docs/windows-build.md`** — it has the MSYS2 bash activation sequence (`setup_msvc_env.sh` + `scripts/ensure-erlang.sh`), the path table (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), the `vcvars64.bat` failure mode, and the "no Clang" rule. Triggered by: any change to `meson.build` Windows branches, `setup_msvc_env.sh`, `.github/workflows/ci.yml` Windows matrix entries, or `vcpkg.json` `windows`/`!windows` platform filters.
 
 ## Review Triggers
 

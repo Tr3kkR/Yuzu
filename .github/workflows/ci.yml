@@ -18,7 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MESON_VERSION: "1.9.2"
+  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
+  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
   CCACHE_MAXSIZE: "500M"
@@ -86,7 +88,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -150,11 +152,26 @@ jobs:
         if: always()
         run: ccache -s
 
-  # ── Windows (MSVC) ─────────────────────────────────────────────────────
+  # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
-    runs-on: windows-2022
+    # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
+    # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
+    # finishes in a fraction of that and avoids the GitHub Actions minute
+    # drain. Per-PR turnaround on the dependabot rollout is the
+    # optimization target. See issue #374 for the full migration rationale.
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 120
+    defaults:
+      run:
+        # The default `bash` keyword on a self-hosted Windows runner
+        # resolves to C:\Windows\system32\bash.EXE which is WSL bash.
+        # WSL refuses to run as LOCAL SYSTEM (the runner's service
+        # account) with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED. Bypass by
+        # explicitly pointing at MSYS2 bash, which is CLAUDE.md's
+        # documented Windows development shell and is already installed
+        # on the runner. Same pattern as codeql.yml's Windows leg.
+        shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
     strategy:
       fail-fast: false
       matrix:
@@ -170,20 +187,34 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install Meson
-        run: pip install meson==${{ env.MESON_VERSION }}
+      - name: Assert toolchain available
+        run: |
+          set -e
+          # Self-hosted runner must have these pre-baked. Fail fast with
+          # a specific error rather than producing weird build failures.
+          for tool in meson ninja cl ccache cmake python; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::$tool not on PATH on yuzu-local-windows runner"
+              exit 1
+            fi
+          done
+          meson --version
+          ccache --version | head -1
 
-      - name: Install ccache
-        run: choco install ccache --yes
+      - name: Assert runner disk (>= 45 GB free)
+        run: |
+          # Debug + release vcpkg trees + ccache + build artifacts can
+          # easily exceed 30 GB. Fail fast rather than hitting "no space
+          # left on device" 30 min into the build.
+          free_gb=$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {printf "%d", $4/1024/1024}')
+          echo "runner disk free: ${free_gb}G on $GITHUB_WORKSPACE"
+          if [[ -z "$free_gb" ]] || (( free_gb < 45 )); then
+            echo "::error::runner disk ${free_gb}G < 45 GB required"
+            exit 1
+          fi
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\ccache
-          key: ccache-windows-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-windows-${{ matrix.build_type }}-
-            ccache-windows-
+      - name: Reset ccache stats
+        run: ccache -z
 
       - name: Export GitHub Actions cache variables
         uses: actions/github-script@v7
@@ -192,55 +223,73 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          # Include matrix.build_type in the cache key so debug and release
-          # jobs don't share a slot. Without this, the first job to populate
-          # the cache wins and the other job links its user code (compiled
-          # with /MDd vs /MD and _ITERATOR_DEBUG_LEVEL=2 vs =0) against the
-          # wrong absl_*.lib variant, producing dozens of LNK2038 errors.
-          # The legacy build-type-less restore key is intentionally NOT in
-          # restore-keys so we can't silently fall back to a poisoned cache.
-          key: vcpkg-x64-windows-${{ matrix.build_type }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-windows-${{ matrix.build_type }}-
-
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Force fresh vcpkg install when triplet changed
+        run: |
+          # The persistent runner workspace accumulates a
+          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
+          # incremental install keys off the manifest only — it does NOT
+          # detect overlay-triplet content edits. A triplet change
+          # (e.g. removing `VCPKG_BUILD_TYPE release` to enable debug
+          # variants — the LNK2038 fix on dev) silently leaves the
+          # existing release-only tree in place, and the debug build
+          # then fails to link with _ITERATOR_DEBUG_LEVEL mismatches
+          # against absl_*.lib. Reconcile by wiping the install root
+          # whenever the recorded triplet hash drifts. Same approach as
+          # codeql.yml's mirror step.
+          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
+          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
+          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
+          have=$(cat "$sentinel" 2>/dev/null || echo "")
+          if [[ "$want" != "$have" ]]; then
+            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
+            rm -rf "$installed_dir"
+            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
+            echo "$want" > "$sentinel"
+          else
+            echo "x64-windows triplet sha256 unchanged — keeping persistent vcpkg_installed/x64-windows"
+          fi
+
       - name: Install vcpkg packages
         run: |
-          & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
-            --triplet x64-windows `
-            --x-manifest-root="${{ github.workspace }}"
+          # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
+          # ${{ github.workspace }} (GHA source interpolation). On Windows
+          # the workspace path contains backslashes and bash's escape
+          # processing strips them when interpolated as source text.
+          "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
+            --triplet x64-windows \
+            --x-manifest-root="$GITHUB_WORKSPACE"
 
       - name: Configure (Meson)
         env:
           CC: ccache cl
           CXX: ccache cl
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
-          meson setup builddir `
-            --buildtype=${{ matrix.build_type }} `
-            -Dcpp_std=vc++latest `
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
-            -Dbuild_tests=true `
+          meson setup build-windows-ci \
+            --buildtype=${{ matrix.build_type }} \
+            -Dcpp_std=vc++latest \
+            -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
+            -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-windows-ci
 
       - name: Test
         run: |
-          $env:PATH = "${{ github.workspace }}/vcpkg_installed/x64-windows/${{ matrix.build_type == 'debug' && 'debug/bin' || 'bin' }};${{ github.workspace }}/vcpkg_installed/x64-windows/tools/protobuf;${{ github.workspace }}/vcpkg_installed/x64-windows/tools/grpc;$env:PATH"
-          meson test -C builddir --print-errorlogs
+          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
+          else
+            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
+          fi
+          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
+          meson test -C build-windows-ci --print-errorlogs
 
       - name: ccache stats
         if: always()
@@ -266,7 +315,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install meson==${{ env.MESON_VERSION }}
+          pipx install "$(grep '^meson==' requirements-ci.txt)"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -354,7 +403,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -438,7 +487,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }}
+          pip3 install -r requirements-ci.txt
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -520,7 +569,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install meson==${{ env.MESON_VERSION }} gcovr
+          pip3 install -r requirements-ci.txt gcovr
 
       - name: Cache ccache
         uses: actions/cache@v4

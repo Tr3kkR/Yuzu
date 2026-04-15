@@ -14,7 +14,9 @@ permissions:
   id-token: write  # Required for cosign keyless signing
 
 env:
-  MESON_VERSION: "1.9.2"
+  # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
+  # Dependabot). vcpkg baseline is tracked by the scheduled
+  # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
 
@@ -305,7 +307,7 @@ jobs:
 
       - name: Install Meson and ccache
         run: |
-          pip install meson==${{ env.MESON_VERSION }}
+          pip install -r requirements-ci.txt
           choco install ccache --yes --no-progress
 
       - name: Cache ccache
@@ -560,7 +562,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install meson==${{ env.MESON_VERSION }}
+          pipx install "$(grep '^meson==' requirements-ci.txt)"
 
       - name: Cache ccache
         uses: actions/cache@v4

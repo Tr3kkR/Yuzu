@@ -7,7 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Targeting **v0.11.0** (minor bump from v0.10.0). The original `0.10.1`
+dev bump in `0c976c7` predated the `feat(test)` commits that landed
+the `/test` skill PR1 + PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new
+operator-facing functionality), the matrix CodeQL workflow expansion
+(8c5b934), and the `563138f` MigrationRunner wiring with its `/readyz`
+response-shape addition (`failed_stores` field on 503). Strict SemVer
+says any new backward-compatible feature ⇒ MINOR bump, so the next
+release is **v0.11.0** rather than the originally-planned v0.10.1
+patch._
+
 ### Added
+
+- **Dependency automation — `pip` ecosystem + scheduled vcpkg baseline
+  bumps (closes #363).** `requirements-ci.txt` at the repo root becomes
+  the single source of truth for Python tooling pins (currently just
+  `meson==1.9.2`), consumed directly by every `pip`/`pip3`/`pipx install`
+  call site in `.github/workflows/ci.yml` (6 sites) and
+  `.github/workflows/release.yml` (2 sites). The hardcoded
+  `MESON_VERSION: "1.9.2"` env var is removed from all three tracked
+  workflows (`ci.yml`, `release.yml`, and the dead reference in
+  `sanitizer-tests.yml`) — the pin now lives in exactly one place.
+  `.github/dependabot.yml` gains a `pip` ecosystem entry so Dependabot
+  opens a weekly PR against `requirements-ci.txt` if a newer meson
+  release lands, and CI re-runs on the PR so breaking changes stall
+  instead of silently merging.
+
+  **vcpkg baseline** — Dependabot does not understand vcpkg, so
+  `.github/workflows/vcpkg-baseline-update.yml` is a new scheduled
+  workflow (10:00 UTC on the 1st of each month, plus
+  `workflow_dispatch`) that: resolves `git ls-remote vcpkg HEAD`,
+  compares to the current `vcpkg.json` `builtin-baseline`, and if
+  different, `sed`s the new SHA into every tracked reference
+  (`vcpkg.json`, `vcpkg-configuration.json`, `qodana.yaml`, `CLAUDE.md`,
+  all four workflow `VCPKG_COMMIT` env vars, and all three Dockerfile
+  ARG/ENV references), failing loudly if any listed file still carries
+  the old SHA after the replace, then opens a PR via
+  `peter-evans/create-pull-request@v7` with `dependencies,ci` labels.
+
+  **rebar3** — gateway dependencies stay on a manual quarterly review
+  cadence, documented in the new `docs/dependency-updates.md`. The doc
+  is also the reference for the full dependency-update strategy —
+  ecosystem table, staleness query per ecosystem, and the known
+  Dockerfile-meson duplication follow-up.
+
+  **Why the Dockerfiles aren't centralized yet** — five Dockerfiles
+  under `deploy/docker/` (`agent`, `server`, `ci`, `ci-linux`,
+  `runner-linux`) still carry a hardcoded `meson==1.9.2` string in
+  their build-stage `RUN` commands. Centralizing them on
+  `COPY requirements-ci.txt` is tracked as a follow-up in
+  `docs/dependency-updates.md`. Until then, the manual merge checklist
+  for a Dependabot meson bump includes bumping the literal string in
+  those five files (`grep -rn 'meson==' deploy/docker/` finds them all).
 
 - **`/test` skill coverage + perf + sanitizer gates (PR2 of 3).** Phase 6
   and Phase 7 of the `/test` pipeline are now wired. `--full` mode
@@ -296,6 +347,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CLAUDE.md second compression pass — Auth/MCP/Windows-build
+  sections trimmed to pure pointers, with reference rules pushed
+  into the relevant agent definitions.** v0.10.0's slimming
+  (`571 → 484 lines`) had crept back to 529 lines as new sections
+  landed. This pass takes it to 502 by removing the inline lists
+  that were already mirrored in `docs/auth-architecture.md`,
+  `docs/mcp-server.md`, and `docs/windows-build.md`. The hard
+  invariants did not move — they're still load-bearing — they're
+  just no longer duplicated between CLAUDE.md and the docs that
+  own them. Drift was the symptom: the Auth invariant list in
+  CLAUDE.md was already 1 item behind `docs/auth-architecture.md`
+  and would silently keep diverging on every doc update.
+
+  To prevent the next compression pass having to relocate the
+  same rules a third time, the relevant agent definitions now
+  carry "Reference Documents" pointers that name the doc and the
+  exact section that holds the invariants:
+
+  - **`.claude/agents/security-guardian.md`** — Reference
+    Documents table mapping (auth/RBAC/crypto/header/token →
+    `docs/auth-architecture.md` "HTTPS and bind defaults",
+    "HTTP security response headers", "API tokens and
+    automation"; MCP → `docs/mcp-server.md` "Architecture",
+    "Security Model"). Adds `security_headers.{hpp,cpp}`,
+    `mcp_server.{hpp,cpp}`, `mcp_policy.hpp`, `mcp_jsonrpc.hpp`
+    to the deep-dive read list. Triggers list per-doc loading
+    rules so the agent loads the right doc on the first relevant
+    file edit instead of recovering invariants from CLAUDE.md.
+  - **`.claude/agents/build-ci.md`** — Reference Documents note
+    pointing at `docs/windows-build.md` for any Windows-touching
+    CI/build change (`setup_msvc_env.sh`, vcpkg Windows triplet,
+    MSVC flags). Linux/macOS build details remain in CLAUDE.md
+    `## Build` / `## CI matrix` / `## vcpkg` sections.
+  - **`.claude/agents/cross-platform.md`** — Reference Documents
+    note for Windows changes plus an explicit "Do NOT use Clang
+    from `C:\Program Files\LLVM\bin`" row in the Standing
+    pitfalls table (was previously buried in CLAUDE.md prose).
+
+- **`Dockerfile.ci-gateway` aligned to Erlang/OTP 28 (closes #334).**
+  The CI gateway image was still pinned to `erlang:27` while every
+  other Erlang surface — `release.yml`'s `erlef/setup-beam` step,
+  `scripts/ensure-erlang.sh`'s default, and the runtime
+  `Dockerfile.gateway` (`erlang:28-alpine`) — had moved to OTP 28.
+  CLAUDE.md is explicit that these must move together; leaving the
+  CI image behind meant the GitHub Actions gateway build was
+  exercising rebar3/dialyzer against an OTP version older than the
+  one the release ships, and any 28-only behavioural change would
+  have been invisible to CI until a release tag was cut.
+  `Dockerfile.gateway`'s `erlang:28-alpine` digest pin was also
+  rolled forward to the current build (`f36705c5…`) as part of the
+  same dependabot bundle. Originally proposed by dependabot in
+  PR #334 against `main`; landed directly on `dev` because PR #334's
+  Windows MSVC failure was the unrelated vcpkg LNK2038 cache issue
+  fixed in PR #355 after dependabot opened its branch. Dependabot
+  will close #334 automatically on its next scan.
+
+- **CodeQL workflow hardened to actually finish + parallel Windows
+  coverage (closes #370).** Every CodeQL run from 2026-03-23 to
+  2026-04-13 was cancelled by the 90-min timeout — 7 consecutive
+  cancellations across both manually-dispatched and PR-event-triggered
+  runs. The actual runtime on the `yuzu-wsl2-linux` self-hosted runner
+  is closer to 15 min for a Linux-only single-leg analysis (32-thread
+  WSL2 host, 60 GB RAM), but the prior workflow had been cancelling
+  before completing. Rebuilt as a `strategy.matrix` workflow that fans
+  out to BOTH self-hosted runners in parallel: `yuzu-wsl2-linux`
+  (gcc-13 + `build-linux-codeql/`) and `yuzu-local-windows`
+  (MSVC + `build-windows-codeql/`), with `fail-fast: false` so one
+  leg failing doesn't kill the other. Each leg uploads SARIF with a
+  distinct category (`/language:c-cpp-linux` vs `/language:c-cpp-windows`)
+  so findings in platform-specific `#ifdef _WIN32` branches stay
+  attributed to the analysis that actually observed them. Closes #370.
+
+  Coverage knobs flipped to maximum:
+  - `queries: +security-and-quality` (strict superset of
+    `security-extended`; for C/C++ specifically, the "quality"
+    queries are security-adjacent — memory leaks, UAF, null deref,
+    dead code hiding logic bugs, inconsistent error handling — not
+    style noise like they would be for JS/Python)
+  - `languages: c-cpp,actions` on the Linux leg (Windows leg keeps
+    `c-cpp` only — no need to double-scan the same
+    `.github/workflows/*.yml` files; the `actions` extractor catches
+    the well-known `${{ github.event.* }}` template-injection class
+    in workflow `run:` bodies)
+  - `-Dbuild_tests=true` (recovers the ~50-100 `tests/unit/*.cpp`
+    files that were skipped in the earlier `build_tests=false`
+    baseline run, which scanned only 231/364 C++ files)
+  - Dedicated per-OS build dirs (`build-linux-codeql/` /
+    `build-windows-codeql/`) isolated from operator's interactive
+    `build-{linux,windows}/` and from PR2's
+    `build-linux-{asan,tsan,coverage}/`
+  - Pre-build runner disk-free assertion (≥40 GB Linux, ≥45 GB
+    Windows; MSVC debug builds are chunkier)
+  - Weekly scheduled run (Sunday 04:00 UTC) + manual `workflow_dispatch`
+  - `timeout-minutes` tightened from 240 (speculation based on
+    GitHub-hosted runner assumptions) to 90 (verified comfortably
+    above the real cold runtime)
+
+  Fixes accumulated during the matrix landing — each is a category
+  of GHA / Windows / bash interaction that took a verification run to
+  surface, all preserved in commit history for the next person who
+  hits one:
+  - **`${{ github.workspace }}` doesn't expand inside matrix
+    `include:` values** — collapsed to literal `/vcpkg_installed/x64-linux`
+    on Linux, breaking CMake's protobuf probe with "Preliminary CMake
+    check failed". Fix: inline `${{ github.workspace }}` directly in
+    each step's `env:` block (where it DOES evaluate) or use
+    `$GITHUB_WORKSPACE` in `run:` blocks.
+  - **`defaults.run.shell: bash` on the Windows self-hosted runner
+    resolves to `C:\Windows\system32\bash.EXE`** (WSL bash), which
+    refuses to run as `LOCAL SYSTEM` with
+    `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`. Fix: per-leg `shell:` matrix
+    variable; Windows uses explicit
+    `'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'`
+    (CLAUDE.md's documented Windows development shell).
+  - **`hashFiles('**/*.cpp', '**/*.hpp', '**/*.h')` exceeds GHA's
+    hard 120-second timeout** on the persistent NTFS Windows runner
+    workspace because `vcpkg_installed/` accumulates thousands of
+    vendored headers from gRPC/protobuf/abseil/openssl/etc. across
+    runs. Linux-hosted CI in `ci.yml` doesn't hit the limit because
+    GitHub-hosted runners get a fresh workspace per run. Fix: hash
+    only build-system config files (`meson.build`, `meson_options.txt`,
+    `vcpkg.json`, `vcpkg-configuration.json`, `meson/native/*.ini`,
+    `meson/cross/*.ini`) — small, fast, and the only inputs that
+    should rotate the GHA ccache slot. ccache itself handles
+    source-level invalidation via content addressing.
+  - **`${{ github.workspace }}` interpolated into bash `run:` source
+    has its backslashes stripped by bash's escape processing on
+    Windows** — the path `C:\actions-runner\_work\Yuzu\Yuzu` becomes
+    `C:actions-runner_workYuzuYuzu` because `\a`, `\Y`, `\_` etc. are
+    parsed as escape sequences. Fix: use `$GITHUB_WORKSPACE` (env var
+    read at runtime — no escape processing) instead of
+    `${{ github.workspace }}` (GHA source interpolation at parse time)
+    in bash `run:` blocks.
+  - **`sanitizer-tests.yml` runner label was wrong** —
+    `runs-on: [self-hosted, yuzu-wsl2-linux]` was the original PR2
+    pattern, but the runner's actual labels are
+    `["self-hosted", "X64", "Linux"]` (no custom `yuzu-wsl2-linux`
+    label exists; that string is the runner NAME, not a label). Gate 3
+    build-ci review called the pattern "correct" without verifying
+    against `gh api /runners`. Fixed both `codeql.yml` and
+    `sanitizer-tests.yml` to use `[self-hosted, Linux, X64]` which
+    matches the runner's real label set. The `sanitizer-gate.sh
+    --expect-runner` check compares `runner_name` (not labels) via
+    `gh api /jobs`, which correctly matches `yuzu-wsl2-linux` as the
+    runner's name, so that check is unaffected.
+
 - **Migration failure now closes the affected store (#339).** When
   `MigrationRunner::run()` returns false for a store that owns its
   SQLite handle (26 of 30 stores), the store's `create_tables()` closes
@@ -336,6 +533,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardening" caveat.
 
 ### Fixed
+
+- **Windows MSVC debug builds: removed `VCPKG_BUILD_TYPE release` from
+  `triplets/x64-windows.cmake`, ending a 4-day Windows debug outage.**
+  Commit `f0bb58b` (2026-04-10, "skip debug vcpkg variants") added
+  `set(VCPKG_BUILD_TYPE release)` to the Windows overlay triplet to
+  halve release-build vcpkg install time. The flag tells vcpkg to skip
+  building the debug variant of every package, leaving only release-CRT
+  binaries (`/MD`, `_ITERATOR_DEBUG_LEVEL=0`) in
+  `vcpkg_installed/x64-windows/`. Our debug build compiles user code
+  with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`, and MSVC's linker refuses
+  to mix the two — every Windows MSVC debug job from `f0bb58b` onward
+  failed with dozens of LNK2038 `RuntimeLibrary` /
+  `_ITERATOR_DEBUG_LEVEL` mismatch errors against `absl_cord.lib`,
+  `absl_cord_internal.lib`, and friends. The CI matrix had **zero
+  successful runs on `dev` for 4 days** (2026-04-10 → 2026-04-14).
+  PR #355's `vcpkg-x64-windows-${{ matrix.build_type }}-…` cache key
+  separation addressed a related cross-job cache contamination but
+  did not fix the underlying triplet — both debug and release jobs
+  still pulled release-only `vcpkg_installed/` trees because that's
+  all the triplet emitted. The CodeQL Windows matrix leg also tripped
+  on this once it got past path/shell quirks.
+
+  Three coordinated changes:
+  - **`triplets/x64-windows.cmake`**: removed
+    `set(VCPKG_BUILD_TYPE release)` and added a doc-comment block
+    explaining why it must NOT be set, with explicit pointer at the
+    f0bb58b regression so the next person tempted by the install-time
+    optimization knows what they'd break. The Linux triplet
+    (`x64-linux-static.cmake`) keeps its `VCPKG_BUILD_TYPE release`
+    because gcc/clang don't have MSVC's runtime-library variant ABI —
+    debug user code links against release-built `.a` static libs
+    without complaint.
+  - **`.github/workflows/ci.yml`**: added `triplets/*.cmake` to the
+    Windows vcpkg cache key's `hashFiles(...)` so the next run busts
+    the cache and pulls a fresh install instead of restoring the
+    release-only tree. Without this, the GHA cache would silently
+    return the poisoned content under the same key and the fix would
+    look like it didn't take. Other vcpkg cache keys (linux, macOS,
+    sanitizer/coverage variants) were left alone because they all use
+    `--triplet x64-linux` / `--triplet arm64-osx` (vcpkg's built-in
+    triplets), not the project's overlay triplets, so triplet-content
+    drift cannot affect them.
+  - **`.github/workflows/codeql.yml`**: added a "Force fresh vcpkg
+    install when triplet changed (windows only)" step that compares
+    `sha256 triplets/x64-windows.cmake` against a sentinel file under
+    `vcpkg_installed/.x64-windows-triplet.sha256` and `rm -rf`s the
+    install root on drift. The CodeQL workflow doesn't use GHA cache
+    for `vcpkg_installed/` — it relies on the persistent self-hosted
+    Windows runner state — so vcpkg's incremental install would
+    otherwise silently reuse the release-only tree on the runner's
+    disk forever. Subsequent runs after the sha256 stabilises return
+    to fast persistent reuse.
+
+  Tradeoff: Windows vcpkg install will now build BOTH debug and
+  release variants of every package, doubling the cold-cache install
+  time. The cost is amortized by the GHA cache (warm restores stay
+  fast) and is the right tradeoff against having no green Windows CI
+  at all. If the install-time optimization is wanted back, do it via
+  per-build-type triplets (`x64-windows-release` for the release
+  matrix leg only) — never on the shared default.
 
 - **`scripts/test/` harness bugs discovered running `/test --full`
   against uncommitted #339.** Three PR1 harness fixes that landed the

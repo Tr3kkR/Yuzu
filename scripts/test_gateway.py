@@ -4,6 +4,32 @@
 Used by Meson test() because Ninja quotes compound shell commands
 as a single argument, which breaks cmd.exe on Windows.
 
+Two responsibilities beyond the bare rebar3 invocation:
+  1. Retry the rebar3 test command up to 4 times when hex.pm fetch
+     fails. hex.pm is intermittently flaky and an HTTP 502 / TCP RST
+     on a single fetch attempt would otherwise fail the test even
+     though Yuzu is fine. The retry helper detects the
+     "Failed to fetch and copy dep:" sentinel and backs off
+     exponentially (5s, 10s, 20s) between attempts. After any
+     successful attempt rebar3's user-level hex cache holds the deps
+     so subsequent runs find them locally without a network
+     round-trip — on the persistent self-hosted Windows runner this
+     means hex.pm is only touched on the very first run.
+  2. OTP 25 CT I/O race detection — see comment block below.
+
+A previous iteration (b33f1df) added an explicit pre-fetch step
+running `rebar3 as test compile --deps_only` ahead of the actual
+test invocation, intending to populate the hex cache earlier. On
+Windows this turned out to leave `_build/test/lib/yuzu_gw/` in a
+state where the subsequent `rebar3 as test eunit` compile race-d
+with cover instrumentation, and cover would error with
+`{cover,get_abstract_code,...,enoent,gateway_pb.beam}` on the
+gpb-generated proto module — sometimes during gateway eunit,
+sometimes during gateway ct, depending on which test ran first.
+The pre-fetch was redundant on persistent runners (cache already
+warm) so it was removed in favor of the simpler retry-on-test
+flow. Linux and macOS were unaffected throughout.
+
 Usage:
     test_gateway.py <gateway_dir> eunit   # EUnit tests
     test_gateway.py <gateway_dir> ct      # Common Test suites
@@ -13,6 +39,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
@@ -34,7 +61,15 @@ suite = sys.argv[2]  # "eunit" or "ct"
 # Erlang's cover module during instrumentation.  Only the app ebin is
 # removed — dependency beams (meck, proper, grpcbox, …) are kept so they
 # don't need to be recompiled on every run.
-app_ebin = Path(gateway_dir) / "_build" / "test" / "lib" / "yuzu_gw" / "ebin"
+#
+# REBAR_BASE_DIR selects the rebar3 `_build/` root; meson.build sets
+# it per-suite (`_build_eunit` vs `_build_ct`) so the two gateway
+# suites never race on the same ebin tree. Absolute paths win over
+# relative — meson hands us an absolute `_build_<suite>`; fall back to
+# `<gateway>/_build` when the env var is unset (e.g. direct script
+# invocation for local debugging).
+_base = os.environ.get("REBAR_BASE_DIR") or str(Path(gateway_dir) / "_build")
+app_ebin = Path(_base) / "test" / "lib" / "yuzu_gw" / "ebin"
 if app_ebin.exists():
     shutil.rmtree(app_ebin)
 
@@ -59,12 +94,55 @@ if suite == "ct":
     env["YUZU_PERF_ENDURANCE_AGENTS"] = "10"
     env["YUZU_PERF_ENDURANCE_SECS"] = "1"
 
+# ──────────────────────────────────────────────────────────────────────
+# hex.pm flake retry helper
+# ──────────────────────────────────────────────────────────────────────
+HEX_FAIL_PATTERN = "Failed to fetch and copy dep:"
+
+
+def run_with_retry(args, label, max_attempts=4):
+    """Run a rebar3 command with retry on hex.pm fetch flakes.
+
+    Returns the final CompletedProcess. Stdout is teed to our stdout
+    on every attempt so the operator sees what's happening live.
+
+    Backoff: 5s, 10s, 20s between attempts (exponential). Total worst
+    case is ~35s of waits across 4 attempts, plus the actual rebar3
+    runtime per attempt.
+    """
+    for attempt in range(1, max_attempts + 1):
+        result = subprocess.run(
+            args,
+            cwd=gateway_dir,
+            env=env if env is not None else os.environ,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        output = result.stdout or ""
+        sys.stdout.write(output)
+        if result.returncode == 0:
+            return result
+        if HEX_FAIL_PATTERN in output and attempt < max_attempts:
+            backoff = 5 * (2 ** (attempt - 1))
+            print(
+                f"\n[test_gateway.py] {label}: hex.pm fetch failure detected "
+                f"(attempt {attempt}/{max_attempts}) — sleeping {backoff}s and retrying",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
+            continue
+        # Non-hex failure or last attempt — surface it.
+        return result
+    return result
+
+
 # Capture output to detect OTP 25 CT I/O race, but also tee to console.
-result = subprocess.run(cmd, cwd=gateway_dir, env=env,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True)
+# run_with_retry handles hex.pm fetch flakes by detecting the
+# "Failed to fetch and copy dep:" sentinel and backing off between
+# attempts. 4 attempts × ~35s of waits at most before giving up.
+result = run_with_retry(cmd, suite, max_attempts=4)
 output = result.stdout or ""
-sys.stdout.write(output)
 
 # OTP 25 has a known race where the CT I/O handler (test_server_io)
 # terminates before all suite completion messages are written, causing

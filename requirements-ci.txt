@@ -1,0 +1,8 @@
+# Python tooling pins consumed by CI jobs (.github/workflows/ci.yml,
+# release.yml) and by scripts/setup.sh when a version is not otherwise
+# supplied. Tracked by Dependabot (pip ecosystem) — see
+# .github/dependabot.yml and docs/dependency-updates.md.
+#
+# Keep this file in a flat "package==version" shape so the macOS pipx
+# path can extract the meson line with a single grep.
+meson==1.9.2
