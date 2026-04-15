@@ -31,11 +31,15 @@ name: Runner inventory sentinel
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:
-  schedule:
-    # Every 30 minutes. Maximum staleness of drift detection is ~30 min
-    # which is well below the "CI has been queued for an hour" pattern
-    # that triggers human investigation anyway.
-    - cron: "*/30 * * * *"
+  # Scheduled trigger DISABLED until RUNNER_INVENTORY_TOKEN PAT is created.
+  # See docs/ci-troubleshooting.md (TODO Saturday) for PAT setup. Until
+  # the PAT exists, scheduled runs would fail every 30 min on the 403
+  # from /actions/runners, training operators to ignore the workflow —
+  # an anti-pattern for a sentinel whose whole job is loud signaling.
+  # Re-enable the cron line below in the same PR that adds the PAT.
+  #
+  # schedule:
+  #   - cron: "*/30 * * * *"
   workflow_dispatch:
   push:
     branches: [dev, main]
