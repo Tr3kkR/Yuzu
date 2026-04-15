@@ -1,0 +1,180 @@
+name: Runner inventory sentinel
+
+# Asserts that GitHub's actions/runners listing matches the expected
+# inventory declared in .github/runner-inventory.json. Fails loud on
+# drift and opens (or comments on) a tracking issue labelled
+# `runner-inventory-drift` so operators are notified within 30 min.
+#
+# Why this exists: Yuzu's CI depends on two self-hosted runners
+# (yuzu-wsl2-linux on Shulgi WSL2, yuzu-local-windows on Shulgi native
+# Windows). If either goes offline silently, CI queues without obvious
+# signal until someone notices the "queued for 30 minutes" pattern.
+# This sentinel is the explicit `something that says` invariant —
+# see memory feedback_ci_infra_priorities.md for the "diagnosability
+# first" framing that motivated it.
+#
+# Source of truth for expected runner state is .github/runner-inventory.json.
+# To legitimately change the inventory (add/remove a runner, change
+# labels) update that file in a PR with intent in the commit message;
+# the sentinel will go green automatically on the next run.
+#
+# Authentication note: listing runners requires `administration: read`
+# permission on GITHUB_TOKEN. If that permission cannot be granted
+# (org-restricted repos) this workflow will 403 on the gh api call;
+# the fallback is a fine-grained PAT in a repo secret — see
+# docs/ci-troubleshooting.md if that becomes necessary.
+
+on:
+  schedule:
+    # Every 30 minutes. Maximum staleness of drift detection is ~30 min
+    # which is well below the "CI has been queued for an hour" pattern
+    # that triggers human investigation anyway.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [dev, main]
+    paths:
+      - '.github/runner-inventory.json'
+      - '.github/workflows/runner-inventory-sentinel.yml'
+
+permissions:
+  contents: read
+  administration: read
+  issues: write
+
+concurrency:
+  group: runner-inventory-sentinel
+  cancel-in-progress: false
+
+jobs:
+  assert:
+    name: Assert expected runner inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check runner inventory against declaration
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, subprocess, sys
+
+          INVENTORY = ".github/runner-inventory.json"
+
+          with open(INVENTORY) as f:
+              inventory = json.load(f)
+
+          expected = {r["name"]: r for r in inventory["expected_runners"]}
+          strict = inventory.get("strict_unknown_runners", True)
+
+          result = subprocess.run(
+              ["gh", "api", "/repos/Tr3kkR/Yuzu/actions/runners"],
+              capture_output=True, text=True, check=False
+          )
+          if result.returncode != 0:
+              print("::error::failed to query /actions/runners — check administration:read permission")
+              print(result.stderr)
+              sys.exit(2)
+
+          payload = json.loads(result.stdout)
+          actual = {
+              r["name"]: {
+                  "name": r["name"],
+                  "labels": sorted(l["name"] for l in r["labels"]),
+                  "status": r["status"],
+                  "busy": r["busy"],
+              }
+              for r in payload["runners"]
+          }
+
+          drift = []
+
+          for name, exp in expected.items():
+              act = actual.get(name)
+              if not act:
+                  drift.append(f"MISSING: expected runner '{name}' not registered with GitHub")
+                  continue
+              if act["status"] != "online":
+                  drift.append(f"OFFLINE: runner '{name}' reports status '{act['status']}'")
+              expected_labels = set(exp["labels"])
+              actual_labels = set(act["labels"])
+              missing_labels = expected_labels - actual_labels
+              if missing_labels:
+                  drift.append(
+                      f"MISSING_LABEL: runner '{name}' missing expected labels {sorted(missing_labels)} "
+                      f"(actual labels: {sorted(actual_labels)})"
+                  )
+
+          if strict:
+              for name in actual:
+                  if name not in expected:
+                      drift.append(
+                          f"UNKNOWN: unexpected runner '{name}' is registered "
+                          f"but not declared in {INVENTORY} — either deregister it "
+                          f"or add it to the inventory in a PR"
+                      )
+
+          print("=== Expected (.github/runner-inventory.json) ===")
+          print(json.dumps(list(expected.values()), indent=2))
+          print()
+          print("=== Actual (GitHub /actions/runners) ===")
+          print(json.dumps(list(actual.values()), indent=2))
+          print()
+
+          if drift:
+              print("=== DRIFT DETECTED ===")
+              for d in drift:
+                  print(f"  - {d}")
+              # Surface the drift report as a step output so the issue-creation
+              # step can embed it in the issue body.
+              import os
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("drift_count=" + str(len(drift)) + "\n")
+                  f.write("drift_report<<DRIFT_EOF\n")
+                  for d in drift:
+                      f.write(f"- {d}\n")
+                  f.write("DRIFT_EOF\n")
+              sys.exit(1)
+
+          print("=== RUNNER INVENTORY OK ===")
+          PY
+
+      - name: Open or update drift issue
+        if: failure() && steps.check.outputs.drift_count != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --label runner-inventory-drift --state open --json number --jq '.[0].number // empty')
+          body=$(cat <<EOF
+          Runner inventory drift detected by \`runner-inventory-sentinel\` workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          **Drift report:**
+          ${{ steps.check.outputs.drift_report }}
+
+          **How to resolve:**
+          - If a runner is legitimately missing/offline: bring it back online (see \`docs/ci-troubleshooting.md\` for the runner restart runbook).
+          - If the expected inventory is intentionally changing: update \`.github/runner-inventory.json\` in a PR with intent in the commit message. The sentinel re-runs on merge and goes green if reality matches.
+          - If an unexpected runner appeared: either deregister it via the GitHub UI (Settings → Actions → Runners) or add it to the inventory declaration with a PR.
+
+          The full expected-vs-actual JSON dump is in the workflow logs.
+
+          Auto-generated; close this issue when resolved.
+          EOF
+          )
+
+          if [ -n "$existing" ]; then
+            echo "Updating existing drift issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            echo "Creating new drift issue"
+            gh issue create \
+              --title "Runner inventory drift ($(date -u +%Y-%m-%d))" \
+              --label runner-inventory-drift \
+              --label operational \
+              --body "$body"
+          fi
