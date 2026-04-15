@@ -311,17 +311,37 @@ For every breakage encountered during any tier:
 > a separate matrix include. We are not doing either; the tiers are
 > CI-config-only.
 >
-> **Standing caveat — clang-19 regression on `dev`.** `dev` carries
-> an unresolved clang-19 debug failure from CI run `24450261405`
-> job `71437121999` (see `project_session_handover_2026-04-15b.md`).
-> It is independent of this rollout, was introduced before the
-> recreate cycle, but **will be visible on every post-merge push
-> run until diagnosed**. Do not treat a red post-merge clang-19 job
-> as a dependabot-introduced regression without first matching the
-> failure signature against `24450261405/71437121999`. If the
-> signatures diverge, the dependabot PR is the suspect. If they
-> match, the dependabot PR is innocent and the regression remains
-> a separate diagnostic owed to the Track A CI work.
+> **Resolved — the clang-19 debug "regression" on
+> `24450261405/71437121999` was a WSL2 VM cycling false positive,
+> not a clang-19 code regression.** Diagnosis 2026-04-15 ~17:30 UTC:
+> in the failed job, steps 1-13 (Setup → Build → Test → ccache
+> stats) and step 24 (Post Cache vcpkg) all completed SUCCESS;
+> step 25 `Post Cache ccache` was `in_progress` with conclusion
+> `null` and step 26 `Post Run actions/checkout` was `pending` —
+> classic runner-killed-mid-cleanup signature. The 33-minute gap
+> between job `71437121999` ending at 11:34:10Z and the next
+> `yuzu-wsl2-linux` job (`Linux clang-19 release` job
+> `71437122003`) starting at 12:07:33Z confirms the runner agent
+> was offline (normal pickup is seconds), matching the WSL2
+> utility VM idle-reaper pattern documented as entry #1 of
+> `docs/ci-troubleshooting.md`. **Validated** by job
+> `71453384876` on the very next run `24455027178`
+> (workflow_dispatch on `675d636`): the same `Linux clang-19
+> debug` code path completed all 27 steps SUCCESS in 4m 53s
+> including `Post Cache ccache` and `Complete job`. The two-part
+> fix (`vmIdleTimeout=-1` in `/mnt/c/Users/natha/.wslconfig` plus
+> `loginctl enable-linger dornbrn`) is **deployed and verified
+> in place** on the WSL2 host. **No standing caveat remains for
+> the dependabot rollout** — Phase 0 is genuinely clear. **One
+> follow-up flagged but not blocking the rollout:** on the same
+> validation run `24455027178`, `Linux gcc-13 debug` job
+> `71453384781` failed mid-Test step (Build SUCCESS, Test
+> interrupted at 15m 11s, all subsequent steps `null`). Different
+> signature from `71437121999` (failure point is Test, not Post
+> Cache ccache), so it is either a second VM cycling event with a
+> shorter wall-clock, a Test-step timeout, or a real test
+> failure — separate diagnostic, owed to Track B but does not
+> block dependabot tier dispatch. Do not conflate the two.
 >
 > **Next action — start Tier 1.** Dispatch `#335` ubuntu and `#248`
 > alpine. Both are docker-only, independent, and can merge in
@@ -386,6 +406,49 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-15 ~17:30 UTC** · Claude session · **Diagnosis: the
+  clang-19 debug "regression" on run `24450261405` job
+  `71437121999` was a WSL2 utility VM cycling false positive, not
+  a clang-19 code regression.** Pulled the failed job's step trace
+  via `gh api repos/Tr3kkR/Yuzu/actions/jobs/71437121999`. Steps
+  1-13 (Setup → Install packages → Cache ccache → Setup vcpkg →
+  Install vcpkg → Configure Meson → **Build** → **Test** → ccache
+  stats) and step 24 (Post Cache vcpkg) all completed SUCCESS.
+  Step 25 `Post Cache ccache` is `in_progress` with conclusion
+  `null` (never finished), step 26 `Post Run actions/checkout` is
+  `pending` (never started). Job marked failure at 11:34:10Z after
+  40m 54s wall time. Cross-checked against the runner timeline:
+  `gh api repos/Tr3kkR/Yuzu/actions/runs/24450261405/jobs` shows
+  the next `yuzu-wsl2-linux` job (`Linux clang-19 release` job
+  `71437122003`) didn't pick up until 12:07:33Z — a **33-minute
+  gap** vs. the seconds-to-minutes normal pickup, signature of
+  the runner agent dying with the host VM. This matches the
+  WSL2 utility VM idle-reaper failure mode documented as entry #1
+  of `docs/ci-troubleshooting.md` (commit `819568b`). **Validated**
+  on the very next CI run, `24455027178` (workflow_dispatch on
+  `675d636`, fired at 12:40:57Z, after the WSL2 keep-alive fix
+  was in place): the same `Linux clang-19 debug` code path on job
+  `71453384876` completed all 27 steps SUCCESS in 4m 53s including
+  `Post Cache ccache` and `Complete job`. Verified the two-part
+  fix is **actually deployed**: `cat /mnt/c/Users/natha/.wslconfig`
+  shows `vmIdleTimeout=-1` (with the explanatory comment block) and
+  `loginctl show-user dornbrn` returns `Linger=yes`. Resume Pointer
+  refreshed: removed the "Standing caveat — clang-19 regression on
+  dev" paragraph that was added in the 17:00 UTC refresh, replaced
+  with a "Resolved" entry holding the diagnosis. **Memory pointer
+  `project_session_handover_2026-04-15b.md` should also be updated
+  to mark item #2 of "Open work / pickup points" (Diagnose Linux
+  clang-19 debug regression) as done; that update is part of this
+  same diagnostic batch.** **One follow-up surfaced** that does
+  NOT block the dependabot rollout: `Linux gcc-13 debug` job
+  `71453384781` on the same validation run `24455027178` failed
+  mid-Test step (Build SUCCESS at step 11, Test step 12 interrupted
+  at 15m 11s wall, steps 13-26 all `null`). Different signature
+  from `71437121999` — failure point is Test, not Post Cache
+  ccache — so it is either a second WSL2 VM cycling event with a
+  shorter wall-clock, a Test-step timeout, or an actual test
+  failure. Separate diagnostic owed to Track B; do not conflate
+  with the resolved clang-19 case.
 - **2026-04-15 ~17:00 UTC** · Claude session · **Phase 0 fully clear,
   Tier 1 unblocked. Resume Pointer refreshed.** Status check after
   the WSL2 keep-alive + CI troubleshooting runbook commits landed.
