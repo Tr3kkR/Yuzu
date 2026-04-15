@@ -95,7 +95,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
-          pip3 install -r requirements-ci.txt
+          pip3 install --user --break-system-packages -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -410,7 +411,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install -r requirements-ci.txt
+          pip3 install --user --break-system-packages -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -494,7 +496,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install -r requirements-ci.txt
+          pip3 install --user --break-system-packages -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -576,7 +579,8 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install -r requirements-ci.txt gcovr
+          pip3 install --user --break-system-packages -r requirements-ci.txt gcovr
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
         uses: actions/cache@v4
