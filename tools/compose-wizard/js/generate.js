@@ -405,7 +405,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: prometheus-config\n`;
     y += `        target: /etc/prometheus/prometheus.yml\n`;
     y += `    volumes:\n`;
-    y += `      - ${c.persistentVolumes ? 'prometheus-data' : 'prometheus-data:/prometheus'}\n`;
+    y += `      - prometheus-data:/prometheus\n`;
     y += `    depends_on:\n`;
     y += `      - server\n`;
     if (c.gateway) y += `      - gateway\n`;
@@ -436,7 +436,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: grafana-dashboard-analytics\n`;
     y += `        target: /var/lib/grafana/dashboards/yuzu-analytics-dashboard.json\n`;
     y += `    volumes:\n`;
-    y += `      - ${c.persistentVolumes ? 'grafana-data' : 'grafana-data:/var/lib/grafana'}\n`;
+    y += `      - grafana-data:/var/lib/grafana\n`;
     y += `    depends_on:\n`;
     y += `      - prometheus\n`;
   }
@@ -459,7 +459,7 @@ ${c.clickhouse ? `## ClickHouse:  http://localhost:${c.chHttpPort}  (${c.chUser}
     y += `      - source: clickhouse-init\n`;
     y += `        target: /docker-entrypoint-initdb.d/init.sql\n`;
     y += `    volumes:\n`;
-    y += `      - ${c.persistentVolumes ? 'clickhouse-data' : 'clickhouse-data:/var/lib/clickhouse'}\n`;
+    y += `      - clickhouse-data:/var/lib/clickhouse\n`;
     y += `    ulimits:\n`;
     y += `      nofile:\n`;
     y += `        soft: 262144\n`;

@@ -3,19 +3,24 @@
 :root {
   --yuzu-orange: #f57c00;
   --yuzu-orange-light: #ffe0b2;
+  --yuzu-orange-dim: #c46a00;
   --yuzu-dark: #1a1a2e;
   --yuzu-mid: #16213e;
   --yuzu-light: #e2e2e2;
-  --bg: #f5f5f5;
-  --card-bg: #ffffff;
-  --text: #333;
-  --text-muted: #666;
-  --border: #ddd;
+  --bg: #0d1117;
+  --card-bg: #161b22;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --border: #30363d;
+  --input-bg: #0d1117;
   --success: #4caf50;
-  --warning-bg: #fff3e0;
+  --warning-bg: #2d1f0e;
   --warning-border: #f57c00;
-  --info-bg: #e3f2fd;
-  --info-border: #1976d2;
+  --info-bg: #0d1b2a;
+  --info-border: #1f6feb;
+  --code-bg: #0d1117;
+  --step-inactive-bg: #21262d;
+  --step-hover-bg: #30363d;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -41,11 +46,15 @@ header {
 
 header h1 {
   font-size: 2rem;
-  color: var(--yuzu-dark);
+  color: var(--text);
 }
 
 header h1 code {
   color: var(--yuzu-orange);
+}
+
+header .subtitle {
+  color: var(--text-muted);
 }
 
 .subtitle {
@@ -66,7 +75,7 @@ header h1 code {
 
 .step {
   flex: 1;
-  background: none;
+  background: var(--step-inactive-bg);
   border: none;
   padding: 0.5rem 0.25rem;
   font-size: 0.85rem;
@@ -76,7 +85,7 @@ header h1 code {
   transition: all 0.2s;
 }
 
-.step:hover { background: var(--yuzu-orange-light); }
+.step:hover { background: var(--step-hover-bg); }
 
 .step.active {
   background: var(--yuzu-orange);
@@ -96,16 +105,16 @@ header h1 code {
 .step-panel.active { display: block; }
 
 .step-panel h2 {
-  color: var(--yuzu-dark);
+  color: var(--text);
   margin-bottom: 1rem;
   padding-bottom: 0.5rem;
-  border-bottom: 2px solid var(--yuzu-orange-light);
+  border-bottom: 2px solid var(--yuzu-orange-dim);
 }
 
 .step-panel h3 {
   margin-top: 1.5rem;
   margin-bottom: 0.5rem;
-  color: var(--yuzu-dark);
+  color: var(--text);
 }
 
 .step-panel ul {
@@ -126,7 +135,7 @@ header h1 code {
   display: block;
   font-weight: 600;
   margin-bottom: 0.25rem;
-  color: var(--yuzu-dark);
+  color: var(--text);
 }
 
 .field input[type="text"],
@@ -136,6 +145,8 @@ header h1 code {
   border: 1px solid var(--border);
   border-radius: 6px;
   font-size: 1rem;
+  background: var(--input-bg);
+  color: var(--text);
   transition: border 0.2s;
 }
 
@@ -162,11 +173,12 @@ fieldset {
   border-radius: 8px;
   padding: 1rem;
   margin: 1rem 0;
+  background: var(--bg);
 }
 
 legend {
   font-weight: 600;
-  color: var(--yuzu-dark);
+  color: var(--yuzu-orange);
   padding: 0 0.5rem;
 }
 
@@ -198,14 +210,14 @@ legend {
   padding: 0.5rem 1.25rem;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: white;
+  background: var(--step-inactive-bg);
   color: var(--text);
   cursor: pointer;
   font-size: 0.95rem;
   transition: all 0.2s;
 }
 
-.btn:hover { background: var(--bg); }
+.btn:hover { background: var(--step-hover-bg); }
 
 .btn.primary {
   background: var(--yuzu-orange);
@@ -263,7 +275,7 @@ legend {
 .review-value {
   font-weight: 600;
   font-family: monospace;
-  color: var(--yuzu-dark);
+  color: var(--yuzu-orange);
 }
 
 /* ── Output ── */
@@ -277,14 +289,14 @@ legend {
   gap: 0.5rem;
   margin-bottom: 0.25rem;
   font-weight: 600;
-  color: var(--yuzu-dark);
+  color: var(--yuzu-orange);
 }
 
 .output-header span { flex: 1; }
 
 .code-output {
-  background: var(--yuzu-dark);
-  color: #e0e0e0;
+  background: #0d1117;
+  color: #c9d1d9;
   padding: 1rem;
   border-radius: 6px;
   font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
@@ -294,6 +306,7 @@ legend {
   line-height: 1.5;
   max-height: 500px;
   overflow-y: auto;
+  border: 1px solid var(--border);
 }
 
 /* ── Footer ── */
@@ -304,7 +317,7 @@ footer {
   font-size: 0.85rem;
 }
 
-footer a {
+a {
   color: var(--yuzu-orange);
   text-decoration: none;
 }
