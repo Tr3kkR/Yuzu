@@ -42,7 +42,7 @@ RUN rebar3 as prod release
 
 # ── Stage 3: Runtime — must match the builder's Alpine version (3.22) for
 #    OpenSSL ABI compatibility (crypto NIF links against libcrypto.so)
-FROM alpine:3.22
+FROM alpine:3.23
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && adduser -D -s /sbin/nologin yuzu-gw
