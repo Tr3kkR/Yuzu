@@ -47,7 +47,7 @@ jobs:
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
     name: "Proto backward-compat"
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
@@ -62,10 +62,17 @@ jobs:
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
 
-  # ── Linux (GCC + Clang) ────────────────────────────────────────────────
+  # ── Linux (GCC + Clang, self-hosted yuzu-wsl2-linux) ──────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
-    runs-on: ubuntu-24.04
+    # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
+    # state between runs on the same workspace amortizes the install
+    # cost. Trade-off: the single runner process serializes this 4-way
+    # matrix, so multi-commit pushes are slower end-to-end than on the
+    # parallel ubuntu-24.04 fleet. Mirrors the Windows migration in
+    # #374 — the optimization target is Actions-minute spend, not
+    # per-PR latency.
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -386,7 +393,7 @@ jobs:
     name: "Sanitizers (ASan+UBSan)"
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     env:
       ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
@@ -471,7 +478,7 @@ jobs:
     name: "Sanitizers (TSan)"
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
@@ -555,7 +562,7 @@ jobs:
     name: "Coverage (GCC 13)"
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     needs: [linux]
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
 
     steps:
