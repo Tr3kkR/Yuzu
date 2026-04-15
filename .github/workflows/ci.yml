@@ -653,15 +653,24 @@ jobs:
 
       - name: Generate coverage reports
         run: |
+          # --gcov-ignore-parse-errors=negative_hits.warn: tests/unit/test_metrics_perf.cpp
+          # runs hot concurrent writer loops that cause gcov's branch counters to race into
+          # negative values ("branch 2 taken -2 (fallthrough)"). gcovr's own error message
+          # suggests this flag as the fix; it downgrades the parse error to a warning so the
+          # rest of the coverage report still generates. If coverage fidelity on that one
+          # file ever matters, switch to per-thread .gcda output or add
+          # #pragma GCC optimize("no-profile-arcs") around the hot loop.
           gcovr --root . \
             --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
             --exclude '.*\.pb\.(h|cc)$' \
             --branches \
+            --gcov-ignore-parse-errors=negative_hits.warn \
             --xml -o builddir/coverage.xml
           gcovr --root . \
             --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
             --exclude '.*\.pb\.(h|cc)$' \
             --branches \
+            --gcov-ignore-parse-errors=negative_hits.warn \
             --html --html-details -o builddir/coverage-html/index.html
 
       - name: Upload coverage to Codecov
