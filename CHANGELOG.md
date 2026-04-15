@@ -19,6 +19,32 @@ patch._
 
 ### Added
 
+- **Runner inventory sentinel workflow
+  (`.github/workflows/runner-inventory-sentinel.yml`,
+  `.github/runner-inventory.json`).** Declarative expected-state file
+  enumerates the self-hosted runners we expect to be online + idle
+  (currently `yuzu-wsl2-linux` and `yuzu-local-windows`), and a
+  scheduled workflow reconciles `gh api repos/Tr3kkR/Yuzu/actions/runners`
+  against it. Reports drift (missing runners, offline runners, wrong
+  labels) as a workflow failure with a human-readable summary in the run
+  annotation. Built across three commits:
+  - `12ef73b` — initial workflow + inventory file scaffold.
+  - `a0425c8` — parse error fix (removed invalid `administration: read`
+    workflow permission, added graceful HTTP 403 handling with
+    PAT-setup runbook in stderr, added `.github/runner-inventory.json`
+    and the workflow file itself to `ci.yml`'s `paths-ignore` so CI
+    doesn't re-trigger on inventory edits).
+  - `675d636` — cron schedule commented out with `[skip ci]`. The
+    sentinel is **inactive until the `RUNNER_INVENTORY_TOKEN` PAT is
+    created** — `gh api /actions/runners` requires admin scope which
+    `GITHUB_TOKEN` cannot grant via workflow permissions (admin scope
+    only exists at org/installation level, not workflow level). PAT
+    creation is the first item on the Saturday at Jordanstone checklist;
+    once it lands, uncomment the schedule block and the sentinel
+    activates. The inactive-until-PAT pattern avoids the chronic-red
+    anti-pattern where a permanently-failing scheduled workflow trains
+    operators to ignore CI failure notifications.
+
 - **Dependency automation — `pip` ecosystem + scheduled vcpkg baseline
   bumps (closes #363).** `requirements-ci.txt` at the repo root becomes
   the single source of truth for Python tooling pins (currently just
@@ -626,6 +652,55 @@ patch._
   run `24426124422` (Windows MSVC debug: `gateway eunit OK 58.58s`,
   `gateway ct OK 78.39s`) — the first fully-green Windows MSVC
   gateway run in the #375 fix chain.
+
+- **`.github/workflows/ci.yml`: Linux jobs (gcc-13/clang-19,
+  debug/release) migrated from `ubuntu-24.04` GHA-hosted to
+  `yuzu-wsl2-linux` self-hosted runner (commits `f4d634e`, `d12ba74`).**
+  Mirrors the Windows MSVC migration to bring all four mainstream
+  platforms under self-hosted control, trading hosted-runner cold-cache
+  cost for persistent-runner warm-cache and freedom from GHA outages.
+  Two follow-up infrastructure gaps surfaced and were closed during the
+  migration:
+  - **NOPASSWD sudo for `github-runner`** — first push run failed on the
+    `Install system packages` step because the `github-runner` user had
+    no NOPASSWD sudo grant. Fixed out-of-band by adding
+    `/etc/sudoers.d/github-runner` granting NOPASSWD for `apt-get`,
+    `apt`, and `dpkg`. The grant is host-side and not version-controlled;
+    canonical recovery procedure is documented in
+    `docs/ci-troubleshooting.md`.
+  - **PEP 668 `externally-managed-environment` (`d12ba74`)** —
+    Ubuntu 24.04 (which the WSL2 distro is) ships PEP 668's marker so a
+    system-wide `pip3 install` refuses with `EXTERNALLY-MANAGED`. All
+    four Linux jobs now use
+    `pip3 install --user --break-system-packages -r requirements-ci.txt`
+    (the documented bypass for ephemeral CI install-and-go environments)
+    plus `echo "$HOME/.local/bin" >> $GITHUB_PATH` so the subsequent
+    `meson setup` step finds the `~/.local/bin/meson` shim.
+
+- **WSL2 utility VM keep-alive: `vmIdleTimeout=-1` in `.wslconfig`,
+  `loginctl enable-linger dornbrn` for defense-in-depth.** The
+  `yuzu-wsl2-linux` self-hosted runner lives inside the WSL2 host distro
+  on Shulgi. WSL2's default `vmIdleTimeout=60000` (60 s) shut the utility
+  VM down ~60 s after the last interactive shell session ended, which
+  killed both the `actions.runner.Tr3kkR-Yuzu.yuzu-wsl2-linux.service`
+  systemd unit AND any tmux sessions inside the distro. Confirmed by 4
+  VM cycles on 2026-04-15 (07:52, 08:24, 10:06, 13:07 UTC, captured by
+  `last reboot`) correlating with SSH disconnect events, and by the
+  parent-run-wedge cascade where CI run `24450261405` lost its
+  `Linux gcc-13 debug` job mid-execution and the orphaned job could not
+  be cancelled until the runner reincarnated and force-cancel propagated.
+  Fix in two coordinated changes (both host-side, neither in the repo):
+  - `vmIdleTimeout=-1` in `/mnt/c/Users/natha/.wslconfig` (Windows-side
+    WSL2 host config, applied via `wsl --shutdown`). `-1` disables the
+    idle timeout entirely — appropriate for a runner host where the
+    cost of the VM running idle is dwarfed by the cost of cancelling
+    an in-flight CI run.
+  - `loginctl enable-linger dornbrn` so user-scope systemd survives
+    "no sessions" windows even with the VM up. Defense-in-depth, since
+    the runner unit is system-scope and didn't strictly need it.
+  Canonical recovery procedure documented in `docs/ci-troubleshooting.md`
+  as the first runbook entry for the "Linux runner shows offline" /
+  "tmux is dying" failure mode.
 
 - **`.github/workflows/ci.yml`: Windows MSVC debug and release jobs
   migrated from the GHA-hosted `windows-2022` runner to the
