@@ -5,4 +5,4 @@
 #
 # Keep this file in a flat "package==version" shape so the macOS pipx
 # path can extract the meson line with a single grep.
-meson==1.9.2
+meson==1.11.0
