@@ -3,10 +3,22 @@ name: CI
 on:
   push:
     branches: [main, dev, "feature/**", "fix/**"]
-    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/runner-inventory.json'
+      - '.github/workflows/runner-inventory-sentinel.yml'
   pull_request:
     branches: [main, dev]
-    paths-ignore: ['docs/**', '*.md', 'LICENSE', '.gitignore']
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.github/runner-inventory.json'
+      - '.github/workflows/runner-inventory-sentinel.yml'
   workflow_dispatch:
 
 permissions:
