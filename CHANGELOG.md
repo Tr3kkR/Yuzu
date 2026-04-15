@@ -534,65 +534,115 @@ patch._
 
 ### Fixed
 
-- **Windows MSVC debug builds: removed `VCPKG_BUILD_TYPE release` from
-  `triplets/x64-windows.cmake`, ending a 4-day Windows debug outage.**
-  Commit `f0bb58b` (2026-04-10, "skip debug vcpkg variants") added
-  `set(VCPKG_BUILD_TYPE release)` to the Windows overlay triplet to
-  halve release-build vcpkg install time. The flag tells vcpkg to skip
-  building the debug variant of every package, leaving only release-CRT
-  binaries (`/MD`, `_ITERATOR_DEBUG_LEVEL=0`) in
-  `vcpkg_installed/x64-windows/`. Our debug build compiles user code
-  with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`, and MSVC's linker refuses
-  to mix the two — every Windows MSVC debug job from `f0bb58b` onward
-  failed with dozens of LNK2038 `RuntimeLibrary` /
-  `_ITERATOR_DEBUG_LEVEL` mismatch errors against `absl_cord.lib`,
-  `absl_cord_internal.lib`, and friends. The CI matrix had **zero
-  successful runs on `dev` for 4 days** (2026-04-10 → 2026-04-14).
-  PR #355's `vcpkg-x64-windows-${{ matrix.build_type }}-…` cache key
-  separation addressed a related cross-job cache contamination but
-  did not fix the underlying triplet — both debug and release jobs
-  still pulled release-only `vcpkg_installed/` trees because that's
-  all the triplet emitted. The CodeQL Windows matrix leg also tripped
-  on this once it got past path/shell quirks.
+- **Windows MSVC LNK2038 closed end-to-end via "option D" — static
+  triplet override + hand-rolled `cxx.find_library()` wiring for
+  grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as
+  `bf95d3b`).** The earlier `0fe5eac` fix (removing
+  `VCPKG_BUILD_TYPE release` from `triplets/x64-windows.cmake`) stopped
+  vcpkg from emitting release-only binaries but did not stop meson's
+  cmake dependency translator from baking the release library paths
+  into the debug link line — every Windows MSVC debug build still
+  produced dozens of `RuntimeLibrary` / `_ITERATOR_DEBUG_LEVEL`
+  mismatches against `absl_cord.lib`, `protobuf.lib`, and friends.
+  Four iterations (per-build-type triplets → explicit
+  `CMAKE_BUILD_TYPE` → drop static override → option H hybrid) failed
+  in distinct ways (`12e40ae` through `220e7bd` on the dev branch).
+  Option D is the combination that works:
+  - `triplets/x64-windows.cmake` forces `VCPKG_LIBRARY_LINKAGE static`
+    + `VCPKG_CRT_LINKAGE dynamic` so vcpkg emits per-build-type static
+    archives (`.lib` for release, `d.lib` for debug) that can be
+    selected at link time by the consumer.
+  - `meson.build` replaces the meson `dependency('grpc++',
+    method: 'cmake')` wiring on Windows MSVC with a hand-rolled
+    `cxx.find_library()` chain that picks the correct variant
+    (`protobuf`/`protobufd`, `zlib`/`zlibd`, `libssl`/`libcrypto` —
+    unconditional because gRPC's TLS/JWT/PEM paths always resolve
+    against OpenSSL regardless of schannel aspirations) per the
+    active `buildtype`. Debug and release link lines are now symmetric
+    and CRT-consistent.
+  - `vcpkg.json` openssl dependency loses its `"platform": "!windows"`
+    filter (it was aspirational, never worked, and confirmed wrong by
+    the option D canary's LNK2019 errors).
+  Full history — every failed option, the symmetry breakage at each
+  step, and the strategic escape path to a QUIC-based transport
+  (P1 #376) in case the option D wiring ever rots — is preserved in
+  `.claude/agents/build-ci.md` under "Windows MSVC static-link history
+  and #375". **Do not simplify either half of the Windows wiring** —
+  the triplet override OR the hand-rolled `cxx.find_library()` list —
+  without reading that agent doc first. Linux and macOS are unaffected
+  throughout (meson's cmake dep translator works correctly on
+  platforms with single-variant runtime libraries). The rest of the
+  dependency rollout (#363, 7 stale Dependabot PRs rebased onto
+  `dev`) was gated on this fix and unblocked immediately after the
+  PR #373 merge.
 
-  Three coordinated changes:
-  - **`triplets/x64-windows.cmake`**: removed
-    `set(VCPKG_BUILD_TYPE release)` and added a doc-comment block
-    explaining why it must NOT be set, with explicit pointer at the
-    f0bb58b regression so the next person tempted by the install-time
-    optimization knows what they'd break. The Linux triplet
-    (`x64-linux-static.cmake`) keeps its `VCPKG_BUILD_TYPE release`
-    because gcc/clang don't have MSVC's runtime-library variant ABI —
-    debug user code links against release-built `.a` static libs
-    without complaint.
-  - **`.github/workflows/ci.yml`**: added `triplets/*.cmake` to the
-    Windows vcpkg cache key's `hashFiles(...)` so the next run busts
-    the cache and pulls a fresh install instead of restoring the
-    release-only tree. Without this, the GHA cache would silently
-    return the poisoned content under the same key and the fix would
-    look like it didn't take. Other vcpkg cache keys (linux, macOS,
-    sanitizer/coverage variants) were left alone because they all use
-    `--triplet x64-linux` / `--triplet arm64-osx` (vcpkg's built-in
-    triplets), not the project's overlay triplets, so triplet-content
-    drift cannot affect them.
-  - **`.github/workflows/codeql.yml`**: added a "Force fresh vcpkg
-    install when triplet changed (windows only)" step that compares
-    `sha256 triplets/x64-windows.cmake` against a sentinel file under
-    `vcpkg_installed/.x64-windows-triplet.sha256` and `rm -rf`s the
-    install root on drift. The CodeQL workflow doesn't use GHA cache
-    for `vcpkg_installed/` — it relies on the persistent self-hosted
-    Windows runner state — so vcpkg's incremental install would
-    otherwise silently reuse the release-only tree on the runner's
-    disk forever. Subsequent runs after the sha256 stabilises return
-    to fast persistent reuse.
+- **Erlang gateway test suites (`eunit` + `ct`) now survive Windows
+  parallel test scheduling (#375, folded into PR #373).** Two distinct
+  Windows-only failures in the gateway test wrapper
+  `scripts/test_gateway.py` had to be untangled in sequence:
+  - **Cover-races-compile on `gateway_pb.beam`** (commit `b33f1df`
+    regression, fixed in `6d8aa5a`). `b33f1df` added a pre-fetch step
+    `rebar3 as test compile --deps_only` to warm the hex cache before
+    the actual test run. On Linux/macOS this is harmless because
+    `_build/test/lib/yuzu_gw/src/` is a symlink to `apps/yuzu_gw/src/`
+    and cover instrumentation always reads a consistent view of the
+    ebin tree. On Windows — where symlinks are unavailable so rebar3
+    copies source files instead — the pre-fetch left
+    `_build/test/lib/yuzu_gw/` in a state where the subsequent
+    `rebar3 as test eunit` incremental compile raced cover's
+    `pmap_spawn` module-scan. Result was a consistent ~10 s failure
+    with `{cover,get_abstract_code,2,...,{file_error,
+    ".../gateway_pb.beam",enoent}}` on the gpb-generated protobuf
+    module before any test executed. `6d8aa5a` drops the pre-fetch
+    entirely (redundant on the persistent `yuzu-local-windows` runner
+    whose hex cache is already warm) and retains the
+    `run_with_retry()` helper with `max_attempts=4` on the actual
+    test invocation for continued hex.pm flake protection.
+  - **Parallel-compile race between the two gateway suites** (fixed
+    in `f0b84c7`). Meson's default test scheduler runs `gateway eunit`
+    and `gateway ct` in parallel, both invoking `test_gateway.py`,
+    both running `rebar3 as test <suite>` against the same
+    `_build/test/lib/<dep>/` tree. rebar3's compile worker writes
+    `<name>.bea#` then atomically renames to `<name>.beam`; when two
+    processes collide on the same dep (`proper` is first, being the
+    largest Erlang dependency), whichever renames first wins and the
+    loser's `MoveFileEx` call fails with `ENOENT` on the temp file.
+    Linux/macOS tolerate the race via POSIX atomic rename and
+    symlinked source trees; Windows does not. The failing suite
+    flipped between eunit and ct across runs depending on which
+    rebar3 process lost the race. Fix: `meson.build` sets a distinct
+    `REBAR_BASE_DIR` per suite (`_build_eunit` vs `_build_ct`) via
+    the test `env:` parameter; `scripts/test_gateway.py` honors the
+    env var when computing its ebin-wipe path; `.gitignore` gains the
+    two new build roots. Two disjoint `_build/` trees cannot race.
+    Cost is a one-time extra compile of Erlang dependencies
+    (`meck`, `proper`, `covertool` ≈ 10–15 s) in whichever suite
+    starts second from a cold cache, paid once per fresh runner and
+    then cached by rebar3's user-level hex cache for subsequent runs.
+  The pre-`b33f1df` eunit path was passing on an earlier commit only
+  because that run happened to avoid the parallel-race by winning the
+  scheduling flip; both failure modes had to be fixed before the CI
+  cycle could go consistently green. Validated on PR #373 push CI
+  run `24426124422` (Windows MSVC debug: `gateway eunit OK 58.58s`,
+  `gateway ct OK 78.39s`) — the first fully-green Windows MSVC
+  gateway run in the #375 fix chain.
 
-  Tradeoff: Windows vcpkg install will now build BOTH debug and
-  release variants of every package, doubling the cold-cache install
-  time. The cost is amortized by the GHA cache (warm restores stay
-  fast) and is the right tradeoff against having no green Windows CI
-  at all. If the install-time optimization is wanted back, do it via
-  per-build-type triplets (`x64-windows-release` for the release
-  matrix leg only) — never on the shared default.
+- **`.github/workflows/ci.yml`: Windows MSVC debug and release jobs
+  migrated from the GHA-hosted `windows-2022` runner to the
+  `yuzu-local-windows` self-hosted runner (#374, commit `3960f46`).**
+  Hosted Windows runners have long vcpkg install times (grpc alone
+  takes 10+ minutes from a cold cache) and occasional `applocal.ps1`
+  / grpc-build flakes that were blocking the #375 debug iteration
+  loop. Moving Windows MSVC onto the persistent self-hosted runner
+  cuts warm-cycle time significantly and gives vcpkg's binary cache a
+  stable disk to live on across runs. The single-runner serialization
+  pattern (only one Windows MSVC job runs at a time) is deliberate —
+  the `yuzu-local-windows` runner is a single physical machine with
+  one worker — and has the side-effect of flushing out any Yuzu test
+  code that was inadvertently relying on hosted-runner-fresh state.
+  The migration exposed #375 (LNK2038 was masked on hosted runners by
+  a different vcpkg cache layout) which was the gate that had to
+  close before the dependabot rollout could proceed.
 
 - **`scripts/test/` harness bugs discovered running `/test --full`
   against uncommitted #339.** Three PR1 harness fixes that landed the
