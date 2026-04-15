@@ -49,16 +49,17 @@ recreate, the new PR numbers go in the **Recreated As** column.
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
 | 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
-| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | plumbing done (commit `3960f46`); exposed #375 |
-| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option D: static triplet + hand-rolled `cxx.find_library()` for grpc/protobuf | **Gate (P0)** | Yes | in progress (folded into #373) |
-| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
-| 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
-| 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
-| 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
-| 3  | #6  | **#243** | TBD | `actions/github-script` 7 → 8 | Med-High | **Yes** | pending |
-| 3  | #7  | **#241** | TBD | `actions/cache` 4 → 5 | High (19 sites) | **Yes** | pending |
-| 4  | #8  | **#242** | TBD | `actions/upload-artifact` 4 → 7 | High | **Yes** | pending |
-| 4  | #9  | **#250** | TBD | `actions/download-artifact` 4 → 8 | **Highest** (digest=error) | **Yes** | pending |
+| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | **done** (commit `3960f46`) |
+| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option D static-link triplet + parallel-compile race | **Gate (P0)** | Yes | **done** (PR #373 merged as `bf95d3b`) |
+| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **done** — all 8 open PRs `base=dev` |
+| 0d  | n/a | n/a      | **#385**         | `meson` 1.9.2 → 1.11.0 (new pip ecosystem from #372) | Gate (build graph) | n/a | pending — tier separately, see Resume Pointer |
+| 1  | #3  | **#335** | #335 (in place)  | `ubuntu` digest 186072b → 84e77de | Low | No | **next** |
+| 1  | #4  | **#248** | #248 (in place)  | `alpine` 3.22 → 3.23 (gateway) | Low | No | **next** |
+| 2  | #5  | **#300** | #300 (in place)  | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
+| 3  | #6  | **#243** | **#386** (now 7→9) | `actions/github-script` 7 → **9** | Med-High | **Yes** | pending |
+| 3  | #7  | **#241** | #241 (in place)  | `actions/cache` 4 → 5 | High (19 sites) | **Yes** | pending |
+| 4  | #8  | **#242** | #242 (in place)  | `actions/upload-artifact` 4 → 7 | High | **Yes** | pending |
+| 4  | #9  | **#250** | #250 (in place)  | `actions/download-artifact` 4 → 8 | **Highest** (digest=error) | **Yes** | pending |
 | 5  | #11 | n/a  | — | Centralize Dockerfile meson pins | Low | n/a | pending |
 | —  | #10 | n/a  | — | Standing breakage triage | n/a | n/a | pending |
 
@@ -239,162 +240,119 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Session handoff 2026-04-14 ~22:00 UTC.** Option D C++ link is
-> solid on Windows MSVC — every C++ target compiles and links on
-> both debug and release, every C++ test passes. The last blocking
-> gate is `yuzu:gateway eunit` / `yuzu:gateway ct` on Windows, and
-> the latest iteration (commit `f0b84c7`, pushed at handoff) gives
-> each suite its own `REBAR_BASE_DIR` so two parallel rebar3
-> processes can never race on the same `_build/test/lib/<dep>/`
-> ebin tree. The full in-flight fix chain is now:
-> `220e7bd` (option D C++ clean, gateway EUnit hex.pm flake) →
-> `b33f1df` (pre-fetch retry added, **regressed** on Windows with
-> cover-races-compile on `gateway_pb.beam`) →
-> `d20852b` (docs-only handoff) →
-> `6d8aa5a` (drop `--deps_only` pre-fetch, fixes cover race — eunit
-> started passing but exposed the parallel-compile race) →
-> `fea3702` (docs-only handoff) →
-> `f0b84c7` (per-suite `_build_eunit`/`_build_ct` to end the race).
+> **Session handoff 2026-04-15 ~17:00 UTC.** Phase 0 is **fully
+> clear**. All eight open Dependabot PRs target `dev`, are MERGEABLE,
+> and PR-time CI is green across the board. **Tier 1 is ready to
+> start whenever an operator picks it up** (see `Slot the new meson
+> PR` below for the one open question to decide first).
 >
-> **The two Windows failures that `6d8aa5a` and `f0b84c7` fix.**
+> **Phase 0 closure recap:**
 >
-> **(1) Cover-races-compile on `gateway_pb.beam`, fixed in `6d8aa5a`.**
-> On push CI run `24412646165` the `b33f1df` pre-fetch produced a
-> consistent ~10s failure in BOTH Windows MSVC variants:
-> - release → gateway EUNIT failed at 10.40s with
->   `{cover,get_abstract_code,...,{file_error,".../gateway_pb.beam",enoent}}`
-> - debug → gateway CT failed at 10.50s with the same cover stack.
+> - **0a (Task #1)** — `yuzu-wsl2-linux` and `yuzu-local-windows`
+>   runners are both at 2.333.1 (well above the 2.327.1 Node 24
+>   floor).
+> - **0b** — Windows MSVC migration to `yuzu-local-windows` shipped
+>   in `3960f46`.
+> - **0bb (Task #14, #375)** — option D static-link + parallel-compile
+>   race fix landed via PR #373 squash-merge `bf95d3b`. `meson.build`
+>   is at 0.11.0. Lessons-learned record is `.claude/agents/build-ci.md`
+>   "Windows MSVC static-link history and #375". The full narrative
+>   of the option D iteration (commits `a61a787 → 713ae8c → 46ea61f
+>   → 220e7bd → b33f1df → 6d8aa5a → f0b84c7 → 5b2996c`) and the
+>   gateway parallel-compile race diagnosis live in the
+>   2026-04-14 ~22:00 UTC and 2026-04-15 ~12:00 UTC Event Log entries
+>   below; do not re-derive from this Resume Pointer.
+> - **0c (Task #2)** — `@dependabot recreate` cycle complete. One
+>   real recreation: `#243 → #386`, the latter offering 7 → **9**
+>   instead of 7 → 8 because GitHub Actions released github-script
+>   v9 during the #375 pause window. The other six PRs (#335, #248,
+>   #300, #241, #242, #250) were rebased in place onto `dev` and
+>   kept their original PR numbers — for those, the `Recreated As`
+>   column in the Tier Table reads `(in place)`.
 >
-> The test profile has `cover_enabled => true`, so eunit/ct fire
-> cover instrumentation immediately after `===> Compiling yuzu_gw`.
-> On Linux/macOS `_build/test/lib/yuzu_gw/src/` is a symlink to
-> `apps/yuzu_gw/src/` and the compile pipeline is synchronous, so
-> cover always sees a consistent ebin. On Windows symlinks are out,
-> the pre-fetch leaves `_build/test/lib/yuzu_gw/` in a state where
-> the subsequent incremental compile races cover's `pmap_spawn`
-> scan — `gateway_pb` is in cover's module list but its `.beam` is
-> not yet on disk when cover's `beam_lib` read fires. `6d8aa5a`
-> drops the pre-fetch (redundant on the persistent runner whose
-> hex cache is warm) and keeps `run_with_retry` on the actual test
-> invocation with `max_attempts=4`.
+> **Open Dependabot PRs (all `base=dev`, all MERGEABLE):**
 >
-> **(2) Parallel-compile race between eunit and ct, fixed in
-> `f0b84c7`.** On push CI run `24419434652` the `6d8aa5a` fix
-> green-lit gateway eunit, but exposed a SECOND distinct failure
-> flipping between the two suites:
-> - push release: eunit FAIL 8.98s, ct OK 55.65s
-> - push debug:   ct    FAIL 4.32s, eunit OK 30.75s
-> - PR debug:     eunit FAIL 8.77s, ct OK 55.49s
+> | Tier | PR | Bump | Notes |
+> |---|---|---|---|
+> | 1 | #335 | ubuntu digest `186072b` → `84e77de` | docker-only |
+> | 1 | #248 | alpine 3.22 → 3.23 | docker-only (gateway runtime) |
+> | 2 | #300 | codecov-action 5 → 6 | github-hosted Node 24 canary |
+> | 3 | **#386** | actions/github-script 7 → **9** | recreated from #243; v9 dropped during the #375 pause window so the bump widened by one major |
+> | 3 | #241 | actions/cache 4 → 5 | 19 sites, self-hosted Node 24 |
+> | 4 | #242 | actions/upload-artifact 4 → 7 | release path |
+> | 4 | #250 | actions/download-artifact 4 → 8 | release path; digest=error |
+> | 0d | **#385** | meson 1.9.2 → 1.11.0 | NEW — pip ecosystem from #372; not in the original Tier Table; **slot before Tier 1** |
 >
-> The failing suite flips based on which rebar3 process loses the
-> race. Error signature in the loser's compile:
+> **What "PR-time CI green" actually means here.** Every open PR
+> shows the same 4-success / 3-skipped rollup:
+> `Proto backward-compat`, `Linux gcc-13 debug`, `Windows MSVC
+> debug`, `macOS debug` succeed; `Sanitizers (ASan+UBSan)`,
+> `Sanitizers (TSan)`, `Coverage (GCC 13)` skip. **The PR-event
+> matrix in `.github/workflows/ci.yml` lines 91-97 deliberately
+> excludes `clang-19` and the `release` build_type via
+> `matrix.exclude` on `pull_request` events** as a CI-cost
+> optimization — the Linux self-hosted runner is single-process so
+> the 4-way (gcc-13 / clang-19) × (debug / release) matrix is
+> serialized; running all four on every PR commit doubles the wall
+> time. Windows MSVC and macOS jobs apply the same release-only
+> exclude on PRs for the same reason. Sanitizers and coverage gate
+> on labels / schedule, hence the SKIPPED rows. clang-19 + release
+> builds run on the post-merge `push` event against `dev` and on
+> nightly schedules.
 >
->     ===> Compiling _build/test/lib/proper/src/proper_orddict.erl failed
->     _build/test/lib/proper/ebin/proper_orddict.beam:none: failed to
->       rename .../proper_orddict.bea# to .../proper_orddict.beam:
->       no such file or directory
+> **Implication for this rollout.** None of the dependabot tiers
+> below touch C++ source, so clang-19-vs-gcc-13 divergence is not
+> a real merge-gate risk; the post-merge push run is the safety net
+> that exercises clang-19 + release. If this rollout had touched
+> C++ source we would tighten the gate by either (a) running
+> `gh workflow run ci.yml --ref <branch>` against the dependabot
+> branch directly to force a `push`-event matrix expansion, or
+> (b) adding a `dependabot-c++` label that the workflow honors with
+> a separate matrix include. We are not doing either; the tiers are
+> CI-config-only.
 >
-> Root cause: meson's default parallel test scheduling runs
-> `gateway eunit` and `gateway ct` simultaneously, both invoking
-> `test_gateway.py`, both running `rebar3 as test <suite>` against
-> the SAME `_build/test/lib/<dep>/` tree. rebar3's compile worker
-> writes `<name>.bea#` then atomically renames to `<name>.beam`;
-> when two processes collide on the same dep (`proper` is first,
-> being the largest), whichever renames first wins and the loser's
-> rename fails with ENOENT. Linux/macOS tolerate the race via
-> atomic POSIX rename and symlinked source trees; Windows does not.
+> **Standing caveat — clang-19 regression on `dev`.** `dev` carries
+> an unresolved clang-19 debug failure from CI run `24450261405`
+> job `71437121999` (see `project_session_handover_2026-04-15b.md`).
+> It is independent of this rollout, was introduced before the
+> recreate cycle, but **will be visible on every post-merge push
+> run until diagnosed**. Do not treat a red post-merge clang-19 job
+> as a dependabot-introduced regression without first matching the
+> failure signature against `24450261405/71437121999`. If the
+> signatures diverge, the dependabot PR is the suspect. If they
+> match, the dependabot PR is innocent and the regression remains
+> a separate diagnostic owed to the Track A CI work.
 >
-> `f0b84c7` sets a distinct `REBAR_BASE_DIR` per suite
-> (`_build_eunit` vs `_build_ct`) in `meson.build`, with
-> `test_gateway.py` honoring the env var when computing its
-> ebin wipe path. Two disjoint build trees, no shared ebin, no
-> possible race. The cost is a one-time extra compile of deps
-> (meck, proper, covertool ≈ 10-15 s) in whichever suite starts
-> second from a cold-cache state, paid once per fresh runner and
-> then cached by rebar3's user-level hex cache for subsequent runs.
+> **Next action — start Tier 1.** Dispatch `#335` ubuntu and `#248`
+> alpine. Both are docker-only, independent, and can merge in
+> either order. Validation gate per Phase 1 is the recreated PR's
+> CI run on the rebased branch + a local
+> `docker build -f deploy/docker/Dockerfile.{server,agent,gateway}`
+> sanity. After Tier 1 lands cleanly, advance to Tier 2 (`#300`
+> codecov-action) which is the single-site github-hosted Node 24
+> canary; Tier 2 is where the Node 24 surface area first widens.
 >
-> **2026-04-15 update — code is green, merge gate is a vcpkg flake
-> rerun.** Push CI run `24426124422` on `5b2996c` (docs-only commit
-> on top of `f0b84c7`) completed with **both Windows variants
-> green**: Windows MSVC debug `gateway eunit OK 58.58s` +
-> `gateway ct OK 78.39s`, Windows MSVC release green. Linux gcc-13,
-> Linux clang-19, macOS debug, macOS release all green on both
-> push and PR runs. The parallel-race fix `f0b84c7` is validated
-> end-to-end; **no code change is needed to close #375**.
+> **Slot the new meson PR (decision needed before Tier 1).** `#385`
+> (meson 1.9.2 → 1.11.0) is not in the original Tier Table — it
+> dropped after #372 added the pip ecosystem to
+> `.github/dependabot.yml`. Meson governs the entire build graph
+> and is currently pinned in five Dockerfiles (which is what the
+> Tier 5 cleanup task exists to centralize). Recommended
+> classification: **slot before Tier 1 as Tier 0d**, treat as its
+> own gate, because every downstream tier's docker build picks up
+> the new meson immediately and a meson regression would mask
+> itself as a dependabot-PR build failure with no easy bisect.
+> Validation gate for #385: a `docker build` of all three
+> Dockerfiles plus a clean `meson setup build-linux --reconfigure`
+> on the WSL2 box. **Open question for the operator:** if you would
+> rather defer #385 until after Tier 5 (centralize the pins first,
+> then bump once), close it with a `dependabot ignore this minor
+> version` comment and proceed straight to Tier 1.
 >
-> The remaining gate is a PR-run Windows debug job that hit a vcpkg
-> `grpc:x64-windows` build flake in `applocal.ps1` copying deps for
-> `grpc_csharp_plugin.exe`. Root signature in the job log:
->
->     error: building grpc:x64-windows failed with: BUILD_FAILED
->     Elapsed time to handle grpc:x64-windows: 9.8 min
->     ...applocal.ps1 -targetBinary .../grpc_csharp_plugin.exe... Error code: 1
->
-> This is unrelated to anything in this PR — the push run on the
-> exact same SHA passed cleanly. Job `71360390333` on PR run
-> `24426126324` was rerun via `gh run rerun 24426126324 --failed`
-> immediately after diagnosis; watch its completion with:
->
->     gh run view 24426126324 --json status,conclusion,jobs \
->       --jq '.jobs[] | select(.name=="Windows MSVC debug")'
->
-> **Next action:** wait for the rerun to complete.
->
-> If green: **merge PR #373** (squash or merge-commit, see #369 for
-> the reconcile pattern), **close #375** with a pointer at
-> `.claude/agents/build-ci.md` "Windows MSVC static-link history
-> and #375" as the lessons-learned record, **dispatch Task #2** —
-> the dependabot recreate cycle. Tasks #3 → #9 unblock in tier
-> order per the Tier Table.
->
-> If red with the **same** vcpkg grpc applocal signature: rerun one
-> more time (grpc-on-vcpkg is legitimately flaky, 2-try attempts
-> are the documented norm). If it hits the flake a third time,
-> escalate by pushing a trivial no-op commit (docs comment,
-> whitespace) to force a fresh workflow cycle — fresh push run
-> gets the warm cache first, then PR run piggybacks.
->
-> If red on a **different** failure mode (e.g. the gateway suites
-> regress, or a new C++ link error, or a different vcpkg package):
-> the parallel-compile race wasn't the last gotcha. Escalation:
-> 1. If gateway tests fail: add `is_parallel: false` to both
->    gateway test() entries in meson.build. Strict-serializes the
->    gateway tests with respect to ALL other meson tests
->    (~30s extra test-time), eliminating ANY shared-resource race
->    not just the `_build/` tree.
-> 2. If vcpkg fails on a different package: check
->    `gh run view <job> --log | grep -iE "(BUILD_FAILED|error:)"`
->    to identify the new failing port and file an upstream issue.
-> 3. If a new C++ link error surfaces: a new transitive lib is
->    missing from option D's hand-rolled `cxx.find_library()` list.
->    Apply the iteration pattern from a61a787 → 713ae8c → 46ea61f
->    → 220e7bd — see `.claude/agents/build-ci.md` "Windows MSVC
->    static-link history and #375" for the long form.
->
-> If red on a new C++ link error: it's a new transitive lib
-> surfacing in option D's hand-rolled `cxx.find_library()` list.
-> Apply the iteration pattern from the a61a787 → 713ae8c → 46ea61f
-> → 220e7bd chain — see `.claude/agents/build-ci.md` "Windows MSVC
-> static-link history and #375" for the long form.
->
-> Tasks #1 and #14 done. Tasks #2-#9 (dependabot rollout) **PAUSED**
-> pending #375 closure on the `f0b84c7` CI cycle. Tasks #11-#13
-> unblocked anytime. Task #15 (hex.pm hardening) is on hold — the
-> `run_with_retry` helper is retained and hex.pm flakes still retry
-> on the actual test invocation, but the explicit pre-fetch step
-> experiment failed and is not being reattempted. Task #16 (move
-> off gRPC) deferred per P1 #376.
->
-> Canary commits on `dev`:
-> `b33f1df` (pre-fetch, regressed) →
-> `d20852b` (docs-only) →
-> `6d8aa5a` (pre-fetch drop, fixed cover race) →
-> `fea3702` (docs-only) →
-> `f0b84c7` (per-suite `_build/`, fixes parallel-compile race).
-> The earlier `24412648443` and `24419435949` PR run IDs in older
-> versions of this Resume Pointer are stale. Always use
-> `gh pr view 373 --json statusCheckRollup` to get the live PR
-> CI run ID before diagnosing.
+> Tasks #1, #14, and #2 done. Tasks #3-#9 unblocked (start with
+> #3 + #4 in Tier 1 once #385 / Tier 0d is decided). Tasks #11-#13
+> unblocked anytime. Task #15 (hex.pm hardening) on hold. Task #16
+> (move off gRPC) deferred per P1 #376.
 
 ## Sub-agent delegation pattern
 
@@ -428,6 +386,42 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-15 ~17:00 UTC** · Claude session · **Phase 0 fully clear,
+  Tier 1 unblocked. Resume Pointer refreshed.** Status check after
+  the WSL2 keep-alive + CI troubleshooting runbook commits landed.
+  Confirmed via `gh pr list --author app/dependabot --state open`
+  + `gh pr view <n> --json statusCheckRollup,mergeable,baseRefName`:
+  (1) PR #373 was merged as `bf95d3b`, which closed #375 and
+  unblocked Phase 0. (2) The `@dependabot recreate` cycle dispatched
+  by the previous session resulted in **one true recreation**
+  (#243 → **#386** — v9 dropped during the pause window so the bump
+  widened from 7→8 to 7→**9**) plus **six in-place rebases** that
+  kept their original PR numbers (#335, #248, #300, #241, #242,
+  #250). (3) **One new pip-ecosystem PR not in the original Tier
+  Table — #385** meson 1.9.2 → 1.11.0, dropped because #372 added
+  the pip ecosystem to `.github/dependabot.yml` after the table was
+  written. Slotted as Tier 0d before Tier 1 because meson governs
+  the entire build graph and is pinned in five Dockerfiles. (4) All
+  8 open PRs report `base=dev`, `mergeable=MERGEABLE`, and the
+  standard 4-success / 3-skipped PR-time CI rollup (`Proto
+  backward-compat`, `Linux gcc-13 debug`, `Windows MSVC debug`,
+  `macOS debug` SUCCESS; `Sanitizers ASan+UBSan`, `Sanitizers TSan`,
+  `Coverage GCC 13` SKIPPED). Resume Pointer wholesale-replaced —
+  the prior 156-line #375 narrative was preserved in the
+  2026-04-14 ~22:00 UTC and 2026-04-15 ~12:00 UTC entries below
+  (no information loss). Documented in this refresh: the PR-time
+  CI matrix in `.github/workflows/ci.yml` lines 91-97 deliberately
+  excludes `clang-19` and `release` build_type via `matrix.exclude`
+  on `pull_request` events as a self-hosted runner cost
+  optimization (Linux runner is single-process, 4-way matrix
+  serializes), so "PR green" does **not** mean "clang-19 green"
+  until the post-merge push run on `dev` lands. Standing caveat
+  recorded: `dev` carries an unresolved clang-19 debug regression
+  from CI run `24450261405` job `71437121999` that is independent
+  of this rollout but visible on every post-merge push run.
+  **Next action:** dispatch Tier 1 (#335 + #248) once the operator
+  decides whether to slot #385 as Tier 0d or close-and-defer it
+  until Tier 5 centralizes the meson pins.
 - **2026-04-15 ~12:00 UTC** · Claude session · **Push run Windows green
   on `5b2996c`; PR run hit vcpkg grpc applocal flake and was rerun.**
   The `f0b84c7` parallel-race fix is **validated** on Windows: push CI
