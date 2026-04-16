@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yuzu Compose Wizard</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🍊 Yuzu Compose Wizard</h1>
+      <p class="subtitle">Generate a customised <code>docker-compose.yml</code> for your Yuzu deployment</p>
+    </header>
+
+    <!-- Step indicator -->
+    <nav class="steps" id="step-nav">
+      <button class="step active" data-step="1">1. Welcome</button>
+      <button class="step" data-step="2">2. Core</button>
+      <button class="step" data-step="3">3. Data</button>
+      <button class="step" data-step="4">4. Observability</button>
+      <button class="step" data-step="5">5. Gateway</button>
+      <button class="step" data-step="6">6. Generate</button>
+    </nav>
+
+    <main id="wizard-content">
+
+      <!-- Step 1: Welcome -->
+      <section id="step-1" class="step-panel active">
+        <h2>Welcome to the Yuzu Compose Wizard</h2>
+        <p>This wizard will walk you through creating a customised <code>docker-compose.yml</code> and <code>.env</code> file for your Yuzu deployment.</p>
+        <div class="callout info">
+          <strong>Why use this?</strong> The default compose file works, but it has hardcoded values and several known gotchas. This wizard helps you avoid common mistakes and generates a production-ready configuration.
+        </div>
+        <h3>What you'll configure:</h3>
+        <ul>
+          <li>Yuzu version, admin credentials, and ports</li>
+          <li>Data storage and ClickHouse settings</li>
+          <li>Prometheus &amp; Grafana observability stack</li>
+          <li>Yuzu Gateway (Erlang/OTP) settings</li>
+        </ul>
+        <h3>What you'll get:</h3>
+        <ul>
+          <li><code>docker-compose.yml</code> — fully commented, ready to run</li>
+          <li><code>.env</code> — environment variables for easy reconfiguration</li>
+          <li>Quick-start commands to get going immediately</li>
+        </ul>
+        <div class="actions">
+          <button onclick="goStep(2)" class="btn primary">Get Started →</button>
+        </div>
+      </section>
+
+      <!-- Step 2: Core Setup -->
+      <section id="step-2" class="step-panel">
+        <h2>Core Setup</h2>
+
+        <div class="field">
+          <label for="yuzu-version">Yuzu Version</label>
+          <input type="text" id="yuzu-version" value="0.10.0" placeholder="0.10.0">
+          <small>The container image tag. Use <code>latest</code> for bleeding edge.</small>
+        </div>
+
+        <div class="field">
+          <label for="admin-user">Admin Username</label>
+          <input type="text" id="admin-user" value="admin">
+        </div>
+
+        <div class="field">
+          <label for="admin-pass">Admin Password</label>
+          <input type="text" id="admin-pass" value="adminpassword1">
+          <small>⚠️ Change this! The hash is auto-generated. For production, use a strong password.</small>
+        </div>
+
+        <div class="field">
+          <label for="dashboard-port">Dashboard Port</label>
+          <input type="number" id="dashboard-port" value="8080" min="1" max="65535">
+          <small>Web dashboard + REST API port. Common alternative: <code>8092</code></small>
+        </div>
+
+        <div class="field">
+          <label for="grpc-port">Agent gRPC Port</label>
+          <input type="number" id="grpc-port" value="50051" min="1" max="65535">
+          <small>Port agents connect to directly.</small>
+        </div>
+
+        <div class="field">
+          <label for="mgmt-port">Management gRPC Port</label>
+          <input type="number" id="mgmt-port" value="50052" min="1" max="65535">
+        </div>
+
+        <div class="field">
+          <label for="gateway-upstream-port">Gateway Upstream Port</label>
+          <input type="number" id="gateway-upstream-port" value="50055" min="1" max="65535">
+          <small>Internal port for gateway→server communication.</small>
+        </div>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="enable-tls"> Enable TLS
+          </label>
+          <small>⚠️ TLS requires cert/key paths and is not recommended for local testing.</small>
+        </div>
+
+        <div class="field tls-field" style="display:none">
+          <label for="tls-cert">Certificate Path</label>
+          <input type="text" id="tls-cert" placeholder="/path/to/cert.pem">
+        </div>
+        <div class="field tls-field" style="display:none">
+          <label for="tls-key">Key Path</label>
+          <input type="text" id="tls-key" placeholder="/path/to/key.pem">
+        </div>
+
+        <div class="actions">
+          <button onclick="goStep(1)" class="btn">← Back</button>
+          <button onclick="goStep(3)" class="btn primary">Next →</button>
+        </div>
+      </section>
+
+      <!-- Step 3: Data & Storage -->
+      <section id="step-3" class="step-panel">
+        <h2>Data &amp; Storage</h2>
+
+        <div class="callout warning">
+          <strong>⚠️ Known gotcha:</strong> The <code>--data-dir</code> flag is <em>required</em> in the server command. Without it, SQLite stores fail silently and agents won't persist. This wizard includes it by default.
+        </div>
+
+        <div class="field">
+          <label for="data-dir">Yuzu Data Directory</label>
+          <input type="text" id="data-dir" value="/var/lib/yuzu">
+          <small>Path inside the container. The named volume maps here.</small>
+        </div>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="include-clickhouse" checked> Include ClickHouse
+          </label>
+          <small>Event analytics backend. Recommended for production.</small>
+        </div>
+
+        <fieldset id="clickhouse-fields">
+          <legend>ClickHouse Settings</legend>
+
+          <div class="field">
+            <label for="ch-http-port">HTTP Port</label>
+            <input type="number" id="ch-http-port" value="8123" min="1" max="65535">
+          </div>
+
+          <div class="field">
+            <label for="ch-native-port">Native Protocol Port</label>
+            <input type="number" id="ch-native-port" value="9000" min="1" max="65535">
+          </div>
+
+          <div class="field">
+            <label for="ch-user">ClickHouse User</label>
+            <input type="text" id="ch-user" value="default">
+          </div>
+
+          <div class="field">
+            <label for="ch-pass">ClickHouse Password</label>
+            <input type="text" id="ch-pass" value="yuzu">
+            <small>⚠️ Change this for production!</small>
+          </div>
+
+          <div class="field">
+            <label for="ch-db">ClickHouse Database</label>
+            <input type="text" id="ch-db" value="yuzu">
+          </div>
+        </fieldset>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="persistent-volumes" checked> Use Named Volumes
+          </label>
+          <small>Recommended. Data survives <code>docker compose down</code>.</small>
+        </div>
+
+        <div class="actions">
+          <button onclick="goStep(2)" class="btn">← Back</button>
+          <button onclick="goStep(4)" class="btn primary">Next →</button>
+        </div>
+      </section>
+
+      <!-- Step 4: Observability -->
+      <section id="step-4" class="step-panel">
+        <h2>Observability</h2>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="include-prometheus" checked> Include Prometheus
+          </label>
+        </div>
+
+        <div class="field" id="prom-port-field">
+          <label for="prom-port">Prometheus Port</label>
+          <input type="number" id="prom-port" value="9090" min="1" max="65535">
+        </div>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="include-grafana" checked> Include Grafana
+          </label>
+        </div>
+
+        <fieldset id="grafana-fields">
+          <legend>Grafana Settings</legend>
+
+          <div class="field">
+            <label for="grafana-port">Grafana Port</label>
+            <input type="number" id="grafana-port" value="3000" min="1" max="65535">
+            <small>Default Grafana port is 3000. Map to 3001 if 3000 is taken.</small>
+          </div>
+
+          <div class="field">
+            <label for="grafana-pass">Grafana Admin Password</label>
+            <input type="text" id="grafana-pass" value="admin">
+            <small>⚠️ Change this! Default is <code>admin</code>.</small>
+          </div>
+        </fieldset>
+
+        <div class="callout info">
+          <strong>Dashboard JSON files:</strong> The wizard references Yuzu's built-in dashboards. Make sure <code>deploy/grafana/</code> exists in your Yuzu checkout, or remove the dashboard configs.
+        </div>
+
+        <div class="actions">
+          <button onclick="goStep(3)" class="btn">← Back</button>
+          <button onclick="goStep(5)" class="btn primary">Next →</button>
+        </div>
+      </section>
+
+      <!-- Step 5: Gateway -->
+      <section id="step-5" class="step-panel">
+        <h2>Yuzu Gateway</h2>
+
+        <div class="callout info">
+          The Yuzu Gateway (Erlang/OTP) provides agent connection pooling, circuit breaking, and hash-ring routing. It sits between agents and the Yuzu server.
+        </div>
+
+        <div class="field">
+          <label>
+            <input type="checkbox" id="include-gateway" checked> Include Yuzu Gateway
+          </label>
+        </div>
+
+        <fieldset id="gateway-fields">
+          <legend>Gateway Settings</legend>
+
+          <div class="field">
+            <label for="gw-agent-port">Agent-Facing Port</label>
+            <input type="number" id="gw-agent-port" value="50061" min="1" max="65535">
+            <small>External port agents connect through the gateway. Maps to internal 50051.</small>
+          </div>
+
+          <div class="field">
+            <label for="gw-mgmt-port">Management Port</label>
+            <input type="number" id="gw-mgmt-port" value="50063" min="1" max="65535">
+          </div>
+
+          <div class="field">
+            <label for="gw-health-port">Health/Readiness Port</label>
+            <input type="number" id="gw-health-port" value="8081" min="1" max="65535">
+          </div>
+
+          <div class="field">
+            <label for="gw-metrics-port">Prometheus Metrics Port</label>
+            <input type="number" id="gw-metrics-port" value="9568" min="1" max="65535">
+          </div>
+
+          <div class="field">
+            <label for="gw-pool-size">Upstream Pool Size</label>
+            <input type="number" id="gw-pool-size" value="32" min="1" max="256">
+            <small>Number of gateway→server connections in the pool.</small>
+          </div>
+
+          <div class="field">
+            <label>
+              <input type="checkbox" id="gw-tls"> Enable Gateway TLS
+            </label>
+            <small>Separate from server TLS. Usually not needed if gateway is internal.</small>
+          </div>
+        </fieldset>
+
+        <div class="actions">
+          <button onclick="goStep(4)" class="btn">← Back</button>
+          <button onclick="goStep(6)" class="btn primary">Review &amp; Generate →</button>
+        </div>
+      </section>
+
+      <!-- Step 6: Generate -->
+      <section id="step-6" class="step-panel">
+        <h2>Review &amp; Generate</h2>
+
+        <div id="review-summary"></div>
+
+        <div id="port-warnings" class="callout warning" style="display:none"></div>
+
+        <div class="actions generate-actions">
+          <button onclick="goStep(5)" class="btn">← Back</button>
+          <button onclick="generate()" class="btn primary big">🍊 Generate Compose Files</button>
+        </div>
+
+        <div id="output" style="display:none">
+          <h3>Generated Files</h3>
+
+          <div class="output-block">
+            <div class="output-header">
+              <span>docker-compose.yml</span>
+              <button onclick="copyToClipboard('compose-output')" class="btn small">📋 Copy</button>
+              <button onclick="downloadFile('docker-compose.yml','compose-output')" class="btn small">⬇ Download</button>
+            </div>
+            <pre id="compose-output" class="code-output"></pre>
+          </div>
+
+          <div class="output-block">
+            <div class="output-header">
+              <span>.env</span>
+              <button onclick="copyToClipboard('env-output')" class="btn small">📋 Copy</button>
+              <button onclick="downloadFile('.env','env-output')" class="btn small">⬇ Download</button>
+            </div>
+            <pre id="env-output" class="code-output"></pre>
+          </div>
+
+          <div class="callout info">
+            <h3>Quick Start</h3>
+            <pre class="code-output">docker compose up -d
+docker compose logs -f yuzu-server</pre>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <footer>
+      <p>Yuzu Compose Wizard · Part of the <a href="https://github.com/Tr3kkR/Yuzu" target="_blank">Yuzu</a> project</p>
+    </footer>
+  </div>
+
+  <script src="js/wizard.js"></script>
+  <script src="js/generate.js"></script>
+</body>
+</html>
