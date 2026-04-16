@@ -111,7 +111,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -130,7 +130,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -338,7 +338,7 @@ jobs:
           pipx install "$(grep '^meson==' requirements-ci.txt)"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           save-always: true
           path: ~/Library/Caches/ccache
@@ -358,7 +358,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
@@ -427,7 +427,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -445,7 +445,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -512,7 +512,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -530,7 +530,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -595,7 +595,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -613,7 +613,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
