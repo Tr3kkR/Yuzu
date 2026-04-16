@@ -80,10 +80,13 @@ private:
     ///                          operator. The row matching this name is
     ///                          rendered without a "Remove" button to
     ///                          prevent self-deletion lockout (#397/#403).
-    ///                          Pass empty only in contexts where there is
-    ///                          no authenticated session; the button will
-    ///                          then render for every row.
-    std::string render_users_fragment(const std::string& current_username = {});
+    ///                          No default is provided — every caller must
+    ///                          pass an explicit value (typically
+    ///                          `session->username`) so a future call site
+    ///                          omitting the argument is a compile error,
+    ///                          not a silent UI regression that re-renders
+    ///                          the pre-fix Remove button on the self row.
+    std::string render_users_fragment(const std::string& current_username);
     std::string render_tokens_fragment(const std::string& new_raw_token = {});
     /// Render the API tokens settings fragment.
     ///
