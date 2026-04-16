@@ -558,8 +558,79 @@ patch._
   includes `docker-compose.reference.yml` with the "requires operator
   hardening" caveat.
 
+### Breaking
+
+- **`DELETE /api/settings/users/:name` now returns 403 + HTMX toast
+  when the URL target matches the caller's own session username
+  (was: 200 + deletion).** Operator scripts that previously called
+  this endpoint to delete the credential they were authenticated
+  with — for example, a decommission flow that removes its own
+  service account as a final step — will receive `403 Forbidden`
+  starting in v0.11.0. The full self-deletion lockout vector
+  including UI suppression is documented in the Fixed entry below
+  (#397). To remove the account a script is signed in as, create a
+  second admin account first, switch authentication to that account,
+  then issue the DELETE.
+- **`POST /api/settings/users` now returns 403 + HTMX toast when an
+  admin attempts to change their own role (typically a self-demote
+  from `admin` to `user`).** The same lockout class as the DELETE
+  case above; closed in the Gate 4 governance hardening round
+  (ca-B1). Self-password-change (same username, same role, different
+  password) is **explicitly allowed** and continues to return 200 —
+  the guard is role-scoped, not a blanket self-upsert ban. Operator
+  scripts that change their own role need to be split: have a
+  second admin perform the role change, or perform the role change
+  before swapping accounts.
+- **Two new audit actions written to `audit_store`:**
+  `user.delete` and `user.upsert`, each with `result` ∈
+  {`success`, `denied`}. Downstream consumers (Splunk HEC,
+  ClickHouse projections) that match on the existing
+  `<noun>.<verb>` action convention pick this up automatically. SOC
+  2 CC7.2 evidence chain (governance Gate 6 CO-1).
+
 ### Fixed
 
+- **Settings → Users hardening round on top of the #397/#403 fix —
+  ca-B1 sibling lockout, CO-1 audit chain, UP-1 empty-username
+  fail-closed, UP-9 GET/POST defensive auth (governance Gate 4-6).**
+  The original two-sided fix below closed the DELETE self-target
+  case but left several adjacent hardening items open that the full
+  governance pipeline surfaced:
+  - **ca-B1 — POST self-demotion guard.** `POST /api/settings/users`
+    is the second equivalent route to the same lockout class: an
+    admin POSTing their own username with a lower role demotes
+    themselves out of admin and is locked out of every admin-gated
+    page on the next request. Now rejected with HTTP 403 + "Cannot
+    change your own role" toast when
+    `(username == session->username && role != session->role)`.
+    Self-password-change (same role) is explicitly allowed.
+  - **CO-1 — SOC 2 CC7.2 audit chain.** The 403 self-reject branches
+    and the success delete/upsert paths now emit `audit_fn_` events
+    (`user.delete` / `user.upsert` with `result` ∈ {`denied`,
+    `success`}). `spdlog::warn` alone is not the audit chain — SIEM
+    ingestion paths and SOC 2 evidence collection both read
+    `audit_store`, not log files. Pre-existing gap on the success
+    path also closed.
+  - **UP-1 — empty session username fail-closed.** All three
+    handlers now return HTTP 500 + `spdlog::error` when
+    `session->username.empty()`. Defense-in-depth against an
+    upstream OIDC mis-config returning empty `preferred_username`;
+    previously the empty-string sentinel could match an empty-
+    username row via `"" == ""` or render every row as non-self.
+  - **UP-9 — GET/POST defensive 401.** GET `/fragments/settings/users`
+    and POST `/api/settings/users` now mirror the DELETE handler's
+    defensive 401 branch when `admin_fn_` passes but `auth_fn_`
+    returns nullopt. Previously they fell through with empty
+    `self_name`, re-rendering Remove buttons on every row including
+    the operator's own — the #403 bug pattern resurrected inside
+    the response body.
+  - **arch-S1 — `render_users_fragment` no longer has a default
+    argument.** Every call site must pass `current_username`
+    explicitly so a future caller forgetting it is a compile error
+    rather than a silent UI regression.
+  - **CLAUDE.md** under Authentication & Authorization captures the
+    self-target principal-destruction guard as a hard invariant for
+    future handlers (doc-S2).
 - **Self-deletion lockout in Settings → Users closed on both UI and
   handler sides (#397 critical, #403 UI — both filed from the Apr 2026
   UAT pass).** The Settings → Users page rendered a "Remove" button
