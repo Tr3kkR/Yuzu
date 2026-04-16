@@ -405,7 +405,7 @@ std::string SettingsRoutes::render_tls_fragment() {
     return html;
 }
 
-std::string SettingsRoutes::render_users_fragment() {
+std::string SettingsRoutes::render_users_fragment(const std::string& current_username) {
     auto users = auth_mgr_->list_users();
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>"
@@ -417,21 +417,41 @@ std::string SettingsRoutes::render_users_fragment() {
         for (const auto& u : users) {
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
+            const bool is_self =
+                !current_username.empty() && u.username == current_username;
             html += "<tr><td>" + html_escape(u.username) +
                     "</td>"
                     "<td><span class=\"role-badge " +
                     std::string(cls) + "\">" + html_escape(role_str) +
                     "</span></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                    "hx-delete=\"/api/settings/users/" +
-                    html_escape(u.username) +
-                    "\" "
-                    "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove user &quot;" +
-                    html_escape(u.username) +
-                    "&quot;?\""
-                    ">Remove</button></td></tr>";
+                    "<td>";
+            if (is_self) {
+                // Self-deletion lockout guard (#397/#403): the Remove button
+                // is suppressed for the currently authenticated operator's
+                // own row so that deleting the sole admin — and thereby
+                // locking every user out of the running server — is not a
+                // two-click operation in the dashboard. The DELETE handler
+                // also rejects self-targeted requests; both halves are load-
+                // bearing because the UI guard alone does not stop a hand-
+                // crafted HTTP DELETE.
+                html += "<span class=\"current-user-badge\" "
+                        "style=\"color:#484f58;font-size:0.7rem;"
+                        "font-style:italic\" "
+                        "title=\"You cannot remove your own account\">"
+                        "Current user</span>";
+            } else {
+                html += "<button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/users/" +
+                        html_escape(u.username) +
+                        "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Remove user &quot;" +
+                        html_escape(u.username) +
+                        "&quot;?\""
+                        ">Remove</button>";
+            }
+            html += "</td></tr>";
         }
     }
 
@@ -1762,7 +1782,10 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
-                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+                auto session = auth_fn_(req, res);
+                const std::string self_name = session ? session->username : std::string{};
+                res.set_content(render_users_fragment(self_name),
+                                "text/html; charset=utf-8");
             });
 
     svr.Get("/fragments/settings/tokens",
@@ -2274,13 +2297,15 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     svr.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        const std::string self_name = session ? session->username : std::string{};
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
         auto role_str = extract_form_value(req.body, "role");
 
         if (username.empty() || password.empty()) {
             res.status = 400;
-            res.set_content(render_users_fragment() +
+            res.set_content(render_users_fragment(self_name) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
                                 "document.getElementById('user-feedback').textContent='"
@@ -2297,14 +2322,42 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         spdlog::info("User '{}' added/updated (role={})", username, role_str);
         res.set_header("HX-Trigger",
             R"({"showToast":{"message":"User created","level":"success"}})");
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(self_name), "text/html; charset=utf-8");
     });
 
     svr.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
                                                        httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            // admin_fn_ already authenticated the caller; this branch is
+            // defensive — if the two callbacks disagree there is a deeper
+            // bug and we refuse to proceed rather than delete on a stale
+            // or unresolvable session.
+            res.status = 401;
+            return;
+        }
         auto username = req.matches[1].str();
+        // Self-deletion lockout guard (#397). Deleting the currently
+        // authenticated operator — typically the sole admin on a single-
+        // seat deployment — leaves the running server with zero usable
+        // credentials until it is restarted against its on-disk config.
+        // The UI suppresses the Remove button for the self row (#403),
+        // but the handler must reject independently because a hand-
+        // crafted HTTP DELETE bypasses the dashboard entirely.
+        if (username == session->username) {
+            spdlog::warn("User '{}' attempted to delete their own account via "
+                         "/api/settings/users — rejected",
+                         session->username);
+            res.status = 403;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
@@ -2313,7 +2366,8 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"User deleted","level":"success"}})");
         }
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(session->username),
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: Enrollment tokens (admin only, HTMX) --------------------

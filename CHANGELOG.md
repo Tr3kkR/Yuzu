@@ -560,6 +560,35 @@ patch._
 
 ### Fixed
 
+- **Self-deletion lockout in Settings → Users closed on both UI and
+  handler sides (#397 critical, #403 UI — both filed from the Apr 2026
+  UAT pass).** The Settings → Users page rendered a "Remove" button
+  next to every account including the currently authenticated
+  operator's own row, and `DELETE /api/settings/users/:name` did not
+  check the target against the caller's session. Confirming the
+  generic hx-confirm dialog dropped the sole admin credential on a
+  running server, leaving every API call returning 401 until the
+  process was restarted against its on-disk config — a permanent
+  lockout on single-seat deployments where the only recovery was a
+  container restart. Fix lands both halves because a hand-crafted
+  HTTP DELETE bypasses the dashboard entirely:
+  - `server/core/src/settings_routes.cpp` —
+    `render_users_fragment(const std::string& current_username)` now
+    takes the caller's session username and renders an italicised
+    "Current user" badge (not a button, no hx-delete) for the matching
+    row. Every call site (`GET /fragments/settings/users`,
+    `POST /api/settings/users` success and error paths,
+    `DELETE /api/settings/users/:name`) resolves the session via
+    `auth_fn_` and threads the name through so the UI stays consistent
+    after user CRUD.
+  - The `DELETE` handler resolves `session = auth_fn_(req, res)` after
+    the `admin_fn_` gate passes, compares `session->username` to the
+    URL-captured target, and rejects with HTTP 403 +
+    `HX-Trigger: {"showToast":{"message":"Cannot delete your own
+    account","level":"error"}}` if they match. The rejected attempt is
+    logged at warn level (`User '<x>' attempted to delete their own
+    account via /api/settings/users — rejected`) so operators chasing
+    a lockout incident can see it in the server log.
 - **Windows MSVC LNK2038 closed end-to-end via "option D" — static
   triplet override + hand-rolled `cxx.find_library()` wiring for
   grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as
