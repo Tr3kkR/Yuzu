@@ -19,6 +19,35 @@ patch._
 
 ### Added
 
+- **`/release` skill at `.claude/skills/release/SKILL.md`** — bash-first
+  release orchestrator that runs preflight (`scripts/release-preflight.sh`
+  + `scripts/check-compose-versions.sh`), pushes the tag, monitors the
+  release workflow until terminal state, troubleshoots known failure
+  modes (the v0.10.0 download-artifact bug, compose version mismatch,
+  Windows signtool absence, macOS notarytool timeout, Windows MSVC
+  LNK2038 vcpkg cache poisoning, EUnit meck false-positive), verifies
+  the GitHub Releases page has every expected asset including the
+  Compose Wizard zip and GHCR images, and produces a release report.
+  Supports `--watch`, `--verify`, and `--resume` modes for
+  re-entrant operation when a release stalls partway. Mirrors the
+  `/test` skill's bash-first orchestration pattern (no agent fan-out;
+  the LLM interprets failures and decides next-step). Use:
+  `/release vX.Y.Z` — full pipeline; `/release --watch vX.Y.Z` —
+  monitor an in-flight release; `/release --verify vX.Y.Z` —
+  post-hoc verification.
+- **Compose Wizard bundled as a release asset
+  (`.github/workflows/release.yml` `Package Compose Wizard` step).**
+  The browser-based docker-compose.yml + .env generator at
+  `tools/compose-wizard/` (PR #405 by @fjarvis) is now packaged into
+  `yuzu-compose-wizard-X.Y.Z.zip` during the release workflow's
+  `release` job and uploaded alongside the other assets. Auto-included
+  in `SHA256SUMS` and the cosign-signed `SHA256SUMS.bundle`. Release
+  notes get a "Compose Wizard" section pointing customers at the
+  download with `unzip + open index.html` instructions. Conditional
+  on `tools/compose-wizard/` existing in the tag's commit tree —
+  emits a workflow warning and skips the bundle if absent (release
+  proceeds without it). Tag must be cut from a commit that has both
+  this workflow change AND the wizard files merged in.
 - **Runner inventory sentinel workflow
   (`.github/workflows/runner-inventory-sentinel.yml`,
   `.github/runner-inventory.json`).** Declarative expected-state file
