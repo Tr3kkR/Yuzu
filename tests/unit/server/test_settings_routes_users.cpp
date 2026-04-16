@@ -1,22 +1,27 @@
 /**
  * test_settings_routes_users.cpp — HTTP-level tests for the Users section of
  * the Settings page, covering the self-deletion lockout guard added for
- * issues #397 and #403.
+ * issues #397 and #403, the sibling self-demotion guard added in the Gate 4
+ * ca-B1 hardening round, and the SOC 2 CC7.2 audit chain (CO-1).
  *
- * The bugs: an admin viewing Settings > Users was shown a "Remove" button
- * next to their own row, and the DELETE /api/settings/users/:name handler
- * did not reject self-targeted deletes. Confirming the hx-confirm dialog
- * dropped the only usable credential on the running server and locked every
- * operator out until the process was restarted against its on-disk config.
- *
- * The fix is two-sided — UI guard (hide the button for the current user)
- * plus handler guard (reject self-targeted DELETE with 403) — because a
- * hand-crafted HTTP request bypasses the dashboard. Both halves need
- * coverage here.
+ * The bugs:
+ *  - #397 (handler): DELETE /api/settings/users/:name did not reject self-
+ *    targeted deletes. Confirming the hx-confirm dialog dropped the only
+ *    usable credential on the running server.
+ *  - #403 (UI): Settings > Users rendered a Remove button next to the
+ *    operator's own row.
+ *  - ca-B1 (sibling, found in governance Gate 4): POST /api/settings/users
+ *    let an admin demote themselves to role=user — the same lockout class
+ *    via a different route. Closed in the same hardening round.
+ *  - CO-1 (compliance, found in governance Gate 6): the rejected and
+ *    successful user lifecycle ops did not emit audit_fn_ events, breaking
+ *    SOC 2 CC7.2 evidence chain. Closed in the hardening round.
  *
  * Pattern mirrors test_rest_api_tokens.cpp: spin up an httplib::Server on
  * a random port, register SettingsRoutes with mock session callbacks, and
- * hit the real HTTP surface with httplib::Client.
+ * hit the real HTTP surface with httplib::Client. The audit_fn mock
+ * captures every call into a vector so tests can assert the evidence chain
+ * is intact on each guarded path.
  */
 
 #include "settings_routes.hpp"
@@ -43,6 +48,7 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -51,17 +57,53 @@ namespace {
 
 static fs::path unique_temp_path(const std::string& prefix) {
     static std::atomic<unsigned> seq{0};
+    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    auto t = std::chrono::steady_clock::now().time_since_epoch().count();
     return fs::temp_directory_path() /
            (prefix + "-" + std::to_string(::getpid()) + "-" +
+            std::to_string(tid) + "-" + std::to_string(t) + "-" +
             std::to_string(seq.fetch_add(1)));
 }
+
+/// RAII wrapper around a temp directory. Constructing it creates the
+/// directory; destruction removes it. Declared as the FIRST member of the
+/// harness so that even if a later REQUIRE inside the harness constructor
+/// throws (port allocation, server bind, etc.) the directory is still
+/// cleaned up — fully-constructed members of a partially-constructed object
+/// have their destructors invoked, but the object's own destructor does
+/// not. Governance Gate 3 qe-B1.
+struct TmpDirGuard {
+    fs::path path;
+    explicit TmpDirGuard(fs::path p) : path(std::move(p)) {
+        fs::create_directories(path);
+    }
+    ~TmpDirGuard() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+    TmpDirGuard(const TmpDirGuard&) = delete;
+    TmpDirGuard& operator=(const TmpDirGuard&) = delete;
+};
+
+/// Single audit call captured by the mock audit_fn.
+struct AuditCall {
+    std::string action;
+    std::string result;
+    std::string target_type;
+    std::string target_id;
+    std::string detail;
+};
 
 /// Harness that stands up a real httplib::Server with SettingsRoutes bound
 /// to an AuthManager seeded with two accounts ("admin" + "bob"). The mock
 /// auth/admin callbacks read `session_user` / `session_role` so individual
 /// tests can switch perspective between calls without rebuilding the server.
+/// The mock audit_fn appends every call into `audit_calls` so tests can
+/// verify the SOC 2 evidence chain (CO-1).
 struct SettingsRoutesHarness {
-    fs::path tmp_dir;
+    // tmp must come first — its destructor handles cleanup if any of the
+    // REQUIREs in the constructor body throw.
+    TmpDirGuard tmp;
     Config cfg{};
     auth::AuthManager auth_mgr{};
     auth::AutoApproveEngine auto_approve{};
@@ -78,9 +120,12 @@ struct SettingsRoutesHarness {
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
 
-    SettingsRoutesHarness() : tmp_dir(unique_temp_path("settings-routes-users")) {
-        fs::create_directories(tmp_dir);
-        cfg.auth_config_path = tmp_dir / "auth.cfg";
+    // Audit capture — each audit_fn_ call from the routes layer appends an
+    // entry. Tests assert on this to verify CC7.2 evidence emission.
+    std::vector<AuditCall> audit_calls;
+
+    SettingsRoutesHarness() : tmp(unique_temp_path("settings-routes-users")) {
+        cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
         REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
@@ -109,9 +154,11 @@ struct SettingsRoutesHarness {
             return true;
         };
 
-        auto audit_fn = [](const httplib::Request&, const std::string&,
-                           const std::string&, const std::string&,
-                           const std::string&, const std::string&) {};
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+        };
 
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
@@ -143,8 +190,7 @@ struct SettingsRoutesHarness {
         svr.stop();
         if (server_thread.joinable())
             server_thread.join();
-        std::error_code ec;
-        fs::remove_all(tmp_dir, ec);
+        // tmp.~TmpDirGuard() runs after this body returns, removing tmp.path.
     }
 
     httplib::Client client() const {
@@ -153,7 +199,43 @@ struct SettingsRoutesHarness {
         cli.set_read_timeout(5);
         return cli;
     }
+
+    /// True if `auth_mgr` currently lists a user with the given name.
+    bool has_user(std::string_view name) const {
+        for (const auto& u : auth_mgr.list_users()) {
+            if (u.username == name)
+                return true;
+        }
+        return false;
+    }
+
+    /// Current role of `name`, or std::nullopt if no such user.
+    std::optional<auth::Role> role_of(std::string_view name) const {
+        for (const auto& u : auth_mgr.list_users()) {
+            if (u.username == name)
+                return u.role;
+        }
+        return std::nullopt;
+    }
+
+    /// True if any captured audit call matches all four fields.
+    bool has_audit(std::string_view action, std::string_view result,
+                   std::string_view target_type, std::string_view target_id) const {
+        for (const auto& a : audit_calls) {
+            if (a.action == action && a.result == result &&
+                a.target_type == target_type && a.target_id == target_id)
+                return true;
+        }
+        return false;
+    }
 };
+
+// Exact toast payloads — must stay in sync with settings_routes.cpp,
+// docs/user-manual/server-admin.md, and the CHANGELOG entries.
+constexpr std::string_view kSelfDeleteToast =
+    R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})";
+constexpr std::string_view kSelfDemoteToast =
+    R"({"showToast":{"message":"Cannot change your own role","level":"error"}})";
 
 } // namespace
 
@@ -169,17 +251,13 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
     auto res = cli.Delete("/api/settings/users/admin");
     REQUIRE(res);
     CHECK(res->status == 403);
-    CHECK(res->get_header_value("HX-Trigger").find("Cannot delete your own account") !=
-          std::string::npos);
-
-    // The admin account must still exist after the rejected DELETE.
-    auto users = h.auth_mgr.list_users();
-    bool admin_present = false;
-    for (const auto& u : users) {
-        if (u.username == "admin")
-            admin_present = true;
-    }
-    CHECK(admin_present);
+    // Full-payload assertion: a substring match would tolerate a regression
+    // that drops the level field or injects an extra key.
+    CHECK(res->get_header_value("HX-Trigger") == kSelfDeleteToast);
+    CHECK(h.has_user("admin"));
+    // SOC 2 CC7.2 evidence emission — denied destructive ops must reach
+    // audit_store, not just spdlog (governance Gate 6 CO-1).
+    CHECK(h.has_audit("user.delete", "denied", "User", "admin"));
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other users",
@@ -192,14 +270,9 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other use
     auto res = cli.Delete("/api/settings/users/bob");
     REQUIRE(res);
     CHECK(res->status == 200);
-
-    auto users = h.auth_mgr.list_users();
-    bool bob_present = false;
-    for (const auto& u : users) {
-        if (u.username == "bob")
-            bob_present = true;
-    }
-    CHECK_FALSE(bob_present);
+    CHECK_FALSE(h.has_user("bob"));
+    // Successful destructive op also requires an audit entry (CO-1).
+    CHECK(h.has_audit("user.delete", "success", "User", "bob"));
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: non-admin session rejected",
@@ -213,15 +286,96 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: non-admin session rejected
     REQUIRE(res);
     // admin_fn_ rejects with 403 before the self-delete guard is even reached.
     CHECK(res->status == 403);
+    CHECK(h.has_user("admin"));
+    // No audit emission expected — the request never reached the handler
+    // body, so no user-level audit event should be recorded.
+    CHECK_FALSE(h.has_audit("user.delete", "denied", "User", "admin"));
+}
 
-    // Admin still exists.
-    auto users = h.auth_mgr.list_users();
-    bool admin_present = false;
-    for (const auto& u : users) {
-        if (u.username == "admin")
-            admin_present = true;
-    }
-    CHECK(admin_present);
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: unauthenticated session rejected",
+          "[settings][users][auth]") {
+    SettingsRoutesHarness h;
+    // Empty session_user → mock auth_fn returns nullopt and admin_fn
+    // returns false; admin_fn_ gate fires before either of the handler's
+    // own defensive branches. Verifies the unauthenticated path does not
+    // accidentally permit a destructive op (governance Gate 3 qe-S3).
+    h.session_user = "";
+
+    auto cli = h.client();
+    auto res = cli.Delete("/api/settings/users/admin");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.has_user("admin"));
+    CHECK(h.audit_calls.empty());
+}
+
+// ── Self-demotion guard — POST upsert sibling (ca-B1) ────────────────────────
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: admin cannot demote own role",
+          "[settings][users][self-demote]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto cli = h.client();
+    // Form-urlencoded body — that's what the dashboard sends and what
+    // extract_form_value parses.
+    auto res = cli.Post("/api/settings/users",
+                        "username=admin&password=newadminpass1&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger") == kSelfDemoteToast);
+    // Role must remain admin — the upsert must not have run.
+    auto role = h.role_of("admin");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::admin);
+    // Audit chain captures the rejection.
+    CHECK(h.has_audit("user.upsert", "denied", "User", "admin"));
+}
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change allowed",
+          "[settings][users]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto cli = h.client();
+    // Same role — only password is changing. The self-demotion guard must
+    // NOT block this; it specifically targets role transitions.
+    auto res = cli.Post("/api/settings/users",
+                        "username=admin&password=anotherpass12&role=admin",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto role = h.role_of("admin");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::admin);
+    CHECK(h.has_audit("user.upsert", "success", "User", "admin"));
+}
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: success path renders self-row guard",
+          "[settings][users][ui]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto cli = h.client();
+    // Add a new user. Response body is the re-rendered fragment; verify
+    // (a) the new user shows up with a Remove button and (b) the operator's
+    // own row still has the Current user badge — the self_name threading
+    // through the success path matters because the dashboard swaps this
+    // body into #user-section.
+    auto res = cli.Post("/api/settings/users",
+                        "username=carol&password=carolpassword1&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(h.has_user("carol"));
+    CHECK(res->body.find("hx-delete=\"/api/settings/users/carol\"") != std::string::npos);
+    CHECK(res->body.find("hx-delete=\"/api/settings/users/admin\"") == std::string::npos);
+    CHECK(res->body.find("Current user") != std::string::npos);
+    CHECK(h.has_audit("user.upsert", "success", "User", "carol"));
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────
@@ -248,11 +402,6 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: Remove button hidden fo
 TEST_CASE("SettingsRoutes GET /fragments/settings/users: non-self rows all get Remove",
           "[settings][users][ui]") {
     SettingsRoutesHarness h;
-    // Log in as bob (user role) — this should be rejected by admin_fn_,
-    // so the fragment is never rendered and we cannot test row visibility
-    // from a non-admin perspective. Instead, delete bob's row via the
-    // admin session and confirm admin still lacks a Remove button on
-    // their own row.
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 

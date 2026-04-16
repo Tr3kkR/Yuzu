@@ -817,22 +817,46 @@ patch._
 
 ### Tests
 
-- **`tests/unit/server/test_settings_routes_users.cpp` (new, 5
+- **`tests/unit/server/test_settings_routes_users.cpp` (new, 9
   cases).** First test file for the Settings routes layer. Stands up a
   real `httplib::Server` on a random port with `SettingsRoutes`
   registered against a two-account `AuthManager` (`admin` +
   `bob`), mocks the `auth_fn`/`admin_fn`/`perm_fn`/`audit_fn`
-  callbacks, and exercises the full HTTP surface. Covers the #397
-  handler guard (admin-self-DELETE returns 403 with the toast
-  HX-Trigger and leaves the account intact; admin-DELETE of another
-  user still returns 200; non-admin DELETE is rejected by the
-  `admin_fn_` gate before the self-delete guard is reached) and the
-  #403 UI guard (`GET /fragments/settings/users` emits no
-  `hx-delete="/api/settings/users/admin"` attribute for the self
-  row, still emits it for every other row, and renders the "Current
-  user" badge in its place). Pattern mirrors
-  `test_rest_api_tokens.cpp` so future Settings-routes regression
-  coverage has a harness template to reuse.
+  callbacks (audit_fn captures every call into a vector for evidence-
+  chain assertions), and exercises the full HTTP surface. Coverage:
+  - **#397 handler guard:** admin-self-DELETE returns 403 with the
+    full HX-Trigger payload (not just substring) and leaves the
+    account intact; the rejected attempt emits a `user.delete` /
+    `denied` audit event (CO-1 evidence chain).
+  - **Non-self DELETE:** admin-DELETE of another user returns 200,
+    the account is removed, and emits a `user.delete` / `success`
+    audit event.
+  - **Non-admin DELETE:** rejected by the `admin_fn_` gate before
+    the self-delete guard is reached, no audit event recorded.
+  - **Unauthenticated DELETE:** rejected by `admin_fn_` with 403,
+    target account intact, no audit event recorded.
+  - **ca-B1 self-demotion guard (POST):** admin POSTing
+    `username=admin&role=user` is rejected with 403 +
+    "Cannot change your own role" toast; role remains admin;
+    `user.upsert` / `denied` audit event captured.
+  - **POST self-password-change:** same username, same role only
+    password change — explicitly allowed, returns 200,
+    `user.upsert` / `success` audit emitted.
+  - **POST success path renders self-row guard:** new user appears
+    in the response fragment with hx-delete; operator's own row
+    still has Current user badge — regression cover for the
+    self_name threading through the success branch.
+  - **#403 UI guard:** `GET /fragments/settings/users` emits no
+    `hx-delete="/api/settings/users/admin"` attribute for the self
+    row, still emits it for every other row, and renders the
+    "Current user" badge in its place.
+  - **UI guard with multiple users:** every non-self row keeps its
+    Remove button when the user list grows.
+  Harness uses an RAII `TmpDirGuard` member that cleans up the temp
+  directory even if a `REQUIRE` inside the constructor body throws
+  (qe-B1 — partially-constructed objects don't run their own
+  destructor but fully-constructed members do). Pattern available for
+  future Settings-routes regression coverage.
 - **`tests/unit/server/test_migration_runner.cpp`** — four new cases
   tagged `[migration][adoption]` exercise the adoption and hardening
   paths: (a) running v1 on a database that already has tables populated
