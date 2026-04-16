@@ -817,6 +817,22 @@ patch._
 
 ### Tests
 
+- **`tests/unit/server/test_settings_routes_users.cpp` (new, 5
+  cases).** First test file for the Settings routes layer. Stands up a
+  real `httplib::Server` on a random port with `SettingsRoutes`
+  registered against a two-account `AuthManager` (`admin` +
+  `bob`), mocks the `auth_fn`/`admin_fn`/`perm_fn`/`audit_fn`
+  callbacks, and exercises the full HTTP surface. Covers the #397
+  handler guard (admin-self-DELETE returns 403 with the toast
+  HX-Trigger and leaves the account intact; admin-DELETE of another
+  user still returns 200; non-admin DELETE is rejected by the
+  `admin_fn_` gate before the self-delete guard is reached) and the
+  #403 UI guard (`GET /fragments/settings/users` emits no
+  `hx-delete="/api/settings/users/admin"` attribute for the self
+  row, still emits it for every other row, and renders the "Current
+  user" badge in its place). Pattern mirrors
+  `test_rest_api_tokens.cpp` so future Settings-routes regression
+  coverage has a harness template to reuse.
 - **`tests/unit/server/test_migration_runner.cpp`** — four new cases
   tagged `[migration][adoption]` exercise the adoption and hardening
   paths: (a) running v1 on a database that already has tables populated

@@ -95,6 +95,7 @@ if build_server
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_static_js_bundle.cpp',
     ),
     include_directories: [
