@@ -139,7 +139,7 @@ jobs:
             --bin-dir builddir --version "$RPM_VERSION" $PRE_FLAG --output .
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-linux-x64
@@ -147,7 +147,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-linux-deb
@@ -155,7 +155,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-linux-rpm
@@ -264,7 +264,7 @@ jobs:
             --version "$RPM_VERSION" $PRE_FLAG --output .
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64
@@ -272,7 +272,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-gateway-deb
@@ -280,7 +280,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-gateway-rpm
@@ -528,7 +528,7 @@ jobs:
           Remove-Item $certPath -Force
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-windows-x64
@@ -536,7 +536,7 @@ jobs:
           retention-days: 3
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-windows-installer
@@ -788,7 +788,7 @@ jobs:
           echo "Notarized and stapled: ${PKG}"
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-macos-arm64
@@ -796,7 +796,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .pkg artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: yuzu-macos-pkg

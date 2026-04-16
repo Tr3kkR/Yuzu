@@ -90,7 +90,7 @@ jobs:
           echo "All checksums verified"
 
       - name: Upload verified artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
           path: artifacts/
@@ -286,7 +286,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-logs
           path: /tmp/yuzu-qa/integration-logs.txt
@@ -437,7 +437,7 @@ jobs:
 
       - name: Upload install log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-install-log
           path: install.log
@@ -605,7 +605,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-scan
           path: |
@@ -752,7 +752,7 @@ jobs:
 
       - name: Upload soak data
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-test
           path: |
@@ -872,7 +872,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: upgrade-logs
           path: /tmp/yuzu-upgrade/upgrade-logs.txt
