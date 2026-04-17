@@ -488,25 +488,30 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include <httplib.h>
 
-#include <atomic>
-#include <thread>
+#include <memory>
 #include <vector>
 
 namespace {
 
-/// RAII test fixture that starts an httplib::Server with MCP routes and
-/// mock callbacks.  Automatically stops the server on destruction.
+/// In-process MCP test fixture.
+///
+/// Builds the McpServer POST /mcp/v1/ handler via `McpServer::build_handler()`
+/// and dispatches synthesized httplib::Request objects to it directly. No
+/// httplib::Server, no listening socket, no acceptor thread.
+///
+/// Why: the prior fixture spun up an httplib::Server on a random port and
+/// drove it from a std::thread. That fixture deadlocked / SIGSEGV'd the
+/// `Sanitizers (TSan)` CI job (#438) — TSan's interceptors interact badly
+/// with httplib's acceptor-thread state machine, and the segfault happened
+/// before any test case body ran. In-process dispatch keeps the JSON-RPC
+/// surface fully exercised without any of that threading.
 struct McpTestServer {
-    httplib::Server svr;
-    std::thread server_thread;
-    int port{0};
-
     // Mock state
-    std::string mock_tier;           // MCP tier for mock auth
-    bool mock_auth_enabled{true};    // false -> auth_fn returns nullopt (401)
+    std::string mock_tier;              // MCP tier for mock auth
+    bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
-    bool read_only_mode_{false};     // Must outlive register_routes (captured by ref)
-    bool mcp_disabled_{false};       // Must outlive register_routes (captured by ref)
+    bool read_only_mode_{false};        // captured by ref by build_handler
+    bool mcp_disabled_{false};          // captured by ref by build_handler
 
     // Dispatch mock state — captured args from last dispatch call
     std::string last_dispatch_plugin;
@@ -516,8 +521,42 @@ struct McpTestServer {
     std::unordered_map<std::string, std::string> last_dispatch_params;
 
     yuzu::server::mcp::McpServer mcp;
+    yuzu::server::mcp::McpServer::HandlerFn handler;
 
     void start(const std::string& tier = "") {
+        install_handler(tier, /*dispatch_fn=*/nullptr);
+    }
+
+    /// Install with a dispatch function (for execute_instruction tests).
+    void start_with_dispatch(yuzu::server::mcp::McpServer::DispatchFn dispatch_fn,
+                             const std::string& tier = "") {
+        install_handler(tier, std::move(dispatch_fn));
+    }
+
+    /// Synthesize a POST /mcp/v1/ request and dispatch it in-process.
+    /// Returns a Response by unique_ptr so existing tests that use
+    /// `res->status` / `res->body` / `res->get_header_value(...)` keep working.
+    ///
+    /// Default-initialized httplib::Response leaves `.status` at -1; the real
+    /// httplib::Server fills it in to 200 after a handler that didn't touch
+    /// status returns. We pre-set 200 so success paths look identical to
+    /// production; handlers that explicitly set 401/204/etc. still override.
+    std::unique_ptr<httplib::Response> call(const std::string& json_body) {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = "/mcp/v1/";
+        req.body = json_body;
+        req.set_header("Content-Type", "application/json");
+        auto res = std::make_unique<httplib::Response>();
+        res->status = 200;
+        REQUIRE(handler);
+        handler(req, *res);
+        return res;
+    }
+
+private:
+    void install_handler(const std::string& tier,
+                         yuzu::server::mcp::McpServer::DispatchFn dispatch_fn) {
         mock_tier = tier;
 
         // Mock auth: returns a session with the configured tier (or nullopt)
@@ -561,117 +600,22 @@ struct McpTestServer {
             });
         };
 
-        // Register routes with nullptr for stores we don't need in basic tests
-        mcp.register_routes(svr, auth_fn, perm_fn, audit_fn, agents_fn,
-                            /*rbac_store=*/nullptr,
-                            /*instruction_store=*/nullptr,
-                            /*execution_tracker=*/nullptr,
-                            /*response_store=*/nullptr,
-                            /*audit_store=*/nullptr,
-                            /*tag_store=*/nullptr,
-                            /*inventory_store=*/nullptr,
-                            /*policy_store=*/nullptr,
-                            /*mgmt_store=*/nullptr,
-                            /*approval_manager=*/nullptr,
-                            /*schedule_engine=*/nullptr,
-                            read_only_mode_,
-                            mcp_disabled_);
-
-        bind_and_listen();
-    }
-
-    /// Start with a dispatch function (for execute_instruction tests).
-    void start_with_dispatch(yuzu::server::mcp::McpServer::DispatchFn dispatch_fn,
-                             const std::string& tier = "") {
-        mock_tier = tier;
-
-        auto auth_fn = [this](const httplib::Request& /*req*/,
-                              httplib::Response& res)
-            -> std::optional<yuzu::server::auth::Session> {
-            if (!mock_auth_enabled) {
-                res.status = 401;
-                res.set_content(R"({"error":"unauthorized"})", "application/json");
-                return std::nullopt;
-            }
-            yuzu::server::auth::Session s;
-            s.username = "test-user";
-            s.role = yuzu::server::auth::Role::admin;
-            s.mcp_tier = mock_tier;
-            return s;
-        };
-
-        auto perm_fn = [](const httplib::Request&, httplib::Response&,
-                          const std::string& /*securable_type*/,
-                          const std::string& /*operation*/) -> bool {
-            return true;
-        };
-
-        auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/,
-                               const std::string& /*detail*/) {
-            audit_log.push_back(action + "|" + result);
-        };
-
-        auto agents_fn = []() -> nlohmann::json {
-            return nlohmann::json::array({
-                {{"agent_id", "agent-001"}, {"hostname", "web-01"}, {"os", "linux"},
-                 {"arch", "x64"}, {"agent_version", "0.1.3"}},
-                {{"agent_id", "agent-002"}, {"hostname", "db-01"}, {"os", "windows"},
-                 {"arch", "x64"}, {"agent_version", "0.1.3"}}
-            });
-        };
-
-        mcp.register_routes(svr, auth_fn, perm_fn, audit_fn, agents_fn,
-                            /*rbac_store=*/nullptr,
-                            /*instruction_store=*/nullptr,
-                            /*execution_tracker=*/nullptr,
-                            /*response_store=*/nullptr,
-                            /*audit_store=*/nullptr,
-                            /*tag_store=*/nullptr,
-                            /*inventory_store=*/nullptr,
-                            /*policy_store=*/nullptr,
-                            /*mgmt_store=*/nullptr,
-                            /*approval_manager=*/nullptr,
-                            /*schedule_engine=*/nullptr,
-                            read_only_mode_,
-                            mcp_disabled_,
-                            dispatch_fn);
-
-        bind_and_listen();
-    }
-
-private:
-    void bind_and_listen() {
-        // Bind to a random available port
-        port = svr.bind_to_any_port("127.0.0.1");
-        REQUIRE(port > 0);
-
-        // Start listening in a background thread
-        server_thread = std::thread([this]() { svr.listen_after_bind(); });
-
-        // Wait for server to be ready (poll with short sleeps)
-        for (int i = 0; i < 100; ++i) {
-            if (svr.is_running()) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        REQUIRE(svr.is_running());
-    }
-
-public:
-
-    ~McpTestServer() {
-        svr.stop();
-        if (server_thread.joinable())
-            server_thread.join();
-    }
-
-    /// Send a JSON-RPC request body and return the result.
-    httplib::Result call(const std::string& json_body) {
-        httplib::Client cli("127.0.0.1", port);
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(5);
-        return cli.Post("/mcp/v1/", json_body, "application/json");
+        handler = mcp.build_handler(
+            std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
+            /*rbac_store=*/nullptr,
+            /*instruction_store=*/nullptr,
+            /*execution_tracker=*/nullptr,
+            /*response_store=*/nullptr,
+            /*audit_store=*/nullptr,
+            /*tag_store=*/nullptr,
+            /*inventory_store=*/nullptr,
+            /*policy_store=*/nullptr,
+            /*mgmt_store=*/nullptr,
+            /*approval_manager=*/nullptr,
+            /*schedule_engine=*/nullptr,
+            read_only_mode_,
+            mcp_disabled_,
+            std::move(dispatch_fn));
     }
 };
 
