@@ -4,6 +4,7 @@
 
 #include "settings_routes.hpp"
 
+#include "http_route_sink.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 
@@ -1721,7 +1722,37 @@ std::string SettingsRoutes::render_directory_fragment() {
 
 // ── Route registration ──────────────────────────────────────────────────────
 
+// Production overload — wraps httplib::Server in an HttplibRouteSink and
+// delegates to the sink-based implementation below. Tests bypass this and
+// call the sink overload directly with their own TestRouteSink (#438).
 void SettingsRoutes::register_routes(httplib::Server& svr,
+                                      AuthFn auth_fn,
+                                      AdminFn admin_fn,
+                                      PermFn perm_fn,
+                                      AuditFn audit_fn,
+                                      Config& cfg,
+                                      auth::AuthManager& auth_mgr,
+                                      auth::AutoApproveEngine& auto_approve,
+                                      ApiTokenStore* api_token_store,
+                                      ManagementGroupStore* mgmt_group_store,
+                                      TagStore* tag_store,
+                                      UpdateRegistry* update_registry,
+                                      RuntimeConfigStore* runtime_config_store,
+                                      AuditStore* audit_store,
+                                      bool gateway_enabled,
+                                      GatewaySessionCountFn gateway_session_count_fn,
+                                      AgentsJsonFn agents_json_fn,
+                                      std::shared_mutex& oidc_mu,
+                                      std::unique_ptr<oidc::OidcProvider>& oidc_provider) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
+                    std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
+                    mgmt_group_store, tag_store, update_registry, runtime_config_store,
+                    audit_store, gateway_enabled, std::move(gateway_session_count_fn),
+                    std::move(agents_json_fn), oidc_mu, oidc_provider);
+}
+
+void SettingsRoutes::register_routes(HttpRouteSink& sink,
                                       AuthFn auth_fn,
                                       AdminFn admin_fn,
                                       PermFn perm_fn,
@@ -1761,7 +1792,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     oidc_provider_ = &oidc_provider;
 
     // -- Settings page (admin only) -------------------------------------------
-    svr.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res)) {
             res.set_redirect("/");
             return;
@@ -1771,14 +1802,14 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings HTMX fragment endpoints -------------------------------------
 
-    svr.Get("/fragments/settings/tls",
+    sink.Get("/fragments/settings/tls",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/users",
+    sink.Get("/fragments/settings/users",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
@@ -1812,28 +1843,28 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                                 "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/tokens",
+    sink.Get("/fragments/settings/tokens",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/pending",
+    sink.Get("/fragments/settings/pending",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/auto-approve",
+    sink.Get("/fragments/settings/auto-approve",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/api-tokens",
+    sink.Get("/fragments/settings/api-tokens",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ApiToken", "Read"))
                     return;
@@ -1848,77 +1879,77 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                                 "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/management-groups",
+    sink.Get("/fragments/settings/management-groups",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ManagementGroup", "Read"))
                     return;
                 res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/tag-compliance",
+    sink.Get("/fragments/settings/tag-compliance",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Tag", "Read"))
                     return;
                 res.set_content(render_tag_compliance_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/updates",
+    sink.Get("/fragments/settings/updates",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/gateway",
+    sink.Get("/fragments/settings/gateway",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_gateway_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/server-config",
+    sink.Get("/fragments/settings/server-config",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_server_config_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/https",
+    sink.Get("/fragments/settings/https",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_https_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/analytics",
+    sink.Get("/fragments/settings/analytics",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/data-retention",
+    sink.Get("/fragments/settings/data-retention",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/mcp",
+    sink.Get("/fragments/settings/mcp",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/nvd",
+    sink.Get("/fragments/settings/nvd",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_nvd_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/directory",
+    sink.Get("/fragments/settings/directory",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
@@ -1926,7 +1957,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Settings API: TLS toggle (HTMX POST) ---------------------------------
-    svr.Post("/api/settings/tls",
+    sink.Post("/api/settings/tls",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -1941,7 +1972,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
              });
 
     // -- Settings API: Certificate upload (admin only, multipart) --------------
-    svr.Post("/api/settings/cert-upload", [this](const httplib::Request& req,
+    sink.Post("/api/settings/cert-upload", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2027,7 +2058,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: Paste PEM content (admin only, HTMX) --------------------
-    svr.Post("/api/settings/cert-paste", [this](const httplib::Request& req,
+    sink.Post("/api/settings/cert-paste", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2128,7 +2159,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: OIDC configuration (admin only, HTMX) -------------------
-    svr.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
 
@@ -2222,7 +2253,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: OIDC test connection (admin only, HTMX) -----------------
-    svr.Post("/api/settings/oidc/test", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/oidc/test", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
 
@@ -2318,7 +2349,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------
-    svr.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
         auto session = auth_fn_(req, res);
@@ -2384,7 +2415,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
+    sink.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
                                                        httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2450,7 +2481,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: Enrollment tokens (admin only, HTMX) --------------------
-    svr.Post("/api/settings/enrollment-tokens", [this](const httplib::Request& req,
+    sink.Post("/api/settings/enrollment-tokens", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2481,7 +2512,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_tokens_fragment(raw_token), "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/enrollment-tokens/(.+))",
+    sink.Delete(R"(/api/settings/enrollment-tokens/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2493,7 +2524,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                });
 
     // -- Batch enrollment token generation (JSON API for scripting) -------------
-    svr.Post("/api/settings/enrollment-tokens/batch", [this](const httplib::Request& req,
+    sink.Post("/api/settings/enrollment-tokens/batch", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2534,7 +2565,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: API tokens (admin only, HTMX) ---------------------------
-    svr.Post("/api/settings/api-tokens", [this](const httplib::Request& req,
+    sink.Post("/api/settings/api-tokens", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Write"))
             return;
@@ -2606,7 +2637,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                         "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/api-tokens/(.+))",
+    sink.Delete(R"(/api/settings/api-tokens/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!perm_fn_(req, res, "ApiToken", "Delete"))
                        return;
@@ -2685,7 +2716,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     // -- Settings API: Pending agents (admin only, HTMX) -----------------------
 
     // Bulk approve/deny — registered BEFORE the (.+) catch-all patterns
-    svr.Post("/api/settings/pending-agents/bulk-approve",
+    sink.Post("/api/settings/pending-agents/bulk-approve",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2703,7 +2734,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post("/api/settings/pending-agents/bulk-deny",
+    sink.Post("/api/settings/pending-agents/bulk-deny",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2721,7 +2752,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post(R"(/api/settings/pending-agents/(.+)/approve)",
+    sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2732,7 +2763,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post(R"(/api/settings/pending-agents/(.+)/deny)",
+    sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2743,7 +2774,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(R"(/api/settings/pending-agents/(.+))",
+    sink.Delete(R"(/api/settings/pending-agents/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2754,7 +2785,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Auto-approve rules (HTMX) ------------------------------
 
-    svr.Post("/api/settings/auto-approve", [this](const httplib::Request& req,
+    sink.Post("/api/settings/auto-approve", [this](const httplib::Request& req,
                                                     httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2777,7 +2808,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Post("/api/settings/auto-approve/mode", [this](const httplib::Request& req,
+    sink.Post("/api/settings/auto-approve/mode", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2788,7 +2819,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
+    sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2800,7 +2831,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(R"(/api/settings/auto-approve/(\d+))",
+    sink.Delete(R"(/api/settings/auto-approve/(\d+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2812,7 +2843,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Management Groups (HTMX) --------------------------------
 
-    svr.Post("/api/settings/management-groups",
+    sink.Post("/api/settings/management-groups",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ManagementGroup", "Write"))
                      return;
@@ -2852,7 +2883,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/settings/management-groups/([a-f0-9]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "ManagementGroup", "Delete"))
@@ -2879,7 +2910,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         });
 
     // -- Settings API: MCP toggle (HTMX POST) ---------------------------------
-    svr.Post("/api/settings/mcp",
+    sink.Post("/api/settings/mcp",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2900,7 +2931,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Update package management (admin only) -------------------
 
-    svr.Post("/api/settings/updates/upload", [this](const httplib::Request& req,
+    sink.Post("/api/settings/updates/upload", [this](const httplib::Request& req,
                                                      httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2991,7 +3022,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!admin_fn_(req, res))
@@ -3020,7 +3051,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
         });
 
-    svr.Post(
+    sink.Post(
         R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!admin_fn_(req, res))

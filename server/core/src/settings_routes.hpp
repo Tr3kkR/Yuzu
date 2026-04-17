@@ -49,7 +49,32 @@ public:
     using GatewaySessionCountFn = std::function<std::size_t()>;
 
     /// Register all settings-related routes on the given server.
+    /// Production callers use this overload; internally it constructs an
+    /// HttplibRouteSink and delegates to the sink-based overload below.
     void register_routes(httplib::Server& svr,
+                         AuthFn auth_fn,
+                         AdminFn admin_fn,
+                         PermFn perm_fn,
+                         AuditFn audit_fn,
+                         Config& cfg,
+                         auth::AuthManager& auth_mgr,
+                         auth::AutoApproveEngine& auto_approve,
+                         ApiTokenStore* api_token_store,
+                         ManagementGroupStore* mgmt_group_store,
+                         TagStore* tag_store,
+                         UpdateRegistry* update_registry,
+                         RuntimeConfigStore* runtime_config_store,
+                         AuditStore* audit_store,
+                         bool gateway_enabled,
+                         GatewaySessionCountFn gateway_session_count_fn,
+                         AgentsJsonFn agents_json_fn,
+                         std::shared_mutex& oidc_mu,
+                         std::unique_ptr<oidc::OidcProvider>& oidc_provider);
+
+    /// Sink-based overload — used by tests to register routes against an
+    /// in-process TestRouteSink and dispatch synthesized requests directly,
+    /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
+    void register_routes(class HttpRouteSink& sink,
                          AuthFn auth_fn,
                          AdminFn admin_fn,
                          PermFn perm_fn,
