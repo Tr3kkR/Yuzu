@@ -266,10 +266,19 @@ The password is hashed with PBKDF2 before storage. Plaintext passwords are never
 ### Deleting a User
 
 1. Navigate to **Settings > User Management**.
-2. Click **Delete** next to the target user.
+2. Click **Remove** next to the target user.
 3. Confirm the deletion.
 
-> **Note:** You cannot delete the last admin account. At least one admin must exist at all times.
+> **Note:** You cannot delete your own account. The Users table renders
+> the text "Current user" in place of the **Remove** button for the
+> currently authenticated operator's row, and the server rejects any
+> hand-crafted `DELETE /api/settings/users/<your-username>` request with
+> HTTP 403 and a `Cannot delete your own account` toast. This prevents
+> a misclick — or a scripted revoke loop — from dropping the only
+> credential on the running server and locking every operator out
+> until the process is restarted against its on-disk config. To remove
+> the account you are signed in as, first create a second admin, log
+> out, log in as the second admin, and delete the original.
 
 ---
 

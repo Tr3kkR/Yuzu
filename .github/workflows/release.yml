@@ -916,10 +916,34 @@ jobs:
           # it could publish; v0.10.0 had to be assembled manually.
           pattern: 'yuzu-*'
 
+      - name: Package Compose Wizard
+        # The Compose Wizard (tools/compose-wizard/) is a browser-based
+        # docker-compose.yml + .env generator contributed in PR #405 by
+        # @fjarvis. Zero dependencies — extract zip, open index.html, walk
+        # the wizard. Bundled here as a release asset so customers can grab
+        # it from the Releases page.
+        #
+        # Conditional on the directory existing — the wizard was merged
+        # into main directly in PR #405, so any tag cut from a branch that
+        # hasn't reconciled with main may not have it. Skip with a warning
+        # rather than fail the release.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -d tools/compose-wizard ]; then
+            STAGING="yuzu-compose-wizard-${VERSION}"
+            cp -r tools/compose-wizard "$STAGING"
+            zip -r "artifacts/yuzu-compose-wizard-${VERSION}.zip" "$STAGING"
+            SIZE=$(du -h "artifacts/yuzu-compose-wizard-${VERSION}.zip" | cut -f1)
+            echo "Packaged compose wizard: yuzu-compose-wizard-${VERSION}.zip ($SIZE)"
+          else
+            echo "::warning::tools/compose-wizard not present in this checkout — skipping wizard bundle. See PR #405."
+          fi
+
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg' \) -exec mv {} . \;
+          # *.zip glob covers both yuzu-windows-x64.zip and yuzu-compose-wizard-*.zip.
           sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg > SHA256SUMS
           cat SHA256SUMS
 
@@ -1022,6 +1046,22 @@ jobs:
           | \`yuzu-windows-x64.zip\` | Windows (server + agent) | x86_64 |
           | \`yuzu-macos-arm64.tar.gz\` | macOS (server + agent) | ARM64 (Apple Silicon) |
 
+          ## Compose Wizard
+
+          \`yuzu-compose-wizard-*.zip\` — browser-based step-by-step
+          generator for a customised \`docker-compose.yml\` + \`.env\`.
+          Zero dependencies — extract the zip and open \`index.html\` in
+          a browser. Contributed by
+          [@fjarvis](https://github.com/fjarvis) in
+          [#405](https://github.com/${{ github.repository }}/pull/405).
+
+          \`\`\`bash
+          unzip yuzu-compose-wizard-*.zip
+          cd yuzu-compose-wizard-*
+          # Open index.html in your browser, or:
+          python3 -m http.server 8000
+          \`\`\`
+
           ## Docker images
 
           \`\`\`bash
@@ -1060,6 +1100,14 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
 
+          # Compose Wizard zip is conditional — Package Compose Wizard step
+          # skips with a warning if tools/compose-wizard isn't in the tag's
+          # commit tree. Only include if the file actually exists.
+          WIZARD_ASSET=()
+          if ls artifacts/yuzu-compose-wizard-*.zip >/dev/null 2>&1; then
+            WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
+          fi
+
           gh release create "${{ github.ref_name }}" \
             --title "Yuzu ${{ github.ref_name }}" \
             --notes-file release-notes.md \
@@ -1074,4 +1122,5 @@ jobs:
             artifacts/*.deb \
             artifacts/*.rpm \
             artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.bundle
+            artifacts/SHA256SUMS.bundle \
+            "${WIZARD_ASSET[@]}"

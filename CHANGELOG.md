@@ -19,6 +19,35 @@ patch._
 
 ### Added
 
+- **`/release` skill at `.claude/skills/release/SKILL.md`** — bash-first
+  release orchestrator that runs preflight (`scripts/release-preflight.sh`
+  + `scripts/check-compose-versions.sh`), pushes the tag, monitors the
+  release workflow until terminal state, troubleshoots known failure
+  modes (the v0.10.0 download-artifact bug, compose version mismatch,
+  Windows signtool absence, macOS notarytool timeout, Windows MSVC
+  LNK2038 vcpkg cache poisoning, EUnit meck false-positive), verifies
+  the GitHub Releases page has every expected asset including the
+  Compose Wizard zip and GHCR images, and produces a release report.
+  Supports `--watch`, `--verify`, and `--resume` modes for
+  re-entrant operation when a release stalls partway. Mirrors the
+  `/test` skill's bash-first orchestration pattern (no agent fan-out;
+  the LLM interprets failures and decides next-step). Use:
+  `/release vX.Y.Z` — full pipeline; `/release --watch vX.Y.Z` —
+  monitor an in-flight release; `/release --verify vX.Y.Z` —
+  post-hoc verification.
+- **Compose Wizard bundled as a release asset
+  (`.github/workflows/release.yml` `Package Compose Wizard` step).**
+  The browser-based docker-compose.yml + .env generator at
+  `tools/compose-wizard/` (PR #405 by @fjarvis) is now packaged into
+  `yuzu-compose-wizard-X.Y.Z.zip` during the release workflow's
+  `release` job and uploaded alongside the other assets. Auto-included
+  in `SHA256SUMS` and the cosign-signed `SHA256SUMS.bundle`. Release
+  notes get a "Compose Wizard" section pointing customers at the
+  download with `unzip + open index.html` instructions. Conditional
+  on `tools/compose-wizard/` existing in the tag's commit tree —
+  emits a workflow warning and skips the bundle if absent (release
+  proceeds without it). Tag must be cut from a commit that has both
+  this workflow change AND the wizard files merged in.
 - **Runner inventory sentinel workflow
   (`.github/workflows/runner-inventory-sentinel.yml`,
   `.github/runner-inventory.json`).** Declarative expected-state file
@@ -558,8 +587,108 @@ patch._
   includes `docker-compose.reference.yml` with the "requires operator
   hardening" caveat.
 
+### Breaking
+
+- **`DELETE /api/settings/users/:name` now returns 403 + HTMX toast
+  when the URL target matches the caller's own session username
+  (was: 200 + deletion).** Operator scripts that previously called
+  this endpoint to delete the credential they were authenticated
+  with — for example, a decommission flow that removes its own
+  service account as a final step — will receive `403 Forbidden`
+  starting in v0.11.0. The full self-deletion lockout vector
+  including UI suppression is documented in the Fixed entry below
+  (#397). To remove the account a script is signed in as, create a
+  second admin account first, switch authentication to that account,
+  then issue the DELETE.
+- **`POST /api/settings/users` now returns 403 + HTMX toast when an
+  admin attempts to change their own role (typically a self-demote
+  from `admin` to `user`).** The same lockout class as the DELETE
+  case above; closed in the Gate 4 governance hardening round
+  (ca-B1). Self-password-change (same username, same role, different
+  password) is **explicitly allowed** and continues to return 200 —
+  the guard is role-scoped, not a blanket self-upsert ban. Operator
+  scripts that change their own role need to be split: have a
+  second admin perform the role change, or perform the role change
+  before swapping accounts.
+- **Two new audit actions written to `audit_store`:**
+  `user.delete` and `user.upsert`, each with `result` ∈
+  {`success`, `denied`}. Downstream consumers (Splunk HEC,
+  ClickHouse projections) that match on the existing
+  `<noun>.<verb>` action convention pick this up automatically. SOC
+  2 CC7.2 evidence chain (governance Gate 6 CO-1).
+
 ### Fixed
 
+- **Settings → Users hardening round on top of the #397/#403 fix —
+  ca-B1 sibling lockout, CO-1 audit chain, UP-1 empty-username
+  fail-closed, UP-9 GET/POST defensive auth (governance Gate 4-6).**
+  The original two-sided fix below closed the DELETE self-target
+  case but left several adjacent hardening items open that the full
+  governance pipeline surfaced:
+  - **ca-B1 — POST self-demotion guard.** `POST /api/settings/users`
+    is the second equivalent route to the same lockout class: an
+    admin POSTing their own username with a lower role demotes
+    themselves out of admin and is locked out of every admin-gated
+    page on the next request. Now rejected with HTTP 403 + "Cannot
+    change your own role" toast when
+    `(username == session->username && role != session->role)`.
+    Self-password-change (same role) is explicitly allowed.
+  - **CO-1 — SOC 2 CC7.2 audit chain.** The 403 self-reject branches
+    and the success delete/upsert paths now emit `audit_fn_` events
+    (`user.delete` / `user.upsert` with `result` ∈ {`denied`,
+    `success`}). `spdlog::warn` alone is not the audit chain — SIEM
+    ingestion paths and SOC 2 evidence collection both read
+    `audit_store`, not log files. Pre-existing gap on the success
+    path also closed.
+  - **UP-1 — empty session username fail-closed.** All three
+    handlers now return HTTP 500 + `spdlog::error` when
+    `session->username.empty()`. Defense-in-depth against an
+    upstream OIDC mis-config returning empty `preferred_username`;
+    previously the empty-string sentinel could match an empty-
+    username row via `"" == ""` or render every row as non-self.
+  - **UP-9 — GET/POST defensive 401.** GET `/fragments/settings/users`
+    and POST `/api/settings/users` now mirror the DELETE handler's
+    defensive 401 branch when `admin_fn_` passes but `auth_fn_`
+    returns nullopt. Previously they fell through with empty
+    `self_name`, re-rendering Remove buttons on every row including
+    the operator's own — the #403 bug pattern resurrected inside
+    the response body.
+  - **arch-S1 — `render_users_fragment` no longer has a default
+    argument.** Every call site must pass `current_username`
+    explicitly so a future caller forgetting it is a compile error
+    rather than a silent UI regression.
+  - **CLAUDE.md** under Authentication & Authorization captures the
+    self-target principal-destruction guard as a hard invariant for
+    future handlers (doc-S2).
+- **Self-deletion lockout in Settings → Users closed on both UI and
+  handler sides (#397 critical, #403 UI — both filed from the Apr 2026
+  UAT pass).** The Settings → Users page rendered a "Remove" button
+  next to every account including the currently authenticated
+  operator's own row, and `DELETE /api/settings/users/:name` did not
+  check the target against the caller's session. Confirming the
+  generic hx-confirm dialog dropped the sole admin credential on a
+  running server, leaving every API call returning 401 until the
+  process was restarted against its on-disk config — a permanent
+  lockout on single-seat deployments where the only recovery was a
+  container restart. Fix lands both halves because a hand-crafted
+  HTTP DELETE bypasses the dashboard entirely:
+  - `server/core/src/settings_routes.cpp` —
+    `render_users_fragment(const std::string& current_username)` now
+    takes the caller's session username and renders an italicised
+    "Current user" badge (not a button, no hx-delete) for the matching
+    row. Every call site (`GET /fragments/settings/users`,
+    `POST /api/settings/users` success and error paths,
+    `DELETE /api/settings/users/:name`) resolves the session via
+    `auth_fn_` and threads the name through so the UI stays consistent
+    after user CRUD.
+  - The `DELETE` handler resolves `session = auth_fn_(req, res)` after
+    the `admin_fn_` gate passes, compares `session->username` to the
+    URL-captured target, and rejects with HTTP 403 +
+    `HX-Trigger: {"showToast":{"message":"Cannot delete your own
+    account","level":"error"}}` if they match. The rejected attempt is
+    logged at warn level (`User '<x>' attempted to delete their own
+    account via /api/settings/users — rejected`) so operators chasing
+    a lockout incident can see it in the server log.
 - **Windows MSVC LNK2038 closed end-to-end via "option D" — static
   triplet override + hand-rolled `cxx.find_library()` wiring for
   grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as
@@ -788,6 +917,46 @@ patch._
 
 ### Tests
 
+- **`tests/unit/server/test_settings_routes_users.cpp` (new, 9
+  cases).** First test file for the Settings routes layer. Stands up a
+  real `httplib::Server` on a random port with `SettingsRoutes`
+  registered against a two-account `AuthManager` (`admin` +
+  `bob`), mocks the `auth_fn`/`admin_fn`/`perm_fn`/`audit_fn`
+  callbacks (audit_fn captures every call into a vector for evidence-
+  chain assertions), and exercises the full HTTP surface. Coverage:
+  - **#397 handler guard:** admin-self-DELETE returns 403 with the
+    full HX-Trigger payload (not just substring) and leaves the
+    account intact; the rejected attempt emits a `user.delete` /
+    `denied` audit event (CO-1 evidence chain).
+  - **Non-self DELETE:** admin-DELETE of another user returns 200,
+    the account is removed, and emits a `user.delete` / `success`
+    audit event.
+  - **Non-admin DELETE:** rejected by the `admin_fn_` gate before
+    the self-delete guard is reached, no audit event recorded.
+  - **Unauthenticated DELETE:** rejected by `admin_fn_` with 403,
+    target account intact, no audit event recorded.
+  - **ca-B1 self-demotion guard (POST):** admin POSTing
+    `username=admin&role=user` is rejected with 403 +
+    "Cannot change your own role" toast; role remains admin;
+    `user.upsert` / `denied` audit event captured.
+  - **POST self-password-change:** same username, same role only
+    password change — explicitly allowed, returns 200,
+    `user.upsert` / `success` audit emitted.
+  - **POST success path renders self-row guard:** new user appears
+    in the response fragment with hx-delete; operator's own row
+    still has Current user badge — regression cover for the
+    self_name threading through the success branch.
+  - **#403 UI guard:** `GET /fragments/settings/users` emits no
+    `hx-delete="/api/settings/users/admin"` attribute for the self
+    row, still emits it for every other row, and renders the
+    "Current user" badge in its place.
+  - **UI guard with multiple users:** every non-self row keeps its
+    Remove button when the user list grows.
+  Harness uses an RAII `TmpDirGuard` member that cleans up the temp
+  directory even if a `REQUIRE` inside the constructor body throws
+  (qe-B1 — partially-constructed objects don't run their own
+  destructor but fully-constructed members do). Pattern available for
+  future Settings-routes regression coverage.
 - **`tests/unit/server/test_migration_runner.cpp`** — four new cases
   tagged `[migration][adoption]` exercise the adoption and hardening
   paths: (a) running v1 on a database that already has tables populated

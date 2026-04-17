@@ -405,7 +405,7 @@ std::string SettingsRoutes::render_tls_fragment() {
     return html;
 }
 
-std::string SettingsRoutes::render_users_fragment() {
+std::string SettingsRoutes::render_users_fragment(const std::string& current_username) {
     auto users = auth_mgr_->list_users();
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>"
@@ -417,21 +417,41 @@ std::string SettingsRoutes::render_users_fragment() {
         for (const auto& u : users) {
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
+            const bool is_self =
+                !current_username.empty() && u.username == current_username;
             html += "<tr><td>" + html_escape(u.username) +
                     "</td>"
                     "<td><span class=\"role-badge " +
                     std::string(cls) + "\">" + html_escape(role_str) +
                     "</span></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                    "hx-delete=\"/api/settings/users/" +
-                    html_escape(u.username) +
-                    "\" "
-                    "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove user &quot;" +
-                    html_escape(u.username) +
-                    "&quot;?\""
-                    ">Remove</button></td></tr>";
+                    "<td>";
+            if (is_self) {
+                // Self-deletion lockout guard (#397/#403): the Remove button
+                // is suppressed for the currently authenticated operator's
+                // own row so that deleting the sole admin — and thereby
+                // locking every user out of the running server — is not a
+                // two-click operation in the dashboard. The DELETE handler
+                // also rejects self-targeted requests; both halves are load-
+                // bearing because the UI guard alone does not stop a hand-
+                // crafted HTTP DELETE.
+                html += "<span class=\"current-user-badge\" "
+                        "style=\"color:#484f58;font-size:0.7rem;"
+                        "font-style:italic\" "
+                        "title=\"You cannot remove your own account\">"
+                        "Current user</span>";
+            } else {
+                html += "<button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/users/" +
+                        html_escape(u.username) +
+                        "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Remove user &quot;" +
+                        html_escape(u.username) +
+                        "&quot;?\""
+                        ">Remove</button>";
+            }
+            html += "</td></tr>";
         }
     }
 
@@ -1762,7 +1782,34 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
-                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+                auto session = auth_fn_(req, res);
+                if (!session) {
+                    // Match the DELETE handler's defensive branch: if
+                    // admin_fn_ passes but auth_fn_ returns nullopt the
+                    // two callbacks have disagreed (concurrent logout,
+                    // stale cookie, OIDC session expiry between calls).
+                    // Refuse to render with empty self_name — that path
+                    // would emit Remove buttons on every row including
+                    // the operator's own, resurrecting #403 inside the
+                    // dashboard fragment.
+                    res.status = 401;
+                    return;
+                }
+                if (session->username.empty()) {
+                    // Defense-in-depth against an upstream auth bug
+                    // (e.g. OIDC mis-config returning empty
+                    // preferred_username). Empty session->username would
+                    // make the is_self comparison in render_users_fragment
+                    // never match any row, and would also let a hand-
+                    // crafted DELETE against an empty-username row
+                    // succeed via "" == "" — see governance Gate 4 UP-1.
+                    spdlog::error("/fragments/settings/users: session has empty username; "
+                                  "refusing to render (likely upstream auth misconfiguration)");
+                    res.status = 500;
+                    return;
+                }
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
             });
 
     svr.Get("/fragments/settings/tokens",
@@ -2274,13 +2321,25 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     svr.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            // Match DELETE defensive branch — see GET handler comment.
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            spdlog::error("POST /api/settings/users: session has empty username; "
+                          "refusing to upsert (likely upstream auth misconfiguration)");
+            res.status = 500;
+            return;
+        }
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
         auto role_str = extract_form_value(req.body, "role");
 
         if (username.empty() || password.empty()) {
             res.status = 400;
-            res.set_content(render_users_fragment() +
+            res.set_content(render_users_fragment(session->username) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
                                 "document.getElementById('user-feedback').textContent='"
@@ -2290,30 +2349,104 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         }
 
         auto role = auth::string_to_role(role_str);
+        // Self-demotion lockout guard (governance Gate 4 ca-B1, sibling
+        // of #397). The upsert path is the second equivalent route to
+        // the same lockout class as the DELETE self-target case: an
+        // admin POSTing their own username with role=user demotes
+        // themselves out of admin and is locked out of every admin-
+        // gated page on the next request. Self-password-change is
+        // explicitly allowed (same role); only role transitions on the
+        // self row are rejected.
+        if (username == session->username && role != session->role) {
+            spdlog::warn("User '{}' attempted to change their own role from {} to {} via "
+                         "POST /api/settings/users — rejected",
+                         session->username,
+                         auth::role_to_string(session->role), role_str);
+            audit_fn_(req, "user.upsert", "denied", "User", username, "self_role_change_blocked");
+            res.status = 403;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         auth_mgr_->upsert_user(username, password, role);
         if (!auth_mgr_->save_config()) {
             spdlog::error("Failed to save config after user upsert");
         }
         spdlog::info("User '{}' added/updated (role={})", username, role_str);
+        // SOC 2 CC7.2: privileged user lifecycle operations must appear
+        // in audit_store, not just spdlog (governance Gate 6 CO-1).
+        audit_fn_(req, "user.upsert", "success", "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
             R"({"showToast":{"message":"User created","level":"success"}})");
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
     svr.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
                                                        httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            // admin_fn_ already authenticated the caller; this branch is
+            // defensive — if the two callbacks disagree there is a deeper
+            // bug and we refuse to proceed rather than delete on a stale
+            // or unresolvable session.
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            // Defense-in-depth: an empty session->username would let
+            // a hand-crafted DELETE against an empty-username row
+            // succeed via the "" == "" comparison below. The root
+            // cause of empty session->username is upstream (typically
+            // OIDC mis-config returning empty preferred_username), but
+            // the handler fails closed regardless. Governance Gate 4 UP-1.
+            spdlog::error("DELETE /api/settings/users: session has empty username; "
+                          "refusing to delete (likely upstream auth misconfiguration)");
+            res.status = 500;
+            return;
+        }
         auto username = req.matches[1].str();
+        // Self-deletion lockout guard (#397). Deleting the currently
+        // authenticated operator — typically the sole admin on a single-
+        // seat deployment — leaves the running server with zero usable
+        // credentials until it is restarted against its on-disk config.
+        // The UI suppresses the Remove button for the self row (#403),
+        // but the handler must reject independently because a hand-
+        // crafted HTTP DELETE bypasses the dashboard entirely.
+        if (username == session->username) {
+            spdlog::warn("User '{}' attempted to delete their own account via "
+                         "/api/settings/users — rejected",
+                         session->username);
+            // SOC 2 CC7.2: rejected privileged operations must appear
+            // in audit_store, not just spdlog (governance Gate 6 CO-1).
+            // SIEM ingestion paths read audit events; spdlog rotation
+            // alone is not the evidence chain.
+            audit_fn_(req, "user.delete", "denied", "User", username, "self_delete_blocked");
+            res.status = 403;
+            // Toast wording must stay in sync with docs/user-manual/server-admin.md
+            // and the CHANGELOG Fixed entry — operators search both.
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
+            audit_fn_(req, "user.delete", "success", "User", username, "");
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"User deleted","level":"success"}})");
         }
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(session->username),
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: Enrollment tokens (admin only, HTMX) --------------------

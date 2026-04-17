@@ -23,6 +23,20 @@ USE_TLS=false
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure `erl` / `escript` / `rebar3` are on PATH before the gateway build
+# step runs. The helper is a no-op if Erlang is already available; otherwise
+# it probes kerl / asdf / Homebrew / MSYS2 and activates the first match.
+# The "28" arg pins the major version tracked by release.yml — keep in
+# sync with erlef/setup-beam otp-version in .github/workflows/release.yml.
+# shellcheck source=ensure-erlang.sh
+source "$SCRIPT_DIR/ensure-erlang.sh" 28
+if ! command -v erl > /dev/null 2>&1; then
+    echo "FAIL: erl not on PATH after ensure-erlang.sh (needed for rebar3/escript)" >&2
+    echo "      Install via kerl (kerl install 28.4.2), asdf, Homebrew, or the" >&2
+    echo "      MSYS2 Erlang installer, then rerun." >&2
+    exit 1
+fi
+
 # Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
 if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
     BUILDDIR="$YUZU_BUILDDIR"

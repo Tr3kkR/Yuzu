@@ -2475,6 +2475,83 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
 
 ---
 
+### Settings — User Management
+
+These endpoints drive the **Settings → Users** tab. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than the standard JSON envelope. All three require an admin session and the dashboard swaps the response body into `#user-section`.
+
+The handler enforces a **self-target guard** on destructive operations: the currently authenticated operator cannot delete or demote their own account, even via a hand-crafted HTTP request that bypasses the dashboard. See `docs/user-manual/server-admin.md` → "Deleting a User" for the operator-side recovery procedure.
+
+**`GET /fragments/settings/users`**
+
+Render the user table fragment.
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment of the user table. The row matching the caller's session username renders an italic `Current user` badge in place of the Remove button. All other rows include an `hx-delete` attribute targeting the DELETE endpoint below.
+- **Response (401):** Returned defensively when the admin gate passes but the session cannot be re-resolved (e.g., concurrent logout). The dashboard should redirect to login.
+- **Response (500):** Returned when the resolved session has an empty username — defense-in-depth against an upstream auth misconfiguration (e.g., OIDC returning empty `preferred_username`). Server log records the cause.
+
+**`POST /api/settings/users`**
+
+Create or update a local account, or change a user's password.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `username` | string | Yes | Account name. Must be non-empty. |
+| `password` | string | Yes | New password. Minimum 12 characters (enforced by `AuthManager::upsert_user`). |
+| `role` | string | Yes | `admin` or `user`. |
+
+- **Response (200):** Re-rendered user table fragment with the upserted account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.upsert / success`.
+- **Response (400):** Re-rendered fragment with an inline error script. Returned when `username` or `password` is empty.
+- **Response (403):** Returned when `username` matches the caller's own session username AND `role` differs from the caller's current role — the **self-demotion guard**. Body is the re-rendered user table fragment. Header includes:
+
+  ```
+  HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}
+  ```
+
+  Audit event recorded as `user.upsert / denied / self_role_change_blocked`. The rejected attempt is logged at warn level. Self-password-change (same username, same role, different password) is **explicitly allowed** and returns 200.
+
+- **Response (401):** Defensive — admin gate passed but session not re-resolvable.
+- **Response (500):** Defensive — session resolved with empty username.
+
+**`DELETE /api/settings/users/:name`**
+
+Delete the named account.
+
+- **Permission:** Admin only
+- **Response (200):** Account deleted. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"User deleted","level":"success"}}`. Audit event recorded as `user.delete / success`.
+- **Response (403):** Returned when `:name` matches the caller's own session username — the **self-deletion guard**. Body is the re-rendered user table fragment. Header includes:
+
+  ```
+  HX-Trigger: {"showToast":{"message":"Cannot delete your own account","level":"error"}}
+  ```
+
+  Audit event recorded as `user.delete / denied / self_delete_blocked`. The rejected attempt is logged at warn level on the server. To delete the account you are signed in as, create a second admin, sign out, sign in as the second admin, then delete the original.
+
+- **Response (401):** Defensive — admin gate passed but session not re-resolvable.
+- **Response (500):** Defensive — session resolved with empty username.
+
+| HTTP status | Condition |
+|---|---|
+| 200 | Account deleted successfully (or no-op if `:name` does not exist) |
+| 403 | Target equals the caller's own username (self-delete guard) |
+| 403 | Caller is not an admin (rejected by admin gate before handler) |
+| 401 | Defensive — admin gate / session callbacks disagree |
+| 500 | Defensive — session has empty username |
+
+**Example — attempt self-delete (will be rejected):**
+```bash
+curl -X DELETE https://yuzu-server:8080/api/settings/users/admin \
+  -H "X-Yuzu-Token: yzt_..." \
+  -v
+# HTTP/1.1 403 Forbidden
+# HX-Trigger: {"showToast":{"message":"Cannot delete your own account","level":"error"}}
+```
+
+---
+
 ## Legacy API Endpoints
 
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.
