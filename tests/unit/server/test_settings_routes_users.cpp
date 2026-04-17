@@ -17,11 +17,14 @@
  *    successful user lifecycle ops did not emit audit_fn_ events, breaking
  *    SOC 2 CC7.2 evidence chain. Closed in the hardening round.
  *
- * Pattern mirrors test_rest_api_tokens.cpp: spin up an httplib::Server on
- * a random port, register SettingsRoutes with mock session callbacks, and
- * hit the real HTTP surface with httplib::Client. The audit_fn mock
- * captures every call into a vector so tests can assert the evidence chain
- * is intact on each guarded path.
+ * Pattern: register SettingsRoutes against an in-process TestRouteSink
+ * and dispatch synthesized httplib::Request objects through the captured
+ * handlers. The audit_fn mock captures every call into a vector so tests
+ * can assert the SOC 2 evidence chain is intact on each guarded path.
+ *
+ * Why in-process and not a real httplib::Server: the prior fixture spun
+ * up a listening server behind a std::thread acceptor, which crashes
+ * deterministically under TSan with no TSan report (#438).
  */
 
 #include "settings_routes.hpp"
@@ -32,6 +35,7 @@
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
+#include "test_route_sink.hpp"
 #include "update_registry.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -111,12 +115,10 @@ struct SettingsRoutesHarness {
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     SettingsRoutes routes;
 
-    httplib::Server svr;
-    std::thread server_thread;
-    int port{0};
+    yuzu::server::test::TestRouteSink sink;
 
     // Mock session state — the auth_fn / admin_fn closures read this so
-    // tests can act as different principals against the same server.
+    // tests can act as different principals against the same harness.
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
 
@@ -163,7 +165,7 @@ struct SettingsRoutesHarness {
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
 
-        routes.register_routes(svr, auth_fn, admin_fn, perm_fn, audit_fn,
+        routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn,
                                cfg, auth_mgr, auto_approve,
                                /*api_token_store=*/nullptr,
                                /*mgmt_group_store=*/nullptr,
@@ -174,30 +176,24 @@ struct SettingsRoutesHarness {
                                /*gateway_enabled=*/false,
                                gateway_count_fn, agents_json_fn,
                                oidc_mu, oidc_provider);
-
-        port = svr.bind_to_any_port("127.0.0.1");
-        REQUIRE(port > 0);
-        server_thread = std::thread([this]() { svr.listen_after_bind(); });
-        for (int i = 0; i < 100; ++i) {
-            if (svr.is_running())
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        REQUIRE(svr.is_running());
     }
+    // No destructor — TmpDirGuard cleans the temp dir on its own; nothing
+    // else owns OS resources. The previous fixture had to stop() the
+    // httplib::Server and join the acceptor thread; both are gone (#438).
 
-    ~SettingsRoutesHarness() {
-        svr.stop();
-        if (server_thread.joinable())
-            server_thread.join();
-        // tmp.~TmpDirGuard() runs after this body returns, removing tmp.path.
+    /// Dispatch a request through the registered routes. Returns
+    /// std::unique_ptr<httplib::Response> so existing test sites that
+    /// access res->status / res->body / res->get_header_value(...) keep
+    /// working unchanged.
+    auto Get(const std::string& path) { return sink.Get(path); }
+    auto Delete(const std::string& path) { return sink.Delete(path); }
+    auto Post(const std::string& path, const std::string& body,
+              const std::string& ct = "application/json") {
+        return sink.Post(path, body, ct);
     }
-
-    httplib::Client client() const {
-        httplib::Client cli("127.0.0.1", port);
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(5);
-        return cli;
+    auto Put(const std::string& path, const std::string& body,
+             const std::string& ct = "application/json") {
+        return sink.Put(path, body, ct);
     }
 
     /// True if `auth_mgr` currently lists a user with the given name.
@@ -247,8 +243,7 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
-    auto res = cli.Delete("/api/settings/users/admin");
+    auto res = h.Delete("/api/settings/users/admin");
     REQUIRE(res);
     CHECK(res->status == 403);
     // Full-payload assertion: a substring match would tolerate a regression
@@ -266,8 +261,7 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other use
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
-    auto res = cli.Delete("/api/settings/users/bob");
+    auto res = h.Delete("/api/settings/users/bob");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(h.has_user("bob"));
@@ -281,8 +275,7 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: non-admin session rejected
     h.session_user = "bob";
     h.session_role = auth::Role::user;
 
-    auto cli = h.client();
-    auto res = cli.Delete("/api/settings/users/admin");
+    auto res = h.Delete("/api/settings/users/admin");
     REQUIRE(res);
     // admin_fn_ rejects with 403 before the self-delete guard is even reached.
     CHECK(res->status == 403);
@@ -301,8 +294,7 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: unauthenticated session re
     // accidentally permit a destructive op (governance Gate 3 qe-S3).
     h.session_user = "";
 
-    auto cli = h.client();
-    auto res = cli.Delete("/api/settings/users/admin");
+    auto res = h.Delete("/api/settings/users/admin");
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.has_user("admin"));
@@ -317,10 +309,9 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: admin cannot demote own role
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
     // Form-urlencoded body — that's what the dashboard sends and what
     // extract_form_value parses.
-    auto res = cli.Post("/api/settings/users",
+    auto res = h.Post("/api/settings/users",
                         "username=admin&password=newadminpass1&role=user",
                         "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -340,10 +331,9 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change a
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
     // Same role — only password is changing. The self-demotion guard must
     // NOT block this; it specifically targets role transitions.
-    auto res = cli.Post("/api/settings/users",
+    auto res = h.Post("/api/settings/users",
                         "username=admin&password=anotherpass12&role=admin",
                         "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -360,13 +350,12 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: success path renders self-ro
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
     // Add a new user. Response body is the re-rendered fragment; verify
     // (a) the new user shows up with a Remove button and (b) the operator's
     // own row still has the Current user badge — the self_name threading
     // through the success path matters because the dashboard swaps this
     // body into #user-section.
-    auto res = cli.Post("/api/settings/users",
+    auto res = h.Post("/api/settings/users",
                         "username=carol&password=carolpassword1&role=user",
                         "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -386,8 +375,7 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: Remove button hidden fo
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    auto cli = h.client();
-    auto res = cli.Get("/fragments/settings/users");
+    auto res = h.Get("/fragments/settings/users");
     REQUIRE(res);
     REQUIRE(res->status == 200);
 
@@ -407,8 +395,7 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: non-self rows all get R
 
     REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
 
-    auto cli = h.client();
-    auto res = cli.Get("/fragments/settings/users");
+    auto res = h.Get("/fragments/settings/users");
     REQUIRE(res);
     REQUIRE(res->status == 200);
 

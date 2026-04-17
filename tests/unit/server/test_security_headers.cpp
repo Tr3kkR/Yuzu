@@ -363,6 +363,28 @@ TEST_CASE("HeaderBundle::apply: omits HSTS on HTTP",
 //
 // This is the QA-2 regression guard from governance review: any future
 // change that drops a header from HeaderBundle::apply will be caught here.
+//
+// SKIPPED UNDER ThreadSanitizer (#438): these integration tests
+// specifically exercise httplib::Server's set_post_routing_handler — i.e.
+// the httplib middleware wiring. That is the exact surface that crashes
+// the TSan build (httplib's threaded acceptor + TSan interceptors). Unlike
+// the MCP / settings_routes / rest_api_v1 fixtures, there is no in-process
+// equivalent because we are deliberately testing httplib's middleware
+// integration, not our own dispatch logic. The HeaderBundle::apply unit
+// tests above (lines 32-355) provide the same correctness coverage for
+// our code without touching httplib::Server, so TSan still validates the
+// header-construction logic — only the on-the-wire delivery check is
+// gated.
+#if defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define YUZU_TSAN_BUILD 1
+#  endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#  define YUZU_TSAN_BUILD 1
+#endif
+
+#ifndef YUZU_TSAN_BUILD
 
 namespace {
 
@@ -466,3 +488,5 @@ TEST_CASE("Integration: --csp-extra-sources surfaces in HTTP response CSP",
     CHECK_THAT(csp, ContainsSubstring("https://cdn.example.com"));
     CHECK_THAT(csp, ContainsSubstring("https://beacon.example.com"));
 }
+
+#endif  // !YUZU_TSAN_BUILD — see comment above the integration block (#438)
