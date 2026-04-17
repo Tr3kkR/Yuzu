@@ -317,33 +317,38 @@ static constexpr int kPromptCount = sizeof(kPrompts) / sizeof(kPrompts[0]);
 
 } // anonymous namespace
 
-// ── Route registration ────────────────────────────────────────────────────
+// ── Handler construction ─────────────────────────────────────────────────
+//
+// build_handler() returns the POST /mcp/v1/ handler as a std::function. Both
+// register_routes() and the in-process test fixtures call it; tests then
+// invoke the returned function directly without spinning up an httplib::Server
+// (see #438 — the acceptor thread crashes under TSan).
 
-void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                AuditFn audit_fn, AgentsJsonFn agents_fn,
-                                RbacStore* rbac_store,
-                                InstructionStore* instruction_store,
-                                ExecutionTracker* execution_tracker,
-                                ResponseStore* response_store,
-                                AuditStore* audit_store,
-                                TagStore* tag_store,
-                                InventoryStore* inventory_store,
-                                PolicyStore* policy_store,
-                                ManagementGroupStore* mgmt_store,
-                                ApprovalManager* approval_manager,
-                                ScheduleEngine* schedule_engine,
-                                const bool& read_only_mode,
-                                const bool& mcp_disabled,
-                                DispatchFn dispatch_fn) {
+McpServer::HandlerFn McpServer::build_handler(
+        AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn,
+        RbacStore* rbac_store,
+        InstructionStore* instruction_store,
+        ExecutionTracker* execution_tracker,
+        ResponseStore* response_store,
+        AuditStore* audit_store,
+        TagStore* tag_store,
+        InventoryStore* inventory_store,
+        PolicyStore* policy_store,
+        ManagementGroupStore* mgmt_store,
+        ApprovalManager* approval_manager,
+        ScheduleEngine* schedule_engine,
+        const bool& read_only_mode,
+        const bool& mcp_disabled,
+        DispatchFn dispatch_fn) {
 
     // Capture by reference so runtime changes (e.g., settings UI toggle)
     // take effect without server restart. The references point to cfg_ members
-    // which outlive the lambda (owned by the server impl).
+    // which outlive the returned handler (owned by the server impl).
     const bool& is_read_only = read_only_mode;
     const bool& is_disabled  = mcp_disabled;
 
     // ── POST /mcp/v1/ — Main JSON-RPC 2.0 endpoint ───────────────────────
-    svr.Post("/mcp/v1/", [=](const httplib::Request& req, httplib::Response& res) {
+    return [=](const httplib::Request& req, httplib::Response& res) {
         res.set_header("Content-Type", "application/json");
 
         // Runtime kill switch check (G4-UHP-MCP-003) — evaluated on every request
@@ -1377,11 +1382,38 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         // ── Unknown method ────────────────────────────────────────────────
         res.set_content(error_response(id, kMethodNotFound, "Unknown method: " + method),
                         "application/json");
-    });
+    };
+}
+
+// ── Route registration ────────────────────────────────────────────────────
+
+void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, AgentsJsonFn agents_fn,
+                                RbacStore* rbac_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker,
+                                ResponseStore* response_store,
+                                AuditStore* audit_store,
+                                TagStore* tag_store,
+                                InventoryStore* inventory_store,
+                                PolicyStore* policy_store,
+                                ManagementGroupStore* mgmt_store,
+                                ApprovalManager* approval_manager,
+                                ScheduleEngine* schedule_engine,
+                                const bool& read_only_mode,
+                                const bool& mcp_disabled,
+                                DispatchFn dispatch_fn) {
+    svr.Post("/mcp/v1/",
+             build_handler(std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                           std::move(agents_fn),
+                           rbac_store, instruction_store, execution_tracker, response_store,
+                           audit_store, tag_store, inventory_store, policy_store, mgmt_store,
+                           approval_manager, schedule_engine,
+                           read_only_mode, mcp_disabled, std::move(dispatch_fn)));
 
     spdlog::info("MCP: registered JSON-RPC endpoint at POST /mcp/v1/ ({} tools, {} resources, {} prompts{})",
                  kToolCount, kResourceCount, kPromptCount,
-                 is_read_only ? ", read-only mode" : "");
+                 read_only_mode ? ", read-only mode" : "");
 }
 
 } // namespace yuzu::server::mcp
