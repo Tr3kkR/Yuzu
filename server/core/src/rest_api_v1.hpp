@@ -42,7 +42,27 @@ public:
     using TagPushFn =
         std::function<void(const std::string& agent_id, const std::string& key)>;
 
+    /// Production overload — constructs an HttplibRouteSink and delegates
+    /// to the sink-based overload below.
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         RbacStore* rbac_store, ManagementGroupStore* mgmt_store,
+                         ApiTokenStore* token_store, QuarantineStore* quarantine_store,
+                         ResponseStore* response_store, InstructionStore* instruction_store,
+                         ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
+                         ApprovalManager* approval_manager, TagStore* tag_store,
+                         AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
+                         TagPushFn tag_push_fn = {},
+                         InventoryStore* inventory_store = nullptr,
+                         ProductPackStore* product_pack_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         DeviceTokenStore* device_token_store = nullptr,
+                         LicenseStore* license_store = nullptr);
+
+    /// Sink-based overload — used by tests to register routes against an
+    /// in-process TestRouteSink so dispatch happens without httplib::Server's
+    /// TSan-hostile acceptor thread (#438).
+    void register_routes(class HttpRouteSink& sink,
+                         AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          RbacStore* rbac_store, ManagementGroupStore* mgmt_store,
                          ApiTokenStore* token_store, QuarantineStore* quarantine_store,
                          ResponseStore* response_store, InstructionStore* instruction_store,
