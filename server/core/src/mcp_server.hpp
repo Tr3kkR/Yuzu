@@ -45,6 +45,39 @@ public:
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters)>;
 
+    /// Type of the POST /mcp/v1/ handler — same shape as httplib::Server's Post handler
+    /// but exposed independently so tests can dispatch in-process without spinning
+    /// up an httplib::Server (see #438 for the TSan-vs-httplib-thread-acceptor bug
+    /// that motivated this seam).
+    using HandlerFn = std::function<void(const httplib::Request&, httplib::Response&)>;
+
+    /// Build the MCP /mcp/v1/ POST handler. The returned function captures all
+    /// callbacks and store pointers by value; `read_only_mode` and `mcp_disabled`
+    /// are captured by reference so runtime toggles take effect without re-binding.
+    /// Caller MUST keep those two booleans alive at least as long as the handler.
+    ///
+    /// Tests should call this directly and invoke the returned function with
+    /// synthesized httplib::Request / httplib::Response — that path avoids the
+    /// httplib::Server acceptor thread that crashes under TSan (#438).
+    HandlerFn build_handler(AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                            AgentsJsonFn agents_fn,
+                            RbacStore* rbac_store,
+                            InstructionStore* instruction_store,
+                            ExecutionTracker* execution_tracker,
+                            ResponseStore* response_store,
+                            AuditStore* audit_store,
+                            TagStore* tag_store,
+                            InventoryStore* inventory_store,
+                            PolicyStore* policy_store,
+                            ManagementGroupStore* mgmt_store,
+                            ApprovalManager* approval_manager,
+                            ScheduleEngine* schedule_engine,
+                            const bool& read_only_mode,
+                            const bool& mcp_disabled,
+                            DispatchFn dispatch_fn = nullptr);
+
+    /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
+    /// Production callers use this; tests prefer build_handler() above.
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          AgentsJsonFn agents_fn,
                          RbacStore* rbac_store,
