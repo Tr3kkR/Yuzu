@@ -7,15 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Targeting **v0.11.0** (minor bump from v0.10.0). The original `0.10.1`
-dev bump in `0c976c7` predated the `feat(test)` commits that landed
-the `/test` skill PR1 + PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new
-operator-facing functionality), the matrix CodeQL workflow expansion
-(8c5b934), and the `563138f` MigrationRunner wiring with its `/readyz`
-response-shape addition (`failed_stores` field on 503). Strict SemVer
-says any new backward-compatible feature ⇒ MINOR bump, so the next
-release is **v0.11.0** rather than the originally-planned v0.10.1
-patch._
+## [0.11.0] - 2026-04-17
+
+_Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
+predated the `feat(test)` commits that landed the `/test` skill PR1 +
+PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new operator-facing
+functionality), the matrix CodeQL workflow expansion (8c5b934), and
+the `563138f` MigrationRunner wiring with its `/readyz` response-shape
+addition (`failed_stores` field on 503). Strict SemVer says any new
+backward-compatible feature ⇒ MINOR bump, so this is v0.11.0 rather
+than the originally-planned v0.10.1 patch. First cut as **v0.11.0-rc1**._
 
 ### Added
 

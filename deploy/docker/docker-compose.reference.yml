@@ -55,7 +55,7 @@
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.11.0}
     container_name: yuzu-server
     restart: unless-stopped
     ports:
@@ -126,7 +126,7 @@ services:
   # without leaving the compose file. For real fleet rollout see
   # docs/user-manual/agent-install.md.
   agent:
-    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.10.0}
+    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.11.0}
     container_name: yuzu-agent
     restart: unless-stopped
     depends_on:
