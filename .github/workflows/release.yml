@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual fallback when GitHub's push/tag webhook dispatch for this repo
+  # silently drops events (encountered 2026-04-18 during v0.11.0-rc1 cut:
+  # push events stopped firing workflows for ~hours while workflow_dispatch
+  # remained functional). Dispatch from the tag ref via the Actions UI or
+  # `gh workflow run release.yml --ref vX.Y.Z` — GITHUB_REF_NAME resolves to
+  # the tag name exactly as it does for push, so the existing version-
+  # extraction in every step continues to work unchanged.
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}-${{ github.sha }}
@@ -902,7 +910,12 @@ jobs:
       - name: Validate docker-compose image versions
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/check-compose-versions.sh "$VERSION"
+          # Compose ${YUZU_VERSION:-X.Y.Z} defaults track the stable base
+          # version, not rc/beta/alpha suffixes — same convention used by
+          # the Extract changelog step below. v0.11.0-rc1 cut (2026-04-18)
+          # hit this after all 6 build jobs had already completed.
+          BASE_VERSION="${VERSION%%-*}"
+          bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
