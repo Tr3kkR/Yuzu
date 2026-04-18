@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual fallback when GitHub's push/tag webhook dispatch for this repo
+  # silently drops events (encountered 2026-04-18 during v0.11.0-rc1 cut:
+  # push events stopped firing workflows for ~hours while workflow_dispatch
+  # remained functional). Dispatch from the tag ref via the Actions UI or
+  # `gh workflow run release.yml --ref vX.Y.Z` — GITHUB_REF_NAME resolves to
+  # the tag name exactly as it does for push, so the existing version-
+  # extraction in every step continues to work unchanged.
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}-${{ github.sha }}
