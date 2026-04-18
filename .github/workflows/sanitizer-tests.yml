@@ -137,7 +137,7 @@ jobs:
 
       - name: Upload ASan artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sanitizer-asan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |
@@ -225,7 +225,7 @@ jobs:
 
       - name: Upload TSan artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sanitizer-tsan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |

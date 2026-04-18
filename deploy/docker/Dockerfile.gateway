@@ -40,9 +40,12 @@ COPY gateway/ .
 
 RUN rebar3 as prod release
 
-# ── Stage 3: Runtime — must match the builder's Alpine version (3.22) for
-#    OpenSSL ABI compatibility (crypto NIF links against libcrypto.so)
-FROM alpine:3.22
+# ── Stage 3: Runtime — must match the builder's Alpine version for
+#    OpenSSL ABI compatibility (crypto NIF links against libcrypto.so).
+#    erlang:28-alpine is currently based on alpine:3.23 (see its
+#    org.opencontainers.image.base.name annotation); bump this FROM line
+#    in lockstep whenever the erlang image's base drifts.
+FROM alpine:3.23
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && adduser -D -s /sbin/nologin yuzu-gw

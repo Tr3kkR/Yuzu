@@ -1,0 +1,4 @@
+interface:
+  display_name: "Yuzu Windows MSVC"
+  short_description: "Use the supported Windows MSYS2 plus MSVC flow."
+  default_prompt: "Use $yuzu-windows-msvc to handle Yuzu Windows builds, CI, and MSVC toolchain issues."

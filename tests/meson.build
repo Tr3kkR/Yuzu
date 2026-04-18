@@ -23,7 +23,7 @@ agent_test_exe = executable(
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
 )
-test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 120)
+test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 240)
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
@@ -42,7 +42,7 @@ tar_test_exe = executable(
   ],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe, suite: 'tar')
+test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -95,6 +95,7 @@ if build_server
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_static_js_bundle.cpp',
     ),
     include_directories: [

@@ -62,8 +62,11 @@ else
 fi
 
 # ── 7. All cache steps in release.yml have save-always ────────────────────
-CACHE_COUNT=$(grep -c 'actions/cache@v4' .github/workflows/release.yml)
-SAVE_ALWAYS_COUNT=$(grep -c 'save-always: true' .github/workflows/release.yml)
+# grep -c returns 1 when it finds 0 matches; with `set -e` that kills the
+# script. `|| true` keeps the preflight going and lets the equality check
+# below report the actual issue. Match any cache version (@v4, @v5, ...).
+CACHE_COUNT=$(grep -cE 'actions/cache@v[0-9]+' .github/workflows/release.yml || true)
+SAVE_ALWAYS_COUNT=$(grep -c 'save-always: true' .github/workflows/release.yml || true)
 if [ "$CACHE_COUNT" -eq "$SAVE_ALWAYS_COUNT" ]; then
     pass "All $CACHE_COUNT cache steps have save-always: true"
 else

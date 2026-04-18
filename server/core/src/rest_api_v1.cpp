@@ -1,4 +1,5 @@
 #include "rest_api_v1.hpp"
+#include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
@@ -351,7 +352,33 @@ const std::string& openapi_spec() {
 
 // ── Route registration ───────────────────────────────────────────────────────
 
+// Production overload — wraps httplib::Server in an HttplibRouteSink and
+// delegates to the sink-based implementation below. Tests bypass this and
+// call the sink overload directly with their own TestRouteSink (#438).
 void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, RbacStore* rbac_store,
+                                ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
+                                QuarantineStore* quarantine_store, ResponseStore* response_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker,
+                                ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
+                                TagStore* tag_store, AuditStore* audit_store,
+                                ServiceGroupFn service_group_fn, TagPushFn tag_push_fn,
+                                InventoryStore* inventory_store,
+                                ProductPackStore* product_pack_store,
+                                SoftwareDeploymentStore* sw_deploy_store,
+                                DeviceTokenStore* device_token_store,
+                                LicenseStore* license_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    rbac_store, mgmt_store, token_store, quarantine_store, response_store,
+                    instruction_store, execution_tracker, schedule_engine, approval_manager,
+                    tag_store, audit_store, std::move(service_group_fn), std::move(tag_push_fn),
+                    inventory_store, product_pack_store, sw_deploy_store, device_token_store,
+                    license_store);
+}
+
+void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 AuditFn audit_fn, RbacStore* rbac_store,
                                 ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
                                 QuarantineStore* quarantine_store, ResponseStore* response_store,
@@ -371,18 +398,18 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
-    svr.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
+    sink.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.status = 204;
     });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
-    svr.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
+    sink.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(openapi_spec(), "application/json");
     });
 
     // ── /api/v1/me ───────────────────────────────────────────────────────
 
-    svr.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -410,7 +437,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
-    svr.Get("/api/v1/management-groups",
+    sink.Get("/api/v1/management-groups",
             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -438,7 +465,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
@@ -477,7 +504,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
 
-    svr.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
+    sink.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -517,7 +544,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             });
 
     // Update group (rename, re-parent, change description/membership)
-    svr.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
+    sink.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
             [auth_fn, perm_fn, audit_fn, mgmt_store](const httplib::Request& req,
                                                       httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
@@ -590,7 +617,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(JObj().add("updated", true).str()), "application/json");
             });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+))",
         [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Delete"))
@@ -613,7 +640,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         });
 
     // Members
-    svr.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
+    sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
              [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Write"))
                      return;
@@ -638,7 +665,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
              });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
         [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
@@ -659,7 +686,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
-    svr.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+    sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -682,7 +709,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(arr.str()), "application/json");
             });
 
-    svr.Post(
+    sink.Post(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
         [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
                                                               httplib::Response& res) {
@@ -758,7 +785,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             res.set_content(ok_json(JObj().add("assigned", true).str()), "application/json");
         });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
         [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
                                                               httplib::Response& res) {
@@ -809,7 +836,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── API Tokens (/api/v1/tokens) ──────────────────────────────────────
 
-    svr.Get("/api/v1/tokens",
+    sink.Get("/api/v1/tokens",
             [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ApiToken", "Read"))
                     return;
@@ -842,7 +869,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
+    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
                                 tag_store](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
@@ -911,7 +938,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    svr.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
+    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
                                              const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -967,7 +994,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
-    svr.Get("/api/v1/quarantine",
+    sink.Get("/api/v1/quarantine",
             [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Security", "Read"))
                     return;
@@ -992,7 +1019,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
+    sink.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
                                        const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "Security", "Execute"))
             return;
@@ -1021,7 +1048,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
     });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/quarantine/(.+))",
         [perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Security", "Execute"))
@@ -1045,7 +1072,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
-    svr.Get("/api/v1/rbac/roles",
+    sink.Get("/api/v1/rbac/roles",
             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "UserManagement", "Read"))
                     return;
@@ -1068,7 +1095,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
+    sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "UserManagement", "Read"))
                     return;
@@ -1090,7 +1117,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(arr.str()), "application/json");
             });
 
-    svr.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
+    sink.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
                                                          httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
@@ -1110,7 +1137,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tag Categories (/api/v1/tag-categories) ────────────────────────
 
-    svr.Get("/api/v1/tag-categories",
+    sink.Get("/api/v1/tag-categories",
             [perm_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1131,7 +1158,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tag Compliance (/api/v1/tag-compliance) ──────────────────────────
 
-    svr.Get("/api/v1/tag-compliance",
+    sink.Get("/api/v1/tag-compliance",
             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1154,7 +1181,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tags (/api/v1/tags) ──────────────────────────────────────────────
 
-    svr.Get("/api/v1/tags",
+    sink.Get("/api/v1/tags",
             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1177,7 +1204,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(obj.str()), "application/json");
             });
 
-    svr.Put("/api/v1/tags",
+    sink.Put("/api/v1/tags",
             [perm_fn, audit_fn, tag_store, service_group_fn,
              tag_push_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Write"))
@@ -1226,7 +1253,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(JObj().add("set", true).str()), "application/json");
             });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/tags/([^/]+)/([^/]+))",
         [perm_fn, audit_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Tag", "Delete"))
@@ -1251,7 +1278,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Instructions (/api/v1/definitions) ───────────────────────────────
 
-    svr.Get("/api/v1/definitions",
+    sink.Get("/api/v1/definitions",
             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
                     return;
@@ -1280,7 +1307,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Audit (/api/v1/audit) ────────────────────────────────────────────
 
-    svr.Get("/api/v1/audit",
+    sink.Get("/api/v1/audit",
             [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "AuditLog", "Read"))
                     return;
@@ -1321,7 +1348,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
 
-    svr.Get("/api/v1/inventory/tables",
+    sink.Get("/api/v1/inventory/tables",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
@@ -1343,7 +1370,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
+    sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
@@ -1377,7 +1404,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(data.str()), "application/json");
             });
 
-    svr.Post("/api/v1/inventory/query",
+    sink.Post("/api/v1/inventory/query",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return;
@@ -1424,7 +1451,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
 
-    svr.Get("/api/v1/execution-statistics",
+    sink.Get("/api/v1/execution-statistics",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 auto summary = execution_tracker->get_fleet_summary();
@@ -1438,7 +1465,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(data), "application/json");
             });
 
-    svr.Get("/api/v1/execution-statistics/agents",
+    sink.Get("/api/v1/execution-statistics/agents",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 ExecutionStatsQuery q;
@@ -1462,7 +1489,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get("/api/v1/execution-statistics/definitions",
+    sink.Get("/api/v1/execution-statistics/definitions",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 ExecutionStatsQuery q;
@@ -1487,7 +1514,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────
 
     if (inventory_store) {
-        svr.Post("/api/v1/inventory/evaluate",
+        sink.Post("/api/v1/inventory/evaluate",
                  [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                      if (!perm_fn(req, res, "Inventory", "Read")) return;
                      auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1539,7 +1566,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 
     if (device_token_store) {
-        svr.Get("/api/v1/device-tokens",
+        sink.Get("/api/v1/device-tokens",
                 [auth_fn, perm_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "DeviceToken", "Read")) return;
                     auto session = auth_fn(req, res);
@@ -1562,7 +1589,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/device-tokens",
+        sink.Post("/api/v1/device-tokens",
                  [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1590,7 +1617,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
                  });
 
-        svr.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
+        sink.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
                    [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                        auto session = auth_fn(req, res);
                        if (!session) return;
@@ -1609,7 +1636,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── Software Deployment (capability 7.6) ──────────────────────────────
 
     if (sw_deploy_store) {
-        svr.Get("/api/v1/software-packages",
+        sink.Get("/api/v1/software-packages",
                 [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
                     auto pkgs = sw_deploy_store->list_packages();
@@ -1625,7 +1652,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/software-packages",
+        sink.Post("/api/v1/software-packages",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1667,7 +1694,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Get("/api/v1/software-deployments",
+        sink.Get("/api/v1/software-deployments",
                 [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
                     auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
@@ -1687,7 +1714,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/software-deployments",
+        sink.Post("/api/v1/software-deployments",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1713,7 +1740,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1728,7 +1755,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      }
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1743,7 +1770,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      }
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1762,7 +1789,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── License Management (capability 22.3) ──────────────────────────────
 
     if (license_store) {
-        svr.Get("/api/v1/license",
+        sink.Get("/api/v1/license",
                 [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "License", "Read")) return;
                     auto lic = license_store->get_active_license();
@@ -1784,7 +1811,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     res.set_content(ok_json(data), "application/json");
                 });
 
-        svr.Post("/api/v1/license",
+        sink.Post("/api/v1/license",
                  [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1814,7 +1841,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Delete(R"(/api/v1/license/([a-f0-9]+))",
+        sink.Delete(R"(/api/v1/license/([a-f0-9]+))",
                    [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                        auto session = auth_fn(req, res);
                        if (!session) return;
@@ -1829,7 +1856,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                        }
                    });
 
-        svr.Get("/api/v1/license/alerts",
+        sink.Get("/api/v1/license/alerts",
                 [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "License", "Read")) return;
                     bool unack = req.has_param("unacknowledged");
@@ -1850,7 +1877,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Topology (capability 22.2) ─ REST endpoint ────────────────────────
 
-    svr.Get("/api/v1/topology",
+    sink.Get("/api/v1/topology",
             [perm_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read")) return;
                 // Topology data is assembled from in-memory agent registry in server.cpp
@@ -1863,7 +1890,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Statistics (capability 22.6) ─ REST endpoint ──────────────────────
 
-    svr.Get("/api/v1/statistics",
+    sink.Get("/api/v1/statistics",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read")) return;
                 auto fleet = execution_tracker->get_fleet_summary();
@@ -1881,7 +1908,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
     // Receives files uploaded by the content_dist plugin's upload_file action.
-    svr.Post("/api/v1/file-retrieval",
+    sink.Post("/api/v1/file-retrieval",
             [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "FileRetrieval", "Write")) return;
 

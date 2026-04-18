@@ -1,0 +1,298 @@
+---
+name: release
+description: Cut a Yuzu release end-to-end. Runs preflight checks, validates compose-file version pins, pushes the tag, monitors the release workflow until artifacts publish, troubleshoots known failure modes (artifact download bugs, version mismatch, Windows signing, macOS notarization), verifies the GitHub Releases page has every expected asset including the Compose Wizard zip, and produces a release record. Use when the user says "/release vX.Y.Z" or asks to cut a release.
+---
+
+# release
+
+Runbook for cutting a Yuzu release. Like `/test`, this skill is a **bash-first orchestrator** — each phase is one or more shell invocations the LLM executes via `Bash`. The LLM's job is to interpret failures, decide whether to continue or roll back, and produce the consolidated release report at the end.
+
+Releases publish to two destinations from one tag push:
+1. **GitHub Releases page** — platform tarballs/zips, .deb/.rpm packages, Windows/.macOS installers, SHA256SUMS + cosign signature, and the Compose Wizard zip
+2. **GHCR** — `ghcr.io/<owner>/yuzu-server:vX.Y.Z` and `:yuzu-gateway:vX.Y.Z` Docker images
+
+Both go out from `.github/workflows/release.yml`, triggered by `git push origin vX.Y.Z`.
+
+## Usage
+
+```
+/release vX.Y.Z              # stable release (e.g. v0.11.0)
+/release vX.Y.Z-rcN          # release candidate (e.g. v0.11.0-rc1)
+/release --watch vX.Y.Z      # only monitor an in-flight release
+/release --verify vX.Y.Z     # only verify a published release
+/release --resume vX.Y.Z     # tag exists and CI started — pick up where workflow stalled
+```
+
+Default mode (no flag): full pipeline from preflight → tag push → workflow monitor → verification.
+
+## Pre-conditions the operator must confirm
+
+Before invoking the skill, the operator should already have:
+- All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty or only contains intentional dev-only changes).
+- CHANGELOG `[Unreleased]` section content moved to `## [X.Y.Z] - YYYY-MM-DD`.
+- `meson.build` `version: 'X.Y.Z'` updated.
+- All tracked compose files updated to `${YUZU_VERSION:-X.Y.Z}` defaults (the workflow's first gate enforces this and will hard-fail the release after ~30 min of build matrix runs if it's wrong — preflight catches it in 2 sec).
+
+If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. **It does NOT auto-bump versions** — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.
+
+## Phase 0 — Preflight (~30 sec)
+
+Run from the repo root on `main` (or whatever branch is being tagged):
+
+```bash
+git fetch origin
+git status -sb                                    # confirm branch + clean tree
+bash scripts/release-preflight.sh vX.Y.Z          # CRLF, version, CHANGELOG, compose pins
+bash scripts/check-compose-versions.sh X.Y.Z      # explicit compose check (preflight wraps this too)
+```
+
+Preflight checks:
+1. No CRLF in scripts or gateway config
+2. `meson.build` version matches the base version of the tag (rc/beta suffix stripped)
+3. CHANGELOG has a `## [X.Y.Z]` section with non-empty content
+4. Working tree is clean
+5. `Dockerfile.server` includes `--data-dir`
+6. All `actions/cache@v*` steps in release.yml have `save-always: true`
+7. `docker-compose.full-uat.yml` includes `--data-dir`
+
+Optional `--full` adds a local C++ + Erlang compile (~2 min).
+
+**Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
+
+## Phase 1 — Tag and push (~5 sec)
+
+```bash
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+This is the irreversible point. Once the tag is pushed, the release workflow starts. `git tag -d vX.Y.Z && git push --delete origin vX.Y.Z` can untag, but if any consumer has already pulled the GHCR image or downloaded an asset, untagging is socially expensive — confirm with the operator before doing it.
+
+Capture the workflow run ID immediately:
+
+```bash
+sleep 10  # give GitHub a moment to start the workflow
+RUN_ID=$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')
+echo "Release workflow: https://github.com/Tr3kkR/Yuzu/actions/runs/$RUN_ID"
+```
+
+## Phase 2 — Monitor the workflow (~30-60 min)
+
+Six jobs run with a partial DAG:
+
+```
+build-linux ─┬─ build-gateway ─┐
+             │                  ├─ docker-publish ─┐
+build-windows (parallel)        │                   │
+build-macos (parallel)          │                   ├─ release
+build-linux ────────────────────┴───────────────────┘
+```
+
+- **build-linux** (self-hosted Linux, ~25 min) — meson release + .deb + .rpm
+- **build-gateway** (self-hosted Linux, ~10 min, needs build-linux) — rebar3 release + .deb + .rpm
+- **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
+- **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
+- **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
+- **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
+
+Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
+
+```bash
+gh run watch "$RUN_ID" --exit-status   # blocks until terminal state, exit 0 if all green
+```
+
+If `gh run watch` is unsuitable (long-running terminal session), poll every 60s:
+
+```bash
+while :; do
+  STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status + "/" + (.conclusion // "")')
+  echo "$(date -u +%H:%M:%S) $STATUS"
+  case "$STATUS" in
+    completed/success) echo "RELEASE WORKFLOW PASSED"; break ;;
+    completed/*)       echo "RELEASE WORKFLOW FAILED: $STATUS"; break ;;
+  esac
+  sleep 60
+done
+```
+
+Phase 2 produces: workflow URL, terminal status, per-job timing, and (on failure) the failing job ID for Phase 3.
+
+## Phase 3 — Troubleshoot known failure modes
+
+Look up the failing job and pull the last 50 lines of its log:
+
+```bash
+gh run view "$RUN_ID" --log-failed | tail -100
+```
+
+Match the failure against this table. **All entries have happened in real Yuzu releases** — the `v0.10.0 manual release` documented in the v0.10.0 release notes is the canonical example.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Validate docker-compose image versions` fails on the `release` job | A tracked compose file's `${YUZU_VERSION:-X.Y.Z}` default doesn't match the tag | Bump the default in the offending file, commit, retag with `git tag -d` + `git tag -a` + `git push --force-with-lease origin vX.Y.Z`. **All matrix jobs re-run** — costs ~30-60 min wall clock. Better: catch in preflight. |
+| `Artifact download failed after 5 retries` on the `release` job, complaining about a `*.dockerbuild` file | Docker buildx provenance/attestation artifacts have unstable names that download-artifact occasionally cannot resolve | Already filtered in workflow with `pattern: 'yuzu-*'` — if regression, re-add filter. v0.10.0 hit this and was assembled manually. |
+| `ccache stats: 0 hits` on a re-run that should have been cached | ccache key changed (any C++ file edit invalidates) | Normal; subsequent build hits. If repeated 0% on identical input, check `~/.cache/ccache` writability on the runner. |
+| `signtool sign /f` fails on Windows | `WINDOWS_SIGNING_CERT` secret missing or expired | The signing step is conditional on `env.HAS_SIGNING_CERT == 'true'` — release proceeds unsigned if absent. Confirm with operator whether unsigned is acceptable for this release; if not, refresh secret and retag. |
+| `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | Re-run the macOS job — `staple` step is idempotent. If consistently failing, post-process: download the .pkg, run `notarytool submit + staple` locally, then upload via `gh release upload`. |
+| `Build and push` fails with `unauthorized` on GHCR | `GITHUB_TOKEN` `packages: write` scope missing | Verify `permissions: packages: write` at workflow root. |
+| `vcpkg install` fails with version baseline mismatch | `VCPKG_COMMIT` env var in workflow drift from `vcpkg.json` baseline | Sync both — workflow env + manifest baseline must match. Tracked by `.github/workflows/vcpkg-baseline-update.yml`. |
+| `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | Workflow already has the `if grep -q "Failed: 0"` workaround — should pass with warning. If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
+| `actions/cache` save fails with EOF | GitHub cache backend transient | `save-always: true` ensures partial saves; retry the workflow. |
+| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, re-run. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+
+For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed (re-run? skip? abort?).
+
+## Phase 4 — Post-release verification (~2 min)
+
+The workflow's `release` job creates the GitHub Release and uploads assets. Verify it actually did so:
+
+```bash
+gh release view "vX.Y.Z" --json assets,isDraft,isPrerelease,publishedAt --jq '{published: .publishedAt, draft: .isDraft, pre: .isPrerelease, asset_count: (.assets | length), assets: [.assets[].name]}'
+```
+
+Required assets (the `--verify` mode of this skill checks each):
+
+```
+yuzu-linux-x64.tar.gz
+yuzu-gateway-linux-x64.tar.gz
+yuzu-windows-x64.zip
+YuzuAgentSetup-X.Y.Z.exe
+YuzuServerSetup-X.Y.Z.exe
+yuzu-macos-arm64.tar.gz
+YuzuAgent-X.Y.Z-macos-arm64.pkg
+yuzu-server_X.Y.Z_amd64.deb
+yuzu-server-X.Y.Z-1.x86_64.rpm
+yuzu-gateway_X.Y.Z_amd64.deb
+yuzu-gateway-X.Y.Z-1.x86_64.rpm
+yuzu-agent_X.Y.Z_amd64.deb
+yuzu-agent-X.Y.Z-1.x86_64.rpm
+yuzu-compose-wizard-X.Y.Z.zip       ← Compose Wizard bundle (PR #405, fjarvis)
+SHA256SUMS
+SHA256SUMS.bundle                     ← cosign keyless signature
+```
+
+If any expected asset is missing, the workflow's `Create GitHub Release` step likely failed silently on a single asset (the `gh release create` call is one big command and a single missing asset returns non-zero). Re-upload the missing one:
+
+```bash
+gh release upload "vX.Y.Z" path/to/missing-asset.tar.gz
+```
+
+The artifacts are still in the workflow run — `gh run download "$RUN_ID"` retrieves them.
+
+Verify the GHCR images:
+
+```bash
+OWNER=$(echo "Tr3kkR" | tr '[:upper:]' '[:lower:]')
+docker pull "ghcr.io/$OWNER/yuzu-server:vX.Y.Z"
+docker pull "ghcr.io/$OWNER/yuzu-gateway:vX.Y.Z"
+docker image inspect "ghcr.io/$OWNER/yuzu-server:vX.Y.Z" --format '{{.Config.Labels}}' | grep -E "version|revision"
+```
+
+For non-prerelease tags, also verify the floating tags moved:
+
+```bash
+docker pull "ghcr.io/$OWNER/yuzu-server:latest"
+docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigests}}'
+# Expect the same digest as :vX.Y.Z
+```
+
+Verify the cosign signature:
+
+```bash
+gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
+cosign verify-blob \
+  --bundle SHA256SUMS.bundle \
+  --certificate-identity-regexp '.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+## Phase 5 — Compose Wizard verification
+
+The release workflow includes a `Package Compose Wizard` step that zips `tools/compose-wizard/` into `yuzu-compose-wizard-X.Y.Z.zip` and includes it in the release assets + SHA256SUMS.
+
+The wizard is a browser-based step-by-step generator for `docker-compose.yml` + `.env`, contributed by @fjarvis in PR #405. Zero dependencies — extract, open `index.html`, walk the wizard.
+
+Smoke-check the bundle:
+
+```bash
+gh release download "vX.Y.Z" --pattern 'yuzu-compose-wizard-*.zip'
+unzip -l "yuzu-compose-wizard-X.Y.Z.zip" | head -20
+# Expect: index.html, css/style.css, js/wizard.js, js/generate.js, README.md
+```
+
+If the wizard zip is **missing**, two causes are likely:
+1. The tag's commit doesn't have `tools/compose-wizard/` (wizard was on `main` only post-PR #405; if cutting from a stale branch, it won't be there). Fix: tag from a commit that includes the wizard.
+2. The workflow's `Package Compose Wizard` step emitted a warning and skipped (check the run log). Same fix.
+
+## Phase 6 — Cleanup and announce (~5 min)
+
+After all verification passes:
+
+1. **Bump dev branch to next dev version.** On `dev`:
+   ```bash
+   # Update meson.build version to X.Y.(Z+1)-dev or (X+1).Y.0-dev (operator's call)
+   # Add new ## [Unreleased] section to CHANGELOG.md
+   git commit -m "chore(post-release): bump dev to X.Y.Z+1-dev"
+   git push origin dev
+   ```
+2. **Reconcile main → dev** if the release tag was on a main commit not yet merged into dev (rare on this project — usually dev → main first).
+3. **Close any release-blocker issues** in the milestone.
+4. **Update the rollout doc** if relevant (`docs/dependency-rollout-*.md`, `docs/roadmap.md`).
+5. **Announce.** Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.
+
+## Phase 7 — Produce the release report
+
+End-of-skill output to the operator:
+
+```
+Release vX.Y.Z
+
+Workflow:    https://github.com/Tr3kkR/Yuzu/actions/runs/<RUN_ID>
+Release page: https://github.com/Tr3kkR/Yuzu/releases/tag/vX.Y.Z
+
+Assets:      <N>/<expected> present
+GHCR:        ghcr.io/<owner>/yuzu-server:vX.Y.Z + :yuzu-gateway:vX.Y.Z (linux/amd64)
+Floating tags: :latest moved (or N/A for prerelease)
+Signature:   cosign verified (or N/A if SIGNING absent)
+SHA256SUMS:  verified
+
+Compose Wizard: bundled (or absent — see Phase 5)
+
+Next dev version: X.Y.(Z+1)-dev (operator: bump on dev branch)
+```
+
+If anything failed, list the failures + the fix attempted + final status, and explicitly state whether the release is shippable as-is or requires a follow-up patch release.
+
+## Resume / re-entry
+
+Releases occasionally stall partway. The skill supports re-entry without redoing completed phases:
+
+- `/release --resume vX.Y.Z` — assume tag exists and workflow ran (or is running). Skip preflight + tag push, jump to Phase 2 monitor with the existing run ID, then continue normally.
+- `/release --watch vX.Y.Z` — only monitor (Phase 2). Useful when the operator pushed the tag manually and just wants the skill to babysit.
+- `/release --verify vX.Y.Z` — only verify (Phases 4-5). Useful for an old release the operator wants to confirm.
+
+In all resume modes, the skill discovers state via `gh release view` and `gh run list --workflow=release.yml`, so it works correctly even on a fresh shell with no in-skill memory.
+
+## Cost / ROI
+
+A successful release run is ~5 sec of operator work (push tag) + 30-60 min wall clock for the workflow + ~2 min of verification. The skill collapses the operator's work into one invocation and turns the 30-60 min wait into supervised waiting where every known failure mode has a documented response.
+
+Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) have historically taken ~2 hours of manual artifact assembly + manual gh release create. The skill cannot prevent novel failures but documents them as they're solved so the runbook captures every known incident — see Phase 3 table.
+
+## Known limitations
+
+- **Self-hosted runner required for Linux + Windows + gateway.** macOS uses a GitHub-hosted runner. The workflow assumes both self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
+- **No rollback.** Once `gh release create` runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.
+- **Compose Wizard requires the tag's commit to have `tools/compose-wizard/`.** PR #405 merged to `main` directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.
+- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.bundle` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
+
+## Files this skill touches
+
+The skill itself is read-only on the repo and write-only on:
+- The git remote (`git push origin vX.Y.Z` — irreversible)
+- GitHub Releases page (via `gh release create` triggered by workflow, or `gh release upload` for repairs)
+- GHCR (via the workflow's `docker buildx push`)
+
+The local repo state is unchanged unless preflight failed and the operator chose to commit version bumps; those are explicit operator commits, not skill-driven.

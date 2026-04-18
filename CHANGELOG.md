@@ -7,17 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Targeting **v0.11.0** (minor bump from v0.10.0). The original `0.10.1`
-dev bump in `0c976c7` predated the `feat(test)` commits that landed
-the `/test` skill PR1 + PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new
-operator-facing functionality), the matrix CodeQL workflow expansion
-(8c5b934), and the `563138f` MigrationRunner wiring with its `/readyz`
-response-shape addition (`failed_stores` field on 503). Strict SemVer
-says any new backward-compatible feature ⇒ MINOR bump, so the next
-release is **v0.11.0** rather than the originally-planned v0.10.1
-patch._
+## [0.11.0] - 2026-04-17
+
+_Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
+predated the `feat(test)` commits that landed the `/test` skill PR1 +
+PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new operator-facing
+functionality), the matrix CodeQL workflow expansion (8c5b934), and
+the `563138f` MigrationRunner wiring with its `/readyz` response-shape
+addition (`failed_stores` field on 503). Strict SemVer says any new
+backward-compatible feature ⇒ MINOR bump, so this is v0.11.0 rather
+than the originally-planned v0.10.1 patch. First cut as **v0.11.0-rc1**._
 
 ### Added
+
+- **`/release` skill at `.claude/skills/release/SKILL.md`** — bash-first
+  release orchestrator that runs preflight (`scripts/release-preflight.sh`
+  + `scripts/check-compose-versions.sh`), pushes the tag, monitors the
+  release workflow until terminal state, troubleshoots known failure
+  modes (the v0.10.0 download-artifact bug, compose version mismatch,
+  Windows signtool absence, macOS notarytool timeout, Windows MSVC
+  LNK2038 vcpkg cache poisoning, EUnit meck false-positive), verifies
+  the GitHub Releases page has every expected asset including the
+  Compose Wizard zip and GHCR images, and produces a release report.
+  Supports `--watch`, `--verify`, and `--resume` modes for
+  re-entrant operation when a release stalls partway. Mirrors the
+  `/test` skill's bash-first orchestration pattern (no agent fan-out;
+  the LLM interprets failures and decides next-step). Use:
+  `/release vX.Y.Z` — full pipeline; `/release --watch vX.Y.Z` —
+  monitor an in-flight release; `/release --verify vX.Y.Z` —
+  post-hoc verification.
+- **Compose Wizard bundled as a release asset
+  (`.github/workflows/release.yml` `Package Compose Wizard` step).**
+  The browser-based docker-compose.yml + .env generator at
+  `tools/compose-wizard/` (PR #405 by @fjarvis) is now packaged into
+  `yuzu-compose-wizard-X.Y.Z.zip` during the release workflow's
+  `release` job and uploaded alongside the other assets. Auto-included
+  in `SHA256SUMS` and the cosign-signed `SHA256SUMS.bundle`. Release
+  notes get a "Compose Wizard" section pointing customers at the
+  download with `unzip + open index.html` instructions. Conditional
+  on `tools/compose-wizard/` existing in the tag's commit tree —
+  emits a workflow warning and skips the bundle if absent (release
+  proceeds without it). Tag must be cut from a commit that has both
+  this workflow change AND the wizard files merged in.
+- **Runner inventory sentinel workflow
+  (`.github/workflows/runner-inventory-sentinel.yml`,
+  `.github/runner-inventory.json`).** Declarative expected-state file
+  enumerates the self-hosted runners we expect to be online + idle
+  (currently `yuzu-wsl2-linux` and `yuzu-local-windows`), and a
+  scheduled workflow reconciles `gh api repos/Tr3kkR/Yuzu/actions/runners`
+  against it. Reports drift (missing runners, offline runners, wrong
+  labels) as a workflow failure with a human-readable summary in the run
+  annotation. Built across three commits:
+  - `12ef73b` — initial workflow + inventory file scaffold.
+  - `a0425c8` — parse error fix (removed invalid `administration: read`
+    workflow permission, added graceful HTTP 403 handling with
+    PAT-setup runbook in stderr, added `.github/runner-inventory.json`
+    and the workflow file itself to `ci.yml`'s `paths-ignore` so CI
+    doesn't re-trigger on inventory edits).
+  - `675d636` — cron schedule commented out with `[skip ci]`. The
+    sentinel is **inactive until the `RUNNER_INVENTORY_TOKEN` PAT is
+    created** — `gh api /actions/runners` requires admin scope which
+    `GITHUB_TOKEN` cannot grant via workflow permissions (admin scope
+    only exists at org/installation level, not workflow level). PAT
+    creation is the first item on the Saturday at Jordanstone checklist;
+    once it lands, uncomment the schedule block and the sentinel
+    activates. The inactive-until-PAT pattern avoids the chronic-red
+    anti-pattern where a permanently-failing scheduled workflow trains
+    operators to ignore CI failure notifications.
 
 - **Dependency automation — `pip` ecosystem + scheduled vcpkg baseline
   bumps (closes #363).** `requirements-ci.txt` at the repo root becomes
@@ -532,67 +588,266 @@ patch._
   includes `docker-compose.reference.yml` with the "requires operator
   hardening" caveat.
 
+### Breaking
+
+- **`DELETE /api/settings/users/:name` now returns 403 + HTMX toast
+  when the URL target matches the caller's own session username
+  (was: 200 + deletion).** Operator scripts that previously called
+  this endpoint to delete the credential they were authenticated
+  with — for example, a decommission flow that removes its own
+  service account as a final step — will receive `403 Forbidden`
+  starting in v0.11.0. The full self-deletion lockout vector
+  including UI suppression is documented in the Fixed entry below
+  (#397). To remove the account a script is signed in as, create a
+  second admin account first, switch authentication to that account,
+  then issue the DELETE.
+- **`POST /api/settings/users` now returns 403 + HTMX toast when an
+  admin attempts to change their own role (typically a self-demote
+  from `admin` to `user`).** The same lockout class as the DELETE
+  case above; closed in the Gate 4 governance hardening round
+  (ca-B1). Self-password-change (same username, same role, different
+  password) is **explicitly allowed** and continues to return 200 —
+  the guard is role-scoped, not a blanket self-upsert ban. Operator
+  scripts that change their own role need to be split: have a
+  second admin perform the role change, or perform the role change
+  before swapping accounts.
+- **Two new audit actions written to `audit_store`:**
+  `user.delete` and `user.upsert`, each with `result` ∈
+  {`success`, `denied`}. Downstream consumers (Splunk HEC,
+  ClickHouse projections) that match on the existing
+  `<noun>.<verb>` action convention pick this up automatically. SOC
+  2 CC7.2 evidence chain (governance Gate 6 CO-1).
+
 ### Fixed
 
-- **Windows MSVC debug builds: removed `VCPKG_BUILD_TYPE release` from
-  `triplets/x64-windows.cmake`, ending a 4-day Windows debug outage.**
-  Commit `f0bb58b` (2026-04-10, "skip debug vcpkg variants") added
-  `set(VCPKG_BUILD_TYPE release)` to the Windows overlay triplet to
-  halve release-build vcpkg install time. The flag tells vcpkg to skip
-  building the debug variant of every package, leaving only release-CRT
-  binaries (`/MD`, `_ITERATOR_DEBUG_LEVEL=0`) in
-  `vcpkg_installed/x64-windows/`. Our debug build compiles user code
-  with `/MDd` and `_ITERATOR_DEBUG_LEVEL=2`, and MSVC's linker refuses
-  to mix the two — every Windows MSVC debug job from `f0bb58b` onward
-  failed with dozens of LNK2038 `RuntimeLibrary` /
-  `_ITERATOR_DEBUG_LEVEL` mismatch errors against `absl_cord.lib`,
-  `absl_cord_internal.lib`, and friends. The CI matrix had **zero
-  successful runs on `dev` for 4 days** (2026-04-10 → 2026-04-14).
-  PR #355's `vcpkg-x64-windows-${{ matrix.build_type }}-…` cache key
-  separation addressed a related cross-job cache contamination but
-  did not fix the underlying triplet — both debug and release jobs
-  still pulled release-only `vcpkg_installed/` trees because that's
-  all the triplet emitted. The CodeQL Windows matrix leg also tripped
-  on this once it got past path/shell quirks.
+- **Settings → Users hardening round on top of the #397/#403 fix —
+  ca-B1 sibling lockout, CO-1 audit chain, UP-1 empty-username
+  fail-closed, UP-9 GET/POST defensive auth (governance Gate 4-6).**
+  The original two-sided fix below closed the DELETE self-target
+  case but left several adjacent hardening items open that the full
+  governance pipeline surfaced:
+  - **ca-B1 — POST self-demotion guard.** `POST /api/settings/users`
+    is the second equivalent route to the same lockout class: an
+    admin POSTing their own username with a lower role demotes
+    themselves out of admin and is locked out of every admin-gated
+    page on the next request. Now rejected with HTTP 403 + "Cannot
+    change your own role" toast when
+    `(username == session->username && role != session->role)`.
+    Self-password-change (same role) is explicitly allowed.
+  - **CO-1 — SOC 2 CC7.2 audit chain.** The 403 self-reject branches
+    and the success delete/upsert paths now emit `audit_fn_` events
+    (`user.delete` / `user.upsert` with `result` ∈ {`denied`,
+    `success`}). `spdlog::warn` alone is not the audit chain — SIEM
+    ingestion paths and SOC 2 evidence collection both read
+    `audit_store`, not log files. Pre-existing gap on the success
+    path also closed.
+  - **UP-1 — empty session username fail-closed.** All three
+    handlers now return HTTP 500 + `spdlog::error` when
+    `session->username.empty()`. Defense-in-depth against an
+    upstream OIDC mis-config returning empty `preferred_username`;
+    previously the empty-string sentinel could match an empty-
+    username row via `"" == ""` or render every row as non-self.
+  - **UP-9 — GET/POST defensive 401.** GET `/fragments/settings/users`
+    and POST `/api/settings/users` now mirror the DELETE handler's
+    defensive 401 branch when `admin_fn_` passes but `auth_fn_`
+    returns nullopt. Previously they fell through with empty
+    `self_name`, re-rendering Remove buttons on every row including
+    the operator's own — the #403 bug pattern resurrected inside
+    the response body.
+  - **arch-S1 — `render_users_fragment` no longer has a default
+    argument.** Every call site must pass `current_username`
+    explicitly so a future caller forgetting it is a compile error
+    rather than a silent UI regression.
+  - **CLAUDE.md** under Authentication & Authorization captures the
+    self-target principal-destruction guard as a hard invariant for
+    future handlers (doc-S2).
+- **Self-deletion lockout in Settings → Users closed on both UI and
+  handler sides (#397 critical, #403 UI — both filed from the Apr 2026
+  UAT pass).** The Settings → Users page rendered a "Remove" button
+  next to every account including the currently authenticated
+  operator's own row, and `DELETE /api/settings/users/:name` did not
+  check the target against the caller's session. Confirming the
+  generic hx-confirm dialog dropped the sole admin credential on a
+  running server, leaving every API call returning 401 until the
+  process was restarted against its on-disk config — a permanent
+  lockout on single-seat deployments where the only recovery was a
+  container restart. Fix lands both halves because a hand-crafted
+  HTTP DELETE bypasses the dashboard entirely:
+  - `server/core/src/settings_routes.cpp` —
+    `render_users_fragment(const std::string& current_username)` now
+    takes the caller's session username and renders an italicised
+    "Current user" badge (not a button, no hx-delete) for the matching
+    row. Every call site (`GET /fragments/settings/users`,
+    `POST /api/settings/users` success and error paths,
+    `DELETE /api/settings/users/:name`) resolves the session via
+    `auth_fn_` and threads the name through so the UI stays consistent
+    after user CRUD.
+  - The `DELETE` handler resolves `session = auth_fn_(req, res)` after
+    the `admin_fn_` gate passes, compares `session->username` to the
+    URL-captured target, and rejects with HTTP 403 +
+    `HX-Trigger: {"showToast":{"message":"Cannot delete your own
+    account","level":"error"}}` if they match. The rejected attempt is
+    logged at warn level (`User '<x>' attempted to delete their own
+    account via /api/settings/users — rejected`) so operators chasing
+    a lockout incident can see it in the server log.
+- **Windows MSVC LNK2038 closed end-to-end via "option D" — static
+  triplet override + hand-rolled `cxx.find_library()` wiring for
+  grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as
+  `bf95d3b`).** The earlier `0fe5eac` fix (removing
+  `VCPKG_BUILD_TYPE release` from `triplets/x64-windows.cmake`) stopped
+  vcpkg from emitting release-only binaries but did not stop meson's
+  cmake dependency translator from baking the release library paths
+  into the debug link line — every Windows MSVC debug build still
+  produced dozens of `RuntimeLibrary` / `_ITERATOR_DEBUG_LEVEL`
+  mismatches against `absl_cord.lib`, `protobuf.lib`, and friends.
+  Four iterations (per-build-type triplets → explicit
+  `CMAKE_BUILD_TYPE` → drop static override → option H hybrid) failed
+  in distinct ways (`12e40ae` through `220e7bd` on the dev branch).
+  Option D is the combination that works:
+  - `triplets/x64-windows.cmake` forces `VCPKG_LIBRARY_LINKAGE static`
+    + `VCPKG_CRT_LINKAGE dynamic` so vcpkg emits per-build-type static
+    archives (`.lib` for release, `d.lib` for debug) that can be
+    selected at link time by the consumer.
+  - `meson.build` replaces the meson `dependency('grpc++',
+    method: 'cmake')` wiring on Windows MSVC with a hand-rolled
+    `cxx.find_library()` chain that picks the correct variant
+    (`protobuf`/`protobufd`, `zlib`/`zlibd`, `libssl`/`libcrypto` —
+    unconditional because gRPC's TLS/JWT/PEM paths always resolve
+    against OpenSSL regardless of schannel aspirations) per the
+    active `buildtype`. Debug and release link lines are now symmetric
+    and CRT-consistent.
+  - `vcpkg.json` openssl dependency loses its `"platform": "!windows"`
+    filter (it was aspirational, never worked, and confirmed wrong by
+    the option D canary's LNK2019 errors).
+  Full history — every failed option, the symmetry breakage at each
+  step, and the strategic escape path to a QUIC-based transport
+  (P1 #376) in case the option D wiring ever rots — is preserved in
+  `.claude/agents/build-ci.md` under "Windows MSVC static-link history
+  and #375". **Do not simplify either half of the Windows wiring** —
+  the triplet override OR the hand-rolled `cxx.find_library()` list —
+  without reading that agent doc first. Linux and macOS are unaffected
+  throughout (meson's cmake dep translator works correctly on
+  platforms with single-variant runtime libraries). The rest of the
+  dependency rollout (#363, 7 stale Dependabot PRs rebased onto
+  `dev`) was gated on this fix and unblocked immediately after the
+  PR #373 merge.
 
-  Three coordinated changes:
-  - **`triplets/x64-windows.cmake`**: removed
-    `set(VCPKG_BUILD_TYPE release)` and added a doc-comment block
-    explaining why it must NOT be set, with explicit pointer at the
-    f0bb58b regression so the next person tempted by the install-time
-    optimization knows what they'd break. The Linux triplet
-    (`x64-linux-static.cmake`) keeps its `VCPKG_BUILD_TYPE release`
-    because gcc/clang don't have MSVC's runtime-library variant ABI —
-    debug user code links against release-built `.a` static libs
-    without complaint.
-  - **`.github/workflows/ci.yml`**: added `triplets/*.cmake` to the
-    Windows vcpkg cache key's `hashFiles(...)` so the next run busts
-    the cache and pulls a fresh install instead of restoring the
-    release-only tree. Without this, the GHA cache would silently
-    return the poisoned content under the same key and the fix would
-    look like it didn't take. Other vcpkg cache keys (linux, macOS,
-    sanitizer/coverage variants) were left alone because they all use
-    `--triplet x64-linux` / `--triplet arm64-osx` (vcpkg's built-in
-    triplets), not the project's overlay triplets, so triplet-content
-    drift cannot affect them.
-  - **`.github/workflows/codeql.yml`**: added a "Force fresh vcpkg
-    install when triplet changed (windows only)" step that compares
-    `sha256 triplets/x64-windows.cmake` against a sentinel file under
-    `vcpkg_installed/.x64-windows-triplet.sha256` and `rm -rf`s the
-    install root on drift. The CodeQL workflow doesn't use GHA cache
-    for `vcpkg_installed/` — it relies on the persistent self-hosted
-    Windows runner state — so vcpkg's incremental install would
-    otherwise silently reuse the release-only tree on the runner's
-    disk forever. Subsequent runs after the sha256 stabilises return
-    to fast persistent reuse.
+- **Erlang gateway test suites (`eunit` + `ct`) now survive Windows
+  parallel test scheduling (#375, folded into PR #373).** Two distinct
+  Windows-only failures in the gateway test wrapper
+  `scripts/test_gateway.py` had to be untangled in sequence:
+  - **Cover-races-compile on `gateway_pb.beam`** (commit `b33f1df`
+    regression, fixed in `6d8aa5a`). `b33f1df` added a pre-fetch step
+    `rebar3 as test compile --deps_only` to warm the hex cache before
+    the actual test run. On Linux/macOS this is harmless because
+    `_build/test/lib/yuzu_gw/src/` is a symlink to `apps/yuzu_gw/src/`
+    and cover instrumentation always reads a consistent view of the
+    ebin tree. On Windows — where symlinks are unavailable so rebar3
+    copies source files instead — the pre-fetch left
+    `_build/test/lib/yuzu_gw/` in a state where the subsequent
+    `rebar3 as test eunit` incremental compile raced cover's
+    `pmap_spawn` module-scan. Result was a consistent ~10 s failure
+    with `{cover,get_abstract_code,2,...,{file_error,
+    ".../gateway_pb.beam",enoent}}` on the gpb-generated protobuf
+    module before any test executed. `6d8aa5a` drops the pre-fetch
+    entirely (redundant on the persistent `yuzu-local-windows` runner
+    whose hex cache is already warm) and retains the
+    `run_with_retry()` helper with `max_attempts=4` on the actual
+    test invocation for continued hex.pm flake protection.
+  - **Parallel-compile race between the two gateway suites** (fixed
+    in `f0b84c7`). Meson's default test scheduler runs `gateway eunit`
+    and `gateway ct` in parallel, both invoking `test_gateway.py`,
+    both running `rebar3 as test <suite>` against the same
+    `_build/test/lib/<dep>/` tree. rebar3's compile worker writes
+    `<name>.bea#` then atomically renames to `<name>.beam`; when two
+    processes collide on the same dep (`proper` is first, being the
+    largest Erlang dependency), whichever renames first wins and the
+    loser's `MoveFileEx` call fails with `ENOENT` on the temp file.
+    Linux/macOS tolerate the race via POSIX atomic rename and
+    symlinked source trees; Windows does not. The failing suite
+    flipped between eunit and ct across runs depending on which
+    rebar3 process lost the race. Fix: `meson.build` sets a distinct
+    `REBAR_BASE_DIR` per suite (`_build_eunit` vs `_build_ct`) via
+    the test `env:` parameter; `scripts/test_gateway.py` honors the
+    env var when computing its ebin-wipe path; `.gitignore` gains the
+    two new build roots. Two disjoint `_build/` trees cannot race.
+    Cost is a one-time extra compile of Erlang dependencies
+    (`meck`, `proper`, `covertool` ≈ 10–15 s) in whichever suite
+    starts second from a cold cache, paid once per fresh runner and
+    then cached by rebar3's user-level hex cache for subsequent runs.
+  The pre-`b33f1df` eunit path was passing on an earlier commit only
+  because that run happened to avoid the parallel-race by winning the
+  scheduling flip; both failure modes had to be fixed before the CI
+  cycle could go consistently green. Validated on PR #373 push CI
+  run `24426124422` (Windows MSVC debug: `gateway eunit OK 58.58s`,
+  `gateway ct OK 78.39s`) — the first fully-green Windows MSVC
+  gateway run in the #375 fix chain.
 
-  Tradeoff: Windows vcpkg install will now build BOTH debug and
-  release variants of every package, doubling the cold-cache install
-  time. The cost is amortized by the GHA cache (warm restores stay
-  fast) and is the right tradeoff against having no green Windows CI
-  at all. If the install-time optimization is wanted back, do it via
-  per-build-type triplets (`x64-windows-release` for the release
-  matrix leg only) — never on the shared default.
+- **`.github/workflows/ci.yml`: Linux jobs (gcc-13/clang-19,
+  debug/release) migrated from `ubuntu-24.04` GHA-hosted to
+  `yuzu-wsl2-linux` self-hosted runner (commits `f4d634e`, `d12ba74`).**
+  Mirrors the Windows MSVC migration to bring all four mainstream
+  platforms under self-hosted control, trading hosted-runner cold-cache
+  cost for persistent-runner warm-cache and freedom from GHA outages.
+  Two follow-up infrastructure gaps surfaced and were closed during the
+  migration:
+  - **NOPASSWD sudo for `github-runner`** — first push run failed on the
+    `Install system packages` step because the `github-runner` user had
+    no NOPASSWD sudo grant. Fixed out-of-band by adding
+    `/etc/sudoers.d/github-runner` granting NOPASSWD for `apt-get`,
+    `apt`, and `dpkg`. The grant is host-side and not version-controlled;
+    canonical recovery procedure is documented in
+    `docs/ci-troubleshooting.md`.
+  - **PEP 668 `externally-managed-environment` (`d12ba74`)** —
+    Ubuntu 24.04 (which the WSL2 distro is) ships PEP 668's marker so a
+    system-wide `pip3 install` refuses with `EXTERNALLY-MANAGED`. All
+    four Linux jobs now use
+    `pip3 install --user --break-system-packages -r requirements-ci.txt`
+    (the documented bypass for ephemeral CI install-and-go environments)
+    plus `echo "$HOME/.local/bin" >> $GITHUB_PATH` so the subsequent
+    `meson setup` step finds the `~/.local/bin/meson` shim.
+
+- **WSL2 utility VM keep-alive: `vmIdleTimeout=-1` in `.wslconfig`,
+  `loginctl enable-linger dornbrn` for defense-in-depth.** The
+  `yuzu-wsl2-linux` self-hosted runner lives inside the WSL2 host distro
+  on Shulgi. WSL2's default `vmIdleTimeout=60000` (60 s) shut the utility
+  VM down ~60 s after the last interactive shell session ended, which
+  killed both the `actions.runner.Tr3kkR-Yuzu.yuzu-wsl2-linux.service`
+  systemd unit AND any tmux sessions inside the distro. Confirmed by 4
+  VM cycles on 2026-04-15 (07:52, 08:24, 10:06, 13:07 UTC, captured by
+  `last reboot`) correlating with SSH disconnect events, and by the
+  parent-run-wedge cascade where CI run `24450261405` lost its
+  `Linux gcc-13 debug` job mid-execution and the orphaned job could not
+  be cancelled until the runner reincarnated and force-cancel propagated.
+  Fix in two coordinated changes (both host-side, neither in the repo):
+  - `vmIdleTimeout=-1` in `/mnt/c/Users/natha/.wslconfig` (Windows-side
+    WSL2 host config, applied via `wsl --shutdown`). `-1` disables the
+    idle timeout entirely — appropriate for a runner host where the
+    cost of the VM running idle is dwarfed by the cost of cancelling
+    an in-flight CI run.
+  - `loginctl enable-linger dornbrn` so user-scope systemd survives
+    "no sessions" windows even with the VM up. Defense-in-depth, since
+    the runner unit is system-scope and didn't strictly need it.
+  Canonical recovery procedure documented in `docs/ci-troubleshooting.md`
+  as the first runbook entry for the "Linux runner shows offline" /
+  "tmux is dying" failure mode.
+
+- **`.github/workflows/ci.yml`: Windows MSVC debug and release jobs
+  migrated from the GHA-hosted `windows-2022` runner to the
+  `yuzu-local-windows` self-hosted runner (#374, commit `3960f46`).**
+  Hosted Windows runners have long vcpkg install times (grpc alone
+  takes 10+ minutes from a cold cache) and occasional `applocal.ps1`
+  / grpc-build flakes that were blocking the #375 debug iteration
+  loop. Moving Windows MSVC onto the persistent self-hosted runner
+  cuts warm-cycle time significantly and gives vcpkg's binary cache a
+  stable disk to live on across runs. The single-runner serialization
+  pattern (only one Windows MSVC job runs at a time) is deliberate —
+  the `yuzu-local-windows` runner is a single physical machine with
+  one worker — and has the side-effect of flushing out any Yuzu test
+  code that was inadvertently relying on hosted-runner-fresh state.
+  The migration exposed #375 (LNK2038 was masked on hosted runners by
+  a different vcpkg cache layout) which was the gate that had to
+  close before the dependabot rollout could proceed.
 
 - **`scripts/test/` harness bugs discovered running `/test --full`
   against uncommitted #339.** Three PR1 harness fixes that landed the
@@ -663,6 +918,46 @@ patch._
 
 ### Tests
 
+- **`tests/unit/server/test_settings_routes_users.cpp` (new, 9
+  cases).** First test file for the Settings routes layer. Stands up a
+  real `httplib::Server` on a random port with `SettingsRoutes`
+  registered against a two-account `AuthManager` (`admin` +
+  `bob`), mocks the `auth_fn`/`admin_fn`/`perm_fn`/`audit_fn`
+  callbacks (audit_fn captures every call into a vector for evidence-
+  chain assertions), and exercises the full HTTP surface. Coverage:
+  - **#397 handler guard:** admin-self-DELETE returns 403 with the
+    full HX-Trigger payload (not just substring) and leaves the
+    account intact; the rejected attempt emits a `user.delete` /
+    `denied` audit event (CO-1 evidence chain).
+  - **Non-self DELETE:** admin-DELETE of another user returns 200,
+    the account is removed, and emits a `user.delete` / `success`
+    audit event.
+  - **Non-admin DELETE:** rejected by the `admin_fn_` gate before
+    the self-delete guard is reached, no audit event recorded.
+  - **Unauthenticated DELETE:** rejected by `admin_fn_` with 403,
+    target account intact, no audit event recorded.
+  - **ca-B1 self-demotion guard (POST):** admin POSTing
+    `username=admin&role=user` is rejected with 403 +
+    "Cannot change your own role" toast; role remains admin;
+    `user.upsert` / `denied` audit event captured.
+  - **POST self-password-change:** same username, same role only
+    password change — explicitly allowed, returns 200,
+    `user.upsert` / `success` audit emitted.
+  - **POST success path renders self-row guard:** new user appears
+    in the response fragment with hx-delete; operator's own row
+    still has Current user badge — regression cover for the
+    self_name threading through the success branch.
+  - **#403 UI guard:** `GET /fragments/settings/users` emits no
+    `hx-delete="/api/settings/users/admin"` attribute for the self
+    row, still emits it for every other row, and renders the
+    "Current user" badge in its place.
+  - **UI guard with multiple users:** every non-self row keeps its
+    Remove button when the user list grows.
+  Harness uses an RAII `TmpDirGuard` member that cleans up the temp
+  directory even if a `REQUIRE` inside the constructor body throws
+  (qe-B1 — partially-constructed objects don't run their own
+  destructor but fully-constructed members do). Pattern available for
+  future Settings-routes regression coverage.
 - **`tests/unit/server/test_migration_runner.cpp`** — four new cases
   tagged `[migration][adoption]` exercise the adoption and hardening
   paths: (a) running v1 on a database that already has tables populated

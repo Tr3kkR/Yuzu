@@ -49,17 +49,18 @@ recreate, the new PR numbers go in the **Recreated As** column.
 | Tier | Task | Original PR | Recreated As | Action / Bump | Risk | Self-hosted? | Status |
 |---|---|---|---|---|---|---|---|
 | 0a  | #1  | —    | — | Verify runners ≥ 2.327.1 | Gate | Yes | **done** (both 2.333.1) |
-| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | plumbing done (commit `3960f46`); exposed #375 |
-| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option D: static triplet + hand-rolled `cxx.find_library()` for grpc/protobuf | **Gate (P0)** | Yes | in progress (folded into #373) |
-| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **PAUSED on #375** |
-| 1  | #3  | **#335** | TBD | `ubuntu` digest 186072b → 84e77de | Low | No | pending |
-| 1  | #4  | **#248** | TBD | `alpine` 3.22 → 3.23 (gateway) | Low | No | pending |
-| 2  | #5  | **#300** | TBD | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | pending |
-| 3  | #6  | **#243** | TBD | `actions/github-script` 7 → 8 | Med-High | **Yes** | pending |
-| 3  | #7  | **#241** | TBD | `actions/cache` 4 → 5 | High (19 sites) | **Yes** | pending |
-| 4  | #8  | **#242** | TBD | `actions/upload-artifact` 4 → 7 | High | **Yes** | pending |
-| 4  | #9  | **#250** | TBD | `actions/download-artifact` 4 → 8 | **Highest** (digest=error) | **Yes** | pending |
-| 5  | #11 | n/a  | — | Centralize Dockerfile meson pins | Low | n/a | pending |
+| 0b  | n/a | —    | — | Migrate ci.yml Windows MSVC → yuzu-local-windows (#374) | Gate | **Yes** | **done** (commit `3960f46`) |
+| 0bb | #14 | —    | — | Fix Windows MSVC LNK2038 (#375) — option D static-link triplet + parallel-compile race | **Gate (P0)** | Yes | **done** (PR #373 merged as `bf95d3b`) |
+| 0c  | #2  | —    | — | `@dependabot recreate` × 7 | Gate | n/a | **done** — all 8 open PRs `base=dev` |
+| 0d  | n/a | n/a      | **#385**         | `meson` 1.9.2 → 1.11.0 (new pip ecosystem from #372) | Gate (build graph) | n/a | **done** (`fed97bb`, 2026-04-15 17:15 UTC) |
+| 1  | #3  | **#335** | #335 (in place)  | `ubuntu` digest 186072b → 84e77de | Low | No | **done** (`5bb8c42`, 2026-04-15 17:16 UTC) |
+| 1  | #4  | **#248** | #248 (in place)  | `alpine` 3.22 → 3.23 (gateway) | Low | No | **done** (`c70bb57`, 2026-04-15 17:16 UTC; `18899a5` follow-up comment fix) |
+| 2  | #5  | **#300** | #300 (in place)  | `codecov-action` 5 → 6 | Med (node24 but github-hosted) | No | **done** (`320a9e5`, 2026-04-15 17:20 UTC; coverage scripts hardened in `54e5bc3` + `bcc17df`) |
+| 3  | #6  | **#243** | **#386** (now 7→9) | `actions/github-script` 7 → **9** | Med-High | **Yes** | **done** (`e85c3f1`, 2026-04-16 04:55 UTC) |
+| 3  | #7  | **#241** | #241 (in place)  | `actions/cache` 4 → 5 | High (19 sites) | **Yes** | **done** (`577530b`, 2026-04-16 07:25 UTC) |
+| 4  | #8  | **#242** | #242 (in place)  | `actions/upload-artifact` 4 → 7 | High | **Yes** | **done** (`90af2d7`, 2026-04-16 11:44 UTC) |
+| 4  | #9  | **#250** | #250 (in place)  | `actions/download-artifact` 4 → 8 | **Highest** (digest=error) | **Yes** | **done** (`c246d66`, 2026-04-16 07:25 UTC) |
+| 5  | #11 | n/a  | — | Centralize Dockerfile meson pins | Low | n/a | **next — Track A done; this is Tier 5 close-out** |
 | —  | #10 | n/a  | — | Standing breakage triage | n/a | n/a | pending |
 
 Task IDs (`#N`) refer to the in-session `TaskList`, **not** GitHub
@@ -239,142 +240,111 @@ For every breakage encountered during any tier:
 
 ## Resume Pointer
 
-> **Session handoff 2026-04-14 ~22:00 UTC.** Option D C++ link is
-> solid on Windows MSVC — every C++ target compiles and links on
-> both debug and release, every C++ test passes. The last blocking
-> gate is `yuzu:gateway eunit` / `yuzu:gateway ct` on Windows, and
-> the latest iteration (commit `f0b84c7`, pushed at handoff) gives
-> each suite its own `REBAR_BASE_DIR` so two parallel rebar3
-> processes can never race on the same `_build/test/lib/<dep>/`
-> ebin tree. The full in-flight fix chain is now:
-> `220e7bd` (option D C++ clean, gateway EUnit hex.pm flake) →
-> `b33f1df` (pre-fetch retry added, **regressed** on Windows with
-> cover-races-compile on `gateway_pb.beam`) →
-> `d20852b` (docs-only handoff) →
-> `6d8aa5a` (drop `--deps_only` pre-fetch, fixes cover race — eunit
-> started passing but exposed the parallel-compile race) →
-> `fea3702` (docs-only handoff) →
-> `f0b84c7` (per-suite `_build_eunit`/`_build_ct` to end the race).
+> **Session refresh 2026-04-16 ~11:55 UTC.** **Track A is COMPLETE
+> — 10 of 10 dependabot PRs merged.** #242 (Tier 4 first half,
+> upload-artifact 4 → 7) squash-merged as `90af2d7` at 2026-04-16
+> 11:44 UTC closes the rollout. The full Track A merge sequence
+> spanned 2026-04-15 17:15 UTC → 2026-04-16 11:44 UTC (rough
+> 19-hour window) in three batches: Tier 0d + 1 + 2 (`fed97bb` meson
+> 1.11.0 → `5bb8c42` ubuntu → `c70bb57` alpine + `18899a5` comment
+> fix → `320a9e5` codecov; 17:15-17:20 UTC), Tier 3 first half
+> (`e85c3f1` github-script 7→9; 04:55 UTC next morning), Tier 3 +
+> Tier 4 second half (`577530b` cache 4→5 + `c246d66` download-
+> artifact 4→8; 07:25 UTC), then Tier 4 first half (`90af2d7`
+> upload-artifact 4→7; 11:44 UTC). Two operational follow-ups
+> landed in the same window — `54e5bc3` (gcov negative-hit parse
+> error) and `bcc17df` (coverage HTML report + build-linux dir
+> convention) — hardening the codecov action's input pipeline after
+> #300 landed.
 >
-> **The two Windows failures that `6d8aa5a` and `f0b84c7` fix.**
+> **⚠ Standing dev-HEAD CI failure — `Linux clang-19 debug` Test
+> step times out.** Two consecutive completed push runs on dev
+> (`24473577716` on `54e5bc3`, `24497677392` on `c246d66`) failed
+> the `Linux clang-19 debug` job at the Test step. Diagnosis on
+> 2026-04-16 ~11:00 UTC: clang-19 debug binary execution is genuinely
+> slower than gcc-13 debug for the same workload (~7 min job vs ~5
+> min), and two Catch2 binaries blow past their meson per-suite
+> timeouts under that slowness:
 >
-> **(1) Cover-races-compile on `gateway_pb.beam`, fixed in `6d8aa5a`.**
-> On push CI run `24412646165` the `b33f1df` pre-fetch produced a
-> consistent ~10s failure in BOTH Windows MSVC variants:
-> - release → gateway EUNIT failed at 10.40s with
->   `{cover,get_abstract_code,...,{file_error,".../gateway_pb.beam",enoent}}`
-> - debug → gateway CT failed at 10.50s with the same cover stack.
+> - `yuzu_tar_tests` (30s timeout) — first test
+>   `TarDatabase: warehouse tables created on open` SIGTERMed at 30s.
+>   Schema-v2 migration alone took 23s on this build (`TarDatabase
+>   opened` log to `migrated to schema version 2` log delta). 1 of 9
+>   test cases reached.
+> - `yuzu_agent_tests` (120s timeout) — failed at
+>   `tests/unit/test_trigger_engine.cpp:378` "TriggerEngine: interval
+>   trigger registered, start/stop no crash". Log shows the trigger
+>   engine drain pattern (5s graceful worker-thread shutdown per
+>   stop, sequentially executed across many tests) chaining past 120s.
+>   337 of 338 cases passed before SIGTERM.
 >
-> The test profile has `cover_enabled => true`, so eunit/ct fire
-> cover instrumentation immediately after `===> Compiling yuzu_gw`.
-> On Linux/macOS `_build/test/lib/yuzu_gw/src/` is a symlink to
-> `apps/yuzu_gw/src/` and the compile pipeline is synchronous, so
-> cover always sees a consistent ebin. On Windows symlinks are out,
-> the pre-fetch leaves `_build/test/lib/yuzu_gw/` in a state where
-> the subsequent incremental compile races cover's `pmap_spawn`
-> scan — `gateway_pb` is in cover's module list but its `.beam` is
-> not yet on disk when cover's `beam_lib` read fires. `6d8aa5a`
-> drops the pre-fetch (redundant on the persistent runner whose
-> hex cache is warm) and keeps `run_with_retry` on the actual test
-> invocation with `max_attempts=4`.
+> **This is NOT caused by Track A** — both #241 (cache) and #250
+> (download-artifact) merged in the same 07:25 UTC batch are
+> CI-config-only. Same clang-19 debug Test failure existed on
+> `54e5bc3` (push run `24473577716`) before #241/#250 were merged.
+> The 17:30 UTC 2026-04-15 "WSL2 VM false positive" diagnosis below
+> covered a different signature (Post Cache ccache stuck mid-cleanup,
+> 33-min gap to next runner pickup). The current failure is at the
+> Test step itself with clean post-Test step transitions — genuine
+> per-suite timeout, not runner death.
 >
-> **(2) Parallel-compile race between eunit and ct, fixed in
-> `f0b84c7`.** On push CI run `24419434652` the `6d8aa5a` fix
-> green-lit gateway eunit, but exposed a SECOND distinct failure
-> flipping between the two suites:
-> - push release: eunit FAIL 8.98s, ct OK 55.65s
-> - push debug:   ct    FAIL 4.32s, eunit OK 30.75s
-> - PR debug:     eunit FAIL 8.77s, ct OK 55.49s
+> **Track A merge decision for #242 — resolved.** Decision was
+> **option 1** (merge anyway, file the clang-19 perf cliff as Track B,
+> let the timeout band-aid be a deliberate follow-up). Executed in
+> three artifacts:
 >
-> The failing suite flips based on which rebar3 process loses the
-> race. Error signature in the loser's compile:
+> - **PR #412** (`ci/clang19-debug-timeouts`, open at this refresh)
+>   carries the band-aid (`tests/meson.build` tar 30→90s, agent
+>   120→240s) plus this doc's reconciliation. PR-time CI green on
+>   PR-event matrix; awaiting Windows MSVC and merge.
+> - **#242 squash-merged** as `90af2d7` ahead of #412 — the dev push
+>   run on `90af2d7` will fail clang-19 debug exactly as today
+>   (band-aid not on dev yet). Acceptable known burn (~7 min runner
+>   time on the failed job); the next push run after #412 lands will
+>   be green.
+> - **Issue #413** (`bug,reliability,devops,P2`) carries the proper
+>   investigation: why is `TarDatabase` schema-v2 migration 23s on
+>   clang-19 debug vs presumably <5s on gcc-13 debug? Why does the
+>   trigger engine 5s graceful drain accumulate so much more on
+>   clang-19 debug that 337/338 cases don't fit in 120s? Hypotheses
+>   in the issue: libstdc++ debug iterators, `-O0` vs gcc's `-Og`,
+>   sqlite3 lib build flags differing by compiler.
 >
->     ===> Compiling _build/test/lib/proper/src/proper_orddict.erl failed
->     _build/test/lib/proper/ebin/proper_orddict.beam:none: failed to
->       rename .../proper_orddict.bea# to .../proper_orddict.beam:
->       no such file or directory
+> **Next actions — Tier 5 + Track A close-out housekeeping.**
 >
-> Root cause: meson's default parallel test scheduling runs
-> `gateway eunit` and `gateway ct` simultaneously, both invoking
-> `test_gateway.py`, both running `rebar3 as test <suite>` against
-> the SAME `_build/test/lib/<dep>/` tree. rebar3's compile worker
-> writes `<name>.bea#` then atomically renames to `<name>.beam`;
-> when two processes collide on the same dep (`proper` is first,
-> being the largest), whichever renames first wins and the loser's
-> rename fails with ENOENT. Linux/macOS tolerate the race via
-> atomic POSIX rename and symlinked source trees; Windows does not.
+> 1. **Land PR #412.** Once Windows MSVC completes green, squash-
+>    merge to dev. The post-merge dev push run will exercise the
+>    full clang-19 debug path with the band-aid in place — should
+>    reach `Complete job` SUCCESS for the first time on dev since
+>    `54e5bc3`.
+> 2. **Tier 5 (Task #11) — Dockerfile meson pin centralization.**
+>    Five Dockerfiles still carry hardcoded `meson==1.9.2`:
+>    `deploy/docker/Dockerfile.{agent,server,ci,ci-linux,runner-linux}`.
+>    Centralize on `COPY requirements-ci.txt` so future Dependabot
+>    meson bumps propagate without manual sync, drop the
+>    `ARG MESON_VERSION=...` lines from `Dockerfile.ci-linux` and
+>    `Dockerfile.runner-linux`, and add `requirements-ci.txt` to the
+>    `ci-runner-image.yml` paths trigger. Note: the Dockerfiles
+>    pin **the old** `1.9.2` while the live env (CI workflows,
+>    `requirements-ci.txt`, dev boxes) is at **`1.11.0`** post-#385.
+>    Centralization is also a forward-port to 1.11.0 across the
+>    image surface.
+> 3. **Watch #413 (clang-19 perf cliff).** Resolution either retires
+>    the band-aid (proper fix lands in `tests/meson.build`) or
+>    documents the band-aid as the permanent fix in
+>    `docs/ci-troubleshooting.md`.
 >
-> `f0b84c7` sets a distinct `REBAR_BASE_DIR` per suite
-> (`_build_eunit` vs `_build_ct`) in `meson.build`, with
-> `test_gateway.py` honoring the env var when computing its
-> ebin wipe path. Two disjoint build trees, no shared ebin, no
-> possible race. The cost is a one-time extra compile of deps
-> (meck, proper, covertool ≈ 10-15 s) in whichever suite starts
-> second from a cold-cache state, paid once per fresh runner and
-> then cached by rebar3's user-level hex cache for subsequent runs.
+> **Doc lifecycle.** Per the doc's own preamble, when this rollout
+> closes, the doc converts to a brief lessons-learned addendum and
+> the live tracking sections collapse. Track A close-out (after
+> Tier 5 lands) is the trigger for that conversion. Until Tier 5
+> lands, this doc remains the live state of record.
 >
-> **Next action:** wait for the push CI run on `f0b84c7` head-commit
-> (whichever commit is actually at the tip of dev when the fix lands
-> — should be a docs commit on top of `f0b84c7`). The paired PR run
-> appears on the same head. Use
-> `gh run list --workflow=ci.yml --branch=dev --limit=3` to find
-> the live run IDs.
->
-> Expected outcome on Windows:
-> - Vcpkg install: cache hit (only meson.build + script + .gitignore
->   changes since 220e7bd)
-> - Configure / build: same as 220e7bd, debug + release link clean
-> - gateway EUNIT: **148/148 PASS** in ~30s (validated locally)
-> - gateway CT: PASS in ~55s (per the earlier successful runs on
->   f0b84c7's precursor 6d8aa5a — only the suite that won the race
->   got to ~55s then)
->
-> If green: **merge PR #373** (squash or merge-commit, see #369 for
-> the reconcile pattern), **close #375** with a pointer at
-> `.claude/agents/build-ci.md` "Windows MSVC static-link history
-> and #375" as the lessons-learned record, **dispatch Task #2** —
-> the dependabot recreate cycle. Tasks #3 → #9 unblock in tier
-> order per the Tier Table.
->
-> If red on a THIRD distinct failure mode: the parallel-compile
-> race wasn't the last Windows-specific gotcha. Next step in order
-> of escalation is:
-> 1. Add `is_parallel: false` to both gateway test() entries in
->    meson.build. This strict-serializes the gateway tests with
->    respect to ALL other meson tests (extra ~30s test-time cost),
->    which eliminates ANY possible race on any shared resource,
->    not just the `_build/` tree.
-> 2. If that still fails, suspect the OTP 28 rebar3 compile worker
->    pool on Windows has non-race-related issues (e.g. file handle
->    leaks, temp dir collision on `%TEMP%`). At that point drop
->    into `gh run view <job> --log` and read the full captured
->    output — there may be a prior WARNING that got truncated in
->    the grep filter.
->
-> If red on a new C++ link error: it's a new transitive lib
-> surfacing in option D's hand-rolled `cxx.find_library()` list.
-> Apply the iteration pattern from the a61a787 → 713ae8c → 46ea61f
-> → 220e7bd chain — see `.claude/agents/build-ci.md` "Windows MSVC
-> static-link history and #375" for the long form.
->
-> Tasks #1 and #14 done. Tasks #2-#9 (dependabot rollout) **PAUSED**
-> pending #375 closure on the `f0b84c7` CI cycle. Tasks #11-#13
-> unblocked anytime. Task #15 (hex.pm hardening) is on hold — the
-> `run_with_retry` helper is retained and hex.pm flakes still retry
-> on the actual test invocation, but the explicit pre-fetch step
-> experiment failed and is not being reattempted. Task #16 (move
-> off gRPC) deferred per P1 #376.
->
-> Canary commits on `dev`:
-> `b33f1df` (pre-fetch, regressed) →
-> `d20852b` (docs-only) →
-> `6d8aa5a` (pre-fetch drop, fixed cover race) →
-> `fea3702` (docs-only) →
-> `f0b84c7` (per-suite `_build/`, fixes parallel-compile race).
-> The earlier `24412648443` and `24419435949` PR run IDs in older
-> versions of this Resume Pointer are stale. Always use
-> `gh pr view 373 --json statusCheckRollup` to get the live PR
-> CI run ID before diagnosing.
+> Tasks #1, #2, #14 done. Tasks #3-#9 **all done** (10 of 10 PRs
+> merged). Task #11 (Tier 5) is the next active item. Tasks #12-#13
+> unblocked. Task #15 (hex.pm hardening) on hold. Task #16 (move off
+> gRPC) deferred per P1 #376. Track B carries #413 (clang-19 debug
+> perf cliff investigation).
 
 ## Sub-agent delegation pattern
 
@@ -408,6 +378,180 @@ gateway runtime; use the `general-purpose` agent if neither fits.
 Append-only. Newest entries at the top. Format:
 `YYYY-MM-DD HH:MM UTC · <actor> · <event>`.
 
+- **2026-04-16 ~11:55 UTC** · Claude session · **Track A complete:
+  #242 squash-merged as `90af2d7`, #413 filed for the underlying
+  clang-19 perf cliff.** Final dependabot PR (`actions/upload-
+  artifact 4 → 7`) landed via `gh pr merge 242 --squash --delete-
+  branch`. PR was CLEAN/MERGEABLE with all 4 PR-time CI jobs SUCCESS;
+  Tier 4's higher-risk sibling #250 (download-artifact, digest=error)
+  had already validated the artifact-action class against the self-
+  hosted Linux runner. **Known burn:** post-merge dev push run on
+  `90af2d7` will fail `Linux clang-19 debug` at the Test step
+  exactly as the prior two pushes (`54e5bc3`, `c246d66`) — the band-
+  aid in PR #412 isn't on dev yet. Acceptable cost (~7 min runner
+  time on the failed job) given the user's stated priority of
+  closing Track A today. The next dev push run after #412 lands
+  will be green for clang-19 debug for the first time since the
+  perf cliff appeared. **Issue #413 filed** (`bug,reliability,
+  devops,P2`) carrying the proper investigation: full symptom
+  trace, comparison table (gcc-13 debug 308s vs clang-19 debug 422s
+  for the same commit `c246d66`), four hypotheses (libstdc++ debug
+  iterators, `-O0` vs `-Og`, sqlite3 build flags, condvar accumulation),
+  investigation steps, and acceptance criteria. Tier Table updated
+  to mark Tier 4 #242 done with `90af2d7` + 11:44 UTC; Tier 5
+  promoted to `next` status; Resume Pointer wholesale-replaced to
+  reflect Track A complete + Tier 5 close-out as the next active
+  item. **Doc lifecycle note:** per the doc preamble, this doc
+  converts to a brief lessons-learned addendum once the rollout
+  closes — Tier 5 landing is the trigger for that conversion.
+- **2026-04-16 ~11:30 UTC** · Claude session · **Doc reconciled +
+  clang-19 debug Test timeout diagnosed and patched.** Doc Resume
+  Pointer was last refreshed at 2026-04-15 17:00 UTC saying "start
+  Tier 1"; in the intervening 19 hours the operator (Tr3kkR)
+  squash-merged 9 of the 10 Track A PRs without updating the doc.
+  Reconciled: Tier Table status column now reflects the 9 merges
+  with merge SHAs and timestamps; Resume Pointer wholesale-replaced
+  to point at #242 as the only remaining Track A PR and Tier 5
+  (Task #11 — Dockerfile meson pin centralization) as the
+  next-after-#242 step. The 9 merges spanned 2026-04-15 17:15 UTC
+  → 2026-04-16 07:25 UTC in three batches: Tier 0d + 1 + 2 (`fed97bb`
+  meson 1.11.0 → `5bb8c42` ubuntu → `c70bb57` alpine + `18899a5`
+  comment fix → `320a9e5` codecov; 17:15-17:20 UTC), Tier 3 first
+  half (`e85c3f1` github-script 7→9; 04:55 UTC next morning), then
+  Tier 3 second + Tier 4 second (`577530b` cache 4→5 + `c246d66`
+  download-artifact 4→8; 07:25 UTC). Two operational follow-ups
+  landed in the same window — `54e5bc3` (gcov negative-hit parse
+  error) and `bcc17df` (coverage HTML report + build-linux dir
+  convention) — hardening the codecov action's input pipeline after
+  #300 landed. **Standing dev-HEAD CI failure diagnosed:** two
+  consecutive completed push runs (`24473577716` on `54e5bc3`,
+  `24497677392` on `c246d66`) failed `Linux clang-19 debug` at the
+  Test step. clang-19 debug binary execution is genuinely slower
+  than gcc-13 debug on the same workload (~7 min job vs ~5 min) and
+  two Catch2 binaries blow past their meson per-suite timeouts
+  under that slowness: `yuzu_tar_tests` (30s default — schema-v2
+  migration alone took 23s, single test couldn't fit in the
+  remaining 7s window) and `yuzu_agent_tests` (120s — 337 of 338
+  cases passed before SIGTERM, trigger engine 5s graceful drain
+  pattern chained past the limit). Same job code path passed in
+  4m 53s on gcc-13 debug for the same commit, so this is a
+  compiler-flavor slowness, not a code regression. **Patched as a
+  band-aid:** `tests/meson.build` `tar` suite now `timeout: 90`,
+  `agent` suite `timeout: 120 → 240`. Proper fix (investigate why
+  schema migration is 23s on clang-19 debug and why trigger drain
+  is heavier) deferred to a Track B Item to be filed separately —
+  this band-aid restores green dev CI without papering over the
+  underlying perf cliff. **#242 squash merge unblocked** — the
+  failure is unrelated to dependabot and the timeout fix is in the
+  same commit as this Event Log update, so the next push run on
+  dev should be green.
+- **2026-04-15 ~17:30 UTC** · Claude session · **Diagnosis: the
+  clang-19 debug "regression" on run `24450261405` job
+  `71437121999` was a WSL2 utility VM cycling false positive, not
+  a clang-19 code regression.** Pulled the failed job's step trace
+  via `gh api repos/Tr3kkR/Yuzu/actions/jobs/71437121999`. Steps
+  1-13 (Setup → Install packages → Cache ccache → Setup vcpkg →
+  Install vcpkg → Configure Meson → **Build** → **Test** → ccache
+  stats) and step 24 (Post Cache vcpkg) all completed SUCCESS.
+  Step 25 `Post Cache ccache` is `in_progress` with conclusion
+  `null` (never finished), step 26 `Post Run actions/checkout` is
+  `pending` (never started). Job marked failure at 11:34:10Z after
+  40m 54s wall time. Cross-checked against the runner timeline:
+  `gh api repos/Tr3kkR/Yuzu/actions/runs/24450261405/jobs` shows
+  the next `yuzu-wsl2-linux` job (`Linux clang-19 release` job
+  `71437122003`) didn't pick up until 12:07:33Z — a **33-minute
+  gap** vs. the seconds-to-minutes normal pickup, signature of
+  the runner agent dying with the host VM. This matches the
+  WSL2 utility VM idle-reaper failure mode documented as entry #1
+  of `docs/ci-troubleshooting.md` (commit `819568b`). **Validated**
+  on the very next CI run, `24455027178` (workflow_dispatch on
+  `675d636`, fired at 12:40:57Z, after the WSL2 keep-alive fix
+  was in place): the same `Linux clang-19 debug` code path on job
+  `71453384876` completed all 27 steps SUCCESS in 4m 53s including
+  `Post Cache ccache` and `Complete job`. Verified the two-part
+  fix is **actually deployed**: `cat /mnt/c/Users/natha/.wslconfig`
+  shows `vmIdleTimeout=-1` (with the explanatory comment block) and
+  `loginctl show-user dornbrn` returns `Linger=yes`. Resume Pointer
+  refreshed: removed the "Standing caveat — clang-19 regression on
+  dev" paragraph that was added in the 17:00 UTC refresh, replaced
+  with a "Resolved" entry holding the diagnosis. **Memory pointer
+  `project_session_handover_2026-04-15b.md` should also be updated
+  to mark item #2 of "Open work / pickup points" (Diagnose Linux
+  clang-19 debug regression) as done; that update is part of this
+  same diagnostic batch.** **One follow-up surfaced** that does
+  NOT block the dependabot rollout: `Linux gcc-13 debug` job
+  `71453384781` on the same validation run `24455027178` failed
+  mid-Test step (Build SUCCESS at step 11, Test step 12 interrupted
+  at 15m 11s wall, steps 13-26 all `null`). Different signature
+  from `71437121999` — failure point is Test, not Post Cache
+  ccache — so it is either a second WSL2 VM cycling event with a
+  shorter wall-clock, a Test-step timeout, or an actual test
+  failure. Separate diagnostic owed to Track B; do not conflate
+  with the resolved clang-19 case.
+- **2026-04-15 ~17:00 UTC** · Claude session · **Phase 0 fully clear,
+  Tier 1 unblocked. Resume Pointer refreshed.** Status check after
+  the WSL2 keep-alive + CI troubleshooting runbook commits landed.
+  Confirmed via `gh pr list --author app/dependabot --state open`
+  + `gh pr view <n> --json statusCheckRollup,mergeable,baseRefName`:
+  (1) PR #373 was merged as `bf95d3b`, which closed #375 and
+  unblocked Phase 0. (2) The `@dependabot recreate` cycle dispatched
+  by the previous session resulted in **one true recreation**
+  (#243 → **#386** — v9 dropped during the pause window so the bump
+  widened from 7→8 to 7→**9**) plus **six in-place rebases** that
+  kept their original PR numbers (#335, #248, #300, #241, #242,
+  #250). (3) **One new pip-ecosystem PR not in the original Tier
+  Table — #385** meson 1.9.2 → 1.11.0, dropped because #372 added
+  the pip ecosystem to `.github/dependabot.yml` after the table was
+  written. Slotted as Tier 0d before Tier 1 because meson governs
+  the entire build graph and is pinned in five Dockerfiles. (4) All
+  8 open PRs report `base=dev`, `mergeable=MERGEABLE`, and the
+  standard 4-success / 3-skipped PR-time CI rollup (`Proto
+  backward-compat`, `Linux gcc-13 debug`, `Windows MSVC debug`,
+  `macOS debug` SUCCESS; `Sanitizers ASan+UBSan`, `Sanitizers TSan`,
+  `Coverage GCC 13` SKIPPED). Resume Pointer wholesale-replaced —
+  the prior 156-line #375 narrative was preserved in the
+  2026-04-14 ~22:00 UTC and 2026-04-15 ~12:00 UTC entries below
+  (no information loss). Documented in this refresh: the PR-time
+  CI matrix in `.github/workflows/ci.yml` lines 91-97 deliberately
+  excludes `clang-19` and `release` build_type via `matrix.exclude`
+  on `pull_request` events as a self-hosted runner cost
+  optimization (Linux runner is single-process, 4-way matrix
+  serializes), so "PR green" does **not** mean "clang-19 green"
+  until the post-merge push run on `dev` lands. Standing caveat
+  recorded: `dev` carries an unresolved clang-19 debug regression
+  from CI run `24450261405` job `71437121999` that is independent
+  of this rollout but visible on every post-merge push run.
+  **Next action:** dispatch Tier 1 (#335 + #248) once the operator
+  decides whether to slot #385 as Tier 0d or close-and-defer it
+  until Tier 5 centralizes the meson pins.
+- **2026-04-15 ~12:00 UTC** · Claude session · **Push run Windows green
+  on `5b2996c`; PR run hit vcpkg grpc applocal flake and was rerun.**
+  The `f0b84c7` parallel-race fix is **validated** on Windows: push CI
+  run `24426124422` (Windows MSVC debug + release both on the same
+  SHA `5b2996c`) completed with `gateway eunit OK 58.58s` and
+  `gateway ct OK 78.39s` — the first fully green gateway suite pair
+  on Windows MSVC in this fix chain. Linux gcc-13/clang-19 and macOS
+  debug/release were all green on both the push and PR runs.
+  However, PR run `24426126324` on the same commit hit a **distinct,
+  unrelated** failure: vcpkg's grpc build step failed inside
+  `vcpkg_copy_tool_dependencies` invoking `applocal.ps1` against
+  `grpc_csharp_plugin.exe`, with vcpkg reporting
+  `error: building grpc:x64-windows failed with: BUILD_FAILED`
+  after a full 9.8-minute fresh grpc rebuild. This is a known
+  grpc-on-vcpkg Windows flake class and is orthogonal to any code in
+  this PR — the push run on the same SHA did not hit it because it
+  had a warm vcpkg binary cache, the PR run apparently got a cache
+  miss (push run was `cancelled` at workflow level before its cache
+  write step ran, so the PR run rebuilt from scratch and rolled the
+  dice on the flake). Job
+  `71360390333` rerun dispatched via `gh run rerun 24426126324
+  --failed`. Expected outcome: either a cache-hit short path (if the
+  push run did write some cache layer after all) or a second fresh
+  grpc build that hopefully doesn't roll the flake this time. No
+  code changes. If a second rerun also hits the vcpkg grpc flake,
+  the next escalation is to push a vcpkg binary-cache warmup commit
+  (empty `[ci skip]`-style no-op) so the cache is populated without
+  gating merge on flake-probability.
 - **2026-04-14 ~22:00 UTC** · Claude session · **Parallel-compile
   race between gateway eunit and gateway ct fixed in `f0b84c7`.**
   Push CI run `24419434652` on `fea3702` (the `6d8aa5a` pre-fetch

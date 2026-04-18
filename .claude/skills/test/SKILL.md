@@ -260,6 +260,12 @@ the `cmd` argument is never read from operator input or external state):
 ```bash
 gate_run() {
     local gate_name="$1" log_basename="$2" cmd="$3" phase="${4:-5}"
+    # Capture project root BEFORE entering the subshell. Several gates
+    # eval a `cd gateway && rebar3 ...` compound — that cd survives into
+    # the post-eval test-db-write.sh invocation, so a relative path would
+    # resolve against gateway/ and fail. The absolute path keeps the
+    # writer reachable regardless of where the gate's cmd left $PWD.
+    local project_root="$PWD"
     (
         local start=$(date +%s)
         # eval is intentional: cmd contains compound shell expressions like
@@ -271,7 +277,7 @@ gate_run() {
             local status=FAIL
         fi
         local dur=$(( $(date +%s) - start ))
-        bash scripts/test/test-db-write.sh gate \
+        bash "$project_root/scripts/test/test-db-write.sh" gate \
             --run-id "$RUN_ID" --phase "$phase" --gate "$gate_name" \
             --status "$status" --duration "$dur" --log "$log_basename"
     ) &

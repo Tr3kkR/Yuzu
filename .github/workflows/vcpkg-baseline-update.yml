@@ -91,7 +91,7 @@ jobs:
 
       - name: Create pull request
         if: steps.check.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
           branch: "deps/vcpkg-baseline-${{ steps.latest.outputs.sha }}"
