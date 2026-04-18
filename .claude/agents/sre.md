@@ -15,6 +15,8 @@ You bridge the gap between "it compiles" and "it runs in production reliably." F
 
 ## Reference Documents
 
+- `docs/observability-conventions.md` — **Load on any change that adds, removes, or modifies metrics, audit events, or lifecycle events.** Prometheus prefixes, label set, histogram buckets, audit envelope, event format.
+- `docs/data-architecture.md` — **Load when designing schemas for new features.** Response data types, audit envelope, metrics labels, inventory data conventions.
 - `docs/enterprise-readiness-soc2-first-customer.md` — Workstream D (Reliability, Availability, Operational Readiness)
 - `deploy/systemd/` — Service unit files
 - `deploy/docker/` — Container deployment
