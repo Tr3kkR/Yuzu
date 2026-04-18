@@ -1117,6 +1117,10 @@ Query audit events.
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
+| `user.upsert` | Local account created, password changed, or role changed. `result` ∈ {`success`, `denied`}. Denied detail values: `self_role_change_blocked` (403, self attempted role change), `duplicate_username` (409, attempted create on an existing name). |
+| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail value: `self_delete_blocked` (403, self attempted to delete own account). |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |
@@ -1183,6 +1187,12 @@ Create a new policy fragment from YAML.
   "status": "created"
 }
 ```
+
+**Response (400):** YAML missing required fields, oversized payload, invalid CEL compliance expression. Body is `{"error": "<reason>"}`.
+
+**Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
+
+**Response (503):** Policy store not yet initialized.
 
 ---
 
@@ -2492,7 +2502,14 @@ Render the user table fragment.
 
 **`POST /api/settings/users`**
 
-Create or update a local account, or change a user's password.
+Create a new local account, or change the caller's own password.
+
+> **Behavior change in v0.11.0:** Prior versions treated this endpoint as a
+> blanket upsert and silently overwrote existing accounts on a duplicate
+> POST. As of v0.11.0 the endpoint rejects duplicates with **409** unless
+> the request targets the caller's own row (self-password-change is still
+> permitted). To update another user's password or role, delete and re-create
+> the account.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):**
@@ -2500,10 +2517,10 @@ Create or update a local account, or change a user's password.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `username` | string | Yes | Account name. Must be non-empty. |
-| `password` | string | Yes | New password. Minimum 12 characters (enforced by `AuthManager::upsert_user`). |
+| `password` | string | Yes | New password. Minimum 12 characters. |
 | `role` | string | Yes | `admin` or `user`. |
 
-- **Response (200):** Re-rendered user table fragment with the upserted account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.upsert / success`.
+- **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.upsert / success`.
 - **Response (400):** Re-rendered fragment with an inline error script. Returned when `username` or `password` is empty.
 - **Response (403):** Returned when `username` matches the caller's own session username AND `role` differs from the caller's current role — the **self-demotion guard**. Body is the re-rendered user table fragment. Header includes:
 
@@ -2512,6 +2529,14 @@ Create or update a local account, or change a user's password.
   ```
 
   Audit event recorded as `user.upsert / denied / self_role_change_blocked`. The rejected attempt is logged at warn level. Self-password-change (same username, same role, different password) is **explicitly allowed** and returns 200.
+
+- **Response (409):** Returned when `username` already exists and the request is not a self-password-change. Body is the re-rendered user table fragment. Header includes:
+
+  ```
+  HX-Trigger: {"showToast":{"message":"Username already exists","level":"error"}}
+  ```
+
+  Audit event recorded as `user.upsert / denied / duplicate_username`.
 
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
@@ -2619,7 +2644,24 @@ Get a single instruction definition by ID.
 
 #### `POST /api/instructions`
 
-Create a new instruction definition from JSON.
+Create a new instruction definition from JSON. The `id` field is optional —
+when omitted the server generates a UUID; when supplied it is validated for
+uniqueness against existing definitions.
+
+**Permission:** `InstructionDefinition:Write`
+
+**Response (200):** `{"id": "<id>"}` for the newly-created definition.
+
+**Response (400):** Validation error (missing required field, invalid
+`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+
+**Response (409):** Returned when an explicit `id` is supplied that already
+exists in the store. Body is
+`{"error": "instruction definition '<id>' already exists"}`.
+Audit event recorded as `instruction.create / denied / duplicate_id`. To
+update the existing definition use `PUT /api/instructions/{id}`.
+
+**Response (503):** Instruction store not yet initialized.
 
 #### `PUT /api/instructions/{id}`
 

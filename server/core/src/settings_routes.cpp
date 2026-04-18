@@ -2380,6 +2380,24 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         }
 
         auto role = auth::string_to_role(role_str);
+        // #399: reject duplicate username on the create path. The underlying
+        // helper is upsert_user, which the original POST handler called
+        // unconditionally — silently overwriting existing accounts (including
+        // password reset on an admin row) with no operator confirmation.
+        // Self-rows are still allowed through so the operator can update
+        // their own password without demotion (the role-change branch below
+        // handles the lockout case separately).
+        if (username != session->username && auth_mgr_->get_user_role(username).has_value()) {
+            spdlog::warn("POST /api/settings/users: username '{}' already exists — rejected", username);
+            audit_fn_(req, "user.upsert", "denied", "User", username, "duplicate_username");
+            res.status = 409;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Username already exists","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         // Self-demotion lockout guard (governance Gate 4 ca-B1, sibling
         // of #397). The upsert path is the second equivalent route to
         // the same lockout class as the DELETE self-target case: an

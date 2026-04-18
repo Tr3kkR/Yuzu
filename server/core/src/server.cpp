@@ -16,6 +16,7 @@
 
 #include "agent.grpc.pb.h"
 #include "analytics_event.hpp"
+#include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
@@ -2904,6 +2905,11 @@ private:
             try {
                 auto j = nlohmann::json::parse(req.body);
                 InstructionDefinition def;
+                // #402 / iter-H1: honor caller-supplied `id` so the
+                // duplicate-id guard in create_definition_impl actually
+                // fires from this endpoint. Prior code dropped the id on
+                // the floor, leaving #402's protection store-only.
+                def.id = j.value("id", "");
                 def.name = j.value("name", "");
                 def.version = j.value("version", "1.0");
                 def.type = j.value("type", "");
@@ -2935,8 +2941,22 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // #402: store-level kConflictPrefix maps to HTTP 409. The
+                    // prefix is an internal store↔route contract — strip it
+                    // before placing the message in the operator-facing JSON
+                    // body (governance enterprise-N1). Emit a denied audit
+                    // event so duplicate-id probing leaves a trace
+                    // (governance compliance-1, up-18).
+                    bool is_conflict = is_conflict_error(result.error());
+                    res.status = is_conflict ? 409 : 400;
+                    if (is_conflict) {
+                        audit_log(req, "instruction.create", "denied",
+                                  "instruction", def.id, "duplicate_id");
+                    }
+                    auto body_msg = is_conflict
+                        ? std::string(strip_conflict_prefix(result.error()))
+                        : result.error();
+                    res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                     "application/json");
                     return;
                 }
@@ -3109,8 +3129,22 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // iter-H2: /import shares the create_definition_impl path,
+                // so it inherits the kConflictPrefix → 409 mapping that the
+                // POST handler does. Without this mapping the import path
+                // returns 400 with the raw "conflict:" prefix in the body
+                // — defeats the prefix-stripping contract on the very
+                // endpoint that exercises duplicate-id rejection most.
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                if (is_conflict) {
+                    audit_log(req, "instruction.import", "denied",
+                              "instruction", "", "duplicate_id");
+                }
+                auto body_msg = is_conflict
+                    ? std::string(strip_conflict_prefix(result.error()))
+                    : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                 "application/json");
                 return;
             }

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`POST /api/settings/users` returns 409 on duplicate username (#399).**
+  Previously the endpoint silently overwrote an existing account via
+  `AuthManager::upsert_user` — a privilege-escalation primitive in the
+  hands of any authenticated admin attacker. The endpoint now rejects
+  duplicates with HTTP 409, an `HX-Trigger` toast (`"Username already
+  exists"`), and a denied audit event
+  (`user.upsert / denied / duplicate_username`). Self-password-change
+  (same username, same role) is still allowed.
+- **`POST /api/instructions` returns 409 on duplicate explicit `id`
+  (#402).** Previously returned a generic 400 (`"insert failed"`); the
+  store now pre-checks under the existing write lock and surfaces a
+  structured 409 (`{"error":"instruction definition '<id>' already
+  exists"}`) plus a denied audit event
+  (`instruction.create / denied / duplicate_id`). Empty `id` paths still
+  generate a UUID with no duplicate-check overhead.
+- **`POST /api/policy-fragments` returns 409 on duplicate fragment name
+  (#396).** Previously silently inserted a duplicate row; the store now
+  rejects with HTTP 409 (`{"error":"policy fragment named '<name>'
+  already exists"}`) plus a denied audit event
+  (`policy_fragment.create / denied / duplicate_name`).
+
+### Tests
+
+- Added `tests/unit/server/test_store_errors.cpp` exercising the shared
+  `kConflictPrefix` constant and `is_conflict_error` /
+  `strip_conflict_prefix` helpers introduced for the route↔store conflict
+  contract (governance Gate 3 arch-B1).
+- Added duplicate-detection cases to `test_settings_routes_users.cpp`,
+  `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
+  pre-existing "duplicate ID" policy-store test was tightened to assert
+  the new `kConflictPrefix` semantics.
+
 ## [0.11.0] - 2026-04-17
 
 _Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
