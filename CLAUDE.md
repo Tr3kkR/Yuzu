@@ -36,80 +36,17 @@ Yuzu Server
     └── Metrics — Prometheus-compatible, per-plugin counters
 ```
 
-## Agent Team
+## Agent Team & Governance
 
-Yuzu uses specialized Claude Code agents for enterprise-quality development.
-Agents live in `.claude/agents/` and are invoked by name.
+Specialized agents live in `.claude/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.claude/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
 
-| Agent | Role | Primary Concern |
-|-------|------|-----------------|
-| architect | System Architect | Module boundaries, proto compat, ABI stability |
-| security-guardian | Security Engineer | Auth enforcement, crypto, input validation, audit |
-| happy-path | Happy Path Reviewer | Normal-condition correctness, logic completeness |
-| unhappy-path | Unhappy Path Reviewer | Failure-mode interrogation, risk register feeding chaos-injector |
-| consistency-auditor | Consistency Auditor | Cross-component state/schema/contract consistency |
-| chaos-injector | Chaos Injector | Controlled failure scenario generation from identified risks |
-| quality-engineer | QA & Test Engineer | Test coverage, fuzz targets, coverage thresholds |
-| cross-platform | Platform Compatibility | Win/Linux/macOS/ARM64 builds, OS-specific code |
-| docs-writer | Technical Writer | User manual, YAML defs, API docs, roadmap |
-| build-ci | Build & CI/CD | Meson, vcpkg, GitHub Actions, proto codegen |
-| performance | Performance Engineer | SQLite optimization, load testing, gateway scaling |
-| erlang-dev | Erlang Developer | Erlang idioms, process lifecycle, EXIT signals, EUnit isolation |
-| gateway-erlang | Erlang/OTP Specialist | Gateway supervision, rebar3, EUnit/CT |
-| plugin-developer | Plugin Dev & SDK | New plugins, ABI guard, InstructionDefinition YAML |
-| release-deploy | Release & Deployment | Docker, systemd, installers, release workflow |
-| dsl-engineer | DSL & Expression Language | Scope DSL, CEL, parameter interpolation, trigger expressions, workflow primitives |
-| compliance-officer | Compliance Officer | SOC 2 control alignment, evidence generation, change traceability, audit readiness |
-| sre | Site Reliability Engineer | SLOs, observability, backup/recovery, capacity planning, hardened deployment |
-| enterprise-readiness | Enterprise Readiness | Customer assurance package, security questionnaires, deployment experience, pilot readiness |
+Pipeline (8 gates, convention-enforced — no git hook): Change Summary → security-guardian + docs-writer mandatory deep-dive → domain-triggered review → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate.
 
-**Workflow:** architect first (design) → feature agents (implement) → erlang-dev (review Erlang code) → cross-platform (compile) → security-guardian (review) → happy-path + unhappy-path + consistency-auditor (parallel analysis) → chaos-injector (failure scenarios) → quality-engineer (test) → docs-writer (document) → compliance-officer + sre + enterprise-readiness (parallel operational review) → build-ci (CI green) → performance (if data-plane) → release-deploy (if packaging).
-
-**DSL touchpoints:** dsl-engineer is invoked as a feature agent for scope targeting, policy conditions (CEL), trigger template expressions, parameter binding, workflow primitives, and any YAML DSL spec evolution.
-
-**Correctness & resilience touchpoints:** happy-path, unhappy-path, and consistency-auditor are invoked for all changes during full governance. consistency-auditor is additionally invoked when changes touch protobuf schemas, database schemas, API contracts, or cross-component state. chaos-injector runs after all three complete, synthesizing risks into executable failure scenarios. Gate 5 (chaos analysis) is skipped if neither unhappy-path nor consistency-auditor produce findings. Gate 4 agents run in parallel — this is a deliberate speed/completeness tradeoff; compound findings that span failure-mode and consistency domains are synthesized by chaos-injector in gate 5. The governance orchestrator should pass prior gate findings as context to gate 4 agents to avoid duplicated effort.
-
-### Governance
-
-**Better process makes better products.** Every code change follows mandatory governance gates — no shortcuts, no exceptions:
-
-1. **Change Summary** — the producing agent writes a structured summary (files, what, why, interfaces affected, security surface, user-facing impact) shared with ALL agents.
-2. **Mandatory deep-dive** — security-guardian and docs-writer read every modified file for every change. Security reviews block on CRITICAL/HIGH findings. Documentation blocks if user-facing changes lack doc updates.
-3. **Domain-triggered review** — architect, quality-engineer, cross-platform, performance, build-ci, dsl-engineer, erlang-dev, gateway-erlang, plugin-developer, and release-deploy review when changes touch their domain.
-4. **Correctness & resilience analysis** — happy-path, unhappy-path, and consistency-auditor run in parallel. happy-path validates normal-condition correctness. unhappy-path performs systematic failure-mode interrogation and produces a risk register. consistency-auditor checks cross-component state/schema/contract consistency. All three are mandatory during full governance; consistency-auditor also triggers on schema evolution and protocol changes.
-5. **Chaos analysis** — chaos-injector ingests outputs from unhappy-path and consistency-auditor (plus happy-path correctness baseline as optional context) to generate controlled failure scenarios with success criteria and rollback procedures. Runs only after gate 4 completes. Skipped if neither unhappy-path nor consistency-auditor produce findings.
-6. **Operational & compliance review** — compliance-officer, sre, and enterprise-readiness run in parallel. compliance-officer verifies SOC 2 control alignment and evidence chain. sre reviews observability, deployment hardening, and recovery posture. enterprise-readiness verifies customer-facing documentation and assurance package consistency. All three are mandatory during full governance.
-7. **All findings addressed** before merge — CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed.
-8. **Iterate** — re-review after fixes until the team gives a clean bill. No commit until governance passes.
-
-**Known limitation:** The governance pipeline is convention-enforced, not automated. There are no git hooks or CI checks that verify gate completion. Discipline and peer review are the enforcement mechanism. Future improvement: add governance attestation artifacts or PR checklist requirements.
-
-**Lesson learned:** Waves 1-4 shipped without governance and accumulated 4 CRITICAL command injection vulnerabilities, untested stores, stale docs, and performance bottlenecks. These were caught before production but should have been caught before commit.
+**Better process makes better products.** Waves 1–4 shipped without governance and accumulated 4 CRITICAL command-injection vulnerabilities, untested stores, stale docs, and performance bottlenecks — all caught before production but they should have been caught before commit. Use `/governance <range>` rather than hand-running.
 
 ## Darwin Compatibility
 
-This Claude instance is the designated **macOS/Darwin compatibility guardian** for Yuzu. When Windows-originated changes land on `origin/dev`, the standing workflow is:
-
-1. `git fetch origin && git status` — confirm branch state.
-2. `git pull` — fast-forward to latest dev.
-3. `git diff HEAD~N..HEAD --stat` — review what changed.
-4. Identify which previous Darwin fixes are still present in the new tree.
-5. `meson setup build-macos --reconfigure ...` if `meson.build` changed.
-6. `meson compile -C build-macos` — fix any new compile errors.
-7. `bash scripts/run-tests.sh all` — fix any new test failures.
-8. Commit clean with a Darwin-fix commit message.
-
-### Standing Darwin pitfalls
-
-| Area | Issue |
-|---|---|
-| Path comparisons | macOS `/var` → `/private/var` symlink: always call `fs::canonical()` on both sides before comparing paths in tests. |
-| SQLite concurrency | All stores must open with `sqlite3_open_v2()` using `SQLITE_OPEN_READWRITE \| SQLITE_OPEN_CREATE \| SQLITE_OPEN_FULLMUTEX` flags — never plain `sqlite3_open()`. Application-level mutexes (`shared_mutex`) are retained as defense-in-depth and are **required** (not optional) for stores with cached prepared statements, because FULLMUTEX does not make bind-step-reset sequences atomic. |
-| Erlang rebar3 ct | Always pass `--dir apps/yuzu_gw/test` together with `--suite` flags. |
-| `curl -f` in tests | Do **not** use `-f` where 4xx is an acceptable response — it causes `|| echo "000"` fallbacks to contaminate the status code variable. |
-| `prometheus_httpd` | Use `start/0` with `application:set_env(prometheus, prometheus_http, [{port, P}, {path, "/metrics"}])` — `start/1` does not exist. Call `application:ensure_all_started(prometheus_httpd)` first so `prometheus_http_impl:setup/0` runs before the first scrape. |
-
-After any cross-platform change, always run `bash scripts/run-tests.sh all` on Darwin before committing.
+This Claude instance is the designated **macOS/Darwin compatibility guardian**. The `cross-platform` agent loads `docs/darwin-compat.md` on any change that may affect macOS — that doc holds the standing reconciliation workflow (fetch → pull → diff → reconfigure → compile → `bash scripts/run-tests.sh all` → commit) and the standing pitfalls table (`/var` symlink, SQLite mutex, `rebar3 ct --dir`, `curl -f`, `prometheus_httpd`).
 
 ## Erlang Gateway Build & Quality
 
@@ -224,13 +161,7 @@ The dispatch flow in `agent_registry.cpp` `send_to()`:
 - Agent has a `gateway_node` but no local stream → queue to `gw_pending_` for gateway forwarding
 - `forward_gateway_pending()` drains the queue via `gw_mgmt_stub_->SendCommand()`
 
-### Gateway config (`gateway/config/sys.config`)
-
-The gateway uses its own port range (5006x) to avoid conflicts with the server (5005x). Both the `yuzu_gw` app config AND the `grpcbox` `listen_opts` must match (they're configured independently).
-
-### Credential generation
-
-The script generates a fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed credentials on each run (`admin` / `adminpassword1`). All UAT state lives under `/tmp/yuzu-uat/` and is wiped on each start.
+The gateway uses port range 5006x (vs server's 5005x); `gateway/config/sys.config` and `grpcbox` `listen_opts` are configured independently and must match. UAT credentials: fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed `admin` / `adminpassword1` per run; state lives under `/tmp/yuzu-uat/` and is wiped on each start.
 
 ### Known bug: stale DB breaks session auth on restart
 
@@ -376,32 +307,19 @@ The symlinks are created automatically at the end of `scripts/setup.sh`. If you 
 Every `dependency()` in `meson.build` and subdirectory files is marked `include_type: 'system'` so vcpkg / gRPC / abseil / protobuf / Catch2 deprecation warnings are treated as `-isystem` and silenced. Our own code is still under `warning_level=3`. **Do not remove `include_type: 'system'`** when adding new dependencies — it's load-bearing for build-log readability.
 
 ## Project layout
+
 ```
-agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
-agents/plugins/           44 plugins (hardware, network, security, filesystem, etc.)
-server/core/              Server daemon (sessions, auth, dashboard, REST API, policy engine)
-gateway/                  Erlang/OTP gateway node (standalone rebar3 project, see docs/erlang-gateway-blueprint.md)
-sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
-proto/                    Protobuf definitions (source of truth for wire protocol)
-  yuzu/agent/v1/          AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
-  yuzu/common/v1/         Shared types: Platform, Timestamp, ErrorDetail
-  yuzu/server/v1/         ManagementService API
-  yuzu/gateway/v1/        GatewayUpstream — server-side RPCs the Erlang gateway calls into
-  gen_proto.py            Codegen script (invoked by meson.build)
-docs/                     Architecture docs, roadmap, capability map
-meson/cross/              Cross-compilation files (aarch64, armv7)
-meson/native/             Native files for CI compilers (gcc-13, clang-18, etc.)
-scripts/setup.sh          vcpkg install + meson setup convenience wrapper
-tests/unit/               Catch2 unit tests
+agents/core/      Agent daemon (gRPC client, plugin loader, trigger engine)
+agents/plugins/   44 plugins
+server/core/      Server daemon (sessions, auth, dashboard, REST API, policy engine)
+gateway/          Erlang/OTP gateway (standalone rebar3 project)
+sdk/              Public SDK — stable C ABI (plugin.h) + C++23 wrapper
+proto/            Protobuf definitions (source of truth for wire protocol)
+tests/unit/       Catch2 unit tests
+docs/             Architecture docs, conventions, roadmap, capability map
 ```
 
-## Protobuf / gRPC code generation
-`proto/meson.build` uses a `custom_target` that invokes `proto/gen_proto.py`. The script:
-1. Runs `protoc` with `--cpp_out` and `--grpc_out` for each `.proto` file.
-2. Rewrites `#include` paths to flatten subdirectory prefixes (so generated headers can be included as `"common.pb.h"` rather than `"yuzu/common/v1/common.pb.h"`).
-3. Moves all generated files to a flat output directory.
-
-The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
+`proto/meson.build` invokes `proto/gen_proto.py` which runs `protoc` and rewrites `#include` paths to flatten subdirectory prefixes — generated headers ship as `"common.pb.h"` rather than `"yuzu/common/v1/common.pb.h"`. Result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`. The `build-ci` agent owns this codegen flow.
 
 ## vcpkg
 - Manifest: `vcpkg.json`. Pinned baseline: `4b77da7fed37817f124936239197833469f1b9a8` (matches `vcpkgGitCommitId` in CI).
@@ -412,7 +330,7 @@ The result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep`.
 
 ## CI matrix
 
-Defined in `.github/workflows/ci.yml` — four jobs: linux (ubuntu-24.04, GCC 13 + Clang 18), windows (windows-2022, MSVC VS 17), macos (macos-14 Apple Silicon, Apple Clang), arm64-cross (ubuntu-24.04, aarch64-linux-gnu gcc, tests skipped). vcpkg binary cache is `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash.
+`.github/workflows/ci.yml` — four jobs: linux (ubuntu-24.04, GCC 13 + Clang 18), windows (windows-2022, MSVC VS 17), macos (macos-14 Apple Silicon, Apple Clang), arm64-cross (ubuntu-24.04, aarch64-linux-gnu gcc, tests skipped). vcpkg binary cache is `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash. The `build-ci` agent owns this matrix.
 
 ## Release workflow gates
 
@@ -425,33 +343,6 @@ bash scripts/check-compose-versions.sh 0.10.0
 ```
 
 The release job will otherwise fail after all build matrix jobs have run, wasting ~30–60 min of runner time without publishing anything. When adding a new compose file to the repo, also add it to the `FILES` array at the top of `scripts/check-compose-versions.sh` — auto-discovery is deliberately off so opt-in is explicit.
-
-## Documentation requirements
-
-All new features must be documented for human usability. **After writing or modifying code, the user manual section covering that feature must be updated to reflect the current user experience.** Documentation lives in `docs/user-manual/` and is the primary reference for operators.
-
-- **User manual updates** — after implementing or changing a feature, update the relevant `docs/user-manual/*.md` file to match the current behavior. If the feature spans a new area, create a new manual section and add it to `docs/user-manual/README.md`.
-- **YAML instruction definitions** — every new plugin must have corresponding `InstructionDefinition` YAML files in `content/definitions/` following the `yuzu.io/v1alpha1` DSL spec (`docs/yaml-dsl-spec.md`).
-- **Substrate primitive registration** — new plugin actions must be added to the Substrate Primitive Reference table in `docs/yaml-dsl-spec.md` (section 14).
-- **REST API documentation** — new or changed REST API endpoints must be reflected in `docs/user-manual/rest-api.md` with method, path, permissions, request/response examples.
-- **CLAUDE.md updates** — architectural decisions, new stores, new plugin patterns, and cross-cutting concerns should be reflected here so future Claude sessions understand the system.
-
-## Coding conventions
-- **C++ standard**: C++23 throughout. Use `std::expected<T, E>` for errors, `std::span`, `std::string_view`, `std::format`.
-- **Namespaces**: `yuzu::`, `yuzu::agent::`, `yuzu::server::`.
-- **Naming**: PascalCase classes, snake_case variables/functions, `k`-prefix constants, trailing `_` for private members.
-- **Headers**: `#pragma once` only. Include order: STL → third-party → project.
-- **Plugin ABI**: C API in `sdk/include/yuzu/plugin.h` must stay stable. C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary.
-- **Entry points**: Both agent and server use CLI11 for args, spdlog for logging, and a `Factory::create(config)->run()` pattern with SIGINT/SIGTERM handlers.
-- **Visibility**: `-fvisibility=hidden` is set globally; use `YUZU_EXPORT` to expose symbols intentionally.
-
-## Observability conventions
-- **Prometheus metrics**: All metrics use `yuzu_` prefix. Server: `yuzu_server_*`. Agent: `yuzu_agent_*`.
-- **Labels**: Consistent label set — `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.
-- **Histograms**: Default buckets: 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0.
-- **Response schemas**: All instruction response data must be typed (bool, int32, int64, string, datetime) for downstream consumption by ClickHouse, Splunk, or other analytics.
-- **Audit events**: Structured JSON with `timestamp`, `principal`, `action`, `target`, `detail`. Suitable for Splunk HEC or webhook delivery.
-- **Event format**: All events (lifecycle, compliance, audit) follow a common envelope: `{event_type, timestamp, source, payload}` for consistent downstream parsing.
 
 ## Build system — Meson only
 
@@ -467,38 +358,18 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 ```
 Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
 
-## Authentication & Authorization
+## Routed concerns (read the doc, not this file)
 
-Hard invariants and full feature history live in `docs/auth-architecture.md` — sections **HTTPS and bind defaults (hard invariants)**, **HTTP security response headers (SOC2-C1)**, and **API tokens and automation** are the load-bearing rules (mTLS mandatory, HTTPS default, 127.0.0.1 bind, metrics localhost-only, private-key perms gate, JSON error envelope, `HeaderBundle::make()`/`apply()` as the only header construction path, owner-scoped token revocation per #222). The `security-guardian` agent loads this doc on any auth/RBAC/crypto/header/token change — route reviews through it instead of hand-checking from CLAUDE.md.
+| Concern | Doc | Loaded by |
+|---|---|---|
+| Authentication, RBAC, headers, tokens, self-target principal-destruction guard (#397/#403) | `docs/auth-architecture.md` | `security-guardian` on auth/RBAC/crypto/header/token change |
+| MCP server architecture, tier-before-RBAC ordering, kill switches, audit pattern | `docs/mcp-server.md` | `security-guardian` on `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, `mcp_policy.hpp` change |
+| C++23 conventions, naming, headers, plugin ABI boundary | `docs/cpp-conventions.md` | `cpp-expert` on any C++ source change |
+| macOS workflow + Darwin pitfalls table | `docs/darwin-compat.md` | `cross-platform` on any macOS-affecting change |
+| Prometheus metrics, label set, audit envelope, event format | `docs/observability-conventions.md` | `sre` and `architect` on any metrics/audit/event change |
+| Response data types, audit envelope, inventory data for analytics | `docs/data-architecture.md` | `architect` and `sre` when designing schemas |
+| User manual / YAML defs / REST API / Substrate primitive registration | docs-writer agent (`.claude/agents/docs-writer.md`) | docs-writer on every change as part of governance gate 2 |
 
-**Self-target principal-destruction guard (hard invariant, #397/#403/ca-B1).** Any handler that destroys, demotes, or otherwise revokes a principal's privileges MUST reject the case where the URL/form target equals the caller's `session->username` (or differs from `session->role` for upserts that demote). UI suppression alone is insufficient — a hand-crafted HTTP request bypasses the dashboard. Two routes are load-bearing today: `DELETE /api/settings/users/:name` (self-delete) and `POST /api/settings/users` (self-demote via role change). Pattern requirements: (1) compare against `session->username` byte-exact, fail closed when `session->username.empty()`; (2) emit `audit_fn_(req, "<noun>.<verb>", "denied", "User", target, "<reason>_blocked")` on the rejection branch — `spdlog::warn` alone breaks the SOC 2 CC7.2 evidence chain; (3) corresponding fragment renderers must accept the session username and suppress destructive controls on the matching row (see `render_users_fragment(const std::string& current_username)` — no default arg, every caller must pass explicitly so a future caller forgetting it is a compile error rather than a silent UI regression). When the third such handler ships, lift the comparison logic into a helper.
+## CLAUDE.md updates
 
-## MCP (Model Context Protocol) Server
-
-Architecture, tier-before-RBAC ordering, kill switches (`--mcp-disable`, `--mcp-read-only`), audit pattern (`action="mcp.<tool_name>"` + `mcp_tool` field), and the JObj/JArr output rule live in `docs/mcp-server.md` — sections **Architecture** and **Security Model**. The `security-guardian` agent loads this doc on any change to `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, or `mcp_policy.hpp`.
-
-## Data architecture for analytics integration
-
-When building new features, design data schemas with downstream analytics in mind:
-
-### Response data
-- Every instruction definition declares a typed schema (column name + type)
-- Types: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`
-- This makes it trivial to create ClickHouse tables or Splunk sourcetypes
-- Large text fields use `clob` type with configurable truncation
-
-### Audit events
-- Structured as `{timestamp, principal, action, target_type, target_id, detail}`
-- Can be forwarded to Splunk HEC or external webhook
-- Indexed by timestamp and principal for efficient querying
-
-### Metrics
-- Prometheus exposition format on `/metrics`
-- Labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`
-- Grafana dashboard templates in `docs/grafana/`
-- ClickHouse can ingest via `prometheus_remote_write` or by scraping
-
-### Inventory data
-- Per-plugin structured blobs stored server-side
-- Queryable via REST API with filter expressions
-- Schema is self-describing (plugin reports its schema)
+Architectural decisions, new stores, new plugin patterns, churning subsystems, and cross-cutting concerns belong here so future Claude sessions read them before touching code. Stable reference material that an agent already loads belongs in `docs/` with a one-line pointer here. See memory `feedback_claude_md_scope.md` for the heuristic — Build / Release / Erlang stay resident because the work is unstable or foreign; mature areas can be split out.
