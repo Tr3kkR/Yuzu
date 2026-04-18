@@ -1,0 +1,63 @@
+name: Zizmor GitHub Actions static analysis
+
+# Zizmor (https://docs.zizmor.sh) is a static analyzer for GitHub Actions
+# workflow YAML. It catches template-injection (`${{ github.event.* }}`
+# interpolated into shell), over-privileged GITHUB_TOKEN grants, mutable
+# action tag references that bypass SHA-pinning, artifact-exfil patterns,
+# dangerous triggers (`pull_request_target` without ref discipline), etc.
+#
+# Triggered on workflow-touching PRs + pushes to main + weekly + manual.
+# Findings are uploaded as SARIF to the GitHub Security tab (category
+# `zizmor`) so they live alongside CodeQL and Scorecard findings.
+#
+# References:
+#   - https://github.com/zizmorcore/zizmor
+#   - https://github.com/zizmorcore/zizmor-action
+#   - LLVM reference: https://github.com/llvm/llvm-project/blob/main/.github/workflows/zizmor.yml
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/workflows/zizmor.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/workflows/zizmor.yml'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Zizmor workflow audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@v0.2.0
+        with:
+          # Audit everything under .github/workflows/ and reusable
+          # composite actions. The action uploads SARIF itself.
+          inputs: ./.github

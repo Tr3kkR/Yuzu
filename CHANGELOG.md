@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenSSF Scorecard + Zizmor workflows (#407).** Added
+  `.github/workflows/scorecard.yml` (weekly + push to main +
+  `branch_protection_rule`; publishes to scorecard.dev + SARIF to the
+  GitHub Security tab) and `.github/workflows/zizmor.yml` (static
+  analyzer for `.github/workflows/*.yml`, runs on workflow-touching PRs
+  + weekly). README now advertises the Scorecard and Zizmor badges; the
+  OpenSSF Best Practices Badge slot is wired up pending manual
+  application at bestpractices.dev. Triaging Scorecard findings into
+  follow-up issues is the remaining work on #407.
+- **README `Install`, `Contributing`, `Reporting Issues` sections
+  (#407).** Addresses the OpenSSF Best Practices `[interact]` criterion
+  — README now points prebuilt-binary users at GitHub Releases +
+  `ghcr.io/tr3kkr/yuzu-{server,gateway,agent}` + `deploy/docker/docker-compose.yml`
+  instead of only documenting the from-source build. Adds explicit
+  links to `CONTRIBUTING.md`, `CLAUDE.md`, the bug-report and
+  feature-request issue templates, `SECURITY.md` (private vulnerability
+  reporting), and GitHub Discussions.
+
 ### Fixed
 
 - **`/api/health` reports the actual server version instead of the
