@@ -6,6 +6,7 @@
  */
 
 #include "instruction_store.hpp"
+#include "store_errors.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -471,4 +472,44 @@ TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][ext
     REQUIRE(fetched.has_value());
     CHECK(fetched->created_at > 0);
     CHECK(fetched->updated_at > 0);
+}
+
+// ── Duplicate-id guard (#402) ──────────────────────────────────────────────
+
+TEST_CASE("InstructionStore: explicit duplicate id rejected with conflict prefix",
+          "[instruction_store][duplicate]") {
+    InstructionStore store(":memory:");
+
+    auto first = make_question("First", "1.0");
+    first.id = "test.os.info";
+    auto first_result = store.create_definition(first);
+    REQUIRE(first_result.has_value());
+    CHECK(*first_result == "test.os.info");
+
+    // Re-using the same explicit id must surface as "conflict:" so the route
+    // layer can map it to HTTP 409 instead of the generic 400.
+    auto second = make_question("Second", "1.0");
+    second.id = "test.os.info";
+    auto second_result = store.create_definition(second);
+    REQUIRE_FALSE(second_result.has_value());
+    CHECK(is_conflict_error(second_result.error()));
+
+    // First definition is unchanged — no silent overwrite.
+    auto fetched = store.get_definition("test.os.info");
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->name == "First");
+}
+
+TEST_CASE("InstructionStore: empty id still gets generated UUID with no conflict",
+          "[instruction_store][duplicate]") {
+    InstructionStore store(":memory:");
+
+    auto a = make_question("Alpha");
+    auto b = make_question("Bravo");
+    // Both with empty def.id — store generates UUIDs, no duplicate-id path.
+    auto ra = store.create_definition(a);
+    auto rb = store.create_definition(b);
+    REQUIRE(ra.has_value());
+    REQUIRE(rb.has_value());
+    CHECK(*ra != *rb);
 }

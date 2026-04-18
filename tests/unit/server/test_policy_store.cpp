@@ -6,6 +6,7 @@
  */
 
 #include "policy_store.hpp"
+#include "store_errors.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -173,10 +174,13 @@ TEST_CASE("PolicyStore: create fragment with duplicate ID", "[policy_store][frag
     REQUIRE(r1.has_value());
     CHECK(r1.value() == "frag-full-001");
 
-    // Attempt duplicate
+    // Attempt duplicate — fragment has both duplicate id and duplicate
+    // displayName. The #396 name guard fires first (and is more informative
+    // than the SQLite PK constraint message), so the error carries the
+    // "conflict:" prefix routes use to map to HTTP 409.
     auto r2 = store.create_fragment(kFullFragment);
     REQUIRE(!r2.has_value());
-    CHECK(r2.error().find("failed to create fragment") != std::string::npos);
+    CHECK(is_conflict_error(r2.error()));
 }
 
 TEST_CASE("PolicyStore: create fragment with empty YAML", "[policy_store][fragment]") {
@@ -771,4 +775,29 @@ TEST_CASE("PolicyStore: get nonexistent agent status returns nullopt",
           "[policy_store][compliance]") {
     PolicyStore store(":memory:");
     CHECK(store.get_agent_status("pol", "agent") == std::nullopt);
+}
+
+// ── Duplicate-name guard (#396) ──────────────────────────────────────────
+
+TEST_CASE("PolicyStore: duplicate fragment name rejected with conflict prefix",
+          "[policy_store][fragment][duplicate]") {
+    PolicyStore store(":memory:");
+
+    // First create succeeds.
+    auto first = store.create_fragment(kCheckOnlyNoFix);
+    REQUIRE(first.has_value());
+
+    // Same YAML again (same displayName -> same name) must surface as
+    // "conflict:" so the route layer can return HTTP 409 instead of 400.
+    auto second = store.create_fragment(kCheckOnlyNoFix);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(is_conflict_error(second.error()));
+
+    // First fragment is intact — no silent duplicate row.
+    auto fragments = store.query_fragments({});
+    int matches = 0;
+    for (const auto& f : fragments)
+        if (f.name == "Check Only Fragment")
+            ++matches;
+    CHECK(matches == 1);
 }
