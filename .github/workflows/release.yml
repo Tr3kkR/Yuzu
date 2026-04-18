@@ -910,7 +910,12 @@ jobs:
       - name: Validate docker-compose image versions
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/check-compose-versions.sh "$VERSION"
+          # Compose ${YUZU_VERSION:-X.Y.Z} defaults track the stable base
+          # version, not rc/beta/alpha suffixes — same convention used by
+          # the Extract changelog step below. v0.11.0-rc1 cut (2026-04-18)
+          # hit this after all 6 build jobs had already completed.
+          BASE_VERSION="${VERSION%%-*}"
+          bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
