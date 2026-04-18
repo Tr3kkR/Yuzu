@@ -7,6 +7,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/version.hpp>
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
 #include "web_utils.hpp"
@@ -1526,7 +1527,10 @@ private:
                  {{"in_flight", in_flight},
                   {"completed_last_hour", completed_last_hour},
                   {"failed_last_hour", failed_last_hour}}},
-                {"version", "0.1.0"}};
+                // #401: was hardcoded "0.1.0" — now derived from the
+                // meson-generated yuzu/version.hpp so the health endpoint
+                // tracks the actual build instead of a stale literal.
+                {"version", std::string(yuzu::kVersionString)}};
 
             // Process health (22.1) — only include for authenticated requests
             // to avoid leaking process internals to unauthenticated callers.

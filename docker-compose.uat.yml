@@ -202,6 +202,8 @@ services:
       - "8080"
       - "--config"
       - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
       - "--gateway-upstream"
       - "0.0.0.0:50055"
       - "--gateway-mode"

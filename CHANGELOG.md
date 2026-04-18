@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/api/health` reports the actual server version instead of the
+  hardcoded "0.1.0" (#401).** The endpoint now derives the version
+  string from the meson-generated `yuzu/version.hpp` constant
+  `kVersionString`, so health probes track the running build (currently
+  `0.11.0`) rather than a stale literal that survived the v0.10.x cycle.
+- **`docker-compose.uat.yml` now passes `--data-dir /var/lib/yuzu` to
+  the server (#389).** Without the flag, all SQLite stores fell back to
+  the working directory (`/etc/yuzu`) instead of the persistent volume
+  mount — agent registrations, audit log, and tokens were lost on
+  container restart. The other compose files (`docker-compose.local.yml`,
+  `deploy/docker/docker-compose.full-uat.yml`) already passed the flag;
+  the UAT file was the outlier.
 - **`POST /api/settings/users` returns 409 on duplicate username (#399).**
   Previously the endpoint silently overwrote an existing account via
   `AuthManager::upsert_user` — a privilege-escalation primitive in the
