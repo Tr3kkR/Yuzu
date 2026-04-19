@@ -19,7 +19,8 @@ concurrency:
 permissions:
   contents: write
   packages: write
-  id-token: write  # Required for cosign keyless signing
+  id-token: write       # Required for cosign keyless signing + Sigstore OIDC
+  attestations: write   # Required for actions/attest-build-provenance
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -146,6 +147,43 @@ jobs:
           bash deploy/packaging/rpm/build-rpm.sh \
             --bin-dir builddir --version "$RPM_VERSION" $PRE_FLAG --output .
 
+      # ── SBOM (CycloneDX + SPDX) ─────────────────────────────────────
+      # Syft scans the workspace and emits one SBOM covering:
+      #   - vcpkg C++ dependencies (via vcpkg.spdx.json files under
+      #     vcpkg_installed/x64-linux-static/share/<pkg>/)
+      #   - Built ELF binaries under builddir/ (server, agent, plugins)
+      # Output two formats because customer questionnaires ask for one
+      # or the other inconsistently and both are trivial to emit.
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-linux-x64.cdx.json
+          artifact-name: yuzu-linux-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-linux-x64.spdx.json
+          artifact-name: yuzu-linux-x64.spdx.json
+          upload-artifact: false
+
+      # ── SLSA build provenance ───────────────────────────────────────
+      # Records that these specific artifacts came from this specific
+      # workflow run. Stored in GitHub's attestation registry; verified
+      # customer-side with `gh attestation verify <file>`.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            yuzu-linux-x64.tar.gz
+            *.deb
+            *.rpm
+
       - name: Upload archive artifact
         uses: actions/upload-artifact@v7
         continue-on-error: true
@@ -168,6 +206,16 @@ jobs:
         with:
           name: yuzu-linux-rpm
           path: "*.rpm"
+          retention-days: 3
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: yuzu-linux-x64-sbom
+          path: |
+            yuzu-linux-x64.cdx.json
+            yuzu-linux-x64.spdx.json
           retention-days: 3
 
   # ── Linux ARM64 release build — SUSPENDED ────────────────────────────
@@ -271,6 +319,36 @@ jobs:
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$RPM_VERSION" $PRE_FLAG --output .
 
+      # ── Gateway SBOM (CycloneDX + SPDX) ─────────────────────────────
+      # Syft reads gateway/rebar.lock for Erlang/OTP dependencies and
+      # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
+      # runtime bundled into the release.
+      - name: Generate gateway SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: gateway
+          format: cyclonedx-json
+          output-file: yuzu-gateway-linux-x64.cdx.json
+          artifact-name: yuzu-gateway-linux-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate gateway SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: gateway
+          format: spdx-json
+          output-file: yuzu-gateway-linux-x64.spdx.json
+          artifact-name: yuzu-gateway-linux-x64.spdx.json
+          upload-artifact: false
+
+      - name: Attest gateway provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            yuzu-gateway-linux-x64.tar.gz
+            *.deb
+            *.rpm
+
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v7
         continue-on-error: true
@@ -293,6 +371,16 @@ jobs:
         with:
           name: yuzu-gateway-rpm
           path: "*.rpm"
+          retention-days: 3
+
+      - name: Upload gateway SBOM artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: yuzu-gateway-linux-x64-sbom
+          path: |
+            yuzu-gateway-linux-x64.cdx.json
+            yuzu-gateway-linux-x64.spdx.json
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
@@ -535,6 +623,36 @@ jobs:
 
           Remove-Item $certPath -Force
 
+      # ── Windows SBOM (CycloneDX + SPDX) ─────────────────────────────
+      # Scans vcpkg_installed/x64-windows (C++ deps) + builddir (PE
+      # binaries). Syft supports PowerShell/Windows runners via the
+      # composite action, which downloads a Windows syft binary.
+      - name: Generate Windows SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-windows-x64.cdx.json
+          artifact-name: yuzu-windows-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate Windows SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-windows-x64.spdx.json
+          artifact-name: yuzu-windows-x64.spdx.json
+          upload-artifact: false
+
+      - name: Attest Windows provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            yuzu-windows-x64.zip
+            YuzuAgentSetup-*.exe
+            YuzuServerSetup-*.exe
+
       - name: Upload archive artifact
         uses: actions/upload-artifact@v7
         continue-on-error: true
@@ -551,6 +669,16 @@ jobs:
           path: |
             YuzuAgentSetup-*.exe
             YuzuServerSetup-*.exe
+          retention-days: 3
+
+      - name: Upload Windows SBOM artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: yuzu-windows-x64-sbom
+          path: |
+            yuzu-windows-x64.cdx.json
+            yuzu-windows-x64.spdx.json
           retention-days: 3
 
   # ── macOS ARM64 release build ────────────────────────────────────────
@@ -795,6 +923,33 @@ jobs:
           xcrun stapler staple "${PKG}"
           echo "Notarized and stapled: ${PKG}"
 
+      # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
+      # Scans vcpkg_installed/arm64-osx + builddir (Mach-O binaries).
+      - name: Generate macOS SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-macos-arm64.cdx.json
+          artifact-name: yuzu-macos-arm64.cdx.json
+          upload-artifact: false
+
+      - name: Generate macOS SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-macos-arm64.spdx.json
+          artifact-name: yuzu-macos-arm64.spdx.json
+          upload-artifact: false
+
+      - name: Attest macOS provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            yuzu-macos-arm64.tar.gz
+            YuzuAgent-*.pkg
+
       - name: Upload archive artifact
         uses: actions/upload-artifact@v7
         continue-on-error: true
@@ -811,6 +966,16 @@ jobs:
           path: "YuzuAgent-*.pkg"
           retention-days: 3
 
+      - name: Upload macOS SBOM artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: yuzu-macos-arm64-sbom
+          path: |
+            yuzu-macos-arm64.cdx.json
+            yuzu-macos-arm64.spdx.json
+          retention-days: 3
+
   # ── Docker images — server + gateway published to GHCR ──────────────
   # Runs on the self-hosted Linux runner (native dockerd, systemd-managed).
   # Both images build in parallel via matrix; buildx registry cache persists
@@ -823,6 +988,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
     strategy:
       fail-fast: false
       matrix:
@@ -873,6 +1040,7 @@ jobs:
             org.opencontainers.image.licenses=MIT
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -885,7 +1053,68 @@ jobs:
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}
           cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }},mode=max
+          # Disable buildx's own provenance/sbom attestation — we emit
+          # GitHub-native attestations + cosign signatures below so
+          # customers have a single verification path via `gh
+          # attestation verify` and `cosign verify`.
           provenance: false
+          sbom: false
+
+      # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
+      # Syft scans the pushed image by digest (pulls manifest +
+      # layers from GHCR) so the SBOM reflects exactly what customers
+      # will pull. Output goes to artifacts/ for the release job to
+      # attach alongside the per-platform archive SBOMs.
+      - name: Generate image SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: yuzu-${{ matrix.image }}-image.cdx.json
+          artifact-name: yuzu-${{ matrix.image }}-image.cdx.json
+          upload-artifact: false
+
+      - name: Generate image SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: yuzu-${{ matrix.image }}-image.spdx.json
+          artifact-name: yuzu-${{ matrix.image }}-image.spdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifacts
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: yuzu-${{ matrix.image }}-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-image.cdx.json
+            yuzu-${{ matrix.image }}-image.spdx.json
+          retention-days: 3
+
+      # ── SLSA build provenance (by image digest) ─────────────────────
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
+        run: |
+          cosign sign --yes \
+            --oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
       - name: Image summary
         run: |
@@ -895,6 +1124,10 @@ jobs:
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
+            echo ""
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Create GitHub Release ────────────────────────────────────────────
@@ -952,12 +1185,41 @@ jobs:
             echo "::warning::tools/compose-wizard not present in this checkout — skipping wizard bundle. See PR #405."
           fi
 
+      - name: Flatten artifacts + SBOMs
+        run: |
+          cd artifacts
+          # Collect archives, installers, AND SBOMs from per-platform
+          # upload-artifact subdirs into artifacts/ for uniform handling
+          # by the gate script, SHA256SUMS generator, and gh release
+          # create. File names are globally unique across jobs (the
+          # per-platform suffix is baked into each asset name), so no
+          # collisions are expected; fail loud if they happen.
+          find . -mindepth 2 -type f \( \
+            -name '*.tar.gz' -o \
+            -name '*.zip'    -o \
+            -name '*.exe'    -o \
+            -name '*.deb'    -o \
+            -name '*.rpm'    -o \
+            -name '*.pkg'    -o \
+            -name '*.cdx.json' -o \
+            -name '*.spdx.json' \
+          \) -exec mv {} . \;
+
+      - name: Verify release artifact completeness
+        run: |
+          # Gate: every expected archive must have a sibling CycloneDX +
+          # SPDX SBOM, and both image SBOMs must be present. Missing any
+          # of the above fails the release before we publish anything
+          # customers will have to unwind. Tracked as #362 / #408.
+          bash scripts/check-release-artifacts.sh artifacts
+
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg' \) -exec mv {} . \;
           # *.zip glob covers both yuzu-windows-x64.zip and yuzu-compose-wizard-*.zip.
-          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg > SHA256SUMS
+          # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
+          # verify the SBOM they download matches the SBOM we shipped.
+          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
@@ -1099,6 +1361,18 @@ jobs:
             SHA256SUMS
           \`\`\`
 
+          ## Supply chain: SBOM, SLSA provenance, signed images
+
+          Every release ships CycloneDX + SPDX SBOMs per platform
+          (\`yuzu-*-{linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json\`,
+          \`yuzu-{server,gateway}-image.{cdx,spdx}.json\`), GitHub-native
+          SLSA build provenance attestations for every binary archive
+          and Docker image, and cosign keyless signatures on both the
+          Docker images and the \`SHA256SUMS\` manifest. See
+          [\`docs/user-manual/release-verification.md\`](docs/user-manual/release-verification.md)
+          for the full verification workflow (\`gh attestation verify\`,
+          \`cosign verify\`, CycloneDX / SPDX validation).
+
           See the [user manual](docs/user-manual/) for full setup instructions.
           NOTES_EOF
           # Strip leading whitespace from heredoc indentation
@@ -1134,6 +1408,8 @@ jobs:
             artifacts/yuzu-macos-arm64.tar.gz \
             artifacts/*.deb \
             artifacts/*.rpm \
+            artifacts/*.cdx.json \
+            artifacts/*.spdx.json \
             artifacts/SHA256SUMS \
             artifacts/SHA256SUMS.bundle \
             "${WIZARD_ASSET[@]}"
