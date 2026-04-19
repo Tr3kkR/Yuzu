@@ -153,15 +153,28 @@ write_metric() {
 }
 
 tool_check() {
+    # Exit code discipline:
+    #   --full / enforce mode: exit 2 so the caller sees a hard failure it
+    #     can choose to bubble up. The WARN row is already recorded.
+    #   --report-only (default-mode caller): exit 0 so the caller's `|| …`
+    #     fallback doesn't fire and double-write a gate row. The WARN row
+    #     from this function is authoritative and sufficient.
+    #   --capture-baselines: exit 2 (same as enforce) — a missing tool here
+    #     would otherwise silently capture a zero-coverage baseline.
+    local tool_miss_exit=2
+    if (( REPORT_ONLY )) && ! (( CAPTURE )); then
+        tool_miss_exit=0
+    fi
+
     if ! command -v gcovr >/dev/null 2>&1; then
         echo "coverage-gate: gcovr not on PATH (pip install gcovr)" | tee -a "$GATE_LOG"
-        write_gate WARN 0 "gcovr missing — install with 'pip3 install gcovr' and re-run"
-        exit 2
+        write_gate WARN 0 "gcovr missing — install with 'pip3 install --user gcovr' and re-run"
+        exit "$tool_miss_exit"
     fi
     if ! command -v meson >/dev/null 2>&1; then
         echo "coverage-gate: meson not on PATH" | tee -a "$GATE_LOG"
         write_gate WARN 0 "meson missing"
-        exit 2
+        exit "$tool_miss_exit"
     fi
 }
 
