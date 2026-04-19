@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian "Guaranteed State" engine — wire contract + server store
+  skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
+  SQLite file `guaranteed-state.db` is created in the server data directory
+  at startup and a `guaranteed_state_store` entry appears in the `/readyz`
+  probe response. No REST endpoints, no dispatch, no agent wiring, and no
+  dashboard surface in this release — PR 1 ships only the proto (new package
+  `yuzu.guardian.v1` at `proto/yuzu/guardian/v1/guaranteed_state.proto`),
+  the server SQLite store, and 17 unit test cases. Operators upgrading will
+  see the new `.db` file alongside the existing stores (same permissions,
+  same backup story: copy the full `--data-dir`) and the new `/readyz` JSON
+  key. Full architecture: `docs/yuzu-guardian-design-v1.1.md`. Windows-first
+  delivery plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+
 - **Supply-chain attestation bundle: CycloneDX + SPDX SBOMs, SLSA
   provenance, and cosign image signatures on every release (#362,
   #408).** The release workflow now emits, per tag, a full verifiable

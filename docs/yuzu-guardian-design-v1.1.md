@@ -1,6 +1,10 @@
 # Yuzu Guardian — Architecture Design
 
 > **Status:** Proposal
+> **Audience:** Engineering, Sales Engineering, Security Review.
+> Customer-shareable as part of the technical due-diligence packet under
+> an NDA. The §23 honest-tamper-resistance stance and the Windows-API
+> surface inventory are deliberate content, not accidental disclosures.
 > **Scope:** Agent (Windows + Linux + macOS) + Server (dashboard, REST API)
 > **Platform priority:** Windows first, Linux second, macOS backlog
 > **Depends on:** Phase 5 Policy Engine, Phase 4 KV Storage, Phase 4 Triggers

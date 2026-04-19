@@ -120,7 +120,16 @@ void GuaranteedStateStore::create_tables() {
         )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
-        spdlog::error("GuaranteedStateStore: schema migration failed, closing database");
+        // Include enough detail in the log for an on-call operator to triage
+        // at 03:00 without reading source. `db_filename()` returns the path
+        // of the main database file on this connection; if open succeeded
+        // far enough to land here, it is non-null.
+        const char* db_file = sqlite3_db_filename(db_, "main");
+        spdlog::error("GuaranteedStateStore: schema migration failed for {}; "
+                      "closing database. Recovery: stop server, move or "
+                      "rename that file, and restart — rules must be "
+                      "re-imported from server-authoritative source.",
+                      db_file ? db_file : "<unknown>");
         sqlite3_close(db_);
         db_ = nullptr;
     }
