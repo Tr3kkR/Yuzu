@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <shared_mutex>
 #include <string_view>
 
@@ -75,8 +76,8 @@ void GuaranteedStateStore::create_tables() {
             );
             CREATE INDEX IF NOT EXISTS idx_gsr_os
                 ON guaranteed_state_rules(os_target);
-            CREATE INDEX IF NOT EXISTS idx_gsr_enabled
-                ON guaranteed_state_rules(enabled);
+            -- Deliberately no index on `enabled` (boolean, cardinality 2):
+            -- SQLite will skip a low-selectivity index and full-scan anyway.
 
             CREATE TABLE IF NOT EXISTS guaranteed_state_events (
                 event_id               TEXT PRIMARY KEY,
@@ -94,12 +95,18 @@ void GuaranteedStateStore::create_tables() {
                 remediation_latency_us INTEGER,
                 timestamp              TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_gse_rule
-                ON guaranteed_state_events(rule_id);
-            CREATE INDEX IF NOT EXISTS idx_gse_agent
-                ON guaranteed_state_events(agent_id);
+            -- Composite indexes cover the three documented filter paths
+            -- (rule / agent / severity), each combined with the timestamp
+            -- sort direction used by query_events. SQLite can satisfy the
+            -- WHERE + ORDER BY with an index range scan and no filesort.
+            CREATE INDEX IF NOT EXISTS idx_gse_rule_time
+                ON guaranteed_state_events(rule_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_gse_agent_time
+                ON guaranteed_state_events(agent_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_gse_severity_time
+                ON guaranteed_state_events(severity, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_gse_time
-                ON guaranteed_state_events(timestamp);
+                ON guaranteed_state_events(timestamp DESC);
         )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
@@ -336,7 +343,10 @@ GuaranteedStateStore::query_events(const GuaranteedStateEventQuery& q) const {
         sql += " AND severity = ?";
         text_binds.emplace_back(bind_idx++, q.severity);
     }
-    sql += " ORDER BY timestamp DESC LIMIT ?";
+    // Secondary sort by event_id for deterministic tie-break when multiple
+    // events share the same timestamp (common under fleet-wide drift bursts
+    // where many agents timestamp with second-granularity clocks).
+    sql += " ORDER BY timestamp DESC, event_id DESC LIMIT ?";
     int limit_idx = bind_idx++;
     int offset_idx = 0;
     if (q.offset > 0) {
@@ -350,7 +360,11 @@ GuaranteedStateStore::query_events(const GuaranteedStateEventQuery& q) const {
 
     for (const auto& [idx, val] : text_binds)
         sqlite3_bind_text(stmt, idx, val.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, limit_idx, q.limit);
+    // Clamp limit: defence-in-depth against a misconfigured or malicious
+    // caller who could otherwise materialise the entire events table into
+    // a vector (GB-scale RSS spike).
+    const int clamped_limit = std::clamp(q.limit, 1, kMaxEventsLimit);
+    sqlite3_bind_int64(stmt, limit_idx, clamped_limit);
     if (offset_idx > 0)
         sqlite3_bind_int64(stmt, offset_idx, q.offset);
 

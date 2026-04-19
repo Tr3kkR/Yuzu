@@ -889,10 +889,10 @@ spec:
 ### 7.1 New messages
 
 ```protobuf
-// proto/yuzu/agent/v1/guaranteed_state.proto
+// proto/yuzu/guardian/v1/guaranteed_state.proto
 
 syntax = "proto3";
-package yuzu.agent.v1;
+package yuzu.guardian.v1;
 import "google/protobuf/timestamp.proto";
 
 message GuaranteedStateRule {
@@ -951,6 +951,16 @@ message GuaranteedStateRuleStatus {
   uint32 remediation_count = 5;
   google.protobuf.Timestamp last_evaluation = 6;
   google.protobuf.Timestamp last_drift = 7;
+
+  // Kernel-wiring health signal (added PR 1, populated starting PR 3 when the
+  // Registry Guard self-test probe lands). Lets the dashboard distinguish
+  // "compliant because nothing's happening" from "silently deaf because the
+  // subscription never plugged into the kernel." On agents predating PR 3 the
+  // fields are default-constructed — consumers MUST treat default as
+  // "status unknown," NOT as "guard unhealthy."
+  bool guard_healthy = 8;
+  google.protobuf.Timestamp last_notification = 9;
+  uint64 notifications_total = 10;
 }
 ```
 

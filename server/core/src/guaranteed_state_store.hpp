@@ -17,8 +17,17 @@ namespace yuzu::server {
 // Responsibilities:
 //   - Persist GuaranteedStateRule definitions (yaml_source is authoritative;
 //     the denormalised columns are for indexing / listing / RBAC filtering).
+//     Caller (REST handler in PR 2+) is responsible for deriving the
+//     denormalised fields (severity / os_target / scope_expr) from
+//     yaml_source atomically on create/update — the store does NOT re-parse.
 //   - Persist GuaranteedStateEvent rows reported by agents (drift detected,
 //     drift remediated, guard unhealthy, resilience escalated, etc.).
+//
+// Events are an **immutable audit-style log** — intentionally no foreign key
+// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
+// When a rule is deleted, its historical events remain for forensic review
+// (matches `audit_store`'s retention discipline). Future PRs may add a
+// time-based retention reaper; do not retroactively add an FK cascade.
 //
 // This store is intentionally write-heavy on events and read-heavy on rules.
 // SQLite full-mutex + WAL is the same pattern the other stores use.
@@ -59,9 +68,15 @@ struct GuaranteedStateEventQuery {
     std::string rule_id;           // filter by rule, optional
     std::string agent_id;          // filter by agent, optional
     std::string severity;          // "critical" ... optional
-    int limit{100};
+    int limit{100};                // clamped to [1, kMaxEventsLimit] by the store
     int offset{0};
 };
+
+// Hard upper bound on `GuaranteedStateEventQuery::limit`. Defence-in-depth
+// against a misconfigured or malicious caller: materialising millions of
+// event rows into a std::vector would produce a GB-scale RSS spike. The
+// REST layer (PR 2) may apply a tighter clamp on top.
+inline constexpr int kMaxEventsLimit = 10'000;
 
 class GuaranteedStateStore {
 public:

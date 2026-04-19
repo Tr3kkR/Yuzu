@@ -16,7 +16,7 @@ Goal of this plan: land PRs 1–4 below to get **one end-to-end Windows rule wor
 
 Land the wire contract and empty server store first so later PRs have something to push/receive.
 
-- `proto/yuzu/agent/v1/guaranteed_state.proto` — new file with the five messages from §7.1 (`GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`). Extend `GuaranteedStateRuleStatus` with three fields not in the design doc — `bool guard_healthy = 8;`, `google.protobuf.Timestamp last_notification = 9;`, `uint64 notifications_total = 10;` — to carry the kernel-wiring health signal surfaced in PR 3.
+- `proto/yuzu/guardian/v1/guaranteed_state.proto` — new file with the five messages from §7.1 (`GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`). Extend `GuaranteedStateRuleStatus` with three fields not in the design doc — `bool guard_healthy = 8;`, `google.protobuf.Timestamp last_notification = 9;`, `uint64 notifications_total = 10;` — to carry the kernel-wiring health signal surfaced in PR 3.
 - `proto/meson.build` — append the new `.proto` to the `custom_target` `input:` array and update `output:`/`gen_srcs`/`gen_hdrs` (follow the agent.proto / management.proto pattern exactly).
 - `server/core/src/guaranteed_state_store.hpp/.cpp` — new store following `audit_store.*` shape. Tables from §9.1 (`guaranteed_state_rules`, `guaranteed_state_events` + indexes). Declares a static `kMigrations` vector and calls `MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)` inside `create_tables()`. CRUD: `create_rule`, `list_rules`, `get_rule`, `update_rule`, `delete_rule`, `insert_event`, `query_events`.
 - `server/core/src/server.cpp` — instantiate the store at startup next to the other stores.
@@ -103,7 +103,7 @@ Tracking list, in the order the design doc suggests and sized roughly one-PR-per
 Net-new:
 
 ```
-proto/yuzu/agent/v1/guaranteed_state.proto
+proto/yuzu/guardian/v1/guaranteed_state.proto
 server/core/src/guaranteed_state_store.{hpp,cpp}
 server/core/src/dashboard_guaranteed_state.{hpp,cpp}
 agents/core/src/guardian_engine.{hpp,cpp}

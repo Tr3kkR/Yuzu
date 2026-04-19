@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package yuzu.agent.v1;
+package yuzu.guardian.v1;
 
 import "google/protobuf/timestamp.proto";
 
@@ -77,6 +77,11 @@ message GuaranteedStateRuleStatus {
   // Kernel-wiring health signal (plan PR 3). Lets the dashboard distinguish
   // "compliant because nothing's happening" from "silently deaf because the
   // subscription never plugged into the kernel."
+  //
+  // Producer-lifecycle note: these fields are populated starting with the
+  // agent build that ships PR 3's self-test probe. On agents predating that
+  // build the fields are default-constructed (false / epoch / 0). Consumers
+  // MUST treat default values as "status unknown," NOT as "guard unhealthy."
   bool guard_healthy = 8;
   google.protobuf.Timestamp last_notification = 9;
   uint64 notifications_total = 10;

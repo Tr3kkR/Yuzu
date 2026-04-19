@@ -32,7 +32,7 @@ gen = custom_target(
     input: [
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
-        proto_root / 'yuzu/agent/v1/guaranteed_state.proto',
+        proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],
@@ -53,7 +53,7 @@ gen = custom_target(
         proto_root,
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
-        proto_root / 'yuzu/agent/v1/guaranteed_state.proto',
+        proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],

@@ -1596,6 +1596,8 @@ private:
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
+                {"guaranteed_state_store",
+                 guaranteed_state_store_ && guaranteed_state_store_->is_open()},
             };
 
             std::string failed_list;
