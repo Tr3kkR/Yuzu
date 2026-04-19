@@ -310,7 +310,11 @@ if $REUSE_STACK; then
     # clean up, and would inflate the agent count in the stability
     # assertions.
     SERVER_PID=$(pgrep -f 'yuzu-server.*--listen' | head -1 || true)
-    GATEWAY_PID=$(pgrep -f 'beam.smp.*yuzu_gw' | head -1 || true)
+    # Gateway can run as either the prod release (`yuzu_gw/bin/yuzu_gw`
+    # wrapper → erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
+    # `-name yuzu_gw1@127.0.0.1` flag is the stable fingerprint across
+    # both; it's present on the cmdline either way.
+    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw1@127.0.0.1' | head -1 || true)
     AGENT_PIDS=($(pgrep -f 'yuzu-agent.*--data-dir /tmp/yuzu-uat' || true))
     if [[ -z "$SERVER_PID" ]]; then
         echo "FAIL: Phase 4 reuse — could not find yuzu-server pid via pgrep" >&2

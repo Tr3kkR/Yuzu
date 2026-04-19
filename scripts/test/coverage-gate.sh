@@ -208,6 +208,17 @@ if [[ ! -d "$BUILD_DIR" ]]; then
         MESON_SETUP_EXTRA+=(--native-file "$NATIVE_FILE")
         echo "coverage-gate: using native-file $NATIVE_FILE (matches ci.yml coverage job)" | tee -a "$GATE_LOG"
     fi
+    # Propagate the vcpkg install root so fresh `build-linux-coverage/`
+    # can find grpc/protobuf/sqlite3/etc. Without this `meson setup` fails
+    # on a bare checkout because the coverage build dir doesn't inherit
+    # the cmake_prefix_path from the sibling `build-linux/`.
+    # Per the governance Round 1 fix and issue #460, the install tree
+    # lives per-OS; use the Linux path here.
+    VCPKG_X64_LINUX="$YUZU_ROOT/vcpkg_installed/x64-linux"
+    if [[ -d "$VCPKG_X64_LINUX" ]]; then
+        MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_X64_LINUX")
+        echo "coverage-gate: using cmake_prefix_path=$VCPKG_X64_LINUX" | tee -a "$GATE_LOG"
+    fi
     if ! meson setup "$BUILD_DIR" \
         "${MESON_SETUP_EXTRA[@]}" \
         --buildtype=debug \
