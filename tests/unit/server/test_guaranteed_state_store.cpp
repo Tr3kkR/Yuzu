@@ -308,25 +308,34 @@ TEST_CASE("GuaranteedStateStore: event query tie-breaks by event_id on equal tim
     CHECK(tied[2].event_id == "evt-A");
 }
 
-TEST_CASE("GuaranteedStateStore: query_events limit is clamped to kMaxEventsLimit",
+TEST_CASE("GuaranteedStateStore: query_events limit is clamped and semantically consistent",
           "[guaranteed_state_store][events]") {
-    // P-S4 / sec-L2 — a malicious or misconfigured caller passing INT_MAX
-    // for limit must NOT materialise the entire table. Verify the clamp
-    // applies even when the underlying data count is small (the clamp is
-    // bind-time, not result-time, but the observable invariant is "no crash,
-    // result bounded").
+    // Pin kMaxEventsLimit at compile time so a future tightening is a
+    // deliberate edit, not a silent drift.
+    static_assert(kMaxEventsLimit == 10'000,
+                  "kMaxEventsLimit changed — update REST layer cap + docs");
+
     GuaranteedStateStore store(":memory:");
     for (int i = 0; i < 5; ++i) {
         REQUIRE(store.insert_event(make_event("evt-" + std::to_string(i), "r", "a")));
     }
 
-    GuaranteedStateEventQuery q;
-    q.limit = 2'000'000'000;  // INT_MAX-ish
-    auto out = store.query_events(q);
-    CHECK(out.size() == 5);  // clamp doesn't inflate a small table
-    // kMaxEventsLimit is exposed in the header so the REST layer can reason
-    // about the cap without re-deriving it.
-    CHECK(kMaxEventsLimit == 10'000);
+    // P-S4 / sec-L2 upper clamp: INT_MAX must not materialise the whole table.
+    GuaranteedStateEventQuery upper;
+    upper.limit = 2'000'000'000;  // INT_MAX-ish
+    CHECK(store.query_events(upper).size() == 5);
+
+    // sec2-M1 / happy-S1 lower clamp: `LIMIT 0` is a valid SQLite query
+    // returning zero rows, matching sibling-store semantics (audit_store,
+    // workflow_engine, inventory_store). The initial hardening clamp of
+    // `std::clamp(limit, 1, max)` promoted 0 to 1 row — regression guard.
+    GuaranteedStateEventQuery zero;
+    zero.limit = 0;
+    CHECK(store.query_events(zero).empty());
+
+    GuaranteedStateEventQuery neg;
+    neg.limit = -42;  // Treated as 0 (clamped up), not as INT_MAX signed overflow.
+    CHECK(store.query_events(neg).empty());
 }
 
 TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel returns",

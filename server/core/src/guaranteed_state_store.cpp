@@ -49,8 +49,18 @@ GuaranteedStateStore::GuaranteedStateStore(const std::filesystem::path& db_path)
 }
 
 GuaranteedStateStore::~GuaranteedStateStore() {
-    if (db_)
+    // Acquire unique_lock before closing the sqlite3* so any concurrent
+    // reader (shared_lock holder mid-query) has released the lock and
+    // returned from SQLite before we call sqlite3_close. Without this
+    // barrier a reader racing with server shutdown would use-after-free on
+    // the handle (UP-14 from PR 1 governance). httplib's server-stop
+    // drains handlers in practice, but the contract shouldn't depend on
+    // unwritten coordination between the web server and store lifetimes.
+    std::unique_lock lock(mtx_);
+    if (db_) {
         sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 bool GuaranteedStateStore::is_open() const {
@@ -363,7 +373,14 @@ GuaranteedStateStore::query_events(const GuaranteedStateEventQuery& q) const {
     // Clamp limit: defence-in-depth against a misconfigured or malicious
     // caller who could otherwise materialise the entire events table into
     // a vector (GB-scale RSS spike).
-    const int clamped_limit = std::clamp(q.limit, 1, kMaxEventsLimit);
+    //
+    // Lower bound is 0, not 1 — `LIMIT 0` is a valid SQLite query returning
+    // zero rows, and that's the semantic sibling stores (`audit_store`,
+    // `workflow_engine`, `inventory_store`) expose to callers. Clamping up
+    // to 1 would silently promote `limit=0` into a one-row result, breaking
+    // cross-store consistency. Negative limits are clamped to 0 for the
+    // same reason.
+    const int clamped_limit = std::clamp(q.limit, 0, kMaxEventsLimit);
     sqlite3_bind_int64(stmt, limit_idx, clamped_limit);
     if (offset_idx > 0)
         sqlite3_bind_int64(stmt, offset_idx, q.offset);

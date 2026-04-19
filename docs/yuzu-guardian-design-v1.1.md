@@ -1114,9 +1114,14 @@ CREATE TABLE guaranteed_state_events (
     detection_latency_us INTEGER, remediation_latency_us INTEGER,
     timestamp TEXT NOT NULL
 );
-CREATE INDEX idx_gse_rule ON guaranteed_state_events(rule_id);
-CREATE INDEX idx_gse_agent ON guaranteed_state_events(agent_id);
-CREATE INDEX idx_gse_time ON guaranteed_state_events(timestamp);
+-- Composite (column, timestamp DESC) indexes cover the three documented
+-- filter paths combined with the `ORDER BY timestamp DESC` used by every
+-- event query, so SQLite satisfies each common "events for rule X / agent Y /
+-- severity Z, newest first" without filesort.
+CREATE INDEX idx_gse_rule_time     ON guaranteed_state_events(rule_id, timestamp DESC);
+CREATE INDEX idx_gse_agent_time    ON guaranteed_state_events(agent_id, timestamp DESC);
+CREATE INDEX idx_gse_severity_time ON guaranteed_state_events(severity, timestamp DESC);
+CREATE INDEX idx_gse_time          ON guaranteed_state_events(timestamp DESC);
 ```
 
 ### 9.2 REST API endpoints
