@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package yuzu.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option cc_enable_arenas = true;
+
+// Guaranteed State wire protocol for the Yuzu Guardian engine.
+// See docs/yuzu-guardian-design-v1.1.md § 7.
+//
+// Transport reuses the existing CommandRequest/CommandResponse bidi stream
+// via the reserved plugin name "__guard__" with these actions:
+//   Server -> Agent:  plugin="__guard__" action="push_rules" params=GuaranteedStatePush
+//   Agent  -> Server: plugin="__guard__" action="event"      output=GuaranteedStateEvent
+//   Server -> Agent:  plugin="__guard__" action="get_status"
+//   Agent  -> Server: plugin="__guard__" action="status"     output=GuaranteedStateStatus
+
+message GuaranteedStateRule {
+  string rule_id = 1;
+  string name = 2;
+  string yaml_source = 3;       // Verbatim source, authoritative form
+  uint64 version = 4;
+  bool enabled = 5;
+  string enforcement_mode = 6;  // "enforce" | "audit" | "disabled"
+  bytes signature = 7;          // HMAC-SHA256 over yaml_source (see design §11.2)
+}
+
+message GuaranteedStatePush {
+  repeated GuaranteedStateRule rules = 1;
+  bool full_sync = 2;           // true = replace active set; false = delta merge
+  uint64 policy_generation = 3;
+}
+
+message GuaranteedStateEvent {
+  string rule_id = 1;
+  string rule_name = 2;
+  string event_type = 3;        // e.g. "drift.detected" | "drift.remediated"
+                                // | "guard.unhealthy" | "resilience.escalated"
+  string severity = 4;          // "critical" | "high" | "medium" | "low"
+  string guard_type = 5;        // "registry" | "etw" | "wfp" | "scm" | "process" ...
+  string guard_category = 6;    // "event" | "condition"
+  string detected_value = 7;
+  string expected_value = 8;
+  string remediation_action = 9;
+  bool remediation_success = 10;
+  uint64 detection_latency_us = 11;
+  uint64 remediation_latency_us = 12;
+  google.protobuf.Timestamp timestamp = 13;
+  string resilience_strategy = 14;
+  uint32 escalation_step = 15;
+  double drift_rate = 16;
+  string competing_process = 17;
+  string platform = 18;         // "windows" | "linux" | "macos"
+}
+
+message GuaranteedStateStatus {
+  string agent_id = 1;
+  uint64 policy_generation = 2;
+  uint32 total_rules = 3;
+  uint32 compliant_rules = 4;
+  uint32 drifted_rules = 5;
+  uint32 errored_rules = 6;
+  repeated GuaranteedStateRuleStatus rules = 7;
+  string platform = 8;
+}
+
+message GuaranteedStateRuleStatus {
+  string rule_id = 1;
+  string status = 2;            // "compliant" | "drifted" | "errored" | "exempt"
+  string guard_category = 3;
+  uint32 drift_count = 4;
+  uint32 remediation_count = 5;
+  google.protobuf.Timestamp last_evaluation = 6;
+  google.protobuf.Timestamp last_drift = 7;
+
+  // Kernel-wiring health signal (plan PR 3). Lets the dashboard distinguish
+  // "compliant because nothing's happening" from "silently deaf because the
+  // subscription never plugged into the kernel."
+  bool guard_healthy = 8;
+  google.protobuf.Timestamp last_notification = 9;
+  uint64 notifications_total = 10;
+}

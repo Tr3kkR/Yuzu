@@ -36,6 +36,7 @@
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "guaranteed_state_store.hpp"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -476,6 +477,17 @@ public:
             policy_store_ = std::make_unique<PolicyStore>(policy_db);
             if (policy_store_ && policy_store_->is_open()) {
                 spdlog::info("PolicyStore initialized at {}", policy_db.string());
+            }
+        }
+
+        // Guardian (Guaranteed State) rule + event store. REST/dashboard/push
+        // wiring lands in later PRs; this PR just stands the store up so the
+        // schema migration runs and the database file exists.
+        {
+            auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
+            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(gs_db);
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
+                spdlog::info("GuaranteedStateStore initialized at {}", gs_db.string());
             }
         }
 
@@ -4717,6 +4729,7 @@ private:
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
+    std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
