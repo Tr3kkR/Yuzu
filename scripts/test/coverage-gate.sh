@@ -276,6 +276,7 @@ GCOVR_RC=0
         --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
         --exclude '.*\.pb\.(h|cc)$' \
         --branches \
+        --gcov-ignore-parse-errors=negative_hits.warn \
         --json-summary "$GCOVR_JSON" \
         --xml "$GCOVR_XML" \
         --html --html-details -o "$GCOVR_HTML_DIR/index.html" \
