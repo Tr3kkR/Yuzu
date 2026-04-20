@@ -87,6 +87,10 @@ struct Config {
     // Audit trail
     int audit_retention_days{365};
 
+    // Guardian (Guaranteed State) event retention. Default 30d matches
+    // kDefaultEventRetentionDays + the workstream-E data inventory.
+    int guardian_event_retention_days{30};
+
     // Analytics
     bool analytics_enabled{true};
     int analytics_drain_interval_seconds{10};

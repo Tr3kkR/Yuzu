@@ -1145,6 +1145,45 @@ GET    /api/v1/guaranteed-state/alerts             Active alerts
 
 **RBAC:** securable type `guaranteed_state` — admin/security_admin: all; operator: read+push; user: read.
 
+### 9.3 Audit-chain reconstruction
+
+`guaranteed_state_rules` carries two principal columns populated by the REST handler from the session:
+
+- `created_by` — principal who first authored the rule.
+- `updated_by` — principal who last modified it (incremented by `version`).
+
+`guaranteed_state_events` has **no** principal column — events originate from agents, not operators — but every rule mutation in `/api/v1/guaranteed-state/rules` emits an `audit_events` row via the normal `audit_store` path. In a compromise scenario, reconstructing "which principal pushed the rule version that caused this remediation" is a three-hop join:
+
+```sql
+-- Given a remediation event, find the rule version in effect and the
+-- principal who authored that version.
+SELECT ev.event_id,
+       ev.agent_id,
+       ev.event_type,
+       ev.timestamp         AS event_ts,
+       r.rule_id,
+       r.version,
+       r.updated_by,
+       a.principal          AS rest_actor,
+       a.action             AS rest_action,
+       a.timestamp          AS rest_ts
+FROM   guaranteed_state_events ev
+JOIN   guaranteed_state_rules  r  ON r.rule_id    = ev.rule_id
+JOIN   audit_events            a  ON a.target_id  = r.rule_id
+                                 AND a.target_type = 'guaranteed_state_rule'
+                                 AND a.timestamp   <= ev.timestamp
+WHERE  ev.event_id = :event_id
+ORDER  BY a.timestamp DESC
+LIMIT  1;
+```
+
+**Gotchas:**
+
+1. `audit_store.retention_days` (default 365d) is longer than `guaranteed_state_events.retention_days` (default 30d), so the event→audit direction always works within the events' window. Operators raising the audit retention below 90d should raise it back for Guardian forensics.
+2. `guaranteed_state_rules.version` is the authoritative identifier of which rule revision was active at event time — **not** `updated_at`. Version increments on every PUT (REST handler responsibility); `audit_events.detail` stores the pre/post YAML diff so the exact change can be reproduced.
+3. The join uses `target_type = 'guaranteed_state_rule'` — the REST handler in PR 2 must emit audit rows with that exact literal for the join to find them. Adding a new mutation path (bulk import, CLI upload) is the moment the audit-type literal is most likely to drift; the integration test in PR 2 must pin it.
+4. A deleted rule leaves events but no `guaranteed_state_rules` row — the join above returns zero rows. For deleted-rule forensics, start from `audit_events.action = 'guaranteed_state_rule.delete'` and trace backwards.
+
 ---
 
 ## 10. Dashboard design

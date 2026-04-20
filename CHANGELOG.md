@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Tighten GitHub Actions token permissions for OpenSSF Scorecard
+  Token-Permissions check.** Scorecard's Token-Permissions check scored 0
+  because `qodana_code_quality.yml` had no top-level `permissions:` block
+  (one missing block zeroes the entire check) and several workflows
+  declared writes at workflow scope that only specific jobs actually
+  needed. Changes:
+  - `qodana_code_quality.yml`: new top-level `permissions: contents: read`;
+    dropped unused job-level `contents: write` + `pull-requests: write`
+    (pr-mode is false, so the action never opens PRs); kept `checks: write`
+    at job scope.
+  - `release.yml`: demoted top-level `contents: write` + `packages: write`
+    to job scope. `id-token: write` and `attestations: write` stay at
+    workflow scope because every build job calls
+    `actions/attest-build-provenance`. The `release` job gets explicit
+    `contents: write` + `id-token: write`; `docker-publish` already had
+    its own explicit block.
+  - `vcpkg-baseline-update.yml`: top-level `permissions: contents: read`;
+    moved `contents: write` + `pull-requests: write` into the
+    `propose-bump` job.
+  - `ci.yml`: removed unused top-level `packages: write` (the workflow
+    doesn't push to any registry); top-level is now `contents: read` only.
+
+- **Wire `SCORECARD_READ_TOKEN` PAT into `scorecard.yml`.** Scorecard's
+  `Branch-Protection` check caps at ~3/10 without a PAT because the
+  public GitHub API can't read Repository Rulesets. The action now
+  receives `repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}`
+  so the ruleset-aware code path runs once the secret is populated. The
+  `|| github.token` fallback keeps fork runs and first-time-setup scans
+  succeeding. PAT creation + rotation procedure documented at
+  `docs/security/scorecard-token.md` — classic PAT with `public_repo` +
+  `read:org` scopes ONLY; 90-day expiration with a 365-day rotation
+  cadence.
+
 ### Added
 
 - **Guardian: agent rejects plugins declaring a reserved internal-dispatch
@@ -19,6 +54,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   third-party plugin) from shadowing the `__guard__` dispatch intercept that
   Guardian PR 3 will add at `agents/core/src/agent.cpp`. Reserved-name
   namespace documented in `docs/cpp-conventions.md`.
+
+- **Guardian PR 2 prerequisites (#452).** Pre-REST-endpoint hardening of the
+  `GuaranteedStateStore` so PR 2's ingest path can land on a production-ready
+  foundation:
+  - **`std::expected<T, std::string>` mutators with `kConflictPrefix`.**
+    `create_rule`, `update_rule`, `delete_rule`, and `insert_event` now
+    return `std::expected<void, std::string>` and surface duplicate-UNIQUE
+    / PRIMARY KEY collisions as `kConflictPrefix`-prefixed errors so REST
+    handlers can map them to HTTP 409 (matching #396/#399/#402). Not-found
+    paths return a distinct non-conflict error so routes can split 404 from
+    409 cleanly.
+  - **`created_by` / `updated_by` audit columns on `guaranteed_state_rules`.**
+    Added to the v1 migration (before schema freeze). REST handlers in PR 2
+    populate both from the session principal; SOC 2 audit-chain
+    reconstruction can now answer "who authorised this rule version" from
+    the store alone, with the full `audit_events` join procedure documented
+    in `docs/yuzu-guardian-design-v1.1.md` §9.3.
+  - **Retention reaper on `guaranteed_state_events`.** 30-day default
+    (new `guardian_event_retention_days` config, overridable via runtime
+    config). Events carry `ttl_expires_at` populated at insert; a
+    background thread mirroring `AuditStore::run_cleanup` runs a periodic
+    `DELETE`. Partial index `idx_gse_ttl WHERE ttl_expires_at > 0` keeps
+    the reap query fast at fleet-scale ingest. `retention_days = 0`
+    disables expiry for forensic freezes.
+  - **Batch `insert_events(std::vector<…>)` API.** Wraps a `BEGIN…COMMIT`
+    envelope; one fsync per batch instead of one per row (10–50× faster at
+    agent batch sizes). Transactional — any failing row rolls back the
+    whole batch so REST handlers never have to reason about partial state.
+  - **Prometheus observability.** Four new server gauges — `yuzu_server_`
+    `guardian_rules_total`, `guardian_events_total`,
+    `guardian_events_written_total`, `guardian_events_reaped_total`. Wired
+    into the existing health-recompute thread alongside `audit_store`'s
+    gauges; sized at zero before ingest starts so alert rules
+    (e.g. `yuzu_server_guardian_events_total > 5e6`) can be authored up
+    front.
+  - **Data inventory entry.** `guaranteed_state_events` recorded in the
+    workstream-E data inventory (`docs/enterprise-readiness-soc2-first-customer.md` §3.5)
+    with the 30-day retention policy, reaper mechanism, and sizing
+    guidance for customers with longer forensic SLAs.
 
 - **Guardian "Guaranteed State" engine — wire contract + server store
   skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
@@ -149,6 +223,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts `PluginLoader::scan` refuses to load it). The fixture is built
   as a `shared_library` in `tests/meson.build` and wired as a `depends:`
   of the agent test runner so it's on disk before the test runs.
+- Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
+  the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
+  errors on both `name` and `rule_id`, conflict on rename-into-existing
+  name, batch `insert_events` happy path + transactional rollback on
+  mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
+  reaper delete mechanics (including `retention_days=0` sentinel).
+
 ## [0.11.0] - 2026-04-17
 
 _Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`

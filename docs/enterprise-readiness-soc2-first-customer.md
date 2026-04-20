@@ -141,6 +141,20 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 
 - Data flow diagrams, retention configs, deletion run records, and quarterly data governance reviews.
 
+### Data Inventory — server-side SQLite stores
+
+| Store | File | Data class | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| Audit trail | `audit.db` | Operator activity (security-relevant) | 365 days | `AuditStore::run_cleanup` thread — `DELETE … WHERE ttl_expires_at < now` | `audit_retention_days` |
+| Response store | `responses.db` | Agent command results | 90 days | `ResponseStore` cleanup thread (TTL at insert) | `response_retention_days` |
+| Guaranteed-state rules | `guaranteed-state.db` (`guaranteed_state_rules`) | Rule definitions (configuration) | Indefinite — lifecycle via explicit delete | REST DELETE / `delete_rule` | n/a |
+| Guaranteed-state events | `guaranteed-state.db` (`guaranteed_state_events`) | Drift/remediation telemetry (high-volume operational) | **30 days default** | `GuaranteedStateStore::run_cleanup` thread — `DELETE … WHERE ttl_expires_at > 0 AND ttl_expires_at < now` | `guardian_event_retention_days` |
+| Analytics events | ClickHouse / JSONL | Telemetry + usage | Customer-controlled (external sink) | Sink-side retention | `clickhouse_*`, `analytics_jsonl_path` |
+
+Retention numbers are inline defaults; every store exposes a `retention_days` constructor argument so a customer can tighten them without a code change. `retention_days = 0` disables the reaper (intended for forensic freezes; requires a compensating manual-export process to avoid unbounded growth).
+
+The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
+
 ---
 
 ## 3.6 Workstream F — Secure SDLC and Change Management

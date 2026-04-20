@@ -236,6 +236,19 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // Guardian observability (#452 §6). Sized at zero before ingest
+        // starts so Prometheus alert rules on these metric names can be
+        // authored up front — e.g. events_total > 5e6 as an early-warning
+        // for reaper failure or retention misconfiguration.
+        metrics_.describe("yuzu_server_guardian_rules_total",
+                          "Total Guaranteed-State rules persisted", "gauge");
+        metrics_.describe("yuzu_server_guardian_events_total",
+                          "Total Guaranteed-State events currently persisted", "gauge");
+        metrics_.describe("yuzu_server_guardian_events_written_total",
+                          "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_reaped_total",
+                          "Cumulative Guaranteed-State events deleted by the retention reaper",
+                          "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent",
                           "Server process CPU usage percentage", "gauge");
@@ -481,13 +494,17 @@ public:
         }
 
         // Guardian (Guaranteed State) rule + event store. REST/dashboard/push
-        // wiring lands in later PRs; this PR just stands the store up so the
-        // schema migration runs and the database file exists.
+        // wiring lands in later PRs; this PR stands the store up with its
+        // retention reaper so the schema migration runs, the database file
+        // exists, and bounded growth is the default from day one (#452 §5).
         {
             auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
-            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(gs_db);
+            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
+                gs_db, cfg_.guardian_event_retention_days);
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
-                spdlog::info("GuaranteedStateStore initialized at {}", gs_db.string());
+                guaranteed_state_store_->start_cleanup();
+                spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
+                             gs_db.string(), cfg_.guardian_event_retention_days);
             }
         }
 
@@ -715,6 +732,23 @@ public:
                     metrics_.gauge("yuzu_server_audit_events_total", {{"result", "other"}})
                         .set(static_cast<double>(audit_store_->events_written("other")));
                 }
+                // Guardian scalars + cumulative write/reap counters. Use
+                // gauges for the count-now values (SQL COUNT(*)) and for the
+                // cumulative-but-serialized-as-gauge counters exposed by
+                // the store — matches the existing audit_store pattern so
+                // the /metrics shape stays consistent across subsystems.
+                if (guaranteed_state_store_) {
+                    metrics_.gauge("yuzu_server_guardian_rules_total")
+                        .set(static_cast<double>(guaranteed_state_store_->rule_count()));
+                    metrics_.gauge("yuzu_server_guardian_events_total")
+                        .set(static_cast<double>(guaranteed_state_store_->event_count()));
+                    metrics_.gauge("yuzu_server_guardian_events_written_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->events_reaped_total()));
+                }
                 // Process health sampling (22.1)
                 {
                     auto ph = process_health_sampler_.sample();
@@ -785,6 +819,8 @@ public:
             response_store_->stop_cleanup();
         if (audit_store_)
             audit_store_->stop_cleanup();
+        if (guaranteed_state_store_)
+            guaranteed_state_store_->stop_cleanup();
 
         // Stop cert reloader before web server (it holds a pointer to web_server_)
         if (cert_reloader_) {

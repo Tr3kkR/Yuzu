@@ -56,6 +56,14 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
+          # PAT scoped to public_repo + read:org. Without it, Scorecard
+          # cannot read Repository Rulesets via the GitHub API and the
+          # Branch-Protection check caps at ~3. Secret rotation cadence
+          # documented in docs/security/scorecard-token.md.
+          # Gracefully optional — when the secret is not yet populated
+          # (e.g. fork runs), the action falls back to the default token
+          # and the Branch-Protection score stays at its public-API limit.
+          repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}
 
       - name: Upload SARIF artifact
         uses: actions/upload-artifact@v4

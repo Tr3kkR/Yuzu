@@ -12,15 +12,19 @@ on:
     - cron: '0 10 1 * *'
   workflow_dispatch:
 
+# Scorecard Token-Permissions hardening: least-privilege read at workflow
+# scope; the single job below exercises writes when it opens the PR.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   propose-bump:
     name: Propose vcpkg baseline bump
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write         # peter-evans/create-pull-request: commit + branch push
+      pull-requests: write    # peter-evans/create-pull-request: open/update PR
     steps:
       - uses: actions/checkout@v6
 
