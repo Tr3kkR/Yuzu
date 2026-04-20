@@ -196,17 +196,47 @@ docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigest
 # Expect the same digest as :vX.Y.Z
 ```
 
-Verify the cosign signature:
+Verify the cosign signature + GitHub attestation provenance. **Before running either command, gate on the client being installed** — first-time runs on a fresh dev box will hit one or both missing, and burning 30 min to discover "oh, I need cosign" post-release is exactly the gap v0.11.0-rc2 surfaced:
 
 ```bash
+# Preflight: require cosign + gh 2.50+ for attestation verify.
+if ! command -v cosign >/dev/null 2>&1; then
+  echo "WARN: cosign not installed — Sigstore signature round-trip skipped"
+  echo "     install: curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o ~/.local/bin/cosign && chmod +x ~/.local/bin/cosign"
+fi
+GH_MAJOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[1]}')
+GH_MINOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[2]}')
+if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 50 ) ]]; then
+  echo "WARN: gh $GH_MAJOR.$GH_MINOR predates attestation subcommand (need 2.50+)"
+  echo "     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz && tar xzf /tmp/gh.tgz -C /tmp && install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh"
+fi
+
 gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
-cosign verify-blob \
-  --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp '.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
 sha256sum -c SHA256SUMS
+
+# cosign: verify the keyless signature on SHA256SUMS + both images
+if command -v cosign >/dev/null 2>&1; then
+  cosign verify-blob \
+    --bundle SHA256SUMS.bundle \
+    --certificate-identity-regexp '.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    SHA256SUMS
+  for img in yuzu-server yuzu-gateway; do
+    cosign verify \
+      --certificate-identity-regexp '.*' \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      "ghcr.io/$OWNER/$img:X.Y.Z"
+  done
+fi
+
+# gh attestation: verifies SLSA build provenance bound to the exact workflow run
+if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
+  gh attestation verify yuzu-linux-x64.tar.gz --repo Tr3kkR/Yuzu
+  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo Tr3kkR/Yuzu
+fi
 ```
+
+**Tighten the identity regex for an auditor-grade check** (optional but recommended once you trust the infra): replace `'.*'` with `'https://github\.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'` — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.
 
 ## Phase 5 — Compose Wizard verification
 
