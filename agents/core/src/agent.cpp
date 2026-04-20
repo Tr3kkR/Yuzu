@@ -402,6 +402,8 @@ public:
         metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
                           "counter");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
+        metrics_.describe("yuzu_agent_plugin_rejected_total",
+                          "Plugins rejected at load time, labeled by reason", "counter");
     }
 
     void run() override {
@@ -467,6 +469,14 @@ public:
         for (const auto& err : scan.errors) {
             auto module_name = std::filesystem::path{err.path}.stem().string();
             record_module(module_name, "", err.reason, "load_failed");
+            // #453: categorise rejections so operators can alert on
+            // reserved-name attempts distinct from generic load failures.
+            const std::string_view reason =
+                err.reason.starts_with(yuzu::agent::kReservedNameReason) ? "reserved_name"
+                                                                         : "load_failed";
+            metrics_
+                .counter("yuzu_agent_plugin_rejected_total", {{"reason", std::string{reason}}})
+                .increment();
         }
 
         auto* raw_plugin_ctx = reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);

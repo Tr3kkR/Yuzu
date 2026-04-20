@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian: agent rejects plugins declaring a reserved internal-dispatch
+  name (#453).** The agent plugin loader now refuses to load any plugin whose
+  `YuzuPluginDescriptor::name` matches the reserved set `__guard__`,
+  `__system__`, `__update__`. Rejected plugins are logged at `error` and
+  counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}` so
+  operators can alert on reserved-name attempts distinct from generic load
+  failures. Prevents a compromised plugin author (or a misconfigured
+  third-party plugin) from shadowing the `__guard__` dispatch intercept that
+  Guardian PR 3 will add at `agents/core/src/agent.cpp`. Reserved-name
+  namespace documented in `docs/cpp-conventions.md`.
+
 - **Guardian "Guaranteed State" engine — wire contract + server store
   skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
   SQLite file `guaranteed-state.db` is created in the server data directory
@@ -130,7 +141,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
-
 ## [0.11.0] - 2026-04-17
 
 _Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
