@@ -21,9 +21,12 @@ on:
       - '.github/workflows/runner-inventory-sentinel.yml'
   workflow_dispatch:
 
+# Scorecard Token-Permissions hardening: ci.yml builds and tests only —
+# no registry pushes, no release creation. contents:read is all that's
+# needed. (Image pushes live in ci-runner-image.yml, which keeps its
+# packages:write.)
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

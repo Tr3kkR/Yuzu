@@ -13,13 +13,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Scorecard Token-Permissions baseline — every workflow must have a
+# least-privilege top-level block. qodana reads the code and writes check
+# runs only; contents stay read-only at workflow scope.
+permissions:
+  contents: read
+
 jobs:
   qodana:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # pr-mode is false, so the action never opens/updates a PR — only
+    # publishes the Checks-API result. contents/pull-requests writes were
+    # unused and have been dropped.
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
       checks: write
     steps:
       - uses: actions/checkout@v6

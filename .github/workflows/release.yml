@@ -17,10 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write       # Required for cosign keyless signing + Sigstore OIDC
-  attestations: write   # Required for actions/attest-build-provenance
+  # Top-level baseline = least-privilege read. id-token + attestations are
+  # shared across every build job (each calls actions/attest-build-provenance);
+  # contents:write and packages:write are scoped per-job to only the jobs
+  # that actually need them (Scorecard Token-Permissions hardening).
+  contents: read
+  id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+  attestations: write   # actions/attest-build-provenance across all build jobs
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -1136,6 +1139,9 @@ jobs:
     needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write   # gh release create
+      id-token: write   # cosign sign-blob keyless (SHA256SUMS.bundle)
 
     steps:
       - uses: actions/checkout@v6
