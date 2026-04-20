@@ -44,6 +44,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian PR 2 prerequisites (#452).** Pre-REST-endpoint hardening of the
+  `GuaranteedStateStore` so PR 2's ingest path can land on a production-ready
+  foundation:
+  - **`std::expected<T, std::string>` mutators with `kConflictPrefix`.**
+    `create_rule`, `update_rule`, `delete_rule`, and `insert_event` now
+    return `std::expected<void, std::string>` and surface duplicate-UNIQUE
+    / PRIMARY KEY collisions as `kConflictPrefix`-prefixed errors so REST
+    handlers can map them to HTTP 409 (matching #396/#399/#402). Not-found
+    paths return a distinct non-conflict error so routes can split 404 from
+    409 cleanly.
+  - **`created_by` / `updated_by` audit columns on `guaranteed_state_rules`.**
+    Added to the v1 migration (before schema freeze). REST handlers in PR 2
+    populate both from the session principal; SOC 2 audit-chain
+    reconstruction can now answer "who authorised this rule version" from
+    the store alone, with the full `audit_events` join procedure documented
+    in `docs/yuzu-guardian-design-v1.1.md` §9.3.
+  - **Retention reaper on `guaranteed_state_events`.** 30-day default
+    (new `guardian_event_retention_days` config, overridable via runtime
+    config). Events carry `ttl_expires_at` populated at insert; a
+    background thread mirroring `AuditStore::run_cleanup` runs a periodic
+    `DELETE`. Partial index `idx_gse_ttl WHERE ttl_expires_at > 0` keeps
+    the reap query fast at fleet-scale ingest. `retention_days = 0`
+    disables expiry for forensic freezes.
+  - **Batch `insert_events(std::vector<…>)` API.** Wraps a `BEGIN…COMMIT`
+    envelope; one fsync per batch instead of one per row (10–50× faster at
+    agent batch sizes). Transactional — any failing row rolls back the
+    whole batch so REST handlers never have to reason about partial state.
+  - **Prometheus observability.** Four new server gauges — `yuzu_server_`
+    `guardian_rules_total`, `guardian_events_total`,
+    `guardian_events_written_total`, `guardian_events_reaped_total`. Wired
+    into the existing health-recompute thread alongside `audit_store`'s
+    gauges; sized at zero before ingest starts so alert rules
+    (e.g. `yuzu_server_guardian_events_total > 5e6`) can be authored up
+    front.
+  - **Data inventory entry.** `guaranteed_state_events` recorded in the
+    workstream-E data inventory (`docs/enterprise-readiness-soc2-first-customer.md` §3.5)
+    with the 30-day retention policy, reaper mechanism, and sizing
+    guidance for customers with longer forensic SLAs.
+
 - **Guardian "Guaranteed State" engine — wire contract + server store
   skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
   SQLite file `guaranteed-state.db` is created in the server data directory
@@ -165,6 +204,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
+- Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
+  the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
+  errors on both `name` and `rule_id`, conflict on rename-into-existing
+  name, batch `insert_events` happy path + transactional rollback on
+  mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
+  reaper delete mechanics (including `retention_days=0` sentinel).
 
 ## [0.11.0] - 2026-04-17
 
