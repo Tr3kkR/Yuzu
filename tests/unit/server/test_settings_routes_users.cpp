@@ -232,6 +232,8 @@ constexpr std::string_view kSelfDeleteToast =
     R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})";
 constexpr std::string_view kSelfDemoteToast =
     R"({"showToast":{"message":"Cannot change your own role","level":"error"}})";
+constexpr std::string_view kDuplicateUsernameToast =
+    R"({"showToast":{"message":"Username already exists","level":"error"}})";
 
 } // namespace
 
@@ -365,6 +367,29 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: success path renders self-ro
     CHECK(res->body.find("hx-delete=\"/api/settings/users/admin\"") == std::string::npos);
     CHECK(res->body.find("Current user") != std::string::npos);
     CHECK(h.has_audit("user.upsert", "success", "User", "carol"));
+}
+
+// ── Duplicate-username guard (#399) ──────────────────────────────────────────
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: duplicate username rejected",
+          "[settings][users][duplicate]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // 'bob' is pre-seeded by the harness with role=user. Re-creating must
+    // fail with 409 + duplicate-username toast — the prior behavior was a
+    // silent password overwrite via upsert_user (#399).
+    auto res = h.Post("/api/settings/users",
+                        "username=bob&password=newbobpassword&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger") == kDuplicateUsernameToast);
+    CHECK(h.has_audit("user.upsert", "denied", "User", "bob"));
+    // The original password must still authenticate — the rejection must
+    // not have run upsert_user under the hood.
+    CHECK(h.auth_mgr.authenticate("bob", "bobpassword12").has_value());
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────

@@ -369,6 +369,15 @@ Cross files live in `meson/cross/`. Native files for CI compiler selection live 
 | Prometheus metrics, label set, audit envelope, event format | `docs/observability-conventions.md` | `sre` and `architect` on any metrics/audit/event change |
 | Response data types, audit envelope, inventory data for analytics | `docs/data-architecture.md` | `architect` and `sre` when designing schemas |
 | User manual / YAML defs / REST API / Substrate primitive registration | docs-writer agent (`.claude/agents/docs-writer.md`) | docs-writer on every change as part of governance gate 2 |
+| Guardian / Guaranteed State — real-time agent-side policy enforcement, guard categories (event vs condition), kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS), YAML DSL (`kind: GuaranteedStateRule`), `__guard__` wire protocol, server store, approval workflow, quarantine | `docs/yuzu-guardian-design-v1.1.md` + Windows-first delivery plan `docs/yuzu-guardian-windows-implementation-plan.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guard_engine*`, `guard_*.{hpp,cpp}`, or `__guard__` protocol change |
+
+## Guardian engine — stores and architectural notes
+
+The Guardian rollout is Windows-first per the delivery plan. Server-side state lives in one new SQLite file opened at startup next to `policy_store_`:
+
+- **`guaranteed-state.db`** (PR 1) — `GuaranteedStateStore` with `guaranteed_state_rules` + `guaranteed_state_events`. Rule yaml_source is authoritative; denormalised columns (severity, os_target, scope_expr) are indexes. Events are an immutable audit-style log (no FK cascade on rule delete; historical events persist for forensic review — matches `audit_store` retention discipline). Proto lives at `proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1` — deliberately separate from `yuzu.agent.v1` so Guardian wire contracts evolve independently). Full schema + design: `docs/yuzu-guardian-design-v1.1.md` §9.1.
+
+Agent-side Guardian code lands in PR 2+ under `agents/core/src/guard_*.{hpp,cpp}` — do not treat as present yet. See `docs/yuzu-guardian-windows-implementation-plan.md` for PR-by-PR scope.
 
 ## CLAUDE.md updates
 

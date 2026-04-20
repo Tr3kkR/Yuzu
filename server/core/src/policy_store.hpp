@@ -126,6 +126,14 @@ public:
     std::optional<PolicyFragment> get_fragment(const std::string& id) const;
     bool delete_fragment(const std::string& id);
 
+    /// Extract the operator-facing fragment name from a YAML source string
+    /// without parsing the entire fragment. Used by route handlers that
+    /// need to attribute denial audits before calling create_fragment().
+    /// Returns the displayName, falling back to name, falling back to id,
+    /// finally falling back to "" if none are present. Defined as a static
+    /// helper because route layers should not own YAML parsing themselves.
+    static std::string peek_fragment_name(const std::string& yaml_source);
+
     // ── Policies ─────────────────────────────────────────────────────────
     std::expected<std::string, std::string> create_policy(const std::string& yaml_source);
     std::vector<Policy> query_policies(const PolicyQuery& q = {}) const;

@@ -3,6 +3,7 @@
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
 #include "migration_runner.hpp"
+#include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -419,6 +420,17 @@ void PolicyStore::create_tables() {
     }
 }
 
+std::string PolicyStore::peek_fragment_name(const std::string& yaml_source) {
+    // Mirrors the resolution order inside create_fragment(): displayName,
+    // then name, then id, finally empty. Used by route layers to attribute
+    // denial audits without re-implementing YAML parsing.
+    auto display = extract_yaml_value(yaml_source, "displayName");
+    if (!display.empty()) return display;
+    auto name = extract_yaml_value(yaml_source, "name");
+    if (!name.empty()) return name;
+    return extract_yaml_value(yaml_source, "id");
+}
+
 std::string PolicyStore::generate_id() const {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dist;
@@ -498,6 +510,31 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     }
 
     auto now = now_epoch();
+
+    // #396: reject duplicate fragment name with the shared kConflictPrefix
+    // the routes layer maps to HTTP 409. The schema does not enforce UNIQUE
+    // on name (would require a destructive migration on existing
+    // deployments), so the check lives in application code under the
+    // unique_lock acquired above. Empty name is impossible — defaults to id
+    // at extraction time.
+    //
+    // sec-LOW2 / sre-1: prepare failure is treated as a hard error rather
+    // than silently bypassing the duplicate check.
+    {
+        sqlite3_stmt* exists_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM policy_fragments WHERE name=? LIMIT 1",
+                               -1, &exists_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("PolicyStore: prepare failed in duplicate-name check: {}",
+                          sqlite3_errmsg(db_));
+            return std::unexpected("internal: duplicate-name check failed");
+        }
+        sqlite3_bind_text(exists_stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
+        sqlite3_finalize(exists_stmt);
+        if (exists)
+            return std::unexpected(std::string(kConflictPrefix) +
+                                   " policy fragment named '" + name + "' already exists");
+    }
 
     const char* sql = R"(
         INSERT INTO policy_fragments

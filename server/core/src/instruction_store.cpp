@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "migration_runner.hpp"
+#include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -256,6 +257,33 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
 
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();
+
+    // #402: when caller supplies an explicit id, reject duplicates with the
+    // shared kConflictPrefix the routes layer maps to HTTP 409. The id column
+    // is PRIMARY KEY so SQLite would also reject the INSERT, but the
+    // constraint failure surfaces as a generic "insert failed" error string
+    // with no way for the route handler to distinguish a 409 from a 400. An
+    // explicit pre-check under unique_lock keeps the error code accurate.
+    //
+    // sec-LOW2 / sre-1: prepare failure is treated as a hard error rather
+    // than silently bypassing the duplicate check — under DB stress we want
+    // the 409 contract to fail closed, not to silently degrade to "INSERT
+    // anyway and hope SQLite's PK rejects it".
+    if (!def.id.empty()) {
+        sqlite3_stmt* exists_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1",
+                               -1, &exists_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("InstructionStore: prepare failed in duplicate-id check: {}",
+                          sqlite3_errmsg(db_));
+            return std::unexpected("internal: duplicate-id check failed");
+        }
+        sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
+        sqlite3_finalize(exists_stmt);
+        if (exists)
+            return std::unexpected(std::string(kConflictPrefix) +
+                                   " instruction definition '" + id + "' already exists");
+    }
 
     const char* sql = R"(
         INSERT INTO instruction_definitions

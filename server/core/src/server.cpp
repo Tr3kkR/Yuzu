@@ -7,6 +7,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/version.hpp>
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
 #include "web_utils.hpp"
@@ -16,6 +17,7 @@
 
 #include "agent.grpc.pb.h"
 #include "analytics_event.hpp"
+#include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
@@ -34,6 +36,7 @@
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "guaranteed_state_store.hpp"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -474,6 +477,17 @@ public:
             policy_store_ = std::make_unique<PolicyStore>(policy_db);
             if (policy_store_ && policy_store_->is_open()) {
                 spdlog::info("PolicyStore initialized at {}", policy_db.string());
+            }
+        }
+
+        // Guardian (Guaranteed State) rule + event store. REST/dashboard/push
+        // wiring lands in later PRs; this PR just stands the store up so the
+        // schema migration runs and the database file exists.
+        {
+            auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
+            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(gs_db);
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
+                spdlog::info("GuaranteedStateStore initialized at {}", gs_db.string());
             }
         }
 
@@ -1525,7 +1539,10 @@ private:
                  {{"in_flight", in_flight},
                   {"completed_last_hour", completed_last_hour},
                   {"failed_last_hour", failed_last_hour}}},
-                {"version", "0.1.0"}};
+                // #401: was hardcoded "0.1.0" — now derived from the
+                // meson-generated yuzu/version.hpp so the health endpoint
+                // tracks the actual build instead of a stale literal.
+                {"version", std::string(yuzu::kVersionString)}};
 
             // Process health (22.1) — only include for authenticated requests
             // to avoid leaking process internals to unauthenticated callers.
@@ -1579,6 +1596,8 @@ private:
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
+                {"guaranteed_state_store",
+                 guaranteed_state_store_ && guaranteed_state_store_->is_open()},
             };
 
             std::string failed_list;
@@ -2904,6 +2923,11 @@ private:
             try {
                 auto j = nlohmann::json::parse(req.body);
                 InstructionDefinition def;
+                // #402 / iter-H1: honor caller-supplied `id` so the
+                // duplicate-id guard in create_definition_impl actually
+                // fires from this endpoint. Prior code dropped the id on
+                // the floor, leaving #402's protection store-only.
+                def.id = j.value("id", "");
                 def.name = j.value("name", "");
                 def.version = j.value("version", "1.0");
                 def.type = j.value("type", "");
@@ -2935,8 +2959,22 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // #402: store-level kConflictPrefix maps to HTTP 409. The
+                    // prefix is an internal store↔route contract — strip it
+                    // before placing the message in the operator-facing JSON
+                    // body (governance enterprise-N1). Emit a denied audit
+                    // event so duplicate-id probing leaves a trace
+                    // (governance compliance-1, up-18).
+                    bool is_conflict = is_conflict_error(result.error());
+                    res.status = is_conflict ? 409 : 400;
+                    if (is_conflict) {
+                        audit_log(req, "instruction.create", "denied",
+                                  "instruction", def.id, "duplicate_id");
+                    }
+                    auto body_msg = is_conflict
+                        ? std::string(strip_conflict_prefix(result.error()))
+                        : result.error();
+                    res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                     "application/json");
                     return;
                 }
@@ -3109,8 +3147,22 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // iter-H2: /import shares the create_definition_impl path,
+                // so it inherits the kConflictPrefix → 409 mapping that the
+                // POST handler does. Without this mapping the import path
+                // returns 400 with the raw "conflict:" prefix in the body
+                // — defeats the prefix-stripping contract on the very
+                // endpoint that exercises duplicate-id rejection most.
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                if (is_conflict) {
+                    audit_log(req, "instruction.import", "denied",
+                              "instruction", "", "duplicate_id");
+                }
+                auto body_msg = is_conflict
+                    ? std::string(strip_conflict_prefix(result.error()))
+                    : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                 "application/json");
                 return;
             }
@@ -4679,6 +4731,7 @@ private:
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
+    std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;

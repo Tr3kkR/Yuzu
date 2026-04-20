@@ -59,6 +59,21 @@ vcpkg_installed/
 .clangd/
 CLion.ini
 
+# Secrets / credentials (defence-in-depth alongside GitHub Advanced Secret
+# Scanning push-protection — stops accidental staging before it reaches a
+# remote). No such files are currently tracked; if you ever need to commit
+# a fixture with one of these extensions (e.g. an intentional test PEM),
+# add a path-specific negation below this block.
+*.pem
+*.key
+*.pfx
+*.p12
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example
+
 # OS
 .DS_Store
 Thumbs.db

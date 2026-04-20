@@ -5,6 +5,7 @@
 
 #include "compliance_routes.hpp"
 
+#include "store_errors.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
@@ -372,8 +373,27 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
             auto result = policy_store_->create_fragment(yaml_source);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+                // #396: store-level kConflictPrefix maps to HTTP 409. Strip
+                // the internal prefix from the operator-facing JSON body
+                // (governance enterprise-N1) and emit a denied audit so
+                // name-enumeration leaves a trace (governance compliance-1,
+                // up-18). The fragment name is recovered from the error
+                // string when audit needs it — the parsed YAML name isn't
+                // available here without re-extracting.
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                if (is_conflict) {
+                    // iter-M1: target_id is the fragment name (parsed from
+                    // YAML) so SOC 2 audit reviewers can answer "duplicate
+                    // of which fragment?" without re-correlating timestamps.
+                    auto attempted_name = PolicyStore::peek_fragment_name(yaml_source);
+                    audit_fn_(req, "policy_fragment.create", "denied",
+                              "policy_fragment", attempted_name, "duplicate_name");
+                }
+                auto body_msg = is_conflict
+                    ? std::string(strip_conflict_prefix(result.error()))
+                    : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
                 return;
             }
             audit_fn_(req, "policy_fragment.create", "success", "policy_fragment", *result, "");

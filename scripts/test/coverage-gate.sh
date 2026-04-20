@@ -153,15 +153,28 @@ write_metric() {
 }
 
 tool_check() {
+    # Exit code discipline:
+    #   --full / enforce mode: exit 2 so the caller sees a hard failure it
+    #     can choose to bubble up. The WARN row is already recorded.
+    #   --report-only (default-mode caller): exit 0 so the caller's `|| …`
+    #     fallback doesn't fire and double-write a gate row. The WARN row
+    #     from this function is authoritative and sufficient.
+    #   --capture-baselines: exit 2 (same as enforce) — a missing tool here
+    #     would otherwise silently capture a zero-coverage baseline.
+    local tool_miss_exit=2
+    if (( REPORT_ONLY )) && ! (( CAPTURE )); then
+        tool_miss_exit=0
+    fi
+
     if ! command -v gcovr >/dev/null 2>&1; then
         echo "coverage-gate: gcovr not on PATH (pip install gcovr)" | tee -a "$GATE_LOG"
-        write_gate WARN 0 "gcovr missing — install with 'pip3 install gcovr' and re-run"
-        exit 2
+        write_gate WARN 0 "gcovr missing — install with 'pip3 install --user gcovr' and re-run"
+        exit "$tool_miss_exit"
     fi
     if ! command -v meson >/dev/null 2>&1; then
         echo "coverage-gate: meson not on PATH" | tee -a "$GATE_LOG"
         write_gate WARN 0 "meson missing"
-        exit 2
+        exit "$tool_miss_exit"
     fi
 }
 
@@ -194,6 +207,17 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     if [[ -f "$NATIVE_FILE" ]]; then
         MESON_SETUP_EXTRA+=(--native-file "$NATIVE_FILE")
         echo "coverage-gate: using native-file $NATIVE_FILE (matches ci.yml coverage job)" | tee -a "$GATE_LOG"
+    fi
+    # Propagate the vcpkg install root so fresh `build-linux-coverage/`
+    # can find grpc/protobuf/sqlite3/etc. Without this `meson setup` fails
+    # on a bare checkout because the coverage build dir doesn't inherit
+    # the cmake_prefix_path from the sibling `build-linux/`.
+    # Per the governance Round 1 fix and issue #460, the install tree
+    # lives per-OS; use the Linux path here.
+    VCPKG_X64_LINUX="$YUZU_ROOT/vcpkg_installed/x64-linux"
+    if [[ -d "$VCPKG_X64_LINUX" ]]; then
+        MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_X64_LINUX")
+        echo "coverage-gate: using cmake_prefix_path=$VCPKG_X64_LINUX" | tee -a "$GATE_LOG"
     fi
     if ! meson setup "$BUILD_DIR" \
         "${MESON_SETUP_EXTRA[@]}" \
@@ -252,6 +276,7 @@ GCOVR_RC=0
         --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
         --exclude '.*\.pb\.(h|cc)$' \
         --branches \
+        --gcov-ignore-parse-errors=negative_hits.warn \
         --json-summary "$GCOVR_JSON" \
         --xml "$GCOVR_XML" \
         --html --html-details -o "$GCOVR_HTML_DIR/index.html" \

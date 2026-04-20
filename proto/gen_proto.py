@@ -39,7 +39,21 @@ for f in glob.glob(outdir + "/**/*.pb.*", recursive=True):
     try:
         with open(f, "r", encoding="utf-8") as fh:
             content = fh.read()
-        content = re.sub(r'#include "(?:[^"/]+/)*([^"/]+\.pb\.h)"', r'#include "\1"', content)
+        # Flatten Yuzu proto include paths so generated files can reference
+        # sibling Yuzu protos by basename alone (matching the flattened layout
+        # produced by the shutil.move step below).
+        #
+        # SCOPE: yuzu/... only. Well-known types like google/protobuf/*.pb.h
+        # MUST retain their canonical include path because they resolve via
+        # vcpkg's protobuf include root, not our build-tree proto/ directory.
+        # A broader pattern (e.g. "any subdir") would rewrite
+        # `#include "google/protobuf/timestamp.pb.h"` to `"timestamp.pb.h"`,
+        # which doesn't exist anywhere and breaks every C++ build target.
+        content = re.sub(
+            r'#include "yuzu/(?:[^"/]+/)*([^"/]+\.pb\.h)"',
+            r'#include "\1"',
+            content,
+        )
         with open(f, "w", encoding="utf-8") as fh:
             fh.write(content)
     except UnicodeDecodeError:

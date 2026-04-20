@@ -744,18 +744,25 @@ log "═════════════════════════
 http_get "$SERVER_URL/api/policy-fragments"
 assert_status_any "GET /api/policy-fragments" "$HTTP_STATUS" 200 503
 
+# Salt the fragment name with the run timestamp so back-to-back runs against
+# the same server don't collide with #396's new 409-on-duplicate-name guard.
+FRAGMENT_NAME="e2e-test-fragment-$(date +%s)-$$"
 http_post "$SERVER_URL/api/policy-fragments" \
-    "{\"name\":\"e2e-test-fragment\",\"expression\":\"os == \\\"linux\\\"\",\"description\":\"E2E test\"}"
-assert_status_any "POST /api/policy-fragments" "$HTTP_STATUS" 200 201 400
+    "{\"name\":\"$FRAGMENT_NAME\",\"expression\":\"os == \\\"linux\\\"\",\"description\":\"E2E test\"}"
+# 409 is also accepted to keep this script resilient to a polluted DB on
+# shared environments — the next run will use a fresh salted name.
+assert_status_any "POST /api/policy-fragments" "$HTTP_STATUS" 200 201 400 409
 FRAGMENT_ID=$(extract_json_field "id" "$HTTP_BODY")
 
 # Policies
 http_get "$SERVER_URL/api/policies"
 assert_status_any "GET /api/policies" "$HTTP_STATUS" 200 503
 
+POLICY_NAME="e2e-test-policy-$(date +%s)-$$"
 http_post "$SERVER_URL/api/policies" \
-    "{\"name\":\"e2e-test-policy\",\"description\":\"E2E test\",\"scope\":\"os == \\\"linux\\\"\",\"rules\":[{\"plugin\":\"os_info\",\"action\":\"os_name\",\"condition\":\"output != ''\",\"name\":\"has-os\"}]}"
-assert_status_any "POST /api/policies" "$HTTP_STATUS" 200 201 400
+    "{\"name\":\"$POLICY_NAME\",\"description\":\"E2E test\",\"scope\":\"os == \\\"linux\\\"\",\"rules\":[{\"plugin\":\"os_info\",\"action\":\"os_name\",\"condition\":\"output != ''\",\"name\":\"has-os\"}]}"
+# Accept 409 against shared environments (same rationale as fragments above).
+assert_status_any "POST /api/policies" "$HTTP_STATUS" 200 201 400 409
 POLICY_ID=$(extract_json_field "id" "$HTTP_BODY")
 
 if [[ -n "$POLICY_ID" ]]; then

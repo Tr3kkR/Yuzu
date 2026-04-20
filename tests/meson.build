@@ -76,6 +76,7 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_policy_store.cpp',
+      'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
@@ -96,6 +97,7 @@ if build_server
       'unit/server/test_rest_api_tokens.cpp',
       'unit/server/test_security_headers.cpp',
       'unit/server/test_settings_routes_users.cpp',
+      'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
     ),
     include_directories: [
