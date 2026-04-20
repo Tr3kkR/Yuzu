@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Tighten GitHub Actions token permissions for OpenSSF Scorecard
+  Token-Permissions check.** Scorecard's Token-Permissions check scored 0
+  because `qodana_code_quality.yml` had no top-level `permissions:` block
+  (one missing block zeroes the entire check) and several workflows
+  declared writes at workflow scope that only specific jobs actually
+  needed. Changes:
+  - `qodana_code_quality.yml`: new top-level `permissions: contents: read`;
+    dropped unused job-level `contents: write` + `pull-requests: write`
+    (pr-mode is false, so the action never opens PRs); kept `checks: write`
+    at job scope.
+  - `release.yml`: demoted top-level `contents: write` + `packages: write`
+    to job scope. `id-token: write` and `attestations: write` stay at
+    workflow scope because every build job calls
+    `actions/attest-build-provenance`. The `release` job gets explicit
+    `contents: write` + `id-token: write`; `docker-publish` already had
+    its own explicit block.
+  - `vcpkg-baseline-update.yml`: top-level `permissions: contents: read`;
+    moved `contents: write` + `pull-requests: write` into the
+    `propose-bump` job.
+  - `ci.yml`: removed unused top-level `packages: write` (the workflow
+    doesn't push to any registry); top-level is now `contents: read` only.
+
+- **Wire `SCORECARD_READ_TOKEN` PAT into `scorecard.yml`.** Scorecard's
+  `Branch-Protection` check caps at ~3/10 without a PAT because the
+  public GitHub API can't read Repository Rulesets. The action now
+  receives `repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}`
+  so the ruleset-aware code path runs once the secret is populated. The
+  `|| github.token` fallback keeps fork runs and first-time-setup scans
+  succeeding. PAT creation + rotation procedure documented at
+  `docs/security/scorecard-token.md` — classic PAT with `public_repo` +
+  `read:org` scopes ONLY; 90-day expiration with a 365-day rotation
+  cadence.
+
 ### Added
 
 - **Guardian "Guaranteed State" engine — wire contract + server store
