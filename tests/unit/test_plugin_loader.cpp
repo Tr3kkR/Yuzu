@@ -4,6 +4,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <random>
+#include <string>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -100,9 +102,15 @@ TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
 
     // Copy the fixture into an isolated directory so we scan only it —
     // avoids false positives from stray built plugins that may live in a
-    // shared tree when run from the build root.
+    // shared tree when run from the build root. Unique per-invocation name
+    // is generated from mt19937_64 rather than ::getpid() so the code
+    // compiles on MSVC (`_getpid` in <process.h>) and Apple Clang
+    // (`<unistd.h>` not transitively available) without per-platform
+    // guards. Same pattern sibling store tests use.
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
     auto tmp = fs::temp_directory_path() /
-               ("yuzu_test_reserved_plugin_" + std::to_string(::getpid()));
+               ("yuzu_test_reserved_plugin_" + std::to_string(gen()));
     fs::create_directories(tmp);
     auto staged = tmp / fixture.filename();
     std::error_code ec;
