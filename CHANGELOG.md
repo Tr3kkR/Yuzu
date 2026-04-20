@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0-rc2] - 2026-04-20
+
 ### Added
 
 - **Guardian "Guaranteed State" engine — wire contract + server store
