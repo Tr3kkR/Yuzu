@@ -1,5 +1,16 @@
 catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
 
+# ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
+# Built only when tests are enabled; test_plugin_loader.cpp scans against this
+# shared library to verify the reserved-name rejection path.
+reserved_name_fixture_plugin = shared_library(
+  'reserved_name_fixture_plugin',
+  files('unit/fixtures/reserved_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 agent_test_exe = executable(
   'yuzu_agent_tests',
@@ -22,8 +33,17 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
+  # Ensure the fixture plugin is built before the test runs so the lookup
+  # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
+  link_depends: reserved_name_fixture_plugin,
 )
-test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 240)
+test(
+  'agent unit tests',
+  agent_test_exe,
+  suite: 'agent',
+  timeout: 240,
+  depends: reserved_name_fixture_plugin,
+)
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]

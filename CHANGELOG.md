@@ -141,6 +141,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
+- Added `tests/unit/fixtures/reserved_name_plugin.cpp` — a test plugin
+  declaring the reserved `__guard__` name — plus three new test cases in
+  `tests/unit/test_plugin_loader.cpp` (`is_reserved_plugin_name`
+  predicate, `kReservedPluginNames` namespace pin, and a behavioural
+  scan-rejection test that copies the fixture into a temp directory and
+  asserts `PluginLoader::scan` refuses to load it). The fixture is built
+  as a `shared_library` in `tests/meson.build` and wired as a `depends:`
+  of the agent test runner so it's on disk before the test runs.
 ## [0.11.0] - 2026-04-17
 
 _Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
