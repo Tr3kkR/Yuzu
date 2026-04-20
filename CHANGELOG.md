@@ -169,6 +169,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
+- Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
+  the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
+  errors on both `name` and `rule_id`, conflict on rename-into-existing
+  name, batch `insert_events` happy path + transactional rollback on
+  mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
+  reaper delete mechanics (including `retention_days=0` sentinel).
 
 ## [0.11.0] - 2026-04-17
 
