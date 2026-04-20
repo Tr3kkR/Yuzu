@@ -26,7 +26,7 @@ Modes are layered: `--full` includes everything `default` runs, `default` includ
 ```
 Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
-Phase 2 — Upgrade Test          (v0.10.0 → HEAD: fixtures, migrate, verify)
+Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
 Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
@@ -196,11 +196,16 @@ Skipped in `--quick`. In default and `--full`:
 ```bash
 bash scripts/test/test-upgrade-stack.sh \
     --run-id "$RUN_ID" \
-    --old-version 0.10.0 \
     --new-version "0.10.1-test-${RUN_ID}" \
     --new-image-loaded 1 \
     --test-dir "$TEST_DIR"
 ```
+
+`--old-version` is omitted so the script resolves it from GitHub's current
+"Latest release" at runtime (`gh api repos/Tr3kkR/Yuzu/releases/latest`).
+This keeps the upgrade baseline tracking whatever the last published stable
+tag is without needing a pipeline edit each release. Pass `--old-version
+X.Y.Z` to pin an older baseline for debugging.
 
 The script records its own gate row (`Upgrade vOLD->vNEW`) and sub-step timings (`pull-old-images`, `stack-up-old`, `fixtures-write`, `image-swap`, `ready-after-upgrade`, `fixtures-verify`, `synthetic-uat-against-upgraded`). The skill doesn't need to record anything additional.
 
