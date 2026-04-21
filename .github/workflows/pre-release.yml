@@ -579,29 +579,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Scan Docker images
+      # Scope: Trivy is used here ONLY for vulnerability scanning of
+      # published container images. SBOM generation is NOT done here —
+      # the authoritative SBOMs ship from release.yml via
+      # `anchore/sbom-action` (Syft). Two generators would produce two
+      # SBOMs that disagree on component enumeration for the same image.
+      - name: Pull images for scanning
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
-
-          # Install Trivy
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-          FAILED=0
           for img in yuzu-server yuzu-agent yuzu-gateway; do
-            echo "=== Scanning $img ==="
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: not found"; continue; }
-
-            # Scan for HIGH/CRITICAL vulns (warn but don't fail on unfixed)
-            trivy image --severity HIGH,CRITICAL \
-              --ignore-unfixed \
-              --exit-code 0 \
-              "$REGISTRY/$img:$VERSION" | tee "trivy-${img}.txt"
-
-            # Generate SBOM
-            trivy image --format spdx-json \
-              -o "sbom-${img}.json" \
-              "$REGISTRY/$img:$VERSION" 2>/dev/null || true
+            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
+              || echo "SKIP: $img:$VERSION not found"
           done
+
+      - name: Scan yuzu-server
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-server:${{ needs.resolve.outputs.version }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: trivy-yuzu-server.txt
+
+      - name: Scan yuzu-agent
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-agent:${{ needs.resolve.outputs.version }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: trivy-yuzu-agent.txt
+
+      - name: Scan yuzu-gateway
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: trivy-yuzu-gateway.txt
 
       - name: Upload scan results
         if: always()
@@ -610,7 +629,6 @@ jobs:
           name: security-scan
           path: |
             trivy-*.txt
-            sbom-*.json
           retention-days: 7
 
   # ── Soak test (10 min stability) ────────────────────────────────────

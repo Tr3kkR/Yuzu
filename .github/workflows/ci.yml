@@ -110,7 +110,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
-          pip3 install --user --break-system-packages -r requirements-ci.txt
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
@@ -338,7 +338,9 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install "$(grep '^meson==' requirements-ci.txt)"
+          # awk strips the trailing ` \` that pip-compile adds when the
+          # requirement is continued by `--hash=...` lines.
+          pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
       - name: Cache ccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -426,7 +428,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
@@ -511,7 +513,7 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
@@ -594,7 +596,11 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt gcovr
+          # requirements-ci.txt is hash-pinned; gcovr is not (it's a coverage
+          # tool pulled in only for this job). --require-hashes applies per
+          # invocation, so split install into two steps.
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache

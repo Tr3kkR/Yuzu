@@ -257,7 +257,8 @@ services:
 
   # ── Prometheus ───────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    # Matches deploy/docker/docker-compose.uat.yml; bump both together.
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
     container_name: yuzu-prometheus
     restart: unless-stopped
     ports:
@@ -273,7 +274,8 @@ services:
 
   # ── Grafana ──────────────────────────────────────────────────────────
   grafana:
-    image: grafana/grafana:latest
+    # Matches deploy/docker/docker-compose.uat.yml; bump both together.
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
     container_name: yuzu-grafana
     restart: unless-stopped
     ports:
@@ -300,7 +302,7 @@ services:
 
   # ── ClickHouse ───────────────────────────────────────────────────────
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.12@sha256:a65ca89ddbe8e04a05036dd7d7110a203256293b407b9359130ed5e4333f45ff
     container_name: yuzu-clickhouse
     restart: unless-stopped
     ports:

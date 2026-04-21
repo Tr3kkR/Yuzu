@@ -45,7 +45,7 @@ RUN rebar3 as prod release
 #    erlang:28-alpine is currently based on alpine:3.23 (see its
 #    org.opencontainers.image.base.name annotation); bump this FROM line
 #    in lockstep whenever the erlang image's base drifts.
-FROM alpine:3.23
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
 
 RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
     && adduser -D -s /sbin/nologin yuzu-gw
