@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SHA-pin every GitHub Actions reference for OpenSSF Scorecard
+  Pinned-Dependencies check (PR #2 of Scorecard lift).** Scorecard's
+  `Pinned-Dependencies` check scored 0 because every `uses:` line in
+  `.github/workflows/*.yml` resolved by tag (`@v6`, `@v3`, `@v0`) rather
+  than by immutable commit SHA — a compromised upstream could silently
+  repoint the tag at a malicious commit. Rewrote all 144 `uses:` refs
+  across 12 workflow files to the form
+  `owner/repo@<40-char-sha> # vX.Y.Z`; the trailing version comment is
+  mandatory so Dependabot can still detect newer releases and propose
+  coordinated SHA+comment bumps. Floating-major refs (`anchore/sbom-action@v0`,
+  `ilammy/msvc-dev-cmd@v1`, `erlef/setup-beam@v1`, `bufbuild/buf-setup-action@v1`,
+  plus two cases where the `v3` major tag lagged the latest point release —
+  `actions/attest-build-provenance` and `sigstore/cosign-installer`) are
+  pinned to the latest exact X.Y.Z SHA rather than the floating major's
+  current SHA, so the pin doesn't drift back when the major tag is
+  eventually updated. `github/codeql-action/init` and `/analyze` are pinned
+  to the same parent-repo SHA per CodeQL's documented invariant.
+  Self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are
+  unaffected — action pins control which code runs on the runner, not the
+  runner image itself. PR #3 will pin the remaining two thirds of
+  `Pinned-Dependencies` (Dockerfile FROMs + `curl | sh` installers +
+  pip hash-pinning).
+- **Group Dependabot GitHub Actions PRs.** After SHA-pinning, Dependabot
+  opens one PR per action per bump — roughly 3× the pre-pin weekly
+  volume. Added a `groups:` block under the `github-actions` ecosystem
+  in `.github/dependabot.yml` to bundle related cohorts:
+  `actions-core` (`actions/*`), `docker-actions` (`docker/*`), and
+  `github-codeql` (`github/codeql-action/*`). Ungrouped actions still
+  ship as individual PRs.
+
 - **Tighten GitHub Actions token permissions for OpenSSF Scorecard
   Token-Permissions check.** Scorecard's Token-Permissions check scored 0
   because `qodana_code_quality.yml` had no top-level `permissions:` block
