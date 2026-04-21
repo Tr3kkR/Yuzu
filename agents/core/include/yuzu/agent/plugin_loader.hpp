@@ -2,10 +2,12 @@
 
 #include <yuzu/plugin.h>
 
+#include <array>
 #include <expected>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -15,6 +17,31 @@ struct LoadError {
     std::string path;
     std::string reason;
 };
+
+/// Plugin names the agent reserves for internal dispatch (Guardian engine,
+/// future system/OTA intercepts). Third-party plugins loaded at scan time
+/// that declare one of these names are rejected so a compromised or
+/// misconfigured plugin author cannot shadow the reserved dispatch paths.
+/// See docs/yuzu-guardian-design-v1.1.md §7.2 for `__guard__`.
+inline constexpr std::array<std::string_view, 3> kReservedPluginNames{
+    "__guard__",   // Guardian engine (design v1.1 §7.2)
+    "__system__",  // reserved for future system-scope commands
+    "__update__",  // reserved for OTA update commands
+};
+
+/// Stable reason prefix recorded in LoadError::reason when a plugin is
+/// rejected because its declared name is in kReservedPluginNames. Callers
+/// (e.g. agent metrics) can match on this prefix to count rejections by
+/// category without re-parsing free-form text.
+inline constexpr std::string_view kReservedNameReason = "reserved plugin name";
+
+/// True if name matches one of kReservedPluginNames exactly (case-sensitive).
+[[nodiscard]] constexpr bool is_reserved_plugin_name(std::string_view name) noexcept {
+    for (auto reserved : kReservedPluginNames) {
+        if (name == reserved) return true;
+    }
+    return false;
+}
 
 /// SHA-256 hash a file on disk. Returns lowercase hex or empty on failure.
 [[nodiscard]] std::string sha256_file(const std::filesystem::path& path);

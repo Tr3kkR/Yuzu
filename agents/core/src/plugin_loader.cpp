@@ -280,6 +280,19 @@ PluginLoader::ScanResult PluginLoader::scan(
 
         auto loaded = PluginHandle::load(entry.path());
         if (loaded) {
+            const std::string_view plugin_name{loaded->descriptor()->name};
+            if (is_reserved_plugin_name(plugin_name)) {
+                // #453: prevent a compromised plugin author from shadowing
+                // the Guardian (__guard__) or other reserved dispatch names.
+                // The handle destructs here and dlcloses the library.
+                spdlog::error(
+                    "Plugin {} declares reserved name '{}' — rejecting to protect internal dispatch",
+                    entry.path().string(), plugin_name);
+                result.errors.push_back(LoadError{
+                    entry.path().string(),
+                    std::string{kReservedNameReason} + ": '" + std::string{plugin_name} + "'"});
+                continue;
+            }
             spdlog::info("Loaded plugin: {} v{} from {}", loaded->descriptor()->name,
                          loaded->descriptor()->version, loaded->path());
             result.loaded.push_back(std::move(*loaded));

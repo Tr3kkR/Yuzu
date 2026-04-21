@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian: agent rejects plugins declaring a reserved internal-dispatch
+  name (#453).** The agent plugin loader now refuses to load any plugin whose
+  `YuzuPluginDescriptor::name` matches the reserved set `__guard__`,
+  `__system__`, `__update__`. Rejected plugins are logged at `error` and
+  counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}` so
+  operators can alert on reserved-name attempts distinct from generic load
+  failures. Prevents a compromised plugin author (or a misconfigured
+  third-party plugin) from shadowing the `__guard__` dispatch intercept that
+  Guardian PR 3 will add at `agents/core/src/agent.cpp`. Reserved-name
+  namespace documented in `docs/cpp-conventions.md`.
+
 - **Guardian PR 2 prerequisites (#452).** Pre-REST-endpoint hardening of the
   `GuaranteedStateStore` so PR 2's ingest path can land on a production-ready
   foundation:
@@ -204,6 +215,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
+- Added `tests/unit/fixtures/reserved_name_plugin.cpp` — a test plugin
+  declaring the reserved `__guard__` name — plus three new test cases in
+  `tests/unit/test_plugin_loader.cpp` (`is_reserved_plugin_name`
+  predicate, `kReservedPluginNames` namespace pin, and a behavioural
+  scan-rejection test that copies the fixture into a temp directory and
+  asserts `PluginLoader::scan` refuses to load it). The fixture is built
+  as a `shared_library` in `tests/meson.build` and wired as a `depends:`
+  of the agent test runner so it's on disk before the test runs.
 - Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
   the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
   errors on both `name` and `rule_id`, conflict on rename-into-existing
