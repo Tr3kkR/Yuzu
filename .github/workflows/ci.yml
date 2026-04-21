@@ -47,7 +47,7 @@ jobs:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@v6
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -65,11 +65,11 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
-      - uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
       - name: Lint protos
@@ -100,7 +100,7 @@ jobs:
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
@@ -114,7 +114,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -126,14 +126,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -141,7 +141,7 @@ jobs:
             vcpkg-x64-linux-${{ matrix.compiler }}-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -203,12 +203,12 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Assert toolchain available
         run: |
@@ -240,14 +240,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -331,7 +331,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
@@ -341,7 +341,7 @@ jobs:
           pipx install "$(grep '^meson==' requirements-ci.txt)"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ~/Library/Caches/ccache
@@ -354,14 +354,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
@@ -370,7 +370,7 @@ jobs:
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -416,7 +416,7 @@ jobs:
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
@@ -430,7 +430,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -441,14 +441,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -456,7 +456,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -501,7 +501,7 @@ jobs:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
@@ -515,7 +515,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -526,14 +526,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -541,7 +541,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -584,7 +584,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
@@ -598,7 +598,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
           key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
@@ -609,14 +609,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
@@ -624,7 +624,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -680,13 +680,13 @@ jobs:
             --html --html-details -o build-linux/coverage-html/index.html
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           files: build-linux/coverage.xml
           fail_ci_if_error: false
 
       - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: build-linux/coverage-html/
