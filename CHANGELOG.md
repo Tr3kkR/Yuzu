@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Digest-pin Dockerfile `FROM` lines, replace `curl | sh` installers,
+  and hash-pin `requirements-ci.txt` (PR #3 of Scorecard lift).**
+  Completes Scorecard's `Pinned-Dependencies` check — the remaining
+  two-thirds after PR #2 addressed the GitHub Actions third. Changes:
+  - **Dockerfile `FROM` digest pins.** Eight `deploy/docker/Dockerfile.*`
+    base images were previously referenced by tag only
+    (`ubuntu:24.04`, `erlang:28`, `alpine:3.23`). Pinned each to its
+    current multi-arch index digest. `Dockerfile.runner-linux` — which
+    seeds the self-hosted runner image on Shulgi — is now pinned to an
+    exact digest of `ghcr.io/actions/actions-runner:latest`; Dependabot's
+    `/deploy/docker` docker scope will continue to propose bumps as new
+    runner releases ship.
+  - **`curl | bash` NodeSource installs replaced with verified tarball
+    download.** `Dockerfile.ci-linux` and `Dockerfile.ci-gateway` both
+    installed Node.js 20 via `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -`,
+    which Scorecard flags as unverified code execution. Replaced with a
+    direct `.tar.xz` download from `nodejs.org` + `sha256sum -c`
+    verification. `NODE_VERSION` and `NODE_SHA256_LINUX_X64` are `ARG`
+    pairs so bumps are atomic.
+  - **Trivy installer replaced with `aquasecurity/trivy-action`.**
+    `pre-release.yml` was installing Trivy via `curl -sfL … install.sh | sh`;
+    swapped for the SHA-pinned `aquasecurity/trivy-action@57a97c7e…`
+    (v0.35.0). **Scope clarification:** while making this swap, removed
+    the Trivy SBOM generation step entirely — `release.yml` already emits
+    authoritative Syft-based SBOMs via `anchore/sbom-action` for every
+    platform archive and container image, so Trivy's SBOMs were a
+    redundant second source that disagreed on component enumeration.
+    Trivy now does vulnerability scanning only (its strength); Syft owns
+    SBOM generation across the entire release pipeline.
+  - **Hash-pinned `requirements-ci.txt` via `pip-compile --generate-hashes`.**
+    Added `requirements-ci.in` as the human-edited source; `pip-compile`
+    regenerates `requirements-ci.txt` with `--hash=sha256:…` continuation
+    lines. Every `pip install -r requirements-ci.txt` call in `ci.yml`
+    and `release.yml` now uses `--require-hashes`; a tampered package
+    would fail the install rather than silently execute. macOS pipx grep
+    path updated (`awk '/^meson==/ {print $1}'`) to handle the trailing
+    `\` that `pip-compile` adds to hashed requirement lines. Bump cadence
+    documented at `docs/dependency-updates.md`.
+  - **Docker Compose image digests.** `docker-compose.local.yml` and the
+    root `docker-compose.uat.yml` referenced `prom/prometheus:latest`,
+    `grafana/grafana:latest`, and `clickhouse/clickhouse-server:latest`.
+    Aligned all three with the digest-pinned variants already used under
+    `deploy/docker/docker-compose*.yml` (Prometheus v3.2.1, Grafana
+    11.5.2, ClickHouse 24.12). Two `clickhouse-server:24.12` tag-only
+    refs under `deploy/docker/` also gained digests.
+
 - **SHA-pin every GitHub Actions reference for OpenSSF Scorecard
   Pinned-Dependencies check (PR #2 of Scorecard lift).** Scorecard's
   `Pinned-Dependencies` check scored 0 because every `uses:` line in

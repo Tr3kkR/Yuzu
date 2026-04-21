@@ -406,7 +406,7 @@ jobs:
 
       - name: Install Meson and ccache
         run: |
-          pip install -r requirements-ci.txt
+          pip install --require-hashes -r requirements-ci.txt
           choco install ccache --yes --no-progress
 
       - name: Cache ccache
@@ -701,7 +701,9 @@ jobs:
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install "$(grep '^meson==' requirements-ci.txt)"
+          # awk strips the trailing ` \` that pip-compile adds when the
+          # requirement is continued by `--hash=...` lines.
+          pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
       - name: Cache ccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5

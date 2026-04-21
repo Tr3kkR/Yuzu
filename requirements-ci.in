@@ -1,0 +1,5 @@
+# Source for requirements-ci.txt. Run
+#   pip-compile --generate-hashes requirements-ci.in
+# to regenerate the hash-pinned lock file. See docs/dependency-updates.md
+# for cadence and the Dependabot flow.
+meson==1.11.0

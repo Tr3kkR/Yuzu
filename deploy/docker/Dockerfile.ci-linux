@@ -11,7 +11,7 @@
 #       runs-on: ubuntu-24.04
 #       container: ghcr.io/tr3kkr/yuzu-ci-linux:latest
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 
 ARG MESON_VERSION=1.9.2
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
@@ -36,9 +36,18 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Node.js 20 (required by GitHub Actions runner actions) ────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# Pinned tarball + SHA-256 verification instead of NodeSource's
+# `curl | bash` repo-add script. Scorecard's Pinned-Dependencies check
+# flags curl-pipe-to-shell as unverified code execution. Tarball from
+# nodejs.org is authoritative and immutable at the checksum. Bump both
+# version and checksum together — they live in lockstep.
+ARG NODE_VERSION=20.20.2
+ARG NODE_SHA256_LINUX_X64=df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d
+RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE_SHA256_LINUX_X64}  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+         --exclude='CHANGELOG.md' --exclude='LICENSE' --exclude='README.md' \
+    && rm /tmp/node.tar.xz
 
 # ── Meson (pinned version) ────────────────────────────────────────────
 RUN pip3 install --break-system-packages meson==${MESON_VERSION}
