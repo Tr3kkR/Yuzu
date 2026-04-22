@@ -1,6 +1,6 @@
 ---
 name: cpp-expert
-description: C++23 language expert — correct, idiomatic, portable C++23 across GCC, Clang, MSVC, Apple Clang
+description: Use for any change touching `.cpp` / `.hpp` / `.h` under `agents/`, `server/`, `sdk/`, or `tests/`. C++23 language expert — reviews and edits for correctness, idiomatic style, std-library use, and portability across GCC 13+, Clang 18+, MSVC 19.38+, and Apple Clang 15+. Catches platform-specific UB, ABI-stability issues at the plugin boundary, and compiler-divergence bugs.
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 

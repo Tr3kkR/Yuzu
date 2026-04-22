@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`.claude/agents/` cleanup — token efficiency + routing effectiveness.**
+  Audit-driven sweep of the subagent frontmatter and a few body-text
+  fixes that bring the descriptions in line with how the parent agent
+  actually picks subagents.
+  - **Bug fix:** `workflow-orchestrator.md` declared `TodoWrite` in its
+    `tools:` list. The harness has long since migrated to the
+    `Task*` family (`TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`,
+    `TaskOutput`, `TaskStop`); `TodoWrite` resolves to nothing and the
+    orchestrator's progress-tracking calls silently no-op'd. Replaced
+    with `TaskCreate, TaskUpdate, TaskList`.
+  - **Merged `erlang-dev` into `gateway-erlang`.** The two agents had
+    overlapping scope ("generic Erlang" vs "Yuzu Erlang gateway") with
+    no clean disjoint routing rule, and the gateway is the only Erlang
+    component in the codebase, making `erlang-dev` functionally
+    redundant. `gateway-erlang` now carries the full body of both:
+    OTP supervision trees, rebar3 + EUnit + CT + dialyzer toolchain,
+    `prometheus_httpd` pitfalls, gpb↔protoc compat, plus the language-
+    expert content (process lifecycle rules, EXIT-signal semantics,
+    EUnit isolation recipe, mock-process-leak diagnosis from #336,
+    Erlang idioms, anti-patterns table). References updated in
+    `CONTRIBUTING.md`, `.claude/agents/workflow-orchestrator.md`
+    (gate-3 agent list + domain-trigger map), and
+    `.claude/skills/governance/SKILL.md`.
+  - **Tightened body wording in `docs-writer` and `quality-engineer`**
+    so it matches their read-only `tools:` lists. Both are governance
+    *reviewers*: their output is a structured findings report
+    (required doc updates / missing test coverage / fixture leaks)
+    that the producing agent then applies. Previous wording
+    ("produce documentation diff", "Maintain `docs/test-coverage.md`",
+    "Expand EUnit coverage") implied authoring authority they don't
+    have.
+  - **Rewrote `description:` for the five highest-traffic agents** in
+    "use when…" routing-instruction style instead of role-label style:
+    `cpp-expert`, `security-guardian`, `docs-writer`, `cross-platform`,
+    `build-ci`. The descriptions now name the file patterns / change
+    classes that should trigger each agent, so the parent's routing
+    decision is mechanical rather than interpretive.
+
 - **Tests: migrate `GuardianFixture` in `test_guardian_engine.cpp` to
   `yuzu::test::TempDbFile` RAII (#482).** Replaces the fixture's
   hand-rolled destructor (`kv_path` member + three manual `fs::remove`

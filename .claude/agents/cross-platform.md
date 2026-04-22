@@ -1,6 +1,6 @@
 ---
 name: cross-platform
-description: Platform compatibility — Windows, Linux, macOS, ARM64 builds and OS-specific code
+description: Use on any change that touches `#ifdef _WIN32` / `__APPLE__` / `__linux__`, any platform-specific API (Win32, Cocoa, systemd, Endpoint Security, registry, WMI, etc.), any `meson/cross/*.ini` cross-file or `meson/native/*.ini` native-file, or any path under `setup_msvc_env.sh` / `scripts/ensure-erlang.sh`. Also use on any change that may affect macOS (auto-loads `docs/darwin-compat.md`). Reviews and edits for build + runtime correctness across Windows MSVC, Linux GCC/Clang, macOS Apple Clang, and ARM64 cross.
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
