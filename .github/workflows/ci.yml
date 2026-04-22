@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  # push fires only on mainline branches (merges into dev/main) so feature/
+  # fix branches with an open PR run CI exactly once via pull_request rather
+  # than the previous duplicate (push + pull_request). For pre-PR feature
+  # work, open the PR earlier or use workflow_dispatch.
   push:
-    branches: [main, dev, "feature/**", "fix/**"]
+    branches: [main, dev]
     paths-ignore:
       - 'docs/**'
       - '*.md'
