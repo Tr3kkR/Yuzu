@@ -25,6 +25,18 @@ The `cpp-expert` agent loads this document on any C++ source change. CLAUDE.md k
 - C++ ergonomics live in `plugin.hpp` (CRTP + `YUZU_PLUGIN_EXPORT` macro). Don't break the C boundary when extending the C++ wrapper.
 - `YUZU_PLUGIN_ABI_VERSION` increments on any layout change with a migration plan (architect agent gates this).
 
+### Reserved plugin names
+
+The agent reserves a small namespace of plugin names for internal dispatch intercepts. Any plugin declaring one of these names in `YuzuPluginDescriptor::name` is **rejected at load time** by `PluginLoader::scan` (see `agents/core/include/yuzu/agent/plugin_loader.hpp` `kReservedPluginNames`) — the rejection is logged at `error` and counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}`.
+
+| Name          | Purpose                                                            |
+|---------------|--------------------------------------------------------------------|
+| `__guard__`   | Guardian engine dispatch (see `docs/yuzu-guardian-design-v1.1.md` §7.2) |
+| `__system__`  | Reserved for future system-scope commands                          |
+| `__update__`  | Reserved for OTA update commands                                   |
+
+Do not pick names matching `__*__` for third-party plugins; treat the double-underscore-bracketed convention as the internal-dispatch namespace and avoid it entirely. Adding a new reserved name requires updating `kReservedPluginNames` and the unit test in `tests/unit/test_plugin_loader.cpp` that pins the exact set.
+
 ## Entry points
 
 Both the agent and the server use:

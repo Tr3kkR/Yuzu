@@ -13,6 +13,19 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    # After SHA-pinning every `uses:` ref (Scorecard PR #2), Dependabot
+    # opens one PR per action per bump. Group them so related actions
+    # ship together and weekly PR volume stays manageable.
+    groups:
+      actions-core:
+        patterns:
+          - "actions/*"
+      docker-actions:
+        patterns:
+          - "docker/*"
+      github-codeql:
+        patterns:
+          - "github/codeql-action/*"
 
   - package-ecosystem: "docker"
     directory: "/deploy/docker"

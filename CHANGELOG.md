@@ -64,6 +64,370 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exception. Proprietary plugins remain permitted. Wording must be
   legal-reviewed before the first AGPL-era release ships.
 
+
+  + exclude vendored and generated paths from CodeQL scanning.** Two
+  security-tooling follow-ups surfaced by the first real CodeQL scan
+  after the Scorecard lift landed.
+  - **Code injection fix.** CodeQL critical rule
+    `actions/code-injection/critical` flagged line 49 of
+    `.github/workflows/pre-release.yml`, where
+    `${{ github.event.workflow_run.head_branch }}` was interpolated
+    directly into the bash `run:` block of the "Determine version" step.
+    `workflow_run` is an externally-influenced event trigger, and branch
+    or tag names can carry shell metacharacters. Rebound both
+    `head_branch` and the `workflow_dispatch` `inputs.tag` value to step-
+    level `env:` entries (`EVENT_BRANCH`, `INPUT_TAG`) and reference them
+    as shell variables — the canonical Actions security pattern.
+  - **CodeQL scope.** Added `.github/codeql/codeql-config.yml` with a
+    `paths-ignore` list (`vcpkg_installed/**`, `build-*/**`,
+    `builddir*/**`, `_build/**`) and wired it into the `codeql-action/init`
+    step via `config-file:`. Previously the scan indexed every header
+    under `vcpkg_installed/x64-linux/include/` — protobuf, abseil,
+    httplib — producing one "critical" (protobuf `map.h`) + six "high"
+    (abseil `raw_hash_set.h`, protobuf tctable, httplib `non-https-url`)
+    findings that are upstream-vendor bugs we cannot fix in-tree and
+    would be erased by the next vcpkg cache rebuild. Excluding them
+    collapses the noise and leaves first-party findings visible.
+
+- **Isolate `yuzu_gw_real_upstream_SUITE` from CI's gateway CT discovery.**
+  The suite needs a live `yuzu-server` reachable on `127.0.0.1:50055`
+  AND `YUZU_GW_TEST_TOKEN` set (or `scripts/linux-start-UAT.sh` to have
+  just run); CI provisions neither. Previously the suite was registered
+  alongside the regular CT tree and ran as part of `meson test --suite
+  gateway`, where it failed deterministically on the Windows MSVC runner
+  (TCP probe to `:50055` succeeded against an unrelated listener bound by
+  WSL2 port-forwarding from the same physical box, so the suite proceeded
+  to the gRPC `ProxyRegister` call and exploded). Linux hid the failure
+  because the self-hosted runner has no `rebar3` on PATH and the entire
+  gateway CT step is skipped at meson configure time.
+  - **Move:** `gateway/apps/yuzu_gw/test/yuzu_gw_real_upstream_SUITE.erl`
+    → `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`.
+    `git mv` so file history follows.
+  - **rebar3 wiring:** add `{extra_src_dirs, [{"integration_test",
+    [{recursive, false}]}]}` under the `test` profile in
+    `gateway/rebar.config` so the moved suite still compiles in the test
+    profile but is reachable only via explicit `--dir
+    apps/yuzu_gw/integration_test`.
+  - **CI invocation:** `scripts/test_gateway.py ct` (called by the meson
+    `gateway ct` test target) keeps using `--dir apps/yuzu_gw/test` and
+    no longer discovers the suite — verified locally: 6 suites / 52
+    tests, all pass, no `yuzu_gw_real_upstream_SUITE` entry.
+  - **`/test` invocation:** `.claude/skills/test/SKILL.md` Phase 5 now
+    runs a second `gate_run "CT real-upstream"` step that targets `--dir
+    apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE`,
+    relying on Phase 4's `linux-start-UAT.sh` to have stood up the
+    server and provisioned the enrollment token. Doc-comment in the
+    SKILL warns about the prerequisites and the per-case
+    `{test_case_failed, "No enrollment token: …"}` failure mode if
+    either is missing.
+
+- **CI dedup: drop `feature/**` and `fix/**` from the `push:` triggers in
+  `ci.yml` and `docs-lint.yml`.** Pushes to feature/fix branches with an
+  open PR previously fired both the `push` and `pull_request` events on
+  the same SHA, doubling runner consumption for every commit pushed to a
+  PR branch. Mainline branches (`main`, `dev`) remain on the `push:`
+  list so merge runs still fire exactly once. Pre-PR work (no PR open
+  yet) no longer runs CI automatically — open the PR earlier or use the
+  existing `workflow_dispatch` trigger to fire it manually.
+
+- **Digest-pin Dockerfile `FROM` lines, replace `curl | sh` installers,
+  and hash-pin `requirements-ci.txt` (PR #3 of Scorecard lift).**
+  Completes Scorecard's `Pinned-Dependencies` check — the remaining
+  two-thirds after PR #2 addressed the GitHub Actions third. Changes:
+  - **Dockerfile `FROM` digest pins.** Eight `deploy/docker/Dockerfile.*`
+    base images were previously referenced by tag only
+    (`ubuntu:24.04`, `erlang:28`, `alpine:3.23`). Pinned each to its
+    current multi-arch index digest. `Dockerfile.runner-linux` — which
+    seeds the self-hosted runner image on Shulgi — is now pinned to an
+    exact digest of `ghcr.io/actions/actions-runner:latest`; Dependabot's
+    `/deploy/docker` docker scope will continue to propose bumps as new
+    runner releases ship.
+  - **`curl | bash` NodeSource installs replaced with verified tarball
+    download.** `Dockerfile.ci-linux` and `Dockerfile.ci-gateway` both
+    installed Node.js 20 via `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -`,
+    which Scorecard flags as unverified code execution. Replaced with a
+    direct `.tar.xz` download from `nodejs.org` + `sha256sum -c`
+    verification. `NODE_VERSION` and `NODE_SHA256_LINUX_X64` are `ARG`
+    pairs so bumps are atomic.
+  - **Trivy installer replaced with `aquasecurity/trivy-action`.**
+    `pre-release.yml` was installing Trivy via `curl -sfL … install.sh | sh`;
+    swapped for the SHA-pinned `aquasecurity/trivy-action@57a97c7e…`
+    (v0.35.0). **Scope clarification:** while making this swap, removed
+    the Trivy SBOM generation step entirely — `release.yml` already emits
+    authoritative Syft-based SBOMs via `anchore/sbom-action` for every
+    platform archive and container image, so Trivy's SBOMs were a
+    redundant second source that disagreed on component enumeration.
+    Trivy now does vulnerability scanning only (its strength); Syft owns
+    SBOM generation across the entire release pipeline.
+  - **Hash-pinned `requirements-ci.txt` via `pip-compile --generate-hashes`.**
+    Added `requirements-ci.in` as the human-edited source; `pip-compile`
+    regenerates `requirements-ci.txt` with `--hash=sha256:…` continuation
+    lines. Every `pip install -r requirements-ci.txt` call in `ci.yml`
+    and `release.yml` now uses `--require-hashes`; a tampered package
+    would fail the install rather than silently execute. macOS pipx grep
+    path updated (`awk '/^meson==/ {print $1}'`) to handle the trailing
+    `\` that `pip-compile` adds to hashed requirement lines. Bump cadence
+    documented at `docs/dependency-updates.md`.
+  - **Docker Compose image digests.** `docker-compose.local.yml` and the
+    root `docker-compose.uat.yml` referenced `prom/prometheus:latest`,
+    `grafana/grafana:latest`, and `clickhouse/clickhouse-server:latest`.
+    Aligned all three with the digest-pinned variants already used under
+    `deploy/docker/docker-compose*.yml` (Prometheus v3.2.1, Grafana
+    11.5.2, ClickHouse 24.12). Two `clickhouse-server:24.12` tag-only
+    refs under `deploy/docker/` also gained digests.
+
+- **SHA-pin every GitHub Actions reference for OpenSSF Scorecard
+  Pinned-Dependencies check (PR #2 of Scorecard lift).** Scorecard's
+  `Pinned-Dependencies` check scored 0 because every `uses:` line in
+  `.github/workflows/*.yml` resolved by tag (`@v6`, `@v3`, `@v0`) rather
+  than by immutable commit SHA — a compromised upstream could silently
+  repoint the tag at a malicious commit. Rewrote all 144 `uses:` refs
+  across 12 workflow files to the form
+  `owner/repo@<40-char-sha> # vX.Y.Z`; the trailing version comment is
+  mandatory so Dependabot can still detect newer releases and propose
+  coordinated SHA+comment bumps. Floating-major refs (`anchore/sbom-action@v0`,
+  `ilammy/msvc-dev-cmd@v1`, `erlef/setup-beam@v1`, `bufbuild/buf-setup-action@v1`,
+  plus two cases where the `v3` major tag lagged the latest point release —
+  `actions/attest-build-provenance` and `sigstore/cosign-installer`) are
+  pinned to the latest exact X.Y.Z SHA rather than the floating major's
+  current SHA, so the pin doesn't drift back when the major tag is
+  eventually updated. `github/codeql-action/init` and `/analyze` are pinned
+  to the same parent-repo SHA per CodeQL's documented invariant.
+  Self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are
+  unaffected — action pins control which code runs on the runner, not the
+  runner image itself. PR #3 will pin the remaining two thirds of
+  `Pinned-Dependencies` (Dockerfile FROMs + `curl | sh` installers +
+  pip hash-pinning).
+- **Group Dependabot GitHub Actions PRs.** After SHA-pinning, Dependabot
+  opens one PR per action per bump — roughly 3× the pre-pin weekly
+  volume. Added a `groups:` block under the `github-actions` ecosystem
+  in `.github/dependabot.yml` to bundle related cohorts:
+  `actions-core` (`actions/*`), `docker-actions` (`docker/*`), and
+  `github-codeql` (`github/codeql-action/*`). Ungrouped actions still
+  ship as individual PRs.
+
+- **Tighten GitHub Actions token permissions for OpenSSF Scorecard
+  Token-Permissions check.** Scorecard's Token-Permissions check scored 0
+  because `qodana_code_quality.yml` had no top-level `permissions:` block
+  (one missing block zeroes the entire check) and several workflows
+  declared writes at workflow scope that only specific jobs actually
+  needed. Changes:
+  - `qodana_code_quality.yml`: new top-level `permissions: contents: read`;
+    dropped unused job-level `contents: write` + `pull-requests: write`
+    (pr-mode is false, so the action never opens PRs); kept `checks: write`
+    at job scope.
+  - `release.yml`: demoted top-level `contents: write` + `packages: write`
+    to job scope. `id-token: write` and `attestations: write` stay at
+    workflow scope because every build job calls
+    `actions/attest-build-provenance`. The `release` job gets explicit
+    `contents: write` + `id-token: write`; `docker-publish` already had
+    its own explicit block.
+  - `vcpkg-baseline-update.yml`: top-level `permissions: contents: read`;
+    moved `contents: write` + `pull-requests: write` into the
+    `propose-bump` job.
+  - `ci.yml`: removed unused top-level `packages: write` (the workflow
+    doesn't push to any registry); top-level is now `contents: read` only.
+
+- **Wire `SCORECARD_READ_TOKEN` PAT into `scorecard.yml`.** Scorecard's
+  `Branch-Protection` check caps at ~3/10 without a PAT because the
+  public GitHub API can't read Repository Rulesets. The action now
+  receives `repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}`
+  so the ruleset-aware code path runs once the secret is populated. The
+  `|| github.token` fallback keeps fork runs and first-time-setup scans
+  succeeding. PAT creation + rotation procedure documented at
+  `docs/security/scorecard-token.md` — classic PAT with `public_repo` +
+  `read:org` scopes ONLY; 90-day expiration with a 365-day rotation
+  cadence.
+
+### Added
+
+- **Guardian: agent rejects plugins declaring a reserved internal-dispatch
+  name (#453).** The agent plugin loader now refuses to load any plugin whose
+  `YuzuPluginDescriptor::name` matches the reserved set `__guard__`,
+  `__system__`, `__update__`. Rejected plugins are logged at `error` and
+  counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}` so
+  operators can alert on reserved-name attempts distinct from generic load
+  failures. Prevents a compromised plugin author (or a misconfigured
+  third-party plugin) from shadowing the `__guard__` dispatch intercept that
+  Guardian PR 3 will add at `agents/core/src/agent.cpp`. Reserved-name
+  namespace documented in `docs/cpp-conventions.md`.
+
+- **Guardian PR 2 prerequisites (#452).** Pre-REST-endpoint hardening of the
+  `GuaranteedStateStore` so PR 2's ingest path can land on a production-ready
+  foundation:
+  - **`std::expected<T, std::string>` mutators with `kConflictPrefix`.**
+    `create_rule`, `update_rule`, `delete_rule`, and `insert_event` now
+    return `std::expected<void, std::string>` and surface duplicate-UNIQUE
+    / PRIMARY KEY collisions as `kConflictPrefix`-prefixed errors so REST
+    handlers can map them to HTTP 409 (matching #396/#399/#402). Not-found
+    paths return a distinct non-conflict error so routes can split 404 from
+    409 cleanly.
+  - **`created_by` / `updated_by` audit columns on `guaranteed_state_rules`.**
+    Added to the v1 migration (before schema freeze). REST handlers in PR 2
+    populate both from the session principal; SOC 2 audit-chain
+    reconstruction can now answer "who authorised this rule version" from
+    the store alone, with the full `audit_events` join procedure documented
+    in `docs/yuzu-guardian-design-v1.1.md` §9.3.
+  - **Retention reaper on `guaranteed_state_events`.** 30-day default
+    (new `guardian_event_retention_days` config, overridable via runtime
+    config). Events carry `ttl_expires_at` populated at insert; a
+    background thread mirroring `AuditStore::run_cleanup` runs a periodic
+    `DELETE`. Partial index `idx_gse_ttl WHERE ttl_expires_at > 0` keeps
+    the reap query fast at fleet-scale ingest. `retention_days = 0`
+    disables expiry for forensic freezes.
+  - **Batch `insert_events(std::vector<…>)` API.** Wraps a `BEGIN…COMMIT`
+    envelope; one fsync per batch instead of one per row (10–50× faster at
+    agent batch sizes). Transactional — any failing row rolls back the
+    whole batch so REST handlers never have to reason about partial state.
+  - **Prometheus observability.** Four new server gauges — `yuzu_server_`
+    `guardian_rules_total`, `guardian_events_total`,
+    `guardian_events_written_total`, `guardian_events_reaped_total`. Wired
+    into the existing health-recompute thread alongside `audit_store`'s
+    gauges; sized at zero before ingest starts so alert rules
+    (e.g. `yuzu_server_guardian_events_total > 5e6`) can be authored up
+    front.
+  - **Data inventory entry.** `guaranteed_state_events` recorded in the
+    workstream-E data inventory (`docs/enterprise-readiness-soc2-first-customer.md` §3.5)
+    with the 30-day retention policy, reaper mechanism, and sizing
+    guidance for customers with longer forensic SLAs.
+
+- **Guardian "Guaranteed State" engine — wire contract + server store
+  skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
+  SQLite file `guaranteed-state.db` is created in the server data directory
+  at startup and a `guaranteed_state_store` entry appears in the `/readyz`
+  probe response. No REST endpoints, no dispatch, no agent wiring, and no
+  dashboard surface in this release — PR 1 ships only the proto (new package
+  `yuzu.guardian.v1` at `proto/yuzu/guardian/v1/guaranteed_state.proto`),
+  the server SQLite store, and 17 unit test cases. Operators upgrading will
+  see the new `.db` file alongside the existing stores (same permissions,
+  same backup story: copy the full `--data-dir`) and the new `/readyz` JSON
+  key. Full architecture: `docs/yuzu-guardian-design-v1.1.md`. Windows-first
+  delivery plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+
+- **Supply-chain attestation bundle: CycloneDX + SPDX SBOMs, SLSA
+  provenance, and cosign image signatures on every release (#362,
+  #408).** The release workflow now emits, per tag, a full verifiable
+  supply-chain artefact set:
+  - **CycloneDX + SPDX SBOMs per platform archive** via
+    [Syft](https://github.com/anchore/syft) (`anchore/sbom-action@v0`):
+    `yuzu-{linux-x64,gateway-linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json`.
+    Syft picks up vcpkg C++ dependencies (reading vcpkg's generated
+    `vcpkg.spdx.json` under `vcpkg_installed/<triplet>/share/`), Erlang
+    deps from `gateway/rebar.lock`, and metadata on the built
+    ELF/PE/Mach-O binaries.
+  - **CycloneDX + SPDX SBOMs per Docker image**
+    (`yuzu-{server,gateway}-image.{cdx,spdx}.json`) generated by Syft
+    scanning the pushed image by digest, so the SBOM is bound to the
+    exact image layers customers will pull.
+  - **SLSA v1.0 build provenance attestations** for every binary archive,
+    installer, and Docker image via `actions/attest-build-provenance@v3`.
+    Stored in GitHub's native attestation registry and verified
+    customer-side with `gh attestation verify <file> --repo Tr3kkR/Yuzu`
+    (images: `oci://ghcr.io/.../<image>@sha256:<digest>`).
+  - **cosign keyless Docker image signing** for both
+    `ghcr.io/tr3kkr/yuzu-server` and `ghcr.io/tr3kkr/yuzu-gateway`,
+    bound to the release workflow's OIDC identity (no static keys to
+    rotate). Existing cosign blob signature on `SHA256SUMS` is retained.
+  - **New release-gate script** at
+    `scripts/check-release-artifacts.sh` runs before `gh release create`
+    and fails the release if any expected archive, installer, or SBOM
+    is missing — preventing partially-attested releases from ever
+    reaching customers.
+  - **New operator doc** at
+    [`docs/user-manual/release-verification.md`](docs/user-manual/release-verification.md)
+    covers `sha256sum -c`, `cosign verify-blob`, `cosign verify` (images),
+    `gh attestation verify` (binaries + images), and CycloneDX / SPDX
+    inspection with `jq` and the CycloneDX CLI. Includes an end-to-end
+    verification script and a compliance-mapping table (SOC 2 CC6.8 /
+    CC7.1, NIST SSDF PW.5 / PS.3, EO 14028, EU CRA Annex V).
+  - Top-level workflow permissions extended with `attestations: write`
+    (required by `actions/attest-build-provenance`); `docker-publish`
+    job gains `id-token: write` + `attestations: write`. `SHA256SUMS`
+    now covers the SBOM files so customers can verify them alongside
+    the archives. Release notes heredoc advertises the new verification
+    workflow and links to the operator doc.
+  - Effective at the next tag after merge. No CHANGELOG gate on
+    historical releases — retro-generating provenance for shipped tags
+    is out of scope.
+- **OpenSSF Scorecard + Zizmor workflows (#407).** Added
+  `.github/workflows/scorecard.yml` (weekly + push to main +
+  `branch_protection_rule`; publishes to scorecard.dev + SARIF to the
+  GitHub Security tab) and `.github/workflows/zizmor.yml` (static
+  analyzer for `.github/workflows/*.yml`, runs on workflow-touching PRs
+  + weekly). README now advertises the Scorecard and Zizmor badges; the
+  OpenSSF Best Practices Badge slot is wired up pending manual
+  application at bestpractices.dev. Triaging Scorecard findings into
+  follow-up issues is the remaining work on #407.
+- **README `Install`, `Contributing`, `Reporting Issues` sections
+  (#407).** Addresses the OpenSSF Best Practices `[interact]` criterion
+  — README now points prebuilt-binary users at GitHub Releases +
+  `ghcr.io/tr3kkr/yuzu-{server,gateway,agent}` + `deploy/docker/docker-compose.yml`
+  instead of only documenting the from-source build. Adds explicit
+  links to `CONTRIBUTING.md`, `CLAUDE.md`, the bug-report and
+  feature-request issue templates, `SECURITY.md` (private vulnerability
+  reporting), and GitHub Discussions.
+
+### Fixed
+
+- **`/api/health` reports the actual server version instead of the
+  hardcoded "0.1.0" (#401).** The endpoint now derives the version
+  string from the meson-generated `yuzu/version.hpp` constant
+  `kVersionString`, so health probes track the running build (currently
+  `0.11.0`) rather than a stale literal that survived the v0.10.x cycle.
+- **`docker-compose.uat.yml` now passes `--data-dir /var/lib/yuzu` to
+  the server (#389).** Without the flag, all SQLite stores fell back to
+  the working directory (`/etc/yuzu`) instead of the persistent volume
+  mount — agent registrations, audit log, and tokens were lost on
+  container restart. The other compose files (`docker-compose.local.yml`,
+  `deploy/docker/docker-compose.full-uat.yml`) already passed the flag;
+  the UAT file was the outlier.
+- **`POST /api/settings/users` returns 409 on duplicate username (#399).**
+  Previously the endpoint silently overwrote an existing account via
+  `AuthManager::upsert_user` — a privilege-escalation primitive in the
+  hands of any authenticated admin attacker. The endpoint now rejects
+  duplicates with HTTP 409, an `HX-Trigger` toast (`"Username already
+  exists"`), and a denied audit event
+  (`user.upsert / denied / duplicate_username`). Self-password-change
+  (same username, same role) is still allowed.
+- **`POST /api/instructions` returns 409 on duplicate explicit `id`
+  (#402).** Previously returned a generic 400 (`"insert failed"`); the
+  store now pre-checks under the existing write lock and surfaces a
+  structured 409 (`{"error":"instruction definition '<id>' already
+  exists"}`) plus a denied audit event
+  (`instruction.create / denied / duplicate_id`). Empty `id` paths still
+  generate a UUID with no duplicate-check overhead.
+- **`POST /api/policy-fragments` returns 409 on duplicate fragment name
+  (#396).** Previously silently inserted a duplicate row; the store now
+  rejects with HTTP 409 (`{"error":"policy fragment named '<name>'
+  already exists"}`) plus a denied audit event
+  (`policy_fragment.create / denied / duplicate_name`).
+
+### Tests
+
+- Added `tests/unit/server/test_store_errors.cpp` exercising the shared
+  `kConflictPrefix` constant and `is_conflict_error` /
+  `strip_conflict_prefix` helpers introduced for the route↔store conflict
+  contract (governance Gate 3 arch-B1).
+- Added duplicate-detection cases to `test_settings_routes_users.cpp`,
+  `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
+  pre-existing "duplicate ID" policy-store test was tightened to assert
+  the new `kConflictPrefix` semantics.
+- Added `tests/unit/fixtures/reserved_name_plugin.cpp` — a test plugin
+  declaring the reserved `__guard__` name — plus three new test cases in
+  `tests/unit/test_plugin_loader.cpp` (`is_reserved_plugin_name`
+  predicate, `kReservedPluginNames` namespace pin, and a behavioural
+  scan-rejection test that copies the fixture into a temp directory and
+  asserts `PluginLoader::scan` refuses to load it). The fixture is built
+  as a `shared_library` in `tests/meson.build` and wired as a `depends:`
+  of the agent test runner so it's on disk before the test runs.
+- Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
+  the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
+  errors on both `name` and `rule_id`, conflict on rename-into-existing
+  name, batch `insert_events` happy path + transactional rollback on
+  mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
+  reaper delete mechanics (including `retention_days=0` sentinel).
+
+
 ## [0.11.0-rc2] - 2026-04-20
 
 ### Added

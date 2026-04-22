@@ -31,15 +31,13 @@ name: Runner inventory sentinel
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:
-  # Scheduled trigger DISABLED until RUNNER_INVENTORY_TOKEN PAT is created.
-  # See docs/ci-troubleshooting.md (TODO Saturday) for PAT setup. Until
-  # the PAT exists, scheduled runs would fail every 30 min on the 403
-  # from /actions/runners, training operators to ignore the workflow —
-  # an anti-pattern for a sentinel whose whole job is loud signaling.
-  # Re-enable the cron line below in the same PR that adds the PAT.
-  #
-  # schedule:
-  #   - cron: "*/30 * * * *"
+  # Runs every 30 minutes against the RUNNER_INVENTORY_TOKEN PAT so
+  # drift between GitHub's actions/runners listing and
+  # .github/runner-inventory.json surfaces quickly. Cron was parked
+  # until the PAT was in place (scheduled failures would have trained
+  # operators to ignore the workflow — anti-pattern for a sentinel).
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
   push:
     branches: [dev, main]
@@ -61,7 +59,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Check runner inventory against declaration
         id: check

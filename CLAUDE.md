@@ -169,7 +169,7 @@ If the server is restarted against an existing data directory (stale SQLite data
 
 ## Pre-commit testing with /test
 
-The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate. It compiles HEAD, stands up the previous released image (`v0.10.0` from `ghcr.io/tr3kkr/yuzu-*`), upgrades it to HEAD, verifies data preservation and migrations, then runs the standard test surface (unit + EUnit + dialyzer + CT + integration + e2e + synthetic UAT + puppeteer). Every gate result and sub-step timing is persisted to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` so operators can compare runs over time, spot flaky gates, and trend upgrade durations.
+The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate. It compiles HEAD, stands up the previous released image (GitHub's current "Latest release" tag from `ghcr.io/tr3kkr/yuzu-*`, resolved at runtime via `gh api repos/Tr3kkR/Yuzu/releases/latest`; pin an older baseline with `--old-version X.Y.Z`), upgrades it to HEAD, verifies data preservation and migrations, then runs the standard test surface (unit + EUnit + dialyzer + CT + integration + e2e + synthetic UAT + puppeteer). Every gate result and sub-step timing is persisted to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` so operators can compare runs over time, spot flaky gates, and trend upgrade durations.
 
 Three modes:
 

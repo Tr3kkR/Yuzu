@@ -17,10 +17,13 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write       # Required for cosign keyless signing + Sigstore OIDC
-  attestations: write   # Required for actions/attest-build-provenance
+  # Top-level baseline = least-privilege read. id-token + attestations are
+  # shared across every build job (each calls actions/attest-build-provenance);
+  # contents:write and packages:write are scoped per-job to only the jobs
+  # that actually need them (Scorecard Token-Permissions hardening).
+  contents: read
+  id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+  attestations: write   # actions/attest-build-provenance across all build jobs
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -37,7 +40,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           clean: false
@@ -58,7 +61,7 @@ jobs:
         run: rm -rf builddir
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ~/.cache/ccache
@@ -70,7 +73,7 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -155,7 +158,7 @@ jobs:
       # Output two formats because customer questionnaires ask for one
       # or the other inconsistently and both are trivial to emit.
       - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: cyclonedx-json
@@ -164,7 +167,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: spdx-json
@@ -177,7 +180,7 @@ jobs:
       # workflow run. Stored in GitHub's attestation registry; verified
       # customer-side with `gh attestation verify <file>`.
       - name: Attest provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             yuzu-linux-x64.tar.gz
@@ -185,7 +188,7 @@ jobs:
             *.rpm
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-x64
@@ -193,7 +196,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-deb
@@ -201,7 +204,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-rpm
@@ -209,7 +212,7 @@ jobs:
           retention-days: 3
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-x64-sbom
@@ -237,16 +240,16 @@ jobs:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install Erlang/OTP and rebar3
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
         with:
           otp-version: '28'
           rebar3-version: '3.24'
 
       - name: Cache rebar3 dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: gateway/_build/default/lib
@@ -255,7 +258,7 @@ jobs:
             rebar3-deps-
 
       - name: Cache Dialyzer PLT
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: gateway/_build/default/*_plt*
@@ -324,7 +327,7 @@ jobs:
       # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
       # runtime bundled into the release.
       - name: Generate gateway SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: gateway
           format: cyclonedx-json
@@ -333,7 +336,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate gateway SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: gateway
           format: spdx-json
@@ -342,7 +345,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest gateway provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             yuzu-gateway-linux-x64.tar.gz
@@ -350,7 +353,7 @@ jobs:
             *.rpm
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64
@@ -358,7 +361,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-deb
@@ -366,7 +369,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-rpm
@@ -374,7 +377,7 @@ jobs:
           retention-days: 3
 
       - name: Upload gateway SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64-sbom
@@ -394,20 +397,20 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Install Meson and ccache
         run: |
-          pip install -r requirements-ci.txt
+          pip install --require-hashes -r requirements-ci.txt
           choco install ccache --yes --no-progress
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ~\AppData\Local\ccache
@@ -419,14 +422,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
@@ -435,7 +438,7 @@ jobs:
             vcpkg-x64-windows-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -628,7 +631,7 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       - name: Generate Windows SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: cyclonedx-json
@@ -637,7 +640,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate Windows SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: spdx-json
@@ -646,7 +649,7 @@ jobs:
           upload-artifact: false
 
       - name: Attest Windows provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             yuzu-windows-x64.zip
@@ -654,7 +657,7 @@ jobs:
             YuzuServerSetup-*.exe
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-windows-x64
@@ -662,7 +665,7 @@ jobs:
           retention-days: 3
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-windows-installer
@@ -672,7 +675,7 @@ jobs:
           retention-days: 3
 
       - name: Upload Windows SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-windows-x64-sbom
@@ -691,17 +694,19 @@ jobs:
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
 
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install "$(grep '^meson==' requirements-ci.txt)"
+          # awk strips the trailing ` \` that pip-compile adds when the
+          # requirement is continued by `--hash=...` lines.
+          pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
       - name: Cache ccache
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ~/Library/Caches/ccache
@@ -713,14 +718,14 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
@@ -729,7 +734,7 @@ jobs:
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -926,7 +931,7 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + builddir (Mach-O binaries).
       - name: Generate macOS SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: cyclonedx-json
@@ -935,7 +940,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate macOS SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: spdx-json
@@ -944,14 +949,14 @@ jobs:
           upload-artifact: false
 
       - name: Attest macOS provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             yuzu-macos-arm64.tar.gz
             YuzuAgent-*.pkg
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-macos-arm64
@@ -959,7 +964,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .pkg artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-macos-pkg
@@ -967,7 +972,7 @@ jobs:
           retention-days: 3
 
       - name: Upload macOS SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-macos-arm64-sbom
@@ -1000,7 +1005,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           clean: false
@@ -1010,10 +1015,10 @@ jobs:
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1021,7 +1026,7 @@ jobs:
 
       - name: Compute image tags and labels
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           # Tag convention mirrors scripts/docker-release.sh:
@@ -1041,7 +1046,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -1066,7 +1071,7 @@ jobs:
       # will pull. Output goes to artifacts/ for the release job to
       # attach alongside the per-platform archive SBOMs.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1075,7 +1080,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1084,7 +1089,7 @@ jobs:
           upload-artifact: false
 
       - name: Upload image SBOM artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-${{ matrix.image }}-image-sbom
@@ -1095,7 +1100,7 @@ jobs:
 
       # ── SLSA build provenance (by image digest) ─────────────────────
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -1103,7 +1108,7 @@ jobs:
 
       # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       - name: Sign image (keyless)
         env:
@@ -1136,9 +1141,12 @@ jobs:
     needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write   # gh release create
+      id-token: write   # cosign sign-blob keyless (SHA256SUMS.bundle)
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Validate docker-compose image versions
         run: |
@@ -1151,7 +1159,7 @@ jobs:
           bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           # Skip docker buildx attestation/provenance artifacts (auto-named
@@ -1223,7 +1231,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       - name: Sign SHA256SUMS (keyless)
         run: |

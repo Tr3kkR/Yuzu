@@ -26,7 +26,7 @@ Modes are layered: `--full` includes everything `default` runs, `default` includ
 ```
 Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
-Phase 2 — Upgrade Test          (v0.10.0 → HEAD: fixtures, migrate, verify)
+Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
 Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
@@ -196,11 +196,16 @@ Skipped in `--quick`. In default and `--full`:
 ```bash
 bash scripts/test/test-upgrade-stack.sh \
     --run-id "$RUN_ID" \
-    --old-version 0.10.0 \
     --new-version "0.10.1-test-${RUN_ID}" \
     --new-image-loaded 1 \
     --test-dir "$TEST_DIR"
 ```
+
+`--old-version` is omitted so the script resolves it from GitHub's current
+"Latest release" at runtime (`gh api repos/Tr3kkR/Yuzu/releases/latest`).
+This keeps the upgrade baseline tracking whatever the last published stable
+tag is without needing a pipeline edit each release. Pass `--old-version
+X.Y.Z` to pin an older baseline for debugging.
 
 The script records its own gate row (`Upgrade vOLD->vNEW`) and sub-step timings (`pull-old-images`, `stack-up-old`, `fixtures-write`, `image-swap`, `ready-after-upgrade`, `fixtures-verify`, `synthetic-uat-against-upgraded`). The skill doesn't need to record anything additional.
 
@@ -298,6 +303,20 @@ gate_run "Dialyzer" "dialyzer.log" \
 
 gate_run "CT suites" "ct.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
+
+# Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
+# (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
+# apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
+#   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
+#      this up via linux-start-UAT.sh).
+#   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR
+#      linux-start-UAT.sh must have just run (its scratch dir is
+#      probed for the token).
+# Failing either prerequisite, the suite reports {test_case_failed,
+# "No enrollment token: …"} per-case rather than a useful skip — file
+# an upstream issue if you hit that during /test.
+gate_run "CT real-upstream" "ct-real-upstream.log" \
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
 
 gate_run "Integration" "integration.log" \
     "bash scripts/integration-test.sh"
