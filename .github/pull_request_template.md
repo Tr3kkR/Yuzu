@@ -21,3 +21,4 @@
 - [ ] Tests pass (`ctest --preset linux-debug`)
 - [ ] No new clang-tidy warnings
 - [ ] No new compiler warnings
+- [ ] I have signed the [Contributor License Agreement](../CLA.md) (either via the CLA workflow comment on this PR, or by appending my name to the Signatories section of `CLA.md`)

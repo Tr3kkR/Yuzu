@@ -23,6 +23,6 @@
     ]},
     {env, []},
     {modules, []},
-    {licenses, ["Proprietary"]},
+    {licenses, ["AGPL-3.0-or-later"]},
     {links, []}
 ]}.

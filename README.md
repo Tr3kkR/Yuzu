@@ -253,4 +253,12 @@ Good first issues are labelled [`good first issue`](https://github.com/Tr3kkR/Yu
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Yuzu is dual-licensed:
+
+- **Community Edition** — [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later). If you modify Yuzu and operate it as a network service, §13 requires you to offer the modified source to all users of that service. See [NOTICE](NOTICE) for attribution.
+- **Enterprise Edition** — a commercial license covering premium features under [`enterprise/`](enterprise/). See [`enterprise/LICENSE-ENTERPRISE.md`](enterprise/LICENSE-ENTERPRISE.md) for terms and contact details.
+- **Plugin authors** — the stable C ABI in [`sdk/`](sdk/) is covered by a linking exception documented in [`sdk/LICENSE-SDK.md`](sdk/LICENSE-SDK.md); proprietary plugins that consume only the ABI remain permitted.
+
+Contributions require a signed [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Releases tagged before the AGPL transition (≤ v0.11.x) remain available under their original Apache-2.0 grant to everyone who received them. Only releases cut after the transition are governed by AGPL.

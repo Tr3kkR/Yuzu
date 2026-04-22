@@ -1,5 +1,32 @@
 # Contributing to Yuzu
 
+## License and Contributor License Agreement
+
+Yuzu is dual-licensed:
+
+- The **community edition** (everything outside the `enterprise/` directory) is
+  [AGPL-3.0-or-later](LICENSE).
+- The **enterprise edition** (`enterprise/`) is under a separate commercial
+  license — see [`enterprise/LICENSE-ENTERPRISE.md`](enterprise/LICENSE-ENTERPRISE.md).
+
+To preserve the ability to ship the same code under both licenses, **every
+contributor must sign a Contributor License Agreement** ([CLA.md](CLA.md))
+before their pull request can be merged. The CLA grants the project steward
+the right to redistribute your contribution under both the AGPL and the
+commercial license.
+
+- **Individual contributors** — include `Signed-off-by: Your Name <email>` in
+  each commit and add yourself to [CLA.md](CLA.md) by opening a pull request
+  that appends your name to the "Signatories" section, or (once the CLA bot
+  is live at `.github/workflows/cla.yml`) sign via the automated workflow on
+  your first PR.
+- **Corporate contributors** — contact the project steward (see
+  [NOTICE](NOTICE)) to execute a corporate CLA covering all employees.
+
+If you do not wish to sign the CLA, you may not contribute code, documentation,
+or other materials to this repository. File an issue instead — the maintainers
+can implement the idea under their own copyright.
+
 ## Getting Started
 
 1. **Prerequisites**: Meson 1.9.2, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.

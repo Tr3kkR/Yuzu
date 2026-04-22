@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (licensing): Yuzu is now distributed under AGPL-3.0-or-later
+  (community edition) with a separate commercial license for the new
+  `enterprise/` subtree.** Previously the repository was Apache-2.0. The
+  motivation is §13 of the AGPL: any operator running a modified Yuzu as a
+  network service must offer the modified source to users of that service.
+  This protects the commons and the viability of a commercial enterprise
+  edition, which a permissive licence would not.
+
+  Releases tagged v0.11.0-rc2 and earlier **remain licensed under
+  Apache-2.0** for everyone who received them — Apache grants are perpetual
+  and we are not retroactively re-licensing past code. The first release
+  cut after this entry lands is the first AGPL-era release.
+
+  Mechanical changes in this commit:
+  - `LICENSE` replaced with the verbatim AGPL-3.0 text from
+    `https://www.gnu.org/licenses/agpl-3.0.txt`.
+  - New top-level `NOTICE` file records the copyright holder, relicensing
+    history, dual-licensing boundary, SDK linking exception, and starter
+    third-party attribution roll-up.
+  - `meson.build` `license:` field → `AGPL-3.0-or-later`.
+  - `vcpkg.json` `license` field → `AGPL-3.0-or-later`.
+  - `gateway/apps/yuzu_gw/src/yuzu_gw.app.src` `licenses` → `["AGPL-3.0-or-later"]`
+    (fixes a legacy `"Proprietary"` drift).
+  - `deploy/docker/Dockerfile.ci-gateway`,
+    `deploy/docker/Dockerfile.ci-linux`, and
+    `.github/workflows/release.yml` OCI image-label `org.opencontainers.image.licenses`
+    set to `AGPL-3.0-or-later` (the release-workflow entry previously
+    incorrectly said `MIT`).
+  - `README.md` License section rewritten to document the AGPL core, the
+    enterprise SKU, and the SDK linking exception.
+
+- **New `enterprise/` subtree — opt-in commercial module surface.** Added
+  as empty scaffolding behind the new Meson option
+  `-Denable_enterprise=true` (default `false`). Does not compile into OSS
+  builds. Includes `enterprise/README.md`, a placeholder
+  `enterprise/LICENSE-ENTERPRISE.md` (TODO: legal review before shipping
+  paid builds), and `enterprise/meson.build`. First real premium feature
+  (SAML/SSO) will land in a follow-up PR. See
+  `docs/enterprise-edition.md`.
+
+- **Contributor License Agreement (CLA) introduced.** New `CLA.md` (based
+  on the Harmony 1.0 template, pending counsel review) assigns copyright
+  to the project steward with a broad re-license grant covering both AGPL
+  and commercial use. `CONTRIBUTING.md` updated to reference it; a
+  disabled-by-default CLA-bot stub at `.github/workflows/cla.yml` is
+  included — ops must provision `CLA_REPO_ACCESS_TOKEN` to activate.
+  Accepting external contributions before activation would lock those
+  contributions to AGPL-only.
+
+- **Plugin SDK linking exception documented.** New `sdk/LICENSE-SDK.md`
+  carves out dynamically-loaded plugins that consume only the stable
+  `plugin.h` C ABI, analogous to the GCC Runtime Library / Classpath
+  Exception. Proprietary plugins remain permitted. Wording must be
+  legal-reviewed before the first AGPL-era release ships.
+
 ## [0.11.0-rc2] - 2026-04-20
 
 ### Added

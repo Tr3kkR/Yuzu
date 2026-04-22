@@ -2,7 +2,7 @@ project(
   'yuzu',
   'cpp',
   version: '0.11.0',
-  license: 'Apache-2.0',
+  license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
     'cpp_std=c++23',
@@ -311,6 +311,15 @@ if build_server
   subdir('server/core')
 endif
 
+# ── Enterprise (commercial license; see enterprise/LICENSE-ENTERPRISE.md) ────
+# This subtree is NOT covered by the AGPL license that governs the rest of
+# the repository. It only builds when explicitly enabled via
+# -Denable_enterprise=true, and doing so requires a commercial license.
+if get_option('enable_enterprise')
+  message('Building WITH enterprise modules — commercial license required (see enterprise/LICENSE-ENTERPRISE.md).')
+  subdir('enterprise')
+endif
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 if build_tests
   subdir('tests')
@@ -413,10 +422,11 @@ endif
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 summary({
-  'Agent':    build_agent,
-  'Server':   build_server,
-  'Examples': build_examples,
-  'Tests':    build_tests,
+  'Agent':      build_agent,
+  'Server':     build_server,
+  'Examples':   build_examples,
+  'Tests':      build_tests,
+  'Enterprise': get_option('enable_enterprise'),
 }, section: 'Components')
 
 summary({
