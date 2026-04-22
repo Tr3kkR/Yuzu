@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Close CodeQL-flagged Actions code-injection sink in `pre-release.yml`
+  + exclude vendored and generated paths from CodeQL scanning.** Two
+  security-tooling follow-ups surfaced by the first real CodeQL scan
+  after the Scorecard lift landed.
+  - **Code injection fix.** CodeQL critical rule
+    `actions/code-injection/critical` flagged line 49 of
+    `.github/workflows/pre-release.yml`, where
+    `${{ github.event.workflow_run.head_branch }}` was interpolated
+    directly into the bash `run:` block of the "Determine version" step.
+    `workflow_run` is an externally-influenced event trigger, and branch
+    or tag names can carry shell metacharacters. Rebound both
+    `head_branch` and the `workflow_dispatch` `inputs.tag` value to step-
+    level `env:` entries (`EVENT_BRANCH`, `INPUT_TAG`) and reference them
+    as shell variables — the canonical Actions security pattern.
+  - **CodeQL scope.** Added `.github/codeql/codeql-config.yml` with a
+    `paths-ignore` list (`vcpkg_installed/**`, `build-*/**`,
+    `builddir*/**`, `_build/**`) and wired it into the `codeql-action/init`
+    step via `config-file:`. Previously the scan indexed every header
+    under `vcpkg_installed/x64-linux/include/` — protobuf, abseil,
+    httplib — producing one "critical" (protobuf `map.h`) + six "high"
+    (abseil `raw_hash_set.h`, protobuf tctable, httplib `non-https-url`)
+    findings that are upstream-vendor bugs we cannot fix in-tree and
+    would be erased by the next vcpkg cache rebuild. Excluding them
+    collapses the noise and leaves first-party findings visible.
+
 - **Isolate `yuzu_gw_real_upstream_SUITE` from CI's gateway CT discovery.**
   The suite needs a live `yuzu-server` reachable on `127.0.0.1:50055`
   AND `YUZU_GW_TEST_TOKEN` set (or `scripts/linux-start-UAT.sh` to have

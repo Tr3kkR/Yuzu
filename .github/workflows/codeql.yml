@@ -291,6 +291,9 @@ jobs:
         with:
           languages: ${{ matrix.languages }}
           queries: +security-and-quality
+          # Scope the scan to first-party code; see the config file for
+          # the list of vendored/generated paths that are excluded.
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Configure (Meson debug) — linux
         if: matrix.os == 'linux'
