@@ -1,0 +1,20 @@
+name: "Yuzu CodeQL config"
+
+# Exclude third-party and generated code from CodeQL scanning.
+#
+# vcpkg_installed/  — vendored dependency headers (protobuf, abseil,
+#   grpc, httplib, etc.). Any finding here is an upstream bug we cannot
+#   fix in-tree and would be erased by the next vcpkg cache rebuild.
+# build-*/          — per-OS Meson build trees (build-linux,
+#   build-windows, build-macos, build-linux-codeql, etc.). Contains
+#   generated .pb.cc files and moc output; findings are derivative of
+#   the source headers CodeQL already scans directly.
+# builddir*/        — legacy build tree names from before the per-OS
+#   convention landed (kept for belt-and-braces; currently .gitignored).
+# _build/           — rebar3 Erlang build dir (Erlang isn't in the
+#   scanned languages but this avoids stray .beam / source scans).
+paths-ignore:
+  - "vcpkg_installed/**"
+  - "build-*/**"
+  - "builddir*/**"
+  - "_build/**"

@@ -42,11 +42,18 @@ jobs:
         id: ver
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind externally-influenced values to env vars rather than
+          # interpolating them into bash source — a branch name or
+          # workflow_dispatch input can carry shell metacharacters, and
+          # direct `${{ ... }}` expansion into a `run:` block is a code-
+          # injection sink (CodeQL actions/code-injection/critical).
+          EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$EVENT_BRANCH"
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
