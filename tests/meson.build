@@ -27,12 +27,13 @@ agent_test_exe = executable(
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
+    'unit/test_guardian_engine.cpp',
     'unit/test_new_plugins.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, yuzu_proto_dep, nlohmann_dep, catch2_dep],
   # Ensure the fixture plugin is built before the test runs so the lookup
   # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
   link_depends: reserved_name_fixture_plugin,
@@ -115,6 +116,7 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_store_errors.cpp',
