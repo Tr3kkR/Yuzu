@@ -4480,7 +4480,11 @@ private:
                 }
             },
             inventory_store_.get(),
-            product_pack_store_.get());
+            product_pack_store_.get(),
+            /*sw_deploy_store=*/nullptr,
+            /*device_token_store=*/nullptr,
+            /*license_store=*/nullptr,
+            guaranteed_state_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 

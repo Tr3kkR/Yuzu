@@ -161,6 +161,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian PR 2 — REST control plane + agent-side `GuardianEngine`
+  skeleton.** Stands up the operator-facing surface and the agent
+  scaffolding the rest of the Windows-first rollout grafts onto. No real
+  guards are running yet; PR 3 lands the Registry Guard + state evaluator
+  + remediation that turns the wire path into actual enforcement.
+  - **Server REST endpoints under `/api/v1/guaranteed-state/*`.** Full CRUD
+    on rules (`GET / POST / GET :id / PUT :id / DELETE :id`) plus `POST
+    /push` (returns `202 Accepted` — fan-out is PR 3), `GET /events`
+    (paginated query mirroring `audit_store` semantics; `limit` capped at
+    1000 at the REST boundary), `GET /status`, `GET /status/:agent_id`,
+    and `GET /alerts`. Conflict detection routes through `kConflictPrefix`
+    → HTTP 409 (matching #396/#399/#402). Created/updated rules carry the
+    session principal in `created_by` / `updated_by`. Every mutating route
+    fires an audit event under target type `GuaranteedState`.
+  - **New RBAC operation `Push` + securable type `GuaranteedState`.**
+    Distributes a rule set to scoped agents — separated from `Write` so
+    operators can be granted "deploy existing rules" without "author new
+    rules." Default seeds: `Operator` gets `Read + Push`,
+    `PlatformEngineer` gets full CRUD + `Push`, `Administrator` and
+    `ITServiceOwner` get the cross-type defaults, `Viewer` gets `Read`.
+    The cross-type `Push` grants on non-Guardian securables are harmless
+    because only the Guardian REST handlers consult `Push`.
+  - **Agent-side `GuardianEngine` class** (`agents/core/src/guardian_engine.{hpp,cpp}`).
+    Two-phase startup per design §4: `start_local()` runs pre-network so
+    the engine is enforcing before the Register RPC opens; `sync_with_server()`
+    runs post-Register and is the future drain point for buffered events.
+    Persists rules into `KvStore` under reserved namespace `__guardian__`
+    as JSON (binary-safe across the SQLite text APIs `KvStore` wraps).
+    `dispatch()` answers `__guard__` plugin commands `push_rules` and
+    `get_status`; reserved-name dispatch is intercepted in `agent.cpp`
+    *before* the plugin match loop so a third-party plugin cannot shadow
+    Guardian (defence-in-depth alongside the load-time reservation that
+    landed in #453). PR 2 reports every rule as `errored` because no
+    guards are running yet — honest about "Guardian installed but inert"
+    until PR 3.
+  - **`TestRouteSink` parses query strings.** The test sink now splits
+    request paths on `?` and feeds the tail to `httplib::detail::`
+    `parse_query_text`, populating `req.params`. This unblocks unit-level
+    coverage of every existing handler that branches on `req.has_param`
+    / `req.get_param_value` (the `events` query parameters were the
+    forcing function). Out-of-scope for the PR but a free win for any
+    follow-up REST test.
+
 - **Guardian: agent rejects plugins declaring a reserved internal-dispatch
   name (#453).** The agent plugin loader now refuses to load any plugin whose
   `YuzuPluginDescriptor::name` matches the reserved set `__guard__`,
@@ -346,6 +389,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, batch `insert_events` happy path + transactional rollback on
   mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
   reaper delete mechanics (including `retention_days=0` sentinel).
+- Added `tests/unit/test_guardian_engine.cpp` (13 cases, 79 assertions)
+  for the agent-side `GuardianEngine` ingest contract: `apply_rules`
+  persists rules + bumps generation, `full_sync` wipes the prior set,
+  delta merge keeps prior rules and updates overlap, empty `rule_id` is
+  skipped, `dispatch` round-trips `push_rules` through proto
+  `SerializeAsString`, `dispatch get_status` returns a serialised
+  `GuaranteedStateStatus`, missing `push` parameter / garbage proto map
+  to distinct exit codes, rule cache + `policy_generation` survive an
+  in-process engine reconstruct against the same `KvStore`, null-`KvStore`
+  construction degrades gracefully, and post-`stop()` `apply_rules`
+  fails. Bumps the agent test suite's `agent_test_exe` deps with
+  `yuzu_proto_dep` (the test constructs proto messages directly).
+- Added `tests/unit/server/test_rest_guaranteed_state.cpp` (11 cases,
+  88 assertions) for the `/api/v1/guaranteed-state/*` REST surface:
+  `201` on create with `rule_id` echoed, `400` on missing required
+  fields, `409` mapping from `kConflictPrefix` for duplicate name, full
+  list/get/update/delete round-trip with version bump, `404` on unknown
+  ids with denied-audit, `202` on `/push` with rule count + scope in the
+  audit detail, `events` filter + `limit` pagination, `400` on invalid
+  `limit`, `status` rollup, and `alerts` placeholder. Built against the
+  in-process `TestRouteSink` (no live `httplib::Server`, no #438 TSan
+  trap).
+- Updated `tests/unit/server/test_rbac_store.cpp`: bumped securable-type
+  count to 19, operations count to 6, `Administrator` perms to 114 (19
+  × 6), `Viewer` to 18, and `ITServiceOwner` to 96 (16 × 6) — all
+  knock-ons from adding the `GuaranteedState` securable type and the
+  `Push` operation seeded for PR 2.
 
 ## [0.11.0] - 2026-04-17
 
