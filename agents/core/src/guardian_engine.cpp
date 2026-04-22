@@ -31,7 +31,6 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -272,34 +271,12 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
         // proto map<string,string> stores the value as a std::string with
         // exact length — binary-safe across embedded NUL bytes, unlike a
         // C-string round trip.
-        // TEMP DIAGNOSTIC (remove after #473 MSVC test failure fixed):
-        // Dump wire-byte length + first/last bytes to distinguish "map value
-        // was truncated" from "ParseFromString lost fields". Remove once
-        // the Windows-only test_guardian_engine.cpp:212-214 failures are
-        // understood.
-        const std::string& wire = it->second;
-        std::string first_hex, last_hex;
-        for (std::size_t i = 0; i < wire.size() && i < 16; ++i) {
-            char b[4];
-            std::snprintf(b, sizeof(b), "%02x ", static_cast<unsigned char>(wire[i]));
-            first_hex += b;
-        }
-        for (std::size_t i = (wire.size() > 16 ? wire.size() - 16 : 0); i < wire.size(); ++i) {
-            char b[4];
-            std::snprintf(b, sizeof(b), "%02x ", static_cast<unsigned char>(wire[i]));
-            last_hex += b;
-        }
-        spdlog::info("Guardian DIAG: push wire bytes={}  head=[{}]  tail=[{}]",
-                     wire.size(), first_hex, last_hex);
         if (!push.ParseFromString(it->second)) {
             res.exit_code = 2;
             res.content_type = "text";
             res.output = "failed to parse GuaranteedStatePush proto";
             return res;
         }
-        spdlog::info("Guardian DIAG: push parsed full_sync={} policy_generation={} rules_count={}",
-                     push.full_sync(), push.policy_generation(),
-                     static_cast<int>(push.rules_size()));
         auto applied = apply_rules(push);
         if (!applied) {
             res.exit_code = 3;
