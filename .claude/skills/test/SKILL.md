@@ -304,6 +304,20 @@ gate_run "Dialyzer" "dialyzer.log" \
 gate_run "CT suites" "ct.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
 
+# Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
+# (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
+# apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
+#   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
+#      this up via linux-start-UAT.sh).
+#   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR
+#      linux-start-UAT.sh must have just run (its scratch dir is
+#      probed for the token).
+# Failing either prerequisite, the suite reports {test_case_failed,
+# "No enrollment token: …"} per-case rather than a useful skip — file
+# an upstream issue if you hit that during /test.
+gate_run "CT real-upstream" "ct-real-upstream.log" \
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
+
 gate_run "Integration" "integration.log" \
     "bash scripts/integration-test.sh"
 

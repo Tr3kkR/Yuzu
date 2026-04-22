@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Isolate `yuzu_gw_real_upstream_SUITE` from CI's gateway CT discovery.**
+  The suite needs a live `yuzu-server` reachable on `127.0.0.1:50055`
+  AND `YUZU_GW_TEST_TOKEN` set (or `scripts/linux-start-UAT.sh` to have
+  just run); CI provisions neither. Previously the suite was registered
+  alongside the regular CT tree and ran as part of `meson test --suite
+  gateway`, where it failed deterministically on the Windows MSVC runner
+  (TCP probe to `:50055` succeeded against an unrelated listener bound by
+  WSL2 port-forwarding from the same physical box, so the suite proceeded
+  to the gRPC `ProxyRegister` call and exploded). Linux hid the failure
+  because the self-hosted runner has no `rebar3` on PATH and the entire
+  gateway CT step is skipped at meson configure time.
+  - **Move:** `gateway/apps/yuzu_gw/test/yuzu_gw_real_upstream_SUITE.erl`
+    → `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`.
+    `git mv` so file history follows.
+  - **rebar3 wiring:** add `{extra_src_dirs, [{"integration_test",
+    [{recursive, false}]}]}` under the `test` profile in
+    `gateway/rebar.config` so the moved suite still compiles in the test
+    profile but is reachable only via explicit `--dir
+    apps/yuzu_gw/integration_test`.
+  - **CI invocation:** `scripts/test_gateway.py ct` (called by the meson
+    `gateway ct` test target) keeps using `--dir apps/yuzu_gw/test` and
+    no longer discovers the suite — verified locally: 6 suites / 52
+    tests, all pass, no `yuzu_gw_real_upstream_SUITE` entry.
+  - **`/test` invocation:** `.claude/skills/test/SKILL.md` Phase 5 now
+    runs a second `gate_run "CT real-upstream"` step that targets `--dir
+    apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE`,
+    relying on Phase 4's `linux-start-UAT.sh` to have stood up the
+    server and provisioned the enrollment token. Doc-comment in the
+    SKILL warns about the prerequisites and the per-case
+    `{test_case_failed, "No enrollment token: …"}` failure mode if
+    either is missing.
+
 - **CI dedup: drop `feature/**` and `fix/**` from the `push:` triggers in
   `ci.yml` and `docs-lint.yml`.** Pushes to feature/fix branches with an
   open PR previously fired both the `push` and `pull_request` events on
