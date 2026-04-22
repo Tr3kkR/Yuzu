@@ -28,10 +28,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -56,11 +58,25 @@ std::string uid_suffix() {
 #endif
 }
 
+// Path uniqueness strategy:
+//   - process-local mt19937_64 seed  → distinct across concurrent test binaries
+//     (belt-and-suspenders: different meson test workers each get a different
+//     random prefix)
+//   - atomic monotonic counter       → guarantees uniqueness within a single
+//     process regardless of `std::chrono::steady_clock` resolution
+//     (MSVC's steady_clock granularity can drop to the 100ns tick on some
+//     Windows builds, and Defender-induced serialisation on SystemTemp made
+//     the prior hash+time scheme produce colliding filenames ~1 run in 40 on
+//     the yuzu-local-windows self-hosted runner — observed on PR #473)
 fs::path unique_kv_path() {
+    static const std::uint64_t kProcessSalt = [] {
+        std::random_device rd;
+        return (static_cast<std::uint64_t>(rd()) << 32) | rd();
+    }();
+    static std::atomic<std::uint64_t> counter{0};
+    const auto n = counter.fetch_add(1, std::memory_order_relaxed);
     return fs::temp_directory_path() / ("yuzu_test_guardian" + uid_suffix()) /
-           ("guardian_" +
-            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + "_" +
-            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".db");
+           ("guardian_" + std::to_string(kProcessSalt) + "_" + std::to_string(n) + ".db");
 }
 
 struct GuardianFixture {
