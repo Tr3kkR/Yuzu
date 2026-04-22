@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI dedup: drop `feature/**` and `fix/**` from the `push:` triggers in
+  `ci.yml` and `docs-lint.yml`.** Pushes to feature/fix branches with an
+  open PR previously fired both the `push` and `pull_request` events on
+  the same SHA, doubling runner consumption for every commit pushed to a
+  PR branch. Mainline branches (`main`, `dev`) remain on the `push:`
+  list so merge runs still fire exactly once. Pre-PR work (no PR open
+  yet) no longer runs CI automatically — open the PR earlier or use the
+  existing `workflow_dispatch` trigger to fire it manually.
+
 - **Digest-pin Dockerfile `FROM` lines, replace `curl | sh` installers,
   and hash-pin `requirements-ci.txt` (PR #3 of Scorecard lift).**
   Completes Scorecard's `Pinned-Dependencies` check — the remaining
