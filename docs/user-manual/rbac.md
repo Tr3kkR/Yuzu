@@ -30,11 +30,11 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 6 operations on all 19 securable types (114 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 19 securable types, plus Push on GuaranteedState (96 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 6 operations on 16 securable types (96 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
+| **ITServiceOwner** | All 5 CRUD operations on 16 securable types, plus Push on GuaranteedState (81 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 18 securable types (all except Infrastructure) (18 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
@@ -70,7 +70,7 @@ Six roles are created automatically and cannot be deleted:
 | `Delete` | Remove a resource |
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve a pending workflow item |
-| `Push` | Distribute an existing rule set to scoped agents (consumed only by `GuaranteedState`; separates deploy authority from authoring authority) |
+| `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
 
 ## Permission Resolution
 

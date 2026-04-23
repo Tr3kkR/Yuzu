@@ -412,6 +412,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round 2 — H-3, H-4, H-7, H-8.** Second hardening
+  round after the BL-1..BL-9 commit on the same governance run. Closes the
+  HIGH findings that were small enough to fold into a single commit; the
+  remaining HIGHs (H-1 read-side audit gap, H-2 plugin-loader RCE, H-5 gateway
+  UTF-8 crash, H-6 apply_rules atomicity) are tracked as issues #477 / #478 /
+  #479 and will land separately.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` stops type-mismatched bodies
+    from surfacing as HTTP 500** (H-3). The handler was using
+    `body["k"].get<T>()` which raises `nlohmann::json::type_error` on a
+    type-mismatched field (e.g. `{"enabled": "yes"}`); without a server-wide
+    `set_exception_handler`, httplib's default path returns 500 with an empty
+    body. Swapped to `body.value("k", existing)` matching the sibling POST
+    handler — type-mismatched fields silently fall back to the current value
+    rather than converting a client-side request-shape mistake into a server-
+    error alertable event.
+  - **`Push` operation seeding restricted to `GuaranteedState`** (H-4). The
+    previous cross-type seed granted `Administrator` and `ITServiceOwner`
+    the `Push` op on every securable type — harmless today because only the
+    Guardian REST handlers consult `Push`, but a latent privilege grant that
+    any future handler reading `perm_fn(..., "Push")` on a non-Guardian
+    securable would silently accept. `ops[]` is now split into `ops[]` (all
+    six, seeded into the operations catalogue) and `crud_ops[]` (the five
+    used for cross-type role seeding). Push is granted explicitly on
+    `GuaranteedState` for `Administrator` and `ITServiceOwner`, matching
+    the already-targeted grants for `Operator` and `PlatformEngineer`.
+    Test assertions updated: Administrator 114 → 96 permissions,
+    ITServiceOwner 96 → 81 permissions, plus new invariant checks that
+    verify `Push` exists exactly once per role and only on `GuaranteedState`.
+    `rbac.md` counts updated to match.
+  - **503 error body vocabulary consolidated** (H-7). Nine Guardian 503
+    sites previously returned `"guaranteed-state store unavailable"`; every
+    other 503 site in `rest_api_v1.cpp` uses `"service unavailable"`.
+    Log-based alerting that greps the sibling string will now match Guardian
+    store outages too.
+  - **New `tests/unit/test_helpers.hpp` replaces the stale `thread::id`-hash
+    + `steady_clock` uniqueness pattern across 5 test files** (H-8, closes
+    #482). The pattern that commit a90a21e replaced in
+    `test_guardian_engine.cpp` for Windows MSVC flake #473 is now extinct
+    in `test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+    `test_rest_api_t2.cpp`, and `test_kv_store.cpp`. Shared header provides
+    `unique_temp_path(prefix)` with a process-local `mt19937_64`-seeded
+    salt + atomic monotonic counter, and `TempDbFile` RAII wrapper cleaning
+    up `.db` / `-wal` / `-shm` companions. Header-only inline impl so each
+    test binary owns its own salt and counter; no shared-state hazard.
+
 - **Guardian PR 2 hardening round — governance Gate 7 BL-1..BL-9.** Consolidates
   the blocking findings from the `/governance b13ff17~1..HEAD` run on
   `feat/guardian-pr2`. No new functionality; closes the gaps between Guardian

@@ -27,9 +27,10 @@
 
 #include <atomic>
 #include <chrono>
+#include "../test_helpers.hpp"
+
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -37,13 +38,11 @@ using namespace yuzu::server;
 
 namespace {
 
+// Delegates to the shared salt + atomic counter helper (#482). The prior
+// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
+// #473 traced back to.
 static fs::path unique_temp_path(const std::string& prefix) {
-    return fs::temp_directory_path() /
-           (prefix + "-" +
-            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-                           static_cast<size_t>(std::chrono::steady_clock::now()
-                                                   .time_since_epoch()
-                                                   .count())));
+    return yuzu::test::unique_temp_path(prefix + "-");
 }
 
 struct AuditRecord {

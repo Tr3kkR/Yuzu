@@ -2066,7 +2066,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2083,7 +2083,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2144,7 +2144,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2164,7 +2164,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2182,13 +2182,22 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 return;
             }
             auto updated = *existing;
-            if (body.contains("name"))             updated.name = body["name"].get<std::string>();
-            if (body.contains("yaml_source"))      updated.yaml_source = body["yaml_source"].get<std::string>();
-            if (body.contains("enabled"))          updated.enabled = body["enabled"].get<bool>();
-            if (body.contains("enforcement_mode")) updated.enforcement_mode = body["enforcement_mode"].get<std::string>();
-            if (body.contains("severity"))         updated.severity = body["severity"].get<std::string>();
-            if (body.contains("os_target"))        updated.os_target = body["os_target"].get<std::string>();
-            if (body.contains("scope_expr"))       updated.scope_expr = body["scope_expr"].get<std::string>();
+            // Use body.value<T>(k, default) rather than body["k"].get<T>()
+            // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
+            // falls back to the existing value rather than throwing
+            // nlohmann::json::type_error. nlohmann throws from get<T>() on
+            // mismatch; without a server-wide set_exception_handler on
+            // web_server_ (none installed), httplib's default path returns
+            // HTTP 500 with an empty body. That converts a client-error
+            // request-shape mistake into a server-error alertable event.
+            // Mirrors the POST handler's body.value(...) pattern.
+            updated.name             = body.value("name", updated.name);
+            updated.yaml_source      = body.value("yaml_source", updated.yaml_source);
+            updated.enabled          = body.value("enabled", updated.enabled);
+            updated.enforcement_mode = body.value("enforcement_mode", updated.enforcement_mode);
+            updated.severity         = body.value("severity", updated.severity);
+            updated.os_target        = body.value("os_target", updated.os_target);
+            updated.scope_expr       = body.value("scope_expr", updated.scope_expr);
             updated.version = existing->version + 1;
             updated.updated_at = iso_now();
             auto session = auth_fn(req, res);
@@ -2221,7 +2230,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Delete")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2249,7 +2258,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Push")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
@@ -2293,7 +2302,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
             if (!guaranteed_state_store) {
                 res.status = 503;
-                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                res.set_content(error_json("service unavailable", 503),
                                 "application/json");
                 return;
             }
