@@ -1,6 +1,7 @@
 #include "rest_api_v1.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "store_errors.hpp"
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -10,9 +11,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::server {
 namespace {
@@ -368,14 +373,15 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ProductPackStore* product_pack_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 DeviceTokenStore* device_token_store,
-                                LicenseStore* license_store) {
+                                LicenseStore* license_store,
+                                GuaranteedStateStore* guaranteed_state_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     rbac_store, mgmt_store, token_store, quarantine_store, response_store,
                     instruction_store, execution_tracker, schedule_engine, approval_manager,
                     tag_store, audit_store, std::move(service_group_fn), std::move(tag_push_fn),
                     inventory_store, product_pack_store, sw_deploy_store, device_token_store,
-                    license_store);
+                    license_store, guaranteed_state_store);
 }
 
 void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -391,7 +397,8 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 ProductPackStore* product_pack_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 DeviceTokenStore* device_token_store,
-                                LicenseStore* license_store) {
+                                LicenseStore* license_store,
+                                GuaranteedStateStore* guaranteed_state_store) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1940,6 +1947,358 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                     .str();
                 res.set_content(ok_json(data), "application/json");
             });
+
+    // ── Guardian / Guaranteed State (/api/v1/guaranteed-state) ────────────
+    // PR 2 of the Guardian Windows-first rollout. Endpoints follow design
+    // doc §9.2. RBAC securable type is "GuaranteedState" with operations
+    // Read/Write/Delete/Push (Push is a new op seeded by rbac_store).
+    //
+    // Re-parsing YAML for the denormalised columns is intentionally NOT
+    // done here — yaml-cpp is not a server-side dep. Callers pass severity
+    // / os_target / scope_expr alongside yaml_source in the JSON body
+    // (matches how `instruction_store` ingests YAML from the dashboard).
+
+    auto iso_now = []() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#if defined(_WIN32)
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        return std::string(buf);
+    };
+
+    auto rule_to_jobj = [](const GuaranteedStateRuleRow& r) {
+        JObj o;
+        o.add("rule_id", r.rule_id)
+            .add("name", r.name)
+            .add("yaml_source", r.yaml_source)
+            .add("version", static_cast<int64_t>(r.version))
+            .add("enabled", r.enabled)
+            .add("enforcement_mode", r.enforcement_mode)
+            .add("severity", r.severity)
+            .add("os_target", r.os_target)
+            .add("scope_expr", r.scope_expr)
+            .add("created_at", r.created_at)
+            .add("updated_at", r.updated_at)
+            .add("created_by", r.created_by)
+            .add("updated_by", r.updated_by);
+        return o;
+    };
+
+    sink.Get("/api/v1/guaranteed-state/rules",
+        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto rows = guaranteed_state_store->list_rules();
+            JArr arr;
+            for (const auto& r : rows) arr.add(rule_to_jobj(r));
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                            "application/json");
+        });
+
+    sink.Post("/api/v1/guaranteed-state/rules",
+        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            GuaranteedStateRuleRow row;
+            row.rule_id          = body.value("rule_id", "");
+            row.name             = body.value("name", "");
+            row.yaml_source      = body.value("yaml_source", "");
+            row.version          = body.value("version", int64_t{1});
+            row.enabled          = body.value("enabled", true);
+            row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
+            row.severity         = body.value("severity", std::string{"medium"});
+            row.os_target        = body.value("os_target", std::string{""});
+            row.scope_expr       = body.value("scope_expr", std::string{""});
+            if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+                res.status = 400;
+                res.set_content(error_json("rule_id, name, and yaml_source are required"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (session) {
+                row.created_by = session->username;
+                row.updated_by = session->username;
+            }
+            row.created_at = iso_now();
+            row.updated_at = row.created_at;
+
+            auto result = guaranteed_state_store->create_rule(row);
+            if (!result) {
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                    "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(error_json(result.error()), "application/json");
+                }
+                audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
+                         row.rule_id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.create", "success", "GuaranteedState",
+                     row.rule_id, row.name);
+            res.status = 201;
+            res.set_content(ok_json(JObj().add("rule_id", row.rule_id).str()),
+                            "application/json");
+        });
+
+    sink.Get(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto row = guaranteed_state_store->get_rule(id);
+            if (!row) {
+                res.status = 404;
+                res.set_content(error_json("rule not found"), "application/json");
+                return;
+            }
+            res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
+        });
+
+    sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto existing = guaranteed_state_store->get_rule(id);
+            if (!existing) {
+                res.status = 404;
+                res.set_content(error_json("rule not found"), "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            auto updated = *existing;
+            if (body.contains("name"))             updated.name = body["name"].get<std::string>();
+            if (body.contains("yaml_source"))      updated.yaml_source = body["yaml_source"].get<std::string>();
+            if (body.contains("enabled"))          updated.enabled = body["enabled"].get<bool>();
+            if (body.contains("enforcement_mode")) updated.enforcement_mode = body["enforcement_mode"].get<std::string>();
+            if (body.contains("severity"))         updated.severity = body["severity"].get<std::string>();
+            if (body.contains("os_target"))        updated.os_target = body["os_target"].get<std::string>();
+            if (body.contains("scope_expr"))       updated.scope_expr = body["scope_expr"].get<std::string>();
+            updated.version = existing->version + 1;
+            updated.updated_at = iso_now();
+            auto session = auth_fn(req, res);
+            if (session) updated.updated_by = session->username;
+
+            auto result = guaranteed_state_store->update_rule(updated);
+            if (!result) {
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                    "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(error_json(result.error()), "application/json");
+                }
+                audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState",
+                         id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.update", "success", "GuaranteedState",
+                     id, updated.name);
+            res.set_content(ok_json(JObj().add("updated", true)
+                                          .add("version", static_cast<int64_t>(updated.version)).str()),
+                            "application/json");
+        });
+
+    sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Delete")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto result = guaranteed_state_store->delete_rule(id);
+            if (!result) {
+                res.status = 404;
+                res.set_content(error_json(result.error()), "application/json");
+                audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
+                         id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.delete", "success", "GuaranteedState",
+                     id, "");
+            res.set_content(ok_json(JObj().add("deleted", true).str()),
+                            "application/json");
+        });
+
+    // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
+    // expansion). PR 2 acks the request and audits the operator action so
+    // dashboards and audit-trail tooling can be exercised end-to-end now.
+    sink.Post("/api/v1/guaranteed-state/push",
+        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Push")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) body = nlohmann::json::object();
+            std::string scope = body.value("scope", std::string{""});
+            bool full_sync = body.value("full_sync", false);
+            const auto rule_count = guaranteed_state_store->rule_count();
+            audit_fn(req, "guaranteed_state.push", "accepted", "GuaranteedState", scope,
+                     "rules=" + std::to_string(rule_count) +
+                     " full_sync=" + (full_sync ? "true" : "false"));
+            res.status = 202;
+            res.set_content(ok_json(JObj()
+                                        .add("queued", true)
+                                        .add("rules", static_cast<int64_t>(rule_count))
+                                        .add("scope", scope)
+                                        .add("note", "fan-out lands in Guardian PR 3").str()),
+                            "application/json");
+        });
+
+    // GET /events — query events with optional filters. Mirrors
+    // `audit_store` query semantics. Caps `limit` at 1000 at the REST
+    // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
+    sink.Get("/api/v1/guaranteed-state/events",
+        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("guaranteed-state store unavailable", 503),
+                                "application/json");
+                return;
+            }
+            GuaranteedStateEventQuery q;
+            q.rule_id  = req.has_param("rule_id")  ? req.get_param_value("rule_id")  : "";
+            q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+            q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+            if (req.has_param("limit")) {
+                int v = 0;
+                auto s = req.get_param_value("limit");
+                auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                if (ec != std::errc{} || v < 0) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid limit"), "application/json");
+                    return;
+                }
+                q.limit = std::min(v, 1000);
+            }
+            if (req.has_param("offset")) {
+                int v = 0;
+                auto s = req.get_param_value("offset");
+                auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                if (ec != std::errc{} || v < 0) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid offset"), "application/json");
+                    return;
+                }
+                q.offset = v;
+            }
+            auto rows = guaranteed_state_store->query_events(q);
+            JArr arr;
+            for (const auto& e : rows) {
+                arr.add(JObj()
+                            .add("event_id", e.event_id)
+                            .add("rule_id", e.rule_id)
+                            .add("agent_id", e.agent_id)
+                            .add("event_type", e.event_type)
+                            .add("severity", e.severity)
+                            .add("guard_type", e.guard_type)
+                            .add("guard_category", e.guard_category)
+                            .add("detected_value", e.detected_value)
+                            .add("expected_value", e.expected_value)
+                            .add("remediation_action", e.remediation_action)
+                            .add("remediation_success", e.remediation_success)
+                            .add("detection_latency_us",
+                                 static_cast<int64_t>(e.detection_latency_us))
+                            .add("remediation_latency_us",
+                                 static_cast<int64_t>(e.remediation_latency_us))
+                            .add("timestamp", e.timestamp));
+            }
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()),
+                                      static_cast<int64_t>(q.offset)),
+                            "application/json");
+        });
+
+    // GET /status, /status/:agent_id, /alerts — placeholders that respond
+    // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
+    // (status) and PR 11 (alerts). Returning empty structures now keeps
+    // dashboard fragments and audit tooling exercisable against the API.
+    sink.Get("/api/v1/guaranteed-state/status",
+        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
+            res.set_content(ok_json(JObj()
+                                        .add("total_rules", static_cast<int64_t>(rules))
+                                        .add("compliant", 0)
+                                        .add("drifted", 0)
+                                        .add("errored", 0)
+                                        .add("note", "fleet aggregation lands in Guardian PR 4")
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get(R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
+        [perm_fn](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            auto agent_id = req.matches[1].str();
+            res.set_content(ok_json(JObj()
+                                        .add("agent_id", agent_id)
+                                        .add("rules", 0)
+                                        .add("note", "per-agent status lands in Guardian PR 4")
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get("/api/v1/guaranteed-state/alerts",
+        [perm_fn](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            res.set_content(list_json("[]", 0), "application/json");
+        });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }

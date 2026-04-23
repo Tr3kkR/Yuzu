@@ -12,6 +12,7 @@ __declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_s
 #include <yuzu/agent/cert_discovery.hpp>
 #include <yuzu/agent/cert_store.hpp>
 #include <yuzu/agent/cloud_identity.hpp>
+#include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -449,6 +450,16 @@ public:
             }
         }
 
+        // 1c. Initialise the Guardian engine (Phase 1 startup, pre-network).
+        // The engine persists rules into the KV store and answers __guard__
+        // dispatches once the Subscribe stream is open. Construction is
+        // safe even when KV failed to open (it degrades to in-memory only).
+        guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(), cfg_.agent_id);
+        if (auto r = guardian_->start_local(); !r) {
+            spdlog::warn("Guardian engine start_local failed: {} — continuing without Guardian",
+                         r.error());
+        }
+
         // Record start time for uptime calculation
         auto start_epoch = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -812,6 +823,11 @@ public:
             }
             spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
                          enrollment_status.empty() ? "enrolled" : enrollment_status);
+
+            // Mark Guardian as network-connected. PR 4 will use this hook to
+            // drain a buffered-events queue back over the command stream.
+            if (guardian_)
+                guardian_->sync_with_server();
         }
 
         // 3b. OTA updater: rollback check and old binary cleanup
@@ -981,6 +997,37 @@ public:
 
                 spdlog::info("Received command: plugin={}, action={}, id={}", cmd.plugin(),
                              cmd.action(), cmd.command_id());
+
+                // Reserved-name dispatch — must run before the plugin match
+                // loop so a third-party plugin cannot shadow Guardian (the
+                // load-time check in plugin_loader.cpp also rejects reserved
+                // names, but defence-in-depth keeps both halves explicit).
+                // See docs/yuzu-guardian-design-v1.1.md §7.2.
+                if (cmd.plugin() == "__guard__") {
+                    pb::CommandResponse resp;
+                    resp.set_command_id(cmd.command_id());
+                    auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+                    resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
+                    if (!guardian_) {
+                        resp.set_status(pb::CommandResponse::FAILURE);
+                        resp.set_exit_code(1);
+                        resp.set_output("guardian engine not initialised");
+                    } else {
+                        auto dr = guardian_->dispatch(cmd);
+                        resp.set_status(dr.exit_code == 0 ? pb::CommandResponse::SUCCESS
+                                                          : pb::CommandResponse::FAILURE);
+                        resp.set_exit_code(dr.exit_code);
+                        resp.set_output(std::move(dr.output));
+                    }
+                    metrics_.counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", "__guard__"}})
+                        .increment();
+                    std::lock_guard lock(stream_write_mu_);
+                    stream->Write(resp, grpc::WriteOptions());
+                    continue;
+                }
 
                 // Find the matching plugin
                 const YuzuPluginDescriptor* target = nullptr;
@@ -1183,6 +1230,8 @@ public:
     void stop() noexcept override {
         stop_requested_.store(true, std::memory_order_release);
         heartbeat_stop_.store(true, std::memory_order_release);
+        if (guardian_)
+            guardian_->stop();
         if (updater_)
             updater_->stop();
         // Cancel the Subscribe stream to unblock the Read() call
@@ -1207,6 +1256,7 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
+    std::unique_ptr<GuardianEngine> guardian_;
     yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;

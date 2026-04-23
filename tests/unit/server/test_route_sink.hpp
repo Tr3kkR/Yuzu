@@ -44,15 +44,28 @@ public:
                                                  const std::string& path,
                                                  const std::string& body = {},
                                                  const std::string& content_type = "application/json") {
+        // httplib::Server splits the request URI into path + query string
+        // before routing, so handlers see `req.path` without the `?...` tail
+        // and `req.params` populated from the query. Mirror that here so
+        // handlers exercising `req.has_param("limit")` work identically.
+        std::string match_path = path;
+        std::string query_text;
+        if (auto qpos = path.find('?'); qpos != std::string::npos) {
+            match_path = path.substr(0, qpos);
+            query_text = path.substr(qpos + 1);
+        }
+
         for (auto& route : routes_) {
             if (route.method != method) continue;
             std::smatch m;
-            if (!std::regex_match(path, m, route.regex)) continue;
+            if (!std::regex_match(match_path, m, route.regex)) continue;
 
             httplib::Request req;
             req.method = method;
-            req.path = path;
+            req.path = match_path;
             req.body = body;
+            if (!query_text.empty())
+                httplib::detail::parse_query_text(query_text, req.params);
             if (!content_type.empty())
                 req.set_header("Content-Type", content_type);
             // httplib populates `matches` with the regex capture groups so
