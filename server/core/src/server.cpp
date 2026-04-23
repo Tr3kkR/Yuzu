@@ -1302,6 +1302,10 @@ private:
                 try {
                     cfg_.audit_retention_days = std::stoi(e.value);
                 } catch (...) {}
+            } else if (e.key == "guardian_event_retention_days") {
+                try {
+                    cfg_.guardian_event_retention_days = std::stoi(e.value);
+                } catch (...) {}
             }
             // auto_approve_enabled is read dynamically, no startup action needed
             // OIDC settings — runtime-configurable via Settings UI
@@ -1557,8 +1561,15 @@ private:
                 }
             }
 
+            // Guardian store is load-bearing for the /api/v1/guaranteed-state/*
+            // surface; prior to inclusion here /healthz reported "healthy" while
+            // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
+            bool guaranteed_state_ok =
+                guaranteed_state_store_ && guaranteed_state_store_->is_open();
+
             // Determine overall status
-            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+            bool all_stores_ok =
+                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -1570,7 +1581,8 @@ private:
                  {{"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
-                  {"policies", policy_ok ? "ok" : "error"}}},
+                  {"policies", policy_ok ? "ok" : "error"},
+                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"}}},
                 {"executions",
                  {{"in_flight", in_flight},
                   {"completed_last_hour", completed_last_hour},
@@ -1674,7 +1686,10 @@ private:
                              bool audit_ok = audit_store_ && audit_store_->is_open();
                              bool instruction_ok = instruction_store_ && instruction_store_->is_open();
                              bool policy_ok = policy_store_ && policy_store_->is_open();
-                             bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+                             bool guaranteed_state_ok =
+                                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+                             bool all_ok = response_ok && audit_ok && instruction_ok &&
+                                           policy_ok && guaranteed_state_ok;
 
                              // Execution stats
                              int in_flight = 0;
@@ -1761,6 +1776,8 @@ private:
                              config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
                              config_obj["response_retention_days"] = cfg_.response_retention_days;
                              config_obj["audit_retention_days"] = cfg_.audit_retention_days;
+                             config_obj["guardian_event_retention_days"] =
+                                 cfg_.guardian_event_retention_days;
                              config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
                              config_obj["log_level"] = spdlog::level::to_string_view(
                                                            spdlog::default_logger()->level())
@@ -1846,6 +1863,10 @@ private:
                              } else if (key == "audit_retention_days") {
                                  try {
                                      cfg_.audit_retention_days = std::stoi(value);
+                                 } catch (...) {}
+                             } else if (key == "guardian_event_retention_days") {
+                                 try {
+                                     cfg_.guardian_event_retention_days = std::stoi(value);
                                  } catch (...) {}
                              }
                              // log_level is applied inside RuntimeConfigStore::set()

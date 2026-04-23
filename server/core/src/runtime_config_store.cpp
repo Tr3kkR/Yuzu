@@ -11,11 +11,12 @@ namespace yuzu::server {
 // ── Allowed keys (safe for runtime modification) ─────────────────────────────
 
 static const std::vector<std::string> kAllowedKeys = {
-    "heartbeat_timeout",      // seconds before marking agent offline
-    "response_retention_days", // days to keep instruction responses
-    "audit_retention_days",    // days to keep audit events
-    "auto_approve_enabled",    // "true" or "false"
-    "log_level",               // trace|debug|info|warn|error
+    "heartbeat_timeout",             // seconds before marking agent offline
+    "response_retention_days",       // days to keep instruction responses
+    "audit_retention_days",          // days to keep audit events
+    "guardian_event_retention_days", // days to keep guaranteed-state events
+    "auto_approve_enabled",          // "true" or "false"
+    "log_level",                     // trace|debug|info|warn|error
     "oidc_issuer",             // OIDC issuer URL
     "oidc_client_id",          // OIDC client ID
     "oidc_client_secret",      // OIDC client secret (encrypted at rest via SQLite)

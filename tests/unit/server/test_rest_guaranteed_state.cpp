@@ -271,15 +271,24 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     REQUIRE(res);
     CHECK(res->status == 202);
     CHECK(res->body.find("\"queued\":true") != std::string::npos);
-    CHECK(res->body.find("PR 3") != std::string::npos);
+    // Response body uses a stable operational phrase, not an engineer-facing
+    // roadmap reference (BL-6 / ER-Dep2).
+    CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
 
     REQUIRE(h.audit_log.size() == 2);  // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
-    CHECK(push_audit.result == "accepted");
-    CHECK(push_audit.target_id == "tag:env=prod");
+    // Vocabulary matches sibling handlers: "success" (not the prior novel
+    // "accepted"), target_id is empty because a push is fleet-level rather
+    // than per-entity, and the scope expression lives in detail alongside
+    // the fan-out-deferred marker so SIEM correlation rules can filter on it.
+    CHECK(push_audit.result == "success");
+    CHECK(push_audit.target_id == "");
+    CHECK(push_audit.target_type == "GuaranteedState");
     CHECK(push_audit.detail.find("rules=1") != std::string::npos);
     CHECK(push_audit.detail.find("full_sync=true") != std::string::npos);
+    CHECK(push_audit.detail.find("scope=\"tag:env=prod\"") != std::string::npos);
+    CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
 }
 
 TEST_CASE("REST gs.events: filter + limit pagination",
@@ -326,6 +335,15 @@ TEST_CASE("REST gs.status: returns store rule_count rollup",
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["data"]["total_rules"].get<int>() == 1);
+    // Field names match the agent-side proto GuaranteedStateStatus so REST and
+    // proto schemas don't diverge when PR 4 wires real aggregation (BL-7 /
+    // consistency-auditor F1). Previously emitted `compliant`/`drifted`/`errored`.
+    CHECK(j["data"].contains("compliant_rules"));
+    CHECK(j["data"].contains("drifted_rules"));
+    CHECK(j["data"].contains("errored_rules"));
+    CHECK_FALSE(j["data"].contains("compliant"));
+    CHECK_FALSE(j["data"].contains("drifted"));
+    CHECK_FALSE(j["data"].contains("errored"));
 }
 
 TEST_CASE("REST gs.alerts: empty list placeholder",

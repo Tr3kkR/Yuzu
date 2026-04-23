@@ -412,6 +412,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round — governance Gate 7 BL-1..BL-9.** Consolidates
+  the blocking findings from the `/governance b13ff17~1..HEAD` run on
+  `feat/guardian-pr2`. No new functionality; closes the gaps between Guardian
+  PR 2's implementation and the operator, SIEM, and SOC 2 contracts it shipped
+  against.
+  - **`/healthz` + dashboard health fragment now include
+    `guaranteed_state_store` in the `all_stores_ok` conjunction** (BL-1). Prior
+    to this fix, `/healthz` reported `"healthy"` while `/api/v1/guaranteed-state/*`
+    returned `503` — the readiness-probe regression pattern (HC-1) that prior
+    governance runs have caught on every new load-bearing store addition.
+    Matches the `/readyz` per-store check which was already correct.
+  - **`guardian_event_retention_days` is now actually overridable** (BL-2). The
+    field was declared in `ServerConfig` with a default of 30 but had no CLI
+    flag and no runtime-config parser branch, so the CHANGELOG's
+    "overridable via runtime config" and the SOC 2 data-inventory doc's
+    "configurable" claims were false. Adds the `--guardian-event-retention-days`
+    CLI flag (+ `YUZU_GUARDIAN_EVENT_RETENTION_DAYS` env var), the `GET /api/config`
+    response key, the runtime `PUT /api/config/guardian_event_retention_days`
+    branch, the `RuntimeConfigStore::allowed_keys` entry, and the startup-config
+    parser branch — all matching the `audit_retention_days` pattern.
+  - **All 10 `/api/v1/guaranteed-state/*` routes now appear in the OpenAPI
+    spec served at `/api/v1/openapi.json` and in
+    `docs/user-manual/rest-api.md`** (BL-3). Adds `GuaranteedStateRule`,
+    `GuaranteedStateStatus`, and `GuaranteedStateEvent` schema components plus
+    per-path entries with security, request/response bodies, and status codes.
+    Rest-api.md gains a full "Guaranteed State" section with the RBAC matrix,
+    every endpoint's permission, request/response shape, and error paths.
+  - **`docs/user-manual/rbac.md` updated for `GuaranteedState` and `Push`**
+    (BL-4). Adds the securable type and operation, recomputes role permission
+    counts (Administrator 19×6=114, ITServiceOwner 16×6=96, Viewer 18×1=18) to
+    match code, and documents `Push` as the deploy-authority-without-author
+    operation consumed only by the Guardian REST handlers.
+  - **`docs/user-manual/audit-log.md` adds the four Guardian audit actions**
+    (BL-5). `guaranteed_state.rule.create / update / delete / push`. The push
+    entry explicitly warns SIEM rule authors that `fan_out_deferred_pr3=true`
+    in the detail field means "server accepted the push but agent delivery is
+    deferred" — misreading this as delivered would be premature until the PR 3
+    fan-out lands.
+  - **`/push` audit vocabulary aligned with sibling handlers** (BL-6 /
+    consistency-auditor F3). Previously emitted `result="accepted"` with
+    `target_id=<scope>` — a novel result string and a target_id that broke
+    SIEM joins (every other audit site uses a concrete entity id in target_id).
+    Now emits `result="success"` with `target_id=""` (pushes are fleet-level,
+    not per-entity) and `detail=rules=N full_sync=B scope="E" fan_out_deferred_pr3=true`.
+    Also rejects non-object JSON bodies with `400` + denied audit (previously
+    silently coerced to empty object), and replaces the engineer-facing
+    `note: "fan-out lands in Guardian PR 3"` in the response body with the
+    stable operational phrase `"push accepted; agent delivery is asynchronous"`.
+  - **`/status` and `/status/:agent_id` field names match the agent-side proto**
+    (BL-7 / consistency-auditor F1). REST previously returned `compliant`,
+    `drifted`, `errored`; the proto `GuaranteedStateStatus` uses
+    `compliant_rules`, `drifted_rules`, `errored_rules`. Renamed REST keys
+    to the `_rules` suffix before any downstream dashboard locks in the drift.
+    Per-agent status response gains `total_rules` for symmetry.
+  - **New operator-facing page `docs/user-manual/guaranteed-state.md`** (BL-8).
+    Covers the PR-2 limitation ("control plane + agent skeleton; no enforcement
+    until PR 3"), the YAML rule schema, the create/push/query workflow with
+    `curl` examples, the RBAC matrix, retention configuration, and the
+    `/healthz` / `/readyz` observability surface. Linked from the user-manual
+    README table of contents.
+  - **Windows Defender exclusion script now refuses to run on non-runner
+    hosts** (BL-9). `scripts/windows-runner-defender-exclusions.ps1` previously
+    would silently weaken Defender coverage on a dev workstation if run by
+    mistake (it excludes `%USERPROFILE%\AppData\Local\ccache` and
+    `C:\WINDOWS\SystemTemp\yuzu_test_*` — paths that exist on dev boxes). Adds
+    a hostname allowlist (default `^yuzu-local-windows`, overridable via
+    `-AllowedHostPattern` when provisioning a new runner) that errors out
+    before any `Add-MpPreference` call runs.
+
 - **`/api/health` reports the actual server version instead of the
   hardcoded "0.1.0" (#401).** The endpoint now derives the version
   string from the meson-generated `yuzu/version.hpp` constant

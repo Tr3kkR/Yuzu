@@ -20,7 +20,7 @@ enabled = true
 | **Principal** | A user or group identity. Matches the authenticated username or an OIDC group claim. |
 | **Role** | A named collection of permissions. Can be system-defined or custom. |
 | **Securable type** | A category of resource that permissions apply to (e.g., `Infrastructure`, `Tag`). |
-| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`). |
+| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`, `Push`). |
 | **Permission** | A single `(securable_type, operation, effect)` entry. Effect is `Allow` or `Deny`. |
 | **Role assignment** | Binds a principal to a role, optionally scoped to a management group. |
 
@@ -30,12 +30,12 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 operations on all 13 securable types (65 permissions) | Server admins, security team leads |
-| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response (14 permissions) | Authors and managers of YAML instruction definitions, sets, and schemas |
-| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response (24 permissions) | Day-to-day instruction execution, schedule management, tagging |
+| **Administrator** | All 6 operations on all 19 securable types (114 permissions) | Server admins, security team leads |
+| **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
+| **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 operations on 10 securable types: Infrastructure, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup (50 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 12 securable types (all except Infrastructure) (12 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 6 operations on 16 securable types (96 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 18 securable types (all except Infrastructure) (18 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
 
@@ -54,6 +54,12 @@ Six roles are created automatically and cannot be deleted:
 | `Security` | Security settings (TLS, enrollment) |
 | `ApiToken` | API token lifecycle |
 | `AuditLog` | Audit event records |
+| `Policy` | Guaranteed State policy fragments and composed policies |
+| `DeviceToken` | Agent device-token issuance and revocation |
+| `SoftwareDeployment` | Software deployment campaigns |
+| `License` | Enterprise license records |
+| `FileRetrieval` | File upload and download operations |
+| `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 
 ## Operations
 
@@ -64,6 +70,7 @@ Six roles are created automatically and cannot be deleted:
 | `Delete` | Remove a resource |
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve a pending workflow item |
+| `Push` | Distribute an existing rule set to scoped agents (consumed only by `GuaranteedState`; separates deploy authority from authoring authority) |
 
 ## Permission Resolution
 

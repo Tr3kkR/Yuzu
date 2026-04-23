@@ -35,8 +35,26 @@
 
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # Hostname pattern that is permitted to apply these exclusions. Default
+    # is the Shulgi self-hosted runner. Override only when provisioning a
+    # new runner with a different name.
+    [string]$AllowedHostPattern = '^yuzu-local-windows'
 )
+
+# Hostname allowlist. Path exclusions below include real dev-workstation
+# locations (%USERPROFILE%\AppData\Local\ccache, C:\WINDOWS\SystemTemp\yuzu_test_*)
+# — running this script on a dev box silently weakens Defender coverage
+# for those directories with no self-revert path. Refuse to proceed unless
+# we are on a known runner host.
+if ($env:COMPUTERNAME -notmatch $AllowedHostPattern) {
+    Write-Error ("Host '$($env:COMPUTERNAME)' does not match the runner allowlist " +
+                 "'$AllowedHostPattern'. This script excludes paths that exist on " +
+                 "dev workstations; refusing to run. Pass -AllowedHostPattern to " +
+                 "override when provisioning a new runner.")
+    exit 1
+}
 
 # Require admin.
 $isAdmin = ([Security.Principal.WindowsPrincipal] `

@@ -250,6 +250,10 @@ int main(int argc, char* argv[]) {
                    "Audit log retention period in days (default: 365)")
         ->default_val(365)
         ->envname("YUZU_AUDIT_RETENTION_DAYS");
+    app.add_option("--guardian-event-retention-days", cfg.guardian_event_retention_days,
+                   "Guardian (guaranteed-state) event retention period in days (default: 30)")
+        ->default_val(30)
+        ->envname("YUZU_GUARDIAN_EVENT_RETENTION_DAYS");
 
     // Analytics options
     app.add_flag("--no-analytics", "Disable analytics event collection")

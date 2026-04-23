@@ -266,6 +266,52 @@ const std::string& openapi_spec() {
           "installed_at": {"type": "integer"},
           "verified": {"type": "boolean", "description": "Whether the pack signature was verified"}
         }
+      },
+      "GuaranteedStateRule": {
+        "type": "object",
+        "properties": {
+          "rule_id": {"type": "string", "description": "Stable operator-chosen id ([A-Za-z0-9._-]+)"},
+          "name": {"type": "string"},
+          "yaml_source": {"type": "string", "description": "Authoritative rule body (kind: GuaranteedStateRule)"},
+          "version": {"type": "integer"},
+          "enabled": {"type": "boolean"},
+          "enforcement_mode": {"type": "string", "enum": ["enforce", "audit"]},
+          "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+          "os_target": {"type": "string", "description": "Empty (any) or one of windows|linux|macos"},
+          "scope_expr": {"type": "string", "description": "Scope DSL expression selecting target agents"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"},
+          "created_by": {"type": "string"},
+          "updated_by": {"type": "string"}
+        }
+      },
+      "GuaranteedStateStatus": {
+        "type": "object",
+        "properties": {
+          "total_rules": {"type": "integer"},
+          "compliant_rules": {"type": "integer"},
+          "drifted_rules": {"type": "integer"},
+          "errored_rules": {"type": "integer"}
+        }
+      },
+      "GuaranteedStateEvent": {
+        "type": "object",
+        "properties": {
+          "event_id": {"type": "string"},
+          "rule_id": {"type": "string"},
+          "agent_id": {"type": "string"},
+          "event_type": {"type": "string"},
+          "severity": {"type": "string"},
+          "guard_type": {"type": "string"},
+          "guard_category": {"type": "string", "enum": ["event", "condition"]},
+          "detected_value": {"type": "string"},
+          "expected_value": {"type": "string"},
+          "remediation_action": {"type": "string"},
+          "remediation_success": {"type": "boolean"},
+          "detection_latency_us": {"type": "integer"},
+          "remediation_latency_us": {"type": "integer"},
+          "timestamp": {"type": "string", "format": "date-time"}
+        }
       }
     }
   },
@@ -347,6 +393,30 @@ const std::string& openapi_spec() {
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
+    },
+    "/guaranteed-state/rules": {
+      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "guaranteed-state store unavailable"}}},
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "guaranteed-state store unavailable"}}}
+    },
+    "/guaranteed-state/rules/{rule_id}": {
+      "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
+      "put": {"summary": "Update a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Version is incremented on every successful update.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"200": {"description": "Rule updated"}, "400": {"description": "Invalid JSON"}, "404": {"description": "Rule not found"}, "409": {"description": "Conflicting name"}}},
+      "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "404": {"description": "Rule not found"}}}
+    },
+    "/guaranteed-state/push": {
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "guaranteed-state store unavailable"}}}
+    },
+    "/guaranteed-state/events": {
+      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
+    },
+    "/guaranteed-state/status": {
+      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
+    },
+    "/guaranteed-state/status/{agent_id}": {
+      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
+    },
+    "/guaranteed-state/alerts": {
+      "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     }
   }
 })json";
@@ -2184,19 +2254,34 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 return;
             }
             auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) body = nlohmann::json::object();
+            if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "invalid JSON body");
+                return;
+            }
+            if (body.is_null()) body = nlohmann::json::object();
             std::string scope = body.value("scope", std::string{""});
             bool full_sync = body.value("full_sync", false);
             const auto rule_count = guaranteed_state_store->rule_count();
-            audit_fn(req, "guaranteed_state.push", "accepted", "GuaranteedState", scope,
+            // target_id is reserved for a concrete entity id across every other
+            // audit emission in this file (rule_id, agent_id, group_id, token_id).
+            // The push scope expression is a fleet-level selector, not an entity
+            // id, so emit it in `detail` and leave target_id empty to preserve
+            // the SIEM join semantics. Result vocabulary stays "success" (202 is
+            // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+            audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
                      "rules=" + std::to_string(rule_count) +
-                     " full_sync=" + (full_sync ? "true" : "false"));
+                     " full_sync=" + (full_sync ? "true" : "false") +
+                     " scope=\"" + scope + "\"" +
+                     " fan_out_deferred_pr3=true");
             res.status = 202;
             res.set_content(ok_json(JObj()
                                         .add("queued", true)
                                         .add("rules", static_cast<int64_t>(rule_count))
                                         .add("scope", scope)
-                                        .add("note", "fan-out lands in Guardian PR 3").str()),
+                                        .add("note", "push accepted; agent delivery is asynchronous").str()),
                             "application/json");
         });
 
@@ -2268,15 +2353,18 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
     // (status) and PR 11 (alerts). Returning empty structures now keeps
     // dashboard fragments and audit tooling exercisable against the API.
+    // Field names match the agent-side proto `GuaranteedStateStatus`
+    // (compliant_rules / drifted_rules / errored_rules) so REST and proto
+    // schemas do not diverge when PR 4 wires real aggregation.
     sink.Get("/api/v1/guaranteed-state/status",
         [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
             const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
             res.set_content(ok_json(JObj()
                                         .add("total_rules", static_cast<int64_t>(rules))
-                                        .add("compliant", 0)
-                                        .add("drifted", 0)
-                                        .add("errored", 0)
+                                        .add("compliant_rules", 0)
+                                        .add("drifted_rules", 0)
+                                        .add("errored_rules", 0)
                                         .add("note", "fleet aggregation lands in Guardian PR 4")
                                         .str()),
                             "application/json");
@@ -2288,7 +2376,10 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             auto agent_id = req.matches[1].str();
             res.set_content(ok_json(JObj()
                                         .add("agent_id", agent_id)
-                                        .add("rules", 0)
+                                        .add("total_rules", 0)
+                                        .add("compliant_rules", 0)
+                                        .add("drifted_rules", 0)
+                                        .add("errored_rules", 0)
                                         .add("note", "per-agent status lands in Guardian PR 4")
                                         .str()),
                             "application/json");

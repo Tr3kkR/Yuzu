@@ -73,6 +73,12 @@ required.
 | `quarantine.enable` | Security | A device is placed in quarantine |
 | `quarantine.disable` | Security | A device is released from quarantine |
 | `cert.reload` | TlsCertificate | Certificate hot-reload attempted; detail contains outcome (success or failure reason) |
+| `guaranteed_state.rule.create` | GuaranteedState | A Guaranteed State rule is created |
+| `guaranteed_state.rule.update` | GuaranteedState | A Guaranteed State rule is updated (version is incremented on every successful update) |
+| `guaranteed_state.rule.delete` | GuaranteedState | A Guaranteed State rule is deleted |
+| `guaranteed_state.push` | GuaranteedState | A push of the active rule set to scoped agents is accepted. `target_id` is empty (pushes are fleet-level, not per-entity); `detail` carries `rules=<N> full_sync=<bool> scope="<expr>"`. While Guardian PR 2 is in effect the detail also includes `fan_out_deferred_pr3=true` — the REST call is accepted and persisted server-side but agent fan-out is not wired until Guardian PR 3, so SIEM rules that infer "rules were delivered to agents" from this event are premature until that flag disappears. |
+
+**Result vocabulary.** Every action above emits `result` as `success` or `denied`. `denied` is used for RBAC rejections and for 4xx/404 failures where the handler explicitly audits the failure (e.g., a DELETE on a non-existent rule). `failure` appears only on internal errors that the handler does not itself audit. SIEM rules that filter on `result == "success"` will match every completed Guardian mutation including `guaranteed_state.push` (which returns 202 rather than 201/200 because agent fan-out is asynchronous).
 
 ## REST API
 
