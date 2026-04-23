@@ -82,6 +82,13 @@ struct TempDbFile {
 
     explicit TempDbFile(std::string_view prefix = "yuzu-test-") : path(unique_temp_path(prefix)) {}
 
+    /// Adopt a caller-computed path. Useful when the fixture needs to place
+    /// the file under a subdirectory that `unique_temp_path` does not model
+    /// (e.g. a per-UID dir shared across tests). The caller is still
+    /// responsible for ensuring the path is unique — typically by deriving
+    /// its filename from `unique_temp_path`.
+    explicit TempDbFile(std::filesystem::path explicit_path) : path(std::move(explicit_path)) {}
+
     ~TempDbFile() noexcept {
         std::error_code ec;
         std::filesystem::remove(path, ec);
