@@ -412,6 +412,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round 3 — UP-R3, doc-B1, doc-B2, UP-R9.** Closes
+  the BLOCKING findings from the governance re-run on `a90a21e..HEAD`
+  (rounds 1 + 2). Pattern C confirmed: the first two hardening rounds
+  themselves introduced one new security regression and two doc regressions
+  that this round addresses.
+  - **`/push` audit detail now sanitises the scope value before embedding**
+    (UP-R3 — new regression introduced by BL-6's audit format change). The
+    BL-6 vocabulary fix formatted detail as `rules=N full_sync=B scope="<scope>"
+    fan_out_deferred_pr3=true`, embedding operator-controlled scope between
+    raw quotes. An operator with `GuaranteedState:Push` could therefore POST
+    `{"scope":"x\" result=\"denied\" fake=\""}` and forge audit-record
+    fragments that parse downstream as successful-looking denials — audit log
+    integrity is a SOC 2 Workstream F control, so this is a real injection
+    vector. Added an inline `sanitize_audit_string` lambda that
+    backslash-escapes `"` and `\` and drops all C0 control bytes (CR/LF/NUL/
+    TAB and the rest of 0x00–0x1F + DEL). audit_store writes the string as
+    an opaque column so the sanitisation is defensive at the SIEM layer —
+    but that's the layer compliance evidence is reconstructed from. Test
+    `test_rest_guaranteed_state.cpp` gains a `[security]`-tagged regression
+    guard that POSTs an adversarial scope and asserts no control bytes, no
+    unescaped top-level injection tokens, and the structural frame of the
+    detail remains intact.
+  - **RBAC matrix tables in `docs/user-manual/guaranteed-state.md` and
+    `docs/user-manual/rest-api.md` now show all 6 operation columns**
+    (doc-B1 — new regression introduced by my BL-4 doc authoring). The
+    tables as first written showed 4 columns (Read/Write/Delete/Push) and
+    silently omitted Execute + Approve. Administrator and ITServiceOwner
+    actually receive Execute and Approve on `GuaranteedState` via the
+    `crud_ops[]` cross-type seed loop in `rbac_store.cpp`; the tables now
+    reflect that. PlatformEngineer's row is narrower (Read/Write/Delete/Push
+    — no Execute, no Approve) because its grants are explicit and targeted,
+    not cross-type. Added a clarifying paragraph beneath each table noting
+    the cross-seed origin of the Execute/Approve grants — this sets
+    expectations for future readers that those ops exist in the DB but have
+    no active Guardian handler today.
+  - **`docs/user-manual/guaranteed-state.md` PR-2 status banner now matches
+    the actual audit vocabulary** (doc-B2 — new regression introduced by
+    BL-6 + my BL-8 doc authoring). The banner still said "audited as
+    `accepted`" while the rest of the same file (and the code) use
+    `result=success` with `fan_out_deferred_pr3=true` in the detail field.
+    Updated the banner to match. Internal doc contradiction closed.
+  - **`openapi_spec()` 503 description strings aligned with the runtime body
+    strings** (UP-R9 / sec-L3 — H-7's scope miss). H-7 changed nine runtime
+    `error_json("service unavailable", 503)` calls but left three OpenAPI
+    path-entry `"503": {"description": "..."}` strings at the old "guaranteed-
+    state store unavailable" wording. Client libraries generated from the
+    spec saw a description that never matched the actual response body.
+    Consolidated.
+
 - **Guardian PR 2 hardening round 2 — H-3, H-4, H-7, H-8.** Second hardening
   round after the BL-1..BL-9 commit on the same governance run. Closes the
   HIGH findings that were small enough to fold into a single commit; the

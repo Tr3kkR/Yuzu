@@ -2406,15 +2406,15 @@ Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [
 
 **RBAC matrix:**
 
-| Role | Read | Write | Delete | Push |
-|---|---|---|---|---|
-| Administrator | ✓ | ✓ | ✓ | ✓ |
-| ITServiceOwner | ✓ | ✓ | ✓ | ✓ |
-| PlatformEngineer | ✓ | ✓ | ✓ | ✓ |
-| Operator | ✓ | | | ✓ |
-| Viewer | ✓ | | | |
+| Role | Read | Write | Execute | Delete | Approve | Push |
+|---|---|---|---|---|---|---|
+| Administrator | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ITServiceOwner | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PlatformEngineer | ✓ | ✓ | | ✓ | | ✓ |
+| Operator | ✓ | | | | | ✓ |
+| Viewer | ✓ | | | | | |
 
-`Push` is a Guardian-specific operation (distribute an existing rule set to scoped agents) that separates deploy authority from authoring authority.
+Administrator and ITServiceOwner inherit Execute and Approve on `GuaranteedState` from the cross-type CRUD seed loop — those operations have no active Guardian handler today but the grants exist in the DB. PlatformEngineer's grants are explicit (Read/Write/Delete/Push only). `Push` is a Guardian-specific operation (distribute an existing rule set to scoped agents) that separates deploy authority from authoring authority.
 
 #### `GET /api/v1/guaranteed-state/rules`
 

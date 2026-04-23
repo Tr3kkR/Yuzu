@@ -289,6 +289,57 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
 }
 
+TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
+          "[rest][guaranteed_state][push][security]") {
+    // UP-R3 regression guard. A scope containing raw quotes, control bytes,
+    // or backslashes must not corrupt the audit detail string that SIEM
+    // parsers consume. Attacker with GuaranteedState:Push could otherwise
+    // forge audit fragments by injecting `" result="denied" fake="`.
+    RestGsHarness h;
+    nlohmann::json push;
+    // Adversarial scope: embedded quote + CR + LF + NUL + backslash + tab.
+    // Built by append so there is no risk of buffer-size mismatch with
+    // std::string(const char*, size_t) and the embedded NUL.
+    std::string adversarial;
+    adversarial += "evil\" result=\"denied\" injected=\"yes\"";
+    adversarial += "\r\n\t";
+    adversarial += "foo";
+    adversarial.push_back('\0');
+    adversarial += "bar\\";
+    push["scope"] = adversarial;
+    push["full_sync"] = false;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", push.dump());
+    REQUIRE(res);
+    CHECK(res->status == 202);
+
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& push_audit = h.audit_log[0];
+    CHECK(push_audit.action == "guaranteed_state.push");
+    CHECK(push_audit.result == "success");
+    // Control bytes (CR/LF/NUL/TAB and the rest of C0) are dropped entirely
+    // so no visual line-split survives the round-trip.
+    const auto& d = push_audit.detail;
+    CHECK(d.find("\r") == std::string::npos);
+    CHECK(d.find("\n") == std::string::npos);
+    CHECK(d.find("\t") == std::string::npos);
+    CHECK(d.find('\0') == std::string::npos);
+    // Quotes inside the attacker-controlled value are backslash-escaped so
+    // SIEM parsers that tokenise on quoted strings see them inside the
+    // scope value, not as delimiters.
+    CHECK(d.find("\\\"") != std::string::npos);
+    // Backslashes are doubled so they cannot escape the closing scope
+    // delimiter.
+    CHECK(d.find("bar\\\\") != std::string::npos);
+    // The original adversarial payload's injected fields do not appear as
+    // unescaped top-level tokens in the detail string.
+    CHECK(d.find(" result=\"denied\"") == std::string::npos);
+    CHECK(d.find(" injected=\"yes\"") == std::string::npos);
+    // The structural frame of the detail is intact.
+    CHECK(d.find("rules=0") != std::string::npos);
+    CHECK(d.find("full_sync=false") != std::string::npos);
+    CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
+}
+
 TEST_CASE("REST gs.events: filter + limit pagination",
           "[rest][guaranteed_state][events]") {
     RestGsHarness h;

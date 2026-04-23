@@ -395,8 +395,8 @@ const std::string& openapi_spec() {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
     },
     "/guaranteed-state/rules": {
-      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "guaranteed-state store unavailable"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "guaranteed-state store unavailable"}}}
+      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/rules/{rule_id}": {
       "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
@@ -404,7 +404,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "404": {"description": "Rule not found"}}}
     },
     "/guaranteed-state/push": {
-      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "guaranteed-state store unavailable"}}}
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/events": {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
@@ -2274,6 +2274,36 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             std::string scope = body.value("scope", std::string{""});
             bool full_sync = body.value("full_sync", false);
             const auto rule_count = guaranteed_state_store->rule_count();
+            // Sanitize scope before embedding in the audit detail: operators
+            // with GuaranteedState:Push can otherwise post a scope containing
+            // raw quotes, CR/LF, NULs, or pipes, which appear verbatim in the
+            // detail string and corrupt SIEM parsers that tokenise on quoted
+            // strings or split on newlines (log-injection, SOC 2 audit-trail
+            // integrity). Dropping control bytes and backslash-escaping `"`
+            // and `\` preserves every printable scope DSL expression while
+            // neutering the injection vector. audit_store stores the string
+            // as an opaque column, so the sanitization is defensive at the
+            // SIEM layer only — but that is the layer SOC 2 Workstream F
+            // evidence is reconstructed from.
+            auto sanitize_audit_string = [](const std::string& s) {
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s) {
+                    if (c == '"' || c == '\\') {
+                        out += '\\';
+                        out += c;
+                    } else if (static_cast<unsigned char>(c) < 0x20 ||
+                               static_cast<unsigned char>(c) == 0x7F) {
+                        // Drop control bytes (CR/LF/NUL/TAB and all C0/DEL).
+                        // Keeping them as escapes would still let an attacker
+                        // embed "\\n\\n" to visually split a SIEM view; better
+                        // to erase. Non-ASCII UTF-8 (>= 0x80) is preserved.
+                    } else {
+                        out += c;
+                    }
+                }
+                return out;
+            };
             // target_id is reserved for a concrete entity id across every other
             // audit emission in this file (rule_id, agent_id, group_id, token_id).
             // The push scope expression is a fleet-level selector, not an entity
@@ -2283,7 +2313,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
                      "rules=" + std::to_string(rule_count) +
                      " full_sync=" + (full_sync ? "true" : "false") +
-                     " scope=\"" + scope + "\"" +
+                     " scope=\"" + sanitize_audit_string(scope) + "\"" +
                      " fan_out_deferred_pr3=true");
             res.status = 202;
             res.set_content(ok_json(JObj()

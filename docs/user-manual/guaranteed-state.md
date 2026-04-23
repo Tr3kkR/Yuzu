@@ -2,7 +2,7 @@
 
 Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rule** is a desired-state assertion about an endpoint — a registry value, a service status, a file presence, a configuration key — plus optional automatic remediation when the endpoint drifts. Unlike the server-side [Policy Engine](policy-engine.md), Guardian runs *inside the agent*, reacts to kernel-backed change notifications in sub-second time, and can repair drift without an operator in the loop.
 
-> **PR 2 status — read this first.** The v0.12 release ships Guardian's **control plane + agent skeleton only**. Rules can be authored, stored, retrieved, and pushed through the REST API. The agent persists the pushed rule set into a reserved KV namespace (`__guardian__`). **No guards run yet** — every rule reports `errored` in `/api/v1/guaranteed-state/status` and dashboards will surface this as "Guardian installed but inert." Server-to-agent fan-out is audited as `accepted` but does not actually deliver rules to agents until Guardian PR 3 lands. Operators pilot-testing Guardian should treat this release as an API-shape preview, not working enforcement. Design reference: `docs/yuzu-guardian-design-v1.1.md`. Windows-first rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+> **PR 2 status — read this first.** The v0.12 release ships Guardian's **control plane + agent skeleton only**. Rules can be authored, stored, retrieved, and pushed through the REST API. The agent persists the pushed rule set into a reserved KV namespace (`__guardian__`). **No guards run yet** — every rule reports `errored` in `/api/v1/guaranteed-state/status` and dashboards will surface this as "Guardian installed but inert." Server-to-agent fan-out is audited as `result=success` with `fan_out_deferred_pr3=true` in the detail field, but does not actually deliver rules to agents until Guardian PR 3 lands. SIEM correlation rules that infer "rules were delivered to agents" from these events are premature until that marker disappears. Operators pilot-testing Guardian should treat this release as an API-shape preview, not working enforcement. Design reference: `docs/yuzu-guardian-design-v1.1.md`. Windows-first rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
 
 ## Concepts
 
@@ -19,15 +19,15 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 
 Guardian introduces a new securable type (`GuaranteedState`) and a new operation (`Push`). Seeded role grants:
 
-| Role | Read | Write | Delete | Push |
-|---|---|---|---|---|
-| Administrator | ✓ | ✓ | ✓ | ✓ |
-| ITServiceOwner | ✓ | ✓ | ✓ | ✓ |
-| PlatformEngineer | ✓ | ✓ | ✓ | ✓ |
-| Operator | ✓ | | | ✓ |
-| Viewer | ✓ | | | |
+| Role | Read | Write | Execute | Delete | Approve | Push |
+|---|---|---|---|---|---|---|
+| Administrator | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ITServiceOwner | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PlatformEngineer | ✓ | ✓ | | ✓ | | ✓ |
+| Operator | ✓ | | | | | ✓ |
+| Viewer | ✓ | | | | | |
 
-`Push` is deliberately separated from `Write` so an operator can deploy a rule set authored by a platform engineer without being able to modify the rule body. See [RBAC](rbac.md) for the full securable-types matrix.
+Administrator and ITServiceOwner inherit Execute and Approve on `GuaranteedState` from the cross-type CRUD seed in `rbac_store.cpp` — neither operation has an active handler on Guardian today, but the grants exist in the database and will surface in any role-permission export. PlatformEngineer's grants are explicit and narrower (Read/Write/Delete/Push only). `Push` is deliberately separated from `Write` so an operator can deploy a rule set authored by a platform engineer without being able to modify the rule body. See [RBAC](rbac.md) for the full securable-types matrix.
 
 ## Rule YAML schema
 
