@@ -170,7 +170,7 @@ const std::string& openapi_spec() {
     "version": "1.0.0",
     "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header.",
     "contact": {"name": "Yuzu Project"},
-    "license": {"name": "Apache-2.0"}
+    "license": {"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"}
   },
   "servers": [{"url": "/api/v1", "description": "API v1 base path"}],
   "components": {

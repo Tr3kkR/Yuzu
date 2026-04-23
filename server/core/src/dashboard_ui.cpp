@@ -390,7 +390,7 @@ extern const char* const kDashboardIndexHtml =
         &nbsp;&middot;&nbsp;
         <a href="/help" style="color:#58a6ff;text-decoration:none">Documentation</a>
       </p>
-      <p style="font-size:0.65rem;color:#484f58;margin-bottom:1rem">Apache 2.0 License</p>
+      <p style="font-size:0.65rem;color:#484f58;margin-bottom:1rem">AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
       <button class="btn-close" onclick="closeAbout()">Close</button>
     </div>
   </div>
