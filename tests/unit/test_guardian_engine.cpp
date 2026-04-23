@@ -65,26 +65,23 @@ fs::path unique_kv_path() {
 }
 
 struct GuardianFixture {
-    fs::path kv_path;
+    // FIRST member — destructor fires even if downstream construction
+    // throws, so a partial REQUIRE failure below does not leak the .db /
+    // -wal / -shm trio. RAII cleanup means no manual fs::remove here.
+    yuzu::test::TempDbFile db_{unique_kv_path()};
     std::unique_ptr<KvStore> kv;
     std::unique_ptr<GuardianEngine> engine;
 
-    GuardianFixture() : kv_path(unique_kv_path()) {
-        auto opened = KvStore::open(kv_path);
+    GuardianFixture() {
+        auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
         engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test");
         REQUIRE(engine->start_local().has_value());
     }
 
-    ~GuardianFixture() {
-        engine.reset();
-        kv.reset();
-        std::error_code ec;
-        fs::remove(kv_path, ec);
-        fs::remove(fs::path{kv_path.string() + "-wal"}, ec);
-        fs::remove(fs::path{kv_path.string() + "-shm"}, ec);
-    }
+    // Default destructor: engine → kv → db_ destroy in reverse-declaration
+    // order, so SQLite handles close before TempDbFile removes the files.
 
     static gpb::GuaranteedStateRule make_rule(const std::string& id, const std::string& name,
                                                 bool enabled = true) {
@@ -279,9 +276,9 @@ TEST_CASE("GuardianEngine: dispatch push_rules with garbage proto → exit_code 
 
 TEST_CASE("GuardianEngine: rule cache + policy_generation survive engine reconstruct",
           "[guardian][engine][persistence]") {
-    auto kv_path = unique_kv_path();
+    yuzu::test::TempDbFile db{unique_kv_path()};
     {
-        auto opened = KvStore::open(kv_path);
+        auto opened = KvStore::open(db.path);
         REQUIRE(opened.has_value());
         auto kv = std::make_unique<KvStore>(std::move(*opened));
         GuardianEngine eng(kv.get(), "agent-test");
@@ -295,7 +292,7 @@ TEST_CASE("GuardianEngine: rule cache + policy_generation survive engine reconst
     }
     // Re-open the same KV file under a fresh engine and verify recovery.
     {
-        auto opened = KvStore::open(kv_path);
+        auto opened = KvStore::open(db.path);
         REQUIRE(opened.has_value());
         auto kv = std::make_unique<KvStore>(std::move(*opened));
         GuardianEngine eng(kv.get(), "agent-test");
@@ -303,10 +300,7 @@ TEST_CASE("GuardianEngine: rule cache + policy_generation survive engine reconst
         CHECK(eng.rule_count() == 1);
         CHECK(eng.policy_generation() == 13);
     }
-    std::error_code ec;
-    fs::remove(kv_path, ec);
-    fs::remove(fs::path{kv_path.string() + "-wal"}, ec);
-    fs::remove(fs::path{kv_path.string() + "-shm"}, ec);
+    // db destructor removes .db / -wal / -shm on scope exit.
 }
 
 TEST_CASE("GuardianEngine: construction with null KvStore degrades gracefully",

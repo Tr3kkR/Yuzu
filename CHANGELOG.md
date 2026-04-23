@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tests: migrate `GuardianFixture` in `test_guardian_engine.cpp` to
+  `yuzu::test::TempDbFile` RAII (#482).** Replaces the fixture's
+  hand-rolled destructor (`kv_path` member + three manual `fs::remove`
+  calls on `.db` / `-wal` / `-shm`) with the shared
+  `TempDbFile`-as-first-member pattern documented in CLAUDE.md. Also
+  migrates the sibling `[guardian][engine][persistence]` test case
+  (line 277) which was managing cleanup the same way. Added a new
+  path-accepting `TempDbFile(std::filesystem::path)` constructor to
+  `tests/unit/test_helpers.hpp` so fixtures that need a per-UID
+  subdirectory (agents/tests/unit/test_guardian_engine.cpp keeps files
+  under `yuzu_test_guardian_<uid>/` so shared dev boxes don't collide
+  between users) can adopt a precomputed path while still getting the
+  destructor-fires-on-partial-construction guarantee. The
+  `unique_kv_path()` helper is retained — it composes `unique_temp_path`
+  with the per-UID dir prefix and remains the single uniqueness source
+  for this test file. Progresses #482; four sibling test files
+  (`test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+  `test_rest_api_t2.cpp`, `test_kv_store.cpp`) still manage their own
+  RAII by hand and are left for a follow-up so this PR stays
+  bisectable.
+
 - **BREAKING (licensing): Yuzu is now distributed under AGPL-3.0-or-later
   (community edition) with a separate commercial license for the new
   `enterprise/` subtree.** Previously the repository was Apache-2.0. The
