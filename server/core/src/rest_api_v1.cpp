@@ -2179,6 +2179,13 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (body.is_discarded() || !body.is_object()) {
                 res.status = 400;
                 res.set_content(error_json("invalid JSON"), "application/json");
+                // Mirror the /push handler's invalid-body audit (BL-6): a
+                // mutating REST path that rejects a malformed body should
+                // leave a denied audit trail so SIEM sees the probe/fuzz
+                // attempt. Asymmetric audit coverage across sibling branches
+                // was flagged as UP-R1 in the Guardian PR 2 governance re-run.
+                audit_fn(req, "guaranteed_state.rule.update", "denied",
+                         "GuaranteedState", id, "invalid JSON body");
                 return;
             }
             auto updated = *existing;

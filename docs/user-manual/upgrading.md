@@ -210,6 +210,23 @@ If a migration fails:
 4. Start the previous server version against the restored data.
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
+## Upgrade notes by release
+
+### v0.12.0 — Guardian PR 2
+
+Guardian PR 2 ships the Guaranteed State control plane + agent skeleton. Two items require operator awareness on upgrade:
+
+**Stale `*:Push` RBAC grants on deployments that ran pre-hardening Guardian PR 2 code.** Between commits `7c83911` and `1f39401`, the RBAC seed granted the `Push` operation to `Administrator` and `ITServiceOwner` on **every** securable type, not just `GuaranteedState`. The H-4 fix (commit `21c0ba4`, hardening round 2) restricted the seed to `GuaranteedState` only going forward — but because `seed_defaults()` uses `INSERT OR IGNORE`, the stale cross-type grants already written to `role_permissions` are not removed on upgrade. These grants are semantically inert today (only the Guardian REST handlers consult `Push`), but become a latent privilege for any future release that adds a non-Guardian handler checking `perm_fn(..., "Push")`. Manual remediation until the auto-migration in issue #485 lands:
+
+```bash
+docker exec -i yuzu-server sqlite3 /var/lib/yuzu/rbac.db \
+  "DELETE FROM role_permissions WHERE operation = 'Push' AND securable_type != 'GuaranteedState';"
+```
+
+Safe on fresh installs (no matching rows). If you are upgrading **from** a v0.11.x release directly **to** v0.12.0 or later, skip this step — your RBAC database never carried the stale grants.
+
+**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/v1/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
+
 ## Rollback
 
 If an upgrade causes issues:

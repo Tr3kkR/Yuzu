@@ -412,6 +412,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round 4 — UP-R1, UP-R5, and SHOULD-tier docs.**
+  Small, code-local MEDIUM/SHOULD items from the governance re-run that did
+  not require architectural decisions. Systemic items (retention runtime-PUT
+  propagation across 3 stores, PUT TOCTOU optimistic concurrency, RBAC
+  upgrade migration, audit action namespace flatten, `.get<T>()` sweep
+  across 12 non-Guardian handlers, `TempDbFile` RAII adoption) are filed as
+  tracking issues #483, #484, #485, #486, #487, #488 and excluded from this
+  round to keep the commit focused.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` 400 invalid-body branch now
+    emits a `denied` audit** (UP-R1). Previously the handler rejected
+    malformed JSON with `400 {"error":"invalid JSON"}` but produced no
+    audit record, while the sibling `/push` 400 branch did — asymmetric
+    audit coverage across two branches shipped in the same hardening round.
+    Added a regression test (`[rest][guaranteed_state][crud]`) that POSTs a
+    non-object body and asserts the denied audit fires with the correct
+    action, target, and detail fields.
+  - **`PUT /api/v1/config/<key>` now validates integer-typed values before
+    persisting** (UP-R5). The prior implementation called
+    `runtime_config_store_->set(key, value, ...)` first, then wrapped
+    `std::stoi(value)` in `try { ... } catch (...) {}`. Any non-numeric or
+    negative value persisted to the store while silently failing to update
+    `cfg_` — an operator PUTting `{"value":"abc"}` received `200 {"applied":
+    true}` with no behaviour change, and on the next restart the invalid
+    string loaded back into `RuntimeConfigStore`. Replaced with
+    `std::from_chars`-based validation that runs **before** the `set` call
+    and rejects with `400 {"error":{"code":400,"message":"value must be a
+    non-negative integer"}}` on any parse failure. Applies to
+    `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
+    and `guardian_event_retention_days`. The `try { stoi } catch (...) {}`
+    blocks in the startup-config parser remain for now because that path
+    has no 400 to return — this fix targets the runtime API only.
+  - **`docs/user-manual/server-admin.md` Retention Settings table documents
+    `--guardian-event-retention-days`** (doc-S2). Third row added alongside
+    the existing `--response-retention-days` and `--audit-retention-days`
+    entries. Supporting prose updated to describe the env-var alternatives
+    (`YUZU_*_RETENTION_DAYS`) and the runtime `PUT /api/v1/config` path,
+    with an explicit "takes effect on restart" caveat cross-referencing
+    issue #483.
+  - **`CHANGELOG.md` round-1 BL-4 entry annotated with the H-4 correction**
+    (doc-S3). The 19×6=114 formula describing Administrator's seed count
+    was accurate at BL-4 commit time but implicitly superseded by round 2's
+    H-4 fix (which removed `Push` from the cross-type seed, reducing
+    Administrator to 96 and ITServiceOwner to 81). Inline note added so a
+    reader walking the CHANGELOG forward sees the correction before the
+    implausible math statement.
+  - **`CLAUDE.md` Guardian section expanded with the invariants that keep
+    surfacing in governance** (N1 + N3). Three resident notes: (a) `Push`
+    seed is Guardian-only — `ops[]` is the catalogue, `crud_ops[]` is the
+    cross-type seed, do not cross-seed `Push`; (b) reserved plugin name
+    `__guard__` has load-time rejection AND dispatch-time intercept, both
+    halves must stay; (c) Guardian wire payloads carrying raw proto bytes
+    must not be placed in `map<string, string>` fields the Erlang gateway
+    re-encodes via `gpb:e_type_string` — UTF-8 validation crashes. New
+    "Test conventions — shared helpers" section points at
+    `tests/unit/test_helpers.hpp` and names the `std::hash<thread::id>` +
+    `steady_clock` anti-pattern as the flake #473 vector.
+  - **`docs/user-manual/upgrading.md` gains a v0.12.0 Guardian PR 2 section**
+    (N2). Documents two operator-visible upgrade notes: the stale `*:Push`
+    RBAC grants on deployments that ran pre-hardening code (with manual
+    remediation SQL pending the #485 auto-migration), and the
+    "retention PUT takes effect on restart" limitation shared across the
+    three retention stores (cross-ref #483).
+
 - **Guardian PR 2 hardening round 3 — UP-R3, doc-B1, doc-B2, UP-R9.** Closes
   the BLOCKING findings from the governance re-run on `a90a21e..HEAD`
   (rounds 1 + 2). Pattern C confirmed: the first two hardening rounds
@@ -537,7 +600,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (BL-4). Adds the securable type and operation, recomputes role permission
     counts (Administrator 19×6=114, ITServiceOwner 16×6=96, Viewer 18×1=18) to
     match code, and documents `Push` as the deploy-authority-without-author
-    operation consumed only by the Guardian REST handlers.
+    operation consumed only by the Guardian REST handlers. **Note:** the 19×6
+    arithmetic is correct for the state at BL-4 commit time; the subsequent
+    H-4 fix in hardening round 2 (entry directly above) restricted `Push`
+    from the cross-type seed loop, reducing Administrator to 96 and
+    ITServiceOwner to 81. The final values that ship are Administrator 96,
+    ITServiceOwner 81, Viewer 18.
   - **`docs/user-manual/audit-log.md` adds the four Guardian audit actions**
     (BL-5). `guaranteed_state.rule.create / update / delete / push`. The push
     entry explicitly warns SIEM rule authors that `fan_out_deferred_pr3=true`

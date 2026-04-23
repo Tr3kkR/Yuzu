@@ -459,10 +459,11 @@ The server applies retention policies to stored data to manage disk usage. Reten
 |---|---|---|---|
 | Instruction responses | `--response-retention-days` | 90 days | Results from executed instructions. Older responses are purged on a daily schedule. |
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
+| Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 
 Reducing the TTL frees disk space; increasing it preserves history for compliance.
 
-> **Note:** Retention settings are configured at server startup via CLI flags. There is no Settings page UI or runtime API for changing them yet. A runtime configuration API (Phase 7.3) will allow changing TTLs and other limits without restarting the server.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/v1/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/v1/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
 
 ---
 

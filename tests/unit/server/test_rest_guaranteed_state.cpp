@@ -247,6 +247,29 @@ TEST_CASE("REST gs.rules: get unknown id → 404",
     CHECK(got->status == 404);
 }
 
+TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
+          "[rest][guaranteed_state][crud]") {
+    // UP-R1 regression guard. The PUT invalid-body 400 branch must emit a
+    // denied audit, matching the sibling /push 400 branch. Asymmetric audit
+    // coverage across sibling rejection paths was the original finding.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
+                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    // Non-object body (top-level array) — body.is_object() is false.
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-001", "[1,2,3]");
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+
+    // Audit log: [0] create, [1] denied update.
+    REQUIRE(h.audit_log.size() == 2);
+    const auto& denied = h.audit_log[1];
+    CHECK(denied.action == "guaranteed_state.rule.update");
+    CHECK(denied.result == "denied");
+    CHECK(denied.target_type == "GuaranteedState");
+    CHECK(denied.target_id == "r-001");
+    CHECK(denied.detail.find("invalid JSON") != std::string::npos);
+}
+
 TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
           "[rest][guaranteed_state][not_found]") {
     RestGsHarness h;
