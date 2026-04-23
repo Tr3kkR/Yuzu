@@ -412,6 +412,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round 5 — doc-RR1..doc-RR4 (documentation only).**
+  Closes the BLOCKING and SHOULD doc findings from the second governance
+  re-run on `21c0ba4..HEAD` (rounds 3 + 4). Pure documentation — no code
+  changes, no behaviour changes. The re-run confirmed that rounds 3 + 4
+  introduced no new code regressions; all remaining findings were either
+  doc precision gaps or pre-existing patterns newly visible after the
+  `/push` sanitisation fix (filed as follow-up issues).
+  - **`docs/user-manual/audit-log.md` `guaranteed_state.push` entry now
+    documents the scope-sanitisation semantic** (doc-RR1). The SIEM-
+    parser-facing description previously read `scope="<expr>"` as if the
+    value were verbatim operator input; after round 3's UP-R3 fix the
+    value is backslash-escaped for `"` and `\` and stripped of C0 control
+    bytes before embedding. The entry now names the normalisation
+    explicitly with a concrete example (`env="prod"` → `scope="env=\"prod\""`)
+    so SIEM rule authors don't build parsers against the wrong shape.
+    The `fan_out_deferred_pr3=true` marker and the non-object-body 400
+    rejection are also called out in the same row.
+  - **`guaranteed_state.rule.update` entry now lists 400 invalid-body as
+    an explicit denied-audit case** (doc-RR2). Round 4's UP-R1 fix emits
+    `result=denied` when the PUT body is unparseable JSON; the audit-log
+    page did not reflect this in its per-action row or in the result
+    vocabulary prose. Both now name the specific 400 branch alongside the
+    existing 404/409 cases. The result-vocabulary paragraph gains a SIEM
+    filter hint: "filter on `result == "denied"` scoped to the actions
+    you care about — every mutating branch produces a row."
+  - **`docs/user-manual/upgrading.md` v0.12.0 section gains a negative-
+    retention behaviour change note** (doc-RR3). Pre-round-4 the `PUT
+    /api/v1/config/<retention-key>` handler silently accepted negative
+    values and the store treated `<= 0` as "never reap"; post-round-4 the
+    handler rejects with 400 and operators must use `0` explicitly to
+    preserve the disable-retention semantic. Also documents that non-
+    numeric values (which were previously silent no-ops) now return 400 —
+    surfacing configuration errors that had been hidden.
+  - **Upgrading.md's RBAC remediation SQL is now a 4-step guarded
+    procedure instead of a single destructive one-liner** (doc-RR4). The
+    single `DELETE` block was replaced with: (1) back up `rbac.db`
+    first, (2) run a `SELECT` preview and review the rows, (3) `DELETE`
+    scoped to `principal_id IN ('Administrator', 'ITServiceOwner')` so a
+    custom role with a legitimate non-Guardian Push grant is left alone,
+    (4) re-run the preview to confirm cleanup. Same remediation, defence-
+    in-depth wrapping. `principal_id` scoping matches what the bug
+    actually produced — seeded roles only.
+
 - **Guardian PR 2 hardening round 4 — UP-R1, UP-R5, and SHOULD-tier docs.**
   Small, code-local MEDIUM/SHOULD items from the governance re-run that did
   not require architectural decisions. Systemic items (retention runtime-PUT
