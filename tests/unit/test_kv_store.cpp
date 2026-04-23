@@ -6,6 +6,8 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
@@ -51,10 +53,12 @@ struct TestKvStore {
 };
 
 static TestKvStore make_test_store() {
-    auto tmp = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) /
-               ("kv_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
-                "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-                ".db");
+    // Previously used `std::hash<std::thread::id>{} ^ steady_clock::now()` for
+    // uniqueness — the pattern that flaked on Windows MSVC debug + Defender
+    // (#473). Delegate to the shared salt+counter helper so KV tests don't
+    // regress even though they haven't flaked in CI yet (#482).
+    const auto dir = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix());
+    const auto tmp = dir / (yuzu::test::unique_temp_path("kv_").filename().string() + ".db");
     auto result = KvStore::open(tmp);
     REQUIRE(result.has_value());
     return TestKvStore{std::move(*result), tmp};

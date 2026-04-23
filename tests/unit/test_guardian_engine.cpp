@@ -26,16 +26,14 @@
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
-#include <atomic>
-#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
-#include <random>
 #include <string>
-#include <thread>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -58,25 +56,12 @@ std::string uid_suffix() {
 #endif
 }
 
-// Path uniqueness strategy:
-//   - process-local mt19937_64 seed  → distinct across concurrent test binaries
-//     (belt-and-suspenders: different meson test workers each get a different
-//     random prefix)
-//   - atomic monotonic counter       → guarantees uniqueness within a single
-//     process regardless of `std::chrono::steady_clock` resolution
-//     (MSVC's steady_clock granularity can drop to the 100ns tick on some
-//     Windows builds, and Defender-induced serialisation on SystemTemp made
-//     the prior hash+time scheme produce colliding filenames ~1 run in 40 on
-//     the yuzu-local-windows self-hosted runner — observed on PR #473)
+// Path uniqueness delegates to the shared salt + atomic counter helper in
+// test_helpers.hpp — the pattern a90a21e introduced for this file is now the
+// single source of truth for every test harness. See #482 for history.
 fs::path unique_kv_path() {
-    static const std::uint64_t kProcessSalt = [] {
-        std::random_device rd;
-        return (static_cast<std::uint64_t>(rd()) << 32) | rd();
-    }();
-    static std::atomic<std::uint64_t> counter{0};
-    const auto n = counter.fetch_add(1, std::memory_order_relaxed);
-    return fs::temp_directory_path() / ("yuzu_test_guardian" + uid_suffix()) /
-           ("guardian_" + std::to_string(kProcessSalt) + "_" + std::to_string(n) + ".db");
+    const auto dir = fs::temp_directory_path() / ("yuzu_test_guardian" + uid_suffix());
+    return dir / (yuzu::test::unique_temp_path("guardian_").filename().string() + ".db");
 }
 
 struct GuardianFixture {

@@ -68,6 +68,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Topology](#topology)
   - [Fleet Statistics](#fleet-statistics)
   - [File Retrieval](#file-retrieval)
+  - [Guaranteed State](#guaranteed-state)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -2396,6 +2397,127 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Guaranteed State
+
+Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide, YAML rule schema, and the PR-2 limitation that all rules report `errored` until the agent-side guards land in Guardian PR 3.
+
+**RBAC matrix:**
+
+| Role | Read | Write | Execute | Delete | Approve | Push |
+|---|---|---|---|---|---|---|
+| Administrator | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ITServiceOwner | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PlatformEngineer | ✓ | ✓ | | ✓ | | ✓ |
+| Operator | ✓ | | | | | ✓ |
+| Viewer | ✓ | | | | | |
+
+Administrator and ITServiceOwner inherit Execute and Approve on `GuaranteedState` from the cross-type CRUD seed loop — those operations have no active Guardian handler today but the grants exist in the DB. PlatformEngineer's grants are explicit (Read/Write/Delete/Push only). `Push` is a Guardian-specific operation (distribute an existing rule set to scoped agents) that separates deploy authority from authoring authority.
+
+#### `GET /api/v1/guaranteed-state/rules`
+
+List all Guaranteed State rules.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `data[]` of `GuaranteedStateRule` objects (see OpenAPI schema).
+- **5xx:** `503` if the store is unavailable.
+
+#### `POST /api/v1/guaranteed-state/rules`
+
+Create a rule.
+
+- **Permission:** `GuaranteedState:Write`
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
+| `name` | string | Yes | Human-readable name (unique per server). |
+| `yaml_source` | string | Yes | Full rule YAML (`kind: GuaranteedStateRule`). |
+| `version` | integer | No | Starting version (default `1`). |
+| `enabled` | boolean | No | Default `true`. |
+| `enforcement_mode` | string | No | `enforce` (default) or `audit`. |
+| `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |
+| `os_target` | string | No | Empty (any) or `windows` / `linux` / `macos`. |
+| `scope_expr` | string | No | Scope DSL expression selecting target agents. |
+
+- **Response:** `201` with `data.rule_id`.
+- **4xx:** `400` missing required fields or invalid JSON; `409` on duplicate `rule_id` or duplicate `name`.
+- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+
+#### `GET /api/v1/guaranteed-state/rules/{rule_id}`
+
+Fetch a single rule.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `data` is a `GuaranteedStateRule` object.
+- **4xx:** `404` if the rule does not exist.
+
+#### `PUT /api/v1/guaranteed-state/rules/{rule_id}`
+
+Update a rule. Version is incremented on every successful update regardless of whether any field changed.
+
+- **Permission:** `GuaranteedState:Write`
+- **Request body:** Any subset of the create-body fields (absent fields retain their current values).
+- **Response:** `200` with `data.updated = true` and `data.version`.
+- **4xx:** `400` invalid JSON; `404` rule not found; `409` on name conflict.
+- **Audit:** `guaranteed_state.rule.update`.
+
+#### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
+
+Delete a rule.
+
+- **Permission:** `GuaranteedState:Delete`
+- **4xx:** `404` if the rule does not exist.
+- **Audit:** `guaranteed_state.rule.delete`.
+
+#### `POST /api/v1/guaranteed-state/push`
+
+Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. In the PR-2 ship of Guardian the fan-out to agents is **not** wired; the endpoint accepts and audits the request so dashboards and SIEM pipelines can be exercised end-to-end. Fan-out lands in Guardian PR 3.
+
+- **Permission:** `GuaranteedState:Push`
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `scope` | string | No | Scope DSL selector. Empty = all agents. |
+| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
+
+- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.scope`.
+- **4xx:** `400` if the JSON body is present but not an object.
+- **Audit:** `guaranteed_state.push` (`success`, detail includes `fan_out_deferred_pr3=true` while PR 2 is in effect).
+
+#### `GET /api/v1/guaranteed-state/events`
+
+Query Guaranteed State events (rule violations, remediations, agent sync events).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
+- **Response:** `data[]` of event objects.
+- **4xx:** `400` on non-integer or negative `limit` / `offset`.
+
+#### `GET /api/v1/guaranteed-state/status`
+
+Fleet-wide status rollup. PR 2 returns placeholder zeros; fleet aggregation lands in Guardian PR 4.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
+
+#### `GET /api/v1/guaranteed-state/status/{agent_id}`
+
+Per-agent status. PR 2 placeholder; per-agent aggregation lands in Guardian PR 4.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+
+#### `GET /api/v1/guaranteed-state/alerts`
+
+Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** empty list in PR 2.
 
 ---
 

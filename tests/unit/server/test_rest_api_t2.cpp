@@ -17,13 +17,14 @@
 #include "license_store.hpp"
 #include "software_deployment_store.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -41,12 +42,12 @@ struct TestDb {
 };
 
 // ── Helpers: unique temp paths for file-backed stores ─────────────────────
+// Delegates to the shared salt + atomic counter helper (#482). The prior
+// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
+// #473 traced back to.
 
 static fs::path unique_temp_path(const std::string& prefix) {
-    auto p = fs::temp_directory_path() / (prefix + "-" + std::to_string(
-        std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-        static_cast<size_t>(std::chrono::steady_clock::now().time_since_epoch().count())));
-    return p;
+    return yuzu::test::unique_temp_path(prefix + "-");
 }
 
 // RAII guard to remove temp files on scope exit

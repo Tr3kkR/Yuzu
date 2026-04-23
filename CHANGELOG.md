@@ -412,6 +412,280 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian PR 2 hardening round 5 — doc-RR1..doc-RR4 (documentation only).**
+  Closes the BLOCKING and SHOULD doc findings from the second governance
+  re-run on `21c0ba4..HEAD` (rounds 3 + 4). Pure documentation — no code
+  changes, no behaviour changes. The re-run confirmed that rounds 3 + 4
+  introduced no new code regressions; all remaining findings were either
+  doc precision gaps or pre-existing patterns newly visible after the
+  `/push` sanitisation fix (filed as follow-up issues).
+  - **`docs/user-manual/audit-log.md` `guaranteed_state.push` entry now
+    documents the scope-sanitisation semantic** (doc-RR1). The SIEM-
+    parser-facing description previously read `scope="<expr>"` as if the
+    value were verbatim operator input; after round 3's UP-R3 fix the
+    value is backslash-escaped for `"` and `\` and stripped of C0 control
+    bytes before embedding. The entry now names the normalisation
+    explicitly with a concrete example (`env="prod"` → `scope="env=\"prod\""`)
+    so SIEM rule authors don't build parsers against the wrong shape.
+    The `fan_out_deferred_pr3=true` marker and the non-object-body 400
+    rejection are also called out in the same row.
+  - **`guaranteed_state.rule.update` entry now lists 400 invalid-body as
+    an explicit denied-audit case** (doc-RR2). Round 4's UP-R1 fix emits
+    `result=denied` when the PUT body is unparseable JSON; the audit-log
+    page did not reflect this in its per-action row or in the result
+    vocabulary prose. Both now name the specific 400 branch alongside the
+    existing 404/409 cases. The result-vocabulary paragraph gains a SIEM
+    filter hint: "filter on `result == "denied"` scoped to the actions
+    you care about — every mutating branch produces a row."
+  - **`docs/user-manual/upgrading.md` v0.12.0 section gains a negative-
+    retention behaviour change note** (doc-RR3). Pre-round-4 the `PUT
+    /api/v1/config/<retention-key>` handler silently accepted negative
+    values and the store treated `<= 0` as "never reap"; post-round-4 the
+    handler rejects with 400 and operators must use `0` explicitly to
+    preserve the disable-retention semantic. Also documents that non-
+    numeric values (which were previously silent no-ops) now return 400 —
+    surfacing configuration errors that had been hidden.
+  - **Upgrading.md's RBAC remediation SQL is now a 4-step guarded
+    procedure instead of a single destructive one-liner** (doc-RR4). The
+    single `DELETE` block was replaced with: (1) back up `rbac.db`
+    first, (2) run a `SELECT` preview and review the rows, (3) `DELETE`
+    scoped to `principal_id IN ('Administrator', 'ITServiceOwner')` so a
+    custom role with a legitimate non-Guardian Push grant is left alone,
+    (4) re-run the preview to confirm cleanup. Same remediation, defence-
+    in-depth wrapping. `principal_id` scoping matches what the bug
+    actually produced — seeded roles only.
+
+- **Guardian PR 2 hardening round 4 — UP-R1, UP-R5, and SHOULD-tier docs.**
+  Small, code-local MEDIUM/SHOULD items from the governance re-run that did
+  not require architectural decisions. Systemic items (retention runtime-PUT
+  propagation across 3 stores, PUT TOCTOU optimistic concurrency, RBAC
+  upgrade migration, audit action namespace flatten, `.get<T>()` sweep
+  across 12 non-Guardian handlers, `TempDbFile` RAII adoption) are filed as
+  tracking issues #483, #484, #485, #486, #487, #488 and excluded from this
+  round to keep the commit focused.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` 400 invalid-body branch now
+    emits a `denied` audit** (UP-R1). Previously the handler rejected
+    malformed JSON with `400 {"error":"invalid JSON"}` but produced no
+    audit record, while the sibling `/push` 400 branch did — asymmetric
+    audit coverage across two branches shipped in the same hardening round.
+    Added a regression test (`[rest][guaranteed_state][crud]`) that POSTs a
+    non-object body and asserts the denied audit fires with the correct
+    action, target, and detail fields.
+  - **`PUT /api/v1/config/<key>` now validates integer-typed values before
+    persisting** (UP-R5). The prior implementation called
+    `runtime_config_store_->set(key, value, ...)` first, then wrapped
+    `std::stoi(value)` in `try { ... } catch (...) {}`. Any non-numeric or
+    negative value persisted to the store while silently failing to update
+    `cfg_` — an operator PUTting `{"value":"abc"}` received `200 {"applied":
+    true}` with no behaviour change, and on the next restart the invalid
+    string loaded back into `RuntimeConfigStore`. Replaced with
+    `std::from_chars`-based validation that runs **before** the `set` call
+    and rejects with `400 {"error":{"code":400,"message":"value must be a
+    non-negative integer"}}` on any parse failure. Applies to
+    `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
+    and `guardian_event_retention_days`. The `try { stoi } catch (...) {}`
+    blocks in the startup-config parser remain for now because that path
+    has no 400 to return — this fix targets the runtime API only.
+  - **`docs/user-manual/server-admin.md` Retention Settings table documents
+    `--guardian-event-retention-days`** (doc-S2). Third row added alongside
+    the existing `--response-retention-days` and `--audit-retention-days`
+    entries. Supporting prose updated to describe the env-var alternatives
+    (`YUZU_*_RETENTION_DAYS`) and the runtime `PUT /api/v1/config` path,
+    with an explicit "takes effect on restart" caveat cross-referencing
+    issue #483.
+  - **`CHANGELOG.md` round-1 BL-4 entry annotated with the H-4 correction**
+    (doc-S3). The 19×6=114 formula describing Administrator's seed count
+    was accurate at BL-4 commit time but implicitly superseded by round 2's
+    H-4 fix (which removed `Push` from the cross-type seed, reducing
+    Administrator to 96 and ITServiceOwner to 81). Inline note added so a
+    reader walking the CHANGELOG forward sees the correction before the
+    implausible math statement.
+  - **`CLAUDE.md` Guardian section expanded with the invariants that keep
+    surfacing in governance** (N1 + N3). Three resident notes: (a) `Push`
+    seed is Guardian-only — `ops[]` is the catalogue, `crud_ops[]` is the
+    cross-type seed, do not cross-seed `Push`; (b) reserved plugin name
+    `__guard__` has load-time rejection AND dispatch-time intercept, both
+    halves must stay; (c) Guardian wire payloads carrying raw proto bytes
+    must not be placed in `map<string, string>` fields the Erlang gateway
+    re-encodes via `gpb:e_type_string` — UTF-8 validation crashes. New
+    "Test conventions — shared helpers" section points at
+    `tests/unit/test_helpers.hpp` and names the `std::hash<thread::id>` +
+    `steady_clock` anti-pattern as the flake #473 vector.
+  - **`docs/user-manual/upgrading.md` gains a v0.12.0 Guardian PR 2 section**
+    (N2). Documents two operator-visible upgrade notes: the stale `*:Push`
+    RBAC grants on deployments that ran pre-hardening code (with manual
+    remediation SQL pending the #485 auto-migration), and the
+    "retention PUT takes effect on restart" limitation shared across the
+    three retention stores (cross-ref #483).
+
+- **Guardian PR 2 hardening round 3 — UP-R3, doc-B1, doc-B2, UP-R9.** Closes
+  the BLOCKING findings from the governance re-run on `a90a21e..HEAD`
+  (rounds 1 + 2). Pattern C confirmed: the first two hardening rounds
+  themselves introduced one new security regression and two doc regressions
+  that this round addresses.
+  - **`/push` audit detail now sanitises the scope value before embedding**
+    (UP-R3 — new regression introduced by BL-6's audit format change). The
+    BL-6 vocabulary fix formatted detail as `rules=N full_sync=B scope="<scope>"
+    fan_out_deferred_pr3=true`, embedding operator-controlled scope between
+    raw quotes. An operator with `GuaranteedState:Push` could therefore POST
+    `{"scope":"x\" result=\"denied\" fake=\""}` and forge audit-record
+    fragments that parse downstream as successful-looking denials — audit log
+    integrity is a SOC 2 Workstream F control, so this is a real injection
+    vector. Added an inline `sanitize_audit_string` lambda that
+    backslash-escapes `"` and `\` and drops all C0 control bytes (CR/LF/NUL/
+    TAB and the rest of 0x00–0x1F + DEL). audit_store writes the string as
+    an opaque column so the sanitisation is defensive at the SIEM layer —
+    but that's the layer compliance evidence is reconstructed from. Test
+    `test_rest_guaranteed_state.cpp` gains a `[security]`-tagged regression
+    guard that POSTs an adversarial scope and asserts no control bytes, no
+    unescaped top-level injection tokens, and the structural frame of the
+    detail remains intact.
+  - **RBAC matrix tables in `docs/user-manual/guaranteed-state.md` and
+    `docs/user-manual/rest-api.md` now show all 6 operation columns**
+    (doc-B1 — new regression introduced by my BL-4 doc authoring). The
+    tables as first written showed 4 columns (Read/Write/Delete/Push) and
+    silently omitted Execute + Approve. Administrator and ITServiceOwner
+    actually receive Execute and Approve on `GuaranteedState` via the
+    `crud_ops[]` cross-type seed loop in `rbac_store.cpp`; the tables now
+    reflect that. PlatformEngineer's row is narrower (Read/Write/Delete/Push
+    — no Execute, no Approve) because its grants are explicit and targeted,
+    not cross-type. Added a clarifying paragraph beneath each table noting
+    the cross-seed origin of the Execute/Approve grants — this sets
+    expectations for future readers that those ops exist in the DB but have
+    no active Guardian handler today.
+  - **`docs/user-manual/guaranteed-state.md` PR-2 status banner now matches
+    the actual audit vocabulary** (doc-B2 — new regression introduced by
+    BL-6 + my BL-8 doc authoring). The banner still said "audited as
+    `accepted`" while the rest of the same file (and the code) use
+    `result=success` with `fan_out_deferred_pr3=true` in the detail field.
+    Updated the banner to match. Internal doc contradiction closed.
+  - **`openapi_spec()` 503 description strings aligned with the runtime body
+    strings** (UP-R9 / sec-L3 — H-7's scope miss). H-7 changed nine runtime
+    `error_json("service unavailable", 503)` calls but left three OpenAPI
+    path-entry `"503": {"description": "..."}` strings at the old "guaranteed-
+    state store unavailable" wording. Client libraries generated from the
+    spec saw a description that never matched the actual response body.
+    Consolidated.
+
+- **Guardian PR 2 hardening round 2 — H-3, H-4, H-7, H-8.** Second hardening
+  round after the BL-1..BL-9 commit on the same governance run. Closes the
+  HIGH findings that were small enough to fold into a single commit; the
+  remaining HIGHs (H-1 read-side audit gap, H-2 plugin-loader RCE, H-5 gateway
+  UTF-8 crash, H-6 apply_rules atomicity) are tracked as issues #477 / #478 /
+  #479 and will land separately.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` stops type-mismatched bodies
+    from surfacing as HTTP 500** (H-3). The handler was using
+    `body["k"].get<T>()` which raises `nlohmann::json::type_error` on a
+    type-mismatched field (e.g. `{"enabled": "yes"}`); without a server-wide
+    `set_exception_handler`, httplib's default path returns 500 with an empty
+    body. Swapped to `body.value("k", existing)` matching the sibling POST
+    handler — type-mismatched fields silently fall back to the current value
+    rather than converting a client-side request-shape mistake into a server-
+    error alertable event.
+  - **`Push` operation seeding restricted to `GuaranteedState`** (H-4). The
+    previous cross-type seed granted `Administrator` and `ITServiceOwner`
+    the `Push` op on every securable type — harmless today because only the
+    Guardian REST handlers consult `Push`, but a latent privilege grant that
+    any future handler reading `perm_fn(..., "Push")` on a non-Guardian
+    securable would silently accept. `ops[]` is now split into `ops[]` (all
+    six, seeded into the operations catalogue) and `crud_ops[]` (the five
+    used for cross-type role seeding). Push is granted explicitly on
+    `GuaranteedState` for `Administrator` and `ITServiceOwner`, matching
+    the already-targeted grants for `Operator` and `PlatformEngineer`.
+    Test assertions updated: Administrator 114 → 96 permissions,
+    ITServiceOwner 96 → 81 permissions, plus new invariant checks that
+    verify `Push` exists exactly once per role and only on `GuaranteedState`.
+    `rbac.md` counts updated to match.
+  - **503 error body vocabulary consolidated** (H-7). Nine Guardian 503
+    sites previously returned `"guaranteed-state store unavailable"`; every
+    other 503 site in `rest_api_v1.cpp` uses `"service unavailable"`.
+    Log-based alerting that greps the sibling string will now match Guardian
+    store outages too.
+  - **New `tests/unit/test_helpers.hpp` replaces the stale `thread::id`-hash
+    + `steady_clock` uniqueness pattern across 5 test files** (H-8, closes
+    #482). The pattern that commit a90a21e replaced in
+    `test_guardian_engine.cpp` for Windows MSVC flake #473 is now extinct
+    in `test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+    `test_rest_api_t2.cpp`, and `test_kv_store.cpp`. Shared header provides
+    `unique_temp_path(prefix)` with a process-local `mt19937_64`-seeded
+    salt + atomic monotonic counter, and `TempDbFile` RAII wrapper cleaning
+    up `.db` / `-wal` / `-shm` companions. Header-only inline impl so each
+    test binary owns its own salt and counter; no shared-state hazard.
+
+- **Guardian PR 2 hardening round — governance Gate 7 BL-1..BL-9.** Consolidates
+  the blocking findings from the `/governance b13ff17~1..HEAD` run on
+  `feat/guardian-pr2`. No new functionality; closes the gaps between Guardian
+  PR 2's implementation and the operator, SIEM, and SOC 2 contracts it shipped
+  against.
+  - **`/healthz` + dashboard health fragment now include
+    `guaranteed_state_store` in the `all_stores_ok` conjunction** (BL-1). Prior
+    to this fix, `/healthz` reported `"healthy"` while `/api/v1/guaranteed-state/*`
+    returned `503` — the readiness-probe regression pattern (HC-1) that prior
+    governance runs have caught on every new load-bearing store addition.
+    Matches the `/readyz` per-store check which was already correct.
+  - **`guardian_event_retention_days` is now actually overridable** (BL-2). The
+    field was declared in `ServerConfig` with a default of 30 but had no CLI
+    flag and no runtime-config parser branch, so the CHANGELOG's
+    "overridable via runtime config" and the SOC 2 data-inventory doc's
+    "configurable" claims were false. Adds the `--guardian-event-retention-days`
+    CLI flag (+ `YUZU_GUARDIAN_EVENT_RETENTION_DAYS` env var), the `GET /api/config`
+    response key, the runtime `PUT /api/config/guardian_event_retention_days`
+    branch, the `RuntimeConfigStore::allowed_keys` entry, and the startup-config
+    parser branch — all matching the `audit_retention_days` pattern.
+  - **All 10 `/api/v1/guaranteed-state/*` routes now appear in the OpenAPI
+    spec served at `/api/v1/openapi.json` and in
+    `docs/user-manual/rest-api.md`** (BL-3). Adds `GuaranteedStateRule`,
+    `GuaranteedStateStatus`, and `GuaranteedStateEvent` schema components plus
+    per-path entries with security, request/response bodies, and status codes.
+    Rest-api.md gains a full "Guaranteed State" section with the RBAC matrix,
+    every endpoint's permission, request/response shape, and error paths.
+  - **`docs/user-manual/rbac.md` updated for `GuaranteedState` and `Push`**
+    (BL-4). Adds the securable type and operation, recomputes role permission
+    counts (Administrator 19×6=114, ITServiceOwner 16×6=96, Viewer 18×1=18) to
+    match code, and documents `Push` as the deploy-authority-without-author
+    operation consumed only by the Guardian REST handlers. **Note:** the 19×6
+    arithmetic is correct for the state at BL-4 commit time; the subsequent
+    H-4 fix in hardening round 2 (entry directly above) restricted `Push`
+    from the cross-type seed loop, reducing Administrator to 96 and
+    ITServiceOwner to 81. The final values that ship are Administrator 96,
+    ITServiceOwner 81, Viewer 18.
+  - **`docs/user-manual/audit-log.md` adds the four Guardian audit actions**
+    (BL-5). `guaranteed_state.rule.create / update / delete / push`. The push
+    entry explicitly warns SIEM rule authors that `fan_out_deferred_pr3=true`
+    in the detail field means "server accepted the push but agent delivery is
+    deferred" — misreading this as delivered would be premature until the PR 3
+    fan-out lands.
+  - **`/push` audit vocabulary aligned with sibling handlers** (BL-6 /
+    consistency-auditor F3). Previously emitted `result="accepted"` with
+    `target_id=<scope>` — a novel result string and a target_id that broke
+    SIEM joins (every other audit site uses a concrete entity id in target_id).
+    Now emits `result="success"` with `target_id=""` (pushes are fleet-level,
+    not per-entity) and `detail=rules=N full_sync=B scope="E" fan_out_deferred_pr3=true`.
+    Also rejects non-object JSON bodies with `400` + denied audit (previously
+    silently coerced to empty object), and replaces the engineer-facing
+    `note: "fan-out lands in Guardian PR 3"` in the response body with the
+    stable operational phrase `"push accepted; agent delivery is asynchronous"`.
+  - **`/status` and `/status/:agent_id` field names match the agent-side proto**
+    (BL-7 / consistency-auditor F1). REST previously returned `compliant`,
+    `drifted`, `errored`; the proto `GuaranteedStateStatus` uses
+    `compliant_rules`, `drifted_rules`, `errored_rules`. Renamed REST keys
+    to the `_rules` suffix before any downstream dashboard locks in the drift.
+    Per-agent status response gains `total_rules` for symmetry.
+  - **New operator-facing page `docs/user-manual/guaranteed-state.md`** (BL-8).
+    Covers the PR-2 limitation ("control plane + agent skeleton; no enforcement
+    until PR 3"), the YAML rule schema, the create/push/query workflow with
+    `curl` examples, the RBAC matrix, retention configuration, and the
+    `/healthz` / `/readyz` observability surface. Linked from the user-manual
+    README table of contents.
+  - **Windows Defender exclusion script now refuses to run on non-runner
+    hosts** (BL-9). `scripts/windows-runner-defender-exclusions.ps1` previously
+    would silently weaken Defender coverage on a dev workstation if run by
+    mistake (it excludes `%USERPROFILE%\AppData\Local\ccache` and
+    `C:\WINDOWS\SystemTemp\yuzu_test_*` — paths that exist on dev boxes). Adds
+    a hostname allowlist (default `^yuzu-local-windows`, overridable via
+    `-AllowedHostPattern` when provisioning a new runner) that errors out
+    before any `Add-MpPreference` call runs.
+
 - **`/api/health` reports the actual server version instead of the
   hardcoded "0.1.0" (#401).** The endpoint now derives the version
   string from the meson-generated `yuzu/version.hpp` constant

@@ -28,10 +28,10 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <chrono>
+#include "../test_helpers.hpp"
+
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -39,13 +39,11 @@ using namespace yuzu::server;
 
 namespace {
 
+// Delegates to the shared salt + atomic counter helper — the stale
+// `thread::id hash ^ steady_clock::now()` pattern that flaked on Windows
+// MSVC debug + Defender (#473) is now extinct across the test tree (#482).
 fs::path unique_temp_path(const std::string& prefix) {
-    return fs::temp_directory_path() /
-           (prefix + "-" +
-            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-                           static_cast<size_t>(std::chrono::steady_clock::now()
-                                                   .time_since_epoch()
-                                                   .count())));
+    return yuzu::test::unique_temp_path(prefix + "-");
 }
 
 struct AuditRecord {
@@ -249,6 +247,29 @@ TEST_CASE("REST gs.rules: get unknown id → 404",
     CHECK(got->status == 404);
 }
 
+TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
+          "[rest][guaranteed_state][crud]") {
+    // UP-R1 regression guard. The PUT invalid-body 400 branch must emit a
+    // denied audit, matching the sibling /push 400 branch. Asymmetric audit
+    // coverage across sibling rejection paths was the original finding.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
+                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    // Non-object body (top-level array) — body.is_object() is false.
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-001", "[1,2,3]");
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+
+    // Audit log: [0] create, [1] denied update.
+    REQUIRE(h.audit_log.size() == 2);
+    const auto& denied = h.audit_log[1];
+    CHECK(denied.action == "guaranteed_state.rule.update");
+    CHECK(denied.result == "denied");
+    CHECK(denied.target_type == "GuaranteedState");
+    CHECK(denied.target_id == "r-001");
+    CHECK(denied.detail.find("invalid JSON") != std::string::npos);
+}
+
 TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
           "[rest][guaranteed_state][not_found]") {
     RestGsHarness h;
@@ -271,15 +292,75 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     REQUIRE(res);
     CHECK(res->status == 202);
     CHECK(res->body.find("\"queued\":true") != std::string::npos);
-    CHECK(res->body.find("PR 3") != std::string::npos);
+    // Response body uses a stable operational phrase, not an engineer-facing
+    // roadmap reference (BL-6 / ER-Dep2).
+    CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
 
     REQUIRE(h.audit_log.size() == 2);  // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
-    CHECK(push_audit.result == "accepted");
-    CHECK(push_audit.target_id == "tag:env=prod");
+    // Vocabulary matches sibling handlers: "success" (not the prior novel
+    // "accepted"), target_id is empty because a push is fleet-level rather
+    // than per-entity, and the scope expression lives in detail alongside
+    // the fan-out-deferred marker so SIEM correlation rules can filter on it.
+    CHECK(push_audit.result == "success");
+    CHECK(push_audit.target_id == "");
+    CHECK(push_audit.target_type == "GuaranteedState");
     CHECK(push_audit.detail.find("rules=1") != std::string::npos);
     CHECK(push_audit.detail.find("full_sync=true") != std::string::npos);
+    CHECK(push_audit.detail.find("scope=\"tag:env=prod\"") != std::string::npos);
+    CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
+}
+
+TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
+          "[rest][guaranteed_state][push][security]") {
+    // UP-R3 regression guard. A scope containing raw quotes, control bytes,
+    // or backslashes must not corrupt the audit detail string that SIEM
+    // parsers consume. Attacker with GuaranteedState:Push could otherwise
+    // forge audit fragments by injecting `" result="denied" fake="`.
+    RestGsHarness h;
+    nlohmann::json push;
+    // Adversarial scope: embedded quote + CR + LF + NUL + backslash + tab.
+    // Built by append so there is no risk of buffer-size mismatch with
+    // std::string(const char*, size_t) and the embedded NUL.
+    std::string adversarial;
+    adversarial += "evil\" result=\"denied\" injected=\"yes\"";
+    adversarial += "\r\n\t";
+    adversarial += "foo";
+    adversarial.push_back('\0');
+    adversarial += "bar\\";
+    push["scope"] = adversarial;
+    push["full_sync"] = false;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", push.dump());
+    REQUIRE(res);
+    CHECK(res->status == 202);
+
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& push_audit = h.audit_log[0];
+    CHECK(push_audit.action == "guaranteed_state.push");
+    CHECK(push_audit.result == "success");
+    // Control bytes (CR/LF/NUL/TAB and the rest of C0) are dropped entirely
+    // so no visual line-split survives the round-trip.
+    const auto& d = push_audit.detail;
+    CHECK(d.find("\r") == std::string::npos);
+    CHECK(d.find("\n") == std::string::npos);
+    CHECK(d.find("\t") == std::string::npos);
+    CHECK(d.find('\0') == std::string::npos);
+    // Quotes inside the attacker-controlled value are backslash-escaped so
+    // SIEM parsers that tokenise on quoted strings see them inside the
+    // scope value, not as delimiters.
+    CHECK(d.find("\\\"") != std::string::npos);
+    // Backslashes are doubled so they cannot escape the closing scope
+    // delimiter.
+    CHECK(d.find("bar\\\\") != std::string::npos);
+    // The original adversarial payload's injected fields do not appear as
+    // unescaped top-level tokens in the detail string.
+    CHECK(d.find(" result=\"denied\"") == std::string::npos);
+    CHECK(d.find(" injected=\"yes\"") == std::string::npos);
+    // The structural frame of the detail is intact.
+    CHECK(d.find("rules=0") != std::string::npos);
+    CHECK(d.find("full_sync=false") != std::string::npos);
+    CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
 }
 
 TEST_CASE("REST gs.events: filter + limit pagination",
@@ -326,6 +407,15 @@ TEST_CASE("REST gs.status: returns store rule_count rollup",
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["data"]["total_rules"].get<int>() == 1);
+    // Field names match the agent-side proto GuaranteedStateStatus so REST and
+    // proto schemas don't diverge when PR 4 wires real aggregation (BL-7 /
+    // consistency-auditor F1). Previously emitted `compliant`/`drifted`/`errored`.
+    CHECK(j["data"].contains("compliant_rules"));
+    CHECK(j["data"].contains("drifted_rules"));
+    CHECK(j["data"].contains("errored_rules"));
+    CHECK_FALSE(j["data"].contains("compliant"));
+    CHECK_FALSE(j["data"].contains("drifted"));
+    CHECK_FALSE(j["data"].contains("errored"));
 }
 
 TEST_CASE("REST gs.alerts: empty list placeholder",

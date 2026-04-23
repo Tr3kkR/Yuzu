@@ -115,6 +115,7 @@
 
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -1302,6 +1303,10 @@ private:
                 try {
                     cfg_.audit_retention_days = std::stoi(e.value);
                 } catch (...) {}
+            } else if (e.key == "guardian_event_retention_days") {
+                try {
+                    cfg_.guardian_event_retention_days = std::stoi(e.value);
+                } catch (...) {}
             }
             // auto_approve_enabled is read dynamically, no startup action needed
             // OIDC settings — runtime-configurable via Settings UI
@@ -1557,8 +1562,15 @@ private:
                 }
             }
 
+            // Guardian store is load-bearing for the /api/v1/guaranteed-state/*
+            // surface; prior to inclusion here /healthz reported "healthy" while
+            // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
+            bool guaranteed_state_ok =
+                guaranteed_state_store_ && guaranteed_state_store_->is_open();
+
             // Determine overall status
-            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+            bool all_stores_ok =
+                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -1570,7 +1582,8 @@ private:
                  {{"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
-                  {"policies", policy_ok ? "ok" : "error"}}},
+                  {"policies", policy_ok ? "ok" : "error"},
+                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"}}},
                 {"executions",
                  {{"in_flight", in_flight},
                   {"completed_last_hour", completed_last_hour},
@@ -1674,7 +1687,10 @@ private:
                              bool audit_ok = audit_store_ && audit_store_->is_open();
                              bool instruction_ok = instruction_store_ && instruction_store_->is_open();
                              bool policy_ok = policy_store_ && policy_store_->is_open();
-                             bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+                             bool guaranteed_state_ok =
+                                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+                             bool all_ok = response_ok && audit_ok && instruction_ok &&
+                                           policy_ok && guaranteed_state_ok;
 
                              // Execution stats
                              int in_flight = 0;
@@ -1761,6 +1777,8 @@ private:
                              config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
                              config_obj["response_retention_days"] = cfg_.response_retention_days;
                              config_obj["audit_retention_days"] = cfg_.audit_retention_days;
+                             config_obj["guardian_event_retention_days"] =
+                                 cfg_.guardian_event_retention_days;
                              config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
                              config_obj["log_level"] = spdlog::level::to_string_view(
                                                            spdlog::default_logger()->level())
@@ -1820,6 +1838,32 @@ private:
                                  return;
                              }
 
+                             // Validate integer-typed keys BEFORE persisting so a
+                             // non-numeric or negative value does not silently land
+                             // in RuntimeConfigStore while leaving cfg_ at the old
+                             // value (the prior `try { stoi } catch (...) {}` path
+                             // was a ghost-write: store persists, cfg ignores,
+                             // operator sees 200 with no effect). UP-R5 from the
+                             // Guardian PR 2 governance re-run.
+                             const bool is_int_key =
+                                 key == "heartbeat_timeout" ||
+                                 key == "response_retention_days" ||
+                                 key == "audit_retention_days" ||
+                                 key == "guardian_event_retention_days";
+                             int parsed_int = 0;
+                             if (is_int_key) {
+                                 auto first = value.data();
+                                 auto last = value.data() + value.size();
+                                 auto [ptr, ec] = std::from_chars(first, last, parsed_int);
+                                 if (ec != std::errc{} || ptr != last || parsed_int < 0) {
+                                     res.status = 400;
+                                     res.set_content(
+                                         R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})",
+                                         "application/json");
+                                     return;
+                                 }
+                             }
+
                              // Get username from session
                              auto session = require_auth(req, res);
                              if (!session)
@@ -1834,19 +1878,17 @@ private:
                                  return;
                              }
 
-                             // Apply the change to in-memory config
+                             // Apply the change to in-memory config. Integer keys
+                             // parsed above; direct assignment here means no
+                             // second `try { stoi }` that could swallow errors.
                              if (key == "heartbeat_timeout") {
-                                 try {
-                                     cfg_.session_timeout = std::chrono::seconds(std::stoi(value));
-                                 } catch (...) {}
+                                 cfg_.session_timeout = std::chrono::seconds(parsed_int);
                              } else if (key == "response_retention_days") {
-                                 try {
-                                     cfg_.response_retention_days = std::stoi(value);
-                                 } catch (...) {}
+                                 cfg_.response_retention_days = parsed_int;
                              } else if (key == "audit_retention_days") {
-                                 try {
-                                     cfg_.audit_retention_days = std::stoi(value);
-                                 } catch (...) {}
+                                 cfg_.audit_retention_days = parsed_int;
+                             } else if (key == "guardian_event_retention_days") {
+                                 cfg_.guardian_event_retention_days = parsed_int;
                              }
                              // log_level is applied inside RuntimeConfigStore::set()
 

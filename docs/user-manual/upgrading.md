@@ -210,6 +210,51 @@ If a migration fails:
 4. Start the previous server version against the restored data.
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
+## Upgrade notes by release
+
+### v0.12.0 — Guardian PR 2
+
+Guardian PR 2 ships the Guaranteed State control plane + agent skeleton. Two items require operator awareness on upgrade:
+
+**Stale `*:Push` RBAC grants on deployments that ran pre-hardening Guardian PR 2 code.** Between commits `7c83911` and `1f39401`, the RBAC seed granted the `Push` operation to `Administrator` and `ITServiceOwner` on **every** securable type, not just `GuaranteedState`. The H-4 fix (commit `21c0ba4`, hardening round 2) restricted the seed to `GuaranteedState` only going forward — but because `seed_defaults()` uses `INSERT OR IGNORE`, the stale cross-type grants already written to `role_permissions` are not removed on upgrade. These grants are semantically inert today (only the Guardian REST handlers consult `Push`), but become a latent privilege for any future release that adds a non-Guardian handler checking `perm_fn(..., "Push")`.
+
+Manual remediation until the auto-migration in issue #485 lands. **Run each step in order:**
+
+1. **Back up the RBAC database first.** Destructive SQL with no rollback.
+
+   ```bash
+   docker exec yuzu-server cp /var/lib/yuzu/rbac.db /var/lib/yuzu/rbac.db.bak.$(date +%Y%m%d)
+   # or for a systemd install:
+   cp /var/lib/yuzu/rbac.db /var/lib/yuzu/rbac.db.bak.$(date +%Y%m%d)
+   ```
+
+2. **Preview the rows that will be deleted.** This should return only `Administrator` and `ITServiceOwner` rows on a fresh Guardian PR 2 upgrade. If it returns rows for any other principal_id, you have custom RBAC grants that the bulk `DELETE` below would silently wipe — in that case stop and prune by hand.
+
+   ```bash
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/rbac.db \
+     "SELECT principal_id, securable_type FROM role_permissions \
+       WHERE operation = 'Push' AND securable_type != 'GuaranteedState' \
+       ORDER BY principal_id, securable_type;"
+   ```
+
+3. **Delete the stale grants.** Scoped to the two seeded roles so custom grants are left alone:
+
+   ```bash
+   docker exec -i yuzu-server sqlite3 /var/lib/yuzu/rbac.db \
+     "DELETE FROM role_permissions \
+       WHERE operation = 'Push' \
+         AND securable_type != 'GuaranteedState' \
+         AND principal_id IN ('Administrator', 'ITServiceOwner');"
+   ```
+
+4. **Confirm cleanup:** re-run the preview query from step 2 — zero rows expected.
+
+Safe on fresh installs (no matching rows). If you are upgrading **from** a v0.11.x release directly **to** v0.12.0 or later, skip this entire sub-section — your RBAC database never carried the stale grants.
+
+**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/v1/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
+
+**Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/v1/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead; it preserves the same disable-retention semantic and passes validation. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
+
 ## Rollback
 
 If an upgrade causes issues:
