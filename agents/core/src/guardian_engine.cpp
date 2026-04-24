@@ -335,4 +335,29 @@ void GuardianEngine::persist_generation_locked() {
     kv_->set(kKvNamespace, kKeyGen, std::to_string(policy_generation_));
 }
 
+// #501: Test-support helper — see guardian_engine.hpp for the full rationale.
+// The CommandRequest construction and `parameters` map population happen
+// INSIDE yuzu_agent_core.dll (where this TU compiles). When the test EXE
+// calls this function, the map is populated and read using the same
+// absl::HashOf seed (the DLL's copy of `MixingHashState::kSeed`), so
+// `engine.dispatch()`'s internal `.find("push")` succeeds. If the test
+// instead populates `cmd.mutable_parameters()` directly, the insert runs
+// against the EXE's hash seed and the DLL's find misses the bucket.
+GuardianDispatchResult
+guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
+                                      std::string_view push_param_bytes) {
+    apb::CommandRequest cmd;
+    cmd.set_command_id("test-dispatch");
+    cmd.set_plugin("__guard__");
+    cmd.set_action(std::string{kActionPushRules});
+    // Use operator[] on the mutable Map here rather than insert({k,v}) or
+    // try_emplace — any of them work equivalently because population and
+    // the downstream find() both happen inside this TU (same DLL, same
+    // seed). The distinction only mattered when the mutation crossed
+    // modules; here it doesn't.
+    (*cmd.mutable_parameters())[std::string{kParamPush}] =
+        std::string{push_param_bytes};
+    return engine.dispatch(cmd);
+}
+
 } // namespace yuzu::agent
