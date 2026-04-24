@@ -38,9 +38,11 @@ param(
     [switch]$DryRun,
 
     # Hostname pattern that is permitted to apply these exclusions. Default
-    # is the Shulgi self-hosted runner. Override only when provisioning a
-    # new runner with a different name.
-    [string]$AllowedHostPattern = '^yuzu-local-windows'
+    # is the Shulgi physical host that carries the yuzu-local-windows
+    # GitHub Actions runner role; $env:COMPUTERNAME is the Windows
+    # machine name ("SHULGI"), NOT the runner label ("yuzu-local-windows").
+    # Override only when provisioning a new runner host.
+    [string]$AllowedHostPattern = '^SHULGI$'
 )
 
 # Hostname allowlist. Path exclusions below include real dev-workstation
@@ -66,9 +68,10 @@ if (-not $isAdmin) {
 }
 
 $paths = @(
-    # GitHub Actions runner workspace — covers vcpkg_installed, build
-    # output, ccache, and the `Cache vcpkg installed packages` step's
-    # tar/zstd extraction.
+    # GitHub Actions runner workspace — covers every build-* directory
+    # (build-windows-ci, build-linux under WSL2 passthrough, etc.),
+    # vcpkg_installed, gateway/_build*, meson-logs, ccache output, and
+    # the `Cache vcpkg installed packages` step's tar/zstd extraction.
     'C:\actions-runner\_work',
 
     # MSVC ccache — out-of-tree by default on modern vcpkg.
@@ -76,8 +79,18 @@ $paths = @(
 
     # SQLite test temp paths for the unit test suite. These are
     # fs::temp_directory_path() resolved as LocalSystem (SystemTemp),
-    # not the interactive user's %TEMP%. The yuzu_test_* prefix
-    # covers all current stores (guardian, kv, updater, etc.).
+    # not the interactive user's %TEMP%. Wildcards required because
+    # the test suite appends a process-identity suffix at runtime
+    # (yuzu_test_guardian_SHULGI$, yuzu_test_kv_SHULGI$), which the
+    # exact-path entries we used to carry did NOT match. The yuzu_*
+    # wildcard also picks up yuzu_trigger_test and the
+    # yuzu_test_reserved_plugin_<random> directories the plugin-loader
+    # tests create on the fly. Observed on #501 testlogs (2026-04-24).
+    'C:\WINDOWS\SystemTemp\yuzu_*',
+
+    # Retain the legacy exact entries — Defender deduplicates, and
+    # keeping them makes it obvious in `Get-MpPreference` output that
+    # the wildcard above is a superset rather than a replacement.
     'C:\WINDOWS\SystemTemp\yuzu_test_guardian',
     'C:\WINDOWS\SystemTemp\yuzu_test_kv',
     'C:\WINDOWS\SystemTemp\yuzu_test_updater_rollback_needed',
@@ -100,7 +113,23 @@ $processes = @(
 
     # ccache + vcpkg helpers.
     'ccache.exe',
-    'vcpkg.exe'
+    'vcpkg.exe',
+
+    # Yuzu test binaries. Defender has been observed retaining file
+    # handles on freshly-written .obj / .pdb siblings after these
+    # processes exit, producing EBUSY during actions/checkout cleanup
+    # on the next CI job (#501 rerun loop 2026-04-24 — locked
+    # unit_test_guardian_engine.cpp.obj for >30 min).
+    'yuzu_agent_tests.exe',
+    'yuzu_server_tests.exe',
+    'yuzu_tar_tests.exe',
+
+    # Yuzu release binaries — for any native UAT or runtime test that
+    # launches them directly on the runner (rare, but the zombie
+    # yuzu-agent.exe PID 36472 that survived 3 days on Shulgi was
+    # exactly this case).
+    'yuzu-agent.exe',
+    'yuzu-server.exe'
 )
 
 function Add-ExclusionPath-Idempotent($p) {
@@ -131,16 +160,22 @@ function Add-ExclusionProcess-Idempotent($proc) {
     }
 }
 
-Write-Host "`n── Applying Defender path exclusions ───────────────────────" -ForegroundColor Cyan
+# ASCII-only header rules — PowerShell 5.1 reads .ps1 without a BOM as
+# the system ANSI codepage (Windows-1252), which mangles the box-drawing
+# characters we used to carry here and produced spurious parse errors.
+Write-Host "`n--- Applying Defender path exclusions ---" -ForegroundColor Cyan
 foreach ($p in $paths) { Add-ExclusionPath-Idempotent $p }
 
-Write-Host "`n── Applying Defender process exclusions ────────────────────" -ForegroundColor Cyan
+Write-Host "`n--- Applying Defender process exclusions ---" -ForegroundColor Cyan
 foreach ($proc in $processes) { Add-ExclusionProcess-Idempotent $proc }
 
-Write-Host "`n── Current Defender configuration (post-update) ────────────" -ForegroundColor Cyan
+Write-Host "`n--- Current Defender configuration (post-update) ---" -ForegroundColor Cyan
 Write-Host "ExclusionPath:"
 (Get-MpPreference).ExclusionPath | ForEach-Object { Write-Host "  $_" }
 Write-Host "ExclusionProcess:"
 (Get-MpPreference).ExclusionProcess | ForEach-Object { Write-Host "  $_" }
 
-Write-Host "`nDone. Reversible with Remove-MpPreference -ExclusionPath <path>."
+# `<path>` in a double-quoted string trips PS's redirection parser; use a
+# single-quoted string (no backtick expansion needed — we concatenate the
+# leading newline via "+ "`n"").
+Write-Host ('Done. Reversible with Remove-MpPreference -ExclusionPath <path>.')
