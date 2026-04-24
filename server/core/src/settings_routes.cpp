@@ -465,8 +465,10 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
             "    <input type=\"text\" name=\"username\" placeholder=\"username\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
-            "    <label>Password</label>"
-            "    <input type=\"password\" name=\"password\" placeholder=\"password\" required>"
+            "    <label>Password <span style=\"color:#8b949e;font-weight:normal;"
+            "font-size:0.7rem\">(min 12 chars)</span></label>"
+            "    <input type=\"password\" name=\"password\" placeholder=\"password\" "
+            "           minlength=\"12\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Role</label>"
@@ -2420,7 +2422,30 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                             "text/html; charset=utf-8");
             return;
         }
-        auth_mgr_->upsert_user(username, password, role);
+        // Weak-password rejection. `upsert_user` returns false when the
+        // password fails the G2-SEC-A1-003 minimum-length rule (12 chars);
+        // that's the only failure mode today. Surface as a 400 with an
+        // HX-Trigger toast matching the duplicate-username / self-role-change
+        // error-toast pattern above — the prior handler fire-and-forgot the
+        // return value, then logged "User added/updated", wrote a success
+        // audit, and emitted a "User created" toast, so a UAT operator who
+        // typed a short password saw a green success toast while nothing was
+        // persisted (silently-failed UX). If more `upsert_user` rejection
+        // reasons are added, replace the bool return with a richer error
+        // signal and fan out the toast text from there.
+        if (!auth_mgr_->upsert_user(username, password, role)) {
+            spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
+                         "(weak_password — minimum 12 characters)",
+                         username);
+            audit_fn_(req, "user.upsert", "denied", "User", username, "weak_password");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (!auth_mgr_->save_config()) {
             spdlog::error("Failed to save config after user upsert");
         }

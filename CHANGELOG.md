@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Settings → Users: short-password submission now shows the real rejection
+  instead of failing silently.** `POST /api/settings/users` in
+  `server/core/src/settings_routes.cpp` was fire-and-forgetting the bool
+  return from `AuthManager::upsert_user`, which silently rejects passwords
+  shorter than 12 characters (G2-SEC-A1-003). When an operator typed a
+  short password, the handler still logged `"User added/updated"`, wrote
+  a **success** entry to `audit_store`, and emitted the `"User created"`
+  green toast via HX-Trigger — while nothing was persisted. UAT reported
+  this as "setting a password less than 12 characters silently fails."
+  The handler now checks the return, audits
+  `user.upsert / denied / weak_password`, returns HTTP 400, and emits
+  `{"showToast":{"message":"Password must be at least 12 characters",
+  "level":"error"}}` so the dashboard shows a red toast and the user is
+  not created. The rendered add-user fragment also carries HTML5
+  `minlength="12"` plus an inline `(min 12 chars)` helper label so the
+  browser surfaces the rule natively before the submit round-trip —
+  defence-in-UX, not a security control; the server-side check remains
+  canonical. Three new test cases in
+  `tests/unit/server/test_settings_routes_users.cpp` pin the denial
+  (short password, 11-char boundary, fragment-carries-minlength).
+
 ### Changed
 
 - **CI observability: upload `meson-logs/` as artifact on Windows test

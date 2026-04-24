@@ -234,6 +234,8 @@ constexpr std::string_view kSelfDemoteToast =
     R"({"showToast":{"message":"Cannot change your own role","level":"error"}})";
 constexpr std::string_view kDuplicateUsernameToast =
     R"({"showToast":{"message":"Username already exists","level":"error"}})";
+constexpr std::string_view kShortPasswordToast =
+    R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})";
 
 } // namespace
 
@@ -390,6 +392,75 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: duplicate username rejected"
     // The original password must still authenticate — the rejection must
     // not have run upsert_user under the hood.
     CHECK(h.auth_mgr.authenticate("bob", "bobpassword12").has_value());
+}
+
+// ── Weak-password guard — UAT-reported silent fail ─────────────────────────
+//
+// Before this fix, POSTing a new user with a password shorter than 12 chars
+// (the G2-SEC-A1-003 minimum enforced inside AuthManager::upsert_user) caused
+// the handler to fire-and-forget the bool return value, then log
+// "User added/updated", write a SUCCESS audit row, and emit the
+// "User created" success toast — while nothing was persisted. UAT observed
+// this as "setting a password less than 12 characters silently fails."
+//
+// The guard must: (1) return 400, (2) emit the short-password error toast,
+// (3) audit the attempt as denied with detail="weak_password", (4) leave
+// the user NOT persisted.
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with toast",
+          "[settings][users][weak-password]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // "shortpw" = 7 chars, below the 12-char minimum. Must be rejected
+    // before any persistence or success audit occurs.
+    auto res = h.Post("/api/settings/users",
+                        "username=charlie&password=shortpw&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("HX-Trigger") == kShortPasswordToast);
+    // User must NOT have been persisted.
+    CHECK_FALSE(h.has_user("charlie"));
+    // Audit chain must capture the denial with the weak_password reason.
+    CHECK(h.has_audit("user.upsert", "denied", "User", "charlie"));
+    // And must NOT show a success row for the same target.
+    CHECK_FALSE(h.has_audit("user.upsert", "success", "User", "charlie"));
+}
+
+TEST_CASE("SettingsRoutes POST /api/settings/users: exactly-11-char password rejected",
+          "[settings][users][weak-password]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // Boundary: 11 chars (one below the minimum). 12 chars must pass, 11
+    // must fail — this pins the inclusive-lower-bound on 12, not 11.
+    auto res = h.Post("/api/settings/users",
+                        "username=dave&password=elevenchars&role=user",
+                        "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->get_header_value("HX-Trigger") == kShortPasswordToast);
+    CHECK_FALSE(h.has_user("dave"));
+}
+
+TEST_CASE("SettingsRoutes /fragments/settings/users: add-user form carries minlength=12 hint",
+          "[settings][users][ui][weak-password]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // The rendered fragment must carry the HTML5 minlength hint so the
+    // browser surfaces the rule natively before a short password even
+    // reaches the server. Defence-in-UX, not a security control — the
+    // server-side check above is canonical.
+    auto res = h.Get("/fragments/settings/users");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("minlength=\"12\"") != std::string::npos);
+    CHECK(res->body.find("min 12 chars") != std::string::npos);
 }
 
 // ── Self-deletion guard — UI side (#403) ─────────────────────────────────────
