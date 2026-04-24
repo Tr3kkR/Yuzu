@@ -201,7 +201,13 @@ TEST_CASE("GuardianEngine: dispatch routes push_rules through SerializeAsString"
     cmd.set_command_id("cmd-1");
     cmd.set_plugin("__guard__");
     cmd.set_action("push_rules");
-    (*cmd.mutable_parameters())["push"] = p.SerializeAsString();
+    // protobuf Map's operator[] is silently lossy on MSVC debug when absl's
+    // flat_hash_map gets linked in via the Windows static-linkage workaround
+    // (CLAUDE.md / #375): insert lands in one instantiation, find searches
+    // another. insert() takes a different code path inside the Map and does
+    // not trip the ODR mismatch. See #501. Semantically equivalent here
+    // because `cmd` is freshly constructed and the key does not pre-exist.
+    cmd.mutable_parameters()->insert({"push", p.SerializeAsString()});
 
     auto dr = f.engine->dispatch(cmd);
     CHECK(dr.exit_code == 0);
@@ -268,7 +274,8 @@ TEST_CASE("GuardianEngine: dispatch push_rules with garbage proto → exit_code 
     apb::CommandRequest cmd;
     cmd.set_plugin("__guard__");
     cmd.set_action("push_rules");
-    (*cmd.mutable_parameters())["push"] = "not a valid proto byte sequence";
+    // See #501 — operator[] is the broken path on MSVC debug; insert() works.
+    cmd.mutable_parameters()->insert({"push", "not a valid proto byte sequence"});
     auto dr = f.engine->dispatch(cmd);
     CHECK(dr.exit_code == 2);
     CHECK(dr.output.find("failed to parse") != std::string::npos);

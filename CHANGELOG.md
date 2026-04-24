@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tests: switch two Guardian dispatch tests from `Map::operator[]` to
+  `Map::insert` — unblocks Windows MSVC debug CI (#501).** In
+  `tests/unit/test_guardian_engine.cpp`, the two test cases at lines 193
+  ("dispatch routes push_rules through SerializeAsString") and 265
+  ("dispatch push_rules with garbage proto → exit_code 2") populated
+  `CommandRequest.parameters` via
+  `(*cmd.mutable_parameters())["push"] = value;`. On Windows MSVC debug
+  the subsequent `cmd.parameters().find("push")` in `GuardianEngine::dispatch`
+  returned `end()` — the key was written but not findable — so dispatch
+  fell into the "missing 'push' parameter" branch, yielding exit_code=1
+  instead of the expected 0 / 2 and making every downstream substring /
+  state check fail. The failure reproduces deterministically on a clean
+  `build-windows-ci` (issue #501 has the testlog captured off the
+  runner). Signature matches an abseil / protobuf ODR layout mismatch
+  specific to the Windows static-linkage workaround documented in
+  CLAUDE.md / #375: `Map::operator[]` and `Map::find` resolving to
+  different `absl::container_internal::raw_hash_set` instantiations.
+  Switching to `insert({key, value})` takes a different internal code
+  path that is not tripped by the mismatch. Semantically equivalent
+  here because `cmd` is freshly constructed. Test-only unblock;
+  production agents are unaffected because `CommandRequest.parameters`
+  in production is populated by protobuf wire deserialization (gRPC),
+  not by C++ `operator[]`. Follow-up noted in PR description:
+  `server/core/src/server.cpp:2395,4316,4434,4577` uses the same
+  `(*cmd.mutable_parameters())[k] = v;` pattern — harmless today
+  because the server is not shipped for native Windows MSVC, but worth
+  the same switch for cross-platform robustness.
+
 - **`.claude/agents/` cleanup — token efficiency + routing effectiveness.**
   Audit-driven sweep of the subagent frontmatter and a few body-text
   fixes that bring the descriptions in line with how the parent agent
