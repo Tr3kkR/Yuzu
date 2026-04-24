@@ -205,8 +205,11 @@ TEST_CASE("GuardianEngine: dispatch routes push_rules through SerializeAsString"
         *f.engine, p.SerializeAsString());
     CHECK(dr.exit_code == 0);
     CHECK(dr.content_type == "text");
-    CHECK(dr.output.find("applied=1") != std::string::npos);
-    CHECK(dr.output.find("generation=42") != std::string::npos);
+    // Space-anchor the numeric substrings: the raw output is
+    // "applied=1 generation=42 total=1" and a bare `"applied=1"` search would
+    // also match `"applied=10"` / `"applied=100"` if this test ever grows.
+    CHECK(dr.output.find("applied=1 ") != std::string::npos);
+    CHECK(dr.output.find(" generation=42 ") != std::string::npos);
     CHECK(f.engine->rule_count() == 1);
     CHECK(f.engine->policy_generation() == 42);
 }

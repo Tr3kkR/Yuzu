@@ -84,8 +84,11 @@ public:
     apply_rules(const yuzu::guardian::v1::GuaranteedStatePush& push);
 
     /// Build a GuaranteedStateStatus reflecting currently cached rules.
-    /// All rules report status="compliant" in PR 2 because no guards
-    /// are running yet — the real status machine arrives with PR 3.
+    /// All rules report status="errored" in PR 2 because no guards are
+    /// running yet — we cannot prove compliance without an evaluator, so
+    /// be honest about it. The real status machine (compliant/drifted/
+    /// errored per-rule) arrives with PR 3; dashboard presentation of the
+    /// PR 2 state is also a PR 3 concern.
     yuzu::guardian::v1::GuaranteedStateStatus get_status() const;
 
     /// Entry point for `cmd.plugin() == "__guard__"`. Parses the

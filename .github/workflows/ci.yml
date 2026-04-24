@@ -322,8 +322,15 @@ jobs:
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
       # every failed test — without this artifact, a multi-assertion failure
       # only exposes ONE expansion in the workflow log. Issue #501.
-      - name: Upload meson-logs on test failure
-        if: failure()
+      #
+      # `failure() || cancelled()` covers the rapid-dev-push concurrency-cancel
+      # scenario that motivated #501: `cancel-in-progress: true` on the `dev`
+      # concurrency group interrupts the Windows test mid-run, which makes
+      # `if: failure()` evaluate false and drops the artifact — the exact case
+      # that most needs the forensic log. `if-no-files-found: warn` handles
+      # cancels that fire before meson writes testlog.txt.
+      - name: Upload meson-logs on test failure or cancel
+        if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}

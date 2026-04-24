@@ -32,6 +32,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Governance Gate 7 hardening round — `/governance 4b35786..HEAD`.**
+  Closes the findings from the full governance re-run on `dev` after
+  Guardian PR 2 merged. No new functionality; tightens four correctness
+  and accuracy gaps against the existing entries on this branch.
+  - **`ci.yml` `Upload meson-logs` trigger broadened from `failure()` to
+    `failure() || cancelled()`** (ci-C1 / Gate 5 CH-3 / Gate 6 OB-1).
+    The motivating scenario for #501 — rapid-dev-push concurrency cancel
+    on the Windows leg — makes `failure()` evaluate false, silently
+    dropping the forensic artifact on the exact runs that need it most.
+    `if-no-files-found: warn` already covers cancels that fire before
+    meson writes `testlog.txt`, so there is no false-positive risk.
+  - **`guardian_engine.hpp` `get_status()` doc comment corrected**
+    (hp-F1). The header had claimed rules report `status="compliant"`
+    in PR 2; the implementation at `guardian_engine.cpp:223-225,249`
+    pessimistically reports `status="errored"` for every rule because
+    no evaluator is running yet. Pre-existing drift from the Guardian
+    PR 2 baseline caught by the Gate 4 happy-path review. Matching
+    comment in `guardian_engine.cpp` also tightened. Speculative
+    "Dashboards surface … as 'Guardian installed but inert'" phrasing
+    removed — no such dashboard presentation exists yet; it is a PR 3
+    concern.
+  - **CHANGELOG scope correction for the #482 follow-up list**
+    (doc-GS1 / Gate 4 CA-1). The original TempDbFile migration entry
+    named `test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+    `test_rest_api_t2.cpp`, and `test_kv_store.cpp` as the remaining
+    sibling test files still managing their own RAII. Those four were
+    already remediated in prior commits; the Gate 4 consistency audit
+    caught the misattribution. The accurate 6-file list is now carried
+    in the TempDbFile entry below (`test_tar_store.cpp`,
+    `test_api_token_store.cpp`, `test_management_group_store.cpp`,
+    `test_settings_routes_users.cpp`, `test_guaranteed_state_store.cpp`,
+    `test_plugin_loader.cpp`).
+  - **#501 entry rewritten for factual accuracy** (doc-GS2 / Gate 7
+    re-review BLOCK-1). The original entry described the fix as
+    "switching from `Map::operator[]` to `Map::insert`"; that framing
+    contradicts `.claude/agents/build-ci.md`, which documents both APIs
+    as equally ineffective (both go through `raw_hash_set`'s bucket-
+    index path). The merged fix is the `YUZU_EXPORT
+    guardian_dispatch_push_bytes_for_test` DLL-side helper; the entry
+    now reflects that, and cross-platform's verification that the
+    sibling `server.cpp` pattern is safe (server_core is a
+    `static_library`) is carried into the entry rather than left as an
+    open follow-up.
+  - **Test substring assertions space-anchored** (test-T1 / Gate 3
+    qe-S3). `tests/unit/test_guardian_engine.cpp:208-214` now matches
+    `"applied=1 "` (trailing space) and `" generation=42 "` (both
+    sides) so that a future test growing to 10-rule batches cannot
+    silently pass a stale `"applied=1"` check against `"applied=10"`
+    output.
+
 - **CI observability: upload `meson-logs/` as artifact on Windows test
   failure (#501).** meson + ninja truncate test stdout to the last 100
   lines in the GitHub Actions UI, which hides all but one assertion
@@ -95,33 +145,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work correctly (they would have required UTF-8 BOM under PS 5.1;
   the PS 7+ preflight makes that irrelevant).
 
-- **Tests: switch two Guardian dispatch tests from `Map::operator[]` to
-  `Map::insert` — unblocks Windows MSVC debug CI (#501).** In
-  `tests/unit/test_guardian_engine.cpp`, the two test cases at lines 193
-  ("dispatch routes push_rules through SerializeAsString") and 265
-  ("dispatch push_rules with garbage proto → exit_code 2") populated
-  `CommandRequest.parameters` via
-  `(*cmd.mutable_parameters())["push"] = value;`. On Windows MSVC debug
-  the subsequent `cmd.parameters().find("push")` in `GuardianEngine::dispatch`
-  returned `end()` — the key was written but not findable — so dispatch
-  fell into the "missing 'push' parameter" branch, yielding exit_code=1
-  instead of the expected 0 / 2 and making every downstream substring /
-  state check fail. The failure reproduces deterministically on a clean
-  `build-windows-ci` (issue #501 has the testlog captured off the
-  runner). Signature matches an abseil / protobuf ODR layout mismatch
-  specific to the Windows static-linkage workaround documented in
-  CLAUDE.md / #375: `Map::operator[]` and `Map::find` resolving to
-  different `absl::container_internal::raw_hash_set` instantiations.
-  Switching to `insert({key, value})` takes a different internal code
-  path that is not tripped by the mismatch. Semantically equivalent
-  here because `cmd` is freshly constructed. Test-only unblock;
-  production agents are unaffected because `CommandRequest.parameters`
-  in production is populated by protobuf wire deserialization (gRPC),
-  not by C++ `operator[]`. Follow-up noted in PR description:
-  `server/core/src/server.cpp:2395,4316,4434,4577` uses the same
-  `(*cmd.mutable_parameters())[k] = v;` pattern — harmless today
-  because the server is not shipped for native Windows MSVC, but worth
-  the same switch for cross-platform robustness.
+- **Tests: route Guardian dispatch test `CommandRequest` population through
+  a DLL-side helper — unblocks Windows MSVC debug CI (#501).** Two test
+  cases in `tests/unit/test_guardian_engine.cpp` were tripping a static-
+  linkage limitation that falls out of the Windows option D
+  `cxx.find_library()` wiring documented in CLAUDE.md / #375. Root cause:
+  `absl::hash_internal::MixingHashState::Seed()` returns the ADDRESS of
+  `kSeed`. `absl_hash.lib` is linked statically into both the test EXE
+  and `yuzu_agent_core.dll`, so each image holds its own `kSeed` at a
+  different virtual address. Protobuf `Map<K,V>` mixes that address into
+  every bucket-index calculation, so an `insert()` performed in the test
+  EXE and a `find()` performed inside the DLL compute different buckets
+  for the same key. The test dispatch silently fell into the
+  "missing 'push' parameter" branch, yielding exit_code=1 instead of 0/2.
+  Deterministic and reproducible on `build-windows-ci`; issue #501 has
+  the testlog.
+
+  The fix adds a `YUZU_EXPORT guardian_dispatch_push_bytes_for_test`
+  helper in `agents/core/src/guardian_engine.cpp` that constructs the
+  `CommandRequest` and populates its `parameters` map INSIDE the DLL,
+  then dispatches. Both the insert and the find now execute against the
+  DLL's copy of `kSeed`. An earlier attempt in the PR swapped
+  `Map::operator[]` for `Map::insert({k,v})` on the test side —
+  **that workaround is ineffective** and was reverted: both APIs go
+  through the same `raw_hash_set` bucket-index path and both are tripped
+  by the cross-image seed split. `.claude/agents/build-ci.md` gains a
+  new "#501 Windows DLL-boundary absl hash seed mismatch" section that
+  documents the failure mode, the DLL-helper fix, the audit pattern for
+  future tests that populate a proto `map<K,V>` in EXE code and pass it
+  to DLL-side code, and the six other approaches that do not work.
+
+  Production agents are unaffected because the gRPC Subscribe stream
+  parses `CommandRequest` bytes inside `yuzu_agent_core.dll`, so
+  population and lookup share a seed. `server/core/src/server.cpp:{2395,
+  4316,4434,4577}` uses the same `(*cmd.mutable_parameters())[k] = v;`
+  pattern — **verified safe** by the Gate 3 cross-platform review:
+  `yuzu_server_core` is a `static_library`, not a DLL, so there is no
+  cross-image boundary for the bucket index to diverge across.
 
 - **`.claude/agents/` cleanup — token efficiency + routing effectiveness.**
   Audit-driven sweep of the subagent frontmatter and a few body-text
@@ -176,11 +236,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destructor-fires-on-partial-construction guarantee. The
   `unique_kv_path()` helper is retained — it composes `unique_temp_path`
   with the per-UID dir prefix and remains the single uniqueness source
-  for this test file. Progresses #482; four sibling test files
-  (`test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
-  `test_rest_api_t2.cpp`, `test_kv_store.cpp`) still manage their own
-  RAII by hand and are left for a follow-up so this PR stays
-  bisectable.
+  for this test file. Progresses #482; six sibling test files still
+  carry the flake-#473 salt pattern (`std::hash<std::thread::id>` +
+  `steady_clock::now()`, or a fresh `random_device` per construction)
+  instead of the shared `yuzu::test::TempDbFile` helper:
+  `tests/unit/test_tar_store.cpp`,
+  `tests/unit/server/test_api_token_store.cpp`,
+  `tests/unit/server/test_management_group_store.cpp`,
+  `tests/unit/server/test_settings_routes_users.cpp`,
+  `tests/unit/server/test_guaranteed_state_store.cpp` (has its own
+  local duplicate `struct TempDbFile` — switch to the shared helper),
+  and `tests/unit/test_plugin_loader.cpp`. Left for follow-up so this
+  PR stays bisectable.
 
 - **BREAKING (licensing): Yuzu is now distributed under AGPL-3.0-or-later
   (community edition) with a separate commercial license for the new

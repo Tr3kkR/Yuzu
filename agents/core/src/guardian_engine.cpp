@@ -217,9 +217,9 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
 
     // PR 2 has no real evaluator yet — be honest about that. Every rule is
     // reported with status="errored" because we cannot prove compliance
-    // without a guard running. Dashboards then surface this as "Guardian
-    // installed but inert," matching the PR 2 reality. PR 3 replaces this
-    // with real per-guard health.
+    // without a guard running. PR 3 replaces this with real per-guard
+    // health; dashboard presentation of the PR 2 state is also a PR 3
+    // concern.
     status.set_compliant_rules(0);
     status.set_drifted_rules(0);
     status.set_errored_rules(static_cast<std::uint32_t>(rule_count_));
