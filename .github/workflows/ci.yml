@@ -318,6 +318,19 @@ jobs:
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
           meson test -C build-windows-ci --print-errorlogs
 
+      # meson+ninja truncate test stdout to the last 100 lines in the Actions
+      # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
+      # every failed test — without this artifact, a multi-assertion failure
+      # only exposes ONE expansion in the workflow log. Issue #501.
+      - name: Upload meson-logs on test failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: build-windows-ci/meson-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: ccache stats
         if: always()
         run: ccache -s
