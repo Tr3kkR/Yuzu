@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Windows runner hardening: broaden Defender exclusions + migrate
+  project scripting to PowerShell 7+ (`pwsh.exe`) (#501, #516, #517).**
+  Two coupled changes shipped together.
+
+  First, **`scripts/windows-runner-defender-exclusions.ps1`** gains
+  `C:\WINDOWS\SystemTemp\yuzu_*` as a wildcard path — the prior
+  exact-path entries (`yuzu_test_guardian`, `yuzu_test_kv`) did NOT
+  match the actual runtime directory names the test suite creates
+  (`yuzu_test_guardian_SHULGI$`, `yuzu_test_kv_SHULGI$`,
+  `yuzu_test_reserved_plugin_<random>`, `yuzu_trigger_test`). Three
+  test binaries (`yuzu_agent_tests.exe`, `yuzu_server_tests.exe`,
+  `yuzu_tar_tests.exe`) and two release binaries (`yuzu-agent.exe`,
+  `yuzu-server.exe`) are added to `ExclusionProcess` — Defender has
+  been observed retaining handles on freshly-written `.obj` / `.pdb`
+  siblings after these processes exit, contributing to the EBUSY
+  loop we hit on #501's rerun of 2026-04-24.
+
+  Second, **stock Windows PowerShell 5.1 (`powershell.exe`) is no
+  longer supported for Yuzu-authored scripting**; the project standard
+  is PowerShell 7+ (`pwsh.exe`). Reason: the repo saves `.ps1` files
+  as UTF-8 without BOM (POSIX / git convention), and PS 5.1 reads
+  such files as the system ANSI codepage (Windows-1252 on English
+  installs), which mangles non-ASCII characters — a right-double-quote
+  byte at 0x94 closes a string literal early and downstream tokens
+  become "command not found" errors. PS 7+ defaults to UTF-8. The
+  `yuzu-local-windows` runner already has `pwsh.exe` 7.6.1
+  pre-installed; 7 workflow steps across `release.yml` and
+  `pre-release.yml` were already on `shell: pwsh`. Concrete changes:
+  - Preflight guard at the top of
+    `scripts/windows-runner-defender-exclusions.ps1`:
+    `PSVersionTable.PSVersion.Major -lt 7` → `Write-Error` + `exit 1`
+    with an actionable message (after the `[CmdletBinding()]`/`param`
+    block, per PS's required ordering).
+  - `docs/yuzu-guardian-design-v1.1.md:781` example guard command
+    changed from `powershell.exe -NonInteractive …` to
+    `pwsh.exe -NonInteractive …`.
+  - `docs/windows-build.md` gains a new **PowerShell: pwsh.exe only**
+    section documenting the standard and the preflight pattern.
+
+  Three latent bugs in the exclusion-applicator script fixed along
+  the way: (a) `<path>` in a double-quoted `Write-Host` string
+  tripped PS's redirection parser; now single-quoted. (b) Hostname
+  allowlist default `^yuzu-local-windows` never matched
+  `$env:COMPUTERNAME` (which is `SHULGI` — the physical machine name,
+  not the GitHub Actions runner role label); default now `^SHULGI$`.
+  (c) Unicode box-drawing characters in `Write-Host` banners now
+  work correctly (they would have required UTF-8 BOM under PS 5.1;
+  the PS 7+ preflight makes that irrelevant).
+
 - **Tests: switch two Guardian dispatch tests from `Map::operator[]` to
   `Map::insert` — unblocks Windows MSVC debug CI (#501).** In
   `tests/unit/test_guardian_engine.cpp`, the two test cases at lines 193

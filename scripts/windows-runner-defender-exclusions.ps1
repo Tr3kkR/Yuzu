@@ -24,8 +24,14 @@
     exclusion entries.
 
 .NOTES
-    Run elevated (`powershell.exe -ExecutionPolicy Bypass`). Defender
-    persists the preference across reboots. Reversible with
+    Run elevated under PowerShell 7+ (`pwsh.exe -ExecutionPolicy Bypass`).
+    Stock Windows PowerShell 5.1 is not supported — the repo saves .ps1
+    files as UTF-8 without BOM (POSIX/git convention), which PS 5.1
+    misreads as the system ANSI codepage and mangles any non-ASCII
+    characters. See docs/windows-build.md for the project-wide PS 7+
+    standard and issue #517 for the migration history.
+
+    Defender persists the preference across reboots. Reversible with
     Remove-MpPreference.
 
     Source of record for the required set:
@@ -44,6 +50,20 @@ param(
     # Override only when provisioning a new runner host.
     [string]$AllowedHostPattern = '^SHULGI$'
 )
+
+# Fail loudly on stock Windows PowerShell 5.1. The script body below uses
+# Unicode box-drawing characters in Write-Host banners that only render
+# correctly under PS 7+ (see .NOTES above and issue #517). Without this
+# guard, the symptom is a cryptic "string missing terminator" parse error
+# at the banner lines rather than a clean actionable message. Must live
+# AFTER the param() block because PS requires [CmdletBinding()]/param()
+# to be the first non-comment statement.
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Error ("This script requires PowerShell 7+. Detected " +
+                 $PSVersionTable.PSVersion.ToString() +
+                 ". Use pwsh.exe, not powershell.exe.")
+    exit 1
+}
 
 # Hostname allowlist. Path exclusions below include real dev-workstation
 # locations (%USERPROFILE%\AppData\Local\ccache, C:\WINDOWS\SystemTemp\yuzu_test_*)
@@ -160,16 +180,16 @@ function Add-ExclusionProcess-Idempotent($proc) {
     }
 }
 
-# ASCII-only header rules — PowerShell 5.1 reads .ps1 without a BOM as
-# the system ANSI codepage (Windows-1252), which mangles the box-drawing
-# characters we used to carry here and produced spurious parse errors.
-Write-Host "`n--- Applying Defender path exclusions ---" -ForegroundColor Cyan
+# Unicode box-drawing banners — safe under PS 7+ (UTF-8 default). The
+# preflight above refuses PS 5.1, which would misread these as ANSI
+# codepage and break the parser.
+Write-Host "`n── Applying Defender path exclusions ───────────────────────" -ForegroundColor Cyan
 foreach ($p in $paths) { Add-ExclusionPath-Idempotent $p }
 
-Write-Host "`n--- Applying Defender process exclusions ---" -ForegroundColor Cyan
+Write-Host "`n── Applying Defender process exclusions ────────────────────" -ForegroundColor Cyan
 foreach ($proc in $processes) { Add-ExclusionProcess-Idempotent $proc }
 
-Write-Host "`n--- Current Defender configuration (post-update) ---" -ForegroundColor Cyan
+Write-Host "`n── Current Defender configuration (post-update) ────────────" -ForegroundColor Cyan
 Write-Host "ExclusionPath:"
 (Get-MpPreference).ExclusionPath | ForEach-Object { Write-Host "  $_" }
 Write-Host "ExclusionProcess:"
