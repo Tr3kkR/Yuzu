@@ -119,4 +119,45 @@ private:
     void persist_generation_locked();
 };
 
+/// Test-support helper: builds a __guard__ `CommandRequest` inside the
+/// agent-core DLL, populates `parameters["push"]` with the supplied bytes,
+/// and dispatches it through `engine.dispatch()`. Intended ONLY for unit
+/// tests — production code paths in `agent.cpp` already own the full
+/// CommandRequest lifecycle inside the DLL.
+///
+/// Why this helper exists (#501, load-bearing):
+///
+///   On Windows MSVC debug, abseil's `MixingHashState::Seed()` returns
+///   `reinterpret_cast<uintptr_t>(&MixingHashState::kSeed)`. `kSeed` lives
+///   in the static library `absl_hash.lib`, which is linked once into the
+///   test EXE and once into `yuzu_agent_core.dll` (yuzu_proto is a static
+///   lib that pulls in absl transitively, and it's linked into both
+///   targets). Each image therefore has its own copy of `kSeed` at a
+///   different virtual address. That address is the hash seed for every
+///   protobuf `Map<K,V>` operation (see `google::protobuf::internal::Hash`
+///   in `map.h` — it calls `absl::HashOf(k, salt)` which mixes in `Seed()`).
+///
+///   Result: if the test EXE populates a `Map<string,string>` via `insert()`,
+///   the bucket index is computed using EXE-side `Seed()`. When the DLL
+///   then calls `.find()` on the same map, the bucket index is computed
+///   using DLL-side `Seed()` — a different value — so `find()` returns
+///   `end()` even though the key is present. With two buckets (`kMinTableSize
+///   = 16 / sizeof(void*) = 2` on 64-bit), this fails ~50% of the time on
+///   average, deterministically for any specific key/seed combination.
+///
+///   Production doesn't hit this because the gRPC Subscribe stream parses
+///   `CommandRequest` bytes inside `yuzu_agent_core.dll` (see `agent.cpp`
+///   Subscribe loop), so population and lookup both use the DLL's seed.
+///
+///   Release builds happen to pass because aggressive inlining + `/OPT:ICF`
+///   can fold the seed accesses; debug builds with `/INCREMENTAL` keep the
+///   split. The fix is to keep the map population inside the DLL by using
+///   this helper instead of hand-constructing a `CommandRequest` in test
+///   code. See `.claude/agents/build-ci.md` for the broader #375 context
+///   and `docs/yuzu-guardian-design-v1.1.md` §10 for the Guardian test
+///   strategy.
+YUZU_EXPORT GuardianDispatchResult
+guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
+                                      std::string_view push_param_bytes);
+
 } // namespace yuzu::agent

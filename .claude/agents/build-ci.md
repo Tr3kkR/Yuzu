@@ -182,6 +182,61 @@ The approach:
 
 The long-term plan is to **eliminate the gRPC dependency entirely** — see **P1 #376 "Strategic: Migrate transport off gRPC to QUIC"**. QUIC (via MsQuic or similar) gives us the same reliable multiplexed bidirectional streams without the C++ ABI / CMake ecosystem tax, which would make the entire "Windows MSVC static-link history and #375" section obsolete history. It's deferred until current customer commitments ship because the transport rewrite touches agent, server, gateway, and the SDK — multi-week work that can't happen under a rollout pause.
 
+## Windows DLL-boundary absl hash seed mismatch (#501)
+
+**Hard rule (downstream consequence of option D):** because `absl_hash.lib` is a static library pulled into every binary that links the grpc/protobuf stack via the option D `cxx.find_library()` wiring, every Windows image gets its own copy of `absl::hash_internal::MixingHashState::kSeed`. `MixingHashState::Seed()` returns `reinterpret_cast<uintptr_t>(&kSeed)` — the **address** of that symbol. The address differs per-image.
+
+**Concrete consequence:** any protobuf `Map<K,V>` whose population and lookup happen in DIFFERENT Windows images (typically the test `.exe` vs `yuzu_agent_core.dll`) will silently mismatch on bucket index. `insert()` writes into bucket computed with seed A; `find()` reads from bucket computed with seed B; `find()` returns `end()` even though the key is present. With protobuf's `kMinTableSize = 16 / sizeof(void*) = 2` on 64-bit, the probability is ~50% per key but **deterministic** for any specific (key, seed-A, seed-B) combination.
+
+**Production is fine** because the gRPC Subscribe stream parses `CommandRequest` bytes inside `yuzu_agent_core.dll` (see `agent.cpp` Subscribe loop), and the DLL's `GuardianEngine::dispatch` reads them inside the same DLL. Both sides use the DLL's `kSeed`. The problem only surfaces when **tests construct a `CommandRequest` and hand-populate its `parameters` map from EXE code**, then pass it by reference to a DLL-side method that calls `.find()`.
+
+**Release happens to pass** because aggressive inlining + `/OPT:ICF` can fold the seed access paths across images in some configurations; debug builds with `/INCREMENTAL` and `/OPT:ICF` disabled keep the split. Do not rely on this coincidence — the bug is latent on release too and any proto-Map cross-module operation is a potential trip wire.
+
+### What does NOT work
+
+| Approach | Why it fails |
+|---|---|
+| Make abseil a DLL to share `kSeed` across images | Same LNK2005 "abseil_dll.lib vs grpc.lib embedded absl symbols" failure mode that killed option H in #375 |
+| Add `/OPT:ICF` to debug `cpp_link_args` | ICF only folds within ONE image; it cannot make `&kSeed` resolve to the same address across EXE and DLL |
+| Use `static_library` for `yuzu_agent_core` on Windows | Would cascade to every DLL that depends on it (37 plugin DLLs, `yuzu-agent.exe`, test binaries) — structural change, touches plugin-ABI boundary |
+| Serialize/ParseFromString round-trip in the test | Still happens in whichever TU calls it; if that's the EXE's TU, same seed mismatch |
+| `insert({k,v})` instead of `operator[]` | Both routes go through `TryEmplaceInternal → FindHelper → BucketNumber → absl::HashOf(k, salt)`; same seed mismatch regardless of API |
+| `__declspec(dllexport)` on `kSeed` via a yuzu-side wrapper | `kSeed` is declared `static const void* const` inside `absl::MixingHashState` — cannot be redeclared or forwarded without modifying abseil sources |
+
+### The current fix: DLL-side test-support helpers
+
+When a test needs to exercise a DLL-side method that consumes a protobuf `Map<K,V>`, build the `CommandRequest` (or other map-carrying message) **inside the DLL**, not in the test EXE. The pattern used for `GuardianEngine::dispatch`:
+
+    // In agents/core/src/guardian_engine.cpp (compiled into yuzu_agent_core.dll):
+    YUZU_EXPORT GuardianDispatchResult
+    guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
+                                          std::string_view push_param_bytes) {
+        apb::CommandRequest cmd;
+        cmd.set_plugin("__guard__");
+        cmd.set_action("push_rules");
+        (*cmd.mutable_parameters())["push"] = std::string{push_param_bytes};
+        return engine.dispatch(cmd);
+    }
+
+    // In tests/unit/test_guardian_engine.cpp (test EXE):
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+        *f.engine, serialized_push_bytes);
+
+The helper is `YUZU_EXPORT`-marked so the DLL exports it and the test EXE imports it; the body compiles into the DLL's TU and thus uses the DLL's `kSeed`. Semantically the helper matches production's gRPC-driven path (bytes in → parsed CommandRequest → dispatch), so it's not a test-only hack — it's a valid simulation of the wire flow.
+
+### Audit: where else this pattern could bite
+
+Any Windows unit test that:
+
+1. Constructs a protobuf message carrying a `map<K,V>` field (`CommandRequest.parameters`, inventory labels, etc.), AND
+2. Populates the map via C++ mutators (`mutable_*`, `operator[]`, `insert`, `try_emplace`, `emplace`), AND
+3. Passes the message by reference/const-reference to a DLL-side method, AND
+4. That DLL-side method reads the map via `find()`, `at()`, `contains()`, iteration, or any other bucket-indexed lookup
+
+…is vulnerable. The fix in every case is to move step 2 into the DLL via a `YUZU_EXPORT` helper.
+
+As of 2026-04-24 the only known vulnerable site was `test_guardian_engine.cpp` (the first test in the repo to combine all four conditions). If a future test fails the `map.find returns end() despite successful insert` pattern on Windows MSVC debug, start here. `grep 'mutable_parameters\\|mutable_labels\\|mutable_tags' tests/` is the fast audit.
+
 ### Concurrency-masked breakage pattern
 
 **Lesson**: `cancel-in-progress: true` on the `dev` branch's CI concurrency group cancels in-flight CI when a new commit lands on the same branch. A string of rapid commits on `dev` never lets a CI run complete, and the last known state is "cancelled" — **not a failure indicator**. The Windows MSVC debug breakage was hidden by this pattern for days.

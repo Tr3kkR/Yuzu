@@ -197,19 +197,12 @@ TEST_CASE("GuardianEngine: dispatch routes push_rules through SerializeAsString"
     p.set_policy_generation(42);
     *p.add_rules() = GuardianFixture::make_rule("r-d", "dispatched");
 
-    apb::CommandRequest cmd;
-    cmd.set_command_id("cmd-1");
-    cmd.set_plugin("__guard__");
-    cmd.set_action("push_rules");
-    // protobuf Map's operator[] is silently lossy on MSVC debug when absl's
-    // flat_hash_map gets linked in via the Windows static-linkage workaround
-    // (CLAUDE.md / #375): insert lands in one instantiation, find searches
-    // another. insert() takes a different code path inside the Map and does
-    // not trip the ODR mismatch. See #501. Semantically equivalent here
-    // because `cmd` is freshly constructed and the key does not pre-exist.
-    cmd.mutable_parameters()->insert({"push", p.SerializeAsString()});
-
-    auto dr = f.engine->dispatch(cmd);
+    // Route through the DLL-side helper: building the CommandRequest and
+    // populating its `parameters` map must happen inside yuzu_agent_core
+    // so that the dispatch-time find() uses the same absl::HashOf seed as
+    // the insert(). See guardian_engine.hpp and #501 for the full story.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+        *f.engine, p.SerializeAsString());
     CHECK(dr.exit_code == 0);
     CHECK(dr.content_type == "text");
     CHECK(dr.output.find("applied=1") != std::string::npos);
@@ -271,12 +264,10 @@ TEST_CASE("GuardianEngine: dispatch push_rules with missing param → exit_code 
 TEST_CASE("GuardianEngine: dispatch push_rules with garbage proto → exit_code 2",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;
-    apb::CommandRequest cmd;
-    cmd.set_plugin("__guard__");
-    cmd.set_action("push_rules");
-    // See #501 — operator[] is the broken path on MSVC debug; insert() works.
-    cmd.mutable_parameters()->insert({"push", "not a valid proto byte sequence"});
-    auto dr = f.engine->dispatch(cmd);
+    // Same DLL-boundary reasoning as the success test above — see #501 and
+    // guardian_engine.hpp for the absl hash seed cross-image mismatch.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+        *f.engine, "not a valid proto byte sequence");
     CHECK(dr.exit_code == 2);
     CHECK(dr.output.find("failed to parse") != std::string::npos);
 }
