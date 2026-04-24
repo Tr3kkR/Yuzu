@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI observability: upload `meson-logs/` as artifact on Windows test
+  failure (#501).** meson + ninja truncate test stdout to the last 100
+  lines in the GitHub Actions UI, which hides all but one assertion
+  expansion when a test fails with multiple asserts.
+  `meson-logs/testlog.txt` contains the full Catch2 output for every
+  failed test. Issue #501 tracks a Windows-only `yuzu_agent_tests`
+  failure that can't be diagnosed from the truncated log —
+  two failing test cases and seven assertions are known, but only one
+  expansion currently escapes the truncation. Artifact retention 14
+  days, keyed on `build-type + run-attempt` so re-runs don't overwrite
+  each other. Added to the Windows MSVC leg only; Linux and macOS
+  will get the same treatment in a follow-up once this one has proven
+  useful.
+
 - **Windows runner hardening: broaden Defender exclusions + migrate
   project scripting to PowerShell 7+ (`pwsh.exe`) (#501, #516, #517).**
   Two coupled changes shipped together.
