@@ -778,7 +778,7 @@ spec:
     action: enforce
     method: command
     params:
-      command: "powershell.exe -NonInteractive -Command Start-MpScan -ScanType FullScan"
+      command: "pwsh.exe -NonInteractive -Command Start-MpScan -ScanType FullScan"
     resilience:
       strategy: fixed
       max_failures: 3

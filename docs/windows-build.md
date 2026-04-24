@@ -28,3 +28,25 @@ All paths are configured by `setup_msvc_env.sh`. Do **not** use Clang (`C:\Progr
 | vcpkg | `C:\vcpkg` (`VCPKG_ROOT`) |
 | protoc | `C:\vcpkg\installed\x64-windows\tools\protobuf\protoc.exe` |
 | grpc_cpp_plugin | `C:\vcpkg\installed\x64-windows\tools\grpc\grpc_cpp_plugin.exe` |
+
+## PowerShell: pwsh.exe only
+
+All Yuzu-authored PowerShell scripts and workflow steps require
+**PowerShell 7+** (`pwsh.exe`, installed at
+`C:\Program Files\PowerShell\7\pwsh.exe`). Stock Windows PowerShell 5.1
+(`powershell.exe`) is not supported.
+
+Reason: the repo saves `.ps1` files as UTF-8 without a BOM (POSIX / git
+convention). Windows PowerShell 5.1 reads `.ps1` files without a BOM as
+the **system ANSI codepage** (Windows-1252 on English installs), which
+mangles any non-ASCII character — box-drawing glyphs, em-dashes, etc. —
+and can trip the parser in non-obvious ways (a right-double-quote byte
+at 0x94 closes a string literal early; downstream tokens become
+"command not found" errors). PS 7+ defaults to UTF-8, reading the
+files correctly.
+
+Every shipped `.ps1` begins with a `PSVersionTable.PSVersion.Major -lt 7`
+guard that exits 1 with an actionable message. CI workflow steps use
+`shell: pwsh` rather than `shell: powershell`. The
+`yuzu-local-windows` runner has `pwsh` 7.6.1 pre-installed. See
+issue #517 for the migration history.
