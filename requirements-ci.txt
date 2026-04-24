@@ -4,7 +4,7 @@
 #
 #    pip-compile --generate-hashes --output-file=requirements-ci.txt --strip-extras requirements-ci.in
 #
-meson==1.11.0 \
-    --hash=sha256:9774eb62bbf2cb8043aa3feb771c09b510d112c0c382221e29aea7453ecce753 \
-    --hash=sha256:dffdd0915ceb028541fe3bed77d63ba35e78514591c043736b450d62634eeb31
+meson==1.11.1 \
+    --hash=sha256:9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80 \
+    --hash=sha256:9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80
     # via -r requirements-ci.in
