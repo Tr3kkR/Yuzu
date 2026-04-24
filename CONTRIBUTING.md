@@ -60,7 +60,7 @@ The gateway (`gateway/`) is a standalone rebar3 project using Erlang/OTP. See `d
 - Run EUnit tests: `cd gateway && rebar3 eunit`
 - Run Common Test: `cd gateway && rebar3 ct --dir apps/yuzu_gw/test`
 - Always pass `--dir apps/yuzu_gw/test` with `--suite` flags
-- Review all Erlang changes with the erlang-dev agent (`.claude/agents/erlang-dev.md`)
+- Review all Erlang changes with the gateway-erlang agent (`.claude/agents/gateway-erlang.md`)
 
 ## MCP Server
 

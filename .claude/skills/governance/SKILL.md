@@ -184,7 +184,7 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | `tests/`, new fixtures, coverage gaps | **quality-engineer** |
 | `meson.build`, `vcpkg.json`, `.github/workflows/`, release tooling | **build-ci** |
 | `agents/plugins/`, plugin YAML defs | **plugin-developer** |
-| `gateway/` (Erlang) | **gateway-erlang** AND **erlang-dev** |
+| `gateway/` (Erlang) | **gateway-erlang** |
 | CEL expressions, scope DSL, trigger templates, YAML DSL spec | **dsl-engineer** |
 | Windows-only / macOS-only code, cross-platform helpers | **cross-platform** |
 | SQLite query paths, BFS/graph, hot authz paths | **performance** |

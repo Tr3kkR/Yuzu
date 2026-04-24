@@ -1,7 +1,7 @@
 ---
 name: workflow-orchestrator
 description: Workflow orchestrator — runs the governance gate sequence, coordinates parallel reviews, synthesizes findings
-tools: Read, Grep, Glob, Bash, Agent, TodoWrite
+tools: Read, Grep, Glob, Bash, Agent, TaskCreate, TaskUpdate, TaskList
 ---
 
 # Workflow Orchestrator Agent
@@ -30,7 +30,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 |------|------|--------|-------------|----------------|
 | 1 | Change Summary | Producing agent | — | Never |
 | 2 | Mandatory Deep-Dive | security-guardian, docs-writer | Parallel | Never |
-| 3 | Domain-Triggered Review | architect, quality-engineer, cross-platform, cpp-expert, performance, build-ci, dsl-engineer, erlang-dev, gateway-erlang, plugin-developer, release-deploy | Parallel (triggered only) | Agent skipped if domain not touched |
+| 3 | Domain-Triggered Review | architect, quality-engineer, cross-platform, cpp-expert, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, release-deploy | Parallel (triggered only) | Agent skipped if domain not touched |
 | 4 | Correctness & Resilience | happy-path, unhappy-path, consistency-auditor | Parallel | Never during full governance |
 | 5 | Chaos Analysis | chaos-injector | Sequential | Skip if gate 4 produces no findings |
 | 6 | Operational & Compliance | compliance-officer, sre, enterprise-readiness | Parallel | Never during full governance |
@@ -44,7 +44,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 | `proto/` or `*.proto` | architect, gateway-erlang |
 | `sdk/include/yuzu/plugin.h` or `plugin.hpp` | architect, plugin-developer, cpp-expert |
 | `meson.build`, `vcpkg.json`, `.github/workflows/` | build-ci |
-| `gateway/` or `*.erl` | erlang-dev, gateway-erlang |
+| `gateway/` or `*.erl` | gateway-erlang |
 | `agents/plugins/` | plugin-developer |
 | `content/definitions/`, `docs/yaml-dsl-spec.md` | dsl-engineer |
 | `scope_engine.*`, `cel_eval.*` | dsl-engineer, performance |

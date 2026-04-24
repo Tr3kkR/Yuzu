@@ -1,6 +1,6 @@
 ---
 name: build-ci
-description: Build & CI/CD — Meson, vcpkg, GitHub Actions, proto codegen
+description: Use on any change to `meson.build` files (root or subdirectory), `vcpkg.json` / `vcpkg-configuration.json`, `triplets/*`, `proto/gen_proto.py` and protoc codegen plumbing, `.github/workflows/*.yml`, `.github/actions/`, dependabot config, or release tooling under `scripts/release-*` / `scripts/check-compose-versions.sh`. Reviews and edits the Meson + vcpkg + GitHub Actions toolchain — ensures builds compile cleanly across the full CI matrix and CI workflows stay correct.
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
