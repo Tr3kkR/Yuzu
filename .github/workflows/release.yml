@@ -1116,9 +1116,15 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
         run: |
-          cosign sign --yes \
-            --oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE}@${DIGEST}"
+          # cosign v3.0+ rejects explicit --oidc-issuer when a signing
+          # config is in use (the GHA-default path). The OIDC issuer is
+          # auto-detected from the workflow's id-token, so the flag is
+          # both redundant and a hard error in v3. The cosign-installer
+          # bump from 3.10.1 → 4.1.1 (#495) installs cosign v3.0.5 by
+          # default; v0.11.0-rc0 hit "cannot specify service URLs and
+          # use signing config" and aborted before publishing the
+          # release page.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
       - name: Image summary
@@ -1236,9 +1242,12 @@ jobs:
       - name: Sign SHA256SUMS (keyless)
         run: |
           cd artifacts
-          cosign sign-blob --yes \
-            --oidc-issuer https://token.actions.githubusercontent.com \
-            SHA256SUMS --bundle SHA256SUMS.bundle
+          # cosign v3.0+ rejects explicit --oidc-issuer when a signing
+          # config is in use (auto-detected from the workflow's id-token).
+          # See "Sign image (keyless)" earlier in this file for the same
+          # fix. v0.11.0-rc0 was the first release to hit this after the
+          # cosign-installer 3 → 4 dependabot bump (#495).
+          cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.bundle
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
 
       - name: Determine if prerelease
