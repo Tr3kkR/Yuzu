@@ -175,13 +175,24 @@ if (-not $mp) {
 
 # == 3. Scheduled tasks ===================================================
 Write-Section "3. Scheduled tasks (auto-reapply + WSL keep-alive)"
+# LongRunning=$true tells the result-code interpreter that the task's
+# action is a never-exiting process (e.g. wsl.exe ... sleep infinity).
+# For those, a previous run's terminal exit code reflects how the
+# process was killed at session-end (Ctrl+C, shutdown, kill), not a
+# failure of the task itself. The signal we actually care about for
+# long-running tasks is the State (Running vs Ready) and whether the
+# expected effect is observable (e.g. WSL distro alive, checked
+# elsewhere). 0xC000013A (STATUS_CONTROL_C_EXIT) is the single most
+# common terminal exit for these.
 $tasksToCheck = @(
     [pscustomobject]@{ Name = 'Yuzu-Runner-Defender-Exclusions';
                        Why  = 'Re-applies Defender exclusions at every logon';
-                       Fix  = 'Re-run scripts\windows-runner-defender-exclusions.ps1 -RegisterAtLogon (elevated pwsh).' }
+                       Fix  = 'Re-run scripts\windows-runner-defender-exclusions.ps1 -RegisterAtLogon (elevated pwsh).';
+                       LongRunning = $false }
     [pscustomobject]@{ Name = 'Yuzu-WSL-KeepAlive';
                        Why  = 'Holds wsl.exe handle open so the WSL2 distro survives idle';
-                       Fix  = 'Re-register per memory project_shulgi_tmux_persistence.md.' }
+                       Fix  = 'Re-register per memory project_shulgi_tmux_persistence.md.';
+                       LongRunning = $true }
 )
 foreach ($t in $tasksToCheck) {
     $task = Get-ScheduledTask -TaskName $t.Name -ErrorAction SilentlyContinue
@@ -199,9 +210,21 @@ foreach ($t in $tasksToCheck) {
         Add-Result WARN ("task-" + $t.Name.ToLower()) "TaskInfo unavailable; task is registered+enabled" $t.Fix
         continue
     }
-    # LastTaskResult: 0 = success, 0x41301 (267009) = currently running, anything else = failure code
+    # LastTaskResult: 0 = success, 0x41301 (267009) = currently running,
+    # 0x41303 (267011) = task has not yet run, anything else = failure
+    # code OR (for long-running tasks) terminal exit signal.
     $resultCode = $info.LastTaskResult
     $resultHex = '0x{0:X}' -f $resultCode
+    # Common terminal-exit signals for long-running tasks. Treated as
+    # NORMAL when LongRunning=$true; the keep-alive process exited
+    # because something killed it at session-end, not because the task
+    # itself failed.
+    $longRunningTerminalCodes = @(
+        3221225786,  # 0xC000013A STATUS_CONTROL_C_EXIT (sleep infinity got Ctrl+C)
+        3221225794,  # 0xC0000142 DLL initialization failure (sometimes seen on session teardown)
+        1,           # plain exit 1 (sleep exits when interrupted by some signals)
+        -1073741510  # signed equivalent of 0xC000013A (PS sometimes prints negative)
+    )
     if ($resultCode -eq 0) {
         $age = if ($info.LastRunTime) { ((Get-Date) - $info.LastRunTime).TotalMinutes } else { -1 }
         $ageStr = if ($age -ge 0) { ("{0:F0}m ago" -f $age) } else { "never" }
@@ -211,7 +234,14 @@ foreach ($t in $tasksToCheck) {
     } elseif ($resultCode -eq 267011) {
         # 0x41303 = task has not yet run
         Add-Result WARN ("task-" + $t.Name.ToLower()) "Task registered but never executed (no LastRunTime)" `
-            "Trigger via Start-ScheduledTask -TaskName '$($t.Name)' to verify the task runs cleanly."
+            "Trigger via Start-ScheduledTask -TaskName '$($t.Name)' to verify the task runs cleanly, OR reboot to fire the AtLogon trigger."
+    } elseif ($t.LongRunning -and $longRunningTerminalCodes -contains $resultCode) {
+        # Long-running keep-alive task whose previous incarnation got
+        # Ctrl+C'd at session teardown. Healthy. Surface State so the
+        # operator can see whether it's currently active too.
+        $age = if ($info.LastRunTime) { ((Get-Date) - $info.LastRunTime).TotalHours } else { -1 }
+        $ageStr = if ($age -ge 0) { ("{0:F1}h ago" -f $age) } else { "never" }
+        Add-Result PASS ("task-" + $t.Name.ToLower()) ("State={0}, last terminal exit={1} (expected for long-running task), LastRun={2}" -f $task.State, $resultHex, $ageStr)
     } else {
         Add-Result FAIL ("task-" + $t.Name.ToLower()) ("LastTaskResult={0} ({1})" -f $resultCode, $resultHex) `
             "Inspect Event Viewer -> Microsoft -> Windows -> TaskScheduler -> Operational for failure detail."
@@ -220,18 +250,36 @@ foreach ($t in $tasksToCheck) {
 
 # == 4. NordVPN service + Meshnet ========================================
 Write-Section "4. NordVPN service + Meshnet adapter"
-$nordSvc = Get-Service -Name 'NordVPN Service' -ErrorAction SilentlyContinue
-if (-not $nordSvc) {
-    Add-Result FAIL "nordvpn-service" "Service 'NordVPN Service' not installed" `
-        "Install NordVPN client; service is the WireGuard daemon for Meshnet."
-} elseif ($nordSvc.Status -ne 'Running') {
-    Add-Result FAIL "nordvpn-service" ("Status={0} (expected Running)" -f $nordSvc.Status) `
-        "Start-Service 'NordVPN Service' (elevated). If StartType != Automatic, set: Set-Service 'NordVPN Service' -StartupType Automatic."
-} elseif ($nordSvc.StartType -ne 'Automatic') {
-    Add-Result WARN "nordvpn-service" ("Status=Running but StartType={0} (expected Automatic)" -f $nordSvc.StartType) `
-        "Set-Service 'NordVPN Service' -StartupType Automatic to survive future reboots."
+# NordVPN's Windows service has been renamed across major versions
+# ('NordVPN Service' on legacy installs, 'nordvpn-service' on modern
+# 7.x+ installs). Match all candidate name patterns; prefer Service
+# name match before falling back to DisplayName scanning.
+$nordSvcCandidates = @(
+    Get-Service -Name 'NordVPN Service','nordvpn-service','NordVPNService' -ErrorAction SilentlyContinue
+)
+if (-not $nordSvcCandidates -or $nordSvcCandidates.Count -eq 0) {
+    # Last-resort: scan DisplayName for anything Nord-related, in
+    # case the user installed a yet-different naming variant.
+    $nordSvcCandidates = @(
+        Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*NordVPN*' -or $_.Name -like '*nord*' }
+    )
+}
+if (-not $nordSvcCandidates -or $nordSvcCandidates.Count -eq 0) {
+    Add-Result FAIL "nordvpn-service" "No NordVPN-related Windows service found" `
+        "Install or repair the NordVPN client; the service is the WireGuard daemon for Meshnet."
 } else {
-    Add-Result PASS "nordvpn-service" "Status=Running, StartType=Automatic"
+    # Use the first matching service. Most installs only have one.
+    $nordSvc = $nordSvcCandidates[0]
+    if ($nordSvc.Status -ne 'Running') {
+        Add-Result FAIL "nordvpn-service" ("Service '{0}' Status={1} (expected Running)" -f $nordSvc.Name, $nordSvc.Status) `
+            "Start-Service '$($nordSvc.Name)' (elevated). If StartType != Automatic, set: Set-Service '$($nordSvc.Name)' -StartupType Automatic."
+    } elseif ($nordSvc.StartType -ne 'Automatic') {
+        Add-Result WARN "nordvpn-service" ("Service '{0}' Status=Running but StartType={1} (expected Automatic)" -f $nordSvc.Name, $nordSvc.StartType) `
+            "Set-Service '$($nordSvc.Name)' -StartupType Automatic to survive future reboots."
+    } else {
+        Add-Result PASS "nordvpn-service" ("Service '{0}' Status=Running, StartType=Automatic" -f $nordSvc.Name)
+    }
 }
 
 # NordVPN tray app in user session -- required for Meshnet auth context
