@@ -194,7 +194,7 @@ start_all() {
         > "$UAT_DIR/server.log" 2>&1 &
     local server_pid=$!
 
-    if ! wait_for_port 8080 "yuzu-server" 10; then
+    if ! wait_for_port 8080 "yuzu-server" 30; then
         fail "Server failed to start. Check $UAT_DIR/server.log"
         exit 1
     fi

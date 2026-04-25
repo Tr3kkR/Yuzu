@@ -6,7 +6,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
   const browser = await puppeteer.launch({
-    headless: false,
+    headless: true,
     args: ['--window-size=1400,900'],
     defaultViewport: { width: 1400, height: 900 },
   });
