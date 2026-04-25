@@ -54,6 +54,7 @@ tar_test_exe = executable(
   files(
     'unit/test_tar_diff.cpp',
     'unit/test_tar_store.cpp',
+    'unit/test_tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',

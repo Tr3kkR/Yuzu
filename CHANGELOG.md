@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **TAR OS compatibility metadata + capture configuration surface
+  (issue #59).** The schema registry's `CaptureSourceDef` now carries a
+  per-OS `os_support` vector (`OsSupportStatus` × `capture_method` ×
+  `notes`) describing how each of the four capture sources (process,
+  tcp, service, user) gathers data on Windows / Linux / macOS, including
+  documented constraints (`KERN_PROCARGS2` invisibility for hardened
+  runtimes, `systemctl`'s `unknown` startup_type, container `/var/run/utmp`
+  absence, `lsof` cost, etc.) and `kPlanned` rows for the ETW and
+  Endpoint Security collectors that have not landed yet
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`). Operators
+  can read the live matrix at runtime via the new `compatibility`
+  action, which emits one `header|...` + N `row|source|os|status|method|notes`
+  lines that the dashboard can render directly.
+- **TAR per-source enable/disable + stabilization exclusions + network
+  capture-method surface (issue #59).** The `configure` action gained
+  four new validated parameters: `process_enabled` /
+  `tcp_enabled` / `service_enabled` / `user_enabled` (default `true`,
+  short-circuit the per-collector block in `collect_fast` /
+  `collect_slow` when `false`); `network_capture_method` (validated
+  against `accepted_capture_methods("tcp")` so unsupported values are
+  rejected at write time, with a `warn|...` line if the value is
+  accepted but not yet wired — currently anything other than
+  `polling`); and `process_stabilization_exclusions` (JSON array of
+  glob patterns; matching processes are dropped before the diff so
+  noisy short-lived helpers don't dwarf real activity, with the
+  forensic-completeness trade-off documented in
+  `docs/user-manual/tar.md`). `do_status` now also surfaces the
+  `<source>_enabled` and `network_capture_method` config rows so
+  operators can see effective state without reading the DB
+  (`agents/plugins/tar/src/tar_plugin.cpp`).
+
+### Documentation
+
+- **`docs/user-manual/tar.md`** gained an "OS compatibility matrix"
+  section (per-OS capture method + constraints for each source, status
+  legend) and a configuration table extended with the seven new
+  `configure` parameters introduced by issue #59. Includes a worked
+  example combining retention, fast_interval, user_enabled=false, and
+  process_stabilization_exclusions.
+
+### Tests
+
+- **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
+  issue #59 (6 cases / 44 assertions). Pins: every source declares
+  windows + linux + macos rows; every non-`kUnsupported` row has a
+  non-empty `capture_method` + `notes`; `accepted_capture_methods` is
+  deduped + sorted + non-empty; unknown source returns empty; all
+  `kPlanned` methods stay in the accept-list (so operators can
+  pre-stage); `kUnsupported`-only methods are excluded.
+
 ### Security
 
 - **`--allow-one-way-tls` renamed to `--insecure-skip-client-verify`,
