@@ -48,7 +48,24 @@ param(
     # GitHub Actions runner role; $env:COMPUTERNAME is the Windows
     # machine name ("SHULGI"), NOT the runner label ("yuzu-local-windows").
     # Override only when provisioning a new runner host.
-    [string]$AllowedHostPattern = '^SHULGI$'
+    [string]$AllowedHostPattern = '^SHULGI$',
+
+    # Register a scheduled task that re-runs this script at user logon.
+    # Defender exclusions silently fall off after some Windows updates
+    # / Defender platform refreshes — without persistent re-application,
+    # the runner regresses to scanning vcpkg cache extraction and
+    # release builds time out (cf. v0.11.0 retag failures, the
+    # observation in feedback file `reference_windows_runner_defender.md`
+    # that exclusions need to be re-applied periodically).
+    #
+    # The scheduled task runs as SYSTEM with `-NonInteractive`, so a
+    # brand-new logon doesn't depend on a user-interactive elevated
+    # shell to re-apply.
+    [switch]$RegisterAtLogon,
+
+    # Counterpart: remove the scheduled task. Run when retiring the
+    # runner host or moving the workload elsewhere.
+    [switch]$UnregisterAtLogon
 )
 
 # Fail loudly on stock Windows PowerShell 5.1. The script body below uses
@@ -199,3 +216,92 @@ Write-Host "ExclusionProcess:"
 # single-quoted string (no backtick expansion needed — we concatenate the
 # leading newline via "+ "`n"").
 Write-Host ('Done. Reversible with Remove-MpPreference -ExclusionPath <path>.')
+
+# ── Optional: scheduled-task registration / unregistration ──────────────
+$TaskName = 'Yuzu-Runner-Defender-Exclusions'
+
+if ($UnregisterAtLogon) {
+    Write-Host "`n── Unregistering scheduled task '$TaskName' ───────────────────" -ForegroundColor Cyan
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        if ($DryRun) {
+            Write-Host "  [dry] would Unregister-ScheduledTask -TaskName '$TaskName'"
+        } else {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+            Write-Host "  [done] task removed."
+        }
+    } else {
+        Write-Host "  [skip] task '$TaskName' not present."
+    }
+}
+
+if ($RegisterAtLogon) {
+    Write-Host "`n── Registering scheduled task '$TaskName' (AtLogon, SYSTEM) ──" -ForegroundColor Cyan
+    # Resolve THIS script's path so the scheduled task re-invokes the
+    # canonical version checked into the runner's clone of the repo.
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) {
+        Write-Error "Cannot determine script path — \$PSCommandPath is empty. Re-run via 'pwsh.exe -File <path>'."
+        exit 1
+    }
+
+    # AtLogon trigger so exclusions are re-applied on every Windows
+    # logon (covers post-reboot, RDP, console). LogonType -User '' fires
+    # for any user — so it covers the autologon path AND any operator
+    # RDP-in to debug.
+    #
+    # The scheduled task action invokes pwsh.exe (NOT powershell.exe)
+    # for the same reason this script's PS-version preflight refuses
+    # PS 5.1: the script's banners use Unicode box-drawing chars that
+    # PS 5.1 mangles. Hard-code the pwsh.exe path most installers use.
+    $pwshExe = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    if (-not (Test-Path $pwshExe)) {
+        Write-Error "pwsh.exe not found at $pwshExe. Install PowerShell 7+ before registering the task."
+        exit 1
+    }
+
+    $action = New-ScheduledTaskAction `
+        -Execute $pwshExe `
+        -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    # Run as SYSTEM (Highest) — Add-MpPreference requires admin and
+    # SYSTEM has admin equivalence without needing a stored password.
+    # An alternate would be NT AUTHORITY\SYSTEM via -Principal; we
+    # explicitly set GroupId / LogonType to be unambiguous.
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId 'SYSTEM' `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+    # Run-when-available + restart-on-failure: if logon fires before
+    # the network is up (Defender cmdlets can fail in that window),
+    # the task retries up to 3 times with 1-min spacing.
+    $settings = New-ScheduledTaskSettingsSet `
+        -StartWhenAvailable `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    $description = ('Re-apply Yuzu runner Defender exclusions at every Windows logon. ' +
+                    'Without this, exclusions silently fall off after Defender platform updates ' +
+                    'and release-build timeouts return. See ' +
+                    'scripts/windows-runner-defender-exclusions.ps1 in the Yuzu repo.')
+
+    if ($DryRun) {
+        Write-Host "  [dry] would Register-ScheduledTask -TaskName '$TaskName'"
+        Write-Host "        Action:  $pwshExe -File '$scriptPath'"
+        Write-Host "        Trigger: AtLogOn (any user)"
+        Write-Host "        Principal: SYSTEM (Highest)"
+    } else {
+        # Idempotent: Unregister-ScheduledTask returns non-zero if the
+        # task does not exist; swallow with -ErrorAction SilentlyContinue.
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask `
+            -TaskName $TaskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Description $description | Out-Null
+        Write-Host "  [done] task registered. Verify with: Get-ScheduledTask -TaskName '$TaskName'"
+        Write-Host "  Trigger fires AtLogon (any user); runs as SYSTEM with the canonical script path:"
+        Write-Host "    $scriptPath"
+    }
+}

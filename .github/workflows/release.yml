@@ -37,7 +37,12 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: [self-hosted, Linux]
-    timeout-minutes: 45
+    # 90 = backstop for the slow GHA cache backend / 9P filesystem
+    # observed during v0.11.0 retags. Cache surgery (restore-only)
+    # should make this irrelevant in practice; keeping the wider
+    # budget so the next dependabot bump or runner hiccup doesn't
+    # immediately cliff back into Post-step timeouts.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -61,9 +66,17 @@ jobs:
         run: rm -rf builddir
 
       - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/.cache/ccache
           key: ccache-release-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -165,6 +178,11 @@ jobs:
           output-file: yuzu-linux-x64.cdx.json
           artifact-name: yuzu-linux-x64.cdx.json
           upload-artifact: false
+          # Explicit source name + version stops Syft from deriving the
+          # artifact ID from the working-directory path ("(which is not
+          # ideal)" warning emitted on every release run otherwise).
+          source-name: yuzu-linux-x64
+          source-version: ${{ github.ref_name }}
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -174,6 +192,8 @@ jobs:
           output-file: yuzu-linux-x64.spdx.json
           artifact-name: yuzu-linux-x64.spdx.json
           upload-artifact: false
+          source-name: yuzu-linux-x64
+          source-version: ${{ github.ref_name }}
 
       # ── SLSA build provenance ───────────────────────────────────────
       # Records that these specific artifacts came from this specific
@@ -249,18 +269,34 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Cache rebar3 dependencies
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: gateway/_build/default/lib
           key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
           restore-keys: |
             rebar3-deps-
 
       - name: Cache Dialyzer PLT
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: gateway/_build/default/*_plt*
           key: dialyzer-plt-otp27-${{ hashFiles('gateway/rebar.lock') }}
           restore-keys: |
@@ -334,6 +370,8 @@ jobs:
           output-file: yuzu-gateway-linux-x64.cdx.json
           artifact-name: yuzu-gateway-linux-x64.cdx.json
           upload-artifact: false
+          source-name: yuzu-gateway-linux-x64
+          source-version: ${{ github.ref_name }}
 
       - name: Generate gateway SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -343,6 +381,8 @@ jobs:
           output-file: yuzu-gateway-linux-x64.spdx.json
           artifact-name: yuzu-gateway-linux-x64.spdx.json
           upload-artifact: false
+          source-name: yuzu-gateway-linux-x64
+          source-version: ${{ github.ref_name }}
 
       - name: Attest gateway provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -392,7 +432,11 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: [self-hosted, Windows]
-    timeout-minutes: 60
+    # 90 = backstop. Same rationale as Build Linux x64. Defender
+    # exclusions on the runner should keep tar/zstd extraction off
+    # the Defender scan path, but if exclusions ever drift the wider
+    # budget at least lets the build complete instead of timing out.
+    timeout-minutes: 90
     env:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
@@ -410,9 +454,17 @@ jobs:
           choco install ccache --yes --no-progress
 
       - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~\AppData\Local\ccache
           key: ccache-release-windows-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -429,9 +481,17 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
@@ -638,6 +698,8 @@ jobs:
           output-file: yuzu-windows-x64.cdx.json
           artifact-name: yuzu-windows-x64.cdx.json
           upload-artifact: false
+          source-name: yuzu-windows-x64
+          source-version: ${{ github.ref_name }}
 
       - name: Generate Windows SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -647,6 +709,8 @@ jobs:
           output-file: yuzu-windows-x64.spdx.json
           artifact-name: yuzu-windows-x64.spdx.json
           upload-artifact: false
+          source-name: yuzu-windows-x64
+          source-version: ${{ github.ref_name }}
 
       - name: Attest Windows provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -706,9 +770,17 @@ jobs:
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
       - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/Library/Caches/ccache
           key: ccache-release-macos-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -725,9 +797,17 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
@@ -938,6 +1018,8 @@ jobs:
           output-file: yuzu-macos-arm64.cdx.json
           artifact-name: yuzu-macos-arm64.cdx.json
           upload-artifact: false
+          source-name: yuzu-macos-arm64
+          source-version: ${{ github.ref_name }}
 
       - name: Generate macOS SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -947,6 +1029,8 @@ jobs:
           output-file: yuzu-macos-arm64.spdx.json
           artifact-name: yuzu-macos-arm64.spdx.json
           upload-artifact: false
+          source-name: yuzu-macos-arm64
+          source-version: ${{ github.ref_name }}
 
       - name: Attest macOS provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0

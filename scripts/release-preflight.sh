@@ -61,20 +61,29 @@ else
     fail "Dockerfile.server CMD missing --data-dir"
 fi
 
-# ── 7. All cache steps in release.yml have save-always ────────────────────
-# grep -c returns 1 when it finds 0 matches; with `set -e` that kills the
-# script. `|| true` keeps the preflight going and lets the equality check
-# below report the actual issue. Match SHA-pinned (Scorecard-recommended,
-# `@<40-hex-sha>`) as well as tag-pinned (`@v4`, `@v5`, …) cache action
-# references — the OpenSSF Scorecard / dependabot pipeline migrates
-# towards SHA pinning, so a regex that only matches `@v[0-9]+` produces
-# false-positive 0/N reports after a SHA bump (caught at v0.12.0-rc0).
-CACHE_COUNT=$(grep -cE 'actions/cache@([0-9a-f]{40}|v[0-9]+)' .github/workflows/release.yml || true)
-SAVE_ALWAYS_COUNT=$(grep -c 'save-always: true' .github/workflows/release.yml || true)
-if [ "$CACHE_COUNT" -eq "$SAVE_ALWAYS_COUNT" ]; then
-    pass "All $CACHE_COUNT cache steps have save-always: true"
+# ── 7. release.yml uses cache/restore only, never cache (save) ────────────
+# Release builds consume cache, never produce — each tag is a unique
+# commit so the file-hash key never matches anything a future release
+# could benefit from. Paying the cache writeback cost on every release
+# blew the Linux 45-min job budget during v0.11.0 retags (Post Cache
+# ccache spent 28.5 min uploading data nobody would re-read). Enforce
+# that only `actions/cache/restore@` references appear in release.yml
+# — bare `actions/cache@` would re-introduce the save phase and the
+# timeout regression. The previous check enforced `save-always: true`,
+# but the action authors deprecated that input as "does not work as
+# intended", so the invariant flipped: now we enforce its absence.
+BARE_CACHE_COUNT=$(grep -cE 'actions/cache@([0-9a-f]{40}|v[0-9]+)' .github/workflows/release.yml || true)
+RESTORE_CACHE_COUNT=$(grep -cE 'actions/cache/restore@([0-9a-f]{40}|v[0-9]+)' .github/workflows/release.yml || true)
+# Match YAML input only (whitespace-then-key), not comments mentioning the
+# string. Without the `^\s*` anchor the regex caught the inline comment
+# block in release.yml that explains why save-always was removed.
+SAVE_ALWAYS_COUNT=$(grep -cE '^\s*save-always:' .github/workflows/release.yml || true)
+if [ "$BARE_CACHE_COUNT" -gt 0 ]; then
+    fail "$BARE_CACHE_COUNT bare actions/cache@ references in release.yml — must be actions/cache/restore@ (release builds consume cache, never produce)"
+elif [ "$SAVE_ALWAYS_COUNT" -gt 0 ]; then
+    fail "$SAVE_ALWAYS_COUNT save-always: references in release.yml — input is deprecated and the cache surgery removed the save phase"
 else
-    fail "$SAVE_ALWAYS_COUNT/$CACHE_COUNT cache steps have save-always: true"
+    pass "All $RESTORE_CACHE_COUNT cache steps in release.yml are restore-only (no save phase, no save-always)"
 fi
 
 # ── 8. docker-compose.full-uat.yml has --data-dir ─────────────────────────
