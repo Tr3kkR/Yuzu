@@ -228,9 +228,7 @@ def _hardware_fingerprint() -> str:
 
 def cmd_run_start(args: argparse.Namespace) -> int:
     with connect(create_dirs=True) as conn:
-        if schema_version(conn) is None:
-            conn.executescript(SCHEMA_V1)
-            stamp_version(conn, SCHEMA_VERSION)
+        _ensure_schema_initialized(conn)
         conn.execute(
             """
             INSERT INTO test_runs
@@ -313,24 +311,61 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_schema_initialized(conn: sqlite3.Connection) -> None:
+    # Idempotent schema bootstrap. SCHEMA_V1 uses CREATE TABLE IF NOT
+    # EXISTS so concurrent callers can't conflict on table creation.
+    # stamp_version uses INSERT OR REPLACE so it's also race-safe.
+    if schema_version(conn) is None:
+        conn.executescript(SCHEMA_V1)
+        stamp_version(conn, SCHEMA_VERSION)
+
+
 def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
     # Auto-vivify a stub test_runs row when an operator-invoked write
     # (gate/timing/metric) targets a run_id that /test never created via
     # run-start. Without this, child-table FKs fail and the write is
     # silently dropped — taking trend data with it. See #528.
-    if schema_version(conn) is None:
-        conn.executescript(SCHEMA_V1)
-        stamp_version(conn, SCHEMA_VERSION)
+    #
+    # Behavior summary:
+    #   - existing row, mode != 'manual' → no-op (real /test run, leave alone).
+    #   - existing row, mode == 'manual' → refresh started_at / commit_sha /
+    #     branch so a re-capture of baselines under the same --run-id
+    #     attributes the new metrics to the current commit (HP-1).
+    #   - missing row → INSERT OR IGNORE a stub with mode='manual',
+    #     overall_status='MANUAL'. The OR IGNORE absorbs the race where
+    #     two concurrent invocations both passed the SELECT and both
+    #     attempt the INSERT (UP-3 / QE-3). Emit a stderr line on actual
+    #     creation so a /test pipeline whose run-start silently failed
+    #     produces a visible signal (UP-18).
+    #
+    # MANUAL is a test_runs lifecycle sentinel for the overall_status
+    # column; it is NOT a gate-status value (cmd_gate validates against
+    # VALID_STATUS, which deliberately excludes MANUAL — gate rows
+    # always carry PASS/FAIL/WARN/SKIP).
+    _ensure_schema_initialized(conn)
     row = conn.execute(
-        "SELECT 1 FROM test_runs WHERE run_id=?", (run_id,)
+        "SELECT mode FROM test_runs WHERE run_id=?", (run_id,)
     ).fetchone()
-    if row:
+    if row is not None:
+        if row[0] == "manual":
+            commit_sha = _git_oneshot(["rev-parse", "HEAD"]) or "unknown"
+            branch = (
+                _git_oneshot(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
+            )
+            conn.execute(
+                """
+                UPDATE test_runs
+                   SET started_at=?, commit_sha=?, branch=?
+                 WHERE run_id=? AND mode='manual'
+                """,
+                (int(time.time()), commit_sha, branch, run_id),
+            )
         return
     commit_sha = _git_oneshot(["rev-parse", "HEAD"]) or "unknown"
     branch = _git_oneshot(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
-    conn.execute(
+    cur = conn.execute(
         """
-        INSERT INTO test_runs
+        INSERT OR IGNORE INTO test_runs
             (run_id, started_at, commit_sha, branch, mode, overall_status,
              hostname, hardware_fingerprint, notes)
         VALUES (?, ?, ?, ?, 'manual', 'MANUAL', ?, ?, ?)
@@ -345,12 +380,31 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
             "auto-vivified by gate/timing/metric write (no prior run-start)",
         ),
     )
+    if cur.rowcount > 0:
+        # Stub row freshly created. Visible signal so a /test pipeline
+        # whose run-start failed silently doesn't ship a green-looking
+        # run with mode='manual' rows. Operator-capture paths
+        # (--run-id manual) will see this on first call per DB and
+        # never again.
+        print(
+            f"test_db: vivified stub test_runs row for run_id={run_id} "
+            f"(mode='manual') — if this is a /test pipeline run, "
+            f"check that run-start succeeded",
+            file=sys.stderr,
+        )
 
 
 def _git_oneshot(args: list[str]) -> str | None:
+    # Pin cwd to the test_db.py file's repo root so a caller cd'd
+    # outside the repo (CI helpers, sourced env scripts) doesn't get
+    # commit_sha='unknown' silently. UP-5.
     try:
         out = subprocess.run(
-            ["git", *args], capture_output=True, text=True, timeout=5
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(Path(__file__).resolve().parent),
         )
         if out.returncode == 0:
             return out.stdout.strip() or None
@@ -438,11 +492,19 @@ def cmd_query(args: argparse.Namespace) -> int:
     with connect() as conn:
         conn.row_factory = sqlite3.Row
 
+        # Auto-vivified manual rows (mode='manual') are excluded from
+        # --latest/--last/--flaky/--prune by default so operator captures
+        # via `coverage-gate.sh --capture-baselines` etc. don't displace
+        # real /test runs in the kept window or pollute trend/flaky stats.
+        # Pass --include-manual to opt back in.
+        manual_filter = "" if args.include_manual else " AND mode != 'manual'"
+
         if args.latest or args.last is not None:
             limit = 1 if args.latest else args.last
             rows = list(
                 conn.execute(
-                    "SELECT * FROM test_runs ORDER BY started_at DESC LIMIT ?",
+                    f"SELECT * FROM test_runs WHERE 1=1{manual_filter} "
+                    f"ORDER BY started_at DESC LIMIT ?",
                     (limit,),
                 )
             )
@@ -587,14 +649,15 @@ def cmd_query(args: argparse.Namespace) -> int:
         if args.flaky:
             days = args.days or 14
             since = int(time.time()) - days * 86400
-            sql = """
+            flaky_manual_filter = "" if args.include_manual else " AND r.mode != 'manual'"
+            sql = f"""
                 SELECT g.gate_name,
                        SUM(CASE WHEN g.status='PASS' THEN 1 ELSE 0 END) AS pass_n,
                        SUM(CASE WHEN g.status='FAIL' THEN 1 ELSE 0 END) AS fail_n,
                        COUNT(*) AS total
                 FROM test_gates g
                 JOIN test_runs r ON r.run_id=g.run_id
-                WHERE r.started_at >= ?
+                WHERE r.started_at >= ?{flaky_manual_filter}
                 GROUP BY g.gate_name
                 HAVING pass_n > 0 AND fail_n > 0
                 ORDER BY (CAST(fail_n AS REAL) / total) DESC
@@ -659,7 +722,8 @@ def cmd_query(args: argparse.Namespace) -> int:
             run_ids = [
                 row[0]
                 for row in conn.execute(
-                    "SELECT run_id FROM test_runs ORDER BY started_at DESC"
+                    f"SELECT run_id FROM test_runs WHERE 1=1{manual_filter} "
+                    f"ORDER BY started_at DESC"
                 )
             ]
             to_delete = run_ids[keep:]
@@ -699,7 +763,8 @@ def cmd_query(args: argparse.Namespace) -> int:
         # No subquery → list last 10 runs.
         rows = list(
             conn.execute(
-                "SELECT * FROM test_runs ORDER BY started_at DESC LIMIT 10"
+                f"SELECT * FROM test_runs WHERE 1=1{manual_filter} "
+                f"ORDER BY started_at DESC LIMIT 10"
             )
         )
         if not rows:
@@ -781,6 +846,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_query.add_argument(
         "--dry-run", action="store_true",
         help="for --prune: print what would be deleted without committing",
+    )
+    p_query.add_argument(
+        "--include-manual", action="store_true",
+        help="include mode='manual' rows (auto-vivified by --capture-baselines etc.) "
+             "in --latest/--last/--flaky/--prune. Off by default so operator captures "
+             "don't displace real /test runs in the kept window.",
     )
     p_query.set_defaults(func=cmd_query)
 

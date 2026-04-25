@@ -230,6 +230,9 @@ wait_for_port() {
             return 1
         fi
     done
+    # SRE-2 — surface cold-start duration. elapsed counts 0.5s ticks.
+    local seconds=$((elapsed / 2))
+    echo "  ✓ $name on :$port in ${seconds}s"
     return 0
 }
 
@@ -435,9 +438,12 @@ if ! $REUSE_STACK; then
     SERVER_PID=$!
     log "  Server PID: $SERVER_PID"
 
-    wait_for_port "$SERVER_WEB_PORT" "C++ server web UI" 15 || exit 1
-    wait_for_port "$SERVER_AGENT_PORT" "C++ server agent gRPC" 15 || exit 1
-    wait_for_port "$SERVER_GW_PORT" "C++ server gateway gRPC" 15 || exit 1
+    # 30s budget — yuzu-server cold-starts walk ~20 MigrationRunners and
+    # routinely take 12+ seconds; the prior 15s headroom was too tight on
+    # WSL2 dev boxes (parity with linux-start-UAT.sh:197).
+    wait_for_port "$SERVER_WEB_PORT" "C++ server web UI" 30 || exit 1
+    wait_for_port "$SERVER_AGENT_PORT" "C++ server agent gRPC" 30 || exit 1
+    wait_for_port "$SERVER_GW_PORT" "C++ server gateway gRPC" 30 || exit 1
     log "  Server is ready."
 else
     log "Phase 4 reuse: verifying existing C++ server ports are responsive..."

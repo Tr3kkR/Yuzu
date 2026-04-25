@@ -115,6 +115,10 @@ wait_for_port() {
             return 1
         fi
     done
+    # Surface cold-start duration so a future bump (Guardian PRs add
+    # MigrationRunners) shows up as a leading indicator before the
+    # next timeout breach. SRE-2.
+    echo "  ✓ $name bound to :$port in ${elapsed}s"
     return 0
 }
 
