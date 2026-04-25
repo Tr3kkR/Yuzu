@@ -123,3 +123,13 @@ __pycache__/
 /build-linux-coverage/
 /build-linux-asan/
 /build-linux-tsan/
+
+# Per-host runner verification script. Stays local on each runner
+# host because the operator-visible defaults (WSL distro, WSL user,
+# tmux session name, expected NordVPN/Meshnet posture, expected
+# Defender exclusion set) are tuned to that specific host's
+# operator account and aren't generally useful across deployments.
+# Sibling scripts that ARE generic (windows-runner-defender-
+# exclusions.ps1 with its host-allowlist guard, the autologon-
+# diagnose script) stay tracked.
+/scripts/windows-runner-status.ps1
