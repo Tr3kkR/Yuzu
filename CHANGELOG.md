@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`--allow-one-way-tls` renamed to `--insecure-skip-client-verify`,
+  now requires `YUZU_ALLOW_INSECURE_TLS=1` (issue #79).** Disabling
+  client certificate verification on the server's agent listener
+  previously required only a single `--allow-one-way-tls` CLI flag and
+  emitted a single `spdlog::warn()` line at startup. A copy-paste
+  mistake or an operator unfamiliar with the flag could silently
+  downgrade an mTLS deployment to one-way TLS — any reachable peer
+  could then register without a client certificate. The flag has been
+  renamed for clarity, the server now refuses to start unless the
+  matching `YUZU_ALLOW_INSECURE_TLS=1` environment variable is also set
+  as a second confirmation, and a multi-line ERROR-level banner is
+  logged at startup. While the listener is running in this degraded
+  mode a background thread re-emits the warning every 5 minutes so the
+  posture remains visible after the startup logs scroll off
+  (`server/core/src/main.cpp`, `server/core/src/server.cpp`). The
+  operator dashboard's TLS row turns red and renames the field to
+  "Insecure Skip Client Verify"
+  (`server/core/src/settings_routes.cpp`). The deprecated
+  `--allow-one-way-tls` flag is still accepted for one release with a
+  startup deprecation warning and will be removed thereafter; existing
+  deployments must add `YUZU_ALLOW_INSECURE_TLS=1` to their environment
+  on upgrade or supply `--ca-cert` to re-enable full mTLS.
+  `SECURITY_REVIEW.md` MEDIUM finding marked resolved against this
+  release.
+
+### Tests
+
+- **`tests/unit/server/test_insecure_tls_gate.cpp`** — new Catch2 suite
+  pinning the #79 env-var gate. Constants `kInsecureTlsEnvVar` /
+  `kInsecureTlsEnvAuthorizedValue` are pinned to their documented
+  values, and `insecure_tls_env_authorized()` is exercised against
+  nullptr, the empty string, `"0"`, `"true"` (any case), `"yes"`,
+  `"on"`, `"enabled"`, whitespace-padded `"1"`, `"10"`, `"1abc"`, and
+  the only authorizing value `"1"`. The exact-match policy is the
+  point — any future "be permissive" change to the gate would have to
+  delete a test case and survive review.
+
 ## [0.11.0] - 2026-04-25
 
 ### Fixed

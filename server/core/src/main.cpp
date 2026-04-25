@@ -3,6 +3,7 @@
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "insecure_tls_gate.hpp"
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
@@ -31,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 
 static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
@@ -107,8 +109,18 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_KEY");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
-    app.add_flag("--allow-one-way-tls", "Allow TLS without --ca-cert (disables mTLS)")
+    bool deprecated_allow_one_way_tls_flag = false;
+    app.add_flag("--insecure-skip-client-verify",
+                 "Allow TLS without --ca-cert (disables mTLS client verification). "
+                 "Requires YUZU_ALLOW_INSECURE_TLS=1.")
         ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+    app.add_flag("--allow-one-way-tls",
+                 "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
+                 "still accepted for backward compatibility.")
+        ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
+            cfg.allow_one_way_tls = true;
+            deprecated_allow_one_way_tls_flag = true;
+        });
     app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
                    "PEM management server certificate override");
     app.add_option("--management-key", cfg.mgmt_tls_server_key,
@@ -391,6 +403,30 @@ int main(int argc, char* argv[]) {
     }
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
+
+    // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
+    // Disabling client certificate verification requires BOTH a CLI flag AND
+    // an explicit environment variable, so that no single misconfiguration
+    // (typo, copy-pasted command, leaked CLI history) can silently downgrade
+    // the agent listener from mTLS to one-way TLS.
+    if (deprecated_allow_one_way_tls_flag) {
+        spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
+                     "instead (this flag will be removed in a future release).");
+    }
+    if (cfg.allow_one_way_tls && cfg.tls_enabled) {
+        if (!yuzu::server::security::insecure_tls_env_authorized()) {
+            spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
+                          "in the environment as a second confirmation. Refusing to start.");
+            return EXIT_FAILURE;
+        }
+        spdlog::error("***********************************************************************");
+        spdlog::error("*** CLIENT CERTIFICATE VERIFICATION DISABLED (one-way TLS)          ***");
+        spdlog::error("*** Any network peer can connect to the agent listener without an   ***");
+        spdlog::error("*** mTLS client certificate. This is acceptable ONLY for short-term ***");
+        spdlog::error("*** development or migration scenarios. Re-enable mTLS by supplying ***");
+        spdlog::error("*** --ca-cert and removing --insecure-skip-client-verify.           ***");
+        spdlog::error("***********************************************************************");
+    }
 
     // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
     if (sqlite3_threadsafe() == 0) {
