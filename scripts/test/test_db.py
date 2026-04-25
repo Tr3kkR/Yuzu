@@ -313,11 +313,58 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
+    # Auto-vivify a stub test_runs row when an operator-invoked write
+    # (gate/timing/metric) targets a run_id that /test never created via
+    # run-start. Without this, child-table FKs fail and the write is
+    # silently dropped — taking trend data with it. See #528.
+    if schema_version(conn) is None:
+        conn.executescript(SCHEMA_V1)
+        stamp_version(conn, SCHEMA_VERSION)
+    row = conn.execute(
+        "SELECT 1 FROM test_runs WHERE run_id=?", (run_id,)
+    ).fetchone()
+    if row:
+        return
+    commit_sha = _git_oneshot(["rev-parse", "HEAD"]) or "unknown"
+    branch = _git_oneshot(["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
+    conn.execute(
+        """
+        INSERT INTO test_runs
+            (run_id, started_at, commit_sha, branch, mode, overall_status,
+             hostname, hardware_fingerprint, notes)
+        VALUES (?, ?, ?, ?, 'manual', 'MANUAL', ?, ?, ?)
+        """,
+        (
+            run_id,
+            int(time.time()),
+            commit_sha,
+            branch,
+            socket.gethostname(),
+            _hardware_fingerprint(),
+            "auto-vivified by gate/timing/metric write (no prior run-start)",
+        ),
+    )
+
+
+def _git_oneshot(args: list[str]) -> str | None:
+    try:
+        out = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=5
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     if args.status not in VALID_STATUS:
         print(f"test_db: invalid status '{args.status}'", file=sys.stderr)
         return 2
     with connect() as conn:
+        _ensure_run_exists(conn, args.run_id)
         conn.execute(
             """
             INSERT OR REPLACE INTO test_gates
@@ -339,6 +386,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
 
 def cmd_timing(args: argparse.Namespace) -> int:
     with connect() as conn:
+        _ensure_run_exists(conn, args.run_id)
         conn.execute(
             """
             INSERT OR REPLACE INTO test_timings
@@ -352,6 +400,7 @@ def cmd_timing(args: argparse.Namespace) -> int:
 
 def cmd_metric(args: argparse.Namespace) -> int:
     with connect() as conn:
+        _ensure_run_exists(conn, args.run_id)
         conn.execute(
             """
             INSERT OR REPLACE INTO test_metrics
