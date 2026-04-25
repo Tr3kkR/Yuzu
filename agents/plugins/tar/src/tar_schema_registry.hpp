@@ -36,11 +36,52 @@ struct GranularityDef {
     std::vector<ColumnDef> columns;
 };
 
+// ── Per-source OS support metadata (issue #59) ─────────────────────────────
+//
+// Each capture source declares, per supported operating system, how it
+// gathers data and any known constraints. The metadata is read at runtime
+// by the TAR `compatibility` action so operators can see exactly what is
+// captured on each platform without reading the source.
+//
+// `kSupported`           -- fully wired and exercised in CI
+// `kSupportedConstrained`-- works but with a known limitation (e.g., legacy
+//                           Windows API that returns less detail; documented
+//                           in `notes`)
+// `kPlanned`             -- not yet implemented, but the `capture_method`
+//                           field names the planned implementation so the
+//                           configuration surface can validate against it
+// `kUnsupported`         -- platform cannot supply the data at all (e.g.,
+//                           `services` on a kernel that has no service
+//                           manager)
+enum class OsSupportStatus { kSupported, kSupportedConstrained, kPlanned, kUnsupported };
+
+struct OsSupport {
+    std::string_view os;             // "windows", "linux", "macos"
+    OsSupportStatus status;
+    std::string_view capture_method; // "polling", "etw", "systemctl", "wts",
+                                      // "utmpx", "launchctl", "iphlpapi", ...
+    std::string_view notes;           // free-form constraint description
+};
+
 struct CaptureSourceDef {
     std::string_view name;        // "process", "tcp", "service", "user"
     std::string_view dollar_name; // "Process", "TCP", "Service", "User"
+    std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
+
+// ── Per-source capture-method validation (issue #59) ───────────────────────
+//
+// Returns the list of accepted `capture_method` values for a given source.
+// Used by the plugin's `configure` action to reject mistyped or unsupported
+// methods (e.g. `etw` for `tcp` on Linux) at write time, instead of
+// silently storing a value that the collector ignores.
+//
+// The accept-list is the union over all OS rows in `os_support` whose
+// `status != kUnsupported`. `kPlanned` methods are intentionally accepted
+// so an operator can pre-stage configuration ahead of an implementation
+// landing.
+[[nodiscard]] std::vector<std::string> accepted_capture_methods(std::string_view source_name);
 
 // ── Registry access ─────────────────────────────────────────────────────────
 

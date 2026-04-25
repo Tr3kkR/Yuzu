@@ -86,11 +86,19 @@ Use the `configure` action to adjust TAR behavior.
 | `fast_interval` | 10-3600 | 60 | Seconds between process/network collections |
 | `slow_interval` | 30-7200 | 300 | Seconds between service/user collections |
 | `redaction_patterns` | JSON array | See below | Patterns for command-line redaction (case-insensitive) |
+| `process_enabled` | `true` / `false` | `true` | Toggle the process collector on this host |
+| `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
+| `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
+| `user_enabled` | `true` / `false` | `true` | Toggle the user-session collector on this host |
+| `network_capture_method` | See [OS compatibility](#os-compatibility-matrix) | `polling` | Network capture mechanism. Today only `polling` is wired; `etw` (Windows) and `endpoint_security` (macOS) are accepted-and-stored for pre-staging. |
+| `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
 **Validation rules:**
 
 - When both `fast_interval` and `slow_interval` are provided, `fast_interval` must be less than `slow_interval`.
-- `redaction_patterns` must be a JSON array of non-empty strings.
+- `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings.
+- `network_capture_method` is rejected if not in the accept-list returned by `accepted_capture_methods("tcp")` (currently `polling`, `iphlpapi`, `procfs`, `lsof`).
+- Disabling a collector (`<source>_enabled=false`) short-circuits new captures but leaves existing rows queryable. Re-enabling later starts from a clean baseline rather than diffing against a stale snapshot.
 
 Example:
 
@@ -101,8 +109,38 @@ POST /api/v1/instructions/execute
   "action": "configure",
   "parameters": {
     "retention_days": "14",
-    "fast_interval": "30"
+    "fast_interval": "30",
+    "user_enabled": "false",
+    "process_stabilization_exclusions": "[\"*-helper*\",\"*ide-language-server*\"]"
   }
+}
+```
+
+## OS compatibility matrix
+
+TAR runs on Windows, Linux, and macOS, but each capture source has platform-specific constraints. Run the `compatibility` action to print the live matrix from the agent itself; the table below is a snapshot for documentation purposes.
+
+| Source | Windows | Linux | macOS |
+|--------|---------|-------|-------|
+| **process** | supported (`toolhelp32`) — full pid/ppid/name/cmdline. Cmdline retrieval requires `PROCESS_QUERY_LIMITED_INFORMATION`. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`sysctl`) — `KERN_PROC_ALL`. Cmdline empty for hardened-runtime processes the agent cannot inspect. |
+| **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`lsof`) — slow on heavily-loaded hosts; consider raising `fast_interval`. Endpoint Security framework is the planned replacement. |
+| **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
+| **user** | supported (`wts`) — `WTSEnumerateSessionsEx`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
+
+Status values:
+
+- **supported** — fully wired and exercised in CI.
+- **constrained** — works but with a documented limitation.
+- **planned** — not yet implemented; `network_capture_method` accepts the value so you can pre-stage configuration.
+- **unsupported** — platform cannot supply the data at all (e.g., `service` on a kernel without a service manager).
+
+To get the matrix at runtime (returns one `row|...` line per source/OS pair):
+
+```
+POST /api/v1/instructions/execute
+{
+  "plugin": "tar",
+  "action": "compatibility"
 }
 ```
 
