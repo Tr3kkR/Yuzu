@@ -5,8 +5,20 @@ on:
   # fix branches with an open PR run CI exactly once via pull_request rather
   # than the previous duplicate (push + pull_request). For pre-PR feature
   # work, open the PR earlier or use workflow_dispatch.
+  #
+  # tags-ignore is belt-and-suspenders: with `branches:` set, GitHub
+  # already filters tag pushes — but explicitly excluding `v*` documents
+  # the intent that release tags MUST NOT trip CI (the Release workflow
+  # at release.yml owns the build matrix for tags). NOTE: this does NOT
+  # eliminate the duplicate CI race we hit during v0.11.0 — that came
+  # from branch pushes (the CHANGELOG promote commit landing on dev,
+  # then fast-forwarded to main) firing two CI runs that contended for
+  # the self-hosted runners against the release tag's workflow. A real
+  # cross-workflow concurrency fix is needed for that; tracked as a
+  # follow-up issue.
   push:
     branches: [main, dev]
+    tags-ignore: ['v*']
     paths-ignore:
       - 'docs/**'
       - '*.md'
