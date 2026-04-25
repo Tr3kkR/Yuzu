@@ -54,8 +54,16 @@ env:
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
-  CCACHE_MAXSIZE: "500M"
+  # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
+  # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
+  # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
+  # thrashing the cache between configs. The hosted macOS leg uploads
+  # via actions/cache and gets capped at GitHub's 10 GB per-repo cache
+  # limit, so this is effectively a "self-hosted gets the full cache"
+  # bump — no risk of bloating the GitHub Actions cache budget.
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
