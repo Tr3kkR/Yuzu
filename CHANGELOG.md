@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR query examples, test coverage, and implementer documentation
+  (issue #60).** Three new pre-built `InstructionDefinition`s shipped
+  in `content/definitions/tar_warehouse.yaml` directly answering the
+  examples called out in the issue body:
+  `crossplatform.tar.process_by_exact_name` (case-sensitive `name='X'`
+  match — sibling to the case-insensitive default `LIKE` semantics),
+  `crossplatform.tar.daily_process_summary` (live-to-aggregate rollup
+  reading from `$Process_Daily` with `datetime(day_ts, 'unixepoch')`
+  for human-readable dates), and `crossplatform.tar.recent_processes_iso`
+  (the canonical pattern for the SQLite-equivalent of competing
+  platforms' `EPOCHTOJSON(TS)` helper). All three carry per-parameter
+  `description` fields so the dashboard and REST API surface them
+  without docs-side cross-references.
 - **TAR OS compatibility metadata + capture configuration surface
   (issue #59).** The schema registry's `CaptureSourceDef` now carries a
   per-OS `os_support` vector (`OsSupportStatus` × `capture_method` ×
@@ -42,6 +55,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **New `docs/tar-implementer.md` (issue #60).** The implementer-facing
+  companion to `docs/user-manual/tar.md`, covering: TAR as a
+  forensics + inventory capability (and what TAR is *not*); the
+  collect_fast / collect_slow / rollup data flow; the on-disk format
+  (plain SQLite WAL today, with explicit honest notes that
+  encryption-at-rest via SQLCipher and page-level compression are
+  deferred); persistence semantics across in-place upgrade, uninstall,
+  reinstall, and `data_dir` change; the post-restart double-capture
+  caveat for TCP and the design rationale for keeping it (forensic
+  completeness over heuristic suppression); device-impact expectations
+  measured on a 5950X (worst-case per-collect timings, default-retention
+  disk usage); and a routine-debugging entry-point table. The doc
+  closes the issue's "supportable without the original upstream page"
+  acceptance criterion. `docs/user-manual/tar.md` gained a top-of-page
+  pointer to it for engineers.
 - **`docs/user-manual/tar.md`** gained an "OS compatibility matrix"
   section (per-OS capture method + constraints for each source, status
   legend) and a configuration table extended with the seven new
@@ -51,6 +79,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **`tests/unit/test_tar_warehouse.cpp`** — new Catch2 suite for issue
+  #60 (15 cases / 284 assertions). Pins: every source/granularity has
+  a `CREATE TABLE` and a timestamp index in `generate_warehouse_ddl()`;
+  `columns_for_table` returns `id` + every declared column for every
+  table; every `$Dollar_Name` is a unique round-trip;
+  process / tcp / service / user rollups cite the correct lower-tier
+  source and upper-tier target; service rolls up only to hourly (no
+  daily/monthly); user rollup has the day-bucket midnight-rollover
+  arithmetic and tracks login_count / logout_count as a count-of-events
+  rather than session-duration; row-count retention uses the H6 OFFSET
+  pattern (not the older O(n*k) NOT IN); time-based retention uses a
+  cutoff predicate; each granularity's retention SQL touches *only*
+  that granularity (independence invariant); and post-restart TCP
+  diff-with-empty-previous yields all-`connected` events (the
+  documented forensic-completeness double-capture caveat).
 - **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
   issue #59 (6 cases / 44 assertions). Pins: every source declares
   windows + linux + macos rows; every non-`kUnsupported` row has a
