@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-25
+
 ### Fixed
 
 - **Settings → Users: short-password submission now shows the real rejection
@@ -1011,6 +1013,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   knock-ons from adding the `GuaranteedState` securable type and the
   `Push` operation seeded for PR 2.
 
+- **Coverage and perf baselines locked off seed; enforcement live in
+  `/test --full`.** `tests/coverage-baseline.json` and
+  `tests/perf-baselines.json` shipped with PR2 of the `/test` skill as
+  permissive `__seed: true` placeholders that emitted WARN regardless
+  of measured numbers. Both are now captured against commit
+  `40acd33` on the 5950X dev box: branch coverage **26.8%** / line
+  coverage **51.8%** with **0.5 pp slack** on the coverage gate; **4
+  perf metrics** (`registration_ops_sec=19084`,
+  `burst_registration_ops_sec=18248`, `heartbeat_queue_ops_sec=2.86M`,
+  `session_cleanup_ms_per_agent=0.05`) with **10% tolerance** and
+  hardware fingerprint locked. Cross-hardware perf runs auto-downgrade
+  to WARN (so a 5950X baseline doesn't false-fail on the MBP and vice
+  versa); coverage stays compiler-deterministic so no fingerprint is
+  recorded there. The `__seed: true` sentinel is still honored as a
+  defensive WARN if anyone re-introduces it. Regenerate with
+  `bash scripts/test/{coverage,perf}-gate.sh --run-id manual --capture-baselines`
+  on a clean test run; both gates refuse capture when the underlying
+  meson test or rebar3 ct exited non-zero (UP-18 guard).
+- **`yuzu_gw_upstream_tests:flush_sends_batch` rewritten to use
+  `flush_sync/0` instead of `! flush; timer:sleep(N)`.** The original
+  drain pattern was racy under coverage-instrumented BEAM — the cast
+  pipeline could outrun the 20ms settle window and the assertion saw
+  fewer than the expected 2 heartbeats. `flush_sync/0` is a
+  `gen_server:call`, so it serialises after pending casts and waits
+  for `do_flush` to complete before returning, making the test
+  deterministic regardless of host load. Sibling tests
+  (`buffer_retained_on_failure`, `buffer_cap_on_failure`) keep
+  `! flush` deliberately — they exercise the timer-flush path's
+  failure-cap semantics that differ from `flush_sync`. Verified:
+  148/148 pass on `rm -rf _build/test`; 3/3 sequential meson coverage
+  runs pass on the originally-flaky path.
+- **Test-runs DB auto-vivifies missing `test_runs` rows on operator-invoked
+  writes (#528).** `scripts/test/test_db.py` `cmd_gate` / `cmd_timing` /
+  `cmd_metric` previously failed `sqlite3.IntegrityError: FOREIGN KEY
+  constraint failed` when the `--run-id` had no parent `test_runs`
+  row — the path triggered by
+  `coverage-gate.sh --run-id manual --capture-baselines` and any direct
+  operator invocation outside the `/test` pipeline. New
+  `_ensure_run_exists(conn, run_id)` helper auto-creates a stub row
+  with `mode='manual'` / `overall_status='MANUAL'` (commit_sha + branch
+  resolved via `git rev-parse`, schema-init runs first if the DB is
+  brand-new). Race-safe via `INSERT OR IGNORE`; emits a stderr signal
+  on actual creation so a `/test` pipeline whose `run-start` silently
+  failed produces a visible signal rather than a green-looking run with
+  `mode='manual'` rows. On repeat manual capture, the existing stub's
+  `started_at` / `commit_sha` / `branch` are refreshed so trend queries
+  attribute new metrics to the current commit.
+- **`--latest` / `--last` / `--flaky` / `--prune` query helpers default-
+  exclude `mode='manual'` rows.** Operator captures via
+  `--capture-baselines` no longer displace real `/test --full` runs in
+  the kept window or pollute trend / flaky stats. Pass `--include-manual`
+  to opt back in.
+- **`scripts/linux-start-UAT.sh` server bind timeout 10s → 30s.**
+  `yuzu-server` cold-start walks ~20 `MigrationRunner` migrations and
+  routinely takes 12+ seconds before binding `:8080`; the prior 10s
+  budget produced a flaky Phase 4 in `/test --full` on WSL2 dev boxes.
+  Same bump applied to `scripts/integration-test.sh:441-443` (15s →
+  30s) and `scripts/win-start-UAT.sh:325` (10s → 30s) for cross-platform
+  parity. `wait_for_port` in all three scripts now emits
+  `bound to :PORT in Ns` on success, so future cold-start growth (e.g.
+  Guardian PRs adding `MigrationRunner` stores) shows up as a leading
+  indicator before the next timeout breach.
+- **`tests/puppeteer/dashboard-help-test.mjs` runs headless.** The test
+  was launching Chrome with `headless: false` and required an X server,
+  which the WSL2 dev box and CI runners don't provide. `headless: true`
+  removes the dependency; verified end-to-end against a fresh UAT stack
+  with `help=162 rows / command=1 row`, exit 0.
+
+### Tests — release tooling
+
+- **`/release` skill: Phase 0.5 reconciliation gate catches dev/main
+  divergence at preflight.** Every prior release hit the same trap —
+  `dev` accumulates merged work, the prior release's prep commits land
+  on `main` without coming back to `dev`, and by the next release both
+  branches are diverged in both directions. `scripts/release-preflight.sh`
+  now hard-FAILs check #8 (`origin/dev and origin/main reconciled`)
+  with the exact ahead/behind counts; the skill's new Phase 0.5
+  documents the cherry-pick + fast-forward reconcile recipe. Verified
+  by `/release v0.12.0-rc0 → /release v0.11.0 final` cycle that found
+  88 dev-ahead / 2 main-ahead and reconciled to 0/0 before tagging.
+- **`scripts/release-preflight.sh` check #7 regex matches SHA-pinned
+  `actions/cache@<40-hex>` references in addition to tag-pinned
+  `@v[0-9]+`.** Dependabot + Scorecard migrated all 7 cache steps in
+  `release.yml` to SHA pinning, so the prior regex matched zero and
+  the count comparison printed `0/7` on a clean release. The regex is
+  now `(@<40-hex-sha>|@v[0-9]+)` so both forms count.
+
+### Changed — deployment
+
+- **`docker-compose.yml` and `docker-compose.reference.yml` no longer
+  include a `yuzu-agent` service; agents run natively on each managed
+  endpoint.** Per-platform installers ship as release assets:
+  `yuzu-agent_X.Y.Z_amd64.deb` / `yuzu-agent-X.Y.Z-1.x86_64.rpm` for
+  Linux, `YuzuAgentSetup-X.Y.Z.exe` (Authenticode-signed) for Windows,
+  `YuzuAgent-X.Y.Z-macos-arm64.pkg` (notarised + stapled) for macOS.
+  The reference compose now documents these install paths and points
+  at `bash scripts/linux-start-UAT.sh` for dev smoke-testing of the
+  server↔agent roundtrip. Power users wanting a containerised agent
+  can still build from `deploy/docker/Dockerfile.agent`; we don't
+  publish a `yuzu-agent` GHCR image. `pre-release.yml` Trivy matrix
+  was scanning a `yuzu-agent` image that never existed — that step is
+  removed; only `yuzu-server` and `yuzu-gateway` are scanned.
+- **`docker-compose.sanitizer-uat.yml` agent service preserved.**
+  This is internal sanitiser test infrastructure that deliberately
+  runs the agent under ASan/TSan via `Dockerfile.agent-asan` /
+  `Dockerfile.agent-tsan`; not user-facing.
+
 
 ## [0.11.0-rc2] - 2026-04-20
 
@@ -1138,7 +1247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-existing "duplicate ID" policy-store test was tightened to assert
   the new `kConflictPrefix` semantics.
 
-## [0.11.0] - 2026-04-17
+## [0.11.0-rc1] - 2026-04-18
 
 _Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
 predated the `feat(test)` commits that landed the `/test` skill PR1 +
@@ -1146,8 +1255,11 @@ PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new operator-facing
 functionality), the matrix CodeQL workflow expansion (8c5b934), and
 the `563138f` MigrationRunner wiring with its `/readyz` response-shape
 addition (`failed_stores` field on 503). Strict SemVer says any new
-backward-compatible feature ⇒ MINOR bump, so this is v0.11.0 rather
-than the originally-planned v0.10.1 patch. First cut as **v0.11.0-rc1**._
+backward-compatible feature ⇒ MINOR bump, so this was first cut as
+**v0.11.0-rc1** (2026-04-18); rc2 followed on 2026-04-20 to smoke-test
+the new SBOM + SLSA + cosign supply-chain pipeline; the **v0.11.0**
+final tag landed on 2026-04-25 — see the `[0.11.0]` section above for
+the full set of changes between rc2 and final._
 
 ### Added
 
