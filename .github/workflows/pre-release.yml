@@ -591,10 +591,13 @@ jobs:
       # the authoritative SBOMs ship from release.yml via
       # `anchore/sbom-action` (Syft). Two generators would produce two
       # SBOMs that disagree on component enumeration for the same image.
+      # Agents are installed natively on managed endpoints and not
+      # published as a container image; only server + gateway are
+      # scanned here.
       - name: Pull images for scanning
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
+          for img in yuzu-server yuzu-gateway; do
             docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
               || echo "SKIP: $img:$VERSION not found"
           done
@@ -608,16 +611,6 @@ jobs:
           exit-code: '0'
           format: table
           output: trivy-yuzu-server.txt
-
-      - name: Scan yuzu-agent
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-agent:${{ needs.resolve.outputs.version }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: '0'
-          format: table
-          output: trivy-yuzu-agent.txt
 
       - name: Scan yuzu-gateway
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

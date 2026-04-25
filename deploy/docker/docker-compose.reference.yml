@@ -118,32 +118,28 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── Yuzu Agent (optional — comment out if agents run outside Docker) ─
+  # ── Yuzu Agent — install natively, not in Docker ─────────────────────
   #
-  # Most production deployments install agents on the managed endpoints
-  # themselves, not as a sidecar to the server. This service is included
-  # as a first-deploy smoke test so you can verify server↔agent roundtrip
-  # without leaving the compose file. For real fleet rollout see
-  # docs/user-manual/agent-install.md.
-  agent:
-    image: ghcr.io/tr3kkr/yuzu-agent:${YUZU_VERSION:-0.11.0}
-    container_name: yuzu-agent
-    restart: unless-stopped
-    depends_on:
-      server:
-        condition: service_healthy
-    volumes:
-      - agent-data:/var/lib/yuzu-agent
-    command:
-      - "--server"
-      - "server:50051"
-      - "--no-tls"          # dev-only — enforce TLS for real deployments
-      - "--data-dir"
-      - "/var/lib/yuzu-agent"
+  # Agents always run natively on each managed endpoint. We do NOT
+  # publish a `yuzu-agent` GHCR image and do NOT recommend running
+  # the agent in a container.
+  #
+  # Production install paths:
+  #   Linux  — yuzu-agent_X.Y.Z_amd64.deb / yuzu-agent-X.Y.Z-1.x86_64.rpm
+  #   Windows — YuzuAgentSetup-X.Y.Z.exe (Authenticode-signed, InnoSetup)
+  #   macOS   — YuzuAgent-X.Y.Z-macos-arm64.pkg (notarized + stapled)
+  # All four are published as release assets — see
+  # docs/user-manual/agent-install.md for per-platform install steps.
+  #
+  # Dev smoke test (server↔agent roundtrip without touching real fleet):
+  #   bash scripts/linux-start-UAT.sh         # native agent against this stack
+  #
+  # Power users who insist on a containerised agent can build from
+  # deploy/docker/Dockerfile.agent themselves; we don't support or
+  # encourage that path.
 
 volumes:
-  # Named volumes for server/agent state — must persist across
+  # Named volume for server state — must persist across
   # `docker compose down`. Do NOT use `docker compose down -v` unless
   # you intend to destroy state.
   server-data:
-  agent-data:
