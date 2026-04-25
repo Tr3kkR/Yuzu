@@ -2,6 +2,8 @@
 
 The TAR plugin continuously captures system state snapshots and records changes as timestamped events in a local SQLite database on each endpoint. It enables retrospective investigation of "what happened on this machine" without requiring pre-configured logging or SIEM integration.
 
+> Engineers maintaining or extending TAR should also read [`docs/tar-implementer.md`](../tar-implementer.md) — it covers the on-disk format, persistence semantics across upgrade/uninstall/reinstall, the post-restart double-capture caveat, and device-impact expectations.
+
 ## What TAR captures
 
 TAR monitors four categories of system activity:
