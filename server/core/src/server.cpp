@@ -774,6 +774,28 @@ public:
             spdlog::info("Fleet health recomputation thread stopped");
         });
 
+        // Periodic reminder when client cert verification is disabled (issue #79).
+        // Logs at ERROR level every 5 minutes to ensure operators monitoring logs
+        // notice the degraded posture even after the startup banner has scrolled off.
+        if (cfg_.tls_enabled && cfg_.allow_one_way_tls) {
+            insecure_tls_reminder_thread_ = std::thread([this]() {
+                using namespace std::chrono_literals;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
+                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                         ++i) {
+                        std::this_thread::sleep_for(5s);
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    spdlog::error("[INSECURE-TLS] Agent listener still running without "
+                                  "client certificate verification "
+                                  "(--insecure-skip-client-verify). Re-enable mTLS "
+                                  "by supplying --ca-cert.");
+                }
+            });
+        }
+
         agent_server_->Wait();
     }
 
@@ -807,6 +829,11 @@ public:
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
+        }
+
+        // Join the insecure-TLS reminder thread (issue #79)
+        if (insecure_tls_reminder_thread_.joinable()) {
+            insecure_tls_reminder_thread_.join();
         }
 
         if (schedule_engine_)
@@ -902,11 +929,13 @@ private:
                 GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
             if (!allow_one_way_tls) {
-                spdlog::error("{} TLS requires --ca-cert (or enable --allow-one-way-tls)",
+                spdlog::error("{} TLS requires --ca-cert (or enable "
+                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
                               listener_name);
                 return nullptr;
             }
-            spdlog::warn("{} TLS running without client certificate verification", listener_name);
+            spdlog::warn("{} TLS running without client certificate verification "
+                         "(--insecure-skip-client-verify)", listener_name);
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
@@ -4851,6 +4880,10 @@ private:
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
+
+    // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
+    std::thread insecure_tls_reminder_thread_;
+
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> stop_entered_{false};
     std::atomic<bool> draining_{false};
