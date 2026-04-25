@@ -145,7 +145,7 @@ jobs:
             vcpkg-x64-linux-${{ matrix.compiler }}-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -251,7 +251,7 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -396,7 +396,7 @@ jobs:
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -482,7 +482,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -567,7 +567,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -654,7 +654,7 @@ jobs:
             vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@5e0cab206a5ea620130caf672fce3e4a6b5666a1 # v11.5
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
