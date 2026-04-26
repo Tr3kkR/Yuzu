@@ -67,10 +67,12 @@ TEST_CASE("TAR schema: accepted_capture_methods returns the deduped sorted union
     CHECK(unique.size() == methods.size());
 
     // The current TCP source declares iphlpapi (Windows), procfs (Linux),
-    // and lsof (macOS). All three should be in the accept-list.
+    // and proc_pidfdinfo (macOS — libproc-based, replaced the original
+    // `lsof` declaration in 5a41db5 to match the actual collector
+    // implementation). All three should be in the accept-list.
     CHECK(unique.contains("iphlpapi"));
     CHECK(unique.contains("procfs"));
-    CHECK(unique.contains("lsof"));
+    CHECK(unique.contains("proc_pidfdinfo"));
 }
 
 TEST_CASE("TAR schema: accepted_capture_methods is empty for an unknown source",
