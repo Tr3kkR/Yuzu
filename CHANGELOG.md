@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: unified vcpkg + ccache cache-key form to compact `gcc13` /
+  `clang19` (no hyphen) across every Linux job (issues #569, #547
+  /test investigation).** The matrix-driven Linux build jobs were
+  using `vcpkg-x64-linux-${{ matrix.compiler }}-...` which
+  interpolated as `gcc-13` / `clang-19` (with hyphen). The
+  standalone Sanitizer / Coverage / Real-upstream jobs hard-coded
+  `vcpkg-x64-linux-gcc13-...` (no hyphen). Two parallel cache
+  entries for identical content forced the GHA 10 GB cap into LRU
+  eviction during the v0.12.0-rc /test run on dev — net effect
+  was 5-7h CI cycles where 50-80 min was vcpkg-from-source rebuilds
+  and 20-40 min ccache uploads, instead of the expected 8-12 min.
+  Added a `compact_compiler` matrix include that maps
+  `gcc-13 → gcc13` / `clang-19 → clang19`; every Linux cache key
+  now uses that field. The deeper architectural fix (drop
+  `actions/cache@v5` on self-hosted Linux entirely in favour of
+  runner-local persistent dirs) is tracked separately as issue
+  #569; this entry closes only the cache-key-mismatch half.
+- **`.claude/agents/consistency-auditor.md` extended to cover
+  `.github/workflows/*.yml`.** Cache-key parity across sibling
+  jobs, restore-key subsumption, runner-label coherence
+  (self-hosted vs cloud), matrix-include shape parity, action SHA
+  pinning uniformity, and workflow-dispatch input contract are now
+  explicit Key Questions for the agent. Without this, /governance
+  runs miss CI-yaml drift like the gcc-13 / gcc13 cache split that
+  thrashed the GHA cache for weeks before /test surfaced it.
+
 - **TAR dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
   Folds the BLOCKING items Gates 5 + 6 (compliance / sre / enterprise-
   readiness / chaos) caught after the first three hardening rounds:
