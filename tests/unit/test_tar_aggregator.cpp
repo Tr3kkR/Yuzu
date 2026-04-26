@@ -141,6 +141,88 @@ TEST_CASE("TAR retention: re-enabling a source resumes retention",
     CHECK(after_resume < 48);
 }
 
+// ── PR-A (#547): apply_source_enabled_transition + paused_at semantics ─────
+
+TEST_CASE("TAR paused_at: enabled→disabled writes the timestamp",
+          "[tar][paused_at][pr-a]") {
+    // Operator transitions process_enabled from default ("true") to "false"
+    // — paused_at must record the wall-clock now passed to the helper.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-disable-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.get_config("process_enabled", "true") == "true");
+    REQUIRE(db.get_config("process_paused_at", "0") == "0");
+
+    const int64_t t_now = 1'735'689'600;
+    apply_source_enabled_transition(db, "process", "false", t_now);
+
+    CHECK(db.get_config("process_enabled", "true") == "false");
+    CHECK(db.get_config("process_paused_at", "0") ==
+          std::to_string(t_now));
+}
+
+TEST_CASE("TAR paused_at: disabled→enabled clears the timestamp to \"0\"",
+          "[tar][paused_at][pr-a]") {
+    // After re-enable, paused_at must read "0" (not absent — operators
+    // distinguish "never paused" from "no key present"). The reverse
+    // transition is the operator-journey close-out: freeze → export →
+    // re-enable; the row drops out of the dashboard's retention-paused list.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-reenable-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    apply_source_enabled_transition(db, "tcp", "false", 1'735'689'600);
+    REQUIRE(db.get_config("tcp_paused_at", "0") == "1735689600");
+
+    apply_source_enabled_transition(db, "tcp", "true", 1'735'700'000);
+
+    CHECK(db.get_config("tcp_enabled", "true") == "true");
+    CHECK(db.get_config("tcp_paused_at", "0") == "0");
+}
+
+TEST_CASE("TAR paused_at: idempotent re-set leaves the timestamp untouched",
+          "[tar][paused_at][pr-a]") {
+    // If the operator submits configure with the same value the source
+    // already holds, paused_at must NOT advance — otherwise repeated
+    // configure round-trips would pretend the pause is fresher than it is,
+    // misleading the retention-paused list's "paused since" column.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-idem-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    apply_source_enabled_transition(db, "service", "false", 1'735'689'600);
+    REQUIRE(db.get_config("service_paused_at", "0") == "1735689600");
+
+    apply_source_enabled_transition(db, "service", "false", 1'735'700'000);
+
+    CHECK(db.get_config("service_paused_at", "0") == "1735689600");
+}
+
+TEST_CASE("TAR paused_at: per-source isolation",
+          "[tar][paused_at][pr-a]") {
+    // Disabling process must not touch tcp / service / user paused_at — the
+    // PR-A retention-paused list relies on per-source rows being independent.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-pra-iso-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    apply_source_enabled_transition(db, "process", "false", 1'735'689'600);
+
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");
+    CHECK(db.get_config("tcp_paused_at", "0") == "0");
+    CHECK(db.get_config("service_paused_at", "0") == "0");
+    CHECK(db.get_config("user_paused_at", "0") == "0");
+}
+
 TEST_CASE("TAR retention: disabling one source does not pause others",
           "[tar][retention][issue539]") {
     // Independence invariant: the guard is per-source. Disabling
