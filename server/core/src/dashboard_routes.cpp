@@ -152,7 +152,8 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
-                                       ResolveFn resolve_fn) {
+                                       ResolveFn resolve_fn,
+                                       yuzu::MetricsRegistry* metrics) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -164,6 +165,31 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     agents_json_fn_ = std::move(agents_json_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     resolve_fn_ = std::move(resolve_fn);
+    metrics_ = metrics;
+
+    // Phase 15.A — issue #547 metric registrations. The design doc
+    // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
+    // two that are operational today (the rest land with their owning PRs).
+    if (metrics_) {
+        metrics_->describe(
+            "yuzu_tar_dashboard_view_total",
+            "Operator views of the TAR dashboard fragments by frame and result.",
+            "counter");
+        metrics_->describe(
+            "yuzu_tar_retention_paused_devices",
+            "Number of devices currently reporting a paused TAR source, by source name.",
+            "gauge");
+        metrics_->describe(
+            "yuzu_tar_scan_dispatched_total",
+            "Operator-triggered tar.status scans dispatched by result (success / "
+            "rate_limited / no_visible_agents / no_connected_agents / denied).",
+            "counter");
+        metrics_->describe(
+            "yuzu_tar_source_reenable_total",
+            "Operator-triggered TAR source re-enable attempts by result "
+            "(success / scope_violation / agent_not_connected / denied / invalid_input).",
+            "counter");
+    }
 
     // -- GET /fragments/results -----------------------------------------------
     svr.Get("/fragments/results",
@@ -618,7 +644,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
 
     svr.Get("/fragments/tar/retention-paused",
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
+                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
                 auto session = auth_fn_(req, res);
                 if (!session) return;
                 // Per-operator scoped data — must not be cached by any
@@ -631,6 +664,11 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 res.set_header("Vary", "Cookie");
                 res.set_content(render_tar_retention_paused(session->username),
                                 "text/html; charset=utf-8");
+                if (metrics_) {
+                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                                      {{"frame", "retention"},
+                                       {"result", "success"}}).increment();
+                }
             });
 
     svr.Post("/fragments/tar/retention-paused/scan",
@@ -638,7 +676,18 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  // Dispatching a command to the fleet is an Execute action,
                  // not a Read. Sibling dispatch handlers (`run-instruction`,
                  // `tar-execute`) all gate on Execution:Execute — match.
-                 if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     // Compliance F1: emit a denied audit row so SIEM rules
+                     // alerting on RBAC-rejection probing have a data source.
+                     // Without this, the audit catalog overclaims coverage.
+                     audit_fn_(req, "tar.status.scan", "denied", "command",
+                              "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "denied"}}).increment();
+                     }
+                     return;
+                 }
                  auto session = auth_fn_(req, res);
                  if (!session) return;
                  if (!dispatch_fn_) {
@@ -647,6 +696,42 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                      "unavailable.</div>",
                                      "text/html; charset=utf-8");
                      return;
+                 }
+
+                 // sre CAP-1: per-operator 30-second scan cooldown to defend
+                 // against an operator (or compromised session) clicking Scan
+                 // in a tight loop and storming the fleet with tar.status
+                 // RPCs. Uses the already-stored dispatched_at field; no new
+                 // state needed.
+                 constexpr int64_t kScanCooldownSec = 30;
+                 {
+                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
+                     auto it = tar_scans_by_user_.find(session->username);
+                     if (it != tar_scans_by_user_.end()) {
+                         auto since = now_epoch() - it->second.dispatched_at;
+                         if (since < kScanCooldownSec) {
+                             res.status = 429;
+                             res.set_header("Retry-After",
+                                 std::to_string(kScanCooldownSec - since));
+                             res.set_content(std::format(
+                                 "<div class=\"empty-state\">Please wait "
+                                 "<strong>{}</strong> second{} before "
+                                 "scanning again.</div>",
+                                 kScanCooldownSec - since,
+                                 (kScanCooldownSec - since) == 1 ? "" : "s"),
+                                 "text/html; charset=utf-8");
+                             audit_fn_(req, "tar.status.scan", "denied",
+                                      "command", "",
+                                      std::format("rate_limited cooldown={}s",
+                                                   kScanCooldownSec - since));
+                             if (metrics_) {
+                                 metrics_->counter(
+                                     "yuzu_tar_scan_dispatched_total",
+                                     {{"result", "rate_limited"}}).increment();
+                             }
+                             return;
+                         }
+                     }
                  }
 
                  // Scope dispatch to the operator's visible agents only —
@@ -663,6 +748,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                          "in scope to scan. Check your management-group "
                          "role assignments.</div>",
                          "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "no_visible_agents"}}).increment();
+                     }
                      return;
                  }
 
@@ -710,6 +799,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      res.set_header("HX-Trigger",
                          "{\"showToast\":{\"message\":\"No connected agents "
                          "in scope to scan\",\"level\":\"warning\"}}");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "no_connected_agents"}}).increment();
+                     }
                  } else {
                      body = std::format(
                          "<div class=\"empty-state\">Scanning <strong>{}"
@@ -721,6 +814,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      res.set_header("HX-Trigger", std::format(
                          "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
                          "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "success"}}).increment();
+                     }
                  }
                  // Cache-Control: no-store applies to all fragment responses
                  // — fragment data is per-operator (post-hardening-round-1)
@@ -750,7 +847,16 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     // existence-enumeration oracle.
     svr.Post("/fragments/tar/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     // Compliance F1: denied audit on RBAC rejection.
+                     audit_fn_(req, "tar.source.reenable", "denied",
+                              "command", "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "denied"}}).increment();
+                     }
+                     return;
+                 }
                  auto session = auth_fn_(req, res);
                  if (!session) return;
                  if (!dispatch_fn_) {
@@ -774,6 +880,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                      "device_id and source are required."
                                      "</span>",
                                      "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "invalid_input"}}).increment();
+                     }
                      return;
                  }
                  // Validate source against the canonical four. Anything else
@@ -786,6 +896,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                      "Unknown source — must be one of "
                                      "process, tcp, service, user.</span>",
                                      "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "invalid_input"}}).increment();
+                     }
                      return;
                  }
 
@@ -811,6 +925,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      res.set_content("<span class=\"tar-row-error\">"
                                      "Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "scope_violation"}}).increment();
+                     }
                      return;
                  }
 
@@ -829,6 +947,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      res.set_content("<span class=\"tar-row-error\">"
                                      "Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "agent_not_connected"}}).increment();
+                     }
                      return;
                  }
 
@@ -836,6 +958,10 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                           "command", command_id,
                           std::format("device={} source={}",
                                        device_id, source));
+                 if (metrics_) {
+                     metrics_->counter("yuzu_tar_source_reenable_total",
+                                       {{"result", "success"}}).increment();
+                 }
 
                  res.set_header("HX-Trigger", std::format(
                      "{{\"showToast\":{{\"message\":\"Re-enabling {} on "
@@ -1472,6 +1598,25 @@ std::string DashboardRoutes::render_tar_retention_paused(
     }
 
     int64_t now = now_epoch();
+
+    // sre OBS-1: surface retention-paused fleet posture as a gauge per
+    // source so SREs can alert on "process retention is paused on N
+    // devices" trends. We compute per-source counts here from the
+    // already-iterated row set, clearing the gauge family first so an
+    // operator's narrowed-by-visibility view doesn't leave stale values
+    // when their group composition shrinks.
+    if (metrics_) {
+        std::unordered_map<std::string, int64_t> per_source_counts{
+            {"process", 0}, {"tcp", 0}, {"service", 0}, {"user", 0}};
+        for (const auto& r : rows) {
+            ++per_source_counts[r.source];
+        }
+        for (const auto& [src, count] : per_source_counts) {
+            metrics_->gauge("yuzu_tar_retention_paused_devices",
+                            {{"source", src}})
+                .set(static_cast<double>(count));
+        }
+    }
 
     // Header showing scan provenance and an honest "responded N of M" count.
     // Includes the in-scope filter so the operator understands the

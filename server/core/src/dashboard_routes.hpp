@@ -15,6 +15,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 namespace yuzu::server {
@@ -64,7 +65,8 @@ public:
                          detail::EventBus* event_bus,
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
-                         ResolveFn resolve_fn);
+                         ResolveFn resolve_fn,
+                         yuzu::MetricsRegistry* metrics = nullptr);
 
 private:
     AuthFn auth_fn_;
@@ -78,6 +80,7 @@ private:
     AgentsJsonFn agents_json_fn_;
     DispatchFn dispatch_fn_;
     ResolveFn resolve_fn_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     // -- Fragment renderers ---------------------------------------------------
 
