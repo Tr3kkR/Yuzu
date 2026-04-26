@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR dashboard hardening round 3 — Gate 4 + Gate 3 follow-up
+  (issue #547).** Folds the BLOCKING items Gate 4 caught after the
+  first two hardening rounds, plus the QE BLOCKING test gap on
+  `json_escape`:
+  - **QE F1** — `json_escape` promoted from `static` in
+    `dashboard_routes.cpp` to inline in `web_utils.hpp` so future
+    hx-vals call sites inherit the helper instead of rolling their
+    own. New `test_web_utils.cpp` block (8 cases) pins JSON-escape
+    semantics for empty / plain ASCII / `"` / `\` / named escapes
+    (`\b\f\n\r\t`) / C0 control bytes / 0x20+ pass-through / the
+    full `html_escape(json_escape(value))` pipeline contract that
+    sec-M3 depends on. Without this test, a future refactor that
+    drops a case from json_escape would silently re-open sec-M3.
+  - **consistency-auditor BLOCKING-8** — `docs/capability-map.md`
+    §28.4 still said `/dashboard/tar`. Fixed to `/tar` matching
+    the implementation and the rest of the docs.
+  - **consistency-auditor BLOCKING-9** — `docs/tar-dashboard.md`
+    §3.5 and §6 (permissions matrix) still said
+    `Infrastructure:Update` for Re-enable. Updated to
+    `Execution:Execute` matching the round-1 perm-tier fix and
+    the user-manual / rest-api docs that already said Execute.
+    The Scan-fleet row was also added to the permissions matrix.
+  - **happy-path SHOULD-1** — empty-state message on the
+    retention-paused fragment now distinguishes "scan still in
+    progress" (responses < dispatched) from "scan complete and
+    clean" (every dispatched agent responded with no paused
+    sources). Without this, the operator would see a "click
+    Refresh in a moment" prompt even after every agent had
+    answered, leading to unnecessary re-fetches.
+  - **happy-path NICE-1** — Scan-fleet button no longer fires a
+    success-level toast saying "dispatched to 0 agent(s)" when
+    no agents in scope are connected. The zero-reach case now
+    fires a warning-level toast that matches the empty-state body.
+  - **unhappy-path UP-11** — three TAR fragment endpoints now
+    emit `Cache-Control: no-store, private` and `Vary: Cookie`.
+    Without these, a corporate proxy honouring default `text/html`
+    caching could re-replay one operator's filtered, visibility-
+    scoped scan results to a different operator on the shared URL,
+    defeating the round-1 sec-H2 fix.
+
 - **TAR dashboard hardening round 2 — docs from Gate 2 governance
   (issue #547).** Folds the four BLOCKING + four SHOULD-FIX docs
   findings the docs-writer caught:

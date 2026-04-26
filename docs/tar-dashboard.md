@@ -129,7 +129,8 @@ Server dispatches a new agent action `tar.purge_source` with `{source: <name>}`.
 ### 3.5 Permissions and safety
 
 - View-only access requires `Infrastructure:Read`.
-- Re-enable requires `Infrastructure:Update` on the target device.
+- **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command — same tier as `run-instruction` and `tar-execute` siblings).
+- **Re-enable** requires `Execution:Execute` and the operator's RBAC visibility on the target device. Out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side.
 - Purge requires `Infrastructure:Delete` on the target device, **and** the device must currently report `<source>_enabled=false` (rejected at the server with `400 SOURCE_NOT_PAUSED` if the live status disagrees — prevents a stale row from triggering accidental purge of an actively-collecting source).
 
 ### 3.6 Tests
@@ -205,7 +206,8 @@ The reconstruction is O(events_in_window) per device. For a 30-day window on a 2
 |---|---|---|
 | `/tar` page load | `Infrastructure:Read` | Same as Devices/Inventory pages |
 | Retention-paused list view | `Infrastructure:Read` | |
-| Re-enable | `Infrastructure:Update` | Per-device check |
+| Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `tar.status` fleet-wide; same tier as run-instruction/tar-execute |
+| Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
 | Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
 | TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and is parameter-checked SELECT-only |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |

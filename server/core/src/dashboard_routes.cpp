@@ -621,6 +621,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
                 auto session = auth_fn_(req, res);
                 if (!session) return;
+                // Per-operator scoped data — must not be cached by any
+                // shared upstream proxy. UP-11 from Gate 4 unhappy-path:
+                // a corporate proxy honoring default text/html caching
+                // would re-replay one operator's filtered, visibility-
+                // scoped table to a different operator on a shared
+                // session-less URL.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
                 res.set_content(render_tar_retention_paused(session->username),
                                 "text/html; charset=utf-8");
             });
@@ -696,6 +704,12 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                             "in your scope are currently connected. Bring "
                             "an agent online and click "
                             "<strong>Scan fleet</strong> again.</div>";
+                     // Suppress the success-level toast on zero-reach — Gate 4
+                     // happy-NICE-1 flagged "dispatched to 0 agent(s)" as
+                     // misleading. Use a warning toast that matches the body.
+                     res.set_header("HX-Trigger",
+                         "{\"showToast\":{\"message\":\"No connected agents "
+                         "in scope to scan\",\"level\":\"warning\"}}");
                  } else {
                      body = std::format(
                          "<div class=\"empty-state\">Scanning <strong>{}"
@@ -704,10 +718,18 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                          "the results.</div>",
                          sent, sent == 1 ? "" : "s",
                          html_escape(std::string{command_id}));
+                     res.set_header("HX-Trigger", std::format(
+                         "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
+                         "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
                  }
-                 res.set_header("HX-Trigger", std::format(
-                     "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
-                     "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
+                 // Cache-Control: no-store applies to all fragment responses
+                 // — fragment data is per-operator (post-hardening-round-1)
+                 // and a shared upstream proxy that caches text/html could
+                 // re-replay one operator's filtered scan result to a
+                 // different operator (UP-11). Vary on Cookie so any
+                 // proxy-cache that does honor CC still keys per-session.
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
                  res.set_content(body, "text/html; charset=utf-8");
              });
 
@@ -819,6 +841,9 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      "{{\"showToast\":{{\"message\":\"Re-enabling {} on "
                      "{}\",\"level\":\"success\"}}}}",
                      source, html_escape(std::string{device_id})));
+                 // No-store on every fragment response (UP-11 mitigation).
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
                  // Empty response body — combined with hx-swap=delete on
                  // the row, this drops the row optimistically. The next
                  // Refresh will reconcile against a fresh tar.status.
@@ -1330,35 +1355,6 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // informational placeholders rather than table-with-zero-rows so the
 // operator gets actionable guidance.
 
-// Helper: JSON-escape a string for safe embedding inside an `hx-vals`
-// attribute. The browser un-HTML-escapes the attribute value before HTMX's
-// JSON parser sees it, so a `"` in `device_id` (after html_escape → &quot;
-// → unescaped to ") would close the JSON string and inject keys. Escape
-// JSON-special characters first; the surrounding html_escape on the final
-// string is still applied for safety in the HTML attribute context.
-static std::string json_escape(std::string_view in) {
-    std::string out;
-    out.reserve(in.size() + 4);
-    for (char c : in) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\b': out += "\\b"; break;
-        case '\f': out += "\\f"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if (static_cast<unsigned char>(c) < 0x20) {
-                out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
-            } else {
-                out += c;
-            }
-        }
-    }
-    return out;
-}
-
 std::string DashboardRoutes::render_tar_retention_paused(
     const std::string& username) const {
     std::string scan_id;
@@ -1502,11 +1498,23 @@ std::string DashboardRoutes::render_tar_retention_paused(
     html += "</div>";
 
     if (rows.empty()) {
-        html += "<div class=\"empty-state\">"
-                "<strong>No paused sources detected</strong> across the "
-                "agents that have responded. If the scan is still in "
-                "progress, click <strong>Refresh</strong> in a moment."
-                "</div>";
+        // Distinguish "scan still in progress" from "scan complete and clean."
+        // Without this branch the empty-state always nudges Refresh, which is
+        // factually wrong once every agent has answered (Gate 4 happy-path
+        // SHOULD-1).
+        if (agents_responded < scan_count) {
+            html += "<div class=\"empty-state\">"
+                    "<strong>No paused sources detected yet.</strong> The "
+                    "scan is still in progress — click "
+                    "<strong>Refresh</strong> in a moment for more responses."
+                    "</div>";
+        } else {
+            html += "<div class=\"empty-state\">"
+                    "<strong>No paused sources detected</strong> &mdash; all "
+                    "agents in your scope responded and every collector is "
+                    "running normally."
+                    "</div>";
+        }
         return html;
     }
 
