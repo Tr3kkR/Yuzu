@@ -118,15 +118,6 @@ jobs:
       matrix:
         compiler: [gcc-13, clang-19]
         build_type: [debug, release]
-        include:
-          # `compact_compiler` is the cache-key form (no hyphen) — keeps
-          # cache keys consistent with the sibling sanitizer/coverage jobs
-          # which were always written `gcc13`. Mismatch caused a parallel
-          # cache entry that thrashed the GHA 10 GB cap. See issue #569.
-          - compiler: gcc-13
-            compact_compiler: gcc13
-          - compiler: clang-19
-            compact_compiler: clang19
         exclude:
           # PRs: only gcc-13 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
@@ -146,32 +137,18 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-${{ matrix.compact_compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-${{ matrix.compact_compiler }}-${{ matrix.build_type }}-
-            ccache-linux-${{ matrix.compact_compiler }}-
-
+      # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
+      # runner, which persists in the github-runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying
+      # the GHA upload cost would just reupload data that's already on
+      # disk. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ matrix.compact_compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-${{ matrix.compact_compiler }}-
+      # vcpkg_installed/ persists in ${{ github.workspace }} between
+      # jobs on this self-hosted runner. The "Force fresh vcpkg install
+      # when triplet changed" step below handles the only invalidation
+      # case (overlay-triplet content change). Issue #569.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -484,31 +461,10 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-asan-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -569,31 +525,10 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-tsan-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -656,31 +591,10 @@ jobs:
           pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-coverage-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6

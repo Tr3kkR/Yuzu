@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: dropped `actions/cache@v5` on every self-hosted runner —
+  Linux + Windows now use runner-local persistent state only
+  (issue #569).** 14 cache blocks removed across `ci.yml` (8),
+  `release.yml` (5), and `codeql.yml` (1). On a self-hosted
+  runner, ccache's OS-default location (`~/.cache/ccache` on
+  Linux, `~\AppData\Local\ccache` on Windows) lives in the
+  github-runner user's home directory, which persists between
+  jobs by definition; `vcpkg_installed/` similarly persists in
+  `${{ github.workspace }}` since self-hosted workspaces are not
+  recycled. Routing those directories through GHA's 10 GB cache
+  backend was pure overhead — the post-`a5436ed` ccache contents
+  alone (~4 GB per (compiler, mode) entry) couldn't all fit, and
+  LRU eviction was forcing from-scratch rebuilds on every job.
+  Expected impact: per-job CI wall time drops from 50-80 min to
+  8-12 min on self-hosted Linux, and the cumulative push-to-CI
+  cycle from 5-7 hours to 30-60 min. macOS jobs (cloud-hosted,
+  ephemeral) keep their `actions/cache` blocks — those are the
+  only legitimate use of GHA cache in this workflow set.
+
+  The vestigial `compact_compiler` matrix include from the
+  earlier round-3 cache-key unification is also removed — it only
+  fed the cache keys that no longer exist.
+
 - **CI: unified vcpkg + ccache cache-key form to compact `gcc13` /
   `clang19` (no hyphen) across every Linux job (issues #569, #547
   /test investigation).** The matrix-driven Linux build jobs were

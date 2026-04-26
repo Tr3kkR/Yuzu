@@ -65,32 +65,13 @@ jobs:
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf builddir
 
-      - name: Cache ccache
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-release-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-release-linux-
-
+      # ccache (~/.cache/ccache) persists on the self-hosted Linux
+      # runner between jobs. The original cache/restore@v5 was already
+      # restore-only because release tags never re-use a file-hash; the
+      # local persistence delivers the same restore semantics without
+      # any GHA round-trip. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Install vcpkg packages (static linkage)
         run: |
@@ -268,39 +249,11 @@ jobs:
           otp-version: '28'
           rebar3-version: '3.24'
 
-      - name: Cache rebar3 dependencies
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: gateway/_build/default/lib
-          key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
-          restore-keys: |
-            rebar3-deps-
-
-      - name: Cache Dialyzer PLT
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: gateway/_build/default/*_plt*
-          key: dialyzer-plt-otp27-${{ hashFiles('gateway/rebar.lock') }}
-          restore-keys: |
-            dialyzer-plt-otp27-
+      # rebar3 _build/default/lib and Dialyzer PLT both persist in
+      # the workspace on the self-hosted Linux runner — the original
+      # cache/restore@v5 calls were already restore-only and the local
+      # persistence is functionally equivalent without GHA round-trip.
+      # Issue #569.
 
       - name: Compile gateway
         working-directory: gateway
@@ -453,49 +406,13 @@ jobs:
           pip install --require-hashes -r requirements-ci.txt
           choco install ccache --yes --no-progress
 
-      - name: Cache ccache
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~\AppData\Local\ccache
-          key: ccache-release-windows-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-release-windows-
-
+      # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
+      # persist on the self-hosted Windows runner between jobs. The
+      # original cache/restore@v5 calls were already restore-only —
+      # local persistence delivers the same restore semantics without
+      # any GHA round-trip. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        # Restore-only: release builds consume cache, never produce.
-        # Each release tag is a unique commit, so the file-hash cache
-        # key never matches anything a future release would benefit
-        # from. Paying writeback cost on every release is what timed
-        # out the v0.11.0 first attempt — Linux Post Cache ccache
-        # spent 28.5 min uploading data nobody would re-read, blowing
-        # the 45-min job budget. cache/restore@v5 also drops the
-        # `save-always: true` input that the maintainers say never
-        # worked as intended (cf. v5.0.5 deprecation warning).
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-windows-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
