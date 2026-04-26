@@ -1,6 +1,6 @@
 # TAR Dashboard — Operator Page Design
 
-**Status:** Design (PR-A in scope for current session — see `docs/roadmap.md`)
+**Status:** Design (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; purge action and persistence deferred. See `docs/roadmap.md` Phase 15.)
 **Audience:** Server engineers, dashboard UI engineers, TAR plugin maintainers
 **Owners:** `architect` (page architecture), `plugin-developer` (TAR action surface), `security-guardian` (SQL execution surface), `docs-writer` (DSL + REST docs)
 **Related:** `docs/scope-walking-design.md` (the cross-cutting result-set primitive this page consumes), `docs/yuzu-guardian-design-v1.1.md` (the agent tamper-resistance pillar that the process tree viewer's data quality depends on), `agents/plugins/tar/` (the data plane).
@@ -29,7 +29,7 @@ Dashboard ───────────────────────�
 ├─ Policies      (existing)
 ├─ TAR           (new — this page) ─────────────────────────────────────────┐
 │                                                                            │
-│  /dashboard/tar                                                            │
+│  /tar                                                            │
 │  ┌────────────────────────────────────────────────────────────────────┐    │
 │  │  [Scope chip ▼]  windows-chrome-suspects · 2,798 devices · pinned │    │
 │  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
@@ -71,7 +71,7 @@ URL structure:
 
 | Path | Purpose | Required permission |
 |---|---|---|
-| `/dashboard/tar` | The page | `Infrastructure:Read` |
+| `/tar` | The page | `Infrastructure:Read` |
 | `/fragments/tar/retention-paused` | HTMX fragment for the paused-sources table | `Infrastructure:Read` |
 | `/fragments/tar/sql` | (existing, relocated) HTMX fragment for the SQL frame | `Infrastructure:Read` + dispatch |
 | `/fragments/tar/process-tree` | HTMX fragment for the tree viewer | `Infrastructure:Read` |
@@ -93,7 +93,7 @@ The source of truth is the agent's `tar_config` table — the `<source>_enabled`
 
 This avoids a new persistent server-side mirror, which would have to be reconciled with agent state on every config change. The trade-off is a 5-15s page-load cost on a large fleet; mitigated by:
 - Scope-restricted queries (the operator usually narrows first via a result set)
-- Background refresh every 60s while the page is open (HTMX `hx-trigger="every 60s"`)
+- Manual **Refresh** button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
 - Manual "Refresh" button for ad-hoc re-fan-out
 
 ### 3.2 Extending `tar.status`
@@ -203,7 +203,7 @@ The reconstruction is O(events_in_window) per device. For a 30-day window on a 2
 
 | Surface | Required | Notes |
 |---|---|---|
-| `/dashboard/tar` page load | `Infrastructure:Read` | Same as Devices/Inventory pages |
+| `/tar` page load | `Infrastructure:Read` | Same as Devices/Inventory pages |
 | Retention-paused list view | `Infrastructure:Read` | |
 | Re-enable | `Infrastructure:Update` | Per-device check |
 | Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
@@ -224,7 +224,7 @@ Per `docs/observability-conventions.md`:
 | `yuzu_tar_process_tree_render_seconds` | histogram | `node_count_bucket` |
 | `yuzu_tar_process_tree_seed_age_seconds` | gauge | `device_id` (only top-N noisiest) |
 
-Audit actions: `tar.retention_paused.list`, `tar.source.reenable`, `tar.source.purge`, `tar.process_tree.read`, `tar.process_tree.reseed`. All carry `device_id` and `source` in `detail_json` where applicable.
+Audit actions: `tar.status.scan` (operator-triggered Scan fleet — emitted by PR-A.A), `tar.source.reenable` (operator-triggered Re-enable on a row — emitted by PR-A.A), `tar.source.purge` (operator-triggered purge — Phase 15.A.next), `tar.process_tree.read` (Phase 15.H), `tar.process_tree.reseed` (Phase 15.H). All carry `device_id` and `source` in `detail` where applicable.
 
 ## 8. Cross-references
 
@@ -241,7 +241,7 @@ Audit actions: `tar.retention_paused.list`, `tar.source.reenable`, `tar.source.p
 
 | PR | Scope | Status |
 |---|---|---|
-| PR-A | Page shell + retention-paused list (this doc §3) | **In flight** — current session |
+| PR-A | Page shell + retention-paused list (this doc §3) | **Shipped** PR-A.A (paused_at extension + dashboard page + retention-paused list). Purge action (§3.4) deferred. |
 | PR-B | Result-set store + REST API (`scope-walking-design.md` PR-B) | Pending |
 | PR-C | Scope chip + sidebar + breadcrumb (`scope-walking-design.md` PR-C) | Pending |
 | PR-D | TAR SQL frame migrated and scope-walking-aware (this doc §4) | Pending |
