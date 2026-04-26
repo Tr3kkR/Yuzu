@@ -101,10 +101,13 @@ private:
     std::string render_scope_list(const std::string& selected, const std::string& username);
 
     /// Render the TAR retention-paused source list (Phase 15.A — issue #547).
-    /// Reads the most recent `tar.status` scan tracked by the routes
-    /// instance, parses each agent's output for `<source>_enabled=false`
-    /// rows, and renders an HTML table body fragment.
-    std::string render_tar_retention_paused() const;
+    /// Reads the most recent `tar.status` scan **for the calling operator**,
+    /// filters the responses to agents the operator can see (per
+    /// `ManagementGroupStore::get_visible_agents`), parses each agent's
+    /// output for `<source>_enabled=false` rows, and renders an HTML table
+    /// body fragment. The username + visibility filter close the
+    /// Gate 2 cross-operator data-leak finding.
+    std::string render_tar_retention_paused(const std::string& username) const;
 
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,
@@ -112,14 +115,24 @@ private:
 
     // -- TAR retention scan tracking (Phase 15.A) -----------------------------
     //
-    // Tracks the most-recent operator-triggered `tar.status` scan so the
-    // GET /fragments/tar/retention-paused endpoint has data to render.
-    // In-memory and per-server-instance for now; persistence + multi-server
-    // coordination land in Phase 15.G operational hardening.
+    // Tracks the most-recent operator-triggered `tar.status` scan, **keyed by
+    // operator username**, so two operators viewing /tar do not see each
+    // other's scan results. The Gate 2 governance review caught the prior
+    // single-shared-slot design as a HIGH cross-operator data-leak (operator
+    // B opens /tar after operator A scans → sees A's data, including agents
+    // outside B's RBAC scope). Per-username state plus visibility-scoped
+    // rendering (see render_tar_retention_paused) close that gap.
+    //
+    // Bounded LRU: hard-cap at 256 entries; oldest evicted on overflow.
+    // Persistence + multi-server coordination land in Phase 15.G.
+    struct TarScanState {
+        std::string command_id;
+        int dispatched_count{0};
+        int64_t dispatched_at{0};
+    };
     mutable std::mutex tar_scan_mu_;
-    std::string latest_tar_scan_id_;     // command_id of the most-recent scan
-    int latest_tar_scan_count_{0};       // number of agents the dispatch reached
-    int64_t latest_tar_scan_at_{0};      // epoch seconds when the scan was triggered
+    std::unordered_map<std::string, TarScanState> tar_scans_by_user_;
+    static constexpr std::size_t kTarScanStateCap = 256;
 };
 
 } // namespace yuzu::server

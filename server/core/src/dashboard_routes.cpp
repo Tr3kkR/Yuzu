@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
@@ -597,10 +598,18 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
 
     // -- TAR retention-paused source list (Phase 15.A — issue #547) -----------
     //
-    // GET renders the table from whatever the most-recent operator-triggered
-    // tar.status scan returned (latest_tar_scan_id_); POST dispatches a fresh
-    // scan to all connected agents and stores the new command_id so the next
-    // GET picks it up.
+    // GET renders the table for the calling operator from THEIR most-recent
+    // tar.status scan (per-username state); POST dispatches a fresh scan
+    // **scoped to the operator's visible agents** and records the new
+    // command_id under the username key. Both routes filter rendered
+    // responses by the operator's visible agent set so an operator without
+    // visibility on a device cannot see its TAR config even via cached
+    // scan results.
+    //
+    // Permission tiers (after Gate 2 hardening):
+    //   GET  scan list      → Infrastructure:Read   (read-only render)
+    //   POST scan dispatch  → Execution:Execute     (dispatches commands)
+    //   POST reenable       → Execution:Execute     (mutates agent state)
     //
     // The two routes are deliberately separate (rather than one auto-fetch
     // route) so an operator viewing the page does not silently re-scan the
@@ -612,13 +621,16 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
                 auto session = auth_fn_(req, res);
                 if (!session) return;
-                res.set_content(render_tar_retention_paused(),
+                res.set_content(render_tar_retention_paused(session->username),
                                 "text/html; charset=utf-8");
             });
 
     svr.Post("/fragments/tar/retention-paused/scan",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
+                 // Dispatching a command to the fleet is an Execute action,
+                 // not a Read. Sibling dispatch handlers (`run-instruction`,
+                 // `tar-execute`) all gate on Execution:Execute — match.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) return;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
                  if (!dispatch_fn_) {
@@ -629,25 +641,60 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      return;
                  }
 
+                 // Scope dispatch to the operator's visible agents only —
+                 // never fan out to devices the operator cannot see.
+                 // Empty visible set = nobody to scan; return early.
+                 std::vector<std::string> agent_ids;
+                 if (mgmt_group_store_) {
+                     agent_ids = mgmt_group_store_->get_visible_agents(
+                         session->username);
+                 }
+                 if (agent_ids.empty()) {
+                     res.set_content(
+                         "<div class=\"empty-state\">You have no agents "
+                         "in scope to scan. Check your management-group "
+                         "role assignments.</div>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+
                  std::unordered_map<std::string, std::string> params;
                  auto [command_id, sent] = dispatch_fn_(
-                     "tar", "status", /*agent_ids=*/{}, /*scope_expr=*/"", params);
+                     "tar", "status", agent_ids, /*scope_expr=*/"", params);
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
-                     latest_tar_scan_id_ = command_id;
-                     latest_tar_scan_count_ = sent;
-                     latest_tar_scan_at_ = now_epoch();
+                     // Bounded LRU: drop the oldest entry by dispatched_at if
+                     // we'd exceed the cap. Keeps memory bounded across
+                     // operator turnover without per-request fairness games.
+                     if (tar_scans_by_user_.size() >= kTarScanStateCap &&
+                         !tar_scans_by_user_.contains(session->username)) {
+                         auto oldest = tar_scans_by_user_.begin();
+                         for (auto it = tar_scans_by_user_.begin();
+                              it != tar_scans_by_user_.end(); ++it) {
+                             if (it->second.dispatched_at <
+                                 oldest->second.dispatched_at) {
+                                 oldest = it;
+                             }
+                         }
+                         tar_scans_by_user_.erase(oldest);
+                     }
+                     auto& st = tar_scans_by_user_[session->username];
+                     st.command_id = command_id;
+                     st.dispatched_count = sent;
+                     st.dispatched_at = now_epoch();
                  }
 
                  audit_fn_(req, "tar.status.scan", "success", "command",
                           command_id,
-                          std::format("dispatched to {} agent(s)", sent));
+                          std::format("dispatched to {} agent(s) in scope",
+                                       sent));
 
                  std::string body;
                  if (sent == 0) {
-                     body = "<div class=\"empty-state\">No agents connected. "
-                            "Bring an agent online and click "
+                     body = "<div class=\"empty-state\">None of the agents "
+                            "in your scope are currently connected. Bring "
+                            "an agent online and click "
                             "<strong>Scan fleet</strong> again.</div>";
                  } else {
                      body = std::format(
@@ -670,9 +717,18 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     // Dispatches `tar.configure` with `<source>_enabled=true` to the single
     // named device. Per-source independence (the #539 invariant) means this
     // does not touch the other three sources on the device.
+    //
+    // Permission: Execution:Execute (dispatches a configure command — same
+    // tier as run-instruction and tar-sql siblings; Gate 2 governance flagged
+    // the original Infrastructure:Update as a tier mismatch).
+    //
+    // RBAC scope: device_id MUST be in the operator's visible agents set;
+    // out-of-scope device_ids are rejected with the same 404 body as
+    // not-connected so non-operators cannot use this endpoint as an
+    // existence-enumeration oracle.
     svr.Post("/fragments/tar/retention-paused/reenable",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "Infrastructure", "Update")) return;
+                 if (!perm_fn_(req, res, "Execution", "Execute")) return;
                  auto session = auth_fn_(req, res);
                  if (!session) return;
                  if (!dispatch_fn_) {
@@ -711,6 +767,31 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      return;
                  }
 
+                 // Per-device RBAC visibility check. Out-of-scope device_ids
+                 // collapse to the same 404 path as not-connected devices so
+                 // the response cannot be used to enumerate device existence.
+                 // Audit detail records the real reason on the server side.
+                 bool visible = false;
+                 if (mgmt_group_store_) {
+                     auto visible_ids = mgmt_group_store_->get_visible_agents(
+                         session->username);
+                     for (const auto& vid : visible_ids) {
+                         if (vid == device_id) { visible = true; break; }
+                     }
+                 }
+
+                 if (!visible) {
+                     audit_fn_(req, "tar.source.reenable", "failure",
+                              "command", "",
+                              std::format("scope_violation source={}",
+                                           source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
                  std::unordered_map<std::string, std::string> params;
                  params[std::format("{}_enabled", source)] = "true";
                  auto [command_id, sent] = dispatch_fn_(
@@ -718,9 +799,13 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      params);
 
                  if (sent == 0) {
+                     audit_fn_(req, "tar.source.reenable", "failure",
+                              "command", "",
+                              std::format("agent_not_connected source={}",
+                                           source));
                      res.status = 404;
                      res.set_content("<span class=\"tar-row-error\">"
-                                     "Agent not connected.</span>",
+                                     "Agent not reachable.</span>",
                                      "text/html; charset=utf-8");
                      return;
                  }
@@ -1232,32 +1317,82 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // render_tar_retention_paused — Phase 15.A retention-paused source list
 // ---------------------------------------------------------------------------
 //
-// Reads the most-recent operator-triggered tar.status scan tracked by this
-// routes instance, queries the response store for that command_id, parses
-// each agent's `config|<source>_enabled|false` lines plus the matching
-// paused_at / live_rows / oldest_ts companions, and returns an HTML table
-// fragment. Empty states (no scan run yet, scan returned zero rows) render
-// as informational placeholders rather than table-with-zero-rows so the
+// Reads THIS OPERATOR'S most-recent tar.status scan (per-username state),
+// queries the response store for that command_id, **filters responses to
+// the operator's visible agents**, parses each agent's
+// `config|<source>_enabled|false` lines plus the matching paused_at /
+// live_rows / oldest_ts companions, and returns an HTML table fragment.
+//
+// Per-username state + visibility filter together close the Gate 2
+// governance HIGH finding (cross-operator data leak via shared scan slot).
+//
+// Empty states (no scan run yet, scan returned zero rows) render as
+// informational placeholders rather than table-with-zero-rows so the
 // operator gets actionable guidance.
 
-std::string DashboardRoutes::render_tar_retention_paused() const {
+// Helper: JSON-escape a string for safe embedding inside an `hx-vals`
+// attribute. The browser un-HTML-escapes the attribute value before HTMX's
+// JSON parser sees it, so a `"` in `device_id` (after html_escape → &quot;
+// → unescaped to ") would close the JSON string and inject keys. Escape
+// JSON-special characters first; the surrounding html_escape on the final
+// string is still applied for safety in the HTML attribute context.
+static std::string json_escape(std::string_view in) {
+    std::string out;
+    out.reserve(in.size() + 4);
+    for (char c : in) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
+}
+
+std::string DashboardRoutes::render_tar_retention_paused(
+    const std::string& username) const {
     std::string scan_id;
     int scan_count = 0;
     int64_t scan_at = 0;
     {
         std::lock_guard<std::mutex> lk(tar_scan_mu_);
-        scan_id = latest_tar_scan_id_;
-        scan_count = latest_tar_scan_count_;
-        scan_at = latest_tar_scan_at_;
+        auto it = tar_scans_by_user_.find(username);
+        if (it != tar_scans_by_user_.end()) {
+            scan_id = it->second.command_id;
+            scan_count = it->second.dispatched_count;
+            scan_at = it->second.dispatched_at;
+        }
     }
 
     if (scan_id.empty()) {
         return "<div class=\"empty-state\">No scan data yet — click "
-               "<strong>Scan fleet</strong> above to query every connected "
-               "agent's TAR retention state.</div>";
+               "<strong>Scan fleet</strong> above to query the agents "
+               "in your scope for TAR retention state.</div>";
     }
     if (!response_store_) {
         return "<div class=\"empty-state\">Response store unavailable.</div>";
+    }
+
+    // Build the operator's visible-agent allow-set so we can filter the
+    // raw response stream against it. Defense-in-depth: even if the scan
+    // dispatch already scoped to visible agents, a separate operator who
+    // shares the command_id (no longer possible after per-user state but
+    // kept for layered safety) still cannot see out-of-scope data.
+    std::unordered_set<std::string> visible_set;
+    if (mgmt_group_store_) {
+        auto visible_ids = mgmt_group_store_->get_visible_agents(username);
+        visible_set.reserve(visible_ids.size());
+        for (auto& v : visible_ids) visible_set.insert(std::move(v));
     }
 
     // Pull every response stored for the scan command_id.
@@ -1284,8 +1419,16 @@ std::string DashboardRoutes::render_tar_retention_paused() const {
     std::vector<PausedRow> rows;
     int agents_responded = 0;
     int agents_with_no_paused_sources = 0;
+    int agents_filtered_out_of_scope = 0;
 
     for (const auto& resp : responses) {
+        // Visibility gate: drop responses from agents the operator cannot
+        // see. If mgmt_group_store_ is unavailable, fail closed (drop all
+        // — operator sees an empty list rather than unscoped data).
+        if (!visible_set.contains(resp.agent_id)) {
+            ++agents_filtered_out_of_scope;
+            continue;
+        }
         ++agents_responded;
         std::unordered_map<std::string, std::string> kv;
         auto lines = split_output_lines(resp.output);
@@ -1335,18 +1478,27 @@ std::string DashboardRoutes::render_tar_retention_paused() const {
     int64_t now = now_epoch();
 
     // Header showing scan provenance and an honest "responded N of M" count.
+    // Includes the in-scope filter so the operator understands the
+    // visibility-bounded view.
     std::string html;
     html.reserve(2048);
     html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
     html += std::format(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
-        "agent{} {} &middot; <strong>{}</strong> responded so far &middot; "
-        "<strong>{}</strong> have all sources collecting normally",
+        "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
+        "responded &middot; <strong>{}</strong> have all sources collecting "
+        "normally",
         html_escape(scan_id),
         scan_count, scan_count == 1 ? "" : "s",
         format_age(scan_at, now),
         agents_responded,
         agents_with_no_paused_sources);
+    if (agents_filtered_out_of_scope > 0) {
+        html += std::format(" &middot; <strong>{}</strong> response{} from "
+                            "out-of-scope agents dropped",
+                            agents_filtered_out_of_scope,
+                            agents_filtered_out_of_scope == 1 ? "" : "s");
+    }
     html += "</div>";
 
     if (rows.empty()) {
@@ -1404,6 +1556,13 @@ std::string DashboardRoutes::render_tar_retention_paused() const {
         // optimistically on success. The next operator-triggered Refresh
         // will reconcile against a fresh tar.status if the agent failed
         // to apply the configure for any reason.
+        //
+        // hx-vals carries JSON inside an HTML attribute. JSON-escape FIRST
+        // (so `"` becomes `\"`) then HTML-escape the result (the browser
+        // un-HTML-escapes attribute values *before* HTMX's JSON parser
+        // sees them). Skipping the JSON-escape pass here was the Gate 2
+        // sec-M3 finding — a malicious agent registering with a `device_id`
+        // containing `"` could close the JSON string and inject keys.
         html += std::format(
             "<td style=\"text-align:right\">"
             "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
@@ -1415,7 +1574,8 @@ std::string DashboardRoutes::render_tar_retention_paused() const {
             "Re-enable"
             "</button>"
             "</td>",
-            html_escape(r.agent_id), html_escape(r.source),
+            html_escape(json_escape(r.agent_id)),
+            html_escape(json_escape(r.source)),
             html_escape(r.source), html_escape(r.agent_display));
         html += "</tr>";
     }

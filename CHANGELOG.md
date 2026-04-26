@@ -9,8 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR dashboard hardening round 1 — Gate 2 governance findings
+  (issue #547).** The PR-A.A initial commit shipped on
+  `Infrastructure:Read` for the Scan dispatch and a single shared
+  `latest_tar_scan_id_` server slot. Governance Gate 2 caught two
+  HIGH and three MEDIUM findings before merge and this round folds
+  the fixes:
+  - **sec-H1 (perm tier mismatch).** `POST .../scan` and
+    `POST .../reenable` now require `Execution:Execute` (matched to
+    sibling dispatch handlers `run-instruction` / `tar-execute`).
+    Reading the rendered list still requires `Infrastructure:Read`.
+  - **sec-H2 (cross-operator data leak).** Scan state is now
+    per-username (`tar_scans_by_user_` map keyed by session
+    username, bounded LRU at 256 entries). Operator B opening
+    `/tar` no longer sees operator A's scan results, and the
+    rendered table is **filtered by the operator's visible-agent
+    set** (`ManagementGroupStore::get_visible_agents`) so even
+    cached responses from agents outside the operator's RBAC scope
+    are dropped. Defense-in-depth: the dispatch itself is now
+    scoped to visible agents at fan-out time, not to all connected
+    agents.
+  - **sec-M1 (per-device RBAC scope).** The reenable endpoint now
+    verifies `device_id` is in the operator's visible-agent set
+    before dispatching. Out-of-scope IDs are rejected.
+  - **sec-M2 (404 enumeration oracle).** Out-of-scope and
+    not-connected reenable attempts now return identical 404
+    bodies ("Agent not reachable") so the response cannot be used
+    to enumerate device existence. Audit detail records the real
+    reason (`scope_violation` vs `agent_not_connected`)
+    server-side.
+  - **sec-M3 (`hx-vals` JSON injection).** A new local
+    `json_escape()` helper in `dashboard_routes.cpp` escapes JSON
+    metacharacters in `device_id` / `source` before the
+    surrounding `html_escape` runs. Without this, a malicious
+    agent registering with a `device_id` containing `"` could
+    close the JSON string in an HTMX `hx-vals` attribute and
+    inject keys that the operator's browser would submit on Re-
+    enable. Bounded today (only same-fleet agents can mint device
+    IDs) but defense-in-depth.
+  - The scan-provenance header now reports out-of-scope responses
+    that were filtered out, so the operator understands the
+    visibility-bounded view they are seeing.
+
 - **TAR dashboard page + retention-paused source list (PR-A,
-  issue #547).** New `/dashboard/tar` page off the main dashboard
+  issue #547).** New `/tar` page off the main dashboard
   nav, served as `kTarPageHtml` from a dedicated translation unit
   (`server/core/src/tar_page_ui.cpp`). The page is the operator's
   destination for *doing TAR* — first frame is the retention-paused
