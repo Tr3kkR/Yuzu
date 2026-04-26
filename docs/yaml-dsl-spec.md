@@ -1559,6 +1559,9 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.collect_slow` | `tar` | Y | Y | Y | Verified |
 | `tar.sql` | `tar` | Y | Y | Y | Verified |
 | `tar.rollup` | `tar` | Y | Y | Y | Verified |
+| `tar.compatibility` | `tar` | Y | Y | Y | Verified |
+
+**`tar.compatibility`** -- Emit the live OS compatibility matrix for all four capture sources (process, tcp, service, user). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`.
 
 ### 14.16 Test and Debug
 

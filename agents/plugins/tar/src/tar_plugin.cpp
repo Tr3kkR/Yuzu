@@ -773,22 +773,31 @@ private:
         // does not silently re-default to polling.
         if (auto m = params.get("network_capture_method"); !m.empty()) {
             std::string method{m};
-            auto accepted = yuzu::tar::accepted_capture_methods("tcp");
-            if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
-                std::string list;
-                for (size_t i = 0; i < accepted.size(); ++i) {
-                    list += accepted[i];
-                    if (i + 1 < accepted.size()) list += ",";
-                }
-                ctx.write_output(std::format(
-                    "error|network_capture_method '{}' is not accepted (must be one of: {})",
-                    method, list));
-                return 1;
-            }
-            // Today only "polling" actually drives collection. Surface this
-            // so an operator who pre-stages 'etw' isn't surprised when the
-            // collector keeps polling.
+            // "polling" is a sentinel meaning "use the platform default" —
+            // the only mechanism actually wired today. It is intentionally
+            // accepted unconditionally even though no os_support row carries
+            // it as a capture_method (the per-OS rows describe the underlying
+            // platform API: iphlpapi / procfs / proc_pidfdinfo). Without this
+            // special case `tar.status` would report `polling` as the default
+            // but `tar.configure network_capture_method=polling` would be
+            // rejected — the round trip would be broken (governance C-1 /
+            // QA Finding 2).
             if (method != "polling") {
+                auto accepted = yuzu::tar::accepted_capture_methods("tcp");
+                if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
+                    std::string list = "polling";
+                    for (const auto& m2 : accepted) {
+                        list += ",";
+                        list += m2;
+                    }
+                    ctx.write_output(std::format(
+                        "error|network_capture_method '{}' is not accepted (must be one of: {})",
+                        method, list));
+                    return 1;
+                }
+                // Surface that no kernel-event collector is wired yet so an
+                // operator pre-staging 'etw' / 'endpoint_security' isn't
+                // surprised that the collector keeps polling under the hood.
                 ctx.write_output(std::format(
                     "warn|network_capture_method '{}' accepted but not yet "
                     "implemented; collector will continue polling",

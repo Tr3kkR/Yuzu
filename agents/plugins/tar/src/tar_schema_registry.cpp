@@ -104,10 +104,12 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
                  "below the fast interval may be missed."},
-                {"macos",   OsSupportStatus::kSupportedConstrained, "lsof",
-                 "lsof -nP -iTCP -iUDP. Slow on heavily-loaded hosts; consider "
-                 "raising fast_interval. Endpoint Security framework would be "
-                 "the modern replacement (kPlanned)."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "proc_pidfdinfo",
+                 "proc_listallpids + proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via "
+                 "libproc. Inherent TOCTOU between pid enumeration and per-fd "
+                 "query — short-lived sockets that close before the per-fd "
+                 "query may produce empty rows. Endpoint Security framework "
+                 "(kPlanned) is the modern replacement for sub-second fidelity."},
             },
             .granularities = {
                 {
@@ -227,9 +229,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .dollar_name = "User",
             .os_support = {
                 {"windows", OsSupportStatus::kSupported,           "wts",
-                 "WTSEnumerateSessionsEx — captures interactive, RDP, console. "
-                 "Requires Terminal Services (always present on supported "
-                 "Windows; absent on Server Core 2008 R2 minimal installs)."},
+                 "WTSEnumerateSessionsW + WTSQuerySessionInformationW — "
+                 "captures interactive, RDP, console. Requires Terminal "
+                 "Services (always present on supported Windows; absent on "
+                 "Server Core 2008 R2 minimal installs). WTSEnumerateSessionsExW "
+                 "is the recommended successor for new code but is not yet wired."},
                 {"linux",   OsSupportStatus::kSupportedConstrained, "utmp",
                  "Reads /var/run/utmp via getutent. Containers running with "
                  "no /var/run/utmp produce no events. logon_type is inferred "

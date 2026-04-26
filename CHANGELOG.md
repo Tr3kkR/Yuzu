@@ -10,18 +10,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **TAR query examples, test coverage, and implementer documentation
-  (issue #60).** Three new pre-built `InstructionDefinition`s shipped
+  (issue #60).** Two new pre-built `InstructionDefinition`s shipped
   in `content/definitions/tar_warehouse.yaml` directly answering the
   examples called out in the issue body:
-  `crossplatform.tar.process_by_exact_name` (case-sensitive `name='X'`
-  match — sibling to the case-insensitive default `LIKE` semantics),
   `crossplatform.tar.daily_process_summary` (live-to-aggregate rollup
   reading from `$Process_Daily` with `datetime(day_ts, 'unixepoch')`
   for human-readable dates), and `crossplatform.tar.recent_processes_iso`
   (the canonical pattern for the SQLite-equivalent of competing
-  platforms' `EPOCHTOJSON(TS)` helper). All three carry per-parameter
+  platforms' `EPOCHTOJSON(TS)` helper). Both carry per-parameter
   `description` fields so the dashboard and REST API surface them
-  without docs-side cross-references.
+  without docs-side cross-references. (The originally-shipped
+  `crossplatform.tar.process_by_exact_name` was removed during
+  governance — it relied on `${process_name}` interpolation in the
+  hidden default SQL, but the server has no parameter-interpolation
+  pass for `parameters.<key>.default`. Re-add once that surface lands.)
+- **`tar.compatibility` InstructionDefinition + DSL spec registration
+  (governance docs Finding 4 + plugin Finding 5).** The action shipped
+  in the plugin (issue #59) but had no corresponding YAML
+  `InstructionDefinition` in `content/definitions/tar.yaml` and no row
+  in `docs/yaml-dsl-spec.md` §14.15 — meaning operators could not
+  invoke it from the dashboard or via the standard
+  `/api/v1/instructions/execute` flow without hand-crafting a
+  `CommandRequest`. Both gaps are closed; `minAgentVersion: "0.12.0"`
+  is set since the action does not exist on prior agents.
+- **`tar.configure` InstructionDefinition now declares the six new
+  parameters introduced by issue #59** (governance plugin Finding 2):
+  `process_enabled` / `tcp_enabled` / `service_enabled` /
+  `user_enabled` (boolean-as-string with `^(true|false)$` regex
+  validation), `network_capture_method`, and
+  `process_stabilization_exclusions` — all four with descriptions and
+  agent-version notes so the dashboard form widget and the OpenAPI
+  spec render the new surface correctly.
 - **TAR OS compatibility metadata + capture configuration surface
   (issue #59).** The schema registry's `CaptureSourceDef` now carries a
   per-OS `os_support` vector (`OsSupportStatus` × `capture_method` ×
@@ -52,6 +71,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<source>_enabled` and `network_capture_method` config rows so
   operators can see effective state without reading the DB
   (`agents/plugins/tar/src/tar_plugin.cpp`).
+
+### Fixed
+
+- **TAR `network_capture_method=polling` (the documented default) is
+  no longer rejected by the configure surface (governance C-1 / QA
+  Finding 2).** Both `do_status` reported `polling` as the default and
+  `do_configure` validated against `accepted_capture_methods("tcp")`
+  — but `polling` was never in that accept-list (the per-OS
+  `os_support` rows describe the underlying platform API:
+  `iphlpapi` / `procfs` / `proc_pidfdinfo`, not the logical
+  `polling` sentinel). The status → configure → status round-trip was
+  broken. `do_configure` now special-cases `polling` and accepts it
+  unconditionally; the rejection error message also lists `polling`
+  alongside the registry-derived methods so the operator sees the
+  full accept-set. (`agents/plugins/tar/src/tar_plugin.cpp`)
+- **TAR macOS TCP `capture_method` metadata corrected
+  (governance C-1 consistency).** `tar_schema_registry.cpp` declared
+  the macOS TCP collector as `capture_method = "lsof"` with notes
+  describing `lsof -nP -iTCP -iUDP`. The actual implementation in
+  `tar_network_collector.cpp` uses `proc_listallpids` +
+  `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc` — `lsof`
+  appears nowhere in the collector. The new `tar.compatibility`
+  diagnostic action (issue #59) was therefore shipping factually
+  wrong information to operators on the most operator-facing
+  surface in this batch. Updated the registry, `docs/user-manual/tar.md`
+  OS compatibility matrix, and `docs/tar-implementer.md` to all
+  reflect `proc_pidfdinfo` / libproc with the inherent TOCTOU caveat.
+- **TAR Windows User collector capture-method note corrected
+  (governance H-1 consistency).** `os_support` notes claimed
+  `WTSEnumerateSessionsEx`, but `tar_user_collector.cpp` uses the
+  legacy `WTSEnumerateSessionsW`. Note now reflects the actual symbol
+  and adds a forward-pointer to the recommended successor.
+- **`tar_warehouse.yaml` `minAgentVersion` bumped from `"0.7.0"` to
+  `"0.10.0"` across all 13 entries (governance H-2 consistency).**
+  All entries use `tar.sql`, which first shipped in v0.10.0. The
+  previous claim caused server-side compatibility checks to schedule
+  these instructions against v0.7.x–v0.9.x agents that would then
+  reject them with `unknown action: sql`.
 
 ### Documentation
 
