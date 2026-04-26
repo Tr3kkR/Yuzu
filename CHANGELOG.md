@@ -72,6 +72,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operators can see effective state without reading the DB
   (`agents/plugins/tar/src/tar_plugin.cpp`).
 
+### Breaking
+
+- **`--allow-one-way-tls` requires `YUZU_ALLOW_INSECURE_TLS=1` on
+  upgrade or the server refuses to start (issue #79).** Existing
+  deployments that pass `--allow-one-way-tls` (or the new flag name
+  `--insecure-skip-client-verify`) will fail to start after upgrade
+  unless `YUZU_ALLOW_INSECURE_TLS=1` is also present in the server
+  environment. The deprecated flag name is still accepted for one
+  release with a startup deprecation warning. To restore mTLS, add
+  `--ca-cert <path>` and remove the insecure flag. See the
+  `### Security` entry below and `docs/user-manual/server-admin.md`
+  "Upgrade note (v0.12.0)" for the full migration including a
+  systemd drop-in recipe.
+- **Management gRPC listener now subject to the same
+  `YUZU_ALLOW_INSECURE_TLS=1` gate as the agent listener (governance
+  C-79-1).** Deployments that supply `--management-cert` /
+  `--management-key` without `--management-ca-cert` previously got an
+  unauthenticated management plane silently. They will now fail to
+  start unless `--insecure-skip-client-verify` AND
+  `YUZU_ALLOW_INSECURE_TLS=1` are both set, OR
+  `--management-ca-cert` is supplied. Most deployments do not set
+  the `--management-*` overrides at all (the management listener
+  reuses the agent listener credentials by default) and are
+  unaffected.
+- **`crossplatform.tar.process_by_exact_name` removed from
+  `content/definitions/tar_warehouse.yaml` (governance plugin H-1 /
+  enterprise-readiness Finding 9).** The instruction shipped briefly
+  with `${process_name}` interpolation in its hidden default SQL,
+  but the server has no `${param}` interpolation pass for
+  `parameters.<key>.default` — the literal `${process_name}` would
+  hit SQLite verbatim and match zero rows. Operators who imported
+  the InstructionDefinition during the brief window it was on
+  `dev` should expect the ID `crossplatform.tar.process_by_exact_name`
+  to be missing on upgrade. Re-add once server-side parameter
+  interpolation lands.
+- **`tar_warehouse.yaml` `minAgentVersion` bumped to `"0.10.0"` for
+  every `tar.sql`-based InstructionDefinition (governance H-2).**
+  Previously claimed `"0.7.0"` against agents on which `tar.sql` did
+  not exist. Server-side compatibility checks will now skip these
+  instructions on agents older than v0.10.0 instead of dispatching
+  and getting `unknown action: sql` per device.
+
 ### Fixed
 
 - **TAR `network_capture_method=polling` (the documented default) is
@@ -146,31 +188,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a copy-pasteable systemd drop-in. An Ansible role can now be
   authored from this doc alone.
 
-### Tests
-
-- **`tests/unit/test_tar_warehouse.cpp`** — new Catch2 suite for issue
-  #60 (15 cases / 284 assertions). Pins: every source/granularity has
-  a `CREATE TABLE` and a timestamp index in `generate_warehouse_ddl()`;
-  `columns_for_table` returns `id` + every declared column for every
-  table; every `$Dollar_Name` is a unique round-trip;
-  process / tcp / service / user rollups cite the correct lower-tier
-  source and upper-tier target; service rolls up only to hourly (no
-  daily/monthly); user rollup has the day-bucket midnight-rollover
-  arithmetic and tracks login_count / logout_count as a count-of-events
-  rather than session-duration; row-count retention uses the H6 OFFSET
-  pattern (not the older O(n*k) NOT IN); time-based retention uses a
-  cutoff predicate; each granularity's retention SQL touches *only*
-  that granularity (independence invariant); and post-restart TCP
-  diff-with-empty-previous yields all-`connected` events (the
-  documented forensic-completeness double-capture caveat).
-- **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
-  issue #59 (6 cases / 44 assertions). Pins: every source declares
-  windows + linux + macos rows; every non-`kUnsupported` row has a
-  non-empty `capture_method` + `notes`; `accepted_capture_methods` is
-  deduped + sorted + non-empty; unknown source returns empty; all
-  `kPlanned` methods stay in the accept-list (so operators can
-  pre-stage); `kUnsupported`-only methods are excluded.
-
 ### Security
 
 - **`--allow-one-way-tls` renamed to `--insecure-skip-client-verify`,
@@ -234,6 +251,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **`tests/unit/test_tar_warehouse.cpp`** — new Catch2 suite for issue
+  #60 (15 cases / 284 assertions). Pins: every source/granularity has
+  a `CREATE TABLE` and a timestamp index in `generate_warehouse_ddl()`;
+  `columns_for_table` returns `id` + every declared column for every
+  table; every `$Dollar_Name` is a unique round-trip;
+  process / tcp / service / user rollups cite the correct lower-tier
+  source and upper-tier target; service rolls up only to hourly (no
+  daily/monthly); user rollup has the day-bucket midnight-rollover
+  arithmetic and tracks login_count / logout_count as a count-of-events
+  rather than session-duration; row-count retention uses the H6 OFFSET
+  pattern (not the older O(n*k) NOT IN); time-based retention uses a
+  cutoff predicate; each granularity's retention SQL touches *only*
+  that granularity (independence invariant); and post-restart TCP
+  diff-with-empty-previous yields all-`connected` events (the
+  documented forensic-completeness double-capture caveat).
+- **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
+  issue #59 (6 cases / 44 assertions). Pins: every source declares
+  windows + linux + macos rows; every non-`kUnsupported` row has a
+  non-empty `capture_method` + `notes`; `accepted_capture_methods` is
+  deduped + sorted + non-empty; unknown source returns empty; all
+  `kPlanned` methods stay in the accept-list (so operators can
+  pre-stage); `kUnsupported`-only methods are excluded.
 - **`tests/unit/server/test_insecure_tls_gate.cpp`** — new Catch2 suite
   pinning the #79 env-var gate. Constants `kInsecureTlsEnvVar` /
   `kInsecureTlsEnvAuthorizedValue` are pinned to their documented
