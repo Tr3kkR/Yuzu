@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
+  Folds the BLOCKING items Gates 5 + 6 (compliance / sre / enterprise-
+  readiness / chaos) caught after the first three hardening rounds:
+  - **compliance F1 (RBAC denied audit gap)** — both new POST handlers
+    (`/fragments/tar/retention-paused/scan` and `.../reenable`) now emit
+    `result=denied` audit rows when `perm_fn_` rejects the request. The
+    audit catalog (`docs/user-manual/audit-log.md`) documented the
+    `denied` rows but the code did not deliver them, contradicting the
+    SOC 2 CC6.1 / CC7.2 control claim. Two `audit_fn_` calls plus the
+    sibling `denied` counter increments close the gap.
+  - **sre OBS-1 (Prometheus metrics)** — the design doc spec'd 5
+    metrics; PR-A in scope is 4: `yuzu_tar_dashboard_view_total`
+    (counter, labels: `frame`, `result`),
+    `yuzu_tar_retention_paused_devices` (gauge, labels: `source`),
+    `yuzu_tar_scan_dispatched_total` (counter, labels: `result` —
+    `success` / `rate_limited` / `no_visible_agents` /
+    `no_connected_agents` / `denied`), and
+    `yuzu_tar_source_reenable_total` (counter, labels: `result` —
+    `success` / `scope_violation` / `agent_not_connected` / `denied` /
+    `invalid_input`). Plumbed `MetricsRegistry*` through
+    `DashboardRoutes::register_routes` (new optional parameter,
+    defaults `nullptr` so tests don't have to construct one).
+    Descriptions registered at startup so the Prometheus serializer
+    emits HELP and TYPE lines correctly. The retention-paused gauge is
+    re-set per source on every render — operators tracking
+    "process retention is paused on N devices over time" now have a
+    queryable signal.
+  - **sre CAP-1 (per-operator scan cooldown)** — `POST .../scan` now
+    enforces a 30-second cooldown using the already-stored
+    `dispatched_at` field. Subsequent dispatches within the window
+    return HTTP 429 with `Retry-After`, an HTML fragment showing the
+    remaining wait, and a `denied` audit row carrying
+    `rate_limited cooldown=Ns`. Without this, a compromised session
+    could spam Scan in a loop and storm the fleet with `tar.status`
+    RPCs at the operator's `Execution:Execute` permission tier.
+  - **enterprise SHOULD-1 (mixed-version upgrade caveat)** —
+    `docs/user-manual/server-admin.md` gains a "v0.12.0 — TAR dashboard
+    page + mixed-version agent caveats" subsection covering the
+    em-dash rendering for pre-PR-A agents, the per-operator scan-state
+    persistence model, and the new audit-action surface. Without this,
+    operators upgrading the server before the agent fleet would see
+    `—` columns and have no documented explanation.
+  - **enterprise SHOULD-2 (TAR nav-link conditional rendering)**
+    deferred to follow-up — requires a JS-time permission lookup that
+    is more architectural than a one-line CSS hide. The current
+    behaviour (click → 401/redirect) is not a security issue.
+
 - **TAR dashboard hardening round 3 — Gate 4 + Gate 3 follow-up
   (issue #547).** Folds the BLOCKING items Gate 4 caught after the
   first two hardening rounds, plus the QE BLOCKING test gap on

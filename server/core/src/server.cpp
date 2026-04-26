@@ -4471,7 +4471,8 @@ private:
                     }
                 }
                 return {"", ""};
-            });
+            },
+            &metrics_);
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
