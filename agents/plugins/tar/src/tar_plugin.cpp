@@ -456,12 +456,41 @@ private:
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
         ctx.write_output(std::format("retention_days|{}", s.retention_days));
 
-        // Per-source enable/disable state (issue #59). Default = enabled, so
-        // operators that never call `configure` see the steady-state behavior.
+        // Per-source enable/disable state (issue #59) plus the operational
+        // surface PR-A (#547) needs: paused_at, live_rows, oldest_ts. Default
+        // = enabled, paused_at = 0, so operators that never call `configure`
+        // see the steady-state behavior. live_rows / oldest_ts are queried
+        // from the per-source `*_live` table; an empty table reports 0 / 0.
         for (const auto& src : yuzu::tar::capture_sources()) {
-            std::string key = std::format("{}_enabled", src.name);
-            auto val = db_->get_config(key, "true");
-            ctx.write_output(std::format("config|{}|{}", key, val));
+            std::string enabled_key = std::format("{}_enabled", src.name);
+            auto enabled_val = db_->get_config(enabled_key, "true");
+            ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
+
+            std::string paused_at_key = std::format("{}_paused_at", src.name);
+            auto paused_at_val = db_->get_config(paused_at_key, "0");
+            ctx.write_output(std::format("config|{}|{}",
+                                          paused_at_key, paused_at_val));
+
+            std::string live_table = std::format("{}_live", src.name);
+            auto count_q = db_->execute_query(
+                "SELECT COUNT(*) FROM " + live_table, /*max_rows=*/1);
+            int64_t live_rows = 0;
+            if (count_q.has_value() && !count_q->rows.empty()) {
+                try { live_rows = std::stoll(count_q->rows[0][0]); } catch (...) {}
+            }
+            ctx.write_output(std::format("config|{}_live_rows|{}",
+                                          src.name, live_rows));
+
+            // `ts` is the column name on every `*_live` table per the schema
+            // registry. NULL on empty table → 0 fallback.
+            auto oldest_q = db_->execute_query(
+                "SELECT IFNULL(MIN(ts), 0) FROM " + live_table, /*max_rows=*/1);
+            int64_t oldest_ts = 0;
+            if (oldest_q.has_value() && !oldest_q->rows.empty()) {
+                try { oldest_ts = std::stoll(oldest_q->rows[0][0]); } catch (...) {}
+            }
+            ctx.write_output(std::format("config|{}_oldest_ts|{}",
+                                          src.name, oldest_ts));
         }
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
@@ -749,6 +778,15 @@ private:
         // editing source. Disabled collectors short-circuit in
         // collect_fast/slow but still permit `query` against existing rows
         // (so historical data remains readable while new captures stop).
+        //
+        // PR-A: when a transition enable→disable happens, record the wall-clock
+        // timestamp in `<source>_paused_at` so the server-side retention-paused
+        // dashboard list (#547) can render "paused since" without inferring it
+        // from the audit log. The reverse transition clears the value to "0"
+        // (we do not delete keys — a missing key would be ambiguous with "never
+        // paused"). The timestamp is operator-facing wall-clock seconds; clock
+        // skew is acceptable because the surface is "paused since approximately
+        // X" and the ground truth is the agent's view.
         for (const auto& src : yuzu::tar::capture_sources()) {
             std::string key = std::format("{}_enabled", src.name);
             auto val = params.get(key);
@@ -759,8 +797,17 @@ private:
                     "error|{} must be 'true' or 'false'", key));
                 return 1;
             }
-            db_->set_config(key, v);
+            yuzu::tar::apply_source_enabled_transition(
+                *db_, src.name, v, now_epoch_seconds());
             ctx.write_output(std::format("config|{}|{}", key, v));
+            // Echo the resulting paused_at so the operator/dashboard sees the
+            // transition timestamp without an extra status round-trip. We
+            // re-read it post-write rather than re-deriving the transition
+            // here — single source of truth.
+            std::string paused_at_key = std::format("{}_paused_at", src.name);
+            ctx.write_output(std::format("config|{}|{}",
+                                          paused_at_key,
+                                          db_->get_config(paused_at_key, "0")));
             changed = true;
         }
 
