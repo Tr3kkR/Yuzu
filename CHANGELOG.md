@@ -151,6 +151,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previous claim caused server-side compatibility checks to schedule
   these instructions against v0.7.x–v0.9.x agents that would then
   reject them with `unknown action: sql`.
+- **TAR retention no longer deletes data after a source is disabled
+  (issue #539, P1, forensic-completeness regression).** The
+  `configure` action and `docs/user-manual/tar.md` both promise that
+  setting `<source>_enabled=false` "leaves existing rows queryable,"
+  but `run_retention()` in `tar_aggregator.cpp` was iterating
+  `capture_sources()` unconditionally — so the rollup trigger
+  continued draining hourly within 24h, daily within 31d, and monthly
+  within ~365d after disable, breaking the forensic-preservation use
+  case that TAR's headline pitch is built around. The retention loop
+  now consults `<source>_enabled` and skips disabled sources entirely;
+  re-enabling the source resumes time-based retention on the next
+  rollup tick. Per-source independence is preserved: disabling
+  `process_enabled` does not pause retention on `tcp` / `service` /
+  `user`. Surfaced by the /governance run on commit range
+  `b2554ad..HEAD` as unhappy-path H-59-3, chaos-injector CHAOS-2,
+  consistency-auditor M-1, and sre Q2 — all four converged on the
+  same docstring-vs-code drift.
 
 ### Documentation
 

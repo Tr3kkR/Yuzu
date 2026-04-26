@@ -120,6 +120,14 @@ void run_retention(TarDatabase& db, int64_t now_epoch) {
     db.execute_sql("BEGIN TRANSACTION");
 
     for (const auto& src : capture_sources()) {
+        // #539: Skip retention for disabled sources. The configure docstring and
+        // user-manual promise that disabling a collector "leaves existing rows
+        // queryable." Without this guard, time-based retention drains hourly
+        // within 24h, daily within 31d, monthly within ~365d after disable —
+        // breaking the forensic-preservation use case. See issue #539.
+        auto enabled_key = std::format("{}_enabled", src.name);
+        if (db.get_config(enabled_key, "true") == "false")
+            continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);
             auto sql = retention_sql(table_name, now_epoch);
