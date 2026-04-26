@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR `tar.status` now emits per-source `paused_at`, `live_rows`,
+  `oldest_ts` (PR-A foundation, issue #547).** The `configure` action's
+  per-source enable/disable surface gained a transition timestamp:
+  flipping `<source>_enabled` from `true` → `false` records the
+  wall-clock seconds in `<source>_paused_at`, and the reverse
+  transition clears it to `"0"` (deliberately not unset — a missing
+  key would be ambiguous with "never paused"). Idempotent re-sets do
+  not advance the timestamp, so the dashboard's "paused since" column
+  reflects the actual operator action rather than the most recent
+  configure round-trip. `tar.status` now also emits one `live_rows`
+  and one `oldest_ts` line per source — the rendering data the
+  retention-paused dashboard list (PR-A) needs without a second
+  round-trip. The transition logic is extracted to a free function
+  `yuzu::tar::apply_source_enabled_transition()` in
+  `tar_aggregator.{hpp,cpp}` so the plugin and the regression tests
+  share one source of truth. Backwards-compatible: agents pre-PR-A
+  simply do not emit the new lines, and the dashboard renders `—` for
+  the missing fields.
+
 - **TAR query examples, test coverage, and implementer documentation
   (issue #60).** Two new pre-built `InstructionDefinition`s shipped
   in `content/definitions/tar_warehouse.yaml` directly answering the
