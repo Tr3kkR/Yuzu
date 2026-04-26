@@ -299,6 +299,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the only authorizing value `"1"`. The exact-match policy is the
   point — any future "be permissive" change to the gate would have to
   delete a test case and survive review.
+- **`tests/unit/test_tar_aggregator.cpp`** — new Catch2 suite (4 cases)
+  pinning the issue #539 retention guard. Reproduces the chaos-injector
+  CHAOS-2 scenario (48 hourly rows seeded across a 48h window centred
+  on the test's `now`, disable the source, run retention) and asserts
+  every row survives. Counter-tests pin that enabled sources still age
+  out, that re-enabling a disabled source resumes retention, and that
+  disabling one source does not pause retention on the others — so a
+  future refactor cannot turn the per-source guard into a global
+  switch without deleting a named test case. Adds
+  `agents/plugins/tar/src/tar_aggregator.cpp` to the TAR test
+  executable's source list (the existing tests are schema-registry-only
+  and did not exercise the rollup engine). Tests use
+  `yuzu::test::TempDbFile` per the shared-helper convention in
+  `tests/unit/test_helpers.hpp`.
+- **`tests/unit/test_tar_schema_registry.cpp`** — orphaned `lsof`
+  assertion fixed. The test on line 73 still expected the macOS TCP
+  capture-method accept-list to contain `"lsof"`, but commit
+  `5a41db5` corrected the registry to `"proc_pidfdinfo"` (matching
+  the actual collector `proc_listallpids` + `proc_pidfdinfo` via
+  libproc). The test was missed in that commit's update wave; this
+  closes the loop and includes a forward-pointer to the SHA in the
+  comment so a future code archaeologist can find the rationale.
 
 ## [0.11.0] - 2026-04-25
 
