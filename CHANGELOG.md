@@ -171,6 +171,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **`docs/tachyon-parity-plan.md`, `docs/capability-map.md`,
+  `docs/roadmap.md`: System Guardian recognised as the GS delivery
+  vehicle.** Today's parity doc claimed `PolicyStore + CEL + 6
+  trigger types` is equivalent to Tachyon's Guaranteed State — that
+  is a server-side compliance evaluation match, not a real-time
+  enforcement match. Tachyon's GS uses kernel-event-driven agent-side
+  enforcement (firewall, registry, services revert in milliseconds,
+  not on the next 5-minute poll), and that is the headline parity
+  feature operators evaluate against. The System Guardian work
+  (`docs/yuzu-guardian-design-v1.1.md`, agent-side `GuardianEngine`,
+  Windows-first 17-PR ladder in `docs/yuzu-guardian-windows-implementation-plan.md`)
+  is what closes that gap. PRs 1-2 already shipped (proto, server
+  store, agent scaffolding, `__guard__` dispatch hook); PR 3+ is the
+  rest of the ladder.
+  - **Parity doc**: Part 1 architecture row split into "server-side"
+    and "real-time agent-side enforcement" — only the first is
+    equivalent today; the second is in flight via Guardian. New gap
+    entry G14 calls Guardian out as the CRITICAL parity feature.
+    Priority matrix gains Phase 15 + Phase 16 rows; execution order
+    diagram and total-effort estimate updated. Part 5 capability-map
+    growth target raised from ~215 to ~225 to include the 10 new
+    System Guardian capabilities.
+  - **Capability map**: §16 title clarified to "Policy and Compliance
+    Engine (Server-Side Guaranteed State)" with a header note
+    explaining that real-time agent-side enforcement lives in §31. New
+    §31 "System Guardian — Real-Time Agent-Side Guaranteed State"
+    with 10 capabilities: Guardian Engine + wire protocol (Partial,
+    PRs 1-2 shipped), Windows event guards, condition guards, Linux
+    event guards, macOS event guards, state evaluator + remediation,
+    audit journal + server store (Partial, PR 1 shipped), pre-login
+    activation + offline capability (Done — service install side
+    operational), dashboard + approval workflow, rule signing +
+    quarantine integration. Totals adjusted: 166/225 done, 3 partial.
+  - **Roadmap**: new Phase 16 with three issues (16.A Windows, 16.B
+    Linux, 16.C macOS — gated on Windows soak; 16.C additionally
+    gated on Endpoint Security entitlement) filed as #555-#557.
+    Recommended execution order extends through Phase 16; total issue
+    count updated to 126.
 - **`docs/capability-map.md`: Phase 15 capabilities added (the WHAT).**
   Section 28 (Response Visualization) gained 28.4 TAR Dashboard Page,
   28.5 TAR Process Tree Viewer, 28.6 Retention Awareness Surface. New

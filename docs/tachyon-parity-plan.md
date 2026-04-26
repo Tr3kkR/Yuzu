@@ -18,7 +18,8 @@ This document analyzes 1e Tachyon 8.1 capabilities against Yuzu's current state 
 | **Content Definition** | XML with XSD schema, digital signing | YAML with `yuzu.io/v1alpha1` DSL, Ed25519 signing |
 | **Auth Model** | Windows AD (Kerberos), 2FA email | PBKDF2 sessions, OIDC/PKCE, API tokens, mTLS |
 | **Content Delivery** | Background Channel (HTTPS) + Nomad P2P | HTTP content staging + execution |
-| **Policy Engine** | Guaranteed State (SCALE-based check/fix) | PolicyStore with CEL expressions + triggers |
+| **Policy Engine — Server side** | Guaranteed State (SCALE-based check/fix) | PolicyStore with CEL expressions + triggers |
+| **Policy Engine — Real-time agent-side enforcement** | Guaranteed State (kernel-event-driven enforcement, pre-login activation, offline-capable) | **System Guardian** — agent-side guard engine using kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS). PRs 1-2 shipped (proto, server store, agent scaffolding); PR 3+ in flight per `docs/yuzu-guardian-windows-implementation-plan.md`. Phase 16 of the roadmap. |
 | **API** | Consumer API (.NET SDK) | REST API v1 (70+ endpoints) + gRPC + MCP |
 | **Dashboard** | ASP.NET web portal | HTMX server-rendered + SSE |
 | **DMZ Support** | Dedicated DMZ Server (Response Stack) | Gateway node (Erlang, can be DMZ-deployed) |
@@ -88,7 +89,7 @@ These Tachyon features have functional equivalents in Yuzu that are as good or b
 | File operations | `filesystem` plugin (17 actions) |
 | Registry | `registry` plugin (CRUD + per-user) |
 | WMI | `wmi` plugin (query + instance) |
-| Policy engine | PolicyStore + CEL + 6 trigger types |
+| Policy engine — server-side compliance | PolicyStore + CEL + 6 trigger types (poll-based desired-state evaluation; this is the *server* half of guaranteed state — see "Major Gaps" G14 for the agent-side real-time half delivered by System Guardian) |
 | Compliance dashboard | Fleet/policy/agent drill-down |
 | Agent-side storage | `storage` plugin (SQLite KV) |
 | Triggers | 7 types (interval, file, dir, service, eventlog, registry, startup) |
@@ -152,6 +153,7 @@ These are significant capability areas not represented in Yuzu's capability map 
 | G11 | **Branding / White-Label** | Custom logos, colors, names in dashboard | LOW — enterprise customization |
 | G12 | **Process/Provider/Sync Logging** | Separate log views for sync jobs, provider operations, infrastructure | LOW — operational visibility |
 | G13 | **Multi-Database Architecture** | Separate databases for responses, catalog, inventory, SLA, BI | MEDIUM — scale separation |
+| G14 | **System Guardian — Real-Time Agent-Side Guaranteed State** | Tachyon's flagship: kernel-event-driven enforcement on Windows (RegNotifyChangeKeyValue, ETW, WFP, SCM), Linux (inotify, netlink, D-Bus, sysctl, audit), macOS (Endpoint Security, fseventsd, launchd). Pre-login activation. Fully offline-capable. Millisecond-level enforcement for event-driven rules. Auditable journal of every detection and remediation. **In flight** — PRs 1-2 shipped (proto, `guaranteed_state_store`, agent `GuardianEngine` scaffolding, `__guard__` dispatch hook); PR 3+ pending per `docs/yuzu-guardian-windows-implementation-plan.md`. PolicyStore alone does *not* deliver this — its 5-minute poll cycle is unacceptable for "this setting must never be in a non-compliant state" use cases (firewall ports, registry-backed security settings, EDR process always-running). Guardian is the agent-side primitive that closes that gap. | **CRITICAL** — this is the headline parity feature for enterprise endpoint management |
 
 ---
 
@@ -571,6 +573,8 @@ This is the closest Yuzu can get to Tachyon's SCALE language without building an
 | **12: Agent Caps** | MEDIUM | Medium | LOW-MEDIUM | Completes capability map to 184/184 |
 | **13: Polish** | MEDIUM | Medium | MEDIUM | Security + operational maturity |
 | **14: Scale** | LOW | Large | HIGH (at scale) | Only needed for 100K+ deployments |
+| **15: TAR Dashboard & Scope Walking** | HIGH | Medium | HIGH | Composable scope is Yuzu's product differentiator; Tachyon has no equivalent — TAR page also unifies retention awareness and process-tree forensics |
+| **16: System Guardian** | **CRITICAL** | Large | **CRITICAL** | **The headline Tachyon parity feature** — real-time agent-side guaranteed state. Without this, "policy engine equivalent" is an overclaim. PR ladder defined; first 2 PRs shipped. |
 
 ### Recommended Execution Order
 
@@ -588,25 +592,31 @@ Phase 11 (Consumer) ────────── 1 sprint ──── Platfor
 Phase 13 (Polish) ──────────── 1 sprint ──── Security + UX
     │
 Phase 14 (Scale) ───────────── 2 sprints ─── Large deployment readiness
+    │
+Phase 15 (TAR + Scope Walking) ─ 2 sprints ─ Product differentiator (composable scope)
+    │
+Phase 16 (System Guardian) ──── 4-6 sprints ─ THE headline parity feature; PRs 1-2 done, PRs 3-17 in ladder
 ```
 
-**Total estimated effort: ~9 sprints (Phases 8-14)**
+**Total estimated effort: ~15-17 sprints (Phases 8-16). Phase 16 is the longest single phase because real-time agent-side enforcement spans three OS platform-specific delivery tracks (Windows-first per `docs/yuzu-guardian-windows-implementation-plan.md`, then Linux, then macOS) and each kernel-event API integration is independently load-bearing.**
 
 ---
 
 ## Part 5: New Capability Map Entries
 
-After all phases complete, the capability map would grow from 184 to ~215 capabilities:
+After all phases complete, the capability map would grow from 184 to ~225 capabilities:
 
 | New Domain | Capabilities |
 |-----------|-------------|
 | 25. Connector Framework | Connector CRUD, Sync Engine, Connection Testing, Sync Scheduling, Sync Logging |
 | 26. Inventory Repositories | Repository CRUD, Consolidation, Deduplication, Normalization, Multi-Source Merge |
 | 27. Software Catalog | Catalog Store, Software Normalization, AI Curation (stub), Usage Tracking, License Entitlements |
-| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management |
+| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management, **TAR Dashboard Page** (Phase 15.A — Partial), **TAR Process Tree Viewer** (Phase 15.H), **Retention Awareness Surface** (Phase 15.A) |
 | 29. Consumer Applications | Consumer Registration, Rate Limiting, Data Offloading, Custom Data |
+| **30. Scope Walking & Result Sets** | Result Set Persistence and Lineage (15.B), Composable Scope from Previous Query (15.C), YAML DSL `fromResultSet:` (15.E), Operational Hardening (15.G) |
+| **31. System Guardian — Real-Time Agent-Side Guaranteed State** | Kernel-event-driven enforcement primitives, event guards (Registry / SCM / WFP / ETW / inotify / netlink / D-Bus / Endpoint Security), condition guards (process / software / compliance / WMI), pre-login activation, offline-capable cached policy, audit journal, dashboard, push protocol, signing, quarantine integration |
 
-Plus the 19 existing "Not Started" items moved to "Done" = **~215 total, all done**.
+Plus the 19 existing "Not Started" items moved to "Done" = **~225 total, all done**.
 
 ---
 
