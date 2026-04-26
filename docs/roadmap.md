@@ -131,6 +131,9 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
 | | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
 | | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
+| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** (PRs 1-2 shipped) |
+| | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open (gated on 16.A soak) |
+| | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
 
 ## Current Status
 
@@ -152,7 +155,8 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 13: Security Hardening & Operational Polish | 0 | 5 | 5 | 0% |
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
 | 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
-| **Total** | **72** | **51** | **123** | **59%** |
+| 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
+| **Total** | **72** | **54** | **126** | **57%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -1558,6 +1562,47 @@ Data quality depends on the agent running from boot/install and being tamper-res
 
 ---
 
+## Phase 16: System Guardian — Real-Time Agent-Side Guaranteed State
+
+*The headline parity feature against 1E Tachyon. PolicyStore (Phase 5) covers server-side compliance evaluation on a 5-minute poll; this phase covers the **kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable** agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — a 5-minute window is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: `docs/yuzu-guardian-design-v1.1.md` (architecture), `docs/yuzu-guardian-windows-implementation-plan.md` (Windows-first 17-PR delivery ladder).*
+
+### Issue 16.A: System Guardian — Windows-first delivery
+**Capability:** 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | **Scope:** Agent (Windows) + Server | **Status:** In progress (PRs 1-2 shipped)
+**GitHub:** [#555](https://github.com/Tr3kkR/Yuzu/issues/555)
+
+End-to-end Windows enforcement using kernel-backed user-mode APIs:
+- **Event guards (~0 ms latency)** — RegNotifyChangeKeyValue (Registry Guard), NotifyServiceStatusChange (SCM Guard), FwpmFilterSubscribeChanges0 (WFP Guard), OpenTrace + ProcessTrace with session pooling (ETW Guard).
+- **Condition guards (configurable interval)** — Process Guard (hybrid ETW + ToolHelp32), Software Guard (Registry Uninstall + WMI), Compliance Guard (Event Log + WMI), WMI Guard (arbitrary query).
+- **Pre-login activation** — agent service `SERVICE_AUTO_START` + `FailureActions`; `GuardianEngine::start_local()` runs before Register RPC.
+- **Offline capable** — policy cached in `kv_store.db` `__guardian__` namespace; enforcement continues when server is unreachable.
+- **Operator surface** — `/guaranteed-state` dashboard page (rule list + event timeline + kernel-wiring health), HTMX rule editor, approval workflow via existing `ApprovalManager`, MCP read-only tools, HMAC rule signing with `CredWrite`/`CredRead` key storage, quarantine integration via WFP block-all filter at weight 65535.
+
+PRs 1-2 (proto, server store, agent scaffolding, REST + dispatch hook) shipped. PRs 3-15 in `docs/yuzu-guardian-windows-implementation-plan.md`. 14 prerequisite issues already filed (#452-#457, #477-#479, #483, #485, #487, #488, #491).
+
+**Files (anticipated):** `proto/yuzu/guardian/v1/guaranteed_state.proto` (shipped), `server/core/src/guaranteed_state_store.{hpp,cpp}` (shipped), `agents/core/src/guardian_engine.{hpp,cpp}` (shipped), `agents/core/src/guard_*.{hpp,cpp}` (PR 3+), `agents/core/src/state_evaluator.{hpp,cpp}`, `agents/core/src/remediation_engine.{hpp,cpp}`, `agents/core/src/guard_audit.{hpp,cpp}`, `server/core/src/dashboard_guaranteed_state.{hpp,cpp}` (PR 4).
+
+### Issue 16.B: System Guardian — Linux delivery
+**Capability:** 31.4, 31.6 (Linux) | **Scope:** Agent (Linux) | **Status:** Open
+**Depends on:** 16.A soak | **GitHub:** [#556](https://github.com/Tr3kkR/Yuzu/issues/556)
+
+Linux equivalents of Windows event guards: Inotify Guard (`inotify_add_watch`), Netlink Guard (`NETLINK_KOBJECT_UEVENT`), D-Bus Guard (`org.freedesktop.systemd1` signals), Audit Guard (`auditd` consumer for syscall-level assertions), Sysctl Guard (`/proc/sys` watch + write remediation). Linux-specific assertion types (`config-file-key-equals`, `kernel-param-equals`, `selinux-mode-enforcing`). Remediation methods: systemd D-Bus service control, atomic file rewrite, `sysctl -w`, package install/remove via dpkg/rpm.
+
+**Why gated on Windows soak:** the architectural primitives (state evaluator, remediation engine, resilience strategies, audit journal) are platform-agnostic — only the guard implementations are platform-specific. Building Linux before Windows soak risks discovering a primitive-level bug that the Windows track would have caught first.
+
+**Files:** new `agents/core/src/guard_inotify.{cpp,hpp}`, `guard_netlink.{cpp,hpp}`, `guard_dbus.{cpp,hpp}`, `guard_audit_linux.{cpp,hpp}`, `guard_sysctl.{cpp,hpp}` (all Linux-only); `agents/core/meson.build` Linux block adding `libdbus-1`, `libaudit` deps.
+
+### Issue 16.C: System Guardian — macOS delivery
+**Capability:** 31.5, 31.6 (macOS) | **Scope:** Agent (macOS) | **Status:** Open
+**Depends on:** 16.A + 16.B soak, Endpoint Security entitlement | **GitHub:** [#557](https://github.com/Tr3kkR/Yuzu/issues/557)
+
+macOS equivalents using Apple's Endpoint Security (ES) framework — *requires the `com.apple.developer.endpoint-security.client` entitlement*, which Apple grants per-bundle-ID after Developer Program enrolment and notarisation review (typically 4-8 weeks). Without ES the macOS surface is reduced to FSEvents Guard (`fseventsd` consumer) + Launchd Guard (plist polling + `launchctl` poll). macOS-specific assertion types (`plist-key-equals`, `launchd-service-running`, `xprotect-version-current`, `gatekeeper-enabled`). Remediation: plist serialisation + atomic write, `launchctl bootstrap`/`bootout`, `spctl --master-enable`.
+
+**Entitlement gating** is tracked out-of-band in the customer-facing release-readiness doc; the issue ships in two phases — degraded surface first (FSEvents + Launchd, no ES), full surface when entitlement lands.
+
+**Files:** new `agents/core/src/guard_endpoint_security.{cpp,hpp}` (macOS, ES-entitlement-gated), `guard_fsevents.{cpp,hpp}` (macOS), `guard_launchd.{cpp,hpp}` (macOS).
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -1651,6 +1696,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 6. **Phase 13** — Security hardening & polish (2FA, branding, MCP write tools)
 7. **Phase 14** — Scale & enterprise readiness (P2P, multi-gateway, HA — large deployment needs)
 8. **Phase 15** — TAR dashboard + scope walking (composable scope from previous query results — the product differentiator). 8-step PR ladder; PR-A (TAR page + retention-paused list) is in flight. Full design in `docs/tar-dashboard.md` and `docs/scope-walking-design.md`. Reference walkthrough: Chrome IR.
+9. **Phase 16** — System Guardian (real-time agent-side guaranteed state). The headline parity feature against 1E Tachyon. Windows-first 17-PR ladder per `docs/yuzu-guardian-windows-implementation-plan.md`; PRs 1-2 shipped, PR 3+ open. Linux + macOS phases gated on Windows soak. Without this phase, "policy engine equivalent" overclaims.
 
 ---
 
@@ -1674,6 +1720,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
 | 15: TAR Dashboard & Scope Walking | 8 | 8 |
-| **Total** | **123** | **149** |
+| 16: System Guardian (Real-Time GS) | 3 | 10 |
+| **Total** | **126** | **159** |
 
 Plus 4 future-tier items tracked but not scheduled. The remaining capabilities are covered by existing "Done" implementations.
