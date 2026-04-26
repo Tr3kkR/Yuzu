@@ -123,6 +123,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
+| **15** | 15.A | TBD | TAR dashboard page shell + retention-paused source list | **In progress** |
+| | 15.B | TBD | Result-set store + REST API (composable scope, the differentiator) | Open |
+| | 15.C | TBD | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
+| | 15.D | TBD | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
+| | 15.E | TBD | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | Open |
+| | 15.F | TBD | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
+| | 15.G | TBD | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
+| | 15.H | TBD | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
 
 ## Current Status
 
@@ -143,7 +151,8 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 12: Remaining Agent Capabilities | 0 | 13 | 13 | 0% |
 | 13: Security Hardening & Operational Polish | 0 | 5 | 5 | 0% |
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
-| **Total** | **72** | **43** | **115** | **63%** |
+| 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
+| **Total** | **72** | **51** | **123** | **59%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -1480,6 +1489,75 @@ Active-passive failover for server resilience:
 
 ---
 
+## Phase 15: TAR Dashboard & Scope Walking
+
+*The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated TAR page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in `docs/scope-walking-design.md` §10.*
+
+### Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List
+**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** In progress
+
+New `/dashboard/tar` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `tar.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/tar/src/tar_plugin.cpp`, new `tests/unit/server/test_tar_dashboard_*`. Design: `docs/tar-dashboard.md` §3.
+
+### Issue 15.B: Result-Set Store + REST API
+**Capability:** new (foundational) | **Scope:** Server | **Status:** Open
+
+`result_set_store.cpp` with new `result_sets.db`. Schema per `docs/scope-walking-design.md` §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: `POST /api/v1/result-sets`, `from-inventory-query`, `from-tar-query`, `from-instruction-result`, `GET .../{id}`, `.../{id}/members`, `.../{id}/lineage`, `pin` / `unpin` / `re-eval`, `DELETE`. Audit hooks per §9.
+
+**Files:** new `server/core/src/result_set_store.{cpp,hpp}`, new `server/core/src/result_set_routes.cpp`, `migration_runner.cpp`. Design: `docs/scope-walking-design.md` §3, §6, §9.
+
+### Issue 15.C: Scope Engine `from_result_set:` + Dashboard Chip + Sidebar + Breadcrumb
+**Capability:** 1.6 (extension) | **Scope:** Server | **Status:** Open
+**Depends on:** 15.B
+
+Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circuit kind alongside `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT`. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors `parent_id` walks; scope chip surfaces in TAR / inventory / instruction frames.
+
+**Files:** `server/core/src/scope_engine.{cpp,hpp}`, `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`. Design: `docs/scope-walking-design.md` §4, §8.
+
+### Issue 15.D: TAR SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 15.A, 15.B, 15.C
+
+Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wire scope-chip resolution to `from_result_set:` (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with `source_kind=tar_query`, members = union of agents that returned ≥1 row by default. Default name is `tar-<5-char-sql-hash>`.
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/agent_service_impl.cpp` (TAR result envelope to carry the producing agent IDs explicitly). Design: `docs/tar-dashboard.md` §4.
+
+### Issue 15.E: YAML DSL `fromResultSet:` + `definition_store` Validation + Spec Amendment
+**Capability:** new | **Scope:** Server (DSL) | **Status:** Open
+**Depends on:** 15.B, 15.C
+
+`scope:` block in `InstructionDefinition`, `InstructionSet`, `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) form. Validation: `fromResultSet + assignment.managementGroups` rejected at YAML load; `fromResultSet` requires `assignment.mode = static`. Resolution at instruction *invocation* time, not load time. Spec section in `docs/yaml-dsl-spec.md`.
+
+**Files:** `server/core/src/definition_store.cpp`, `server/core/src/policy_store.cpp`, `docs/yaml-dsl-spec.md`. Design: `docs/scope-walking-design.md` §7.
+
+### Issue 15.F: Reference Walkthrough — Chrome IR End-to-End Integration Test
+**Capability:** new (regression net) | **Scope:** Tests | **Status:** Open
+**Depends on:** 15.B, 15.C, 15.D, 15.E
+
+`tests/integration/test_chrome_ir_chain.cpp` drives the full §10 walkthrough against a live UAT stack with synthetic agents. Asserts: each step's audit row carries `parent_result_set_id` and `result_result_set_id`; the resulting lineage chain is complete; pinning prevents mid-incident GC; the final un-quarantine + watch step terminates cleanly. The reference test for end-to-end correctness — when this passes, scope walking is real.
+
+**Files:** `tests/integration/test_chrome_ir_chain.cpp`, supporting fixtures in `scripts/uat/synthetic-fleet.sh`. Design: `docs/scope-walking-design.md` §10.
+
+### Issue 15.G: Operational Hardening — Live Re-Eval, GC Sweep, Prometheus + Audit Polish
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 15.B
+
+Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep every 5 min; per-operator 10K result-set quota + 50 pin cap with `429 RESULT_SET_QUOTA` / `409 PIN_LIMIT`; Prometheus metrics (`yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram, GC counter, quota-rejection counter); audit polish on every state transition.
+
+**Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
+
+### Issue 15.H: TAR Process Tree Viewer
+**Capability:** new (forensic) | **Scope:** TAR plugin + Server (renderer) | **Status:** Open (gated on agent service-install hardening readiness)
+
+`tar.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `tar_plugin.cpp` `load_redaction_patterns`.
+
+Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder (`docs/yuzu-guardian-windows-implementation-plan.md` and successors). The viewer ships with honest "observation window" badging; the hardening track does not block this issue.
+
+**Files:** `agents/plugins/tar/src/tar_plugin.cpp` (new `do_process_tree`), new `agents/plugins/tar/src/tar_process_tree_collector.{cpp,hpp}` (cross-platform walks), `server/core/src/dashboard_routes.cpp` (renderer), new `server/core/src/tar_process_tree_reconstruct.{cpp,hpp}`. Design: `docs/tar-dashboard.md` §5.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -1572,6 +1650,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 5. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12)
 6. **Phase 13** — Security hardening & polish (2FA, branding, MCP write tools)
 7. **Phase 14** — Scale & enterprise readiness (P2P, multi-gateway, HA — large deployment needs)
+8. **Phase 15** — TAR dashboard + scope walking (composable scope from previous query results — the product differentiator). 8-step PR ladder; PR-A (TAR page + retention-paused list) is in flight. Full design in `docs/tar-dashboard.md` and `docs/scope-walking-design.md`. Reference walkthrough: Chrome IR.
 
 ---
 
@@ -1594,6 +1673,7 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 | 12: Agent Capabilities | 13 | 13 |
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
-| **Total** | **115** | **141** |
+| 15: TAR Dashboard & Scope Walking | 8 | 8 |
+| **Total** | **123** | **149** |
 
 Plus 4 future-tier items tracked but not scheduled. The remaining capabilities are covered by existing "Done" implementations.

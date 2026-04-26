@@ -171,6 +171,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **New `docs/tar-dashboard.md` + `docs/scope-walking-design.md`
+  (Phase 15 design — see `docs/roadmap.md` Phase 15 PR ladder).** Two
+  rigorous design documents covering (a) a dedicated TAR dashboard
+  page with three frames — retention-paused source list, scope-walking-
+  aware ad-hoc SQL, and process tree viewer reconstructed from
+  `process_live` seed + events — and (b) the cross-cutting
+  composable-scope-from-previous-query primitive that is Yuzu's
+  product differentiator. Result-set storage schema (immutable
+  lineage edges, TTL with pin override, source payload JSON for live
+  re-eval), Scope Engine `from_result_set:<id>` short-circuit kind,
+  REST API, YAML DSL `fromResultSet:` surface, dashboard sidebar +
+  breadcrumb, audit chain. Reference walkthrough is the Chrome
+  incident-response scenario — operator iteratively narrows from
+  `__all__` → all-windows → windows-chrome → windows-chrome-bad-hash
+  → windows-chrome-compromised → quarantine + remediate +
+  un-quarantine + heightened-IOC watch, with every step's audit row
+  carrying `parent_result_set_id` and `result_result_set_id` so
+  forensic reconstruction shows the full reasoning chain.
+  `CLAUDE.md` routed-concerns table gains pointers to both docs;
+  `docs/roadmap.md` gains Phase 15 (8 issues, 15.A–15.H) with the
+  PR ladder explicit. PR-A (TAR page shell + retention-paused list)
+  is the first slice and is in progress.
 - **New `docs/tar-implementer.md` (issue #60).** The implementer-facing
   companion to `docs/user-manual/tar.md`, covering: TAR as a
   forensics + inventory capability (and what TAR is *not*); the
