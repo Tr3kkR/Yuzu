@@ -119,6 +119,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -618,9 +619,16 @@ public:
 
             if (!cfg_.mgmt_tls_server_cert.empty() || !cfg_.mgmt_tls_server_key.empty() ||
                 !cfg_.mgmt_tls_ca_cert.empty()) {
-                auto mgmt_tls =
-                    build_tls_credentials(cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key,
-                                          cfg_.mgmt_tls_ca_cert, true, "management listener");
+                // The management listener is governed by the SAME insecure-TLS gate
+                // as the agent listener (issue #79 / C-79-1). An operator who supplies
+                // --management-cert/--management-key without --management-ca-cert must
+                // also pass --insecure-skip-client-verify (which itself requires
+                // YUZU_ALLOW_INSECURE_TLS=1) — otherwise build_tls_credentials refuses.
+                // Previously this was hardcoded `true`, which silently accepted any
+                // unauthenticated peer on the management plane.
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key,
+                    cfg_.mgmt_tls_ca_cert, cfg_.allow_one_way_tls, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
                     return;
@@ -774,11 +782,16 @@ public:
             spdlog::info("Fleet health recomputation thread stopped");
         });
 
-        // Periodic reminder when client cert verification is disabled (issue #79).
-        // Logs at ERROR level every 5 minutes to ensure operators monitoring logs
-        // notice the degraded posture even after the startup banner has scrolled off.
-        if (cfg_.tls_enabled && cfg_.allow_one_way_tls) {
-            insecure_tls_reminder_thread_ = std::thread([this]() {
+        // Periodic reminder when TLS is disabled or weakened (issue #79 + C-79
+        // family). Logs at ERROR level every 5 minutes AND writes an audit event
+        // so SOC 2 CC7.2 evidence is collected for the duration the server runs
+        // in a degraded posture (otherwise spdlog-only output would not survive
+        // log rotation or land in audit.db).
+        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
+        const bool no_tls_active = !cfg_.tls_enabled;
+        if (insecure_skip_verify_active || no_tls_active) {
+            insecure_tls_reminder_thread_ = std::thread([this, insecure_skip_verify_active,
+                                                        no_tls_active]() {
                 using namespace std::chrono_literals;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
@@ -788,10 +801,28 @@ public:
                     }
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
-                    spdlog::error("[INSECURE-TLS] Agent listener still running without "
-                                  "client certificate verification "
-                                  "(--insecure-skip-client-verify). Re-enable mTLS "
-                                  "by supplying --ca-cert.");
+                    const char* posture = no_tls_active ? "--no-tls"
+                                                        : "--insecure-skip-client-verify";
+                    const char* detail =
+                        no_tls_active
+                            ? "TLS is fully disabled; both agent and management gRPC "
+                              "listeners accept plaintext from any peer with no encryption "
+                              "and no peer authentication. Restart with TLS certificates "
+                              "to leave this posture."
+                            : "Agent / management listener still running without client "
+                              "certificate verification. Re-enable mTLS by supplying "
+                              "--ca-cert (and --management-ca-cert if applicable).";
+                    spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
+                    if (audit_store_ && audit_store_->is_open()) {
+                        audit_store_->log({.timestamp = std::time(nullptr),
+                                           .principal = "system",
+                                           .principal_role = "system",
+                                           .action = "server.tls_degraded",
+                                           .target_type = "server",
+                                           .target_id = posture,
+                                           .detail = detail,
+                                           .result = "warning"});
+                    }
                 }
             });
         }
