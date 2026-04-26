@@ -123,14 +123,14 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
-| **15** | 15.A | TBD | TAR dashboard page shell + retention-paused source list | **In progress** |
-| | 15.B | TBD | Result-set store + REST API (composable scope, the differentiator) | Open |
-| | 15.C | TBD | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
-| | 15.D | TBD | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
-| | 15.E | TBD | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | Open |
-| | 15.F | TBD | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
-| | 15.G | TBD | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
-| | 15.H | TBD | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **In progress** |
+| | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | Open |
+| | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
+| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
+| | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | Open |
+| | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
+| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
+| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
 
 ## Current Status
 
