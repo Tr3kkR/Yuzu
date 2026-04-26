@@ -5,7 +5,9 @@
 /// Extracted here for testability.
 
 #include <cstddef>
+#include <cstdio>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -36,6 +38,46 @@ inline std::string base64_decode(const std::string& in) {
         if (bits >= 0) {
             out += static_cast<char>((val >> bits) & 0xFF);
             bits -= 8;
+        }
+    }
+    return out;
+}
+
+/// Escape JSON metacharacters in a string so the result is safe to embed
+/// inside a JSON string literal. Used in particular for HTMX `hx-vals`
+/// attributes — the browser un-HTML-escapes the attribute value *before*
+/// HTMX's JSON parser sees it, so a `"` in any value (after `html_escape`
+/// becomes `&quot;`, which the browser un-escapes to `"`) would otherwise
+/// close the JSON string and inject keys into the form. The correct
+/// pattern is JSON-escape FIRST, then HTML-escape the result, so the
+/// surrounding html_escape on the JSON-attribute literal is safe.
+///
+/// Caller is responsible for the final html_escape pass; this function
+/// only addresses JSON metacharacters and C0 control bytes per RFC 8259.
+/// Multi-byte UTF-8 sequences pass through unchanged — JSON does not
+/// require U+2028/U+2029 escaping unless the parser is JS `eval`, which
+/// is not the case here.
+inline std::string json_escape(std::string_view in) {
+    std::string out;
+    out.reserve(in.size() + 4);
+    for (char c : in) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x",
+                              static_cast<unsigned char>(c));
+                out += buf;
+            } else {
+                out += c;
+            }
         }
     }
     return out;

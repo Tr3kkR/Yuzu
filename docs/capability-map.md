@@ -1079,7 +1079,7 @@ Not implemented. Configure external HTTP endpoints to receive response data in r
 
 ### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
 
-In progress (Phase 15.A and 15.D). A dedicated `/dashboard/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the process tree viewer. The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+In progress (Phase 15.A and 15.D). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the process tree viewer. The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
 
 ### 28.5 TAR Process Tree Viewer :x: `T2`
 

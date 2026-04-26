@@ -108,6 +108,96 @@ TEST_CASE("html_escape: already-escaped text gets double-escaped", "[web_utils][
     REQUIRE(html_escape("&amp;") == "&amp;amp;");
 }
 
+// ── json_escape (Phase 15.A — issue #547, hardening round 3) ───────────────
+//
+// json_escape is the defense against the HTMX hx-vals JSON-injection vector.
+// The browser un-HTML-escapes the attribute value *before* HTMX's JSON
+// parser sees it, so the correct ordering for a JSON-string-in-HTML-
+// attribute is `json_escape` FIRST, `html_escape` SECOND. These tests pin
+// the JSON-escape half — corruption in either direction silently re-opens
+// sec-M3 from the Gate 2 governance review.
+
+TEST_CASE("json_escape: empty string", "[web_utils][json][issue547]") {
+    REQUIRE(json_escape("") == "");
+}
+
+TEST_CASE("json_escape: plain ASCII unchanged", "[web_utils][json][issue547]") {
+    REQUIRE(json_escape("agent-abc-123") == "agent-abc-123");
+    REQUIRE(json_escape("Hello, world! 0123456789")
+            == "Hello, world! 0123456789");
+}
+
+TEST_CASE("json_escape: double-quote escapes to backslash-quote",
+          "[web_utils][json][issue547]") {
+    // The exact sec-M3 vector — a `"` in device_id would otherwise close
+    // the JSON string in an hx-vals='{"device_id":"..."}' attribute and
+    // inject keys that the operator's browser would submit on Re-enable.
+    REQUIRE(json_escape("a\"b") == "a\\\"b");
+    REQUIRE(json_escape("\"") == "\\\"");
+    REQUIRE(json_escape("evil\",\"cmd\":\"exec")
+            == "evil\\\",\\\"cmd\\\":\\\"exec");
+}
+
+TEST_CASE("json_escape: backslash escapes to double-backslash",
+          "[web_utils][json][issue547]") {
+    REQUIRE(json_escape("\\") == "\\\\");
+    REQUIRE(json_escape("a\\b") == "a\\\\b");
+}
+
+TEST_CASE("json_escape: named escapes for \\b \\f \\n \\r \\t",
+          "[web_utils][json][issue547]") {
+    REQUIRE(json_escape("\b") == "\\b");
+    REQUIRE(json_escape("\f") == "\\f");
+    REQUIRE(json_escape("\n") == "\\n");
+    REQUIRE(json_escape("\r") == "\\r");
+    REQUIRE(json_escape("\t") == "\\t");
+    REQUIRE(json_escape("line1\nline2\tcol") == "line1\\nline2\\tcol");
+}
+
+TEST_CASE("json_escape: C0 control bytes encode as \\u00xx",
+          "[web_utils][json][issue547]") {
+    // A malicious agent registering with `device_id` containing
+    // 0x00-0x1F could log-inject if downstream sinks didn't escape.
+    // json_escape is one of the layers; verify every C0 byte that
+    // doesn't have a named escape produces \u00xx.
+    REQUIRE(json_escape(std::string{static_cast<char>(0x00)}) == "\\u0000");
+    REQUIRE(json_escape(std::string{static_cast<char>(0x01)}) == "\\u0001");
+    REQUIRE(json_escape(std::string{static_cast<char>(0x1f)}) == "\\u001f");
+    // Bytes 0x08 (\b), 0x09 (\t), 0x0a (\n), 0x0c (\f), 0x0d (\r) take
+    // the named form, verified by the prior test — not duplicated here.
+}
+
+TEST_CASE("json_escape: bytes 0x20 and above pass through unchanged",
+          "[web_utils][json][issue547]") {
+    REQUIRE(json_escape(std::string{static_cast<char>(0x20)}) == " ");
+    REQUIRE(json_escape(std::string{static_cast<char>(0x7e)}) == "~");
+    // High-bit bytes (UTF-8 continuation, etc.) pass through. JSON does
+    // not require U+2028 / U+2029 escaping outside `eval`-style contexts.
+    REQUIRE(json_escape(std::string{static_cast<char>(0xc3),
+                                     static_cast<char>(0xa9)}) ==
+            std::string{static_cast<char>(0xc3),
+                         static_cast<char>(0xa9)});
+}
+
+TEST_CASE("json_escape: result is safe to surround with html_escape",
+          "[web_utils][json][issue547]") {
+    // The full PR-A pipeline is `html_escape(json_escape(value))`. After
+    // browser un-HTML-escape the attribute value reads back as the
+    // json_escape output, which the JSON parser handles correctly.
+    auto value = std::string{"\"\\\n"};
+    auto js   = json_escape(value);
+    auto html = html_escape(js);
+    // The html-escaped form must contain no bare " (would close the
+    // attribute), no bare < / > (would break HTML parser), no bare &
+    // (would corrupt entity decode beyond the ones we emitted).
+    REQUIRE(html.find('"') == std::string::npos);
+    REQUIRE(html.find('<') == std::string::npos);
+    REQUIRE(html.find('>') == std::string::npos);
+    // And the raw JSON-escape output is the parseable JSON literal we
+    // expect: \"\\\n
+    REQUIRE(js == "\\\"\\\\\\n");
+}
+
 // ── url_decode ──────────────────────────────────────────────────────────────
 
 TEST_CASE("url_decode: plain text unchanged", "[web_utils][url]") {
