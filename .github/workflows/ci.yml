@@ -118,6 +118,15 @@ jobs:
       matrix:
         compiler: [gcc-13, clang-19]
         build_type: [debug, release]
+        include:
+          # `compact_compiler` is the cache-key form (no hyphen) — keeps
+          # cache keys consistent with the sibling sanitizer/coverage jobs
+          # which were always written `gcc13`. Mismatch caused a parallel
+          # cache entry that thrashed the GHA 10 GB cap. See issue #569.
+          - compiler: gcc-13
+            compact_compiler: gcc13
+          - compiler: clang-19
+            compact_compiler: clang19
         exclude:
           # PRs: only gcc-13 debug (fast feedback)
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
@@ -141,10 +150,10 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          key: ccache-linux-${{ matrix.compact_compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
-            ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-
-            ccache-linux-${{ matrix.compiler }}-
+            ccache-linux-${{ matrix.compact_compiler }}-${{ matrix.build_type }}-
+            ccache-linux-${{ matrix.compact_compiler }}-
 
       - name: Reset ccache stats
         run: ccache -z
@@ -160,9 +169,9 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-x64-linux-${{ matrix.compact_compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-x64-linux-${{ matrix.compiler }}-
+            vcpkg-x64-linux-${{ matrix.compact_compiler }}-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
