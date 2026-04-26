@@ -171,6 +171,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **`docs/capability-map.md`: Phase 15 capabilities added (the WHAT).**
+  Section 28 (Response Visualization) gained 28.4 TAR Dashboard Page,
+  28.5 TAR Process Tree Viewer, 28.6 Retention Awareness Surface. New
+  Section 30 (Scope Walking & Result Sets) covers 30.1 Result Set
+  Persistence and Lineage, 30.2 Composable Scope from Previous Query,
+  30.3 YAML DSL `fromResultSet:` Surface, 30.4 Result Set Operational
+  Hardening. Progress totals adjusted: 165 done / 215 total / 1 partial
+  (15.A is in flight, marked `:large_orange_diamond:`); the rest are
+  honestly `:x:` Not Started. The capability map now describes what we
+  will do; the roadmap's Phase 15 PR ladder describes how we will get
+  there. Phase 15 issues filed on GitHub as #547 (15.A) through #554
+  (15.H); the roadmap's "TBD" entries replaced with the issue links.
 - **New `docs/tar-dashboard.md` + `docs/scope-walking-design.md`
   (Phase 15 design — see `docs/roadmap.md` Phase 15 PR ladder).** Two
   rigorous design documents covering (a) a dedicated TAR dashboard

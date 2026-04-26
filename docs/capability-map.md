@@ -30,9 +30,9 @@ Each capability is rated on two axes:
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
 Future       [====================------------]  31/50 done  (62%)
-New (Ph 8-14)[----------------------------]     0/24 done   (0%)
+New (Ph 8-15)[----------------------------]     0/31 done   (0%) (1 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   165/208 done (79%)
+Overall      [======================---------]   165/215 done (77%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -64,9 +64,10 @@ Overall      [======================---------]   165/208 done (79%)
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
 | 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 3 | 0 | 0 | 3 |
+| 28. Response Visualization | 6 | 0 | 1 | 5 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
-| **TOTAL** | **208** | **165** | **0** | **43** |
+| 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
+| **TOTAL** | **215** | **165** | **1** | **49** |
 
 ---
 
@@ -1075,6 +1076,18 @@ Not implemented. Named response view configurations (column selection, sort orde
 
 Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.
 
+### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
+
+In progress (Phase 15.A and 15.D). A dedicated `/dashboard/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the process tree viewer. The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+
+### 28.5 TAR Process Tree Viewer :x: `T2`
+
+Not implemented (Phase 15.H). Reconstructs the per-device process tree from `process_live` — a seed snapshot taken at agent install / first start (walks `/proc` on Linux, `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` on Windows, `proc_listallpids` + `proc_pidinfo` on macOS) plus subsequent `started` / `stopped` events from the regular `collect_fast` cycle. Renders as a collapsible tree with honest "as observed since `<seed_ts>`" framing — orphans whose parents died before the seed appear reparented to PID 1, exactly as in a live `ps`. Time-slicing via `?as_of=<ts>`. Cmdline redaction reuses the existing TAR redaction patterns. Data quality depends on agent uptime and tamper-resistance — that hardening pillar is the parallel Guardian PR ladder and does not block the viewer. Design: `docs/tar-dashboard.md` §5.
+
+### 28.6 Retention Awareness Surface :large_orange_diamond: `T2`
+
+In progress (Phase 15.A). Operator-facing aggregate view of every device × source pair where `<source>_enabled=false` — the operational consequence of issue #539's per-source retention pause. Surfaces "paused since" timestamp, live-row count, oldest timestamp; supports one-click re-enable (per-source, the #539 invariant) and a typed-confirmation purge for the "we have what we need, drop the rows but keep the collector paused" case. Without this surface, operators who disabled a collector for forensic preservation have no way to know which boxes are accumulating non-aging data. Design: `docs/tar-dashboard.md` §3.
+
 ---
 
 ## 29. Consumer Applications
@@ -1096,6 +1109,28 @@ Not implemented. `Yuzu.Management` PowerShell module wrapping REST API v1 with c
 ### 29.4 Python SDK :x: `T3`
 
 Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async support and typed models.
+
+---
+
+## 30. Scope Walking & Result Sets
+
+*The Yuzu product differentiator. Operator working memory is finite; the IT estate is a finite-state automaton with mutating state-table size and mutating per-row state. Real-time discovery via iterative scope narrowing — every query produces a device set that becomes the input scope for the next query or action — is the only realistic interaction model at fleet scale. Reference walkthrough: the Chrome incident-response scenario in `docs/scope-walking-design.md` §10.*
+
+### 30.1 Result Set Persistence and Lineage :x: `T2`
+
+Not implemented (Phase 15.B). A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in `result_sets.db` with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
+
+### 30.2 Composable Scope from Previous Query :x: `T2`
+
+Not implemented (Phase 15.C). The Scope Engine grammar gains a third short-circuit kind, `from_result_set:<id-or-alias>`, alongside the existing `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT` so a result set can be the candidate set and the predicate is a real-time refinement against current device attributes. Stale members (offline > 24h, decommissioned, removed from management group) are silently dropped at resolve time with a dashboard-surfaced warning rather than failing the query — operators iterating an IR chain need progress, not a stop, and the audit row records the dropped IDs for forensic completeness. Dashboard surfacing: persistent left-rail sidebar of the operator's active result sets, chain breadcrumb above every query frame mirroring the lineage, scope chip in every query/instruction/policy frame for one-click rebinding. Design: `docs/scope-walking-design.md` §4, §8.
+
+### 30.3 YAML DSL `fromResultSet:` Surface :x: `T2`
+
+Not implemented (Phase 15.E). The `scope:` block in `InstructionDefinition`, `InstructionSet`, and `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: `fromResultSet + assignment.managementGroups` rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); `fromResultSet` requires `assignment.mode = static` (the whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it). Resolution at instruction *invocation* time, not YAML load time, so a definition carrying `fromResultSet:` is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row. Design: `docs/scope-walking-design.md` §7.
+
+### 30.4 Result Set Operational Hardening :x: `T2`
+
+Not implemented (Phase 15.G). Live re-evaluation produces a *new* result set ID rooted at the original's parent (sibling, not child) — operators can refresh a stale set against current estate state without breaking lineage. Background GC sweep every 5 minutes removes unpinned sets past TTL, cascading to member rows. Per-operator quotas enforced with `429 RESULT_SET_QUOTA` and `409 PIN_LIMIT`. Prometheus metrics — `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram by cardinality bucket, GC counter, quota-rejection counter — surface health and runaway-script detection. Audit polish on every state transition. Design: `docs/scope-walking-design.md` §3.3, §9.
 
 ---
 
