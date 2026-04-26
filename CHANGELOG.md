@@ -390,8 +390,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the only authorizing value `"1"`. The exact-match policy is the
   point — any future "be permissive" change to the gate would have to
   delete a test case and survive review.
-- **`tests/unit/test_tar_aggregator.cpp`** — new Catch2 suite (4 cases)
-  pinning the issue #539 retention guard. Reproduces the chaos-injector
+- **`tests/unit/test_tar_aggregator.cpp`** — extended with 4 PR-A
+  cases (issue #547) pinning the
+  `apply_source_enabled_transition()` helper and the
+  `<source>_paused_at` semantics: enabled→disabled writes the
+  passed timestamp; disabled→enabled clears to `"0"`; idempotent
+  re-set leaves the timestamp untouched (so repeated configure
+  round-trips don't pretend the pause is fresher than it is); per-
+  source isolation (disabling `process` does not touch `tcp` /
+  `service` / `user` paused_at). The four cases sit alongside the
+  existing #539 retention-guard suite — same fixture pattern, same
+  `yuzu::test::TempDbFile` shared helper.
+- **`tests/unit/test_tar_aggregator.cpp`** — original 4-case Catch2
+  suite pinning the issue #539 retention guard. Reproduces the chaos-injector
   CHAOS-2 scenario (48 hourly rows seeded across a 48h window centred
   on the test's `now`, disable the source, run retention) and asserts
   every row survives. Counter-tests pin that enabled sources still age
