@@ -92,14 +92,15 @@ Use the `configure` action to adjust TAR behavior.
 | `tcp_enabled` | `true` / `false` | `true` | Toggle the network collector on this host |
 | `service_enabled` | `true` / `false` | `true` | Toggle the service collector on this host |
 | `user_enabled` | `true` / `false` | `true` | Toggle the user-session collector on this host |
-| `network_capture_method` | See [OS compatibility](#os-compatibility-matrix) | `polling` | Network capture mechanism. Today only `polling` is wired; `etw` (Windows) and `endpoint_security` (macOS) are accepted-and-stored for pre-staging. |
+| `network_capture_method` | `polling` plus the values returned by `accepted_capture_methods("tcp")` (`iphlpapi`, `procfs`, `proc_pidfdinfo`, plus any `kPlanned` rows once added) | `polling` | Network capture mechanism. `polling` is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a `warn` line and continues polling. |
 | `process_stabilization_exclusions` | JSON array | `[]` | Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. **Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.** |
 
 **Validation rules:**
 
 - When both `fast_interval` and `slow_interval` are provided, `fast_interval` must be less than `slow_interval`.
 - `redaction_patterns` and `process_stabilization_exclusions` must each be a JSON array of non-empty strings.
-- `network_capture_method` is rejected if not in the accept-list returned by `accepted_capture_methods("tcp")` (currently `polling`, `iphlpapi`, `procfs`, `lsof`).
+- `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. A pattern like `"a"` will match every process whose name contains the letter `a` (most of them) — use length-3+ patterns or anchor with explicit substrings (`"-helper"`, `"chrome-helper"`).
+- `network_capture_method` is accepted unconditionally for the literal value `polling` (the platform default). Any other value must appear in the accept-list returned by `accepted_capture_methods("tcp")` (currently `iphlpapi`, `procfs`, `proc_pidfdinfo`); else the configure call is rejected.
 - Disabling a collector (`<source>_enabled=false`) short-circuits new captures but leaves existing rows queryable. Re-enabling later starts from a clean baseline rather than diffing against a stale snapshot.
 
 Example:
@@ -125,9 +126,9 @@ TAR runs on Windows, Linux, and macOS, but each capture source has platform-spec
 | Source | Windows | Linux | macOS |
 |--------|---------|-------|-------|
 | **process** | supported (`toolhelp32`) — full pid/ppid/name/cmdline. Cmdline retrieval requires `PROCESS_QUERY_LIMITED_INFORMATION`. | supported (`procfs`) — `/proc/<pid>/status` and `/proc/<pid>/cmdline`. | constrained (`sysctl`) — `KERN_PROC_ALL`. Cmdline empty for hardened-runtime processes the agent cannot inspect. |
-| **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`lsof`) — slow on heavily-loaded hosts; consider raising `fast_interval`. Endpoint Security framework is the planned replacement. |
+| **tcp** | supported (`iphlpapi`) — `GetExtendedTcpTable` polled at `fast_interval`. ETW (`Microsoft-Windows-Kernel-Network`) is **planned** for sub-second fidelity; not yet wired. | supported (`procfs`) — `/proc/net/{tcp,tcp6,udp,udp6}`. Connection lifetime below `fast_interval` may be missed. | constrained (`proc_pidfdinfo`) — `proc_listallpids` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc`. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement. |
 | **service** | supported (`scm`) — `EnumServicesStatusEx` / `QueryServiceConfig`; full status + startup_type. | constrained (`systemctl`) — `systemctl list-units`; `startup_type` reported as `unknown`. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported. | constrained (`launchctl`) — `launchctl list`; no startup_type, status binary running/stopped only. |
-| **user** | supported (`wts`) — `WTSEnumerateSessionsEx`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
+| **user** | supported (`wts`) — `WTSEnumerateSessionsW` + `WTSQuerySessionInformationW`; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services. | constrained (`utmp`) — `getutent`. Containers without `/var/run/utmp` produce no events. `logon_type` inferred from tty (`pts/*` → remote). | constrained (`utmpx`) — `getutxent`. GUI logins are not always reflected. |
 
 Status values:
 

@@ -53,7 +53,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -103,7 +103,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -153,7 +153,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -203,7 +203,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -253,7 +253,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -303,7 +303,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -355,7 +355,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -405,7 +405,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -455,7 +455,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -506,69 +506,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
-    requiredPlugins: [tar]
-
-status:
-  phase: active
-
----
-## Issue #60 — case-sensitive process-name lookup.
-## SQLite LIKE is case-INSENSITIVE by default; for an exact-name match use
-## `=` (this query) or `GLOB` (case-sensitive wildcard). The parameter is
-## interpolated as a string literal by the SQL executor.
-apiVersion: yuzu.io/v1alpha1
-kind: InstructionDefinition
-metadata:
-  id: crossplatform.tar.process_by_exact_name
-  displayName: "TAR: Process by exact name (case-sensitive)"
-  version: 1.0.0
-  description: >
-    Find every recorded start/stop event for a process whose name matches
-    EXACTLY (case-sensitive) the supplied value. Use this rather than LIKE
-    when the casing is known and you need to avoid `Chrome.exe` matching
-    `chrome.exe`. To match a substring case-sensitively, use the sibling
-    `tar.process_by_glob` query (or pass a `*` glob to that one).
-  tags: [tar, warehouse, processes, forensics, examples]
-
-spec:
-  type: question
-  platforms: [windows, linux, darwin]
-
-  execution:
-    plugin: tar
-    action: sql
-    concurrency: per-device
-
-  parameters:
-    type: object
-    properties:
-      process_name:
-        type: string
-        displayName: Process name
-        description: Exact name (case-sensitive) — e.g. `chrome.exe`, `bash`
-      sql:
-        type: string
-        default: "SELECT ts, action, pid, ppid, name, user, cmdline FROM $Process_Live WHERE name = '${process_name}' ORDER BY ts DESC LIMIT 500"
-        hidden: true
-    required: [process_name, sql]
-
-  result:
-    columns:
-      - { name: output, type: clob }
-
-  gather:
-    ttlSeconds: 30
-
-  approval:
-    mode: auto
-
-  permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
-    authorRoles: [content-author]
-
-  compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -627,7 +565,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -686,7 +624,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -738,7 +676,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:

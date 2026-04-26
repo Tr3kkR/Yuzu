@@ -34,9 +34,10 @@ What TAR is **not**:
 
 - Not a kernel-mode probe. All collection is poll-based via documented
   user-mode APIs (`CreateToolhelp32Snapshot`, `/proc/*`, `sysctl`,
-  `GetExtendedTcpTable`, `systemctl`, `launchctl`, `WTSEnumerateSessionsEx`,
-  `getutxent`). Anything that lives shorter than the fast collector
-  interval (default 60s) is invisible.
+  `GetExtendedTcpTable`, `proc_listallpids` + `proc_pidfdinfo`,
+  `systemctl`, `launchctl`, `WTSEnumerateSessionsW`, `getutxent`).
+  Anything that lives shorter than the fast collector interval
+  (default 60s) is invisible.
 - Not a transport for events. TAR persists everything locally; the
   server queries on demand via the `query` and `sql` actions. There is
   no push-to-server stream and no aggregation across hosts at write
@@ -190,8 +191,9 @@ Steady-state CPU cost on a typical 8-core workstation, measured against
 
 Worst observed full collect_fast: ~25 ms. Worst observed collect_slow:
 ~150 ms (Linux `systemctl list-units` on a host with 400 units; macOS
-`lsof -nP -i` on a host with 5000 sockets — see the lsof note in the
-compatibility matrix and consider raising `fast_interval`).
+`proc_listallpids` + per-fd `proc_pidfdinfo` on a host with 5000
+sockets — consider raising `fast_interval` if the per-cycle cost
+exceeds your latency budget).
 
 Disk usage at default retention:
 
