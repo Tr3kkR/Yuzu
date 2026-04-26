@@ -1,8 +1,13 @@
 #include "dashboard_routes.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <format>
 #include <sstream>
+#include <string_view>
+#include <unordered_map>
 
 #include <spdlog/spdlog.h>
 
@@ -19,6 +24,45 @@ namespace yuzu::server {
 // -- Helper: clamp an integer to [lo, hi] -------------------------------------
 static int clamp(int val, int lo, int hi) {
     return std::max(lo, std::min(val, hi));
+}
+
+// -- Helper: format epoch seconds as a coarse "Xd Yh ago" age -----------------
+//
+// Used by the TAR retention-paused list. Intentionally coarse: operators care
+// about "this has been paused for days/hours" not seconds. Returns "—" for 0
+// (sentinel for "never paused").
+static std::string format_age(int64_t epoch_then, int64_t now_epoch) {
+    if (epoch_then <= 0) return "—";
+    int64_t delta = now_epoch - epoch_then;
+    if (delta < 0) delta = 0;
+    if (delta < 60) return std::format("{}s ago", delta);
+    if (delta < 3600) return std::format("{}m ago", delta / 60);
+    if (delta < 86400) return std::format("{}h {}m ago", delta / 3600, (delta % 3600) / 60);
+    int64_t days = delta / 86400;
+    int64_t hours = (delta % 86400) / 3600;
+    if (days < 30) return std::format("{}d {}h ago", days, hours);
+    return std::format("{}d ago", days);
+}
+
+// -- Helper: format epoch seconds as ISO-ish "YYYY-MM-DD HH:MM UTC" -----------
+static std::string format_utc(int64_t epoch_secs) {
+    if (epoch_secs <= 0) return "—";
+    std::time_t t = static_cast<std::time_t>(epoch_secs);
+    std::tm tm_val{};
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
+    gmtime_r(&t, &tm_val);
+#endif
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC",
+                        tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+                        tm_val.tm_hour, tm_val.tm_min);
+}
+
+// -- Helper: epoch-seconds "now" for human-facing age math ---------------------
+static int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // -- Helper: safe int from query param ----------------------------------------
@@ -551,6 +595,151 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
+    // -- TAR retention-paused source list (Phase 15.A — issue #547) -----------
+    //
+    // GET renders the table from whatever the most-recent operator-triggered
+    // tar.status scan returned (latest_tar_scan_id_); POST dispatches a fresh
+    // scan to all connected agents and stores the new command_id so the next
+    // GET picks it up.
+    //
+    // The two routes are deliberately separate (rather than one auto-fetch
+    // route) so an operator viewing the page does not silently re-scan the
+    // fleet on every page load — the dispatch is an explicit operator action,
+    // surfaced in the audit trail.
+
+    svr.Get("/fragments/tar/retention-paused",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
+                auto session = auth_fn_(req, res);
+                if (!session) return;
+                res.set_content(render_tar_retention_paused(),
+                                "text/html; charset=utf-8");
+            });
+
+    svr.Post("/fragments/tar/retention-paused/scan",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<div class=\"empty-state\">Dispatch "
+                                     "unavailable.</div>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 auto [command_id, sent] = dispatch_fn_(
+                     "tar", "status", /*agent_ids=*/{}, /*scope_expr=*/"", params);
+
+                 {
+                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
+                     latest_tar_scan_id_ = command_id;
+                     latest_tar_scan_count_ = sent;
+                     latest_tar_scan_at_ = now_epoch();
+                 }
+
+                 audit_fn_(req, "tar.status.scan", "success", "command",
+                          command_id,
+                          std::format("dispatched to {} agent(s)", sent));
+
+                 std::string body;
+                 if (sent == 0) {
+                     body = "<div class=\"empty-state\">No agents connected. "
+                            "Bring an agent online and click "
+                            "<strong>Scan fleet</strong> again.</div>";
+                 } else {
+                     body = std::format(
+                         "<div class=\"empty-state\">Scanning <strong>{}"
+                         "</strong> agent{} (command <code>{}</code>) — "
+                         "click <strong>Refresh</strong> in a moment to see "
+                         "the results.</div>",
+                         sent, sent == 1 ? "" : "s",
+                         html_escape(std::string{command_id}));
+                 }
+                 res.set_header("HX-Trigger", std::format(
+                     "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
+                     "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
+                 res.set_content(body, "text/html; charset=utf-8");
+             });
+
+    // POST /fragments/tar/retention-paused/reenable
+    //   form params: device_id, source
+    //
+    // Dispatches `tar.configure` with `<source>_enabled=true` to the single
+    // named device. Per-source independence (the #539 invariant) means this
+    // does not touch the other three sources on the device.
+    svr.Post("/fragments/tar/retention-paused/reenable",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Infrastructure", "Update")) return;
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<span class=\"tar-row-error\">Dispatch "
+                                     "unavailable.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 auto device_id = req.has_param("device_id")
+                     ? req.get_param_value("device_id")
+                     : extract_form_value(req.body, "device_id");
+                 auto source = req.has_param("source")
+                     ? req.get_param_value("source")
+                     : extract_form_value(req.body, "source");
+
+                 if (device_id.empty() || source.empty()) {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "device_id and source are required."
+                                     "</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+                 // Validate source against the canonical four. Anything else
+                 // would be a forged form submission; reject rather than
+                 // dispatch a configure command with an arbitrary key.
+                 if (source != "process" && source != "tcp" &&
+                     source != "service" && source != "user") {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Unknown source — must be one of "
+                                     "process, tcp, service, user.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 params[std::format("{}_enabled", source)] = "true";
+                 auto [command_id, sent] = dispatch_fn_(
+                     "tar", "configure", {device_id}, /*scope_expr=*/"",
+                     params);
+
+                 if (sent == 0) {
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Agent not connected.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 audit_fn_(req, "tar.source.reenable", "success",
+                          "command", command_id,
+                          std::format("device={} source={}",
+                                       device_id, source));
+
+                 res.set_header("HX-Trigger", std::format(
+                     "{{\"showToast\":{{\"message\":\"Re-enabling {} on "
+                     "{}\",\"level\":\"success\"}}}}",
+                     source, html_escape(std::string{device_id})));
+                 // Empty response body — combined with hx-swap=delete on
+                 // the row, this drops the row optimistically. The next
+                 // Refresh will reconcile against a fresh tar.status.
+                 res.set_content("", "text/html; charset=utf-8");
+             });
+
     spdlog::info("DashboardRoutes: registered fragment endpoints");
 }
 
@@ -1034,6 +1223,211 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
                     html_escape(agents_arr.dump()) +
                     "\" style=\"display:none\"></div>";
         }
+    }
+
+    return html;
+}
+
+// ---------------------------------------------------------------------------
+// render_tar_retention_paused — Phase 15.A retention-paused source list
+// ---------------------------------------------------------------------------
+//
+// Reads the most-recent operator-triggered tar.status scan tracked by this
+// routes instance, queries the response store for that command_id, parses
+// each agent's `config|<source>_enabled|false` lines plus the matching
+// paused_at / live_rows / oldest_ts companions, and returns an HTML table
+// fragment. Empty states (no scan run yet, scan returned zero rows) render
+// as informational placeholders rather than table-with-zero-rows so the
+// operator gets actionable guidance.
+
+std::string DashboardRoutes::render_tar_retention_paused() const {
+    std::string scan_id;
+    int scan_count = 0;
+    int64_t scan_at = 0;
+    {
+        std::lock_guard<std::mutex> lk(tar_scan_mu_);
+        scan_id = latest_tar_scan_id_;
+        scan_count = latest_tar_scan_count_;
+        scan_at = latest_tar_scan_at_;
+    }
+
+    if (scan_id.empty()) {
+        return "<div class=\"empty-state\">No scan data yet — click "
+               "<strong>Scan fleet</strong> above to query every connected "
+               "agent's TAR retention state.</div>";
+    }
+    if (!response_store_) {
+        return "<div class=\"empty-state\">Response store unavailable.</div>";
+    }
+
+    // Pull every response stored for the scan command_id.
+    ResponseQuery q;
+    q.limit = 10000;
+    auto responses = response_store_->query(scan_id, q);
+
+    // Each response is from one agent. Parse each line for
+    //   config|<source>_enabled|<value>
+    //   config|<source>_paused_at|<ts>
+    //   config|<source>_live_rows|<count>
+    //   config|<source>_oldest_ts|<ts>
+    // and emit one table row for every (agent, source) pair where
+    // `<source>_enabled` == "false". Sources with `enabled=true` are
+    // dropped — the operator wants the *paused* set, not the whole fleet.
+    struct PausedRow {
+        std::string agent_id;
+        std::string agent_display;
+        std::string source;
+        int64_t paused_at{0};
+        int64_t live_rows{-1};   // -1 = unknown (older agent)
+        int64_t oldest_ts{0};
+    };
+    std::vector<PausedRow> rows;
+    int agents_responded = 0;
+    int agents_with_no_paused_sources = 0;
+
+    for (const auto& resp : responses) {
+        ++agents_responded;
+        std::unordered_map<std::string, std::string> kv;
+        auto lines = split_output_lines(resp.output);
+        for (const auto& line : lines) {
+            if (!line.starts_with("config|")) continue;
+            // line shape: config|<key>|<value>
+            auto first_pipe = line.find('|', 7);
+            if (first_pipe == std::string::npos) continue;
+            std::string key = line.substr(7, first_pipe - 7);
+            std::string val = line.substr(first_pipe + 1);
+            kv[std::move(key)] = std::move(val);
+        }
+
+        bool any_paused_for_this_agent = false;
+        // Iterate the four canonical sources. Hardcoding here is fine — these
+        // are stable across the project; new sources land via TAR registry
+        // changes, and the dashboard list is robust to unknown sources by
+        // simply not rendering them (they will surface in PR-A.6 follow-up).
+        for (const char* source : {"process", "tcp", "service", "user"}) {
+            std::string enabled_key = std::string{source} + "_enabled";
+            auto it = kv.find(enabled_key);
+            if (it == kv.end() || it->second != "false") continue;
+
+            PausedRow row;
+            row.agent_id = resp.agent_id;
+            row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
+                                          : resp.agent_id;
+            row.source = source;
+            if (auto p = kv.find(std::string{source} + "_paused_at");
+                p != kv.end()) {
+                try { row.paused_at = std::stoll(p->second); } catch (...) {}
+            }
+            if (auto lr = kv.find(std::string{source} + "_live_rows");
+                lr != kv.end()) {
+                try { row.live_rows = std::stoll(lr->second); } catch (...) {}
+            }
+            if (auto ot = kv.find(std::string{source} + "_oldest_ts");
+                ot != kv.end()) {
+                try { row.oldest_ts = std::stoll(ot->second); } catch (...) {}
+            }
+            rows.push_back(std::move(row));
+            any_paused_for_this_agent = true;
+        }
+        if (!any_paused_for_this_agent) ++agents_with_no_paused_sources;
+    }
+
+    int64_t now = now_epoch();
+
+    // Header showing scan provenance and an honest "responded N of M" count.
+    std::string html;
+    html.reserve(2048);
+    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
+    html += std::format(
+        "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
+        "agent{} {} &middot; <strong>{}</strong> responded so far &middot; "
+        "<strong>{}</strong> have all sources collecting normally",
+        html_escape(scan_id),
+        scan_count, scan_count == 1 ? "" : "s",
+        format_age(scan_at, now),
+        agents_responded,
+        agents_with_no_paused_sources);
+    html += "</div>";
+
+    if (rows.empty()) {
+        html += "<div class=\"empty-state\">"
+                "<strong>No paused sources detected</strong> across the "
+                "agents that have responded. If the scan is still in "
+                "progress, click <strong>Refresh</strong> in a moment."
+                "</div>";
+        return html;
+    }
+
+    // Sort: paused-longest-first, then by agent display name. Operators want
+    // to see the boxes that have been accumulating non-aging data the
+    // longest at the top of the list.
+    std::sort(rows.begin(), rows.end(),
+              [](const PausedRow& a, const PausedRow& b) {
+                  if (a.paused_at != b.paused_at) {
+                      // Smaller paused_at = older = first. Treat 0 as "infinity"
+                      // so unknowns sink to the bottom.
+                      auto cmp_a = a.paused_at == 0 ? INT64_MAX : a.paused_at;
+                      auto cmp_b = b.paused_at == 0 ? INT64_MAX : b.paused_at;
+                      return cmp_a < cmp_b;
+                  }
+                  return a.agent_display < b.agent_display;
+              });
+
+    html += "<table>";
+    html += "<thead><tr>"
+            "<th>Device</th>"
+            "<th>Source</th>"
+            "<th>Paused since</th>"
+            "<th>Paused for</th>"
+            "<th style=\"text-align:right\">Live rows</th>"
+            "<th>Oldest data</th>"
+            "<th></th>"
+            "</tr></thead><tbody>";
+
+    for (const auto& r : rows) {
+        html += "<tr>";
+        html += "<td>" + html_escape(r.agent_display) + "</td>";
+        html += "<td><span class=\"source-pill\">" +
+                html_escape(r.source) + "</span></td>";
+        html += "<td>" + format_utc(r.paused_at) + "</td>";
+        html += "<td>" + format_age(r.paused_at, now) + "</td>";
+        html += "<td style=\"text-align:right\">";
+        if (r.live_rows < 0) {
+            html += "<span style=\"color:#8b949e\">—</span>";
+        } else {
+            html += std::format("{}", r.live_rows);
+        }
+        html += "</td>";
+        html += "<td>" + format_age(r.oldest_ts, now) + "</td>";
+        // Re-enable button: HTMX POST with the device_id + source as form
+        // values, swap=delete on the closest tr so the row drops
+        // optimistically on success. The next operator-triggered Refresh
+        // will reconcile against a fresh tar.status if the agent failed
+        // to apply the configure for any reason.
+        html += std::format(
+            "<td style=\"text-align:right\">"
+            "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
+            "font-size:0.75rem\" "
+            "hx-post=\"/fragments/tar/retention-paused/reenable\" "
+            "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
+            "hx-target=\"closest tr\" hx-swap=\"delete\" "
+            "hx-confirm=\"Re-enable {} collector on {}?\">"
+            "Re-enable"
+            "</button>"
+            "</td>",
+            html_escape(r.agent_id), html_escape(r.source),
+            html_escape(r.source), html_escape(r.agent_display));
+        html += "</tr>";
+    }
+    html += "</tbody></table>";
+
+    if (agents_responded < scan_count) {
+        html += std::format(
+            "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+            "{} of {} agent{} still pending — click "
+            "<strong>Refresh</strong> to pick up additional responses.</div>",
+            scan_count - agents_responded, scan_count,
+            scan_count == 1 ? "" : "s");
     }
 
     return html;

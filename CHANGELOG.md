@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR dashboard page + retention-paused source list (PR-A,
+  issue #547).** New `/dashboard/tar` page off the main dashboard
+  nav, served as `kTarPageHtml` from a dedicated translation unit
+  (`server/core/src/tar_page_ui.cpp`). The page is the operator's
+  destination for *doing TAR* — first frame is the retention-paused
+  source list, with placeholder slots for the scope-walking-aware
+  SQL frame (Phase 15.D / issue #550) and the process tree viewer
+  (Phase 15.H / issue #554) that drop in as those PRs land.
+  Three new HTMX fragment endpoints:
+  - `GET /fragments/tar/retention-paused` queries the response store
+    for the most recent operator-triggered `tar.status` scan, parses
+    each agent's `<source>_enabled=false` rows along with the
+    matching `paused_at` / `live_rows` / `oldest_ts` companions, and
+    renders a sortable table with one row per (agent × paused
+    source) pair. Sorted paused-longest-first so the boxes
+    accumulating non-aging data the longest float to the top. Honest
+    scan-provenance header showing dispatched-to count,
+    responded-so-far count, and the "all-collecting-normally" count.
+  - `POST /fragments/tar/retention-paused/scan` dispatches a fresh
+    `tar.status` to all connected agents, records the resulting
+    command_id in an in-memory `latest_tar_scan_id_` (per-server-
+    instance for now; persistence + multi-server coordination land
+    in Phase 15.G operational hardening). Audit row written:
+    `action=tar.status.scan` with the dispatched-agent count.
+  - `POST /fragments/tar/retention-paused/reenable` takes
+    `device_id` + `source` form params, validates `source` against
+    the canonical four (`process` / `tcp` / `service` / `user`)
+    rejecting forged form submissions with `400 Unknown source`,
+    requires `Infrastructure:Update` per device (re-enable is more
+    consequential than view), then dispatches a single-device
+    `tar.configure` with `<source>_enabled=true`. The row drops
+    optimistically via HTMX `hx-swap=delete`; the next operator-
+    triggered Refresh reconciles against a fresh scan. Audit row:
+    `action=tar.source.reenable` with `device_id` and `source` in
+    the detail. Per-source independence preserved (the #539
+    invariant) — re-enabling one source does not touch the others.
+
+  The page also gains a "TAR" entry in the main dashboard nav,
+  added consistently across `dashboard_ui.cpp`, `help_ui.cpp`,
+  `instruction_ui.cpp`, `settings_ui.cpp`, and `compliance_ui.cpp`
+  so the link is reachable from every existing page.
+
 - **TAR `tar.status` now emits per-source `paused_at`, `live_rows`,
   `oldest_ts` (PR-A foundation, issue #547).** The `configure` action's
   per-source enable/disable surface gained a transition timestamp:

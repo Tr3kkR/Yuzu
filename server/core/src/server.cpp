@@ -150,6 +150,7 @@ extern const char* const kSettingsHtml;
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kTarPageHtml;
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
@@ -2968,6 +2969,22 @@ private:
         web_server_->Get("/help", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(kHelpHtml, "text/html; charset=utf-8");
         });
+
+        // -- TAR dashboard page (Phase 15.A — issue #547) --------------------
+        // Auth required because the page makes HTMX calls to retention-paused
+        // and (later) SQL fragment endpoints that themselves require auth +
+        // RBAC; loading the page unauthenticated would just produce a blank
+        // shell that immediately redirects on first fragment request. Mirror
+        // the /instructions pattern.
+        web_server_->Get("/tar",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session) {
+                                 res.set_redirect("/login");
+                                 return;
+                             }
+                             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
+                         });
 
         // -- Instruction management page --------------------------------------
         web_server_->Get("/instructions",
