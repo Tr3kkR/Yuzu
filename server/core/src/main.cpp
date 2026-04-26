@@ -421,10 +421,29 @@ int main(int argc, char* argv[]) {
         }
         spdlog::error("***********************************************************************");
         spdlog::error("*** CLIENT CERTIFICATE VERIFICATION DISABLED (one-way TLS)          ***");
-        spdlog::error("*** Any network peer can connect to the agent listener without an   ***");
-        spdlog::error("*** mTLS client certificate. This is acceptable ONLY for short-term ***");
-        spdlog::error("*** development or migration scenarios. Re-enable mTLS by supplying ***");
-        spdlog::error("*** --ca-cert and removing --insecure-skip-client-verify.           ***");
+        spdlog::error("*** Any network peer can connect to the agent listener AND the      ***");
+        spdlog::error("*** management listener without an mTLS client certificate. This is ***");
+        spdlog::error("*** acceptable ONLY for short-term development or migration         ***");
+        spdlog::error("*** scenarios. Re-enable mTLS by supplying --ca-cert (and           ***");
+        spdlog::error("*** --management-ca-cert if a management override is configured)    ***");
+        spdlog::error("*** and removing --insecure-skip-client-verify.                     ***");
+        spdlog::error("***********************************************************************");
+    }
+
+    // ── --no-tls warning banner ──────────────────────────────────────────────
+    // --no-tls is the supported posture for UAT and customer demos until the
+    // CA/CSR pipeline is automated. It is intentionally NOT gated behind an
+    // env var (an operator passing --no-tls is opting in to plaintext loudly
+    // and explicitly), but we make the degradation impossible to miss in logs.
+    if (!cfg.tls_enabled) {
+        spdlog::error("***********************************************************************");
+        spdlog::error("*** --no-tls IS UNSAFE                                              ***");
+        spdlog::error("*** TLS is fully disabled. The agent gRPC listener AND the          ***");
+        spdlog::error("*** management gRPC listener accept plaintext connections from any  ***");
+        spdlog::error("*** network peer with no encryption and no peer authentication.     ***");
+        spdlog::error("*** The administrative surface is ungated. Anyone reachable on the  ***");
+        spdlog::error("*** management port can issue admin RPCs.                           ***");
+        spdlog::error("*** Use --no-tls ONLY for local UAT, customer demos, and dev work.  ***");
         spdlog::error("***********************************************************************");
     }
 

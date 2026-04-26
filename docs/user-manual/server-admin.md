@@ -37,6 +37,15 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
+| `--no-tls` | off | Disable **all** gRPC TLS (agent listener AND management listener). Plaintext gRPC, no encryption, no peer authentication. **The administrative surface is ungated when this flag is passed.** Intended for local UAT, customer demos, and development. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder when running in this mode. |
+| `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
+| `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
+| `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
+| `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
+| `--allow-one-way-tls` | off | **[DEPRECATED]** Renamed to `--insecure-skip-client-verify`. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release. |
+| `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
+| `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
+| `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -179,11 +188,64 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 
 ## TLS Configuration
 
-TLS can be configured at startup via CLI flags or at runtime through the Settings page.
+The Yuzu server has **two independent TLS surfaces**:
 
-### Via CLI Flags
+1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
+2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
+
+The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
+
+### HTTPS via CLI Flags
 
 HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server startup. Use `--no-https` for development without TLS. See [Server CLI Flags](#server-cli-flags).
+
+### gRPC TLS via CLI Flags
+
+The recommended posture is **mutual TLS (mTLS)** — the server presents a certificate and verifies a client certificate from each connecting agent:
+
+```bash
+./yuzu-server \
+  --cert /etc/yuzu/grpc-server.crt \
+  --key  /etc/yuzu/grpc-server.key \
+  --ca-cert /etc/yuzu/agent-clients-ca.crt
+```
+
+If you have not yet stood up a CA for issuing agent client certificates, you have two fallback options:
+
+**Option 1 — One-way TLS** (server cert is presented but client certs are not verified):
+
+```bash
+export YUZU_ALLOW_INSECURE_TLS=1   # required as a second confirmation
+./yuzu-server \
+  --cert /etc/yuzu/grpc-server.crt \
+  --key  /etc/yuzu/grpc-server.key \
+  --insecure-skip-client-verify
+```
+
+This applies to **both** the agent listener and the management listener. The server emits an ERROR-level startup banner and a 5-minute recurring reminder log line for the duration the listener runs in this mode. An audit event with action `server.tls_degraded` is also written every 5 minutes for SOC 2 evidence.
+
+**Option 2 — `--no-tls`** (no encryption, no peer authentication, plaintext gRPC):
+
+```bash
+./yuzu-server --no-tls
+```
+
+This is the supported posture for **local UAT, customer demos, and development**. The administrative surface is ungated — anyone reachable on port 50052 can issue management RPCs. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder. Do not run `--no-tls` against any network you do not control end-to-end.
+
+### Upgrade note (v0.12.0)
+
+The `--allow-one-way-tls` flag was renamed to `--insecure-skip-client-verify` AND now requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation. **Existing deployments that pass `--allow-one-way-tls` (or the new flag name) will refuse to start after upgrade until the env var is set.** The old flag name remains accepted with a deprecation warning for one release.
+
+For systemd-managed deployments, add the env var via a drop-in:
+
+```bash
+sudo systemctl edit yuzu-server   # creates /etc/systemd/system/yuzu-server.service.d/override.conf
+```
+
+```ini
+[Service]
+Environment="YUZU_ALLOW_INSECURE_TLS=1"
+```
 
 ### Via Settings Page
 

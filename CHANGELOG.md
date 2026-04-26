@@ -76,6 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `configure` parameters introduced by issue #59. Includes a worked
   example combining retention, fast_interval, user_enabled=false, and
   process_stabilization_exclusions.
+- **`docs/user-manual/server-admin.md` now documents the gRPC TLS
+  flag surface (governance docs Finding 3 / enterprise-readiness
+  blocker).** The "Server CLI Flags" table gained entries for `--no-tls`,
+  `--cert`, `--key`, `--ca-cert`, `--insecure-skip-client-verify`,
+  the deprecated `--allow-one-way-tls`, and the three `--management-*`
+  override flags. The "TLS Configuration" section now distinguishes
+  the two independent TLS surfaces (HTTPS dashboard vs. gRPC agent +
+  management listeners), shows the full mTLS / one-way-TLS / `--no-tls`
+  invocation patterns, and adds an "Upgrade note (v0.12.0)" subsection
+  walking operators through the `YUZU_ALLOW_INSECURE_TLS=1` requirement
+  with a copy-pasteable systemd drop-in. An Ansible role can now be
+  authored from this doc alone.
 
 ### Tests
 
@@ -128,6 +140,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on upgrade or supply `--ca-cert` to re-enable full mTLS.
   `SECURITY_REVIEW.md` MEDIUM finding marked resolved against this
   release.
+- **Management listener now gated by the same `YUZU_ALLOW_INSECURE_TLS=1`
+  check as the agent listener (governance C-79-1 follow-up).** Previously
+  the management gRPC listener (port 50052) called
+  `build_tls_credentials(..., /*allow_one_way_tls=*/true, ...)` with the
+  flag hardcoded — an operator who set `--management-cert` /
+  `--management-key` without `--management-ca-cert` got an
+  unauthenticated management plane with no env-var gate, no banner, and
+  no recurring reminder. The `true` literal has been replaced with
+  `cfg_.allow_one_way_tls`, so the management listener is now subject to
+  the same two-factor confirmation as the agent listener
+  (`server/core/src/server.cpp`). On upgrade, deployments that supply
+  management cert + key without management CA cert must also pass
+  `--insecure-skip-client-verify` and `YUZU_ALLOW_INSECURE_TLS=1`.
+- **`--no-tls` startup banner (governance C-79-2 follow-up).** `--no-tls`
+  remains intentionally ungated — it is the supported posture for local
+  UAT, customer demos, and development until the CA/CSR pipeline is
+  automated. The flag now emits a multi-line ERROR-level startup banner
+  spelling out that both the agent gRPC listener AND the management
+  gRPC listener accept plaintext from any peer with no encryption and
+  no peer authentication, and that the administrative surface is
+  ungated. The 5-minute recurring reminder thread also fires under
+  `--no-tls`, not just `--insecure-skip-client-verify`
+  (`server/core/src/main.cpp`, `server/core/src/server.cpp`).
+- **TLS-degraded posture now writes audit events for SOC 2 CC7.2
+  evidence (governance H-3 / compliance Finding 2).** The 5-minute
+  reminder thread now writes an `AuditEvent` (`action: "server.tls_degraded"`,
+  `principal: "system"`, `result: "warning"`) to `audit_store_` for every
+  recurring tick, in addition to the existing ERROR-level spdlog line.
+  Without this hookup, `journald` / SIEM forwarding was the only durable
+  evidence of degraded-mode duration; `audit.db` queries for "show me
+  every period the server ran without mTLS" returned nothing. The
+  startup gate-failure case (server refuses to start) remains spdlog +
+  systemd-journal only by structural necessity (audit_store is not yet
+  initialized at that point).
 
 ### Tests
 
