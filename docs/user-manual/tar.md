@@ -182,7 +182,53 @@ oldest_timestamp|1710950000
 newest_timestamp|1711050423
 db_size_bytes|2097152
 retention_days|7
+config|process_enabled|true
+config|process_paused_at|0
+config|process_live_rows|18402
+config|process_oldest_ts|1710950000
+config|tcp_enabled|true
+config|tcp_paused_at|0
+config|tcp_live_rows|4193
+config|tcp_oldest_ts|1710955000
+config|service_enabled|true
+config|service_paused_at|0
+config|service_live_rows|812
+config|service_oldest_ts|1710901000
+config|user_enabled|true
+config|user_paused_at|0
+config|user_live_rows|97
+config|user_oldest_ts|1710900100
+config|network_capture_method|polling
 ```
+
+The four `<source>_*` blocks are emitted per capture source. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0`. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines; the dashboard renders `—` in their absence.
+
+## TAR dashboard page
+
+The Yuzu dashboard includes a dedicated TAR page at `/tar`, reachable from the **TAR** entry in the main navigation bar (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the scope-walking-aware SQL frame and the process tree viewer drop into placeholder slots in subsequent phases.
+
+### Retention-paused source list
+
+The first frame surfaces every device × source pair where the collector has been disabled (`<source>_enabled=false`). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.
+
+**Columns:** device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.
+
+**Workflow:**
+
+1. Click **Scan fleet** to dispatch a `tar.status` command to the agents in your management-group scope. The scan-provenance header above the table reports how many agents were dispatched to, how many have responded so far, and how many have all sources collecting normally.
+2. Review the table. A row with a high `live_rows` count or a long pause duration may indicate forensic data accumulating without being queried.
+3. Click **Re-enable** on a row to dispatch `tar.configure` with `<source>_enabled=true` to that single device. The row drops optimistically; click **Refresh** to reconcile against a fresh scan.
+
+**Permissions:**
+
+- Viewing the page and the retention-paused list requires `Infrastructure:Read`.
+- **Scan fleet** requires `Execution:Execute` (it dispatches a fleet-wide command).
+- **Re-enable** requires `Execution:Execute` (it dispatches a configure command to a single device).
+- Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope `device_id` values with the same 404 response as a not-connected agent (no enumeration oracle).
+
+**State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
+
+**Audit trail:** Every Scan emits a `tar.status.scan` audit event. Every Re-enable emits `tar.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation` or `agent_not_connected` — on rejected attempts). See `docs/user-manual/audit-log.md` for the full schema.
 
 ## Forcing an immediate snapshot
 

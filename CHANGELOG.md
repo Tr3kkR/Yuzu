@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TAR dashboard hardening round 2 — docs from Gate 2 governance
+  (issue #547).** Folds the four BLOCKING + four SHOULD-FIX docs
+  findings the docs-writer caught:
+  - **doc-B1** — `docs/user-manual/tar.md` gains a new "TAR
+    dashboard page" section after "Checking TAR status," covering
+    the page URL, the retention-paused list workflow, columns,
+    permissions (`Infrastructure:Read` to view, `Execution:Execute`
+    to scan or re-enable — reflects the round-1 perm tier fix), the
+    in-memory per-username scan-state caveat, and the audit-action
+    surface. Also extends the `tar.status` example output block
+    with the four new per-source `enabled` / `paused_at` /
+    `live_rows` / `oldest_ts` lines so operators reading the manual
+    know what to expect.
+  - **doc-B2** — URL drift fixed across `docs/tar-dashboard.md`,
+    `CLAUDE.md`, and `docs/roadmap.md`. The page is at `/tar` (the
+    implementation), not `/dashboard/tar` (the prior design-doc
+    text). The CLAUDE.md routed-concerns trigger pattern updates to
+    `/tar` and `/fragments/tar/...`.
+  - **doc-B3** — `docs/tar-dashboard.md` §3.1 no longer claims
+    background refresh every 60s. Replaced with the actual
+    behaviour (manual Refresh button) and a forward-pointer to
+    Phase 15.G operational hardening.
+  - **doc-B4** — `docs/user-manual/audit-log.md` "Logged actions"
+    table gains entries for `tar.status.scan` and
+    `tar.source.reenable`, including the `result=failure` /
+    `detail=scope_violation|agent_not_connected` distinction the
+    handler emits server-side even when the HTTP response body is
+    identical (404 with body `Agent not reachable.`) for both
+    cases — so SIEM rules can distinguish forged-form attempts
+    from transient connectivity issues.
+  - **doc-S1** — `docs/user-manual/rest-api.md` "Dashboard TAR"
+    section gains entries for `GET /tar`, `GET
+    /fragments/tar/retention-paused`, `POST .../scan`, and `POST
+    .../reenable` with method, path, permission, request schema,
+    response codes, and the audit-action emitted.
+  - **doc-S2** — `docs/tar-dashboard.md` §7 audit-action list
+    corrected: `tar.retention_paused.list` (never implemented) →
+    `tar.status.scan` (the actual emission). Forward-pointer added
+    to `tar.source.purge` etc. as the Phase 15.A.next deliverables.
+  - **doc-S3** — `docs/roadmap.md` Phase 15 issue index row for
+    #547 now reflects PR-A.A delivery — "In progress —
+    PR-A.A shipped (paused_at + status extension + dashboard page +
+    Scan + Re-enable; purge action + persistence pending)" rather
+    than the bare "In progress" of the prior doc commit.
+  - **doc-S4** — `docs/tar-dashboard.md` PR ladder row for PR-A
+    flips from "In flight — current session" to "Shipped PR-A.A"
+    so future readers do not treat the deferred purge action as an
+    accidental omission.
 - **TAR dashboard hardening round 1 — Gate 2 governance findings
   (issue #547).** The PR-A.A initial commit shipped on
   `Infrastructure:Read` for the Scan dispatch and a single shared

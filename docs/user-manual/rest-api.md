@@ -3103,6 +3103,54 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
 - Agent-side: validates `$`-prefixed table name whitelist, enforces single-statement limit, and rejects queries exceeding 4KB.
 
+#### `GET /tar`
+
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list and placeholder slots for the SQL frame and process tree viewer.
+
+**Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
+
+#### `GET /fragments/tar/retention-paused`
+
+Render an HTML table fragment of the calling operator's most-recent TAR retention scan, scoped to the operator's visible-agent set. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources."
+
+**Permission:** `Infrastructure:Read`.
+
+**Request:** no parameters.
+
+**Response:** HTML fragment.
+
+#### `POST /fragments/tar/retention-paused/scan`
+
+Dispatch a `tar.status` command to the operator's visible-agent set and record the new command_id in the per-username scan slot. The next `GET /fragments/tar/retention-paused` picks up the responses.
+
+**Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
+
+**Request:** no parameters. Scope is implicitly the operator's visible-agent set; the operator cannot widen scope through this endpoint.
+
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder if the operator has zero visible agents in scope.
+
+**Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
+
+#### `POST /fragments/tar/retention-paused/reenable`
+
+Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-source independence is preserved — re-enabling `process` does not affect `tcp` / `service` / `user`.
+
+**Permission:** `Execution:Execute`. Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
+
+**Request body (form-encoded):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. |
+
+**Response:**
+- 200 OK with empty body and an `HX-Trigger` toast on success.
+- 400 with explanatory body for missing/invalid params.
+- 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
+
+**Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+
 ---
 
 ## MCP (Model Context Protocol)
