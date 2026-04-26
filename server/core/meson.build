@@ -83,6 +83,7 @@ yuzu_server_core_lib = static_library(
     'src/schedule_engine.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
+    'src/tar_page_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
     'src/error_codes.cpp',

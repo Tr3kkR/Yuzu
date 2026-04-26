@@ -6,6 +6,7 @@
 /// and HTMX-native instruction dispatch.
 
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -99,9 +100,26 @@ private:
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);
 
+    /// Render the TAR retention-paused source list (Phase 15.A — issue #547).
+    /// Reads the most recent `tar.status` scan tracked by the routes
+    /// instance, parses each agent's output for `<source>_enabled=false`
+    /// rows, and renders an HTML table body fragment.
+    std::string render_tar_retention_paused() const;
+
     /// Parse f_* filter params from request into FacetFilter vector.
     std::vector<FacetFilter> parse_filters(const httplib::Request& req,
                                             const std::string& plugin) const;
+
+    // -- TAR retention scan tracking (Phase 15.A) -----------------------------
+    //
+    // Tracks the most-recent operator-triggered `tar.status` scan so the
+    // GET /fragments/tar/retention-paused endpoint has data to render.
+    // In-memory and per-server-instance for now; persistence + multi-server
+    // coordination land in Phase 15.G operational hardening.
+    mutable std::mutex tar_scan_mu_;
+    std::string latest_tar_scan_id_;     // command_id of the most-recent scan
+    int latest_tar_scan_count_{0};       // number of agents the dispatch reached
+    int64_t latest_tar_scan_at_{0};      // epoch seconds when the scan was triggered
 };
 
 } // namespace yuzu::server
