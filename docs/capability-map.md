@@ -136,6 +136,8 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 > **Gap:** No scope/filter-based targeting (e.g., "all Windows agents").
 
+> **Gap:** Contradicts the stated capability to filter scope based on asset tag values as stated in asset-tagging-guide.md.
+
 ### 2.3 Streaming Command Output :white_check_mark: `T1`
 
 `CommandResponse` streams via gRPC and SSE to the dashboard.
