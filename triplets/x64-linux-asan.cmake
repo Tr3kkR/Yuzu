@@ -20,9 +20,21 @@ set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 # Sanitiser flags propagate to every compiled C/C++ TU in vendored
 # dependencies. `-fno-omit-frame-pointer` keeps backtraces accurate;
 # `-g` keeps file:line debug info.
-set(VCPKG_C_FLAGS   "-fsanitize=address,undefined -fno-omit-frame-pointer -g")
-set(VCPKG_CXX_FLAGS "-fsanitize=address,undefined -fno-omit-frame-pointer -g")
-set(VCPKG_LINKER_FLAGS "-fsanitize=address,undefined")
+#
+# UBSan is intentionally **not** built into the deps. Adding
+# `-fsanitize=undefined` instruments function-pointer + vptr access
+# in a way that prevents abseil 20260107.1's
+# `TypeErasedApplyToSlotFn` constexpr address-comparison in
+# `absl/container/internal/hash_policy_traits.h:158` from being
+# constant-evaluated, breaking the abseil build before it can
+# produce artefacts. The Yuzu application binary still compiles
+# under both ASan + UBSan via meson `-Db_sanitize=address,undefined`,
+# but the vendored libs only need to cooperate with ASan's
+# container-poisoning logic to fix the protobuf-static-init
+# use-after-poison; UBSan instrumentation in libs adds nothing.
+set(VCPKG_C_FLAGS   "-fsanitize=address -fno-omit-frame-pointer -g")
+set(VCPKG_CXX_FLAGS "-fsanitize=address -fno-omit-frame-pointer -g")
+set(VCPKG_LINKER_FLAGS "-fsanitize=address")
 
 # Skip dep debug variants — the sanitiser job builds protobuf/abseil/
 # grpc (already large); a debug-side build would double the binary-
