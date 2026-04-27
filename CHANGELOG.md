@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: ASan job now uses `x64-linux-asan` triplet so vendored deps
+  (protobuf/abseil/grpc) are built with `-fsanitize=address,undefined`
+  — fixes a 4-of-4 ASan FAIL streak.** Every prior ASan run aborted
+  in 0.44s with `AddressSanitizer: use-after-poison` triggered before
+  any Yuzu test code executed: protobuf's `DescriptorPool::Tables`
+  static constructor inserts into an `absl::flat_hash_map` whose
+  unused slots are poisoned by abseil's container-overflow logic, but
+  abseil's `ABSL_HAVE_ADDRESS_SANITIZER` macro only fires when the
+  abseil build itself sees `-fsanitize=address` — vcpkg's stock
+  abseil port doesn't, so the application's ASan instrumentation
+  diverged from the library's, gcc 13's libstdc++ basic_string SSO
+  inline-buffer read on an adjacent slot was flagged as
+  use-after-poison, and the binary aborted.
+  Building the deps with the same sanitiser flags as the application
+  (via the new `triplets/x64-linux-asan.cmake` overlay triplet)
+  makes abseil cooperate with ASan and resolves the static-init
+  abort. Per-sanitiser binary-cache directory keeps the instrumented
+  .zips separate from the regular `x64-linux` cache. First run pays
+  ~25 min from-source for the ASan-instrumented deps; subsequent
+  runs are extract-from-zip (~10s) since the runner's local disk has
+  ample room (issue #569's local-cache architecture made this
+  tractable). TSan deferred — different shadow-memory model, no
+  similar abseil interference today.
+
 - **CI: dropped `actions/cache@v5` on every self-hosted runner —
   Linux + Windows now use runner-local persistent state only
   (issue #569).** 14 cache blocks removed across `ci.yml` (8),
