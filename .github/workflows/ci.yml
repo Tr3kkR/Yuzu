@@ -137,32 +137,18 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-
-            ccache-linux-${{ matrix.compiler }}-
-
+      # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
+      # runner, which persists in the github-runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying
+      # the GHA upload cost would just reupload data that's already on
+      # disk. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-${{ matrix.compiler }}-
+      # vcpkg_installed/ persists in ${{ github.workspace }} between
+      # jobs on this self-hosted runner. The "Force fresh vcpkg install
+      # when triplet changed" step below handles the only invalidation
+      # case (overlay-triplet content change). Issue #569.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -458,7 +444,16 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     env:
-      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      # detect_odr_violation=0: gRPC's libgpr.so embeds a static copy of
+      # abseil's `kToUpper` (from absl/strings/ascii.cc) while the
+      # application links abseil dynamically; ASan sees two
+      # definitions and aborts. This is a vcpkg port-linkage artefact
+      # (gpr → static abseil) rather than a Yuzu code bug. The ODR
+      # check catches a class of static-init-order issues with
+      # duplicate-symbol SO copies that no Yuzu source path can hit.
+      # If gpr's vcpkg port is fixed to use dynamic abseil this can
+      # be re-enabled.
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
 
     steps:
@@ -475,31 +470,10 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-asan-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -507,22 +481,37 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Install vcpkg packages
+      # ASan job uses the x64-linux-asan triplet so vcpkg builds
+      # protobuf/abseil/grpc with -fsanitize=address,undefined. This
+      # makes abseil cooperate with ASan via ABSL_HAVE_ADDRESS_SANITIZER
+      # and resolves the spurious use-after-poison at protobuf static
+      # init that aborted every prior ASan run before any Yuzu test
+      # could execute.
+      #
+      # Binary cache lives in a sanitiser-specific dir on the runner so
+      # the instrumented .zips don't clobber the regular x64-linux
+      # cache. First run is from-source (~25 min), subsequent runs are
+      # extract-from-zip (~10s).
+      - name: Install vcpkg packages (ASan-instrumented)
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-asan
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
+            --triplet x64-linux-asan \
+            --overlay-triplets=${{ github.workspace }}/triplets \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + ASan/UBSan)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-asan/lib/pkgconfig
         run: |
           meson setup builddir \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-asan \
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined
 
@@ -560,31 +549,10 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-tsan-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -647,31 +615,10 @@ jobs:
           pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-coverage-
-
+      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
+      # the self-hosted Linux runner between jobs. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6

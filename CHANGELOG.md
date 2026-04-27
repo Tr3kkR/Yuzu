@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CI: ASan job now uses `x64-linux-asan` triplet so vendored deps
+  (protobuf/abseil/grpc) are built with `-fsanitize=address,undefined`
+  — fixes a 4-of-4 ASan FAIL streak.** Every prior ASan run aborted
+  in 0.44s with `AddressSanitizer: use-after-poison` triggered before
+  any Yuzu test code executed: protobuf's `DescriptorPool::Tables`
+  static constructor inserts into an `absl::flat_hash_map` whose
+  unused slots are poisoned by abseil's container-overflow logic, but
+  abseil's `ABSL_HAVE_ADDRESS_SANITIZER` macro only fires when the
+  abseil build itself sees `-fsanitize=address` — vcpkg's stock
+  abseil port doesn't, so the application's ASan instrumentation
+  diverged from the library's, gcc 13's libstdc++ basic_string SSO
+  inline-buffer read on an adjacent slot was flagged as
+  use-after-poison, and the binary aborted.
+  Building the deps with the same sanitiser flags as the application
+  (via the new `triplets/x64-linux-asan.cmake` overlay triplet)
+  makes abseil cooperate with ASan and resolves the static-init
+  abort. Per-sanitiser binary-cache directory keeps the instrumented
+  .zips separate from the regular `x64-linux` cache. First run pays
+  ~25 min from-source for the ASan-instrumented deps; subsequent
+  runs are extract-from-zip (~10s) since the runner's local disk has
+  ample room (issue #569's local-cache architecture made this
+  tractable). TSan deferred — different shadow-memory model, no
+  similar abseil interference today.
+
+- **CI: dropped `actions/cache@v5` on every self-hosted runner —
+  Linux + Windows now use runner-local persistent state only
+  (issue #569).** 14 cache blocks removed across `ci.yml` (8),
+  `release.yml` (5), and `codeql.yml` (1). On a self-hosted
+  runner, ccache's OS-default location (`~/.cache/ccache` on
+  Linux, `~\AppData\Local\ccache` on Windows) lives in the
+  github-runner user's home directory, which persists between
+  jobs by definition; `vcpkg_installed/` similarly persists in
+  `${{ github.workspace }}` since self-hosted workspaces are not
+  recycled. Routing those directories through GHA's 10 GB cache
+  backend was pure overhead — the post-`a5436ed` ccache contents
+  alone (~4 GB per (compiler, mode) entry) couldn't all fit, and
+  LRU eviction was forcing from-scratch rebuilds on every job.
+  Expected impact: per-job CI wall time drops from 50-80 min to
+  8-12 min on self-hosted Linux, and the cumulative push-to-CI
+  cycle from 5-7 hours to 30-60 min. macOS jobs (cloud-hosted,
+  ephemeral) keep their `actions/cache` blocks — those are the
+  only legitimate use of GHA cache in this workflow set.
+
+  The vestigial `compact_compiler` matrix include from the
+  earlier round-3 cache-key unification is also removed — it only
+  fed the cache keys that no longer exist.
+
+- **CI: unified vcpkg + ccache cache-key form to compact `gcc13` /
+  `clang19` (no hyphen) across every Linux job (issues #569, #547
+  /test investigation).** The matrix-driven Linux build jobs were
+  using `vcpkg-x64-linux-${{ matrix.compiler }}-...` which
+  interpolated as `gcc-13` / `clang-19` (with hyphen). The
+  standalone Sanitizer / Coverage / Real-upstream jobs hard-coded
+  `vcpkg-x64-linux-gcc13-...` (no hyphen). Two parallel cache
+  entries for identical content forced the GHA 10 GB cap into LRU
+  eviction during the v0.12.0-rc /test run on dev — net effect
+  was 5-7h CI cycles where 50-80 min was vcpkg-from-source rebuilds
+  and 20-40 min ccache uploads, instead of the expected 8-12 min.
+  Added a `compact_compiler` matrix include that maps
+  `gcc-13 → gcc13` / `clang-19 → clang19`; every Linux cache key
+  now uses that field. The deeper architectural fix (drop
+  `actions/cache@v5` on self-hosted Linux entirely in favour of
+  runner-local persistent dirs) is tracked separately as issue
+  #569; this entry closes only the cache-key-mismatch half.
+- **`.claude/agents/consistency-auditor.md` extended to cover
+  `.github/workflows/*.yml`.** Cache-key parity across sibling
+  jobs, restore-key subsumption, runner-label coherence
+  (self-hosted vs cloud), matrix-include shape parity, action SHA
+  pinning uniformity, and workflow-dispatch input contract are now
+  explicit Key Questions for the agent. Without this, /governance
+  runs miss CI-yaml drift like the gcc-13 / gcc13 cache split that
+  thrashed the GHA cache for weeks before /test surfaced it.
+
 - **TAR dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
   Folds the BLOCKING items Gates 5 + 6 (compliance / sre / enterprise-
   readiness / chaos) caught after the first three hardening rounds:
