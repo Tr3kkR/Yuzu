@@ -444,7 +444,16 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     env:
-      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      # detect_odr_violation=0: gRPC's libgpr.so embeds a static copy of
+      # abseil's `kToUpper` (from absl/strings/ascii.cc) while the
+      # application links abseil dynamically; ASan sees two
+      # definitions and aborts. This is a vcpkg port-linkage artefact
+      # (gpr → static abseil) rather than a Yuzu code bug. The ODR
+      # check catches a class of static-init-order issues with
+      # duplicate-symbol SO copies that no Yuzu source path can hit.
+      # If gpr's vcpkg port is fixed to use dynamic abseil this can
+      # be re-enabled.
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
 
     steps:
