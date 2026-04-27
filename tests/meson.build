@@ -33,7 +33,13 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, yuzu_proto_dep, nlohmann_dep, catch2_dep],
+  # yuzu_proto_headers_dep (not yuzu_proto_dep) — see #572. Linking
+  # yuzu_proto.a directly here puts a second copy of every .pb.o into the
+  # test binary even though libyuzu_agent_core.so already embeds them, and
+  # the duplicate descriptor-registration trips protobuf's CHECK under
+  # ASan. Symbols resolve transitively through libyuzu_agent_core.so
+  # (proto compiled with visibility=default per proto/meson.build).
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, yuzu_proto_headers_dep, nlohmann_dep, catch2_dep],
   # Ensure the fixture plugin is built before the test runs so the lookup
   # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
   link_depends: reserved_name_fixture_plugin,
