@@ -427,6 +427,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`yuzu_agent_tests` no longer double-links `yuzu_proto.a`, removing
+  the duplicate protobuf descriptor registration that aborted ASan
+  runs (issue #572).** Both `libyuzu_agent_core.so` and
+  `yuzu_agent_tests` listed `yuzu_proto_dep` (which carries
+  `link_with: yuzu_proto_lib` — a static archive). The linker pulled
+  every `.pb.o` into both the .so and the test exe, so each `.pb.cc`
+  static initializer ran twice at process startup. Non-ASan builds
+  silently tolerated the double registration (the second
+  `DescriptorPool::InternalAddGeneratedFile` saw the same encoded
+  descriptor and returned without retrying); ASan flipped static-init
+  ordering enough to make protobuf's `GOOGLE_CHECK` fire with `File
+  already exists in database: yuzu/common/v1/common.proto`, which
+  this option-2 chain (`afd3904`, `4321a40`, `bc498b3`) finally
+  exposed. The fix has two halves: (a) compile `yuzu_proto` with
+  `-fvisibility=default` (added via per-target `cpp_args` since
+  `add_project_arguments`'s `-fvisibility=hidden` would otherwise
+  win the last-flag-wins fight with `gnu_symbol_visibility`) so the
+  proto symbols actually get exported from any `.so` they're linked
+  into; (b) introduce a `yuzu_proto_headers_dep` (includes + sources
+  + protobuf/grpcpp deps, no `link_with`) and use it in the
+  `yuzu_agent_tests` executable so the test binary resolves proto
+  symbols dynamically against `libyuzu_agent_core.so` instead of
+  relinking the static archive. The ASan path can now exercise the
+  agent test surface end-to-end. (`proto/meson.build`,
+  `tests/meson.build`)
 - **TAR `network_capture_method=polling` (the documented default) is
   no longer rejected by the configure surface (governance C-1 / QA
   Finding 2).** Both `do_status` reported `polling` as the default and
