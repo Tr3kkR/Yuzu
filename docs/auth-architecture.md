@@ -4,7 +4,7 @@ Reference for the authentication and authorization features implemented in the Y
 
 ## Transport and identity
 
-- **mTLS** for agent ↔ server gRPC connections.
+- **mTLS** for agent ↔ server gRPC connections. Note that a migration from gRPC->QUIC is intended.
 - **Windows certificate store integration** — agent can read mTLS client cert + private key from the Windows cert store instead of PEM files. Uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`). Searches Local Machine first, falls back to Current User. Exports full certificate chain (leaf + intermediates) as PEM. CLI flags: `--cert-store MY --cert-subject "yuzu-agent"` or `--cert-thumbprint "AB12..."`.
 - **Certificate hot-reload** — HTTPS cert/key PEM files are polled for changes (default 60s interval) and hot-swapped without server restart. Validates PEM parse, cert/key match, and key file permissions before applying. gRPC TLS reload not supported. CLI: `--no-cert-reload`, `--cert-reload-interval`. Audit action: `cert.reload`. Metrics: `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total`.
 
@@ -13,7 +13,7 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 ## Login and session management
 
 - **RBAC login** — session-cookie auth with PBKDF2-hashed passwords in `yuzu-server.cfg`. Legacy roles: `admin` (full access) and `user` (read-only). First-run interactive setup prompts for credentials.
-- **Login page** — dark-themed, with greyed-out OIDC SSO stub where appropriate.
+- **Login page** — dark-themed, with greyed-out OIDC SSO stub where appropriate. Yuzu does not support Light Mode.
 - **Settings page** (admin-only) — TLS toggle, PEM cert upload, user management, enrollment tokens, pending agent approvals, AD/Entra section.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
