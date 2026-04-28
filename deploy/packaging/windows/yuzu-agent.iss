@@ -8,7 +8,7 @@
 
 ; Build output directory — override with /DBuildDir=...
 #ifndef BuildDir
-  #define BuildDir "..\..\..\builddir"
+  #define BuildDir "..\..\..\build-windows"
 #endif
 
 [Setup]

@@ -27,7 +27,7 @@
 #endif
 
 #ifndef BuildDir
-  #define BuildDir "..\..\..\builddir"
+  #define BuildDir "..\..\..\build-windows"
 #endif
 
 #ifndef ContentDir
