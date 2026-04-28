@@ -172,6 +172,16 @@ if host_os == 'windows'
   _libssl    = _cxx.find_library('libssl',    dirs: [_vcpkg_lib_win], required: true)
   _libcrypto = _cxx.find_library('libcrypto', dirs: [_vcpkg_lib_win], required: true)
 
+  # CLI11 — same build-type-conditional reasoning as protobuf/grpc above.
+  # Meson's cmake dep would pick `lib/CLI11.lib` (release) for both debug
+  # and release consumers, producing LNK2038 mismatches between debug
+  # user code (/MDd, _ITERATOR_DEBUG_LEVEL=2) and release CLI11.lib's
+  # Precompile.cpp.obj (/MD, =0). Hand-wire to the buildtype-specific
+  # _vcpkg_lib_win directory so debug picks debug/lib/CLI11.lib.
+  # CLI11's vcpkg port keeps the same name in both lib/ and debug/lib/
+  # (no `d` suffix), so no _pbd handling needed here.
+  _libcli11 = _cxx.find_library('CLI11', dirs: [_vcpkg_lib_win], required: true)
+
   # zlib — grpc.lib(message_compress.cc.obj) has unresolved references to
   # __imp_deflate / __imp_inflate / __imp_deflateInit2_ / __imp_inflateInit2_
   # etc. gRPC's message compression code path uses zlib for gzip-compressed
@@ -211,6 +221,10 @@ if host_os == 'windows'
       _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,
     ] + _absl_deps,
   )
+  cli11_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    dependencies: [_libcli11],
+  )
 else
   # Linux/macOS: meson's cmake dep method works correctly because gcc/clang
   # don't have MSVC's runtime-library variant ABI — debug user code can
@@ -228,12 +242,12 @@ else
     protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
       include_type: 'system')
   endif
+  cli11_dep = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
+    required: true, include_type: 'system')
 endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
 nlohmann_dep    = dependency('nlohmann_json', required: true, include_type: 'system')
-cli11_dep       = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
-  required: true, include_type: 'system')
 httplib_dep     = dependency('httplib', required: false, include_type: 'system')
 if not httplib_dep.found()
   httplib_dep   = dependency('cpp-httplib', required: true, include_type: 'system')
