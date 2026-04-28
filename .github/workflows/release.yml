@@ -63,7 +63,7 @@ jobs:
           fi
 
       - name: Clean stale build directory (preserve vcpkg_installed)
-        run: rm -rf builddir
+        run: rm -rf build-linux
 
       # ccache (~/.cache/ccache) persists on the self-hosted Linux
       # runner between jobs. The original cache/restore@v5 was already
@@ -72,6 +72,10 @@ jobs:
       # any GHA round-trip. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
+
+      - name: vcpkg sentinel (x64-linux-static)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-static
 
       - name: Install vcpkg packages (static linkage)
         run: |
@@ -86,14 +90,14 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static/lib/pkgconfig
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static
         run: |
-          meson setup builddir \
+          meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-static \
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-linux
 
       - name: ccache stats
         if: always()
@@ -101,8 +105,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/server/core/yuzu-server --help || true
-          ./builddir/agents/core/yuzu-agent --help || true
+          ./build-linux/server/core/yuzu-server --help || true
+          ./build-linux/agents/core/yuzu-agent --help || true
 
       - name: Package archive
         run: |
@@ -112,14 +116,14 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
-          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
+          cp build-linux/server/core/yuzu-server "${STAGING}/bin/"
+          cp build-linux/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core shared library
-          find builddir -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
+          find build-linux -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
 
           # Plugin shared libraries
-          find builddir/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
+          find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
 
           # Content definitions
           cp content/definitions/*.yaml "${STAGING}/content/definitions/"
@@ -131,7 +135,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
-            --bin-dir builddir --version "$DEB_VERSION" --output .
+            --bin-dir build-linux --version "$DEB_VERSION" --output .
 
       - name: Build .rpm packages
         run: |
@@ -142,13 +146,13 @@ jobs:
           PRE_FLAG=""
           [ -n "$PRERELEASE" ] && PRE_FLAG="--prerelease $PRERELEASE"
           bash deploy/packaging/rpm/build-rpm.sh \
-            --bin-dir builddir --version "$RPM_VERSION" $PRE_FLAG --output .
+            --bin-dir build-linux --version "$RPM_VERSION" $PRE_FLAG --output .
 
       # ── SBOM (CycloneDX + SPDX) ─────────────────────────────────────
       # Syft scans the workspace and emits one SBOM covering:
       #   - vcpkg C++ dependencies (via vcpkg.spdx.json files under
       #     vcpkg_installed/x64-linux-static/share/<pkg>/)
-      #   - Built ELF binaries under builddir/ (server, agent, plugins)
+      #   - Built ELF binaries under build-linux/ (server, agent, plugins)
       # Output two formats because customer questionnaires ask for one
       # or the other inconsistently and both are trivial to emit.
       - name: Generate SBOM (CycloneDX)
@@ -420,6 +424,11 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: vcpkg sentinel (x64-windows)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        shell: bash
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
+
       - name: Install vcpkg packages
         run: |
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
@@ -431,14 +440,14 @@ jobs:
           CC: ccache cl
           CXX: ccache cl
         run: |
-          meson setup builddir `
+          meson setup build-windows `
             --buildtype=release `
             -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-windows
 
       - name: ccache stats
         if: always()
@@ -446,8 +455,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          & ./builddir/server/core/yuzu-server.exe --help
-          & ./builddir/agents/core/yuzu-agent.exe --help
+          & ./build-windows/server/core/yuzu-server.exe --help
+          & ./build-windows/agents/core/yuzu-agent.exe --help
         continue-on-error: true
 
       - name: Sign binaries (Authenticode)
@@ -475,10 +484,10 @@ jobs:
 
           # Collect all EXE and DLL files to sign
           $filesToSign = @()
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-server.exe" -Recurse
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-agent.exe" -Recurse
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu_agent_core.dll" -Recurse
-          $filesToSign += Get-ChildItem builddir/agents/plugins -Filter "*.dll" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu-server.exe" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu-agent.exe" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu_agent_core.dll" -Recurse
+          $filesToSign += Get-ChildItem build-windows/agents/plugins -Filter "*.dll" -Recurse
 
           foreach ($file in $filesToSign) {
             Write-Host "Signing: $($file.FullName)"
@@ -511,14 +520,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
 
           # Binaries
-          Copy-Item "builddir/server/core/yuzu-server.exe" "${staging}/bin/"
-          Copy-Item "builddir/agents/core/yuzu-agent.exe" "${staging}/bin/"
+          Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"
+          Copy-Item "build-windows/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
           # Agent core DLL
-          Get-ChildItem -Path builddir -Filter "yuzu_agent_core.dll" -Recurse | Copy-Item -Destination "${staging}/bin/"
+          Get-ChildItem -Path build-windows -Filter "yuzu_agent_core.dll" -Recurse | Copy-Item -Destination "${staging}/bin/"
 
           # Plugin DLLs
-          Get-ChildItem -Path builddir/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
+          Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
           # Runtime DLLs from vcpkg that plugins/binaries need
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
@@ -548,7 +557,7 @@ jobs:
           Write-Host "=== Building Agent Installer ==="
           & $iscc `
             "/DAppVersion=${version}" `
-            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "/DBuildDir=${{ github.workspace }}\build-windows" `
             "deploy\packaging\windows\yuzu-agent.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Agent installer failed"; exit 1 }
 
@@ -560,7 +569,7 @@ jobs:
           Write-Host "=== Building Server Installer ==="
           & $iscc `
             "/DAppVersion=${version}" `
-            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "/DBuildDir=${{ github.workspace }}\build-windows" `
             "/DContentDir=${{ github.workspace }}\content" `
             "deploy\packaging\windows\yuzu-server.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
@@ -604,7 +613,7 @@ jobs:
           Remove-Item $certPath -Force
 
       # ── Windows SBOM (CycloneDX + SPDX) ─────────────────────────────
-      # Scans vcpkg_installed/x64-windows (C++ deps) + builddir (PE
+      # Scans vcpkg_installed/x64-windows (C++ deps) + build-windows (PE
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       - name: Generate Windows SBOM (CycloneDX)
@@ -723,11 +732,17 @@ jobs:
         # the 45-min job budget. cache/restore@v5 also drops the
         # `save-always: true` input that the maintainers say never
         # worked as intended (cf. v5.0.5 deprecation warning).
+        #
+        # Cache key follows the universal contract from the CI overhaul
+        # plan: vcpkg.json + vcpkg-configuration.json + every overlay
+        # triplet + the pinned VCPKG_COMMIT baseline. Same shape as the
+        # ci.yml macOS cache key.
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
+            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
@@ -747,7 +762,7 @@ jobs:
           CC: ccache cc
           CXX: ccache c++
         run: |
-          meson setup builddir \
+          meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
@@ -755,7 +770,7 @@ jobs:
             -Db_lto=true
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-macos
 
       - name: ccache stats
         if: always()
@@ -763,8 +778,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/server/core/yuzu-server --help || true
-          ./builddir/agents/core/yuzu-agent --help || true
+          ./build-macos/server/core/yuzu-server --help || true
+          ./build-macos/agents/core/yuzu-agent --help || true
 
       - name: Sign binaries (codesign)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -799,7 +814,7 @@ jobs:
 
           # Sign all binaries and dylibs with hardened runtime
           IDENTITY="${MACOS_SIGNING_IDENTITY}"
-          for binary in builddir/yuzu-server builddir/yuzu-agent; do
+          for binary in build-macos/yuzu-server build-macos/yuzu-agent; do
             echo "Signing: ${binary}"
             codesign --force --options runtime \
               --sign "${IDENTITY}" \
@@ -809,7 +824,7 @@ jobs:
           done
 
           # Sign dylibs
-          find builddir -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
+          find build-macos -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
             echo "Signing: ${dylib}"
             codesign --force --options runtime \
               --sign "${IDENTITY}" \
@@ -831,11 +846,11 @@ jobs:
           # Create a ZIP of the signed binaries for notarization submission
           NOTARIZE_ZIP="${RUNNER_TEMP}/yuzu-notarize.zip"
           zip -j "${NOTARIZE_ZIP}" \
-            builddir/yuzu-server \
-            builddir/yuzu-agent
+            build-macos/yuzu-server \
+            build-macos/yuzu-agent
 
           # Add dylibs to the notarization payload
-          find builddir -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
+          find build-macos -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
 
           # Submit for notarization and wait for result
           echo "Submitting for Apple notarization..."
@@ -865,14 +880,14 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
-          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
+          cp build-macos/server/core/yuzu-server "${STAGING}/bin/"
+          cp build-macos/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core dylib
-          find builddir -name 'libyuzu_agent_core.dylib*' -exec cp {} "${STAGING}/bin/" \;
+          find build-macos -name 'libyuzu_agent_core.dylib*' -exec cp {} "${STAGING}/bin/" \;
 
           # Plugin dylibs
-          find builddir/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
+          find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
 
           # Content definitions
           cp content/definitions/*.yaml "${STAGING}/content/definitions/"
@@ -884,7 +899,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           bash deploy/packaging/macos/build-pkg.sh \
-            --bin-dir builddir --version "$VERSION" --output .
+            --bin-dir build-macos --version "$VERSION" --output .
 
       - name: Sign installer (.pkg)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -926,7 +941,7 @@ jobs:
           echo "Notarized and stapled: ${PKG}"
 
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
-      # Scans vcpkg_installed/arm64-osx + builddir (Mach-O binaries).
+      # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
