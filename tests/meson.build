@@ -1,32 +1,38 @@
 if host_os == 'windows'
   # Same #375-class IMPORTED_LOCATION_RELEASE problem as protobuf/grpc/cli11
   # in the top-level meson.build: meson's cmake dep translator picks
-  # lib/Catch2.lib (release CRT) for both debug and release consumers,
-  # so a debug test binary linking with /MDd against release Catch2.lib
+  # the release-CRT Catch2 lib for both debug and release consumers,
+  # so a debug test binary linking with /MDd against release Catch2
   # trips dozens of LNK2038 _ITERATOR_DEBUG_LEVEL mismatches.
   #
-  # Three vcpkg quirks for catch2 specifically:
-  #   1. Libs live at lib/manual-link/ + debug/lib/manual-link/ — vcpkg
-  #      convention for libraries the consumer must explicitly link
-  #      against (Catch2WithMain.lib defines main() so consumers must
-  #      opt in by listing it; Catch2.lib is the body that
-  #      Catch2WithMain depends on).
-  #   2. The "main" target is named Catch2WithMain (NOT Catch2Main).
-  #   3. Same filename in lib/ and debug/lib/ — no `d` suffix.
+  # Catch2's vcpkg layout (verified against vcpkg_installed/x64-linux/
+  # — same convention on Windows with .lib instead of .a):
   #
-  # Hand-wire to the buildtype-specific _vcpkg_lib_win/manual-link/
-  # directory. _vcpkg_lib_win is established in the top-level Windows
-  # block (debug/lib for debug, lib for release).
+  #   lib/Catch2.lib                              <- base lib
+  #   lib/manual-link/Catch2Main.lib              <- defines main()
+  #   debug/lib/Catch2d.lib                       <- debug, `d` suffix
+  #   debug/lib/manual-link/Catch2Maind.lib
+  #
+  # Three quirks:
+  #   1. Two libs in two directories. Catch2 is in plain lib/; only
+  #      Catch2Main lives in lib/manual-link/. (vcpkg convention:
+  #      libs that define main() — that the consumer must explicitly
+  #      opt into linking — go in manual-link/.)
+  #   2. The lib file is named Catch2Main, NOT Catch2WithMain. The
+  #      cmake TARGET is Catch2::Catch2WithMain but the underlying
+  #      filename omits the "With".
+  #   3. Same `d` suffix convention as protobuf for the debug variant.
+  #      _pbd is established in the top-level Windows block ('' for
+  #      release, 'd' for debug).
   _cxx_tests = meson.get_compiler('cpp')
-  _vcpkg_catch2_lib_win = _vcpkg_lib_win / 'manual-link'
-  _libcatch2         = _cxx_tests.find_library('Catch2',         dirs: [_vcpkg_catch2_lib_win], required: true)
-  _libcatch2withmain = _cxx_tests.find_library('Catch2WithMain', dirs: [_vcpkg_catch2_lib_win], required: true)
+  _libcatch2     = _cxx_tests.find_library('Catch2'     + _pbd, dirs: [_vcpkg_lib_win],                 required: true)
+  _libcatch2main = _cxx_tests.find_library('Catch2Main' + _pbd, dirs: [_vcpkg_lib_win / 'manual-link'], required: true)
   catch2_dep = declare_dependency(
     include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
-    # Order matters: the WithMain lib defines main() and depends on
-    # symbols from the Catch2 lib. List WithMain first so the linker
-    # pulls it in, then Catch2 satisfies the leftover refs.
-    dependencies: [_libcatch2withmain, _libcatch2],
+    # Order matters: Catch2Main defines main() and references symbols
+    # from Catch2. List Main first so the linker pulls it in, then
+    # Catch2 satisfies the leftover refs.
+    dependencies: [_libcatch2main, _libcatch2],
   )
 else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
