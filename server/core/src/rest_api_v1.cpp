@@ -2,6 +2,7 @@
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "store_errors.hpp"
+#include "visualization_engine.hpp"
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <regex>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -393,6 +395,9 @@ const std::string& openapi_spec() {
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
+    },
+    "/executions/{id}/visualization": {
+      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Requires Response:Read. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
     })json"
     // Split here so each raw-string literal stays under MSVC's 16,380-byte
     // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -1590,6 +1595,157 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 }
                 res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                 "application/json");
+            });
+
+    // ── Response Visualization (issue #253, capability 20.6) ─────────────
+    //
+    // Renders an instruction's response set as chart-ready JSON using the
+    // `spec.visualization` block stored on the InstructionDefinition. The
+    // {id} path parameter is the response_store key (a.k.a. command_id /
+    // instruction_id) returned at dispatch time. `definition_id` is required
+    // because Yuzu's response model keys responses by command_id, not by
+    // executions.id — the only durable link from a response set back to a
+    // definition is the one the dispatcher recorded in the audit trail.
+    //
+    // Securable: Response:Read — sibling parity with /fragments/results,
+    // /api/responses/{id}/aggregate, and /api/responses/{id}/export which
+    // all read response_store on the same gate. Governance gate C-1.
+    sink.Get(R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
+            [auth_fn, perm_fn, audit_fn, response_store, instruction_store]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Response", "Read")) return;
+                auto session = auth_fn(req, res);
+                if (!session) return;
+                if (!response_store || !instruction_store ||
+                    !response_store->is_open() ||
+                    !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+
+                auto execution_id = req.matches[1].str();
+                if (!req.has_param("definition_id")) {
+                    res.status = 400;
+                    res.set_content(error_json("definition_id query parameter is required"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, "reason=missing_definition_id");
+                    return;
+                }
+                auto definition_id = req.get_param_value("definition_id");
+
+                // Closes governance sec-F3 / C-15: regex-bound definition_id
+                // on the REST endpoint to match the dashboard fragment.
+                // Without this, an unbounded value flows through audit_fn,
+                // spdlog, and SQL bind parameters.
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                if (!std::regex_match(definition_id, kIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, "reason=malformed_definition_id");
+                    return;
+                }
+
+                // Issue #587: optional `?index=N` selects which chart to
+                // render when a definition declares multiple. Default 0.
+                int chart_index = 0;
+                if (req.has_param("index")) {
+                    try {
+                        chart_index = std::stoi(req.get_param_value("index"));
+                    } catch (...) {
+                        res.status = 400;
+                        res.set_content(error_json("index must be a non-negative integer"),
+                                        "application/json");
+                        return;
+                    }
+                    if (chart_index < 0) {
+                        res.status = 400;
+                        res.set_content(error_json("index must be a non-negative integer"),
+                                        "application/json");
+                        return;
+                    }
+                }
+
+                auto def = instruction_store->get_definition(definition_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("instruction definition not found"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id,
+                             definition_id + " reason=definition_not_found");
+                    return;
+                }
+                int chart_count = VisualizationEngine::count(def->visualization_spec);
+                if (chart_count == 0) {
+                    res.status = 404;
+                    res.set_content(error_json("no visualization configured for this definition"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, definition_id + " reason=no_visualization");
+                    return;
+                }
+                if (chart_index >= chart_count) {
+                    res.status = 404;
+                    res.set_content(
+                        error_json("visualization index out of range (have " +
+                                   std::to_string(chart_count) + " chart(s))"),
+                        "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id,
+                             definition_id + " reason=index_oor index=" +
+                                 std::to_string(chart_index));
+                    return;
+                }
+
+                ResponseQuery q;
+                // Sibling parity: dashboard_routes.cpp's /fragments/results
+                // and the response aggregate/export paths use 10000. Closes
+                // governance C-2 row-cap drift.
+                static constexpr int kRowCap = 10000;
+                q.limit = kRowCap;
+                auto responses = response_store->query(execution_id, q);
+                bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
+                if (rows_capped) {
+                    spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
+                                 kRowCap, execution_id, definition_id);
+                }
+
+                VisualizationEngine engine;
+                auto result = engine.transform_at(def->visualization_spec, chart_index,
+                                                   def->plugin, responses);
+                if (!result.ok) {
+                    res.status = 500;
+                    auto parsed = nlohmann::json::parse(result.json, nullptr, false);
+                    auto msg = parsed.is_discarded() ? std::string("invalid spec")
+                                                     : parsed.value("error", "invalid spec");
+                    res.set_content(error_json(msg), "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, definition_id + " err=" + msg);
+                    return;
+                }
+                // Stamp truncation status + chart index/total onto the
+                // payload so the dashboard can show a "1/2" indicator and
+                // a "showing first 10000 rows" banner. Closes UP-3 / ER-P1.
+                std::string final_json = result.json;
+                if (!final_json.empty() && final_json.back() == '}') {
+                    final_json.pop_back();
+                    final_json += ",\"chart_index\":" + std::to_string(chart_index);
+                    final_json += ",\"chart_count\":" + std::to_string(chart_count);
+                    if (rows_capped) {
+                        final_json += ",\"rows_capped\":true,\"rows_cap\":";
+                        final_json += std::to_string(kRowCap);
+                    }
+                    final_json += "}";
+                }
+                res.set_content(ok_json(final_json), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "success", "execution",
+                         execution_id,
+                         definition_id + " index=" + std::to_string(chart_index));
             });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────

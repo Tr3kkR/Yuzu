@@ -132,6 +132,8 @@ if build_server
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_visualization_engine.cpp',
+      'unit/server/test_rest_visualization.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

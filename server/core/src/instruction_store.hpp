@@ -37,6 +37,10 @@ struct InstructionDefinition {
     std::string min_agent_version;
     std::string required_plugins; // comma-separated
     std::string readable_payload; // e.g. "Inspect service '${serviceName}'"
+    // Issue #253: spec.visualization serialized as JSON. Empty (or "{}") means
+    // the definition has no visualization configured and the
+    // /api/v1/executions/{id}/visualization endpoint returns 404 for it.
+    std::string visualization_spec;
 };
 
 struct InstructionQuery {

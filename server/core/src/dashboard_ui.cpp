@@ -14,6 +14,10 @@ extern const char* const kDashboardIndexHtml =
   <script src="/static/htmx.js"></script>
   <script>htmx.config.useTemplateFragments = true;</script>
   <script src="/static/sse.js"></script>
+  <!-- Chart renderer for spec.visualization payloads (#253). Self-rehydrates
+       on htmx:afterSettle, so chart placeholders appear automatically when
+       /fragments/results swaps the deck via OOB. -->
+  <script src="/static/yuzu-charts.js"></script>
   <style>
     body {
       display: flex; flex-direction: column; height: 100vh;
@@ -113,6 +117,22 @@ extern const char* const kDashboardIndexHtml =
       background: var(--surface);
     }
     .results-header h2 { font-size: 0.85rem; font-weight: 600; }
+
+    /* Chart deck (issue #253 / #587) — one or more chart cards rendered
+       above the filter bar by yuzu-charts.js when the dispatched
+       definition has a spec.visualization. */
+    .yuzu-chart-deck {
+      display: flex; flex-wrap: wrap; gap: 1rem;
+      padding: 0.75rem 1rem; background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .yuzu-chart-deck:empty { display: none; }
+    .yuzu-chart-card {
+      flex: 1 1 360px; min-width: 320px; max-width: 600px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 0.5rem 0.75rem;
+    }
+    .yuzu-chart-card svg { display: block; max-width: 100%; height: auto; }
 
     /* Filter bar */
     .filter-bar {
@@ -444,6 +464,10 @@ extern const char* const kDashboardIndexHtml =
         <span id="density-label">Comfortable</span>
       </button>
     </div>
+    <!-- Chart deck — populated by OOB swap from /fragments/results when the
+         dispatched command has an InstructionDefinition with spec.visualization
+         (issue #587). yuzu-charts.js auto-renders each placeholder div. -->
+    <div id="chart-deck-host"></div>
     <!-- Filter bar — populated by OOB swap after command dispatch -->
     <div id="filter-bar"></div>
     <!-- Loading indicator for HTMX filter/sort requests -->

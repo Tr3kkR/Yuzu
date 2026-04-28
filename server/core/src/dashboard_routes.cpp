@@ -5,6 +5,7 @@
 #include <cmath>
 #include <ctime>
 #include <format>
+#include <regex>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -14,8 +15,10 @@
 
 #include "agent_registry.hpp" // provides detail::AgentRegistry
 #include "event_bus.hpp"
+#include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "response_store.hpp"
+#include "visualization_engine.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
@@ -153,7 +156,8 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
                                        ResolveFn resolve_fn,
-                                       yuzu::MetricsRegistry* metrics) {
+                                       yuzu::MetricsRegistry* metrics,
+                                       InstructionStore* instruction_store) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -166,6 +170,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     dispatch_fn_ = std::move(dispatch_fn);
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
+    instruction_store_ = instruction_store;
 
     // Phase 15.A — issue #547 metric registrations. The design doc
     // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
@@ -218,8 +223,24 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 auto filters = parse_filters(req, plugin);
                 auto text_query = req.get_param_value("q");
 
+                // Issue #587: when the dispatcher knew the definition_id
+                // (e.g. an instruction text resolved to a definition with
+                // spec.visualization), it propagates here so the chart
+                // deck is re-rendered as an OOB swap alongside the tbody.
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                std::string definition_id;
+                if (req.has_param("definition_id")) {
+                    auto raw = req.get_param_value("definition_id");
+                    if (std::regex_match(raw, kIdRegex))
+                        definition_id = raw;
+                    // Silently drop malformed values rather than 400 — this
+                    // is an OOB enrichment, not a primary contract; the
+                    // results table still renders.
+                }
+
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
-                                           page, per_page, filters, text_query);
+                                           page, per_page, filters, text_query,
+                                           definition_id);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -237,7 +258,86 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                     return;
                 }
 
-                auto html = render_filter_bar(command_id, plugin);
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                std::string definition_id;
+                if (req.has_param("definition_id")) {
+                    auto raw = req.get_param_value("definition_id");
+                    if (std::regex_match(raw, kIdRegex))
+                        definition_id = raw;
+                }
+
+                auto html = render_filter_bar(command_id, plugin, definition_id);
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+    // -- GET /fragments/executions/{id}/visualization (issue #253) ------------
+    //
+    // HTMX placeholder for instruction-response chart cards. Lives here
+    // (next to /fragments/results) rather than in server.cpp so the
+    // dashboard fragment surface is in one file. Closes arch-S6 / #589.
+    //
+    // Returns either:
+    //   * a `<div class="yuzu-chart-deck">` containing one
+    //     `<div data-yuzu-chart-url="...&index=K">` per configured chart
+    //     (issue #587 — definitions may declare multiple charts) that the
+    //     yuzu-charts.js auto-render hook (htmx:afterSettle) populates,
+    //   * an empty body when the definition is missing or has no
+    //     visualization configured (so the dashboard suppresses the
+    //     deck entirely rather than showing a "no data" placeholder).
+    //
+    // Securable: Response:Read — sibling parity with /fragments/results
+    // and the /api/v1/executions/{id}/visualization REST endpoint.
+    svr.Get(R"(/fragments/executions/([A-Za-z0-9._-]+)/visualization)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn_(req, res, "Response", "Read")) return;
+                auto execution_id = req.matches[1].str();
+                std::string definition_id;
+                if (req.has_param("definition_id"))
+                    definition_id = req.get_param_value("definition_id");
+                // Validate definition_id with the same character set the
+                // path-bound execution_id uses. Closes sec-H1: without
+                // this check a value containing `"` or `>` would break
+                // out of the `data-yuzu-chart-url` attribute below
+                // (reflected XSS).
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                if (execution_id.empty() || definition_id.empty() ||
+                    !std::regex_match(definition_id, kIdRegex)) {
+                    res.status = 400;
+                    res.set_content(
+                        R"(<div class="yuzu-chart-empty">Missing or malformed execution id or definition_id.</div>)",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                // Pre-flight count: skip the entire deck when no chart is
+                // configured. count() handles both legacy single-object
+                // and canonical array shapes.
+                int chart_count = 0;
+                if (instruction_store_ && instruction_store_->is_open()) {
+                    auto def = instruction_store_->get_definition(definition_id);
+                    if (def)
+                        chart_count = VisualizationEngine::count(def->visualization_spec);
+                }
+                if (chart_count <= 0) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+
+                // Both ids regex-bounded by this point — safe to embed
+                // verbatim into the attribute value. One placeholder per
+                // chart; yuzu-charts.js fetches each independently so a
+                // slow/failed render of one chart doesn't block siblings.
+                // Use `&amp;` (not raw `&`) inside HTML attribute values for
+                // strict HTML5 conformance and consistency with render_results
+                // base_url emission. Closes governance C-14 / sec-F5 / UP-36.
+                std::string html = R"(<div class="yuzu-chart-deck">)";
+                for (int i = 0; i < chart_count; ++i) {
+                    html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
+                    html += "/api/v1/executions/" + execution_id
+                          + "/visualization?definition_id=" + definition_id
+                          + "&amp;index=" + std::to_string(i);
+                    html += R"("></div>)";
+                }
+                html += "</div>";
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -429,6 +529,39 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      return;
                  }
 
+                 // Issue #587: reverse-lookup an InstructionDefinition that
+                 // matches (plugin, action) AND has a spec.visualization.
+                 // When found, propagate the definition_id through the
+                 // result-render flow so the chart deck renders inline.
+                 //
+                 // Closes governance CP-1 / sec-F1 / ER-NEW-2: gate the
+                 // reverse-lookup on `InstructionDefinition:Read` so a
+                 // principal with `Execution:Execute` but denied
+                 // `InstructionDefinition:Read` cannot enumerate definition
+                 // IDs via this side channel. The dispatch itself is
+                 // already authorised — we only suppress the chart-deck
+                 // enrichment, not the command. perm_fn_'s deny path
+                 // writes 403 to its res argument, so we hand it a
+                 // throwaway Response and discard the side effect.
+                 std::string def_id;
+                 httplib::Response def_perm_res;
+                 bool can_read_defs = perm_fn_(req, def_perm_res,
+                                               "InstructionDefinition", "Read");
+                 if (can_read_defs && instruction_store_ &&
+                     instruction_store_->is_open()) {
+                     InstructionQuery q;
+                     q.plugin_filter = plugin;
+                     q.enabled_only = true;
+                     q.limit = 50;
+                     for (const auto& d : instruction_store_->query_definitions(q)) {
+                         if (d.action != action) continue;
+                         if (!VisualizationEngine::has_visualization(d.visualization_spec))
+                             continue;
+                         def_id = d.id;
+                         break;
+                     }
+                 }
+
                  // Resolve scope → agent_ids or scope expression
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
@@ -485,11 +618,36 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
 
                  // OOB: filter bar — initially empty, self-refreshes after
                  // results arrive (facets are stored when agent responds,
-                 // which is after this HTTP response returns)
+                 // which is after this HTTP response returns).
+                 // Issue #587: include definition_id when known so the
+                 // re-fetched filter bar emits it as a hidden input and
+                 // every subsequent /fragments/results call carries it,
+                 // which keeps the chart deck rendered as filters change.
                  html += "<div id=\"filter-bar\" hx-swap-oob=\"true\""
                          " hx-get=\"/fragments/results/filter-bar?command_id=" +
-                         html_escape(command_id) + "&plugin=" + html_escape(plugin) +
-                         "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
+                         html_escape(command_id) + "&amp;plugin=" + html_escape(plugin);
+                 if (!def_id.empty())
+                     html += "&amp;definition_id=" + html_escape(def_id);
+                 html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
+
+                 // OOB: chart deck — empty initially, self-refreshes once
+                 // responses are in. Same delay window as the filter bar.
+                 // Without this, the deck only appears after the operator
+                 // touches a filter; users expect the chart to render as
+                 // soon as the data arrives. `hx-swap-oob="true"` replaces
+                 // the whole element (outerHTML) so the new hx-get /
+                 // hx-trigger attributes attach; `innerHTML` would lose
+                 // them.
+                 if (!def_id.empty()) {
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
+                             " hx-get=\"/fragments/results?command_id=" +
+                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
+                             "&amp;definition_id=" + html_escape(def_id) +
+                             "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
+                 } else {
+                     // Clear any deck left over from a prior command.
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
+                 }
 
                  // OOB: clear pagination and summary
                  html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
@@ -502,8 +660,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
 
-                 audit_fn_(req, "command.dispatch", "success", "command", command_id,
-                          plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)");
+                 // Closes governance CP-2 / C-16: append definition_id when
+                 // the reverse-lookup resolved one, so SIEM correlation
+                 // between command.dispatch and execution.visualization.fetch
+                 // (2s later) is traceable by definition.
+                 std::string detail =
+                     plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
+                 if (!def_id.empty())
+                     detail += " definition_id=" + def_id;
+                 audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -1019,7 +1184,8 @@ std::string DashboardRoutes::render_results(
     const std::string& sort_col, const std::string& sort_dir,
     int page, int per_page,
     const std::vector<FacetFilter>& filters,
-    const std::string& text_query) {
+    const std::string& text_query,
+    const std::string& definition_id) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -1124,6 +1290,8 @@ std::string DashboardRoutes::render_results(
                           "&amp;dir=" + html_escape(new_dir) +
                           "&amp;page=" + std::to_string(new_page) +
                           "&amp;per_page=" + std::to_string(per_page);
+        if (!definition_id.empty())
+            url += "&amp;definition_id=" + html_escape(definition_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -1263,6 +1431,34 @@ std::string DashboardRoutes::render_results(
     }
     html += "</div>";
 
+    // Issue #587 — OOB chart deck. When the dispatched command came from an
+    // InstructionDefinition that has a `spec.visualization`, populate
+    // #chart-deck-host with one chart-card div per configured chart.
+    // yuzu-charts.js (loaded in dashboard.html) re-runs auto-render on
+    // htmx:afterSettle and fetches each chart's REST URL independently.
+    // When no definition_id is supplied or the definition has no charts,
+    // we still emit an empty <div> so any prior chart deck from a previous
+    // command is cleared.
+    int chart_count = 0;
+    if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
+        auto def = instruction_store_->get_definition(definition_id);
+        if (def)
+            chart_count = VisualizationEngine::count(def->visualization_spec);
+    }
+    html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
+    if (chart_count > 0) {
+        html += R"(<div class="yuzu-chart-deck">)";
+        for (int i = 0; i < chart_count; ++i) {
+            html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
+            html += "/api/v1/executions/" + html_escape(command_id) +
+                    "/visualization?definition_id=" + html_escape(definition_id) +
+                    "&amp;index=" + std::to_string(i);
+            html += R"("></div>)";
+        }
+        html += "</div>";
+    }
+    html += "</div>";
+
     return html;
 }
 
@@ -1271,7 +1467,8 @@ std::string DashboardRoutes::render_results(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
-                                                const std::string& plugin) {
+                                                const std::string& plugin,
+                                                const std::string& definition_id) {
     auto& cols = columns_for_plugin(plugin);
 
     std::string html;
@@ -1280,6 +1477,10 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html_escape(command_id) + "\">"
             "<input type=\"hidden\" name=\"plugin\" value=\"" +
             html_escape(plugin) + "\">";
+    if (!definition_id.empty()) {
+        html += "<input type=\"hidden\" name=\"definition_id\" value=\"" +
+                html_escape(definition_id) + "\">";
+    }
 
     // Per-column filter controls (skip Agent at index 0)
     for (size_t i = 1; i < cols.size(); ++i) {
