@@ -378,7 +378,15 @@ jobs:
         # Universal cache-key contract — wipe vcpkg_installed/x64-windows
         # only when (vcpkg.json | vcpkg-configuration.json | triplet | baseline)
         # has actually changed. See scripts/ci/vcpkg-triplet-sentinel.sh.
-        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
+        #
+        # Explicit `/usr/bin/bash` (NOT `bash`) because $PATH on this
+        # runner has C:\Windows\system32 ahead of C:\msys64\usr\bin, so
+        # `bash` resolves to C:\Windows\System32\bash.exe (WSL bash)
+        # which silently exits with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+        # when the runner is a LOCAL SYSTEM service. /usr/bin/bash
+        # resolves through MSYS2's mount table (no $PATH lookup) →
+        # MSYS2 bash. Same gotcha CLAUDE.md documents for `shell: bash`.
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
       - name: Install vcpkg packages
         env:
