@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows MSVC: `yuzu_agent_tests.exe` LNK2019 regression from #572.**
+  PR #572 changed `yuzu_agent_tests` to depend on `yuzu_proto_headers_dep`
+  (no link_with) instead of `yuzu_proto_dep`. On Linux/macOS this works
+  because `proto/meson.build` compiles with `-fvisibility=default`, so
+  proto symbols appear in `libyuzu_agent_core.so`'s dynamic symbol table
+  and the test binary resolves them at runtime. On Windows MSVC there
+  is no equivalent — `shared_library` produces a `.dll` + import lib
+  but does not export every symbol the way ELF visibility does (no
+  `__declspec(dllexport)` on proto symbols means they are not in the
+  import lib). Result: every `.pb.o` symbol referenced in
+  `test_guardian_engine.cpp` (`yuzu::agent::v1::CommandRequest`,
+  `yuzu::guardian::v1::GuaranteedStateRule`, etc.) became unresolved at
+  link time, breaking both Windows MSVC debug and release CI jobs that
+  had previously been green.
+
+  Fix: make the proto-dep choice platform-conditional in
+  `tests/meson.build`. Linux and macOS keep
+  `yuzu_proto_headers_dep` (the ASan-clean #572 path); Windows uses
+  `yuzu_proto_dep` (with link_with) since the duplicate-registration
+  CHECK is non-fatal there and ASan is not part of the Windows MSVC
+  build matrix. Linux verified: `yuzu_agent_tests` 366 cases / 35 775
+  assertions and `yuzu_server_tests` 1252 cases / 14 923 assertions
+  both green after reconfigure + rebuild.
+
 ### Changed
 
 - **Visualization: governance round-2 hardening on the multi-chart and

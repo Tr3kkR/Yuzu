@@ -12,6 +12,32 @@ reserved_name_fixture_plugin = shared_library(
 )
 
 # ── Agent unit tests ──────────────────────────────────────────────────────────
+#
+# Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
+#
+#   * Linux + macOS: yuzu_proto_headers_dep (no link_with). The proto
+#     symbols are baked into libyuzu_agent_core.so as `.dynsym` entries
+#     because proto/meson.build compiles with -fvisibility=default. The
+#     test binary resolves them dynamically at runtime → single
+#     descriptor registration → ASan-clean.
+#
+#   * Windows MSVC: yuzu_proto_dep (with link_with). MSVC shared_library
+#     does NOT export symbols by default — there's no equivalent of
+#     -fvisibility=default that lets every symbol cross the DLL boundary
+#     without __declspec(dllexport). So libyuzu_agent_core.dll's import
+#     lib does not surface proto symbols and the test binary must link
+#     yuzu_proto.lib directly. Same proto archive, double-registered —
+#     but ASan isn't part of the Windows MSVC build matrix, so the
+#     duplicate-descriptor CHECK that drove #572 doesn't fire here.
+#
+# Without this split, Windows MSVC fails LNK2019 on every .pb.o symbol
+# in test_guardian_engine.cpp (the canary that surfaces the broken link).
+if host_machine.system() == 'windows'
+  agent_test_proto_dep = yuzu_proto_dep
+else
+  agent_test_proto_dep = yuzu_proto_headers_dep
+endif
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -33,13 +59,7 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  # yuzu_proto_headers_dep (not yuzu_proto_dep) — see #572. Linking
-  # yuzu_proto.a directly here puts a second copy of every .pb.o into the
-  # test binary even though libyuzu_agent_core.so already embeds them, and
-  # the duplicate descriptor-registration trips protobuf's CHECK under
-  # ASan. Symbols resolve transitively through libyuzu_agent_core.so
-  # (proto compiled with visibility=default per proto/meson.build).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, yuzu_proto_headers_dep, nlohmann_dep, catch2_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep],
   # Ensure the fixture plugin is built before the test runs so the lookup
   # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
   link_depends: reserved_name_fixture_plugin,
