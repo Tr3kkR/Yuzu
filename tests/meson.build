@@ -1,4 +1,22 @@
-catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+if host_os == 'windows'
+  # Same #375-class IMPORTED_LOCATION_RELEASE problem as protobuf/grpc/cli11
+  # in the top-level meson.build: meson's cmake dep translator picks
+  # lib/Catch2.lib (release CRT) for both debug and release consumers,
+  # so a debug test binary linking with /MDd against release Catch2.lib
+  # trips dozens of LNK2038 _ITERATOR_DEBUG_LEVEL mismatches. Hand-wire
+  # to the buildtype-specific _vcpkg_lib_win directory established in
+  # the top-level Windows block. Catch2's vcpkg port keeps the same
+  # name in both lib/ and debug/lib/ — no `d` suffix.
+  _cxx_tests = meson.get_compiler('cpp')
+  _libcatch2     = _cxx_tests.find_library('Catch2',     dirs: [_vcpkg_lib_win], required: true)
+  _libcatch2main = _cxx_tests.find_library('Catch2Main', dirs: [_vcpkg_lib_win], required: true)
+  catch2_dep = declare_dependency(
+    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    dependencies: [_libcatch2main, _libcatch2],
+  )
+else
+  catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+endif
 
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
 # Built only when tests are enabled; test_plugin_loader.cpp scans against this
