@@ -1,0 +1,388 @@
+name: Nightly
+
+# Tier-3 of the CI overhaul plan (PR-6): sanitizers + coverage moved off the
+# every-push critical path of ci.yml. Runs once a day at 06:00 UTC against
+# the dev branch, with `workflow_dispatch` available for on-demand re-runs.
+#
+# On any failure the `alert` job opens or comments on a `nightly-broken`
+# issue, mirroring the runner-inventory-sentinel pattern. The discipline
+# norm is "no merge to main while `nightly-broken` is open" (documented
+# in CLAUDE.md after this PR lands).
+#
+# Note: `sanitizer-tests.yml` remains the on-demand path for `/test --full`.
+# It uses the same triplet + binary cache as the asan job here, so a fresh
+# nightly run warms the cache for the next dispatched run.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # 06:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_BINARY_SOURCES: "default"
+  CCACHE_MAXSIZE: "30G"
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "1"
+
+jobs:
+  # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
+  sanitize-asan:
+    name: "Sanitizers (ASan+UBSan)"
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+    env:
+      # detect_odr_violation=0 mirrors ci.yml's matrix linux: gRPC's
+      # libgpr.so embeds a static copy of abseil's kToUpper while the
+      # application links abseil dynamically. Re-enable when gpr's
+      # vcpkg port stops vendoring abseil.
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+
+    steps:
+      - name: Wipe build-linux-asan/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-linux-asan/"
+              rm -rf "$GITHUB_WORKSPACE/build-linux-asan"
+            fi
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip ccache
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-linux-asan)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-asan
+
+      - name: Install vcpkg packages (ASan-instrumented)
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-asan
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux-asan \
+            --overlay-triplets=${{ github.workspace }}/triplets \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + ASan/UBSan)
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-asan/lib/pkgconfig
+        run: |
+          reconfig=""
+          [[ -d build-linux-asan/meson-info ]] && reconfig="--reconfigure"
+          meson setup $reconfig build-linux-asan \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-asan \
+            -Dbuild_tests=true \
+            -Db_sanitize=address,undefined
+
+      - name: Build
+        run: meson compile -C build-linux-asan
+
+      - name: Test
+        run: meson test -C build-linux-asan --print-errorlogs
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+  # ── Sanitizers (TSan) ──────────────────────────────────────────────────
+  sanitize-tsan:
+    name: "Sanitizers (TSan)"
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+    env:
+      TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+
+    steps:
+      - name: Wipe build-linux-tsan/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-linux-tsan/"
+              rm -rf "$GITHUB_WORKSPACE/build-linux-tsan"
+            fi
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip ccache
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-linux)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+
+      - name: Install vcpkg packages
+        env:
+          # Shares the matrix linux cache — TSan uses the same x64-linux
+          # triplet so the package zips are bit-identical. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + TSan)
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+        run: |
+          reconfig=""
+          [[ -d build-linux-tsan/meson-info ]] && reconfig="--reconfigure"
+          meson setup $reconfig build-linux-tsan \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_sanitize=thread
+
+      - name: Build
+        run: meson compile -C build-linux-tsan
+
+      - name: Test
+        run: meson test -C build-linux-tsan --print-errorlogs
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+  # ── Coverage (gcov + gcovr) ────────────────────────────────────────────
+  coverage:
+    name: "Coverage (GCC 13)"
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+
+    steps:
+      - name: Wipe build-linux-coverage/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-linux-coverage/"
+              rm -rf "$GITHUB_WORKSPACE/build-linux-coverage"
+            fi
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build gcc-13 g++-13 \
+            pkg-config curl zip unzip tar python3-pip ccache
+          # requirements-ci.txt is hash-pinned; gcovr is not.
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+          pip3 install --user --break-system-packages gcovr
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Reset ccache stats
+        run: ccache -z
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-linux)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+
+      - name: Install vcpkg packages
+        env:
+          # Coverage uses x64-linux triplet — package zips identical to
+          # matrix linux so we share the cache.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          ${{ github.workspace }}/vcpkg/vcpkg install \
+            --triplet x64-linux \
+            --x-manifest-root=${{ github.workspace }}
+
+      - name: Configure (Meson + coverage)
+        # build-linux-coverage (not build-linux) so a coverage rebuild
+        # can't disturb a concurrent ci.yml matrix linux build that
+        # might otherwise queue behind it on the shared self-hosted
+        # runner. Distinct from PR-1's per-OS naming because coverage
+        # is a sanitizer-class job, not a tier-2 matrix variant.
+        env:
+          CC: ccache gcc-13
+          CXX: ccache g++-13
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+        run: |
+          reconfig=""
+          [[ -d build-linux-coverage/meson-info ]] && reconfig="--reconfigure"
+          meson setup $reconfig build-linux-coverage \
+            --native-file meson/native/linux-gcc13.ini \
+            --buildtype=debug \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dbuild_tests=true \
+            -Db_coverage=true
+
+      - name: Build
+        run: meson compile -C build-linux-coverage
+
+      - name: Test
+        run: meson test -C build-linux-coverage --print-errorlogs
+
+      - name: Generate coverage reports
+        run: |
+          # --gcov-ignore-parse-errors=negative_hits.warn: tests/unit/test_metrics_perf.cpp
+          # runs hot concurrent writer loops that cause gcov's branch counters to race into
+          # negative values. gcovr's own error message suggests this flag.
+          gcovr --root . \
+            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
+            --exclude '.*\.pb\.(h|cc)$' \
+            --branches \
+            --gcov-ignore-parse-errors=negative_hits.warn \
+            --xml -o build-linux-coverage/coverage.xml
+          mkdir -p build-linux-coverage/coverage-html
+          gcovr --root . \
+            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
+            --exclude '.*\.pb\.(h|cc)$' \
+            --branches \
+            --gcov-ignore-parse-errors=negative_hits.warn \
+            --html --html-details -o build-linux-coverage/coverage-html/index.html
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
+        with:
+          files: build-linux-coverage/coverage.xml
+          fail_ci_if_error: false
+
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: build-linux-coverage/coverage-html/
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+  # ── Alert on nightly failure ───────────────────────────────────────────
+  # Opens or comments on the `nightly-broken` issue if any of the three
+  # jobs above failed. The discipline rule is "no merge to main while
+  # `nightly-broken` is open." Mirrors runner-inventory-sentinel.yml's
+  # issue-creation pattern.
+  alert:
+    name: "Open nightly-broken on failure"
+    needs: [sanitize-asan, sanitize-tsan, coverage]
+    if: failure()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update nightly-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'nightly-broken';
+            const failedJobs = [];
+            const ctx = ${{ toJSON(needs) }};
+            for (const [name, job] of Object.entries(ctx)) {
+              if (job.result === 'failure') failedJobs.push(name);
+            }
+            const summary = failedJobs.length
+              ? failedJobs.join(', ')
+              : 'unknown (alert fired without specific job failures)';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sha = '${{ github.sha }}';
+            const body = [
+              `Nightly run failed on \`${{ github.ref_name }}\` @ \`${sha.substring(0, 7)}\`.`,
+              ``,
+              `**Failed jobs:** ${summary}`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `**Discipline:** no merge to main while this issue is open.`,
+              ``,
+              `(auto-posted by .github/workflows/nightly.yml — close after a green nightly.)`,
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 5,
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+              core.notice(`Commented on existing nightly-broken issue #${existing.data[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Nightly broken: ${summary}`,
+                labels: [label],
+                body,
+              });
+              core.notice(`Opened nightly-broken issue #${created.data.number}`);
+            }
