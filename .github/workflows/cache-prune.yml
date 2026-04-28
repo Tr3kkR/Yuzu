@@ -1,0 +1,82 @@
+name: Cache prune
+
+# Weekly maintenance for self-hosted runner-local caches (PR-9 of the CI
+# overhaul plan). Deletes vcpkg binary-cache zips older than 30 days from
+# ${runner.tool_cache}/yuzu-vcpkg-binary-cache-*/ on each self-hosted
+# runner. Caps unbounded growth at the cost of one warm-rebuild per stale
+# port — acceptable, since stale-by-mtime ports are by definition not in
+# the active build's working set.
+#
+# Does NOT touch:
+#   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache) — its own LRU at
+#     CCACHE_MAXSIZE=30G already handles eviction without our help.
+#   - the Yuzu workspace (build-*/, vcpkg/, vcpkg_installed/) — those
+#     have per-job sentinels that handle invalidation.
+#   - GHA-hosted actions/cache entries — managed by GitHub's own LRU.
+#
+# Schedule: Sundays 04:00 UTC (low CI load). Manual trigger via
+# workflow_dispatch for ad-hoc cleanup. The runner-inventory-sentinel
+# also runs every 30 min and would surface a wedged runner separately.
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Sundays 04:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-prune
+  cancel-in-progress: false
+
+jobs:
+  prune-linux:
+    name: "Prune Linux runner cache"
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 10
+    steps:
+      - name: Prune vcpkg binary cache zips older than 30 days
+        run: |
+          set -eu
+          base="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}"
+          if [[ ! -d "$base" ]]; then
+            echo "::warning::RUNNER_TOOL_CACHE not found at $base — skipping"
+            exit 0
+          fi
+          echo "Pruning vcpkg binary-cache zips older than 30 days under: $base"
+          # `-type f` because the cache subdirs are kept; only the zip
+          # contents age out. -mtime +30 = strictly older than 30 days.
+          # Print before delete so the workflow log shows what went.
+          before_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
+          deleted=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
+          after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
+          echo "before=${before_total} deleted=${deleted} after=${after_total}"
+
+  prune-windows:
+    name: "Prune Windows runner cache"
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+    defaults:
+      run:
+        # MSYS2 bash for the same `find -mtime` semantics. Same shell
+        # convention as the windows job in ci.yml.
+        shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+    steps:
+      - name: Prune vcpkg binary cache zips older than 30 days
+        run: |
+          set -eu
+          # RUNNER_TOOL_CACHE on Windows is typically C:\actions-runner\_work\_tool
+          # which msys2 bash sees as /c/actions-runner/_work/_tool. Use the
+          # native env var directly; bash treats forward+back slashes equivalently
+          # for path operations.
+          base="${RUNNER_TOOL_CACHE:-}"
+          if [[ -z "$base" || ! -d "$base" ]]; then
+            echo "::warning::RUNNER_TOOL_CACHE not found at '$base' — skipping"
+            exit 0
+          fi
+          echo "Pruning vcpkg binary-cache zips older than 30 days under: $base"
+          before_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
+          deleted=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f -mtime +30 -print -delete 2>/dev/null | wc -l || echo 0)
+          after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
+          echo "before=${before_total} deleted=${deleted} after=${after_total}"
