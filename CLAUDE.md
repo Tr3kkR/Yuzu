@@ -382,6 +382,31 @@ Manual recovery: `bash scripts/ci/runner-reset.sh` runs `git clean -fdx -e vcpkg
 
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner. Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` zips with mtime >30 days. Caps unbounded growth. Does not touch ccache (its own LRU at `CCACHE_MAXSIZE=30G` handles eviction).
 
+### vcpkg state corruption — recovery path
+
+If a Windows CI run repeatedly fails at `Install vcpkg packages` with `read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such file or directory`, the load-bearing corruption is almost certainly **`vcpkg/packages/<port>_<triplet>/`** — vcpkg's manifest install short-circuits to "already installed" when that dir exists with the right hash, regardless of what's in `vcpkg_installed/<triplet>/` or `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows`. A build killed mid-port-build leaves a partial `vcpkg/packages/abseil_x64-windows/` (no `.pc` files yet); subsequent runs trust it and fail.
+
+The sentinel + binary-cache wipe alone do NOT reach `vcpkg/packages/`. The full set of candidate corruption paths under `clean: false`:
+
+- `<workspace>/vcpkg/packages/` — pre-stage zips (THE one)
+- `<workspace>/vcpkg/buildtrees/` — port build state
+- `<workspace>/vcpkg/installed/` — vcpkg classic-mode install (rare in manifest mode)
+- `<workspace>/vcpkg_installed/<triplet>/` — project install root
+- `<workspace>/vcpkg_installed/.x64-<triplet>-cachekey.sha256` — the sentinel
+- `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows` — runner-local binary cache
+- `C:\Users\<user>\AppData\Local\vcpkg\archives\` — interactive-user default cache (vcpkg consults this even when `VCPKG_DEFAULT_BINARY_CACHE` is set)
+- `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
+
+Recovery procedure: `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over SSH on the runner as the `natha` interactive user with output redirected to a `.out` file:
+
+```powershell
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+```
+
+Outputs structured `KEY: value` inventory before + nuke + after. Preserves `vcpkg/` (the tool itself) and `vcpkg/downloads/` (source tarballs — slow to refetch). Wipes everything else. Total disk freed in the 2026-04-28 incident: 33.9 GB.
+
+After running, REMOVE any TEMP one-shot recovery step from `ci.yml` if one was added during the incident (otherwise it forces from-source rebuild on every run and defeats the cache).
+
 ## Release workflow gates
 
 The `release:` job in `.github/workflows/release.yml` runs `scripts/check-compose-versions.sh` as its **first step**, before any artifact download. The script walks an explicit list of tracked compose files and rejects any `ghcr.io/<owner>/yuzu-{server,gateway,agent}:X.Y.Z` reference that is (a) a bare numeric tag rather than `${YUZU_VERSION:-...}`, or (b) a parameterised default that does not equal the tag being released (`${GITHUB_REF_NAME#v}`). Floating tags (`latest`, `local`, sha-pinned) are ignored.
