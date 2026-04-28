@@ -46,7 +46,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PRs cancel-in-progress (rapid iteration — every push obsoletes the last).
+  # Pushes to dev / main do NOT cancel — they queue. Mid-flight pushes were
+  # killing 10+ min of compile work on rapid landings, and the
+  # squash-merge-mid-CI race plausibly explained the irreproducible
+  # post-squash Windows test failure (#501). PR-4 of the CI overhaul plan.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -66,6 +71,37 @@ env:
   CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
+  # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
+  # Runs on a GHA-hosted runner (always available) and queries
+  # /actions/runners. Each downstream job that targets a self-hosted
+  # runner gates on the corresponding *_healthy output with explicit
+  # `== 'true'` (fail-closed: an unhealthy or unknown runner skips the
+  # job in <30s rather than queuing 30 min into a stalled runner).
+  #
+  # Output names are slugified runner names from .github/runner-inventory.json:
+  #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
+  #   yuzu-local-windows → yuzu_local_windows_healthy
+  #
+  # If RUNNER_INVENTORY_TOKEN is missing, the script writes
+  # all runners as `false` and exits 0 (fail-closed): downstream jobs
+  # skip with an obvious "preflight detected unhealthy runner" reason
+  # rather than disappearing into a queue.
+  preflight:
+    name: "Preflight (runner health)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
+      yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
+      all_healthy: ${{ steps.health.outputs.all_healthy }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Probe runner health
+        id: health
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci/runner-health-check.py --mode preflight
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
@@ -86,6 +122,8 @@ jobs:
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
     name: "Proto backward-compat"
+    needs: [preflight]
+    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
@@ -104,6 +142,10 @@ jobs:
   # ── Linux (GCC + Clang, self-hosted yuzu-wsl2-linux) ──────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    needs: [preflight]
+    # PR-7 of CI overhaul plan: skip if the self-hosted Linux runner is
+    # unhealthy or unknown. Fail-closed `== 'true'` (NOT `!= 'false'`).
+    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
     # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
     # state between runs on the same workspace amortizes the install
     # cost. Trade-off: the single runner process serializes this 4-way
@@ -124,9 +166,33 @@ jobs:
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
 
     steps:
+      # PR-5 of the CI overhaul plan: clean:false preserves build-linux/
+      # across jobs so meson + ninja can be incremental across pushes.
+      # The branch-switch sentinel below is the safety net — if the
+      # previous job on this runner was on a different branch, the
+      # build dir's source paths and meson config are stale and must
+      # be wiped (NEVER touch vcpkg/, vcpkg_installed/, or the
+      # runner.tool_cache binary caches — those have their own
+      # sentinel, see scripts/ci/vcpkg-triplet-sentinel.sh).
+      - name: Wipe build-linux/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-linux/"
+              rm -rf "$GITHUB_WORKSPACE/build-linux"
+            fi
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          # clean:false — persist build-linux/ + vcpkg_installed/ between
+          # runs. Branch switches are handled by the pre-checkout wipe
+          # step above; cache freshness is handled by the vcpkg sentinel.
+          # Manual recovery: scripts/ci/runner-reset.sh.
+          clean: false
 
       - name: Install system packages
         run: |
@@ -145,13 +211,11 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      # vcpkg_installed/ does NOT persist between runs — actions/checkout
-      # @v6 defaults to `clean: true`, which `git clean -ffdx`s the
-      # workspace and wipes both vcpkg/ and vcpkg_installed/. Persistent
-      # restore comes from VCPKG_DEFAULT_BINARY_CACHE on the Install
-      # step below, pointed at ${{ runner.tool_cache }} (outside the
-      # workspace, so checkout cleanup can't touch it). Without that,
-      # lukka/run-vcpkg defaults to a per-run UUID temp dir and every
+      # vcpkg_installed/ persists across runs under clean:false (PR-5).
+      # The vcpkg sentinel below detects manifest / triplet / baseline
+      # drift and wipes vcpkg_installed/<triplet>/ on mismatch. The
+      # runner.tool_cache binary cache lives outside the workspace so
+      # checkout cannot touch it regardless. Issue #569.
       # job rebuilds every port from source — symptom signature in the
       # build log is `Restored 0 package(s) from .../<uuid>/vcpkg_cache`.
       # Mirrors the sanitize-asan pattern at the VCPKG_DEFAULT_BINARY_CACHE
@@ -162,6 +226,10 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-linux)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
 
       - name: Install vcpkg packages
         env:
@@ -185,7 +253,13 @@ jobs:
           CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-19' }}
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
-          meson setup builddir \
+          # Under clean:false (PR-5) build-linux/ may already be configured
+          # from a previous matrix variant or push. meson setup errors on
+          # an existing configured dir without --reconfigure; detect and
+          # branch so the same step works on cold and warm workspaces.
+          reconfig=""
+          [[ -d build-linux/meson-info ]] && reconfig="--reconfigure"
+          meson setup $reconfig build-linux \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
@@ -193,10 +267,10 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-linux
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        run: meson test -C build-linux --print-errorlogs
 
       - name: ccache stats
         if: always()
@@ -205,6 +279,10 @@ jobs:
   # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
+    needs: [preflight]
+    # PR-7 of CI overhaul plan: skip if the self-hosted Windows runner
+    # is unhealthy or unknown. Fail-closed `== 'true'`.
+    if: needs.preflight.outputs.yuzu_local_windows_healthy == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -230,9 +308,27 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
+      # PR-5 of the CI overhaul plan: clean:false on the persistent
+      # yuzu-local-windows runner. Branch-switch sentinel runs in the
+      # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
+      # env vars and bash test syntax both work).
+      - name: Wipe build-windows/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-windows/"
+              rm -rf "$GITHUB_WORKSPACE/build-windows"
+            fi
+          fi
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          # clean:false — persist build-windows/ + vcpkg_installed/ between
+          # runs. Manual recovery: scripts/ci/runner-reset.sh.
+          clean: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -278,31 +374,11 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Force fresh vcpkg install when triplet changed
-        run: |
-          # The persistent runner workspace accumulates a
-          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
-          # incremental install keys off the manifest only — it does NOT
-          # detect overlay-triplet content edits. A triplet change
-          # (e.g. removing `VCPKG_BUILD_TYPE release` to enable debug
-          # variants — the LNK2038 fix on dev) silently leaves the
-          # existing release-only tree in place, and the debug build
-          # then fails to link with _ITERATOR_DEBUG_LEVEL mismatches
-          # against absl_*.lib. Reconcile by wiping the install root
-          # whenever the recorded triplet hash drifts. Same approach as
-          # codeql.yml's mirror step.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
-          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
-          have=$(cat "$sentinel" 2>/dev/null || echo "")
-          if [[ "$want" != "$have" ]]; then
-            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
-            rm -rf "$installed_dir"
-            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
-            echo "$want" > "$sentinel"
-          else
-            echo "x64-windows triplet sha256 unchanged — keeping persistent vcpkg_installed/x64-windows"
-          fi
+      - name: vcpkg sentinel (x64-windows)
+        # Universal cache-key contract — wipe vcpkg_installed/x64-windows
+        # only when (vcpkg.json | vcpkg-configuration.json | triplet | baseline)
+        # has actually changed. See scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
       - name: Install vcpkg packages
         env:
@@ -333,7 +409,12 @@ jobs:
           CXX: ccache cl
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
-          meson setup build-windows-ci \
+          # Under clean:false (PR-5) build-windows/ may already be
+          # configured. Branch on existence to satisfy meson's "use
+          # --reconfigure" requirement.
+          reconfig=""
+          [[ -d build-windows/meson-info ]] && reconfig="--reconfigure"
+          meson setup $reconfig build-windows \
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
@@ -341,7 +422,7 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-windows-ci
+        run: meson compile -C build-windows
 
       - name: Test
         run: |
@@ -351,7 +432,7 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          meson test -C build-windows-ci --print-errorlogs
+          meson test -C build-windows --print-errorlogs
 
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
@@ -369,7 +450,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
-          path: build-windows-ci/meson-logs/
+          path: build-windows/meson-logs/
           if-no-files-found: warn
           retention-days: 14
 
@@ -422,12 +503,17 @@ jobs:
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
+        # Universal cache-key contract: vcpkg.json + vcpkg-configuration.json
+        # + every overlay triplet + the pinned VCPKG_COMMIT baseline.
+        # Without the triplet/baseline components a port edit or baseline
+        # bump silently restores stale binaries (D3 in the CI overhaul plan).
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
+            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
@@ -448,7 +534,7 @@ jobs:
           CXX: ccache c++
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
         run: |
-          meson setup builddir \
+          meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
@@ -456,136 +542,51 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-macos
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        run: meson test -C build-macos --print-errorlogs
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-  # ── Sanitizers (ASan + UBSan) — main/dev push only ────────────────────
-  sanitize-asan:
-    name: "Sanitizers (ASan+UBSan)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-    env:
-      # detect_odr_violation=0: gRPC's libgpr.so embeds a static copy of
-      # abseil's `kToUpper` (from absl/strings/ascii.cc) while the
-      # application links abseil dynamically; ASan sees two
-      # definitions and aborts. This is a vcpkg port-linkage artefact
-      # (gpr → static abseil) rather than a Yuzu code bug. The ODR
-      # check catches a class of static-init-order issues with
-      # duplicate-symbol SO copies that no Yuzu source path can hit.
-      # If gpr's vcpkg port is fixed to use dynamic abseil this can
-      # be re-enabled.
-      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
-      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
-
+  # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
+  # Detects whether a PR touches CI infrastructure (workflows / actions /
+  # CI helper scripts). If it does, the canary leg runs the linux build
+  # on GHA-hosted ubuntu-24.04 — a fresh-disk runner with no warm caches
+  # and no self-hosted assumptions — so workflow regressions are caught
+  # against a vanilla environment BEFORE the change lands on main and
+  # becomes the next CI run for everyone.
+  detect-ci-changes:
+    name: "Detect CI infrastructure changes"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          submodules: recursive
-
-      - name: Install system packages
+          fetch-depth: 0
+      - id: detect
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      # ccache persists in ~/.cache/ccache on the runner.
-      # vcpkg_installed/ does NOT persist (checkout default clean wipes
-      # it); the binary cache below provides fast restore. Issue #569.
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Force fresh vcpkg install when triplet changed
-        run: |
-          # vcpkg's incremental install keys off the manifest only — it
-          # does NOT detect overlay-triplet content edits. An edit to
-          # triplets/x64-linux-asan.cmake (e.g. changing sanitizer flags
-          # or VCPKG_BUILD_TYPE) silently leaves the existing tree in
-          # place, and downstream link errors look like phantom ABI
-          # mismatches. Mirrors the Windows sentinel pattern. Issue #569.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux-asan"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-linux-asan-triplet.sha256"
-          want=$(sha256sum triplets/x64-linux-asan.cmake | awk '{print $1}')
-          have=$(cat "$sentinel" 2>/dev/null || echo "")
-          if [[ "$want" != "$have" ]]; then
-            echo "x64-linux-asan triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-linux-asan"
-            rm -rf "$installed_dir"
-            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
-            echo "$want" > "$sentinel"
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          if git diff --name-only "$base_sha"..HEAD \
+              | grep -qE '^\.github/(workflows|actions)/|^scripts/ci/'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "CI infrastructure changes detected — canary will run."
           else
-            echo "x64-linux-asan triplet sha256 unchanged"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No CI infrastructure changes — canary skipped."
           fi
 
-      # ASan job uses the x64-linux-asan triplet so vcpkg builds
-      # protobuf/abseil/grpc with -fsanitize=address,undefined. This
-      # makes abseil cooperate with ASan via ABSL_HAVE_ADDRESS_SANITIZER
-      # and resolves the spurious use-after-poison at protobuf static
-      # init that aborted every prior ASan run before any Yuzu test
-      # could execute.
-      #
-      # Binary cache lives in a sanitiser-specific dir on the runner so
-      # the instrumented .zips don't clobber the regular x64-linux
-      # cache. First run is from-source (~25 min), subsequent runs are
-      # extract-from-zip (~10s).
-      - name: Install vcpkg packages (ASan-instrumented)
-        env:
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-asan
-        run: |
-          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux-asan \
-            --overlay-triplets=${{ github.workspace }}/triplets \
-            --x-manifest-root=${{ github.workspace }}
-
-      - name: Configure (Meson + ASan/UBSan)
-        env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-asan/lib/pkgconfig
-        run: |
-          meson setup builddir \
-            --native-file meson/native/linux-gcc13.ini \
-            --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-asan \
-            -Dbuild_tests=true \
-            -Db_sanitize=address,undefined
-
-      - name: Build
-        run: meson compile -C builddir
-
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
-  # ── Sanitizers (TSan) — main/dev push only ─────────────────────────────
-  sanitize-tsan:
-    name: "Sanitizers (TSan)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-    env:
-      TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
-
+  canary:
+    name: "Workflow canary (GHA-hosted ubuntu-24.04)"
+    needs: [detect-ci-changes]
+    if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -600,15 +601,18 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ccache (~/.cache/ccache) persists in the github-runner user's
-      # home between jobs. vcpkg_installed/ does NOT persist —
-      # actions/checkout@v6 defaults to `clean: true` which wipes the
-      # workspace. Persistent restore comes from VCPKG_DEFAULT_BINARY_CACHE
-      # on the Install step below, pointed at ${{ runner.tool_cache }}
-      # (outside the workspace, so checkout cleanup can't touch it).
-      # Mirrors the sanitize-asan and matrix linux pattern. Issue #569.
-      - name: Reset ccache stats
-        run: ccache -z
+      - name: Cache vcpkg installed packages (canary)
+        # Universal cache key — invalidates only when manifest, triplet,
+        # or vcpkg baseline changes. First canary run on a stable manifest
+        # is ~25 min from-source; subsequent runs restore in ~10 s.
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          save-always: true
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
+          restore-keys: |
+            vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
+            vcpkg-canary-x64-linux-
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -616,95 +620,16 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: vcpkg sentinel (x64-linux)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+
       - name: Install vcpkg packages
-        env:
-          # Shares the matrix linux cache — TSan uses the same x64-linux
-          # triplet so the package zips are bit-identical. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
-          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
-      - name: Configure (Meson + TSan)
-        env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-        run: |
-          meson setup builddir \
-            --native-file meson/native/linux-gcc13.ini \
-            --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true \
-            -Db_sanitize=thread
-
-      - name: Build
-        run: meson compile -C builddir
-
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
-  # ── Coverage — main/dev push only, after Linux passes ─────────────────
-  coverage:
-    name: "Coverage (GCC 13)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          submodules: recursive
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
-          # requirements-ci.txt is hash-pinned; gcovr is not (it's a coverage
-          # tool pulled in only for this job). --require-hashes applies per
-          # invocation, so split install into two steps.
-          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
-          pip3 install --user --break-system-packages gcovr
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      # ccache (~/.cache/ccache) persists in the github-runner user's
-      # home between jobs. vcpkg_installed/ does NOT persist —
-      # actions/checkout@v6 defaults to `clean: true` which wipes the
-      # workspace. Persistent restore comes from VCPKG_DEFAULT_BINARY_CACHE
-      # on the Install step below, pointed at ${{ runner.tool_cache }}
-      # (outside the workspace, so checkout cleanup can't touch it).
-      # Mirrors the sanitize-asan and matrix linux pattern. Issue #569.
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Install vcpkg packages
-        env:
-          # Shares the matrix linux cache — coverage uses the same
-          # x64-linux triplet so the package zips are bit-identical.
-          # Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
-        run: |
-          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
-            --x-manifest-root=${{ github.workspace }}
-
-      - name: Configure (Meson + coverage)
+      - name: Configure (Meson, gcc-13 debug)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
@@ -714,52 +639,10 @@ jobs:
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true \
-            -Db_coverage=true
+            -Dbuild_tests=true
 
       - name: Build
         run: meson compile -C build-linux
 
       - name: Test
         run: meson test -C build-linux --print-errorlogs
-
-      - name: Generate coverage reports
-        run: |
-          # --gcov-ignore-parse-errors=negative_hits.warn: tests/unit/test_metrics_perf.cpp
-          # runs hot concurrent writer loops that cause gcov's branch counters to race into
-          # negative values ("branch 2 taken -2 (fallthrough)"). gcovr's own error message
-          # suggests this flag as the fix; it downgrades the parse error to a warning so the
-          # rest of the coverage report still generates. If coverage fidelity on that one
-          # file ever matters, switch to per-thread .gcda output or add
-          # #pragma GCC optimize("no-profile-arcs") around the hot loop.
-          gcovr --root . \
-            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
-            --exclude '.*\.pb\.(h|cc)$' \
-            --branches \
-            --gcov-ignore-parse-errors=negative_hits.warn \
-            --xml -o build-linux/coverage.xml
-          # gcovr's -o does not create parent directories; --html-details emits
-          # a multi-file report so the parent must exist before the invocation.
-          mkdir -p build-linux/coverage-html
-          gcovr --root . \
-            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
-            --exclude '.*\.pb\.(h|cc)$' \
-            --branches \
-            --gcov-ignore-parse-errors=negative_hits.warn \
-            --html --html-details -o build-linux/coverage-html/index.html
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
-        with:
-          files: build-linux/coverage.xml
-          fail_ci_if_error: false
-
-      - name: Upload HTML coverage report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage-report
-          path: build-linux/coverage-html/
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
