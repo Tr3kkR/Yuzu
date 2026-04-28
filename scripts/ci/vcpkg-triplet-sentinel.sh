@@ -24,7 +24,16 @@
 # Idempotent. Exit 0 unconditionally — a sentinel mismatch is a normal state,
 # not a failure. Hard errors (no manifest, missing workspace) exit non-zero.
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: `set -e` deliberately omitted. Under MSYS2 bash on the Windows
+# self-hosted runner, the `[[ test ]] && cmd` short-circuit pattern
+# silently exits the script before any echo runs (run #25051196135 hit
+# this — the script produced zero log output and exited non-zero,
+# making diagnosis impossible). Explicit if/fi blocks plus per-command
+# error checks instead.
+
+# Self-identify so the next failure isn't a 0-byte log line.
+echo "vcpkg-triplet-sentinel.sh: starting (triplet=${1:-?}, GITHUB_WORKSPACE=${GITHUB_WORKSPACE:-<unset>})"
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <triplet>" >&2
@@ -33,7 +42,18 @@ fi
 TRIPLET="$1"
 
 WS="${GITHUB_WORKSPACE:-$(pwd)}"
-cd "$WS"
+# On MSYS2 Windows GITHUB_WORKSPACE arrives as 'C:\actions-runner\...'
+# with backslashes. Translate to POSIX form when cygpath is available so
+# `cd` and downstream relative-path operations behave consistently across
+# Linux / MSYS2 / macOS.
+if command -v cygpath >/dev/null 2>&1; then
+  WS=$(cygpath -u "$WS")
+fi
+if ! cd "$WS"; then
+  echo "::error::cd to '$WS' failed" >&2
+  exit 2
+fi
+echo "vcpkg-triplet-sentinel.sh: cwd=$(pwd)"
 
 if [[ ! -f vcpkg.json ]]; then
   echo "::error::$(pwd) has no vcpkg.json — cannot compute sentinel" >&2
@@ -49,15 +69,27 @@ fi
 # x64-windows currently have one. Stock triplets (x64-linux, arm64-osx) do
 # not.
 inputs=(vcpkg.json)
-[[ -f vcpkg-configuration.json ]] && inputs+=(vcpkg-configuration.json)
+if [[ -f vcpkg-configuration.json ]]; then
+  inputs+=(vcpkg-configuration.json)
+fi
 overlay="triplets/${TRIPLET}.cmake"
-[[ -f "$overlay" ]] && inputs+=("$overlay")
+if [[ -f "$overlay" ]]; then
+  inputs+=("$overlay")
+fi
+echo "vcpkg-triplet-sentinel.sh: inputs=${inputs[*]}"
 
 # Include the vcpkg baseline commit so a baseline bump invalidates every
 # cache (correct: ports may have changed even if our manifest didn't).
 baseline="${VCPKG_COMMIT:-unset}"
 
-want=$( { sha256sum "${inputs[@]}"; printf '%s\n' "$baseline"; } | sha256sum | awk '{print $1}')
+if ! want=$( { sha256sum "${inputs[@]}" && printf '%s\n' "$baseline"; } | sha256sum | awk '{print $1}'); then
+  echo "::error::sha256sum pipeline failed" >&2
+  exit 2
+fi
+if [[ -z "$want" ]]; then
+  echo "::error::sha256sum produced empty output" >&2
+  exit 2
+fi
 
 # --- compare against stored sentinel --------------------------------------
 sentinel_dir="$WS/vcpkg_installed"
