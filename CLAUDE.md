@@ -328,9 +328,59 @@ docs/             Architecture docs, conventions, roadmap, capability map
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND `meson.build`'s Windows-specific `cxx.find_library()` hand-wired `protobuf_dep`/`grpcpp_dep` construction are the **only configuration we've found** that simultaneously avoids LNK2038 (meson cmake-dep bug) and LNK2005 (abseil DLL symbol conflicts). Do not simplify either half without reading `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375" — full timeline, every failed approach, and the #376 strategic escape (migrate off gRPC to QUIC) are there. Linux/macOS are unaffected.
 
-## CI matrix
+## CI architecture
 
-`.github/workflows/ci.yml` — four jobs: linux (ubuntu-24.04, GCC 13 + Clang 18), windows (windows-2022, MSVC VS 17), macos (macos-14 Apple Silicon, Apple Clang), arm64-cross (ubuntu-24.04, aarch64-linux-gnu gcc, tests skipped). vcpkg binary cache is `actions/cache` on `vcpkg/installed`, keyed on `vcpkg.json` + `vcpkg-configuration.json` hash. The `build-ci` agent owns this matrix.
+The CI overhaul (April 2026) split work into three tiers. Plan: `/home/dornbrn/.claude/plans/our-ci-has-been-piped-castle.md`. The `build-ci` agent owns the matrix; `cross-platform` owns Windows/macOS specifics.
+
+**Tier 1 — PR fast-path** (`ci.yml` on `pull_request`): one Linux variant (gcc-13 debug on `yuzu-wsl2-linux`), one Windows variant (MSVC debug on `yuzu-local-windows`), one macOS variant (appleclang debug on GHA-hosted `macos-15`), plus `proto-compat`. Wall target: <10 min per leg.
+
+**Tier 2 — push to dev/main** (`ci.yml` on push to those branches): full 4-way Linux matrix (gcc-13 / clang-19 × debug / release), 2-way Windows, 2-way macOS. **No sanitizers, no coverage** — those moved out (#410 closed as not-planned).
+
+**Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC + `workflow_dispatch`): ASan+UBSan, TSan, coverage, all on the self-hosted Linux runner. On any leg failure, the `alert` job auto-opens or comments on a `nightly-broken` issue. **Discipline norm: no merge to main while a `nightly-broken` issue is open.** That's the lever — sanitizers don't gate every PR; nightly catches regressions and gates main.
+
+`workflow_dispatch` only works once a workflow file exists on the **default branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are dormant until merged.
+
+### Self-hosted runner topology
+
+One runner process per OS, single source of throughput:
+
+| Runner | Host | Jobs |
+|---|---|---|
+| `yuzu-wsl2-linux` | Shulgi 5950X WSL2 Ubuntu 24.04 | proto-compat, linux matrix, nightly (asan/tsan/coverage), cache-prune-linux |
+| `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows |
+| `macos-15` | GitHub-hosted | macos matrix |
+
+Inventory declared in `.github/runner-inventory.json`. The sentinel at `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel and the new ci.yml `preflight` job share `scripts/ci/runner-health-check.py` (`--mode sentinel` vs `--mode preflight`). Preflight gates downstream self-hosted jobs with explicit `if: needs.preflight.outputs.<runner>_healthy == 'true'` — fail-closed: a degraded runner skips its jobs in <30 s rather than queueing 30 min into a stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight returns false and self-hosted jobs are skipped with a clear reason.
+
+### Universal vcpkg cache-key contract
+
+`scripts/ci/vcpkg-triplet-sentinel.sh` is the single source of truth for "have the inputs to vcpkg actually changed?". Key:
+
+```
+sha256(vcpkg.json + vcpkg-configuration.json + triplets/<triplet>.cmake + $VCPKG_COMMIT)
+```
+
+Stored at `vcpkg_installed/.<triplet>-cachekey.sha256`. On drift, wipes ONLY `vcpkg_installed/<triplet>/` — never `vcpkg/`, never `runner.tool_cache`, never ccache. Persistence: self-hosted in `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}` (per-triplet, outside workspace). macOS uses `actions/cache@v5` keyed on the same invariant.
+
+The script must run cleanly under MSYS2 bash on Windows. **Do NOT use `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under MSYS2 (cost us run #25051196135). Use `if/fi` blocks and explicit per-command error checks.
+
+### Persistence + recovery
+
+Self-hosted checkouts use `clean: false` (PR-5). A pre-checkout step wipes `build-<os>/` ONLY when the branch differs from the previous run; vcpkg state is invalidated by the sentinel above. Meson setup uses `--reconfigure` when an existing `meson-info/` directory is present, so option drift across matrix variants doesn't abort the configure.
+
+Manual recovery: `bash scripts/ci/runner-reset.sh` runs `git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`. **This is the only sanctioned in-repo nuke path**; never `rm -rf` runner caches as a debug step (memory `feedback_vcpkg_cache.md`).
+
+### Per-OS build directory names
+
+`build-linux`, `build-windows`, `build-macos` (matrix); `build-linux-asan`, `build-linux-tsan`, `build-linux-coverage` (nightly variants). Sanitizer-tests.yml (the on-demand `/test --full` path) uses the same names so it shares the warm asan binary cache with nightly. release.yml + pre-release.yml follow the same convention. Closes #406.
+
+### Workflow-PR canary
+
+`ci.yml`'s `detect-ci-changes` + `canary` jobs only run when a PR touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The canary mirrors the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` runner with `actions/cache` for vcpkg. Catches workflow regressions before they land on main and become the next CI run.
+
+### Cache pruning
+
+`cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner. Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` zips with mtime >30 days. Caps unbounded growth. Does not touch ccache (its own LRU at `CCACHE_MAXSIZE=30G` handles eviction).
 
 ## Release workflow gates
 
