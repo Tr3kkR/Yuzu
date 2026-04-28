@@ -109,6 +109,8 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 | `permissions` | object | No | -- | Role-based access control. |
 | `compatibility` | object | No | -- | Agent version and plugin requirements. |
 | `legacy_shim` | object | No | -- | Auto-generation from plugin descriptors. |
+| `visualization` | object | No | -- | Chart configuration for the dashboard's response view. See below. Use `visualizations` (plural) to declare more than one chart. |
+| `visualizations` | list of object | No | -- | One or more chart configurations; the canonical multi-chart form. See below. |
 
 #### `spec.execution`
 
@@ -217,6 +219,83 @@ Each column object:
 |---|---|---|---|---|
 | `enabled` | boolean | No | `false` | When `true`, this definition was auto-generated from a plugin descriptor. The parameter schema uses `additionalProperties: {type: string}` (open schema). |
 
+#### `spec.visualization`
+
+Optional chart configuration consumed by the dashboard's instruction-response views and the `GET /api/v1/executions/{id}/visualization` REST endpoint (issue #253). When omitted, the response view shows the standard tabular layout only — no chart card is rendered.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `type` | string | Yes | -- | Chart type. Values: `pie`, `bar`, `column`, `line`, `area`. |
+| `processor` | string | Yes | -- | Server-side data transformer. Values: `single_series` (group + count/sum into one series), `multi_series` (group by both label and series fields, producing one series per distinct series value), `datetime_series` (timestamped points, one series per agent or per `seriesField`). |
+| `title` | string | No | `""` | Display title rendered above the chart. Static text — parameter interpolation (`${paramName}`) is **not** supported in this revision. |
+| `labelField` | integer | Conditional | `0` | 0-based column index used to bucket rows. The index counts the **result columns** declared under `spec.result.columns` (or the implicit columns for built-in plugins like `procfetch` — `PID, Name, Path, SHA-1`). The `Agent` column is **not** counted. Required for `single_series` and `multi_series`. |
+| `valueField` | integer | No | `null` | Numeric column to sum into each bucket. When omitted, the processor counts rows. Non-numeric cell values (e.g. `"n/a"`) count as 1, not 0 — this preserves count-mode semantics on mixed columns; spec authors who want strict numeric summation should pre-validate the result schema. |
+| `valueLabel` | string | No | `"Count"` | Series name shown in the legend for `single_series`. |
+| `seriesField` | integer | Conditional | -- | Column index splitting rows into distinct series for `multi_series` (defaults to `1` if unset) and `datetime_series` (defaults to per-agent series when unset). |
+| `xField` | integer or string | No | `"agent_timestamp"` | For `datetime_series`: either a numeric column index or the literal `"agent_timestamp"` to use the response's wall-clock timestamp. |
+| `yField` | integer | No | `null` | Numeric column for `datetime_series`; rows count as `1` when omitted. |
+| `maxCategories` | integer | No | `0` | When > 0, retain only the top-N buckets by total and collapse the tail into an `Other` bucket. Applies to `single_series`. |
+
+> **Field naming.** This block uses camelCase, matching the rest of `apiVersion: yuzu.io/v1alpha1`. The engine also accepts the legacy snake_case names (`label_field`, `value_field`, …) as deprecated aliases — they will be removed in a future API version. Author new specs against the camelCase names.
+
+> **Multi-chart definitions.** A definition can declare more than one chart by using the canonical plural form `spec.visualizations: [<vis>, ...]`. The singular `spec.visualization: <vis>` is accepted as syntactic sugar for a single-element list and is normalised at ingest. The dashboard renders all charts as a deck (`<div class="yuzu-chart-deck">`); the REST endpoint takes an optional `?index=N` query parameter (default 0) to address individual charts and includes `chart_index` and `chart_count` in every response payload so callers can iterate.
+
+> **Limitations.** The engine caps each chart at 10 000 underlying response rows; when truncated, the response payload includes `rows_capped: true` so the dashboard can show a banner. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
+
+The engine returns a self-contained payload the dashboard's renderer (`/static/yuzu-charts.js`) can draw without a second request:
+
+```json
+{
+  "data": {
+    "chart_type": "pie",
+    "title": "Service States",
+    "labels": ["running", "stopped", "paused"],
+    "series": [{"name": "Count", "data": [42, 7, 1]}],
+    "meta": {"responses_total": 50, "responses_succeeded": 50, "responses_failed": 0}
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+For `datetime_series` the shape replaces `labels` with `x` (epoch-seconds array) and adds `"x_axis": "datetime"`.
+
+Example — count distinct process names across the fleet (plugin `procfetch` emits `PID|Name|Path|SHA-1`; `labelField: 1` selects the `Name` column):
+
+```yaml
+spec:
+  visualization:
+    type: pie
+    processor: single_series
+    title: Top processes
+    labelField: 1
+    maxCategories: 8
+```
+
+Example — events-over-time per agent (default `xField` uses the response's wall-clock timestamp; one data point per response):
+
+```yaml
+spec:
+  visualization:
+    type: line
+    processor: datetime_series
+    title: Events per second
+```
+
+Example — multiple charts on one definition (issue #587). The dashboard renders both side by side:
+
+```yaml
+spec:
+  visualizations:
+    - type: pie
+      processor: single_series
+      title: Top processes
+      labelField: 1
+      maxCategories: 8
+    - type: line
+      processor: datetime_series
+      title: Process count over time
+```
+
 #### `status`
 
 | Field | Type | Required | Default | Description |
@@ -297,6 +376,12 @@ spec:
       - services
   legacy_shim:
     enabled: true                        # auto-generate from plugin descriptor if true
+  visualization:                         # optional — omit if no chart is needed
+    type: pie
+    processor: single_series
+    title: Service State Distribution
+    labelField: 1                        # 0-based index into spec.result.columns: 1 = state
+    maxCategories: 8
 status:
   phase: proposed
 ```

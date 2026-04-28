@@ -2021,6 +2021,74 @@ Get per-definition execution statistics.
 
 ---
 
+### Execution Visualization
+
+Render an execution's response set as chart-ready JSON, using the `spec.visualization` block configured on the associated `InstructionDefinition` (issue #253). The endpoint is the data source for the dashboard's chart cards and is also suitable for external consumers (Grafana scripted-panel datasources, custom dashboards) that can read JSON over HTTP.
+
+#### `GET /api/v1/executions/{id}/visualization`
+
+**Permission:** `Response:Read`
+
+**Path parameters:**
+
+| Param | Description |
+|---|---|
+| `id` | The response-store key (the `command_id` returned at dispatch time). |
+
+**Query parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `definition_id` | string | Yes | ID of the `InstructionDefinition` that holds the `spec.visualization` (or `spec.visualizations`) block. Required because Yuzu keys responses by `command_id`, not by `executions.id` — the caller supplies the link. Must match `[A-Za-z0-9._-]+`. |
+| `index` | integer | No | Chart index when the definition declares multiple visualizations. Default `0`. Returns 404 if out of range. |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "chart_type": "pie",
+    "title": "Service States",
+    "labels": ["running", "stopped", "paused"],
+    "series": [{ "name": "Count", "data": [42, 7, 1] }],
+    "meta": {
+      "responses_total": 50,
+      "responses_succeeded": 50,
+      "responses_failed": 0
+    },
+    "chart_index": 0,
+    "chart_count": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`chart_index` and `chart_count` (issue #587) let clients iterate when the definition declares multiple charts. For `datetime_series` charts, `labels` is replaced by `x` (epoch-seconds array) and `"x_axis": "datetime"` is added.
+
+When the underlying response set exceeds the per-request row cap (10000), the response payload includes `"rows_capped": true` and `"rows_cap": 10000` so the client can surface a "showing first N rows" banner.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `400` | `definition_id` query parameter not provided, or `index` is not a non-negative integer. |
+| `404` | Definition not found, has no `spec.visualization` configured, or the requested `index` is out of range. |
+| `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
+| `503` | Response store or instruction store unavailable. |
+
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id>`.
+
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/executions/cmd-os_info-abc123/visualization?definition_id=crossplatform.service.inspect"
+```
+
+See `docs/yaml-dsl-spec.md` § `spec.visualization` for the full configuration schema.
+
+---
+
 ### Device Tokens
 
 Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.

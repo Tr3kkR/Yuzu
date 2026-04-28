@@ -1264,6 +1264,24 @@ registry get_value hive=HKLM key=SOFTWARE\Microsoft\Windows value=ProductName
 
 This differs from YAML-parameterised instructions where parameters are defined in the `parameter_schema` of an `InstructionDefinition`. Inline parameters are ad-hoc and bypass schema validation — they are sent directly to the plugin action. YAML-defined parameters provide type constraints, descriptions, default values, and validation.
 
+### Response Visualization (chart deck)
+
+When the dispatched (plugin, action) reverse-resolves to an enabled `InstructionDefinition` that declares `spec.visualization` or `spec.visualizations`, a chart deck auto-renders above the results table — no operator action required. The dashboard:
+
+1. Resolves `(plugin, action)` to the first enabled definition with a configured visualization. The reverse-lookup is gated on `InstructionDefinition:Read` in addition to `Execution:Execute`; an operator without `InstructionDefinition:Read` sees the dispatch succeed but no chart appears.
+2. Emits an OOB `<div id="chart-deck-host">` with a 2-second deferred load trigger so responses have time to arrive.
+3. Fetches `/fragments/results?...&definition_id=<id>` which returns one chart-card placeholder per configured chart in a `<div class="yuzu-chart-deck">` container.
+4. The embedded SVG renderer (`/static/yuzu-charts.js`) populates each placeholder from `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>`.
+
+**Limitations operators should expect:**
+
+- **First-match arbitrariness.** When multiple enabled definitions share `(plugin, action)` and more than one declares a visualization, the alphabetically-first definition wins. Authors should ensure at most one chart-bearing definition per `(plugin, action)` — or dispatch via the Instructions tab (which carries `definition_id` explicitly).
+- **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
+- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
+- **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
+
+See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
+
 ---
 
 ## 14. Planned Features

@@ -24,6 +24,7 @@ namespace yuzu::server {
 class ResponseStore;
 class ManagementGroupStore;
 class TagStore;
+class InstructionStore;
 struct FacetFilter;
 
 namespace detail {
@@ -66,7 +67,8 @@ public:
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
                          ResolveFn resolve_fn,
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         yuzu::MetricsRegistry* metrics = nullptr,
+                         InstructionStore* instruction_store = nullptr);
 
 private:
     AuthFn auth_fn_;
@@ -77,6 +79,7 @@ private:
     detail::AgentRegistry* registry_{nullptr};
     TagStore* tag_store_{nullptr};
     detail::EventBus* event_bus_{nullptr};
+    InstructionStore* instruction_store_{nullptr};
     AgentsJsonFn agents_json_fn_;
     DispatchFn dispatch_fn_;
     ResolveFn resolve_fn_;
@@ -84,15 +87,23 @@ private:
 
     // -- Fragment renderers ---------------------------------------------------
 
-    /// Render filtered/sorted/paginated result rows + OOB thead, pagination, summary.
+    /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
+    /// summary. When @p definition_id is non-empty AND the definition has a
+    /// `spec.visualization`, an OOB chart deck fragment is appended to
+    /// re-populate `#chart-deck-host` (issue #587).
     std::string render_results(const std::string& command_id, const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
                                const std::vector<FacetFilter>& filters,
-                               const std::string& text_query);
+                               const std::string& text_query,
+                               const std::string& definition_id = {});
 
-    /// Render filter controls for a plugin schema.
-    std::string render_filter_bar(const std::string& command_id, const std::string& plugin);
+    /// Render filter controls for a plugin schema. When @p definition_id is
+    /// non-empty it's emitted as a hidden form input so subsequent
+    /// `hx-include="#filter-bar"` requests propagate it through to
+    /// `/fragments/results` (which uses it to keep the chart deck live).
+    std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
+                                   const std::string& definition_id = {});
 
     /// Render group creation form.
     std::string render_create_group_form(const std::string& command_id,

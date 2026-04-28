@@ -7,7 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Visualization: governance round-2 hardening on the multi-chart and
+  dashboard auto-render deltas.** Resolved in-PR: arch-B2 (migration v2
+  duplicate-column was non-idempotent on iterated DBs — added a
+  pre-migration probe that stamps `schema_meta` to v2 when the column
+  already exists, so the migration runner skips the failing ALTER);
+  C-14/sec-F5/UP-36 (raw `&` replaced with `&amp;` in three HTML
+  attribute emit sites for strict HTML5 conformance and consistency
+  with `render_results`); CP-1/sec-F1/ER-NEW-2 (reverse-lookup at
+  `/api/dashboard/execute` now gates on `InstructionDefinition:Read`
+  in addition to `Execution:Execute` — a principal denied
+  `InstructionDefinition:Read` no longer enumerates definition IDs
+  through this side channel; the dispatch itself still succeeds, only
+  the chart auto-render is suppressed); CP-2/C-16 (the `command.dispatch`
+  audit `detail` now appends `definition_id=<id>` when the reverse-lookup
+  resolved one — closes the SIEM correlation gap between dispatch and
+  the subsequent `execution.visualization.fetch` event); sec-F3/C-15
+  (REST endpoint regex-validates `definition_id` against
+  `^[A-Za-z0-9._-]{1,128}$` matching the dashboard fragment, so
+  unbounded values no longer reach SQL bind / audit / log paths);
+  sec-F2 (added failure audit emission for every 4xx path on the REST
+  visualization endpoint with a structured `reason=<r>` token in
+  `detail` so SIEM rules can detect probe / fuzz traffic);
+  doc-SF1 (visualization-demo.sh header comment updated — the
+  browser-console paste workaround is removed in favour of the
+  dashboard auto-render UX); doc-SF2 (`audit-log.md` table now
+  documents `execution.visualization.fetch` with the success / failure
+  detail vocabulary and the SIEM-correlation note);
+  doc-SF3/ER-NEW-4 (`instructions.md` § 13 grew a "Response
+  Visualization (chart deck)" subsection covering the auto-render
+  flow, RBAC, and known limitations).
+
+  Tests: `[visualization]` filter now 28 cases / 186 assertions, all
+  green. Added "REST visualization: malformed definition_id → 400" and
+  asserted failure-path audit emission on the existing missing-
+  definition_id 400 case.
+
+- **Visualization: chart deck auto-renders inline in the dashboard
+  results panel (no manual paste needed).** New `<div id="chart-deck-host">`
+  placeholder above the filter bar in `dashboard_ui.cpp`; `yuzu-charts.js`
+  now ships in the dashboard's `<script>` block alongside `htmx.js` and
+  `sse.js`. `/fragments/results` accepts an optional `definition_id`
+  query parameter and emits an OOB `<div id="chart-deck-host">` swap
+  alongside the tbody, populating the deck with one chart card per
+  configured chart. The dashboard `/api/dashboard/execute` path does a
+  best-effort reverse lookup against `InstructionStore` for a
+  definition matching the dispatched (plugin, action) that has a
+  `spec.visualization` configured; when found, `definition_id` is
+  threaded through (a) the OOB filter-bar `load delay:2s` URL,
+  (b) the OOB chart-deck-host load URL, (c) the filter-bar form's
+  hidden inputs, and (d) the pagination/sort/filter base URLs. Operators
+  who type an instruction whose plugin/action matches a chart-bearing
+  definition now see charts render automatically as soon as responses
+  arrive, with no need for the browser-console paste from
+  `scripts/visualization-demo.sh`. Minimal CSS for the
+  `.yuzu-chart-deck` flex container keeps multiple charts side-by-side
+  with sensible min-width/max-width.
+
+- **Visualization: multi-chart definitions (issue #587, governance arch-S2).**
+  A definition can now declare more than one chart via the canonical
+  plural form `spec.visualizations: [<vis>, ...]`. The singular
+  `spec.visualization: <vis>` is accepted as syntactic sugar for a
+  single-element list and is normalised at ingest by
+  `import_definition_json`. The REST endpoint accepts an optional
+  `?index=N` query parameter (default `0`); the response payload
+  includes `chart_index` and `chart_count` so clients can iterate.
+  Out-of-range `index` returns 404; non-integer `index` returns 400.
+  The dashboard fragment emits one `<div data-yuzu-chart-url="...&index=K">`
+  per configured chart wrapped in a `<div class="yuzu-chart-deck">`
+  container, so each chart is rendered independently and a slow/failed
+  fetch on one doesn't block its siblings. Engine API grew
+  `count(spec_json)` and `transform_at(spec_json, index, ...)`;
+  `has_visualization` and `transform` continue to work for the legacy
+  single-chart case. Storage column `visualization_spec` keeps its
+  TEXT/JSON shape but values are normalised to JSON arrays at ingest.
+
+- **Visualization fragment route relocated to `dashboard_routes.cpp`
+  (issue #589, governance arch-S6).** `GET /fragments/executions/{id}/visualization`
+  was registered in `server.cpp` alongside the static-asset handlers
+  because that's where the stores were already in scope. Every other
+  `/fragments/*` route lives in `dashboard_routes.cpp`; this one now
+  joins them. `DashboardRoutes::register_routes(...)` grew an optional
+  `InstructionStore*` parameter (defaulted to `nullptr` for
+  backward-compatible call sites). Behavior, URL, permission gate
+  (`Response:Read`), and XSS-safe `definition_id` regex validation
+  all unchanged. Demo script and unit tests (`[visualization]`)
+  continue to pass; live UAT confirms the moved route returns
+  HTTP 200 with the expected `data-yuzu-chart-url` placeholder.
+
 ### Added
+
+- **Response Visualization Engine — server-side chart rendering for
+  instruction responses (issue #253, Phase 8.1).** New
+  `spec.visualization` block on `InstructionDefinition` declares a
+  chart configuration (5 chart types: pie / bar / column / line /
+  area; 3 processors: single_series / multi_series / datetime_series).
+  The server walks the response set, runs the chosen processor, and
+  returns chart-ready JSON via
+  `GET /api/v1/executions/{id}/visualization` (gated on `Response:Read`
+  for sibling parity with the rest of the response-store read surface;
+  requires `definition_id` query parameter). Dashboard fragment
+  `GET /fragments/executions/{id}/visualization` returns an
+  HTMX-friendly placeholder div the embedded vanilla-SVG renderer
+  (`/static/yuzu-charts.js`, no third-party dependency) populates on
+  settle. `visualization_spec` is stored on the definitions table as
+  a JSON string and tracked by `MigrationRunner` v2 so the schema
+  ledger reflects when the column became canonical. Field names use
+  camelCase (`labelField`, `valueField`, `seriesField`, `xField`,
+  `yField`, `maxCategories`, `valueLabel`); the engine still accepts
+  the snake_case forms as deprecated aliases for backward compat.
+  Row reads cap at 10000 (sibling parity); when the cap is hit the
+  payload includes `rows_capped:true` and a server-side warn log
+  fires so on-call has a signal. Engine label cardinality is also
+  hard-capped at 10000 distinct labels per chart as defense-in-depth.
+  Every render emits an `execution.visualization.fetch` audit event.
+  REST API documented in `docs/user-manual/rest-api.md` and the
+  embedded OpenAPI spec; YAML DSL documented in
+  `docs/yaml-dsl-spec.md` § `spec.visualization` with two worked
+  examples and an entry in the §3.2 complete example.
+
+  Hardening followed an 8-gate `/governance` run on the initial
+  commit; this entry reflects the post-hardening surface. Resolved
+  in-PR: sec-H1 reflected XSS via `definition_id`, sec-H2/C-1 wrong
+  securable, sec-L6/C-4 missing audit, sec-M4/F-9 unbounded label
+  cardinality, bld-B1 macOS `std::from_chars(double)` compile,
+  arch-B1/F-6 migration discipline, dsl-B1 broken services-plugin
+  example, dsl-B2 snake_case→camelCase rename, dsl-B3 missing §3.2
+  example, doc-B1/B2 missing rest-api.md and OpenAPI entries, qe-1/2/3
+  test gaps for 403/audit/503 paths, C-2 row-cap drift 5000→10000,
+  UP-3/ER-P1 silent truncation. Deferred to follow-up issues:
+  sec-M3/F-3 mgmt-group visibility filter (non-trivial — needs
+  `ManagementGroupStore` wired into `RestApiV1::register_routes`),
+  UP-5/SRE-7 concurrent render DoS semaphore, UP-19 duplicate
+  command_id collision, arch-S2 multi-chart-per-definition, arch-S6
+  fragment route relocation to `dashboard_routes.cpp`.
+
+  Test deltas: `tests/unit/server/test_visualization_engine.cpp`
+  (12 engine cases, all camelCase), `tests/unit/server/test_rest_visualization.cpp`
+  (10 wire cases including 403 perm-denied, 503 null-stores, audit
+  emission, snake_case alias, rows_capped meta).
 
 - **CI: ASan job now uses `x64-linux-asan` triplet so vendored deps
   (protobuf/abseil/grpc) are built with `-fsanitize=address,undefined`

@@ -31,6 +31,8 @@
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+// Visualization engine consumers live in dashboard_routes.cpp (#589) and
+// rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -159,6 +161,7 @@ extern const char* const kYuzuCss;
 extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
+namespace yuzu::server { extern const std::string kYuzuChartsJs; }
 
 namespace yuzu::server {
 
@@ -2210,6 +2213,18 @@ private:
                              res.set_header("Cache-Control", "public, max-age=86400");
                              res.set_content(kSseJs, "application/javascript; charset=utf-8");
                          });
+        // Issue #253: response visualization renderer (vanilla SVG, no
+        // third-party dependency). Cached aggressively because the JS
+        // bundle is content-addressed by binary version.
+        web_server_->Get(
+            "/static/yuzu-charts.js",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kYuzuChartsJs,
+                                "application/javascript; charset=utf-8");
+            });
+
+        // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
         // -- Dashboard (unified UI) -------------------------------------------
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
@@ -4472,7 +4487,8 @@ private:
                 }
                 return {"", ""};
             },
-            &metrics_);
+            &metrics_,
+            instruction_store_.get());
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
