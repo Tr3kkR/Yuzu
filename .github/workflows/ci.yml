@@ -388,56 +388,6 @@ jobs:
         # MSYS2 bash. Same gotcha CLAUDE.md documents for `shell: bash`.
         run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
-      # ⚠ TEMPORARY one-shot recovery (delete after first successful
-      # warm rebuild on Windows). Two prior runs (aac6c78, bfee270)
-      # showed:
-      #   read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/absl_absl_check.pc"):
-      #   no such file or directory
-      # vcpkg sees its per-package state files in vcpkg_installed/
-      # (so it says "already installed"), but the actual extracted
-      # tree is incomplete from a prior failed restore. The sentinel
-      # above returns "unchanged" because the cache-key hash hasn't
-      # drifted — so vcpkg_installed/x64-windows survives across runs
-      # in its broken state.
-      #
-      # This step nukes BOTH:
-      #   1. yuzu-vcpkg-binary-cache-windows (binary cache zips —
-      #      may include a partial-write zip from a cancelled run)
-      #   2. vcpkg_installed/x64-windows (the extracted tree —
-      #      incomplete from a prior failed restore)
-      #   3. the sentinel hash file, so the sentinel writes a fresh
-      #      one after the next successful install.
-      # vcpkg then rebuilds all ports from source (~25 min on this
-      # 32-core runner) and repopulates everything cleanly.
-      - name: TEMP — nuke corrupt vcpkg state (one-shot recovery)
-        env:
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
-        # No `find` here: Windows has a native find.exe at
-        # C:\Windows\system32\find.exe (a text-search tool, completely
-        # different from GNU find), and $PATH resolves `find` to that
-        # before the MSYS2 one. Same PATH-collision class as the bash
-        # issue. `rm -rf` is safe because Windows has no native `rm`,
-        # so PATH lookup falls through to MSYS2's coreutils.
-        run: |
-          if [[ -d "$VCPKG_DEFAULT_BINARY_CACHE" ]]; then
-            echo "wiping binary cache: $VCPKG_DEFAULT_BINARY_CACHE"
-            rm -rf "$VCPKG_DEFAULT_BINARY_CACHE"
-          else
-            echo "$VCPKG_DEFAULT_BINARY_CACHE does not exist — skipping"
-          fi
-          installed="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
-          if [[ -d "$installed" ]]; then
-            echo "wiping extracted tree: $installed"
-            rm -rf "$installed"
-          else
-            echo "$installed does not exist — skipping"
-          fi
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-cachekey.sha256"
-          if [[ -f "$sentinel" ]]; then
-            echo "wiping sentinel: $sentinel"
-            rm -f "$sentinel"
-          fi
-
       - name: Install vcpkg packages
         env:
           # Persistent binary cache outside the workspace. Without this
