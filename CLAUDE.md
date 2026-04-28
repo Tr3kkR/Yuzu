@@ -71,18 +71,7 @@ Use the `gateway-eunit` and `gateway-dialyzer` skills (in `.claude/skills/`) for
 
 ### Toolchain activation (Erlang on PATH)
 
-The gateway and the meson custom_target that drives `rebar3 compile` both
-require `erl` on PATH. WSL2 / Linux dev shells typically rely on
-[kerl](https://github.com/kerl/kerl) and need `source $(kerl path <ver>)/activate`
-before any build; macOS uses Homebrew or asdf; MSYS2 bash on Windows reads the
-native installer (`C:\Program Files\Erlang OTP\bin` on modern installers,
-`C:\Program Files\erl-<ver>\bin` on older ones). Forgetting to activate is a
-common cause of phantom `.gateway_built` failures from `meson compile` even
-though the C++ targets succeed.
-
-**Use the helper.** Before any gateway work — `rebar3`, `meson compile`, or any
-script that touches `gateway/` — source the cross-platform helper and verify
-`erl` is on PATH:
+`rebar3` and the meson custom_target that wraps it both need `erl` on PATH. Forgetting to activate is the usual cause of phantom `.gateway_built` failures while the C++ targets succeed. Source the cross-platform helper before any gateway work and verify:
 
 ```bash
 source scripts/ensure-erlang.sh           # default: latest 28.x
@@ -90,27 +79,7 @@ source scripts/ensure-erlang.sh 28.4.2    # exact pin
 command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
 ```
 
-The script is a no-op if `erl` is already on PATH **and runs** (it probes with
-`erl -version`, so broken symlinks and wrong-arch binaries don't pass the
-check). Otherwise it tries, in order:
-
-1. **kerl** — matches the requested version exactly or as a major-version
-   prefix (so `28` finds `28.4.2`); falls back to the highest installed `28.x`.
-2. **asdf** — uses `asdf which erl` (works on both classic and the 0.16+
-   rewrite that dropped `asdf where`).
-3. **Homebrew** — *macOS only*, via `brew --prefix erlang`.
-4. **MSYS2 Windows installer probe** — *MSYS2 bash on Windows only*, scans
-   both `Program Files` locations for the latest installed OTP.
-
-The helper **always returns 0** — a sourced script that returns non-zero would
-trip the parent shell's `set -e`. Callers MUST verify `command -v erl`
-themselves (see usage above). If no detector succeeds, the helper prints
-actionable install instructions to stderr.
-
-The default version argument tracks `.github/workflows/release.yml`'s
-`erlef/setup-beam` `otp-version`; bump both together. Native `cmd.exe` /
-PowerShell sessions are out of scope — Yuzu's documented Windows build path is
-MSYS2 bash (see `setup_msvc_env.sh`, the sibling MSVC activation helper).
+The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
 
 ### Standing Erlang pitfalls
 
@@ -185,8 +154,6 @@ The DB lives outside the repo (XDG data dir) so it persists across `git clean` a
 
 **Sanitizers.** `--full` Phase 6 dispatches `.github/workflows/sanitizer-tests.yml` on the `yuzu-wsl2-linux` self-hosted runner via `scripts/test/dispatch-runner-job.sh`. Local runs would pin the dev box for ~15 min per sanitizer rebuild; the runner absorbs that cost in the background. Runner offline → WARN, not FAIL, with operator retry instructions in the gate notes.
 
-PR1 landed the skill scaffold + upgrade test + standard Phase 5 gates + test-runs DB. PR2 lands Phase 6 (sanitizer runner dispatch), Phase 7 (coverage + perf with enforceable baselines), and the `dispatch-runner-job.sh` helper. PR3 will land the cross-platform OTA self-exec tests + Windows agent build dispatch on `yuzu-local-windows`.
-
 ## Instruction Engine
 
 The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack` with typed parameter and result schemas, executed via the `CommandRequest` wire protocol. DSL: `apiVersion: yuzu.io/v1alpha1`, six `kind` values (`InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`). Definitions are persisted with verbatim `yaml_source` as the source of truth plus denormalized columns for queries.
@@ -204,6 +171,8 @@ The path from feature-complete to enterprise-deployable is scoped in `docs/enter
 Roadmap: `docs/roadmap.md`. Capability map: `docs/capability-map.md`. Headline progress figure in the capability map is overstated — treat with skepticism (see memory `project_capability_map_accuracy.md`). When working on an issue, check the roadmap for dependencies and the capability map for target context.
 
 ## Build
+
+Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory** and verify the build compiles.
 
 ### Prerequisites
 - Meson 1.9.2, Ninja
@@ -251,10 +220,7 @@ Sanitizers and LTO use Meson built-in options (`b_lto`, `b_sanitize`).
 
 ### Per-OS build directory convention
 
-The same source tree is built from multiple hosts (WSL2 Linux + native
-Windows on the same physical machine, plus a separate macOS dev box). To
-keep them from clobbering each other, `scripts/setup.sh` selects a
-**per-OS canonical build directory**:
+Same source tree is built from multiple hosts (WSL2 + native Windows on the same box, plus a separate macOS); per-OS dirs prevent clobbering:
 
 | Host    | Build dir       |
 |---------|-----------------|
@@ -262,18 +228,17 @@ keep them from clobbering each other, `scripts/setup.sh` selects a
 | Windows | `build-windows` |
 | macOS   | `build-macos`   |
 
-Always use `scripts/setup.sh` (which picks the right dir automatically) or
-pass `-C build-<os>` explicitly to `meson compile` / `meson test`. If
-`scripts/setup.sh` finds an existing dir whose recorded source path looks
-like a different host's, it refuses to reconfigure unless `--wipe` is
-passed — this prevents the opaque ninja "dyndep is not an input" / Windows-
-path failures you get when a Windows-configured `builddir` is reused under
-WSL2 (and vice versa). All `build-*/` and legacy `builddir*/` paths are in
-`.gitignore`.
+Use `scripts/setup.sh` (auto-picks the dir) or pass `-C build-<os>` to `meson compile`/`meson test`. If setup.sh finds a dir whose recorded source path looks like another host's, it refuses to reconfigure unless `--wipe` — prevents opaque ninja "dyndep is not an input"/Windows-path failures when a Windows builddir is reused under WSL2. `setup.sh` no longer auto-wipes; defaults to `--reconfigure`.
 
-`./scripts/setup.sh` no longer auto-wipes an existing build directory —
-pass `--wipe` if you actually want to start from scratch, otherwise it
-runs `meson setup --reconfigure` and preserves prior compilation state.
+### Windows build
+
+`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, full path inventory, and the two hard rules: **never use `vcvars64.bat`** (extension exit-1 corrupts wrappers) and **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` and `build-ci` agents load this on any Windows-touching change.
+
+### Cross-compilation
+```bash
+./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini
+```
+Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
 
 ## Test
 
@@ -366,46 +331,23 @@ The script must run cleanly under MSYS2 bash on Windows. **Do NOT use `set -e` +
 
 ### Persistence + recovery
 
-Self-hosted checkouts use `clean: false` (PR-5). A pre-checkout step wipes `build-<os>/` ONLY when the branch differs from the previous run; vcpkg state is invalidated by the sentinel above. Meson setup uses `--reconfigure` when an existing `meson-info/` directory is present, so option drift across matrix variants doesn't abort the configure.
-
-Manual recovery: `bash scripts/ci/runner-reset.sh` runs `git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`. **This is the only sanctioned in-repo nuke path**; never `rm -rf` runner caches as a debug step (memory `feedback_vcpkg_cache.md`).
+Self-hosted checkouts use `clean: false`. Pre-checkout wipes `build-<os>/` ONLY on branch change; vcpkg state is invalidated by the sentinel above. `meson setup --reconfigure` when `meson-info/` exists. Manual recovery: `bash scripts/ci/runner-reset.sh` (`git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`) — **the only sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory `feedback_vcpkg_cache.md`).
 
 ### Per-OS build directory names
 
-`build-linux`, `build-windows`, `build-macos` (matrix); `build-linux-asan`, `build-linux-tsan`, `build-linux-coverage` (nightly variants). Sanitizer-tests.yml (the on-demand `/test --full` path) uses the same names so it shares the warm asan binary cache with nightly. release.yml + pre-release.yml follow the same convention. Closes #406.
+Matrix: `build-{linux,windows,macos}`. Nightly variants: `build-linux-{asan,tsan,coverage}`. sanitizer-tests.yml + release.yml + pre-release.yml follow the same convention so the warm asan binary cache is shared. Closes #406.
 
 ### Workflow-PR canary
 
-`ci.yml`'s `detect-ci-changes` + `canary` jobs only run when a PR touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The canary mirrors the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` runner with `actions/cache` for vcpkg. Catches workflow regressions before they land on main and become the next CI run.
+`ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. Canary mirrors the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for vcpkg — catches workflow regressions before main.
 
 ### Cache pruning
 
-`cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner. Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` zips with mtime >30 days. Caps unbounded growth. Does not touch ccache (its own LRU at `CCACHE_MAXSIZE=30G` handles eviction).
+`cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner. Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 
 ### vcpkg state corruption — recovery path
 
-If a Windows CI run repeatedly fails at `Install vcpkg packages` with `read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such file or directory`, the load-bearing corruption is almost certainly **`vcpkg/packages/<port>_<triplet>/`** — vcpkg's manifest install short-circuits to "already installed" when that dir exists with the right hash, regardless of what's in `vcpkg_installed/<triplet>/` or `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows`. A build killed mid-port-build leaves a partial `vcpkg/packages/abseil_x64-windows/` (no `.pc` files yet); subsequent runs trust it and fail.
-
-The sentinel + binary-cache wipe alone do NOT reach `vcpkg/packages/`. The full set of candidate corruption paths under `clean: false`:
-
-- `<workspace>/vcpkg/packages/` — pre-stage zips (THE one)
-- `<workspace>/vcpkg/buildtrees/` — port build state
-- `<workspace>/vcpkg/installed/` — vcpkg classic-mode install (rare in manifest mode)
-- `<workspace>/vcpkg_installed/<triplet>/` — project install root
-- `<workspace>/vcpkg_installed/.x64-<triplet>-cachekey.sha256` — the sentinel
-- `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows` — runner-local binary cache
-- `C:\Users\<user>\AppData\Local\vcpkg\archives\` — interactive-user default cache (vcpkg consults this even when `VCPKG_DEFAULT_BINARY_CACHE` is set)
-- `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
-
-Recovery procedure: `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over SSH on the runner as the `natha` interactive user with output redirected to a `.out` file:
-
-```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
-```
-
-Outputs structured `KEY: value` inventory before + nuke + after. Preserves `vcpkg/` (the tool itself) and `vcpkg/downloads/` (source tarballs — slow to refetch). Wipes everything else. Total disk freed in the 2026-04-28 incident: 33.9 GB.
-
-After running, REMOVE any TEMP one-shot recovery step from `ci.yml` if one was added during the incident (otherwise it forces from-source rebuild on every run and defeats the cache).
+If a Windows CI run repeatedly fails at `Install vcpkg packages` with a missing `.pc` file under `vcpkg_installed/x64-windows/lib/pkgconfig/`, the corruption is in `vcpkg/packages/` (which the cache-key sentinel does NOT reach). Recovery procedure + full corruption-path inventory: `docs/ci-troubleshooting.md` §7. Don't leave the recovery step in `ci.yml` after an incident — it defeats the cache.
 
 ## Release workflow gates
 
@@ -419,20 +361,6 @@ bash scripts/check-compose-versions.sh 0.10.0
 
 The release job will otherwise fail after all build matrix jobs have run, wasting ~30–60 min of runner time without publishing anything. When adding a new compose file to the repo, also add it to the `FILES` array at the top of `scripts/check-compose-versions.sh` — auto-discovery is deliberately off so opt-in is explicit.
 
-## Build system — Meson only
-
-Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory.** Always verify the meson build compiles after any change.
-
-### Windows build
-
-`docs/windows-build.md` is the source of truth — MSYS2 bash command sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, the full path inventory (cl.exe, cmake, ninja, python, meson, vcpkg, protoc, grpc_cpp_plugin), and the two hard rules: **never use `vcvars64.bat`** (exit code 1 from optional extension failures corrupts wrapper scripts) and **never use Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe / MSVC). The `cross-platform` and `build-ci` agents load this doc on any Windows-touching change.
-
-### Cross-compilation
-```bash
-./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini
-```
-Cross files live in `meson/cross/`. Native files for CI compiler selection live in `meson/native/`.
-
 ## Routed concerns (read the doc, not this file)
 
 | Concern | Doc | Loaded by |
@@ -444,9 +372,9 @@ Cross files live in `meson/cross/`. Native files for CI compiler selection live 
 | Prometheus metrics, label set, audit envelope, event format | `docs/observability-conventions.md` | `sre` and `architect` on any metrics/audit/event change |
 | Response data types, audit envelope, inventory data for analytics | `docs/data-architecture.md` | `architect` and `sre` when designing schemas |
 | User manual / YAML defs / REST API / Substrate primitive registration | docs-writer agent (`.claude/agents/docs-writer.md`) | docs-writer on every change as part of governance gate 2 |
-| Guardian / Guaranteed State — real-time agent-side policy enforcement, guard categories (event vs condition), kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS), YAML DSL (`kind: GuaranteedStateRule`), `__guard__` wire protocol, server store, approval workflow, quarantine | `docs/yuzu-guardian-design-v1.1.md` + Windows-first delivery plan `docs/yuzu-guardian-windows-implementation-plan.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guard_engine*`, `guard_*.{hpp,cpp}`, or `__guard__` protocol change |
-| TAR dashboard page — three frames (retention-paused source list, scope-walking-aware SQL, process tree viewer reconstructed from `process_live` seed + events), URL structure, permissions, observability | `docs/tar-dashboard.md` | `architect` on any `/tar` page or `/fragments/tar/...` route change; `plugin-developer` on TAR action surface (`tar.status`, `tar.process_tree`, `tar.purge_source`); `docs-writer` on dashboard nav / template change |
-| Scope walking — composable scope from previous query results (the Yuzu product differentiator). Result-set primitive, `result_sets.db` schema, `from_result_set:<id>` Scope Engine kind, REST API, YAML DSL `fromResultSet:` surface, lineage breadcrumb, audit chain. Reference walkthrough: Chrome IR. | `docs/scope-walking-design.md` | `architect` + `dsl-engineer` on any scope-engine, scope-DSL, or result-set surface change; `consistency-auditor` on the audit chain; `security-guardian` on cross-operator authorisation |
+| Guardian / Guaranteed State — real-time agent-side policy enforcement, guard categories, YAML DSL, `__guard__` wire protocol, server store, approval workflow, quarantine | `docs/yuzu-guardian-design-v1.1.md` + delivery plan `docs/yuzu-guardian-windows-implementation-plan.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guard_engine*`, `guard_*.{hpp,cpp}`, or `__guard__` change |
+| TAR dashboard — three frames (retention-paused sources, scope-walking SQL, process tree viewer), URL structure, permissions | `docs/tar-dashboard.md` | `architect` on `/tar` or `/fragments/tar/...` change; `plugin-developer` on TAR action surface; `docs-writer` on dashboard nav |
+| Scope walking — composable scope from previous query results (Yuzu's product differentiator). Result-set primitive, `result_sets.db`, `from_result_set:<id>` Scope kind, REST/DSL surface, lineage, audit chain | `docs/scope-walking-design.md` | `architect` + `dsl-engineer` on scope-engine/DSL/result-set change; `consistency-auditor` on audit chain; `security-guardian` on cross-operator authz |
 
 ## Guardian engine — stores and architectural notes
 
