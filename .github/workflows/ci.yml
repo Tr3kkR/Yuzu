@@ -402,10 +402,15 @@ jobs:
       - name: TEMP — nuke corrupt vcpkg binary cache (one-shot recovery)
         env:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
+        # No `find` here: Windows has a native find.exe at
+        # C:\Windows\system32\find.exe (a text-search tool, completely
+        # different from GNU find), and $PATH resolves `find` to that
+        # before the MSYS2 one. Same PATH-collision class as the bash
+        # issue. `rm -rf` is safe because Windows has no native `rm`,
+        # so PATH lookup falls through to MSYS2's coreutils.
         run: |
           if [[ -d "$VCPKG_DEFAULT_BINARY_CACHE" ]]; then
-            count=$(find "$VCPKG_DEFAULT_BINARY_CACHE" -type f | wc -l)
-            echo "wiping $count files from $VCPKG_DEFAULT_BINARY_CACHE"
+            echo "wiping $VCPKG_DEFAULT_BINARY_CACHE"
             rm -rf "$VCPKG_DEFAULT_BINARY_CACHE"
           else
             echo "$VCPKG_DEFAULT_BINARY_CACHE does not exist — nothing to nuke"
