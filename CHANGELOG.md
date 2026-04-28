@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI: Linux + Windows self-hosted runners rebuilt every vcpkg port from
+  source on every run.** Two compounding causes: (a) `lukka/run-vcpkg`
+  defaults `VCPKG_DEFAULT_BINARY_CACHE` to a per-run UUID temp dir under
+  its own state path, so every job started with a 0% hit rate; (b)
+  `actions/checkout@v6` defaults to `clean: true` (`git clean -ffdx`),
+  which wiped both `vcpkg/` and `vcpkg_installed/` from the workspace.
+  Combined effect: ~25 min from-source on Linux and ~90 min on Windows
+  for grpc + abseil + protobuf, every push, on a runner that had every
+  byte already on disk in a different directory. Symptom signature in
+  the build log: `Restored 0 package(s) from .../<uuid>/vcpkg_cache`.
+
+  Fix: redirect `VCPKG_DEFAULT_BINARY_CACHE` to `${{ runner.tool_cache }}`
+  on every self-hosted job (matrix linux × 4, sanitize-asan, sanitize-tsan,
+  coverage, windows × 2). The tool_cache path lives outside
+  `$GITHUB_WORKSPACE` so checkout's clean leaves it alone. After warm-up,
+  vcpkg restores from zip in ~10 s on Linux / ~30 s on Windows. Caches
+  are scoped by triplet only (`-linux`, `-asan`, `-windows`) — variants
+  using the same triplet share one cache because the package zips are
+  bit-identical regardless of consumer compiler/buildtype. Previous CI
+  rounds had used per-matrix scoping for defensive isolation, which
+  caused 4× from-source on the Linux matrix's first warm-up; we've
+  never had an isolation incident, so the speed wins. Net cumulative
+  first-warm cost dropped from ~5 h to ~2 h 20 min.
+
+- **CI: ASan job lacked sentinel-based triplet drift detection.** The
+  `triplets/x64-linux-asan.cmake` overlay is fingerprinted into vcpkg's
+  ABI hash, but vcpkg's _incremental install_ keys on the manifest only
+  — an edit that touches sanitiser flags or `VCPKG_BUILD_TYPE` would
+  silently leave the existing tree in place, yielding phantom link
+  errors that look like ABI mismatches. Mirrored the Windows
+  `Force fresh vcpkg install when triplet changed` step on the ASan
+  job, sentinel at `vcpkg_installed/.x64-linux-asan-triplet.sha256`.
+  Stock `x64-linux` jobs (matrix linux, TSan, coverage) don't carry an
+  overlay so don't need the sentinel; vcpkg-pinned commit ID covers
+  upstream triplet changes.
+
+- **CI: dead `Export GitHub Actions cache variables` step on the Windows
+  self-hosted job.** `ACTIONS_CACHE_URL` / `ACTIONS_RUNTIME_TOKEN` were
+  exported for an in-process GHA cache backend that nothing on this
+  runner consumes (binary cache is in `runner.tool_cache`, ccache writes
+  to the runner's HOME). Replaced with a comment explaining the history;
+  the macOS leg still uses `actions/cache@v5` directly so its export is
+  also dead but left in place pending a separate scope.
+
 - **Windows MSVC: `dashboard_ui.cpp` C2026 raw-string-literal limit hit
   by round-2 visualization additions.** The `kDashboardIndexHtml` raw
   string at the top of `dashboard_ui.cpp` was already at ~16 019 bytes

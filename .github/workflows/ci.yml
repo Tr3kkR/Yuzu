@@ -145,10 +145,17 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      # vcpkg_installed/ persists in ${{ github.workspace }} between
-      # jobs on this self-hosted runner. The "Force fresh vcpkg install
-      # when triplet changed" step below handles the only invalidation
-      # case (overlay-triplet content change). Issue #569.
+      # vcpkg_installed/ does NOT persist between runs — actions/checkout
+      # @v6 defaults to `clean: true`, which `git clean -ffdx`s the
+      # workspace and wipes both vcpkg/ and vcpkg_installed/. Persistent
+      # restore comes from VCPKG_DEFAULT_BINARY_CACHE on the Install
+      # step below, pointed at ${{ runner.tool_cache }} (outside the
+      # workspace, so checkout cleanup can't touch it). Without that,
+      # lukka/run-vcpkg defaults to a per-run UUID temp dir and every
+      # job rebuilds every port from source — symptom signature in the
+      # build log is `Restored 0 package(s) from .../<uuid>/vcpkg_cache`.
+      # Mirrors the sanitize-asan pattern at the VCPKG_DEFAULT_BINARY_CACHE
+      # line further down. Issue #569.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -157,7 +164,17 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Single shared cache across all matrix variants. The x64-linux
+          # triplet produces bit-identical package zips regardless of the
+          # consuming compiler (gcc-13 vs clang-19) or buildtype (vcpkg
+          # builds with its own toolchain, not the consumer's). Sharing
+          # one cache means the first matrix variant pays the from-source
+          # cost (~25 min) and the other three restore in seconds, vs.
+          # 4× from-source under per-matrix scoping. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
@@ -249,12 +266,11 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export was previously
+      # done here for the in-process GHA cache backend that lukka/run-vcpkg
+      # used to support. We don't consume those vars anywhere on this
+      # self-hosted runner (binary cache lives in runner.tool_cache, ccache
+      # writes to the runner's HOME), so the export was dead wiring. Issue #569.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -289,11 +305,24 @@ jobs:
           fi
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace. Without this
+          # lukka/run-vcpkg defaults to a per-run UUID temp dir under its
+          # own state path → 0% hit rate every run → every port rebuilt
+          # from source (~90 min for grpc + abseil + protobuf on this
+          # runner). runner.tool_cache survives actions/checkout's
+          # default `clean: true`. Mirrors the Linux pattern. Issue #569.
+          # Single shared cache across debug+release. The x64-windows
+          # triplet builds both variants in one port build (the
+          # VCPKG_BUILD_TYPE override was removed in the LNK2038 fix), so
+          # the zip filename is the same regardless of consumer build_type.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
           # the workspace path contains backslashes and bash's escape
           # processing strips them when interpolated as source text.
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
             --x-manifest-root="$GITHUB_WORKSPACE"
@@ -470,8 +499,9 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
-      # the self-hosted Linux runner between jobs. Issue #569.
+      # ccache persists in ~/.cache/ccache on the runner.
+      # vcpkg_installed/ does NOT persist (checkout default clean wipes
+      # it); the binary cache below provides fast restore. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -480,6 +510,27 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Force fresh vcpkg install when triplet changed
+        run: |
+          # vcpkg's incremental install keys off the manifest only — it
+          # does NOT detect overlay-triplet content edits. An edit to
+          # triplets/x64-linux-asan.cmake (e.g. changing sanitizer flags
+          # or VCPKG_BUILD_TYPE) silently leaves the existing tree in
+          # place, and downstream link errors look like phantom ABI
+          # mismatches. Mirrors the Windows sentinel pattern. Issue #569.
+          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux-asan"
+          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-linux-asan-triplet.sha256"
+          want=$(sha256sum triplets/x64-linux-asan.cmake | awk '{print $1}')
+          have=$(cat "$sentinel" 2>/dev/null || echo "")
+          if [[ "$want" != "$have" ]]; then
+            echo "x64-linux-asan triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-linux-asan"
+            rm -rf "$installed_dir"
+            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
+            echo "$want" > "$sentinel"
+          else
+            echo "x64-linux-asan triplet sha256 unchanged"
+          fi
 
       # ASan job uses the x64-linux-asan triplet so vcpkg builds
       # protobuf/abseil/grpc with -fsanitize=address,undefined. This
@@ -549,8 +600,13 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
-      # the self-hosted Linux runner between jobs. Issue #569.
+      # ccache (~/.cache/ccache) persists in the github-runner user's
+      # home between jobs. vcpkg_installed/ does NOT persist —
+      # actions/checkout@v6 defaults to `clean: true` which wipes the
+      # workspace. Persistent restore comes from VCPKG_DEFAULT_BINARY_CACHE
+      # on the Install step below, pointed at ${{ runner.tool_cache }}
+      # (outside the workspace, so checkout cleanup can't touch it).
+      # Mirrors the sanitize-asan and matrix linux pattern. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -561,7 +617,12 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Shares the matrix linux cache — TSan uses the same x64-linux
+          # triplet so the package zips are bit-identical. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
@@ -615,8 +676,13 @@ jobs:
           pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ccache (~/.cache/ccache) and vcpkg_installed/ both persist on
-      # the self-hosted Linux runner between jobs. Issue #569.
+      # ccache (~/.cache/ccache) persists in the github-runner user's
+      # home between jobs. vcpkg_installed/ does NOT persist —
+      # actions/checkout@v6 defaults to `clean: true` which wipes the
+      # workspace. Persistent restore comes from VCPKG_DEFAULT_BINARY_CACHE
+      # on the Install step below, pointed at ${{ runner.tool_cache }}
+      # (outside the workspace, so checkout cleanup can't touch it).
+      # Mirrors the sanitize-asan and matrix linux pattern. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -627,7 +693,13 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Shares the matrix linux cache — coverage uses the same
+          # x64-linux triplet so the package zips are bit-identical.
+          # Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
