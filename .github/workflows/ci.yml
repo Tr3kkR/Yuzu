@@ -388,6 +388,29 @@ jobs:
         # MSYS2 bash. Same gotcha CLAUDE.md documents for `shell: bash`.
         run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
+      # ⚠ TEMPORARY one-shot recovery (delete after run #25052277981+1
+      # successful warm rebuild on Windows). Run #25052277981 hit a
+      # corrupt abseil zip in yuzu-vcpkg-binary-cache-windows — vcpkg
+      # restored it but `read_lines("...lib/pkgconfig/absl_absl_check.pc")`
+      # returned ENOENT, suggesting a partial-write (cancellation) from
+      # a prior run. The sentinel above doesn't touch the binary cache
+      # by design (only invalidates vcpkg_installed/<triplet>/), so a
+      # corrupt cache zip survives. This step nukes the binary-cache
+      # contents ONCE so the next install rebuilds zips fresh, then
+      # falls out of use (subsequent runs see an empty dir, vcpkg
+      # repopulates, normal cache behaviour resumes).
+      - name: TEMP — nuke corrupt vcpkg binary cache (one-shot recovery)
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
+        run: |
+          if [[ -d "$VCPKG_DEFAULT_BINARY_CACHE" ]]; then
+            count=$(find "$VCPKG_DEFAULT_BINARY_CACHE" -type f | wc -l)
+            echo "wiping $count files from $VCPKG_DEFAULT_BINARY_CACHE"
+            rm -rf "$VCPKG_DEFAULT_BINARY_CACHE"
+          else
+            echo "$VCPKG_DEFAULT_BINARY_CACHE does not exist — nothing to nuke"
+          fi
+
       - name: Install vcpkg packages
         env:
           # Persistent binary cache outside the workspace. Without this
