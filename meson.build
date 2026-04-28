@@ -114,7 +114,20 @@ if host_os == 'windows'
   # so the include dir has to be a relative-to-source-root string.
   # Headers are the same across debug and release variants, so this
   # points at the shared include/ regardless of buildtype.
+  #
+  # Two forms exist on purpose:
+  #   * _vcpkg_include_win_rel — string path, used in run_command() / find_program()
+  #     contexts that take a string (none today, but kept stable for diagnostics).
+  #   * _vcpkg_inc_win         — IncludeDirs object captured once at the project
+  #     root, safe to reuse across subdirs.
+  #
+  # include_directories() resolves a relative string path against the CURRENT
+  # meson.build's source directory. Calling include_directories('vcpkg_installed/...')
+  # from tests/meson.build would look for tests/vcpkg_installed/... and fail.
+  # Capturing the IncludeDirs object here once anchors it to the project root;
+  # subdirs can then reuse the same object via the project-global variable.
   _vcpkg_include_win_rel = 'vcpkg_installed/x64-windows/include'
+  _vcpkg_inc_win = include_directories(_vcpkg_include_win_rel, is_system: true)
   if get_option('buildtype') == 'debug'
     _vcpkg_lib_win = _vcpkg_root_win / 'debug' / 'lib'
     _pbd = 'd'   # vcpkg convention: libprotobufd.lib / libprotobuf-lited.lib / libprotocd.lib / libupbd.lib
@@ -203,14 +216,14 @@ if host_os == 'windows'
   # method: 'cmake')` calls that Linux/macOS use — those paths are
   # unreachable on Windows.
   protobuf_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    include_directories: _vcpkg_inc_win,
     dependencies: [
       _libprotobuf, _libprotobuf_lite, _libprotoc, _libupb,
       _libutf8_range, _libutf8_validity,
     ] + _absl_deps,
   )
   grpcpp_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    include_directories: _vcpkg_inc_win,
     dependencies: [
       _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
       _libre2, _libcares,
@@ -222,7 +235,7 @@ if host_os == 'windows'
     ] + _absl_deps,
   )
   cli11_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    include_directories: _vcpkg_inc_win,
     dependencies: [_libcli11],
   )
 else

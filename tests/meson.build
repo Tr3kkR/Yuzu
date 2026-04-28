@@ -28,7 +28,11 @@ if host_os == 'windows'
   _libcatch2     = _cxx_tests.find_library('Catch2'     + _pbd, dirs: [_vcpkg_lib_win],                 required: true)
   _libcatch2main = _cxx_tests.find_library('Catch2Main' + _pbd, dirs: [_vcpkg_lib_win / 'manual-link'], required: true)
   catch2_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    # Reuse the project-root-anchored IncludeDirs object from the top-level
+    # meson.build. Recreating it here with include_directories() would resolve
+    # the relative path against tests/ and fail with "vcpkg_installed/...
+    # does not exist".
+    include_directories: _vcpkg_inc_win,
     # Order matters: Catch2Main defines main() and references symbols
     # from Catch2. List Main first so the linker pulls it in, then
     # Catch2 satisfies the leftover refs.
