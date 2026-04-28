@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Windows MSVC: `dashboard_ui.cpp` C2026 raw-string-literal limit hit
+  by round-2 visualization additions.** The `kDashboardIndexHtml` raw
+  string at the top of `dashboard_ui.cpp` was already at ~16 019 bytes
+  (a notorious sub-section of the 16 380-byte MSVC C2026 limit). Adding
+  the `<div id="chart-deck-host">` placeholder, the
+  `<script src="/static/yuzu-charts.js">` tag, and the
+  `.yuzu-chart-deck` / `.yuzu-chart-card` CSS for the chart deck pushed
+  it over, breaking Windows MSVC release with
+  `error C2026: string too big, trailing characters truncated`. Linux,
+  macOS, and clang accepted the bigger string fine.
+
+  Fix: split the raw string at the `</head>` boundary so chunk 1
+  (head + style) is now ~12 810 bytes and chunk 2 (body onward) is its
+  own 3 209-byte literal. Adjacent string literals concatenate at
+  compile time, so the runtime HTML is byte-identical. Same chunking
+  pattern `static_js_bundle.cpp` already uses for `kHtmxJs` and the
+  governance build-ci agent flagged for `charts_js_bundle.cpp` (#607).
+
 - **Windows MSVC: `yuzu_agent_tests.exe` LNK2019 regression from #572.**
   PR #572 changed `yuzu_agent_tests` to depend on `yuzu_proto_headers_dep`
   (no link_with) instead of `yuzu_proto_dep`. On Linux/macOS this works
