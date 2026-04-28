@@ -426,8 +426,13 @@ jobs:
 
       - name: vcpkg sentinel (x64-windows)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
-        shell: bash
-        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
+        # Both the outer shell AND the inner bash invocation must bypass
+        # $PATH lookup for `bash`, otherwise the runner's $PATH order
+        # (C:\Windows\system32 before C:\msys64\usr\bin) resolves `bash`
+        # to WSL bash, which exits with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+        # under LOCAL SYSTEM. Explicit MSYS2 paths fix it.
+        shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
       - name: Install vcpkg packages
         run: |
