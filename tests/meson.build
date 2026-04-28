@@ -3,16 +3,30 @@ if host_os == 'windows'
   # in the top-level meson.build: meson's cmake dep translator picks
   # lib/Catch2.lib (release CRT) for both debug and release consumers,
   # so a debug test binary linking with /MDd against release Catch2.lib
-  # trips dozens of LNK2038 _ITERATOR_DEBUG_LEVEL mismatches. Hand-wire
-  # to the buildtype-specific _vcpkg_lib_win directory established in
-  # the top-level Windows block. Catch2's vcpkg port keeps the same
-  # name in both lib/ and debug/lib/ — no `d` suffix.
+  # trips dozens of LNK2038 _ITERATOR_DEBUG_LEVEL mismatches.
+  #
+  # Three vcpkg quirks for catch2 specifically:
+  #   1. Libs live at lib/manual-link/ + debug/lib/manual-link/ — vcpkg
+  #      convention for libraries the consumer must explicitly link
+  #      against (Catch2WithMain.lib defines main() so consumers must
+  #      opt in by listing it; Catch2.lib is the body that
+  #      Catch2WithMain depends on).
+  #   2. The "main" target is named Catch2WithMain (NOT Catch2Main).
+  #   3. Same filename in lib/ and debug/lib/ — no `d` suffix.
+  #
+  # Hand-wire to the buildtype-specific _vcpkg_lib_win/manual-link/
+  # directory. _vcpkg_lib_win is established in the top-level Windows
+  # block (debug/lib for debug, lib for release).
   _cxx_tests = meson.get_compiler('cpp')
-  _libcatch2     = _cxx_tests.find_library('Catch2',     dirs: [_vcpkg_lib_win], required: true)
-  _libcatch2main = _cxx_tests.find_library('Catch2Main', dirs: [_vcpkg_lib_win], required: true)
+  _vcpkg_catch2_lib_win = _vcpkg_lib_win / 'manual-link'
+  _libcatch2         = _cxx_tests.find_library('Catch2',         dirs: [_vcpkg_catch2_lib_win], required: true)
+  _libcatch2withmain = _cxx_tests.find_library('Catch2WithMain', dirs: [_vcpkg_catch2_lib_win], required: true)
   catch2_dep = declare_dependency(
     include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
-    dependencies: [_libcatch2main, _libcatch2],
+    # Order matters: the WithMain lib defines main() and depends on
+    # symbols from the Catch2 lib. List WithMain first so the linker
+    # pulls it in, then Catch2 satisfies the leftover refs.
+    dependencies: [_libcatch2withmain, _libcatch2],
   )
 else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
