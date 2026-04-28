@@ -44,7 +44,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_V1 = """
 PRAGMA journal_mode=WAL;
@@ -110,7 +110,43 @@ CREATE INDEX IF NOT EXISTS idx_test_timings_gate    ON test_timings(gate_name, s
 CREATE INDEX IF NOT EXISTS idx_test_metrics_name    ON test_metrics(metric_name);
 """
 
+# Schema v2 (PR-9 of CI overhaul plan): ci_runs table tracks CI invocations
+# from .github/workflows/ci.yml. Joined to test_runs via commit_sha when both
+# exist for a given commit. Populated by `ci-ingest` (pulls from `gh run
+# list --json`) on demand or as a periodic operator task; query via
+# `ci-stats` for cache-hit / wall-time / failure-rate aggregates.
+#
+# Additive migration: v1 tables are untouched.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS ci_runs (
+    workflow_id      TEXT NOT NULL,        -- e.g. "ci.yml" / "release.yml"
+    run_id           INTEGER NOT NULL,     -- GitHub Actions run database ID
+    job_name         TEXT NOT NULL,        -- e.g. "Linux gcc-13 debug"
+    triplet          TEXT,                 -- vcpkg triplet, NULL for non-vcpkg jobs
+    runner           TEXT,                 -- e.g. "yuzu-wsl2-linux"
+    commit_sha       TEXT NOT NULL,
+    branch           TEXT NOT NULL,
+    started_at       INTEGER NOT NULL,
+    finished_at      INTEGER,
+    duration_seconds INTEGER,
+    conclusion       TEXT NOT NULL,        -- success/failure/cancelled/skipped/timed_out
+    vcpkg_cache_hit  INTEGER,              -- 1 hit, 0 miss/from-source, NULL unknown
+    ccache_hit_ratio REAL,                 -- 0.0-1.0; NULL if not measured
+    notes            TEXT,
+    PRIMARY KEY (workflow_id, run_id, job_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ci_runs_started_at ON ci_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ci_runs_branch     ON ci_runs(branch);
+CREATE INDEX IF NOT EXISTS idx_ci_runs_commit     ON ci_runs(commit_sha);
+CREATE INDEX IF NOT EXISTS idx_ci_runs_triplet    ON ci_runs(triplet);
+CREATE INDEX IF NOT EXISTS idx_ci_runs_conclusion ON ci_runs(conclusion);
+"""
+
 VALID_STATUS = {"PASS", "FAIL", "WARN", "SKIP", "RUNNING", "ABORTED"}
+VALID_CI_CONCLUSIONS = {
+    "success", "failure", "cancelled", "skipped", "timed_out", "neutral", "action_required",
+}
 
 
 # --- DB plumbing ----------------------------------------------------------
@@ -183,8 +219,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         existing = schema_version(conn)
         if existing is None:
             conn.executescript(SCHEMA_V1)
+            conn.executescript(SCHEMA_V2)
             stamp_version(conn, SCHEMA_VERSION)
             print(f"test_db: initialized {p} at schema v{SCHEMA_VERSION}")
+        elif existing == 1 and SCHEMA_VERSION >= 2:
+            # v1 → v2: additive migration. ci_runs table + indexes only;
+            # existing v1 tables are untouched. Idempotent (CREATE IF NOT
+            # EXISTS) so re-runs are safe.
+            conn.executescript(SCHEMA_V2)
+            stamp_version(conn, 2)
+            print(f"test_db: migrated {p} from v1 to v2 (added ci_runs)")
         elif existing < SCHEMA_VERSION:
             print(
                 f"test_db: {p} at v{existing}, target v{SCHEMA_VERSION} — "
@@ -312,11 +356,20 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
 
 
 def _ensure_schema_initialized(conn: sqlite3.Connection) -> None:
-    # Idempotent schema bootstrap. SCHEMA_V1 uses CREATE TABLE IF NOT
+    # Idempotent schema bootstrap. SCHEMA_V1 + V2 use CREATE TABLE IF NOT
     # EXISTS so concurrent callers can't conflict on table creation.
     # stamp_version uses INSERT OR REPLACE so it's also race-safe.
-    if schema_version(conn) is None:
+    v = schema_version(conn)
+    if v is None:
         conn.executescript(SCHEMA_V1)
+        conn.executescript(SCHEMA_V2)
+        stamp_version(conn, SCHEMA_VERSION)
+    elif v < SCHEMA_VERSION:
+        # In-place upgrade for callers that hit a stale DB before
+        # `init` has been re-run.
+        if v == 1:
+            conn.executescript(SCHEMA_V2)
+            stamp_version(conn, 2)
         stamp_version(conn, SCHEMA_VERSION)
 
 
@@ -467,6 +520,169 @@ def cmd_metric(args: argparse.Namespace) -> int:
 
 
 # --- queries --------------------------------------------------------------
+
+
+def cmd_ci_record(args: argparse.Namespace) -> int:
+    """Insert (or replace) one ci_runs row.
+
+    Idempotent on (workflow_id, run_id, job_name) — re-running with the
+    same key updates the row, which is what we want for in-progress runs
+    that haven't yet logged a finished_at.
+    """
+    if args.conclusion not in VALID_CI_CONCLUSIONS:
+        print(
+            f"test_db: invalid conclusion '{args.conclusion}', "
+            f"want one of {sorted(VALID_CI_CONCLUSIONS)}",
+            file=sys.stderr,
+        )
+        return 2
+    with connect(create_dirs=True) as conn:
+        _ensure_schema_initialized(conn)
+        finished = args.finished_at
+        duration = None
+        if finished is not None:
+            duration = max(0, finished - args.started_at)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO ci_runs
+                (workflow_id, run_id, job_name, triplet, runner,
+                 commit_sha, branch, started_at, finished_at, duration_seconds,
+                 conclusion, vcpkg_cache_hit, ccache_hit_ratio, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                args.workflow, args.run_id, args.job_name, args.triplet, args.runner,
+                args.commit, args.branch, args.started_at, finished, duration,
+                args.conclusion, args.vcpkg_cache_hit, args.ccache_hit_ratio,
+                args.notes or "",
+            ),
+        )
+    print(
+        f"test_db: ci_runs <- {args.workflow}#{args.run_id}/{args.job_name} "
+        f"({args.conclusion}, {duration}s)"
+    )
+    return 0
+
+
+def cmd_ci_ingest(args: argparse.Namespace) -> int:
+    """Pull recent CI runs from `gh run list --json` and insert.
+
+    No GitHub API access from the CI workflow itself — that's a separate
+    concern. This command runs locally (operator's dev box) and ingests
+    history for the trend queries. Re-runnable; existing rows are upserted.
+    """
+    cmd = [
+        "gh", "run", "list",
+        "--workflow", args.workflow,
+        "--limit", str(args.limit),
+        "--json", "databaseId,headSha,headBranch,createdAt,updatedAt,conclusion,status,name",
+    ]
+    if args.branch:
+        cmd.extend(["--branch", args.branch])
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print(f"test_db: gh run list failed: {proc.stderr.strip()}", file=sys.stderr)
+        return 1
+    runs = json.loads(proc.stdout)
+
+    inserted = 0
+    skipped = 0
+    with connect(create_dirs=True) as conn:
+        _ensure_schema_initialized(conn)
+        for run in runs:
+            conclusion = run.get("conclusion") or "in_progress"
+            # gh times are RFC3339 ("2026-04-28T09:45:07Z"). Parse to unix.
+            from datetime import datetime, timezone
+            def to_unix(s: str | None) -> int | None:
+                if not s:
+                    return None
+                return int(datetime.fromisoformat(s.replace("Z", "+00:00"))
+                           .astimezone(timezone.utc).timestamp())
+            started = to_unix(run["createdAt"]) or 0
+            finished = to_unix(run.get("updatedAt"))
+            duration = (finished - started) if finished else None
+            if conclusion not in VALID_CI_CONCLUSIONS:
+                skipped += 1
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO ci_runs
+                    (workflow_id, run_id, job_name, triplet, runner,
+                     commit_sha, branch, started_at, finished_at, duration_seconds,
+                     conclusion, vcpkg_cache_hit, ccache_hit_ratio, notes)
+                VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, '')
+                """,
+                (
+                    args.workflow, run["databaseId"], run.get("name") or "(workflow)",
+                    run["headSha"], run.get("headBranch") or "",
+                    started, finished, duration, conclusion,
+                ),
+            )
+            inserted += 1
+    print(f"test_db: ingested {inserted} ci_runs from {args.workflow} ({skipped} skipped)")
+    return 0
+
+
+def cmd_ci_stats(args: argparse.Namespace) -> int:
+    """Aggregate stats: median wall time, hit rate, failure rate per triplet.
+
+    Window is `--since N{d|h}` (default 7d). Output is plain-text table.
+    """
+    seconds = _parse_window(args.since)
+    cutoff = int(time.time()) - seconds
+    with connect() as conn:
+        conn.row_factory = sqlite3.Row
+        # By triplet (or workflow if triplet NULL).
+        rows = list(conn.execute(
+            """
+            SELECT
+                COALESCE(triplet, workflow_id) AS scope,
+                COUNT(*)                       AS n,
+                SUM(CASE WHEN conclusion='success' THEN 1 ELSE 0 END)   AS successes,
+                SUM(CASE WHEN conclusion='failure' THEN 1 ELSE 0 END)   AS failures,
+                SUM(CASE WHEN conclusion='cancelled' THEN 1 ELSE 0 END) AS cancellations,
+                AVG(vcpkg_cache_hit)                                    AS hit_rate,
+                AVG(duration_seconds)                                   AS avg_duration
+            FROM ci_runs
+            WHERE started_at >= ?
+            GROUP BY scope
+            ORDER BY n DESC
+            """,
+            (cutoff,),
+        ))
+    if not rows:
+        print(f"(no ci_runs since {args.since})")
+        return 0
+    print(f"{'scope':<24} {'n':>4} {'pass':>5} {'fail':>5} {'cncl':>5} "
+          f"{'fail%':>6} {'hit%':>5} {'avg_dur':>9}")
+    print("-" * 75)
+    for r in rows:
+        n = r["n"] or 0
+        fails = r["failures"] or 0
+        fail_pct = (fails / n * 100) if n else 0
+        hit = r["hit_rate"]
+        hit_pct = f"{hit*100:>4.0f}%" if hit is not None else "  -- "
+        avg = r["avg_duration"]
+        avg_s = f"{int(avg)}s" if avg is not None else "    --"
+        print(
+            f"{(r['scope'] or '?')[:24]:<24} "
+            f"{n:>4} {(r['successes'] or 0):>5} {fails:>5} "
+            f"{(r['cancellations'] or 0):>5} {fail_pct:>5.1f}% "
+            f"{hit_pct:>5} {avg_s:>9}"
+        )
+    return 0
+
+
+def _parse_window(s: str) -> int:
+    """Convert "7d" / "12h" / "30m" → seconds. Defaults to days if no unit."""
+    s = s.strip().lower()
+    if s.endswith("d"):
+        return int(s[:-1]) * 86400
+    if s.endswith("h"):
+        return int(s[:-1]) * 3600
+    if s.endswith("m"):
+        return int(s[:-1]) * 60
+    return int(s) * 86400
 
 
 def _print_runs(rows: Iterable[sqlite3.Row]) -> None:
@@ -825,6 +1041,57 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_metric.add_argument("--value", type=float, required=True)
     p_metric.add_argument("--unit", default=None)
     p_metric.set_defaults(func=cmd_metric)
+
+    # ── ci_runs subcommands (PR-9 of CI overhaul plan) ──────────────────
+    p_ci_record = sub.add_parser(
+        "ci-record",
+        help="record one ci_runs row (idempotent on workflow+run+job)",
+    )
+    p_ci_record.add_argument("--workflow", required=True, help="e.g. ci.yml")
+    p_ci_record.add_argument("--run-id", type=int, required=True, dest="run_id")
+    p_ci_record.add_argument("--job-name", required=True, dest="job_name")
+    p_ci_record.add_argument("--triplet", default=None)
+    p_ci_record.add_argument("--runner", default=None)
+    p_ci_record.add_argument("--commit", required=True)
+    p_ci_record.add_argument("--branch", required=True)
+    p_ci_record.add_argument("--started-at", type=int, required=True, dest="started_at")
+    p_ci_record.add_argument("--finished-at", type=int, default=None, dest="finished_at")
+    p_ci_record.add_argument(
+        "--conclusion", required=True,
+        help=f"one of {sorted(VALID_CI_CONCLUSIONS)}",
+    )
+    p_ci_record.add_argument(
+        "--vcpkg-cache-hit", type=int, default=None, dest="vcpkg_cache_hit",
+        choices=[0, 1], help="1 for hit, 0 for from-source",
+    )
+    p_ci_record.add_argument(
+        "--ccache-hit-ratio", type=float, default=None, dest="ccache_hit_ratio",
+        help="0.0-1.0",
+    )
+    p_ci_record.add_argument("--notes", default=None)
+    p_ci_record.set_defaults(func=cmd_ci_record)
+
+    p_ci_ingest = sub.add_parser(
+        "ci-ingest",
+        help="pull recent CI runs from `gh run list --json` into ci_runs",
+    )
+    p_ci_ingest.add_argument(
+        "--workflow", default="ci.yml",
+        help="workflow file name (default: ci.yml)",
+    )
+    p_ci_ingest.add_argument("--limit", type=int, default=50)
+    p_ci_ingest.add_argument("--branch", default=None)
+    p_ci_ingest.set_defaults(func=cmd_ci_ingest)
+
+    p_ci_stats = sub.add_parser(
+        "ci-stats",
+        help="aggregate CI stats per triplet/workflow over a window",
+    )
+    p_ci_stats.add_argument(
+        "--since", default="7d",
+        help="window: 7d / 12h / 30m (default 7d)",
+    )
+    p_ci_stats.set_defaults(func=cmd_ci_stats)
 
     p_query = sub.add_parser("query", help="query historical runs")
     g = p_query.add_mutually_exclusive_group()
