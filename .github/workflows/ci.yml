@@ -174,13 +174,19 @@ jobs:
       # be wiped (NEVER touch vcpkg/, vcpkg_installed/, or the
       # runner.tool_cache binary caches — those have their own
       # sentinel, see scripts/ci/vcpkg-triplet-sentinel.sh).
-      - name: Wipe build-linux/ on branch switch (pre-checkout)
+      - name: Wipe build-linux*/ on branch switch (pre-checkout)
+        # Per-variant dirs (build-linux-gcc-13-debug, ...) — wipe all of
+        # them on branch switch, not just the matrix-specific one, so
+        # any stale variant-dir from a different branch is also cleared.
         run: |
           incoming="${GITHUB_REF#refs/heads/}"
           if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
             current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
-              echo "branch switch: $current -> $incoming — wiping build-linux/"
+              echo "branch switch: $current -> $incoming — wiping build-linux*/"
+              rm -rf "$GITHUB_WORKSPACE"/build-linux-*
+              # Also wipe legacy non-variant dir if it lingers from before
+              # the per-variant migration.
               rm -rf "$GITHUB_WORKSPACE/build-linux"
             fi
           fi
@@ -188,10 +194,11 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
-          # clean:false — persist build-linux/ + vcpkg_installed/ between
-          # runs. Branch switches are handled by the pre-checkout wipe
-          # step above; cache freshness is handled by the vcpkg sentinel.
-          # Manual recovery: scripts/ci/runner-reset.sh.
+          # clean:false — persist build-linux-{compiler}-{buildtype}/ +
+          # vcpkg_installed/ between runs. Branch switches are handled
+          # by the pre-checkout wipe step above; cache freshness is
+          # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
+          # runner-reset.sh.
           clean: false
 
       - name: Install system packages
@@ -255,11 +262,20 @@ jobs:
         run: |
           # Under clean:false (PR-5) build-linux/ may already be configured
           # from a previous matrix variant or push. meson setup errors on
-          # an existing configured dir without --reconfigure; detect and
-          # branch so the same step works on cold and warm workspaces.
+          # Per-variant build dir under PR-5 clean:false. Sharing one
+          # build-linux/ across all 4 matrix legs (gcc-13/clang-19 ×
+          # debug/release) trips a meson --reconfigure edge case where
+          # the linker driver from a previous variant leaks into the
+          # current one — observed in run #25070779695 where Linux
+          # gcc-13 release ended up linking yuzu-agent with `clang++-19
+          # -flto` instead of `g++-13 -flto`, producing CLI11 undefined
+          # references. Per-variant dirs eliminate the reconfigure
+          # entirely; ccache absorbs the per-TU work across matrix runs
+          # so the disk cost is the only added cost (~1-2 GB × 4).
+          BUILDDIR=build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
           reconfig=""
-          [[ -d build-linux/meson-info ]] && reconfig="--reconfigure"
-          meson setup $reconfig build-linux \
+          [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
+          meson setup $reconfig "$BUILDDIR" \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
@@ -267,10 +283,10 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-linux
+        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
 
       - name: Test
-        run: meson test -C build-linux --print-errorlogs
+        run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
 
       - name: ccache stats
         if: always()
