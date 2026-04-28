@@ -347,7 +347,12 @@ extern const char* const kDashboardIndexHtml =
     }
   </style>
 </head>
-<body>
+)HTM"
+    // Split here: chunk 1 (head + <style>) was ~16 KB and bumped against
+    // the MSVC C2026 16380-byte raw-string-literal limit after the round-2
+    // visualization additions. Adjacent string literals concatenate at
+    // compile time, so the runtime HTML is byte-identical.
+    R"HTM(<body>
 
   <nav class="nav-bar">
     <a href="/" class="nav-brand">
