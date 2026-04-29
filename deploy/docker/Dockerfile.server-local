@@ -1,0 +1,30 @@
+# Dockerfile.server-local — wraps a pre-built yuzu-server binary in the
+# same runtime image Dockerfile.server produces, but skips the multi-stage
+# vcpkg + meson rebuild. Used to swap a freshly-compiled local server
+# (build-linux/server/core/yuzu-server) into the UAT compose stack
+# without spinning the full image build (~25 min). Mirrors stage 3 of
+# Dockerfile.server. Build context must be the repo root so the local
+# build-linux/ tree is reachable:
+#
+#   docker build -t yuzu-server:fresh \
+#     -f deploy/docker/Dockerfile.server-local .
+
+FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libsqlite3-0 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -s /usr/sbin/nologin yuzu \
+    && mkdir -p /var/lib/yuzu /etc/yuzu \
+    && chown yuzu:yuzu /var/lib/yuzu
+
+COPY build-linux/server/core/yuzu-server /usr/local/bin/yuzu-server
+COPY content/definitions/ /usr/share/yuzu/definitions/
+
+USER yuzu
+WORKDIR /var/lib/yuzu
+
+EXPOSE 8080 50051 50052 50055
+
+ENTRYPOINT ["yuzu-server"]
+CMD ["--listen", "0.0.0.0:50051", "--no-tls", "--no-https", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]

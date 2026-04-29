@@ -80,7 +80,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
-| **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | Open |
+| **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
 | | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | Open |
 | | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
 | **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
@@ -147,7 +147,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
-| 8: Visualization & Response Experience | 0 | 3 | 3 | 0% |
+| 8: Visualization & Response Experience | 1 | 2 | 3 | 33% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% |
 | 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
@@ -156,7 +156,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
 | 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
-| **Total** | **72** | **54** | **126** | **57%** |
+| **Total** | **73** | **53** | **126** | **58%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -948,27 +948,14 @@ Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI 
 
 *Make collected data actionable with charts, templates, and processing pipelines.*
 
-### Issue 8.1: Response Visualization Engine
-**Capabilities:** 20.6 (partial), new | **Scope:** Server | **Status:** Open
+### Issue 8.1: Response Visualization Engine :white_check_mark:
+**Capabilities:** 20.6 (partial), new | **Scope:** Server | **Status:** Done
 
-Add chart rendering to instruction response views with server-side data transformation:
-- Built-in processors: SingleSeries, MultiSeries, DateTimeSeries
-- Chart types: Pie, Bar, Column, Line, Area (rendered via lightweight JS chart library in HTMX pages)
-- Configuration via `spec.visualization` in InstructionDefinition YAML:
-  ```yaml
-  spec:
-    visualization:
-      charts:
-        - type: pie
-          title: "OS Distribution"
-          x: os_name
-          y: count
-          processor: single_series
-  ```
-- REST endpoint: `GET /api/v1/executions/{id}/visualization`
-- Dashboard: embedded chart cards in execution detail view
+Server-side chart rendering for instruction responses. `spec.visualization` (singular) or `spec.visualizations` (canonical plural for multi-chart) on `InstructionDefinition`. Five chart types (`pie`, `bar`, `column`, `line`, `area`) × three processors (`single_series`, `multi_series`, `datetime_series`) with camelCase fields (`labelField`, `valueField`, `seriesField`, `xField`, `yField`, `maxCategories`, `valueLabel`); snake_case forms accepted as deprecated aliases. REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Dashboard auto-renders a chart deck above the results table by reverse-resolving the dispatched `(plugin, action)` to a chart-bearing definition (`InstructionDefinition:Read` required for chart to appear). Embedded vanilla-SVG renderer at `/static/yuzu-charts.js` — no third-party JS dep. Engine row cap 10 000 with `rows_capped: true` flag; label cardinality cap 10 000.
 
-**Files:** New `server/core/src/visualization_engine.cpp`, `server/core/src/instruction_ui.cpp`, `server/core/src/rest_api_v1.cpp`
+Six demo charts ship as default examples — `content/definitions/visualization_demo_set.yaml` (`InstructionSet demo.visualization.fleet-posture`) and `content/packs/visualization-demo-pack.yaml` (`ProductPack pack.demo.visualization`) — covering vulnerability severity (the headline pie), Defender real-time protection, disk encryption protection state, firewall state per profile (multi-series column), certificate issuer breakdown (top-N + Other), and OS distribution.
+
+**Files:** `server/core/src/visualization_engine.{hpp,cpp}`, `server/core/src/charts_js_bundle.cpp`, `server/core/src/instruction_store.{hpp,cpp}` (visualization_spec column + MigrationRunner v2), `server/core/src/rest_api_v1.cpp`, `server/core/src/dashboard_routes.{hpp,cpp}`, `docs/yaml-dsl-spec.md` § `spec.visualization`, `docs/user-manual/instructions.md` § Response Visualization, plus `tests/unit/server/test_visualization_engine.cpp` and `tests/unit/server/test_rest_visualization.cpp`.
 
 ### Issue 8.2: Response Templates
 **Capability:** 20.6 | **Scope:** Server | **Status:** Open
@@ -1688,7 +1675,7 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope)
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates and 8.3 Response Offloading remain.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)

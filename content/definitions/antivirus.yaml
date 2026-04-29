@@ -103,6 +103,19 @@ spec:
       - name: last_quick_scan
         type: string
 
+  visualization:
+    # The Defender plugin emits one row per status field as
+    # `<key>|<value>` (e.g. `realtime_protection|enabled`,
+    # `definition_version|1.449.353.0`, …). Filter to just the
+    # real-time-protection rows, then label by their value.
+    type: pie
+    processor: single_series
+    title: Defender real-time protection across the fleet
+    whereField: 0
+    whereEquals: realtime_protection
+    labelField: 1
+    valueLabel: Devices
+
   readablePayload: "Query Windows Defender status"
 
   gather:

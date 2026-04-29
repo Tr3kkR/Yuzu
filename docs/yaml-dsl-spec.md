@@ -235,6 +235,8 @@ Optional chart configuration consumed by the dashboard's instruction-response vi
 | `xField` | integer or string | No | `"agent_timestamp"` | For `datetime_series`: either a numeric column index or the literal `"agent_timestamp"` to use the response's wall-clock timestamp. |
 | `yField` | integer | No | `null` | Numeric column for `datetime_series`; rows count as `1` when omitted. |
 | `maxCategories` | integer | No | `0` | When > 0, retain only the top-N buckets by total and collapse the tail into an `Other` bucket. Applies to `single_series`. |
+| `whereField` | integer | No | `-1` | 0-based column index for an optional row pre-filter. Rows where the column at this index does not equal `whereEquals` are skipped before bucketing. Use to chart one logical category from a plugin that emits a mixed `key\|value` row layout (e.g. firewall, bitlocker, antivirus). `-1` (or omitted) disables the filter. Applies to `single_series` and `multi_series`. If `whereField` is set without `whereEquals` (or vice versa), the filter is treated as disabled — half-config is rejected silently rather than half-applied. |
+| `whereEquals` | string | No | `""` | Required field value when `whereField` is active. Case-sensitive exact match against the field contents — no glob, no regex. |
 
 > **Field naming.** This block uses camelCase, matching the rest of `apiVersion: yuzu.io/v1alpha1`. The engine also accepts the legacy snake_case names (`label_field`, `value_field`, …) as deprecated aliases — they will be removed in a future API version. Author new specs against the camelCase names.
 

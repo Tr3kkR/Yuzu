@@ -35,6 +35,17 @@ spec:
       - name: os_name
         type: string
 
+  visualization:
+    # The os_info plugin emits rows of the form `os_name|<value>` — the
+    # `result.columns` declaration is dashboard metadata, not an engine
+    # parser hint. The actual value lives at field index 1.
+    type: pie
+    processor: single_series
+    title: OS distribution across the fleet
+    labelField: 1       # actual OS string e.g. "Windows 11 Pro", "Ubuntu 24.04.1 LTS"
+    maxCategories: 8
+    valueLabel: Devices
+
   readablePayload: "Get operating system name"
 
   gather:

@@ -53,6 +53,27 @@ spec:
       groupBy: [protection_status]
       operations: [count]
 
+  visualization:
+    # bitlocker is a key|value-schema plugin — `result_parsing.hpp` splits
+    # every output line into exactly two fields: a key (always "volume"
+    # on this action) and the whole pipe-delimited descriptor as a
+    # single value string. This means `labelField: 1` gives us one
+    # bucket per distinct volume descriptor rather than per protection
+    # status. Acceptable as a fleet-overview chart ("which BitLocker
+    # volume descriptors do we see, and how many devices share each
+    # one"), but a finer chart that pies just the protection_status
+    # column would need either a plugin output change to emit one row
+    # per (volume, status_field) pair, or a value-substring extractor on
+    # the engine. Both are tracked under issue #626.
+    type: pie
+    processor: single_series
+    title: BitLocker volumes seen across the fleet
+    whereField: 0
+    whereEquals: volume
+    labelField: 1
+    maxCategories: 8
+    valueLabel: Volumes
+
   readablePayload: "Query disk encryption status"
 
   gather:
