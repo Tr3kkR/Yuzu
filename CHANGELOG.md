@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI: Windows MSVC debug failed at link with LNK2038 abseil
+  RuntimeLibrary mismatch and LNK1181 truncated obj-path errors when
+  it ran after Windows MSVC release on the same self-hosted
+  yuzu-local-windows runner.** Both legs of the matrix shared a single
+  `build-windows/` dir under `clean: false`. When release ran first,
+  `meson setup --reconfigure` for the debug leg did not regenerate
+  ninja's link response files cleanly, so debug-build link.exe
+  invocations pulled release-CRT abseil libs (mismatched
+  `_ITERATOR_DEBUG_LEVEL=0` vs `=2` in `src_main.cpp.obj`) and
+  truncated obj-path entries in the response file (e.g.
+  `'isualization.cpp.obj'` for `unit_server_test_rest_visualization.cpp.obj`).
+  This is the same `--reconfigure` variant-leak edge case the Linux
+  matrix already worked around with per-variant `build-linux-{compiler}-{buildtype}/`
+  dirs (ci.yml:265-274). Fix: split Windows into `build-windows-debug/`
+  and `build-windows-release/` so the two legs can never poison each
+  other's ninja state. Pre-checkout sentinel also wipes the legacy
+  `build-windows/` so a stale pre-split dir cannot linger on the runner.
+
 - **CI: Linux + Windows self-hosted runners rebuilt every vcpkg port from
   source on every run.** Two compounding causes: (a) `lukka/run-vcpkg`
   defaults `VCPKG_DEFAULT_BINARY_CACHE` to a per-run UUID temp dir under
