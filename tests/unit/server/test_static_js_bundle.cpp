@@ -28,11 +28,32 @@
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
 
+// External symbols from build-time embed targets (governance Gate 3 QE-B1):
+//   * kEChartsJs            — embed_js.py over server/core/vendor/echarts.min.js
+//   * kInterVariableWoff2   — embed_binary.py over vendor/inter/InterVariable.woff2
+//   * kYuzuCss              — embed_js.py over server/core/static/yuzu.css
+//   * kYuzuChartsJs         — server/core/src/charts_js_bundle.cpp (hand-written)
+namespace yuzu::server {
+extern const std::string kEChartsJs;
+extern const std::string_view kInterVariableWoff2;
+extern const std::string kYuzuCss;
+extern const std::string kYuzuChartsJs;
+} // namespace yuzu::server
+
 using Catch::Matchers::ContainsSubstring;
 
 namespace {
 constexpr std::size_t kExpectedHtmxBytes = 50918;
 constexpr std::size_t kExpectedSseBytes  = 8897;
+// Pinned upstream byte counts. If you intentionally update vendor/, bump
+// these in lock-step. ECharts 5.6.0 minified is 1,034,102 bytes; Inter v4.0
+// variable woff2 is 345,588 bytes; Yuzu CSS bundle is content-addressed by
+// the source file and approximate-pinned (a 1% drift tolerance lets the
+// design system iterate without re-flowing this file every commit).
+constexpr std::size_t kExpectedEChartsBytes      = 1'034'102;
+constexpr std::size_t kExpectedInterWoff2Bytes   = 345'588;
+constexpr std::size_t kYuzuCssMinBytes           = 20'000; // ≥20 KB sanity floor
+constexpr std::size_t kYuzuChartsMinBytes        = 6'000;  // ≥6 KB adapter floor
 } // namespace
 
 // ── HTMX core ───────────────────────────────────────────────────────────────
@@ -129,4 +150,119 @@ TEST_CASE("static_js_bundle: kSseJs has no leading whitespace",
     REQUIRE_FALSE(kSseJs.empty());
     CHECK(kSseJs.front() == '/');
     CHECK(kSseJs.front() != '\n');
+}
+
+// ── Apache ECharts ──────────────────────────────────────────────────────────
+
+TEST_CASE("static_js_bundle: kEChartsJs has expected pinned size",
+          "[static-js][echarts]") {
+    CHECK(yuzu::server::kEChartsJs.size() == kExpectedEChartsBytes);
+}
+
+TEST_CASE("static_js_bundle: kEChartsJs starts with the Apache license header",
+          "[static-js][echarts]") {
+    REQUIRE(yuzu::server::kEChartsJs.size() >= 100);
+    // The vendored bundle preserves the Apache 2.0 header banner (License
+    // §4(c) compliance check).
+    CHECK_THAT(yuzu::server::kEChartsJs,
+               ContainsSubstring("Licensed to the Apache Software Foundation"));
+}
+
+TEST_CASE("static_js_bundle: kEChartsJs exposes the global echarts object",
+          "[static-js][echarts]") {
+    // The minified bundle assigns to global `echarts` and exports `init`.
+    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("echarts"));
+    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("init"));
+}
+
+TEST_CASE("static_js_bundle: kEChartsJs has no embedded NULs or stray delimiter",
+          "[static-js][echarts]") {
+    CHECK(yuzu::server::kEChartsJs.find('\0') == std::string::npos);
+    CHECK(yuzu::server::kEChartsJs.find(")ECHARTSEMBED\"") == std::string::npos);
+}
+
+// ── Inter variable webfont (woff2 binary) ───────────────────────────────────
+
+TEST_CASE("static_js_bundle: kInterVariableWoff2 has expected pinned size",
+          "[static-js][inter]") {
+    CHECK(yuzu::server::kInterVariableWoff2.size() == kExpectedInterWoff2Bytes);
+}
+
+TEST_CASE("static_js_bundle: kInterVariableWoff2 begins with WOFF2 magic",
+          "[static-js][inter]") {
+    REQUIRE(yuzu::server::kInterVariableWoff2.size() >= 4);
+    // WOFF2 file format: signature 0x774F4632 ('wOF2') at offset 0.
+    auto sv = yuzu::server::kInterVariableWoff2;
+    CHECK(static_cast<unsigned char>(sv[0]) == 0x77);
+    CHECK(static_cast<unsigned char>(sv[1]) == 0x4F);
+    CHECK(static_cast<unsigned char>(sv[2]) == 0x46);
+    CHECK(static_cast<unsigned char>(sv[3]) == 0x32);
+}
+
+// ── Yuzu Design System CSS bundle ───────────────────────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuCss is at least 20 KB",
+          "[static-js][yuzu-css]") {
+    // Sanity floor — a single-chunk truncation would silently drop content.
+    CHECK(yuzu::server::kYuzuCss.size() >= kYuzuCssMinBytes);
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss carries the Momentum token layer",
+          "[static-js][yuzu-css]") {
+    // Anchor on tokens introduced in the Cisco Momentum sweep.
+    CHECK_THAT(yuzu::server::kYuzuCss,
+               ContainsSubstring("--mds-color-theme-background-canvas"));
+    CHECK_THAT(yuzu::server::kYuzuCss,
+               ContainsSubstring("--mds-color-theme-accent-primary-normal"));
+    CHECK_THAT(yuzu::server::kYuzuCss,
+               ContainsSubstring("--mds-color-chart-1"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("@font-face"));
+    CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'Inter'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs or stray delimiter",
+          "[static-js][yuzu-css]") {
+    CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
+    CHECK(yuzu::server::kYuzuCss.find(")ECHARTSEMBED\"") == std::string::npos);
+}
+
+// ── Yuzu chart adapter (kYuzuChartsJs) ──────────────────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs is at least 6 KB",
+          "[static-js][yuzu-charts]") {
+    CHECK(yuzu::server::kYuzuChartsJs.size() >= kYuzuChartsMinBytes);
+}
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs exposes the YuzuCharts global",
+          "[static-js][yuzu-charts]") {
+    CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("window.YuzuCharts"));
+    CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("echarts.init"));
+    CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("htmx:afterSettle"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs reads Momentum chart tokens",
+          "[static-js][yuzu-charts]") {
+    // The adapter resolves --mds-color-chart-* via getComputedStyle at
+    // render time (governance Gate 3 architecture-N3). Drift in this
+    // surface should fail the test.
+    CHECK_THAT(yuzu::server::kYuzuChartsJs,
+               ContainsSubstring("--mds-color-chart-1"));
+    CHECK_THAT(yuzu::server::kYuzuChartsJs,
+               ContainsSubstring("--mds-color-theme-background-solid-primary"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs has no embedded NULs",
+          "[static-js][yuzu-charts]") {
+    CHECK(yuzu::server::kYuzuChartsJs.find('\0') == std::string::npos);
+}
+
+TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no data",
+          "[static-js][yuzu-charts]") {
+    // Governance Gate 4 HP-1: empty-data payloads should fall through to
+    // emptyState() with an operator-facing message instead of painting a
+    // blank canvas. Pin the message string so a future renderer rewrite
+    // can't silently remove it.
+    CHECK_THAT(yuzu::server::kYuzuChartsJs,
+               ContainsSubstring("No data to plot."));
+    CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
 }
