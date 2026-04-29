@@ -76,6 +76,63 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 /* alert overrides (shared .alert base from yuzu.css, page-specific padding) */
 .alert{padding:.5rem 1rem;font-size:.8rem;margin-bottom:.8rem}
 .legacy-badge{font-size:.65rem;background:var(--mds-color-theme-outline-secondary);color:var(--mds-color-text-on-accent);padding:.05rem .4rem;border-radius:3px}
+/* Executions tab — clickable rows + per-execution detail drawer.
+   Information-design conventions:
+     - Status as hue + icon + row stripe (two channels for colorblind safety).
+     - Sparkbar widths = counts (length channel); hue = status (hue channel).
+     - KPI strip carries the headline; tables carry the long tail.
+     - Agent grid is small-multiples; one cell per agent, color by status. */
+.exec-table{width:100%}
+.exec-row{cursor:pointer}
+.exec-row:hover{background:var(--mds-color-state-hover)}
+.exec-row.expanded{background:var(--mds-color-state-selected)}
+.exec-row--failed>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-error)}
+.exec-row--running>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-stable)}
+.exec-row:focus{outline:2px solid var(--accent);outline-offset:-2px}
+.exec-def-name{font-weight:600}
+.exec-agent-count{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.exec-error-preview{font-family:var(--font-mono);font-size:.7rem;color:var(--mds-color-theme-indicator-error);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exec-time{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.status-sparkbar{display:block}
+.exec-detail{display:none}
+.exec-detail.open{display:table-row}
+.exec-detail>td{padding:1rem!important;background:var(--mds-color-theme-bg-secondary,var(--bg))}
+.exec-detail-grid{display:grid;gap:1rem;grid-template-columns:1fr minmax(220px,320px)}
+@media (max-width:900px){.exec-detail-grid{grid-template-columns:1fr}}
+.exec-detail-grid h4{margin:0 0 .3rem 0;font-size:.7rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em}
+.exec-kpi-strip{display:flex;flex-wrap:wrap;gap:1.5rem;grid-column:1/-1;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+.exec-kpi{min-width:7rem}
+.exec-kpi-value{font-size:1.5rem;font-weight:600;line-height:1.1}
+.exec-kpi-value--ok{color:var(--green)}
+.exec-kpi-value--err{color:var(--red)}
+.exec-kpi-label{font-size:.65rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em;margin-top:.2rem}
+.agent-grid-wrap{grid-column:1/-1}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,12px);gap:2px;max-height:200px;overflow-y:auto}
+.agent-cell{width:12px;height:12px;border-radius:2px;cursor:pointer}
+.agent-cell--bucket{width:auto;height:18px;display:flex;align-items:center;justify-content:center;font-size:.65rem;color:var(--mds-color-text-on-accent);padding:0 .3rem;border-radius:3px}
+.agent-cell--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
+.agent-cell--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
+.agent-cell--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
+.agent-cell--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
+.per-agent-table-wrap{grid-column:1}
+.per-agent-table{font-size:.75rem}
+.per-agent-table td{vertical-align:middle}
+.duration-bar{height:6px;border-radius:3px;display:inline-block;vertical-align:middle;min-width:1px}
+.duration-bar--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
+.duration-bar--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
+.duration-bar--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
+.duration-bar--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
+.duration-text{font-size:.65rem;color:var(--muted);margin-left:.3rem}
+.per-agent-row-highlight{background:var(--mds-color-state-selected)!important;transition:background .3s}
+.per-agent-responses-wrap{grid-column:1}
+.per-agent-responses summary{cursor:pointer;font-size:.75rem;color:var(--muted);padding:.3rem 0}
+.per-agent-responses-table{font-size:.7rem}
+.resp-output pre{margin:.3rem 0;padding:.3rem;background:var(--bg);border-radius:3px;max-height:200px;overflow:auto;white-space:pre-wrap}
+.exec-detail-sidebar{grid-column:2;font-size:.75rem}
+@media (max-width:900px){.exec-detail-sidebar{grid-column:1}}
+.exec-detail-sidebar>div{margin-bottom:.5rem}
+.exec-detail-meta-id{font-family:var(--font-mono);font-size:.65rem;color:var(--muted)}
+.exec-detail-scope,.exec-detail-params{display:block;font-size:.7rem;background:var(--bg);padding:.3rem;border-radius:3px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head><body>
 
@@ -477,6 +534,38 @@ document.addEventListener('keydown', function(e) {
     window.location.href = '/?palette=1';
   }
 });
+
+/* ── Executions drawer toggle ─────────────────────────────────────────────
+   Modeled on dashboard_ui.cpp's toggleDetail. Single-drawer-open invariant:
+   clicking a row collapses any other open drawer first so the operator
+   never has two expanded forensic views competing for attention. The HTMX
+   attributes on the row handle the lazy fetch (click once); this function
+   only manages visibility state. */
+function toggleExecDetail(row) {
+  if (!row) return;
+  /* Collapse any other open drawer first. */
+  document.querySelectorAll('.exec-row.expanded').forEach(function(other) {
+    if (other === row) return;
+    other.classList.remove('expanded');
+    var sib = other.nextElementSibling;
+    if (sib && sib.classList.contains('exec-detail')) sib.classList.remove('open');
+  });
+  row.classList.toggle('expanded');
+  var det = row.nextElementSibling;
+  if (det && det.classList.contains('exec-detail')) det.classList.toggle('open');
+}
+
+/* Click on an agent grid cell — scroll to the matching row in the per-agent
+   table and flash a highlight so the eye picks it up. */
+function scrollToAgentRow(event, execId, agentId) {
+  if (event) event.stopPropagation();
+  var rowId = 'per-agent-row-' + execId + '-' + agentId;
+  var row = document.getElementById(rowId);
+  if (!row) return;
+  row.scrollIntoView({behavior: 'smooth', block: 'center'});
+  row.classList.add('per-agent-row-highlight');
+  setTimeout(function() { row.classList.remove('per-agent-row-highlight'); }, 1500);
+}
 </script>
 </body></html>
 )HTM";

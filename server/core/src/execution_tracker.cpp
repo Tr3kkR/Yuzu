@@ -48,12 +48,22 @@ Execution row_to_exec(sqlite3_stmt* stmt) {
     e.completed_at = sqlite3_column_int64(stmt, 11);
     e.parent_id = col_text(stmt, 12);
     e.rerun_of = col_text(stmt, 13);
+    e.last_error_detail = col_text(stmt, 14);
     return e;
 }
 
 const char* kSelectAll = "id, definition_id, status, scope_expression, parameter_values, "
                          "dispatched_by, dispatched_at, agents_targeted, agents_responded, "
-                         "agents_success, agents_failure, completed_at, parent_id, rerun_of";
+                         "agents_success, agents_failure, completed_at, parent_id, rerun_of, "
+                         // Correlated subquery: most recent non-empty agent error_detail.
+                         // Gated by `agents_failure > 0` so successful runs pay zero cost
+                         // (CASE short-circuits the subquery). Indexed on
+                         // (execution_id, agent_id) by primary key.
+                         "(CASE WHEN agents_failure > 0 THEN ("
+                         "  SELECT error_detail FROM agent_exec_status "
+                         "  WHERE execution_id = executions.id AND error_detail != '' "
+                         "  ORDER BY completed_at DESC LIMIT 1"
+                         ") ELSE '' END) AS last_error_detail";
 
 } // namespace
 

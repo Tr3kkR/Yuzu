@@ -8,6 +8,7 @@
 #include "instruction_store.hpp"
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
+#include "response_store.hpp"
 #include "schedule_engine.hpp"
 #include "tag_store.hpp"
 #include "workflow_engine.hpp"
@@ -50,6 +51,10 @@ public:
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters)>;
 
+    /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink
+    /// and delegates to the sink-based overload below. New code should keep
+    /// using this entrypoint; the sink overload exists for in-process unit
+    /// tests that bypass httplib::Server's TSan-hostile acceptor thread (#438).
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
                          WorkflowEngine* workflow_engine,
@@ -59,7 +64,21 @@ public:
                          InstructionStore* instruction_store,
                          PolicyStore* policy_store,
                          CommandDispatchFn command_dispatch_fn,
-                         ApprovalManager* approval_manager = nullptr);
+                         ApprovalManager* approval_manager = nullptr,
+                         ResponseStore* response_store = nullptr);
+
+    /// Sink-based overload — used by tests. See `tests/unit/server/test_route_sink.hpp`.
+    void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                         AuditFn audit_fn, EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
+                         WorkflowEngine* workflow_engine,
+                         ExecutionTracker* execution_tracker,
+                         ScheduleEngine* schedule_engine,
+                         ProductPackStore* product_pack_store,
+                         InstructionStore* instruction_store,
+                         PolicyStore* policy_store,
+                         CommandDispatchFn command_dispatch_fn,
+                         ApprovalManager* approval_manager = nullptr,
+                         ResponseStore* response_store = nullptr);
 };
 
 } // namespace yuzu::server

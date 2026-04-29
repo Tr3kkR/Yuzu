@@ -26,6 +26,11 @@ struct Execution {
     int64_t completed_at{0};
     std::string parent_id;
     std::string rerun_of;
+    /// Most recent non-empty agent error_detail for this execution, computed
+    /// via correlated subquery in `query_executions` / `get_execution` when
+    /// the row had at least one agent failure. Empty otherwise. Populated for
+    /// the executions list "first error" preview without an N×M lookup.
+    std::string last_error_detail;
 };
 
 struct ExecutionQuery {
