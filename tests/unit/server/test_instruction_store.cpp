@@ -513,3 +513,54 @@ TEST_CASE("InstructionStore: empty id still gets generated UUID with no conflict
     REQUIRE(rb.has_value());
     CHECK(*ra != *rb);
 }
+
+// Governance Gate 4 C-B1 / arch-B1 / QE-B2 regression — pin the contract
+// the boot-time auto-import loop in server.cpp depends on. Both
+// import_definition_json and create_set MUST return kConflictPrefix-
+// prefixed errors on duplicate id; substring matches like "already exists"
+// are NOT the contract.
+TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPrefix",
+          "[instruction_store][duplicate][import]") {
+    InstructionStore store(":memory:");
+
+    const std::string envelope = R"({
+        "id":"test.import.dup",
+        "name":"Test Import Dup",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: test.import.dup\n  displayName: Test Import Dup\n"
+    })";
+
+    auto first = store.import_definition_json(envelope);
+    REQUIRE(first.has_value());
+
+    auto second = store.import_definition_json(envelope);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(is_conflict_error(second.error()));  // contract for boot-time auto-import
+    CHECK(second.error().find(kConflictPrefix) == 0);
+}
+
+TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
+          "[instruction_store][duplicate][set]") {
+    InstructionStore store(":memory:");
+
+    InstructionSet s;
+    s.id = "test.set.dup";
+    s.name = "Test Set Dup";
+    s.created_by = "test";
+
+    auto first = store.create_set(s);
+    REQUIRE(first.has_value());
+    CHECK(*first == "test.set.dup");
+
+    auto second = store.create_set(s);
+    REQUIRE_FALSE(second.has_value());
+    // Pre-fix this returned "insert failed: UNIQUE constraint failed: ..."
+    // — the boot-time auto-import substring-matched "already exists" and
+    // miscounted every reboot's bundled sets as `errored`. Pin the
+    // kConflictPrefix contract so a future refactor cannot regress it.
+    CHECK(is_conflict_error(second.error()));
+    CHECK(second.error().find(kConflictPrefix) == 0);
+}
