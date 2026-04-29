@@ -127,6 +127,46 @@ int parse_field_index(const json& obj, std::string_view camel,
     return -1;
 }
 
+/// Optional row pre-filter so a single chart can isolate one logical
+/// "category" of rows from a plugin that emits a mixed key|value layout.
+/// Example: antivirus emits `realtime_protection|enabled`,
+/// `definition_version|...`, `last_update|...` rows for a single device —
+/// charting "real-time protection across the fleet" needs whereField=0
+/// whereEquals="realtime_protection" to filter to just the relevant rows
+/// before labelField=1 picks the value.
+///
+/// `where_field == -1` means "no filter". `where_value` is matched
+/// case-sensitively against the exact field contents (no glob, no regex).
+struct WhereSpec {
+    int where_field{-1};
+    std::string where_value;
+    [[nodiscard]] bool active() const noexcept { return where_field >= 0; }
+    [[nodiscard]] bool matches(const std::vector<std::string>& fields) const {
+        if (!active()) return true;
+        // Reuse field_or_empty semantics so out-of-range columns just fail
+        // the match (rather than throwing) — keeps the engine forgiving on
+        // mixed-shape outputs.
+        if (where_field >= static_cast<int>(fields.size())) return false;
+        return fields[where_field] == where_value;
+    }
+};
+
+WhereSpec parse_where_spec(const json& obj) {
+    WhereSpec w;
+    w.where_field = parse_field_index(obj, "whereField", "where_field");
+    if (auto* v = resolve_key(obj, "whereEquals", "where_equals");
+        v && v->is_string()) {
+        w.where_value = v->get<std::string>();
+    }
+    // Defensive: if whereField was given but whereEquals wasn't (or vice
+    // versa), disable the filter rather than half-apply it. Half-config
+    // is almost always an authoring mistake and silently letting either
+    // half through would make the chart non-deterministic.
+    if (w.where_field >= 0 && w.where_value.empty()) w.where_field = -1;
+    if (w.where_field < 0)                          w.where_value.clear();
+    return w;
+}
+
 /// `x_field` for datetime_series accepts either a numeric index or the
 /// literal string "agent_timestamp" — meaning "use the response's wall-
 /// clock timestamp instead of a column value". This matches the way most
@@ -207,6 +247,7 @@ struct LabelTotal {
 
 std::vector<LabelTotal>
 group_single(const std::string& plugin, int label_field, int value_field,
+             const WhereSpec& where,
              const std::vector<StoredResponse>& responses) {
     // Use std::map for deterministic ordering — operator dashboards benefit
     // from a stable label sequence across reruns. The label cardinality is
@@ -217,6 +258,7 @@ group_single(const std::string& plugin, int label_field, int value_field,
         for (const auto& line : split_output_lines(r.output)) {
             if (is_tar_protocol_line(line)) continue;
             auto fields = split_fields(plugin, line);
+            if (!where.matches(fields)) continue;
             auto label = field_or_empty(fields, label_field);
             if (label.empty()) continue;
             double inc = (value_field >= 0)
@@ -253,6 +295,7 @@ void apply_max_categories(std::vector<LabelTotal>& buckets, int max_n) {
 
 std::vector<LabelTotal>
 group_multi(const std::string& plugin, int label_field, int series_field, int value_field,
+            const WhereSpec& where,
             const std::vector<StoredResponse>& responses,
             std::map<std::string, std::map<std::string, double>>& by_series) {
     // Two-level grouping: series name → label → total. The single-pass walk
@@ -265,6 +308,7 @@ group_multi(const std::string& plugin, int label_field, int series_field, int va
         for (const auto& line : split_output_lines(r.output)) {
             if (is_tar_protocol_line(line)) continue;
             auto fields = split_fields(plugin, line);
+            if (!where.matches(fields)) continue;
             auto label = field_or_empty(fields, label_field);
             auto series = field_or_empty(fields, series_field);
             if (label.empty() || series.empty()) continue;
@@ -389,9 +433,10 @@ void render_single_series(const json& spec, const std::string& plugin,
     int label_field = parse_field_index(spec, "labelField", "label_field");
     int value_field = parse_field_index(spec, "valueField", "value_field");
     int max_n = parse_field_index(spec, "maxCategories", "max_categories");
+    auto where = parse_where_spec(spec);
     if (label_field < 0) label_field = 0; // sensible default
 
-    auto buckets = group_single(plugin, label_field, value_field, responses);
+    auto buckets = group_single(plugin, label_field, value_field, where, responses);
     apply_max_categories(buckets, max_n);
 
     std::string series_name = "Count";
@@ -414,11 +459,13 @@ void render_multi_series(const json& spec, const std::string& plugin,
     int label_field = parse_field_index(spec, "labelField", "label_field");
     int series_field = parse_field_index(spec, "seriesField", "series_field");
     int value_field = parse_field_index(spec, "valueField", "value_field");
+    auto where = parse_where_spec(spec);
     if (label_field < 0) label_field = 0;
     if (series_field < 0) series_field = 1;
 
     std::map<std::string, std::map<std::string, double>> by_series;
-    auto labels = group_multi(plugin, label_field, series_field, value_field, responses, by_series);
+    auto labels = group_multi(plugin, label_field, series_field, value_field, where,
+                              responses, by_series);
 
     render_labels_array(labels, out);
     out += ",\"series\":[";

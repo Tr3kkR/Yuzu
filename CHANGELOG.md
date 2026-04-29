@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Visualization engine: optional row pre-filter (`whereField` /
+  `whereEquals`).** Lets a chart isolate one logical category of rows
+  from a plugin that emits a mixed `key|value` row layout (firewall,
+  bitlocker, antivirus, os_info, …). Spec authors set `whereField` to a
+  column index and `whereEquals` to the required value; rows whose
+  field at that index doesn't match are skipped before bucketing. The
+  filter is conjunctive with the existing `labelField` / `valueField`
+  extraction. Half-config (one of the pair set, the other absent) is
+  silently disabled rather than half-applied — half-applied filters
+  produce non-deterministic charts depending on row order. Documented
+  in `docs/yaml-dsl-spec.md` § `spec.visualization`. Live use: every
+  one of the six chart-bearing demo definitions added in this release
+  except `vuln_scan.scan` and `os_info.os_name`. Tracking issue #626
+  covers the matching value-substring extractor for plugins whose
+  values themselves carry pipe-delimited sub-fields (firewall's
+  `Domain|enabled`, bitlocker's full volume descriptor) — this PR's
+  filter handles the row-selection half; #626 will close the
+  field-extraction half.
+
+- **Six demo charts ship as default examples for the Phase 8.1 Response
+  Visualization Engine (#253 — closes the issue).** `spec.visualization`
+  blocks added in-place to six existing instruction definitions, covering
+  every processor (`single_series`, `multi_series`) and the most-used
+  chart types (`pie`, `column`):
+  - `security.vuln_scan.summary` — pie of vulnerabilities by severity
+    (`labelField: 0` severity + `valueField: 1` count summed across
+    devices). The headline demo chart.
+  - `security.antivirus.defender_status` — pie of Windows Defender
+    real-time protection state across the fleet.
+  - `security.encryption.state` (BitLocker / LUKS / FileVault) — pie of
+    volume `protection_status`.
+  - `security.firewall.state` — column chart, multi-series, one column
+    per profile (Domain/Private/Public on Windows; firewalld / ufw /
+    iptables / pf elsewhere) and one series per state (ON/OFF).
+  - `security.certificates.list` — pie of certificates by issuer with
+    `maxCategories: 8` (top-N + "Other"). Most informative when run
+    with `expiring_within_days: 90` so the chart focuses on certs
+    needing renewal.
+  - `device.os_info.os_name` — pie of OS distribution across the fleet
+    with `maxCategories: 8`.
+
+  Bundled as `InstructionSet demo.visualization.fleet-posture` in
+  `content/definitions/visualization_demo_set.yaml` and as
+  `ProductPack pack.demo.visualization` in
+  `content/packs/visualization-demo-pack.yaml` (the new `content/packs/`
+  directory is conventional shipping ground for example product packs).
+  Both ship unsigned because they carry only read-only `question`
+  definitions sourced from the in-tree library — production / customer
+  packs should still be signed per `docs/yaml-dsl-spec.md` §8.
+
+  Use the dashboard YAML import view or
+  `POST /api/v1/product-packs` to install the pack against a UAT or
+  demo fleet; running any of the six instructions then auto-renders the
+  declared chart above the standard results table.
+
 ### Fixed
 
 - **CI: Windows MSVC debug failed at link with LNK2038 abseil

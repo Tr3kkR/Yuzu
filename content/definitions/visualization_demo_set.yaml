@@ -1,0 +1,61 @@
+## Visualization Demo Instruction Set
+##
+## Six chart-bearing instruction definitions chosen to demonstrate every
+## processor (single_series, multi_series) and chart type (pie, column)
+## that the Phase 8.1 Response Visualization Engine ships with.
+##
+## Each definition's `spec.visualization` block is the only addition over the
+## stock definition — the underlying plugin actions are unchanged. Run any
+## of these against a fleet from the dashboard "Send" panel and the engine
+## will reverse-resolve the dispatched (plugin, action) to the chart-bearing
+## definition and OOB-swap a chart card above the results table — no
+## browser-console paste required.
+##
+## Reference: `docs/yaml-dsl-spec.md` §3 (visualization), issue #253.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionSet
+metadata:
+  id: demo.visualization.fleet-posture
+  displayName: Fleet Posture Charts (Demo)
+  version: 1.0.0
+  description: >
+    Demo bundle of six chart-bearing instruction definitions that turn
+    common fan-out queries into at-a-glance pies and bars. Includes
+    vulnerability severity distribution (the highest-ROI chart for any
+    operator), Defender real-time protection status, disk encryption
+    protection state, firewall state per profile, certificate issuer
+    breakdown, and OS distribution across the fleet. All six are
+    read-only `question` definitions and run in auto-approve mode.
+  tags: [demo, visualization, dashboard, posture, charts]
+  platforms: [windows, linux, darwin]
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+    approveRoles: [endpoint-admin]
+
+  contents:
+    instructionDefinitions:
+      # Pie of vulnerabilities by severity — the headline chart.
+      # Hosted on the `scan` action (one row per finding) rather than `summary`
+      # (which also emits a TOTAL row that dominates the pie).
+      - security.vuln_scan.scan
+      # Pie of Windows Defender real-time protection state.
+      - security.antivirus.defender_status
+      # Pie of disk encryption protection status (BitLocker / LUKS / FileVault).
+      - security.encryption.state
+      # Column chart of firewall state per profile (multi_series demo).
+      - security.firewall.state
+      # Pie of certificates by issuer with top-N + "Other" rollup.
+      - security.certificates.list
+      # Pie of OS distribution across the fleet.
+      - device.os_info.os_name
+
+  defaults:
+    approvalMode: auto
+    responseRetentionDays: 30
+
+status:
+  phase: active

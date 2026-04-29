@@ -1282,6 +1282,27 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 
 See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
 
+**Worked examples (default-shipped).** Six chart-bearing definitions ship in the in-tree content library as the default demo set:
+
+| Definition | Chart |
+|---|---|
+| `security.vuln_scan.summary` | pie — vulnerabilities by severity |
+| `security.antivirus.defender_status` | pie — Defender real-time protection |
+| `security.encryption.state` | pie — volume protection (BitLocker / LUKS / FileVault) |
+| `security.firewall.state` | column (multi-series) — firewall state per profile |
+| `security.certificates.list` | pie — certificates by issuer (top-N + Other) |
+| `device.os_info.os_name` | pie — OS distribution across the fleet |
+
+They are bundled as `InstructionSet demo.visualization.fleet-posture` (`content/definitions/visualization_demo_set.yaml`) and as `ProductPack pack.demo.visualization` (`content/packs/visualization-demo-pack.yaml`). To demo against a UAT fleet, install the pack via the dashboard YAML import view or:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     --data-binary @content/packs/visualization-demo-pack.yaml \
+     https://yuzu.example/api/v1/product-packs
+```
+
+Then dispatch any of the six from the dashboard "Send" panel — the chart deck auto-renders above the results table.
+
 ---
 
 ## 14. Planned Features

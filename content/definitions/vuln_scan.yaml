@@ -47,6 +47,19 @@ spec:
       groupBy: [severity, category]
       operations: [count]
 
+  visualization:
+    # vuln_scan emits one row per finding on `scan`, format
+    # `severity|category|title|detail`. labelField=0 picks severity so
+    # CRITICAL / HIGH / MEDIUM / LOW / INFO each become a pie slice and
+    # findings are counted into them. Preferred over the summary action's
+    # pie because summary also emits a TOTAL row that would dominate the
+    # chart.
+    type: pie
+    processor: single_series
+    title: Vulnerabilities by severity
+    labelField: 0
+    valueLabel: Findings
+
   readablePayload: "Run full vulnerability scan (CVE + configuration)"
 
   gather:
