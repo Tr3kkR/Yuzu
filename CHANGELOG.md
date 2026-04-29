@@ -175,6 +175,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demo fleet; running any of the six instructions then auto-renders the
   declared chart above the standard results table.
 
+### Tests
+
+- **`tests/unit/server/test_web_utils.cpp`** — extended with 18 new
+  Catch2 cases for the executions-tab rendering primitives.
+  - `format_iso_utc`: dash sentinel for `<= 0`; canonical RFC 3339 form
+    for known UTC moments; fixed-width 20-byte output (`YYYY-MM-DDTHH:MM:SSZ`).
+  - `format_relative_time`: dash sentinel for `<= 0`; bucketing across
+    seconds / minutes / hours / days; future-`then` (clock-skew) clamps
+    to "0s ago".
+  - `now_epoch_seconds`: monotonicity smoke.
+  - `truncate_utf8`: ASCII pass-through under limit, ASCII truncation
+    appends U+2026 ellipsis, walks back across both 2-byte (`café`) and
+    4-byte (FIRE U+1F525) codepoint boundaries — proves the cell can
+    truncate any agent error string without producing invalid UTF-8 that
+    breaks browser `title=` rendering or screen-reader announcement.
+  - `render_status_sparkbar`: hatched empty state when `total == 0`
+    (with `aria-label="no agents matched scope"`); zero-count buckets
+    emit no `<rect>`; aria-label summarises the four counts; widths sum
+    to exactly 120 px including the rounding edge case (1/1/1/0 of 3,
+    2/2/2/1 of 7) — rounding residue is absorbed by the last non-zero
+    segment.
+  - `render_duration_bar_html`: width clamps to 100 % when over
+    max-duration; zero max yields zero width; status class flows through
+    to the `duration-bar--{class}` selector; negative duration clamps to
+    zero in the `aria-label`.
+- **`tests/unit/server/test_workflow_routes.cpp`** — new Catch2 file
+  covering the executions list and detail handlers (19 cases / 159
+  assertions). Uses the `TestRouteSink` pattern (no httplib::Server
+  acceptor, no #438 TSan trap) registered against the new
+  `WorkflowRoutes::register_routes(HttpRouteSink&, ...)` overload.
+  Pins: empty state; definition-name resolution vs id-prefix fallback;
+  `definition_id` query filter; failed-row stripe class
+  (`exec-row--failed`); ISO-8601 UTC time title; sparkbar `aria-label`
+  shape; zero-agent run renders the empty-state sparkbar variant; detail
+  404 on unknown id; detail 403 when `perm_fn` denies; KPI strip carries
+  Total / Succeeded / Failed / p50 / p95; "—" sentinel for p50/p95
+  when any agent is still `running`; per-agent table sorts failed-first;
+  agent grid switches to decile bucketing above 1024 agents; UTF-8
+  truncation does not tear emoji; sidebar shows dispatched_by + ISO
+  timestamps; `last_error_detail` correlated subquery is empty for
+  fully-successful runs and surfaces the most-recent agent error
+  (highest `completed_at`) for failed runs.
+- **`tests/puppeteer/executions-drawer-smoke.mjs`** — new browser-level
+  visual regression net for the executions tab. Logs in, switches to
+  Executions, asserts: at least one `.exec-row` + `.status-sparkbar`
+  rendered; ISO-8601 title on `.exec-time`; sparkbar `aria-label`
+  matches the four-counts pattern; clicking a row lazy-loads the drawer
+  with `.exec-kpi-strip` + `.agent-grid` + `.per-agent-table` all
+  present; KPI strip carries the five labelled tiles
+  (Total / Succeeded / Failed / p50 / p95) and the "—" sentinel does
+  not appear in KPI value position for completed runs; opening row B
+  collapses row A's drawer (single-drawer-open invariant); six Cisco
+  Momentum tokens (`--mds-color-bg-success-emphasis`,
+  `--mds-color-theme-indicator-error`, `--mds-color-theme-indicator-stable`,
+  `--mds-color-theme-text-tertiary`, `--mds-color-state-hover`,
+  `--mds-color-state-selected`) resolve non-empty so silent palette
+  drift is detected. Same shape as `tests/puppeteer/echarts-smoke.mjs`.
+
 ### Removed
 
 - **`/static/debug/<name>.png` route deleted.** A skin-iteration

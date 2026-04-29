@@ -153,6 +153,7 @@ if build_server
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_workflow_routes.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
