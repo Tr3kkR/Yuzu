@@ -8,7 +8,7 @@
 // engine underneath: charts are now drawn by Apache ECharts 5
 // (Apache-2.0, vendored at server/core/vendor/echarts.min.js) using a
 // dynamically-built theme that resolves every colour, font, and
-// gridline from Cisco Momentum CSS custom properties at render time.
+// gridline from the Yuzu design-system CSS custom properties at render time.
 // Re-skinning Yuzu = changing --mds-color-* tokens; charts pick up
 // the new palette on the next render with no JS rebuild.
 //
@@ -33,7 +33,7 @@ extern const std::string kYuzuChartsJs = R"JS((function () {
   'use strict';
 
   // ── Token bridge ────────────────────────────────────────────────────────
-  // Resolve Momentum tokens at render time so theme switches take effect
+  // Resolve design-system tokens at render time so theme switches take effect
   // without a rebuild. getComputedStyle is cheap on :root.
   function tok(name, fallback) {
     var v = getComputedStyle(document.documentElement)

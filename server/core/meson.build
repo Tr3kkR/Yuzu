@@ -67,7 +67,7 @@ echarts_embed = custom_target(
 
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
-# after the Cisco Momentum token expansion. Chunking into ~14 KB
+# after the design-token expansion. Chunking into ~14 KB
 # fragments concatenated at static-init time keeps every chunk under
 # the limit. Symbol: kYuzuCss (std::string).
 yuzu_css_embed = custom_target(

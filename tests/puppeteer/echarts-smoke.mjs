@@ -4,7 +4,7 @@
 // each chart-card host element contains a <canvas> the renderer drew.
 //
 // Failure modes that this regression net catches (governance Gate 4):
-//   UP-1  empty Momentum-token resolution → asserted non-empty below
+//   UP-1  empty design-token resolution → asserted non-empty below
 //   UP-15 in-page JS error mid-render → trapped via pageerror
 //   UP-3  blank-canvas-passes-OK → still partially open; canvas dimensions
 //         alone don't prove rendering happened. Pixel-content check is a
@@ -120,7 +120,7 @@ async function main() {
     if (!ok) allOk = false;
   }
 
-  // Snapshot of resolved Momentum tokens — confirms the bridge works.
+  // Snapshot of resolved design-system tokens — confirms the bridge works.
   // UP-1: assert each token resolves non-empty. If yuzu.css fails to
   // load or the :root token block is dropped, every value comes back
   // as the empty string and the chart palette silently falls through
@@ -133,7 +133,7 @@ async function main() {
                   '--mds-color-chart-axis','--mds-color-chart-grid'];
     return Object.fromEntries(keys.map(k => [k, cs.getPropertyValue(k).trim()]));
   });
-  console.log('  resolved Momentum tokens:');
+  console.log('  resolved design-system tokens:');
   let tokensOk = true;
   for (const [k, v] of Object.entries(tokens)) {
     console.log(`    ${k} = ${v || '(empty!)'}`);
@@ -147,7 +147,7 @@ async function main() {
     console.log(`FAIL: ${pageErrors.length} page-level JS error(s) during run`);
     process.exit(1);
   }
-  if (!tokensOk) { console.log('FAIL: one or more Momentum tokens resolved empty'); process.exit(1); }
+  if (!tokensOk) { console.log('FAIL: one or more design-system tokens resolved empty'); process.exit(1); }
   if (!allOk)    { console.log('FAIL: at least one chart did not render'); process.exit(1); }
   console.log('PASS');
 }

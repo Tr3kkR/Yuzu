@@ -16,7 +16,7 @@ extern const char* const kDashboardIndexHtml =
   <script src="/static/sse.js"></script>
   <!-- Chart renderer for spec.visualization payloads (#253). ECharts 5
        (Apache-2.0) is the engine; yuzu-charts.js is the thin adapter that
-       maps our payload onto ECharts options and reads Momentum CSS tokens
+       maps our payload onto ECharts options and reads Yuzu design-system CSS tokens
        for theming. Self-rehydrates on htmx:afterSettle, so chart
        placeholders appear automatically when /fragments/results swaps
        the deck via OOB. echarts.min.js must load first — yuzu-charts.js

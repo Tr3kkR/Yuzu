@@ -16,7 +16,7 @@ gh issue create --repo "$Repo" `
   --title "Implement core TAR abstraction and read-only query layer" `
   --body @'
 ## Summary
-Implement the core 1E Client Activity Record (TAR) abstraction in Yuzu as a read-only, system-managed persistent data layer.
+Implement the core Telemetry Activity Record (TAR) abstraction in Yuzu as a read-only, system-managed persistent data layer.
 
 ## Scope
 - Add a read-only TAR layer

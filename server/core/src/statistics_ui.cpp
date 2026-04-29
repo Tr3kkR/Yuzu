@@ -14,7 +14,7 @@ const char* const kStatisticsHtml = R"html(<!DOCTYPE html>
 <link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
 <style>
-/* Inherits Momentum tokens from /static/yuzu.css — no local :root override. */
+/* Inherits Yuzu design-system tokens from /static/yuzu.css — no local :root override. */
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font-family:var(--mds-font-family-default);padding:1.5rem}
 h1{font-size:1.4rem;margin-bottom:1rem}

@@ -5,8 +5,8 @@
 - `docs/erlang-gateway-blueprint.md`
 
 This review focuses on the target operating model of **millions of agents** and
-**hundreds of plugins**, with parity ambitions for Tachyon/Tanium class
-capabilities, including command and control, inventory, vulnerability scanning,
+**hundreds of plugins**, with parity ambitions for the leading commercial
+endpoint-management platforms in this class, including command and control, inventory, vulnerability scanning,
 and anti-virus workflows.
 
 ## Executive Assessment
@@ -108,7 +108,7 @@ This avoids huge gRPC stream pressure and improves retry behavior.
 
 ### 6) Security model should be expanded for high-impact remote actions
 
-For Tanium-like action breadth, authZ granularity and safety controls become
+For enterprise-class action breadth, authZ granularity and safety controls become
 as important as scale.
 
 **Recommendation:**
@@ -187,6 +187,6 @@ Static estimates are useful but insufficient for production commitments.
 ## Bottom Line
 
 The Erlang/OTP direction is the right foundation for the stated scale goals.
-To reach "Tachyon/Tanium-class breadth in one platform," the design should now
+To reach enterprise-class breadth in one platform, the design should now
 add explicit overload controls, workload separation, versioned plugin
 capabilities, stronger authZ/audit controls, and SLO-driven validation.

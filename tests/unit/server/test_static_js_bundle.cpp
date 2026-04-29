@@ -225,9 +225,9 @@ TEST_CASE("static_js_bundle: kYuzuCss is at least 20 KB",
     CHECK(yuzu::server::kYuzuCss.size() >= kYuzuCssMinBytes);
 }
 
-TEST_CASE("static_js_bundle: kYuzuCss carries the Momentum token layer",
+TEST_CASE("static_js_bundle: kYuzuCss carries the design-system token layer",
           "[static-js][yuzu-css]") {
-    // Anchor on tokens introduced in the Cisco Momentum sweep.
+    // Anchor on tokens introduced in the design-system sweep.
     CHECK_THAT(yuzu::server::kYuzuCss,
                ContainsSubstring("--mds-color-theme-background-canvas"));
     CHECK_THAT(yuzu::server::kYuzuCss,
@@ -259,7 +259,7 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs exposes the YuzuCharts global",
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("htmx:afterSettle"));
 }
 
-TEST_CASE("static_js_bundle: kYuzuChartsJs reads Momentum chart tokens",
+TEST_CASE("static_js_bundle: kYuzuChartsJs reads design-system chart tokens",
           "[static-js][yuzu-charts]") {
     // The adapter resolves --mds-color-chart-* via getComputedStyle at
     // render time (governance Gate 3 architecture-N3). Drift in this
