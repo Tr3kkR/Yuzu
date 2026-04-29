@@ -165,6 +165,8 @@ extern const std::string kYuzuCss;       // server/core/static/yuzu.css (build-t
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs;     // server/core/vendor/echarts.min.js (Apache-2.0)
 extern const std::string_view kInterVariableWoff2;  // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
+extern const std::vector<std::string> kBundledDefinitions;  // build-time embed of content/definitions/
+extern const std::vector<std::string> kBundledSets;         // build-time embed of content/packs/*sets*
 }  // namespace yuzu::server
 
 namespace yuzu::server {
@@ -475,8 +477,6 @@ public:
                 // operators can triage without reading 200+ envelopes by
                 // hand (Gate 6 SRE-O2).
                 {
-                    extern const std::vector<std::string> kBundledDefinitions;
-                    extern const std::vector<std::string> kBundledSets;
                     auto audit_bundle = [this](std::string_view target_type,
                                                 const std::string& target_id,
                                                 std::string_view result,
