@@ -1,8 +1,9 @@
 
-/* Inter variable webfont (SIL OFL) — Momentum's prescribed family.
-   One file covers Regular through ExtraBold via font-variation-settings;
-   browsers without variable-font support fall through to the @supports
-   query and the next family in the stack. font-display:swap avoids FOIT. */
+/* Inter variable webfont (SIL OFL) — the Yuzu design system's
+   default family. One file covers Regular through ExtraBold via
+   font-variation-settings; browsers without variable-font support
+   fall through to the @supports query and the next family in the
+   stack. font-display:swap avoids FOIT. */
 @font-face {
   font-family: 'Inter';
   font-style: normal;
@@ -14,12 +15,12 @@
 
 /* Yuzu Design System — Dark Theme.
  *
- * Tokens-only adoption of Cisco's Momentum Design System: every visual
- * primitive (color/type/spacing/radius/elevation) is exposed as a
- * --mds-* semantic token, and the legacy --bg/--fg/--accent aliases
- * re-point at those tokens so the rest of the dashboard CSS does not
- * change. To re-skin Yuzu, override the --mds-* tokens at :root or on
- * a [data-theme="..."] selector — every component (and every chart,
+ * Token-driven design system: every visual primitive
+ * (color/type/spacing/radius/elevation) is exposed as a --mds-*
+ * semantic token, and the legacy --bg/--fg/--accent aliases re-point
+ * at those tokens so the rest of the dashboard CSS does not change.
+ * To re-skin Yuzu, override the --mds-* tokens at :root or on a
+ * [data-theme="..."] selector — every component (and every chart,
  * via getComputedStyle in yuzu-charts.js) re-renders against the new
  * palette.
  *
@@ -29,9 +30,9 @@
  * rebuild.
  */
 :root {
-  /* === Cisco Momentum tokens — Cisco IQ palette === */
+  /* === Yuzu design tokens — dark navy palette === */
 
-  /* Surface / structure — deep navy canvas, Cisco IQ-style stacked navies */
+  /* Surface / structure — deep navy canvas, stacked-navy elevation */
   --mds-color-theme-background-canvas: #0e1a2d;
   --mds-color-theme-background-solid-primary: #1a2940;
   --mds-color-theme-background-solid-secondary: #243553;
@@ -45,22 +46,22 @@
   --mds-color-theme-text-disabled: #5b6e8a;
   --mds-color-theme-text-inverted: #0e1a2d;
 
-  /* Brand / accent — Cisco cyan family (#00BCEB is Cisco's signature blue) */
+  /* Brand / accent — cyan family (#00BCEB anchors the accent ramp) */
   --mds-color-theme-accent-primary-normal: #00bceb;
   --mds-color-theme-accent-primary-hover:  #1ecfff;
   --mds-color-theme-accent-primary-active: #009ec4;
 
-  /* Status (semantic) — Cisco gold, mint, coral */
+  /* Status (semantic) — gold, mint, coral */
   --mds-color-theme-indicator-success: #4ed27e;
   --mds-color-theme-indicator-warning: #ffcc00;
   --mds-color-theme-indicator-error:   #ff5765;
   --mds-color-theme-indicator-info:    #00bceb;
 
-  /* Data viz — 12-step categorical palette, Cisco-aligned hues
-     ordered for maximum perceptual separation in series legends. */
-  --mds-color-chart-1:  #00bceb;  /* Cisco cyan      */
+  /* Data viz — 12-step categorical palette ordered for maximum
+     perceptual separation in series legends. */
+  --mds-color-chart-1:  #00bceb;  /* cyan            */
   --mds-color-chart-2:  #c8208e;  /* magenta         */
-  --mds-color-chart-3:  #ffcc00;  /* Cisco gold      */
+  --mds-color-chart-3:  #ffcc00;  /* gold            */
   --mds-color-chart-4:  #4ed27e;  /* mint            */
   --mds-color-chart-5:  #8e51c8;  /* plum            */
   --mds-color-chart-6:  #ff5765;  /* coral           */
@@ -76,7 +77,7 @@
   --mds-color-chart-tooltip-fg: #ffffff;
   --mds-color-chart-tooltip-border: #3f5680;
 
-  /* Typography — Inter (Momentum-prescribed) shipped as a webfont via
+  /* Typography — Inter shipped as a webfont via
      /static/fonts/InterVariable.woff2 (SIL OFL); falls through to
      system fonts if the woff2 fetch fails. */
   --mds-font-family-default: 'Inter', -apple-system, BlinkMacSystemFont,
@@ -84,7 +85,7 @@
   --mds-font-family-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code',
                           'Consolas', monospace;
 
-  /* Spacing — Momentum's 4-px grid. Numeric suffix = px / 0.5 → 50 = 4 px,
+  /* Spacing — 4-px grid. Numeric suffix = px / 0.5 → 50 = 4 px,
      100 = 8 px, 150 = 12 px, 200 = 16 px, 300 = 24 px, etc. Components and
      pages should consume these; never hard-code rems or px. */
   --mds-spacing-25:  2px;
@@ -101,7 +102,7 @@
   --mds-spacing-700: 56px;
   --mds-spacing-800: 64px;
 
-  /* Type ramp — Momentum semantic sizes. Line-heights are 4-px-grid-aligned
+  /* Type ramp — semantic sizes. Line-heights are 4-px-grid-aligned
      for vertical rhythm. Pages/components should consume the named tokens;
      legacy --text-* aliases are re-pointed onto these below. */
   --mds-font-size-caption:    11px;
@@ -129,15 +130,15 @@
   --mds-border-radius-md: 0.375rem;
   --mds-border-radius-lg: 0.5rem;
 
-  /* Elevation (Momentum shadow tokens — kept light for dark theme) */
+  /* Elevation (shadow tokens — kept light for dark theme) */
   --mds-elevation-1: 0 1px 2px rgba(0,0,0,0.3);
   --mds-elevation-2: 0 2px 8px rgba(0,0,0,0.4);
   --mds-elevation-3: 0 4px 16px rgba(0,0,0,0.5);
 
-  /* Interaction state colors — translucent layers Momentum stacks on
-     top of any surface to indicate hover / active / selection without
-     swapping the background hue. Cisco IQ tints these with the cyan
-     accent so hover/selection feels brand-aligned. */
+  /* Interaction state colors — translucent layers stacked on top of
+     any surface to indicate hover / active / selection without
+     swapping the background hue. Tinted with the cyan accent so
+     hover/selection feels brand-aligned. */
   --mds-color-state-hover:    rgba(0,188,235,0.06);
   --mds-color-state-active:   rgba(0,188,235,0.10);
   --mds-color-state-selected: rgba(0,188,235,0.15);
@@ -151,7 +152,7 @@
 
   /* Bright indicator variants — used on translucent badge backgrounds and
      in syntax-highlighted content where the muted indicator hue would be
-     too low-contrast. Cisco palette: brighter mint/gold/coral/cyan. */
+     too low-contrast. Brighter mint/gold/coral/cyan. */
   --mds-color-indicator-success-bright: #80e5a4;
   --mds-color-indicator-warning-bright: #ffd93b;
   --mds-color-indicator-error-bright:   #ff8e97;
@@ -160,14 +161,14 @@
   --mds-color-indicator-special:        #b793e6;
 
   /* Tinted indicator backgrounds — translucent fills for badges and chips
-     so the tint shows the underlying surface. Cisco palette. */
+     so the tint shows the underlying surface. */
   --mds-color-bg-success-tinted: rgba(78,210,126,0.18);
   --mds-color-bg-warning-tinted: rgba(255,204,0,0.18);
   --mds-color-bg-error-tinted:   rgba(255,87,101,0.18);
   --mds-color-bg-info-tinted:    rgba(0,188,235,0.18);
   --mds-color-bg-neutral-tinted: rgba(143,163,189,0.18);
 
-  /* === Legacy aliases (re-point onto Momentum tokens) === */
+  /* === Legacy aliases (re-point onto Yuzu design tokens) === */
   --bg: var(--mds-color-theme-background-canvas);
   --fg: var(--mds-color-theme-text-secondary);
   --accent: var(--mds-color-theme-accent-primary-normal);
@@ -179,7 +180,7 @@
   --muted: var(--mds-color-theme-text-tertiary);
   --subtle: var(--mds-color-theme-outline-secondary);
 
-  /* Legacy spacing aliases — re-pointed onto Momentum's 4-px grid */
+  /* Legacy spacing aliases — re-pointed onto the 4-px grid */
   --sp-1: var(--mds-spacing-50);   /* 4px  */
   --sp-2: var(--mds-spacing-100);  /* 8px  */
   --sp-3: var(--mds-spacing-150);  /* 12px */
@@ -190,7 +191,7 @@
   --font-sans: var(--mds-font-family-default);
   --font-mono: var(--mds-font-family-mono);
   --mono: var(--font-mono); /* backward-compat alias for existing page CSS */
-  /* Legacy size aliases — re-pointed onto the Momentum type ramp.
+  /* Legacy size aliases — re-pointed onto the design system type ramp.
      xs ≈ caption, sm ≈ body-small, base ≈ body-small (existing 0.8rem
      was between body-small and body; bumping to 13px reads cleanly),
      lg ≈ body-large. */
@@ -205,8 +206,8 @@
   --radius-lg: var(--mds-border-radius-lg);
 
   /* Role accent colors */
-  /* Role accents re-pointed onto Cisco IQ semantic tokens so they stay
-     consistent if the palette is ever re-skinned again. */
+  /* Role accents re-pointed onto semantic indicator tokens so they
+     stay consistent if the palette is ever re-skinned again. */
   --role-admin:    var(--mds-color-theme-indicator-error);
   --role-platform: var(--mds-color-indicator-special);
   --role-operator: var(--mds-color-theme-accent-primary-normal);
@@ -422,7 +423,7 @@ body { font-family: var(--font-sans); background: var(--bg); color: var(--fg); l
 .yl { display: flex; }
 .ln { color: var(--subtle); min-width: 2.5em; text-align: right; padding-right: var(--sp-2);
       user-select: none; }
-/* YAML syntax token colors — Momentum bright indicators */
+/* YAML syntax token colors — bright indicator palette */
 .yk   { color: var(--mds-color-indicator-info-bright); }
 .yv   { color: var(--mds-color-theme-text-secondary); }
 .yc   { color: var(--mds-color-theme-text-tertiary); font-style: italic; }

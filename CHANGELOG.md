@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Cisco Momentum design tokens + Cisco IQ palette (dashboard re-skin).**
+- **Yuzu design tokens + dark navy palette (dashboard re-skin).**
   91 `--mds-*` CSS custom properties (color / spacing / type / state /
   elevation / indicator) layered into `kYuzuCss`; legacy aliases
   (`--bg`, `--fg`, `--accent`, `--surface`, `--sp-*`, `--text-*`,
-  `--radius-*`, `--font-sans/mono`) re-pointed onto Momentum tokens so
-  every component re-skins through the same layer. Default values
-  match Cisco IQ (deep navy canvas `#0e1a2d`, Cisco cyan accent
-  `#00bceb`, mint / Cisco gold / coral indicators). Re-skinning Yuzu
-  is now a token override, not a CSS rewrite. (#XXX)
+  `--radius-*`, `--font-sans/mono`) re-pointed onto the design tokens
+  so every component re-skins through the same layer. Default values
+  use a deep navy canvas `#0e1a2d`, cyan accent `#00bceb`, and
+  mint / gold / coral indicators. Re-skinning Yuzu is now a token
+  override, not a CSS rewrite. (#XXX)
 
 - **Inter v4.0 variable webfont shipped (SIL OFL 1.1).**
   Vendored at `server/core/vendor/inter/InterVariable.woff2` (345 KB),
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/static/echarts.min.js`. Replaces the previous bespoke SVG
   renderer in `charts_js_bundle.cpp`. Same `[data-yuzu-chart-url]`
   auto-render contract and same JSON payload schema — operators do
-  not migrate. Adapter resolves Momentum tokens via `getComputedStyle`
+  not migrate. Adapter resolves design-system tokens via `getComputedStyle`
   at render time, so palette switches go live without a JS rebuild.
   Empty-data payloads now render an explicit `'No data to plot.'`
   message (matching the prior renderer) rather than a blank canvas.
@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`tests/puppeteer/echarts-smoke.mjs`** — regression test for the
   ECharts adapter; renders all five chart types against synthetic
-  payloads and verifies Momentum tokens resolve correctly.
+  payloads and verifies design-system tokens resolve correctly.
 
 - **Test pinning for embedded asset symbols** in
   `tests/unit/server/test_static_js_bundle.cpp`: pinned size +
@@ -914,12 +914,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- **`docs/tachyon-parity-plan.md`, `docs/capability-map.md`,
+- **`docs/enterprise-parity-plan.md`, `docs/capability-map.md`,
   `docs/roadmap.md`: System Guardian recognised as the GS delivery
   vehicle.** Today's parity doc claimed `PolicyStore + CEL + 6
-  trigger types` is equivalent to Tachyon's Guaranteed State — that
-  is a server-side compliance evaluation match, not a real-time
-  enforcement match. Tachyon's GS uses kernel-event-driven agent-side
+  trigger types` is equivalent to commercial peers' Guaranteed State —
+  that is a server-side compliance evaluation match, not a real-time
+  enforcement match. Commercial peers' GS uses kernel-event-driven agent-side
   enforcement (firewall, registry, services revert in milliseconds,
   not on the next 5-minute poll), and that is the headline parity
   feature operators evaluate against. The System Guardian work

@@ -1271,7 +1271,7 @@ When the dispatched (plugin, action) reverse-resolves to an enabled `Instruction
 1. Resolves `(plugin, action)` to the first enabled definition with a configured visualization. The reverse-lookup is gated on `InstructionDefinition:Read` in addition to `Execution:Execute`; an operator without `InstructionDefinition:Read` sees the dispatch succeed but no chart appears.
 2. Emits an OOB `<div id="chart-deck-host">` with a 2-second deferred load trigger so responses have time to arrive.
 3. Fetches `/fragments/results?...&definition_id=<id>` which returns one chart-card placeholder per configured chart in a `<div class="yuzu-chart-deck">` container.
-4. The Yuzu chart adapter (`/static/yuzu-charts.js`) — built on Apache ECharts 5 (`/static/echarts.min.js`) and themed from Cisco Momentum design tokens — populates each placeholder from `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>`.
+4. The Yuzu chart adapter (`/static/yuzu-charts.js`) — built on Apache ECharts 5 (`/static/echarts.min.js`) and themed from Yuzu design tokens — populates each placeholder from `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>`.
 
 **Limitations operators should expect:**
 

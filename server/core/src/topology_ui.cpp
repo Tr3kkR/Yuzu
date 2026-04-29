@@ -14,7 +14,7 @@ const char* const kTopologyHtml = R"html(<!DOCTYPE html>
 <link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
 <style>
-/* Inherits Momentum tokens from /static/yuzu.css — no local :root override. */
+/* Inherits Yuzu design-system tokens from /static/yuzu.css — no local :root override. */
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--fg);font-family:var(--mds-font-family-default);padding:1.5rem}
 h1{font-size:1.4rem;margin-bottom:1rem}
@@ -32,7 +32,7 @@ h1{font-size:1.4rem;margin-bottom:1rem}
 .os-bar{display:flex;height:24px;border-radius:4px;overflow:hidden;margin-top:.5rem}
 .os-seg{display:flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:600;color:var(--mds-color-text-on-accent)}
 /* OS swatches keep their brand hues (Windows blue, Ubuntu orange,
-   macOS grey) — not part of the Momentum design palette. */
+   macOS grey) — not part of the Yuzu design palette. */
 .os-win{background:#0078d4}.os-linux{background:#e95420}.os-darwin{background:#6e7681}
 a.back{color:var(--accent);text-decoration:none;font-size:.9rem}
 </style>

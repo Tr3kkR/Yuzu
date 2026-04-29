@@ -2332,7 +2332,7 @@ private:
         // /static/echarts.min.js is the vendored Apache ECharts 5 library
         // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
         // that maps our chart payload onto ECharts options and reads
-        // Momentum CSS tokens for theming. Both are cached aggressively
+        // Yuzu design-system CSS tokens for theming. Both are cached aggressively
         // because the bundle is content-addressed by binary version.
         web_server_->Get(
             "/static/echarts.min.js",
@@ -2341,9 +2341,10 @@ private:
                 res.set_content(yuzu::server::kEChartsJs,
                                 "application/javascript; charset=utf-8");
             });
-        // Inter variable webfont (SIL OFL) — Cisco Momentum's prescribed
-        // family. Single woff2 covers all weights via font-variation-
-        // settings on the @font-face declaration in css_bundle.cpp.
+        // Inter variable webfont (SIL OFL) — the Yuzu design system's
+        // default family. Single woff2 covers all weights via font-
+        // variation-settings on the @font-face declaration in
+        // css_bundle.cpp.
         web_server_->Get(
             "/static/fonts/InterVariable.woff2",
             [](const httplib::Request&, httplib::Response& res) {
