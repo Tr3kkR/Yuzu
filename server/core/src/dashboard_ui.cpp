@@ -14,9 +14,14 @@ extern const char* const kDashboardIndexHtml =
   <script src="/static/htmx.js"></script>
   <script>htmx.config.useTemplateFragments = true;</script>
   <script src="/static/sse.js"></script>
-  <!-- Chart renderer for spec.visualization payloads (#253). Self-rehydrates
-       on htmx:afterSettle, so chart placeholders appear automatically when
-       /fragments/results swaps the deck via OOB. -->
+  <!-- Chart renderer for spec.visualization payloads (#253). ECharts 5
+       (Apache-2.0) is the engine; yuzu-charts.js is the thin adapter that
+       maps our payload onto ECharts options and reads Momentum CSS tokens
+       for theming. Self-rehydrates on htmx:afterSettle, so chart
+       placeholders appear automatically when /fragments/results swaps
+       the deck via OOB. echarts.min.js must load first — yuzu-charts.js
+       defers if window.echarts is missing but eager order is faster. -->
+  <script src="/static/echarts.min.js"></script>
   <script src="/static/yuzu-charts.js"></script>
   <style>
     body {
@@ -42,7 +47,7 @@ extern const char* const kDashboardIndexHtml =
       background: var(--surface);
     }
     .instr-bar label {
-      font-size: 0.8rem; font-weight: 600; color: #8b949e;
+      font-size: 0.8rem; font-weight: 600; color: var(--mds-color-theme-text-tertiary);
       white-space: nowrap;
     }
     .instr-bar input[type="text"] {
@@ -54,9 +59,9 @@ extern const char* const kDashboardIndexHtml =
     }
     .instr-bar input[type="text"]:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(88,166,255,0.2);
+      box-shadow: 0 0 0 2px var(--mds-color-state-selected);
     }
-    .instr-bar input[type="text"]::placeholder { color: #484f58; }
+    .instr-bar input[type="text"]::placeholder { color: var(--mds-color-theme-outline-secondary); }
     .instr-wrap { position: relative; flex: 1; display: flex; }
     .instr-wrap input[type="text"] { width: 100%; }
     .ac-list {
@@ -73,11 +78,11 @@ extern const char* const kDashboardIndexHtml =
       justify-content: space-between; align-items: center;
     }
     .ac-item:last-child { border-bottom: none; }
-    .ac-item:hover, .ac-item.sel { background: rgba(88,166,255,0.12); }
-    .ac-item .ac-desc { color: #8b949e; font-size: 0.75rem; margin-left: 1rem; text-align: right; }
+    .ac-item:hover, .ac-item.sel { background: var(--mds-color-state-active); }
+    .ac-item .ac-desc { color: var(--mds-color-theme-text-tertiary); font-size: 0.75rem; margin-left: 1rem; text-align: right; }
     .instr-bar button {
       padding: 0.45rem 1.2rem; font-size: 0.875rem; font-weight: 500;
-      background: var(--accent); color: #fff; border: none;
+      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
       border-radius: 0.375rem; cursor: pointer; transition: opacity 0.15s;
     }
     .instr-bar button:hover { opacity: 0.85; }
@@ -86,10 +91,10 @@ extern const char* const kDashboardIndexHtml =
       font-size: 0.7rem; padding: 0.15rem 0.5rem;
       border-radius: 1rem; font-weight: 600;
     }
-    .badge-idle     { background: #484f58; color: #fff; }
-    .badge-running  { background: var(--green); color: #fff; }
-    .badge-done     { background: var(--green); color: #fff; }
-    .badge-error    { background: var(--red); color: #fff; }
+    .badge-idle     { background: var(--mds-color-theme-outline-secondary); color: var(--mds-color-text-on-accent); }
+    .badge-running  { background: var(--green); color: var(--mds-color-text-on-accent); }
+    .badge-done     { background: var(--green); color: var(--mds-color-text-on-accent); }
+    .badge-error    { background: var(--red); color: var(--mds-color-text-on-accent); }
     .btn-clear {
       padding: 0.45rem 0.8rem; font-size: 0.8rem; font-weight: 500;
       background: var(--surface); color: var(--fg);
@@ -101,7 +106,7 @@ extern const char* const kDashboardIndexHtml =
     /* ── Stats row ───────────────────────────────────────────── */
     .stats {
       display: flex; gap: 1.2rem; align-items: center;
-      font-size: 0.75rem; color: #8b949e; white-space: nowrap;
+      font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary); white-space: nowrap;
     }
 
     /* ── Results Area ────────────────────────────────────────── */
@@ -128,11 +133,14 @@ extern const char* const kDashboardIndexHtml =
     }
     .yuzu-chart-deck:empty { display: none; }
     .yuzu-chart-card {
-      flex: 1 1 360px; min-width: 320px; max-width: 600px;
+      flex: 1 1 360px; min-width: 320px; max-width: 600px; height: 280px;
       background: var(--bg); border: 1px solid var(--border);
-      border-radius: 6px; padding: 0.5rem 0.75rem;
+      border-radius: var(--radius-md); padding: 0.5rem 0.75rem;
+      box-shadow: var(--mds-elevation-1);
     }
-    .yuzu-chart-card svg { display: block; max-width: 100%; height: auto; }
+    .yuzu-chart-card svg, .yuzu-chart-card canvas {
+      display: block; max-width: 100%;
+    }
 
     /* Filter bar */
     .filter-bar {
@@ -140,35 +148,35 @@ extern const char* const kDashboardIndexHtml =
       padding: 0.4rem 1rem; background: var(--surface);
       border-bottom: 1px solid var(--border); font-size: 0.75rem;
     }
-    .filter-bar label { color: #8b949e; font-weight: 600; font-size: 0.65rem; text-transform: uppercase; }
+    .filter-bar label { color: var(--mds-color-theme-text-tertiary); font-weight: 600; font-size: 0.65rem; text-transform: uppercase; }
     .filter-bar select, .filter-bar input[type="text"], .filter-bar input[type="search"] {
       background: var(--bg); color: var(--fg); border: 1px solid var(--border);
       border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.75rem;
       font-family: var(--font-mono);
     }
-    .filter-bar select:focus, .filter-bar input:focus { border-color: #58a6ff; outline: none; }
+    .filter-bar select:focus, .filter-bar input:focus { border-color: var(--mds-color-theme-accent-primary-normal); outline: none; }
 
     /* Sortable column headers */
     th.sortable { cursor: pointer; user-select: none; }
-    th.sortable:hover { color: #58a6ff; }
+    th.sortable:hover { color: var(--mds-color-theme-accent-primary-normal); }
 
     /* Pagination */
     #result-pagination {
       display: flex; align-items: center; gap: 0.5rem;
-      padding: 0.4rem 1rem; font-size: 0.75rem; color: #8b949e;
+      padding: 0.4rem 1rem; font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary);
     }
     .btn-page {
       background: var(--surface); color: var(--fg); border: 1px solid var(--border);
       border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.7rem; cursor: pointer;
     }
-    .btn-page:hover { border-color: #58a6ff; color: #58a6ff; }
+    .btn-page:hover { border-color: var(--mds-color-theme-accent-primary-normal); color: var(--mds-color-theme-accent-primary-normal); }
 
     /* Group creation */
     .btn-create-group {
-      background: #238636; color: #fff; border: none; border-radius: 4px;
+      background: var(--green); color: var(--mds-color-text-on-accent); border: none; border-radius: 4px;
       padding: 0.25rem 0.6rem; font-size: 0.7rem; cursor: pointer; margin-left: 0.5rem;
     }
-    .btn-create-group:hover { background: #2ea043; }
+    .btn-create-group:hover { background: var(--mds-color-indicator-success-bright); }
     .create-group-form {
       display: flex; align-items: center; gap: 0.5rem;
       padding: 0.5rem 1rem; font-size: 0.75rem;
@@ -178,16 +186,16 @@ extern const char* const kDashboardIndexHtml =
       border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.75rem;
     }
     .create-group-form button {
-      background: #238636; color: #fff; border: none; border-radius: 4px;
+      background: var(--green); color: var(--mds-color-text-on-accent); border: none; border-radius: 4px;
       padding: 0.3rem 0.6rem; font-size: 0.75rem; cursor: pointer;
     }
-    .form-hint { color: #8b949e; font-size: 0.7rem; }
-    .feedback-error { color: #f85149; font-size: 0.75rem; }
+    .form-hint { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; }
+    .feedback-error { color: var(--mds-color-theme-indicator-error); font-size: 0.75rem; }
 
     /* Scope section headers */
     .scope-section-header {
       padding: 0.3rem 0.75rem; font-size: 0.6rem; font-weight: 600;
-      text-transform: uppercase; letter-spacing: 0.05em; color: #484f58;
+      text-transform: uppercase; letter-spacing: 0.05em; color: var(--mds-color-theme-outline-secondary);
       border-top: 1px solid var(--border); margin-top: 0.25rem;
     }
 
@@ -205,7 +213,7 @@ extern const char* const kDashboardIndexHtml =
       position: sticky; top: 0; background: var(--surface);
       text-align: left; padding: 0.45rem 0.6rem;
       border-bottom: 2px solid var(--border); font-weight: 600;
-      color: #8b949e; text-transform: uppercase; font-size: 0.65rem;
+      color: var(--mds-color-theme-text-tertiary); text-transform: uppercase; font-size: 0.65rem;
       letter-spacing: 0.05em;
     }
     tbody td {
@@ -216,7 +224,7 @@ extern const char* const kDashboardIndexHtml =
     .result-detail td {
       white-space: normal; overflow: visible; max-width: none;
     }
-    tbody tr:hover { background: rgba(88,166,255,0.06); }
+    tbody tr:hover { background: var(--mds-color-state-hover); }
     .col-agent {
       font-family: var(--mono); font-size: 0.7rem;
       color: var(--yellow); width: 10rem;
@@ -225,7 +233,7 @@ extern const char* const kDashboardIndexHtml =
       font-family: var(--mono); font-size: 0.75rem;
     }
     .empty-state {
-      text-align: center; padding: 3rem 1rem; color: #484f58;
+      text-align: center; padding: 3rem 1rem; color: var(--mds-color-theme-outline-secondary);
       font-size: 0.85rem;
     }
 
@@ -242,7 +250,7 @@ extern const char* const kDashboardIndexHtml =
       font-size: 0.8rem; font-weight: 600;
     }
     .scope-count {
-      font-weight: 400; color: #8b949e; font-size: 0.7rem;
+      font-weight: 400; color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem;
       margin-left: 0.5rem;
     }
     .scope-list {
@@ -254,16 +262,16 @@ extern const char* const kDashboardIndexHtml =
       border-left: 3px solid transparent;
       transition: background 0.1s;
     }
-    .scope-item:hover { background: rgba(88,166,255,0.06); }
+    .scope-item:hover { background: var(--mds-color-state-hover); }
     .scope-item.selected {
-      background: rgba(88,166,255,0.1);
+      background: var(--mds-color-state-active);
       border-left-color: var(--accent);
     }
     .scope-item-name {
       font-size: 0.8rem; font-weight: 500;
     }
     .scope-item-meta {
-      font-size: 0.65rem; color: #8b949e;
+      font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary);
       font-family: var(--mono);
     }
     .scope-item-all {
@@ -289,7 +297,7 @@ extern const char* const kDashboardIndexHtml =
       display: flex; justify-content: space-between; align-items: center;
     }
     .history-header button {
-      background: none; border: none; color: #8b949e; cursor: pointer;
+      background: none; border: none; color: var(--mds-color-theme-text-tertiary); cursor: pointer;
       font-size: 0.7rem; padding: 0.15rem 0.4rem;
     }
     .history-header button:hover { color: var(--fg); }
@@ -301,9 +309,9 @@ extern const char* const kDashboardIndexHtml =
       border-left: 3px solid transparent;
       transition: background 0.1s;
     }
-    .history-item:hover { background: rgba(88,166,255,0.06); }
+    .history-item:hover { background: var(--mds-color-state-hover); }
     .history-item.active {
-      background: rgba(88,166,255,0.1);
+      background: var(--mds-color-state-active);
       border-left-color: var(--accent);
     }
     .history-cmd {
@@ -311,24 +319,24 @@ extern const char* const kDashboardIndexHtml =
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .history-meta {
-      font-size: 0.6rem; color: #8b949e; margin-top: 0.1rem;
+      font-size: 0.6rem; color: var(--mds-color-theme-text-tertiary); margin-top: 0.1rem;
     }
     .history-empty {
       padding: 1.5rem 1rem; text-align: center;
-      font-size: 0.75rem; color: #484f58;
+      font-size: 0.75rem; color: var(--mds-color-theme-outline-secondary);
     }
 
     /* ── Footer ──────────────────────────────────────────────── */
     footer {
       grid-area: footer;
       padding: 0.4rem 1rem; border-top: 1px solid var(--border);
-      font-size: 0.7rem; color: #484f58;
+      font-size: 0.7rem; color: var(--mds-color-theme-outline-secondary);
     }
 
     /* ── About Modal ─────────────────────────────────────────── */
     .modal-overlay {
       display: none; position: fixed; inset: 0;
-      background: rgba(0,0,0,0.6); z-index: 2000;
+      background: var(--mds-color-state-overlay-scrim); z-index: 2000;
       align-items: center; justify-content: center;
     }
     .modal-overlay.open { display: flex; }
@@ -338,11 +346,11 @@ extern const char* const kDashboardIndexHtml =
       text-align: center;
     }
     .modal h2 { font-size: 1.3rem; margin-bottom: 0.5rem; }
-    .modal .version { font-size: 0.8rem; color: #8b949e; margin-bottom: 1rem; }
-    .modal p { font-size: 0.8rem; color: #8b949e; line-height: 1.5; margin-bottom: 1rem; }
+    .modal .version { font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); margin-bottom: 1rem; }
+    .modal p { font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); line-height: 1.5; margin-bottom: 1rem; }
     .modal .btn-close {
       padding: 0.4rem 1.5rem; font-size: 0.8rem; font-weight: 500;
-      background: var(--accent); color: #fff; border: none;
+      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
       border-radius: 0.375rem; cursor: pointer;
     }
   </style>
@@ -379,8 +387,14 @@ extern const char* const kDashboardIndexHtml =
   <div class="dashboard-grid">
 
   <!-- ── Instruction Bar ────────────────────────────────────── -->
+  <!-- hx-on::before-request clears the chart deck the instant the
+       operator clicks Send so a stale chart from the previous
+       dispatch can't linger over the new query's results. The new
+       deck is delivered later via the OOB swap from
+       /fragments/results once execution has data to render. -->
   <form class="instr-bar" id="instr-form"
-        hx-post="/api/dashboard/execute" hx-swap="none">
+        hx-post="/api/dashboard/execute" hx-swap="none"
+        hx-on::before-request="clearChartDeck()">
     <label>Instruction</label>
     <div class="instr-wrap">
       <input type="text" id="instr-input" name="instruction"
@@ -407,16 +421,16 @@ extern const char* const kDashboardIndexHtml =
     <div class="modal">
       <h2>Yuzu</h2>
       <div class="version">Endpoint Management Platform</div>
-      <p id="about-details" style="font-size:0.75rem;color:#8b949e;line-height:1.7;margin-bottom:0.75rem">
+      <p id="about-details" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);line-height:1.7;margin-bottom:0.75rem">
         Loading...
       </p>
       <p style="font-size:0.7rem;margin-bottom:0.75rem">Built with C++23, gRPC, Protobuf, SQLite</p>
       <p style="font-size:0.7rem;margin-bottom:1rem">
-        <a href="https://github.com/anthropics/yuzu" target="_blank" style="color:#58a6ff;text-decoration:none">GitHub</a>
+        <a href="https://github.com/anthropics/yuzu" target="_blank" style="color: var(--mds-color-theme-accent-primary-normal);text-decoration:none">GitHub</a>
         &nbsp;&middot;&nbsp;
-        <a href="/help" style="color:#58a6ff;text-decoration:none">Documentation</a>
+        <a href="/help" style="color: var(--mds-color-theme-accent-primary-normal);text-decoration:none">Documentation</a>
       </p>
-      <p style="font-size:0.65rem;color:#484f58;margin-bottom:1rem">AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
+      <p style="font-size:0.65rem;color: var(--mds-color-theme-outline-secondary);margin-bottom:1rem">AGPL-3.0-or-later (community) &middot; commercial license available for enterprise edition</p>
       <button class="btn-close" onclick="closeAbout()">Close</button>
     </div>
   </div>
@@ -459,8 +473,8 @@ extern const char* const kDashboardIndexHtml =
   <div class="results">
     <div class="results-header">
       <h2>Results</h2>
-      <span id="result-context" style="font-size:0.75rem;color:#8b949e"></span>
-      <div id="result-summary" style="font-size:0.75rem;color:#8b949e"></div>
+      <span id="result-context" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary)"></span>
+      <div id="result-summary" style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary)"></div>
       <span style="flex:1"></span>
       <button class="density-toggle" id="density-toggle" onclick="toggleDensity()" title="Toggle table density">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
@@ -679,6 +693,22 @@ extern const char* const kDashboardIndexHtml =
       wrap.scrollTop = wrap.scrollHeight;
     }
 
+    // Drop any chart-card ECharts instances and empty the deck. Called
+    // both when the operator clicks Clear and at the start of every new
+    // dispatch (hx-on::before-request on #instr-form) so a stale chart
+    // from the previous query never overlays the new one.
+    function clearChartDeck() {
+      var host = document.getElementById('chart-deck-host');
+      if (!host) return;
+      if (window.echarts) {
+        host.querySelectorAll('.yuzu-chart-card').forEach(function (el) {
+          var inst = window.echarts.getInstanceByDom(el);
+          if (inst) { inst.dispose(); }
+        });
+      }
+      host.innerHTML = '';
+    }
+
     function clearResults() {
       document.getElementById('results-tbody').innerHTML = '';
       document.getElementById('results-thead').innerHTML = '<tr></tr>';
@@ -688,6 +718,7 @@ extern const char* const kDashboardIndexHtml =
       document.getElementById('stat-agent').innerHTML = '&mdash;';
       document.getElementById('stat-total').innerHTML = '&mdash;';
       document.getElementById('result-context').textContent = '';
+      clearChartDeck();
       setBadge('idle');
     }
 

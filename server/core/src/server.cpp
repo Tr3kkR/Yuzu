@@ -156,12 +156,16 @@ extern const char* const kTarPageHtml;
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
-// Shared design system assets (css_bundle.cpp, icons_svg.cpp).
-extern const char* const kYuzuCss;
+// Shared design system assets (icons_svg.cpp + build-time embed targets).
 extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
-namespace yuzu::server { extern const std::string kYuzuChartsJs; }
+namespace yuzu::server {
+extern const std::string kYuzuCss;       // server/core/static/yuzu.css (build-time embed)
+extern const std::string kYuzuChartsJs;
+extern const std::string kEChartsJs;     // server/core/vendor/echarts.min.js (Apache-2.0)
+extern const std::string_view kInterVariableWoff2;  // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
+}  // namespace yuzu::server
 
 namespace yuzu::server {
 
@@ -449,6 +453,111 @@ public:
 
                     schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
                     schedule_engine_->create_tables();
+                }
+
+                // Auto-import shipped content from content/definitions/ and
+                // content/packs/. The build-time embed_content.py script
+                // converts each YAML doc to a JSON envelope; we walk the
+                // arrays and upsert. Conflicts on already-existing ids are
+                // expected on second-and-later startups and silently
+                // skipped — content is the source of truth at boot, not
+                // override of in-place operator edits.
+                //
+                // Conflict detection uses is_conflict_error() against the
+                // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
+                // matching on "already exists" was fragile to localization
+                // and to error-string drift in the store layer.
+                //
+                // Audit emission: each successful import or skip writes one
+                // audit_store entry with principal="system" — closes Gate 6
+                // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
+                // field in both the audit detail and the spdlog warning so
+                // operators can triage without reading 200+ envelopes by
+                // hand (Gate 6 SRE-O2).
+                {
+                    extern const std::vector<std::string> kBundledDefinitions;
+                    extern const std::vector<std::string> kBundledSets;
+                    auto audit_bundle = [this](std::string_view target_type,
+                                                const std::string& target_id,
+                                                std::string_view result,
+                                                const std::string& detail) {
+                        // Hardening round 1 INFO — audit_store_ is
+                        // initialized at server.cpp:394, before this
+                        // block at :441; the null branch is unreachable
+                        // today. Guard with an error log so a future
+                        // re-ordering surfaces immediately rather than
+                        // silently dropping boot-content audit events.
+                        if (!audit_store_) {
+                            spdlog::error("bundled_content audit dropped: "
+                                          "audit_store_ not initialized "
+                                          "(target_type={} target_id={})",
+                                          target_type, target_id);
+                            return;
+                        }
+                        AuditEvent ev{};
+                        ev.timestamp      = std::time(nullptr);
+                        ev.principal      = "system";
+                        ev.principal_role = "system";
+                        ev.action         = "content.bundled_import";
+                        ev.target_type    = std::string(target_type);
+                        ev.target_id      = target_id;
+                        ev.detail         = detail;
+                        ev.result         = std::string(result);
+                        audit_store_->log(ev);
+                    };
+                    auto envelope_id = [](const std::string& env) -> std::string {
+                        auto p = nlohmann::json::parse(env, nullptr, false);
+                        return p.is_discarded() ? std::string{}
+                                                : p.value("id", std::string{});
+                    };
+                    int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
+                    for (const auto& env : kBundledDefinitions) {
+                        auto id = envelope_id(env);
+                        auto r = instruction_store_->import_definition_json(env);
+                        if (r) {
+                            ++defs_imported;
+                            audit_bundle("InstructionDefinition", *r,
+                                         "success", "boot-time content embed");
+                        } else if (is_conflict_error(r.error())) {
+                            ++defs_skipped;
+                        } else {
+                            ++defs_errored;
+                            spdlog::warn("bundled definition import failed: id={} error={}",
+                                         id, r.error());
+                            audit_bundle("InstructionDefinition", id,
+                                         "error", r.error());
+                        }
+                    }
+                    int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
+                    for (const auto& env : kBundledSets) {
+                        auto parsed = nlohmann::json::parse(env, nullptr, false);
+                        if (parsed.is_discarded()) { ++sets_errored; continue; }
+                        InstructionSet s;
+                        s.id          = parsed.value("id", "");
+                        s.name        = parsed.value("name", s.id);
+                        s.description = parsed.value("description", "");
+                        s.created_by  = parsed.value("created_by", "system");
+                        if (s.id.empty()) { ++sets_errored; continue; }
+                        auto r = instruction_store_->create_set(s);
+                        if (r) {
+                            ++sets_imported;
+                            audit_bundle("InstructionSet", *r,
+                                         "success", "boot-time content embed");
+                        } else if (is_conflict_error(r.error())) {
+                            ++sets_skipped;
+                        } else {
+                            ++sets_errored;
+                            spdlog::warn("bundled set import failed: id={} error={}",
+                                         s.id, r.error());
+                            audit_bundle("InstructionSet", s.id,
+                                         "error", r.error());
+                        }
+                    }
+                    spdlog::info(
+                        "bundled content: {} definitions imported / {} skipped / {} errored; "
+                        "{} sets imported / {} skipped / {} errored",
+                        defs_imported, defs_skipped, defs_errored,
+                        sets_imported, sets_skipped, sets_errored);
                 }
             }
         }
@@ -2193,10 +2302,16 @@ private:
         });
 
         // -- Static design-system assets ----------------------------------------
+        // CSS is served with no-cache so dashboard skin iteration during
+        // active dev/UAT is picked up on a normal browser reload. The bundle
+        // is ~22 KB; revalidation cost is negligible. Switch back to
+        // max-age + content-hashed URL for prod once the skin stabilises.
         web_server_->Get("/static/yuzu.css",
                          [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=3600");
-                             res.set_content(kYuzuCss, "text/css; charset=utf-8");
+                             res.set_header("Cache-Control",
+                                            "no-cache, no-store, must-revalidate");
+                             res.set_content(yuzu::server::kYuzuCss,
+                                             "text/css; charset=utf-8");
                          });
         web_server_->Get("/static/icons.svg",
                          [](const httplib::Request&, httplib::Response& res) {
@@ -2213,9 +2328,35 @@ private:
                              res.set_header("Cache-Control", "public, max-age=86400");
                              res.set_content(kSseJs, "application/javascript; charset=utf-8");
                          });
-        // Issue #253: response visualization renderer (vanilla SVG, no
-        // third-party dependency). Cached aggressively because the JS
-        // bundle is content-addressed by binary version.
+        // Issue #253: response visualization renderer.
+        // /static/echarts.min.js is the vendored Apache ECharts 5 library
+        // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
+        // that maps our chart payload onto ECharts options and reads
+        // Momentum CSS tokens for theming. Both are cached aggressively
+        // because the bundle is content-addressed by binary version.
+        web_server_->Get(
+            "/static/echarts.min.js",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kEChartsJs,
+                                "application/javascript; charset=utf-8");
+            });
+        // Inter variable webfont (SIL OFL) — Cisco Momentum's prescribed
+        // family. Single woff2 covers all weights via font-variation-
+        // settings on the @font-face declaration in css_bundle.cpp.
+        web_server_->Get(
+            "/static/fonts/InterVariable.woff2",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=2592000, immutable");
+                // Zero-copy: pass the byte view's data+size directly so we
+                // don't allocate a 345 KB std::string per fetch. (Gate 3
+                // cpp-S1.) httplib's set_content(const char*, size_t, ...)
+                // copies into the response buffer once.
+                res.set_content(yuzu::server::kInterVariableWoff2.data(),
+                                yuzu::server::kInterVariableWoff2.size(),
+                                "font/woff2");
+            });
+
         web_server_->Get(
             "/static/yuzu-charts.js",
             [](const httplib::Request&, httplib::Response& res) {

@@ -134,3 +134,4 @@ __pycache__/
 # exclusions.ps1 with its host-allowlist guard, the autologon-
 # diagnose script) stay tracked.
 /scripts/windows-runner-status.ps1
+.screenshots/

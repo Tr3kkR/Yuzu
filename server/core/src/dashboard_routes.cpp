@@ -513,6 +513,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      html += "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\"></nav>";
                      html += "<div id=\"result-summary\" hx-swap-oob=\"innerHTML\"></div>";
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
+                     // Clear any chart deck from a prior query — help is
+                     // a no-chart command so any lingering deck would
+                     // overlay the help table. The hx-on::before-request
+                     // JS hook on #instr-form clears it client-side too;
+                     // this OOB swap is defence-in-depth so a future
+                     // refactor of the form-handler attribute can't
+                     // silently leave stale charts on the page.
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
                      res.set_content(html, "text/html; charset=utf-8");
                      return;
                  }
@@ -520,11 +528,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  // Resolve instruction text → plugin/action
                  auto [plugin, action] = resolve_fn_(lower_cmd);
                  if (plugin.empty()) {
+                     // Defensive: clear any chart deck from a prior
+                     // query so the unknown-command banner isn't
+                     // overlaid on a stale chart.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " style=\"font-size:0.75rem;color:var(--mds-color-theme-indicator-error)\">"
                          "Unknown command: &quot;" + html_escape(instruction) +
-                         "&quot;. Type &quot;help&quot; to list all commands.</span>",
+                         "&quot;. Type &quot;help&quot; to list all commands.</span>"
+                         "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                          "text/html; charset=utf-8");
                      return;
                  }

@@ -3,3 +3,10 @@
 # to regenerate the hash-pinned lock file. See docs/dependency-updates.md
 # for cadence and the Dependabot flow.
 meson==1.11.1
+# pyyaml is a build-time dep of server/core/scripts/embed_content.py, which
+# converts content/definitions/*.yaml + content/packs/*.yaml into the
+# bundled_content.cpp JSON envelopes the server auto-imports on startup.
+# Pinned + hashed so SBOM/SLSA attestation reproducibly records the parser
+# used for content embedding (governance Gate 3 build-ci B1 / Gate 6 COMP-2).
+# Avoids yaml-cpp on Windows MSVC (#625).
+pyyaml==6.0.2

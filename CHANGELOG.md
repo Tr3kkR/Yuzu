@@ -9,6 +9,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cisco Momentum design tokens + Cisco IQ palette (dashboard re-skin).**
+  91 `--mds-*` CSS custom properties (color / spacing / type / state /
+  elevation / indicator) layered into `kYuzuCss`; legacy aliases
+  (`--bg`, `--fg`, `--accent`, `--surface`, `--sp-*`, `--text-*`,
+  `--radius-*`, `--font-sans/mono`) re-pointed onto Momentum tokens so
+  every component re-skins through the same layer. Default values
+  match Cisco IQ (deep navy canvas `#0e1a2d`, Cisco cyan accent
+  `#00bceb`, mint / Cisco gold / coral indicators). Re-skinning Yuzu
+  is now a token override, not a CSS rewrite. (#XXX)
+
+- **Inter v4.0 variable webfont shipped (SIL OFL 1.1).**
+  Vendored at `server/core/vendor/inter/InterVariable.woff2` (345 KB),
+  served at `/static/fonts/InterVariable.woff2` with
+  `Cache-Control: public, max-age=2592000, immutable`. One file covers
+  weights 100-900 via `font-variation-settings`. `--mds-font-family-default`
+  starts with `'Inter'`. Self-hosted — no CDN dependency, air-gap-safe.
+
+- **Apache ECharts 5 chart renderer (Apache-2.0).** Vendored at
+  `server/core/vendor/echarts.min.js` (1.0 MB), served at
+  `/static/echarts.min.js`. Replaces the previous bespoke SVG
+  renderer in `charts_js_bundle.cpp`. Same `[data-yuzu-chart-url]`
+  auto-render contract and same JSON payload schema — operators do
+  not migrate. Adapter resolves Momentum tokens via `getComputedStyle`
+  at render time, so palette switches go live without a JS rebuild.
+  Empty-data payloads now render an explicit `'No data to plot.'`
+  message (matching the prior renderer) rather than a blank canvas.
+
+- **Build-time content auto-import.** All YAML files in
+  `content/definitions/*.yaml` and `content/packs/*.yaml` (217
+  InstructionDefinitions + 10 InstructionSets at this commit) are
+  converted to JSON envelopes at build time by
+  `server/core/scripts/embed_content.py` (PyYAML, build-time
+  dependency pinned in `requirements-ci.txt`) and embedded in the
+  server binary as `kBundledDefinitions` / `kBundledSets`. On every
+  startup the server upserts each entry via `import_definition_json`
+  and `create_set`. **Conflicts on existing IDs are silently skipped
+  — operator-customized definitions are never overwritten.** This
+  is BREAKING for one specific case: definitions an operator
+  previously DELETED will reappear on next restart. To permanently
+  suppress a shipped definition, set `enabled: false` via the
+  dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE.
+  Each successful import / errored import emits an
+  `audit_events.action="content.bundled_import"` row with
+  `principal=system` for SOC 2 traceability. Sidesteps yaml-cpp on
+  Windows MSVC (#625).
+
+- **Inter, ECharts, HTMX, htmx-ext-sse attribution in `NOTICE`.**
+  Closes a long-standing gap for HTMX (0BSD) which was already
+  vendored. ECharts upstream NOTICE vendored at
+  `server/core/vendor/echarts-NOTICE.txt` per Apache 2.0 §4(c).
+
+- **Build-time embed scripts** in `server/core/scripts/`:
+  `embed_js.py` (chunked raw-string-literal generator for arbitrary
+  vendored JS, sized to MSVC's 16,380-byte C2026 limit),
+  `embed_binary.py` (constexpr byte-array generator for binary
+  assets), `embed_content.py` (YAML→JSON envelope converter for
+  shipped instruction content). These replace hand-written chunked
+  literals; future vendor additions should use the scripts.
+
+- **`tests/puppeteer/echarts-smoke.mjs`** — regression test for the
+  ECharts adapter; renders all five chart types against synthetic
+  payloads and verifies Momentum tokens resolve correctly.
+
+- **Test pinning for embedded asset symbols** in
+  `tests/unit/server/test_static_js_bundle.cpp`: pinned size +
+  content sentinels for `kEChartsJs`, `kInterVariableWoff2`,
+  `kYuzuCss`, `kYuzuChartsJs`. Plus `kConflictPrefix` contract tests
+  for `import_definition_json` and `create_set` in
+  `tests/unit/server/test_instruction_store.cpp` so a future error-
+  string drift cannot silently miscount the boot-time auto-import.
+
 - **Visualization engine: optional row pre-filter (`whereField` /
   `whereEquals`).** Lets a chart isolate one logical category of rows
   from a plugin that emits a mixed `key|value` row layout (firewall,
@@ -64,7 +135,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demo fleet; running any of the six instructions then auto-renders the
   declared chart above the standard results table.
 
+### Removed
+
+- **`/static/debug/<name>.png` route deleted.** A skin-iteration
+  debug helper that served PNG screenshots from
+  `/usr/share/yuzu/screenshots/` (only present in
+  `Dockerfile.server-local`). Unauthenticated by design as a dev
+  helper, but the route existed in every build; closing the data-
+  disclosure surface area before any pilot ship. The `.screenshots/`
+  directory is now gitignored.
+
 ### Fixed
+
+- **`InstructionStore::create_set` now uses the `kConflictPrefix`
+  contract on duplicate-id.** Previously returned
+  `"insert failed: UNIQUE constraint failed: ..."` on duplicate, which
+  the boot-time auto-import substring-matched against `"already exists"`
+  and miscounted as `errored`. Every server restart logged
+  `0 sets imported / 0 skipped / 10 errored` plus 10 WARN lines —
+  looking like a persistent fault to any SIEM integration. The store
+  now does a pre-INSERT existence check and returns `kConflictPrefix`-
+  prefixed errors, mirroring `create_definition_impl`. Auto-import
+  classifies via the shared `is_conflict_error()` helper.
+
+- **`/static/yuzu.css` Cache-Control loosened to
+  `no-cache, no-store, must-revalidate`** (was `max-age=3600`) to
+  prevent stale skin during design-token iteration. Operators running
+  a reverse-proxy cache will see slight uplift in origin load on
+  dashboard pageloads. Tracked for dev-mode-flag gating in follow-up
+  — not gated yet.
+
+- **`/static/fonts/InterVariable.woff2` zero-copy.** Route now passes
+  the underlying byte-array `data + size` directly to
+  `httplib::Response::set_content`, skipping a 345 KB `std::string`
+  allocation per fetch.
 
 - **CI: Windows MSVC debug failed at link with LNK2038 abseil
   RuntimeLibrary mismatch and LNK1181 truncated obj-path errors when

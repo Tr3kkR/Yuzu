@@ -21,25 +21,25 @@ th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border);
 th{color:var(--muted);font-weight:600}
 .empty-state{color:var(--muted);text-align:center;padding:2rem}
 .status-badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;font-size:.7rem;font-weight:600}
-.status-pending{background:var(--yellow);color:#0d1117}
-.status-running{background:#1f6feb;color:#fff}
-.status-completed{background:var(--green);color:#fff}
-.status-cancelled{background:var(--subtle);color:#fff}
-.status-failed{background:var(--red);color:#fff}
-.status-approved{background:var(--green);color:#fff}
-.status-rejected{background:var(--red);color:#fff}
+.status-pending{background:var(--yellow);color: var(--mds-color-theme-background-canvas)}
+.status-running{background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent)}
+.status-completed{background:var(--green);color:var(--mds-color-text-on-accent)}
+.status-cancelled{background:var(--subtle);color:var(--mds-color-text-on-accent)}
+.status-failed{background:var(--red);color:var(--mds-color-text-on-accent)}
+.status-approved{background:var(--green);color:var(--mds-color-text-on-accent)}
+.status-rejected{background:var(--red);color:var(--mds-color-text-on-accent)}
 /* Instruction-page button overrides (smaller, denser) */
 .btn{height:auto;padding:.3rem .8rem;font-size:.75rem;margin-right:.3rem}
-.btn-primary{background:var(--green);color:#fff}
+.btn-primary{background:var(--green);color:var(--mds-color-text-on-accent)}
 .btn-secondary{background:var(--surface);color:var(--fg);border:1px solid var(--border)}
-.btn-danger{background:var(--red);color:#fff}
+.btn-danger{background:var(--red);color:var(--mds-color-text-on-accent)}
 .btn-sm{padding:.2rem .5rem;font-size:.7rem}
 .progress-bar{width:80px;height:8px;background:var(--border);border-radius:4px;display:inline-block;vertical-align:middle}
 .progress-fill{height:100%;background:var(--green);border-radius:4px}
 code{background:var(--surface);padding:.1rem .3rem;border-radius:4px;font-size:.75rem}
 .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem}
 .role-badge{display:inline-block;padding:.1rem .4rem;border-radius:4px;font-size:.65rem;
-  font-weight:600;background:#1f6feb;color:#fff;margin-left:.5rem;vertical-align:middle}
+  font-weight:600;background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent);margin-left:.5rem;vertical-align:middle}
 /* Editor panel */
 .editor-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1rem;display:none}
 .editor-panel.active{display:block}
@@ -56,18 +56,18 @@ input,select,textarea{background:var(--bg);border:1px solid var(--border);border
 textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 /* Syntax token colors — GitHub-dark-inspired */
-.yk{color:#79c0ff}                     /* YAML key */
-.yv{color:#a5d6ff}                     /* YAML string value */
-.yc{color:#8b949e;font-style:italic}   /* comment */
-.ya{color:#d2a8ff}                     /* apiVersion / kind (schema keywords) */
-.yt-q{color:#7ee787}                   /* type: question — green (safe, read-only) */
-.yt-a{color:#ffa657;font-weight:700}   /* type: action — orange bold (privileged, modifying) */
-.yap{color:#ff7b72;font-weight:700}    /* approval: always — red bold (requires sign-off) */
-.yap-auto{color:#7ee787}              /* approval: auto — green (no gate) */
-.ycc{color:#d29922}                    /* concurrency mode — amber */
-.yn{color:#79c0ff}                     /* numeric values */
-.yb{color:#ff7b72}                     /* boolean values */
-.yd{color:#8b949e}                     /* dashes (list markers) */
+.yk{color: var(--mds-color-indicator-info-bright)}                     /* YAML key */
+.yv{color:var(--mds-color-indicator-info-bright)} /* YAML string value */
+.yc{color: var(--mds-color-theme-text-tertiary);font-style:italic}   /* comment */
+.ya{color: var(--mds-color-indicator-special)}                     /* apiVersion / kind (schema keywords) */
+.yt-q{color: var(--mds-color-indicator-success-bright)}                   /* type: question — green (safe, read-only) */
+.yt-a{color: var(--mds-color-indicator-attention);font-weight:700}   /* type: action — orange bold (privileged, modifying) */
+.yap{color: var(--mds-color-indicator-error-bright);font-weight:700}    /* approval: always — red bold (requires sign-off) */
+.yap-auto{color: var(--mds-color-indicator-success-bright)}              /* approval: auto — green (no gate) */
+.ycc{color: var(--mds-color-theme-indicator-warning)}                    /* concurrency mode — amber */
+.yn{color: var(--mds-color-indicator-info-bright)}                     /* numeric values */
+.yb{color: var(--mds-color-indicator-error-bright)}                     /* boolean values */
+.yd{color: var(--mds-color-theme-text-tertiary)}                     /* dashes (list markers) */
 /* Legend */
 .yaml-legend{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem;font-size:.7rem}
 .yaml-legend span{display:flex;align-items:center;gap:.3rem}
@@ -75,7 +75,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 .form-actions{margin-top:1rem;display:flex;gap:.5rem}
 /* alert overrides (shared .alert base from yuzu.css, page-specific padding) */
 .alert{padding:.5rem 1rem;font-size:.8rem;margin-bottom:.8rem}
-.legacy-badge{font-size:.65rem;background:#6e7681;color:#fff;padding:.05rem .4rem;border-radius:3px}
+.legacy-badge{font-size:.65rem;background:var(--mds-color-theme-outline-secondary);color:var(--mds-color-text-on-accent);padding:.05rem .4rem;border-radius:3px}
 </style>
 </head><body>
 
@@ -566,12 +566,12 @@ extern const char* const kInstructionEditorHtml = R"HTM(
             <div class="form-group full">
                 <label>YAML Source (apiVersion: yuzu.io/v1alpha1)</label>
                 <div class="yaml-legend">
-                    <span><span class="swatch" style="background:#7ee787"></span> question (read-only)</span>
-                    <span><span class="swatch" style="background:#ffa657"></span> action (privileged)</span>
-                    <span><span class="swatch" style="background:#ff7b72"></span> approval required</span>
-                    <span><span class="swatch" style="background:#d29922"></span> concurrency</span>
-                    <span><span class="swatch" style="background:#79c0ff"></span> keys</span>
-                    <span><span class="swatch" style="background:#d2a8ff"></span> schema</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-success-bright)"></span> question (read-only)</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-attention)"></span> action (privileged)</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-error-bright)"></span> approval required</span>
+                    <span><span class="swatch" style="background: var(--mds-color-theme-indicator-warning)"></span> concurrency</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-info-bright)"></span> keys</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-special)"></span> schema</span>
                 </div>
                 <div class="yaml-split">
                     <textarea id="yaml-editor" name="yaml_source"

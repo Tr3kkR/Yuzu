@@ -32,7 +32,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       padding-bottom: 0.5rem;
     }
     .tar-subtitle {
-      color: #8b949e;
+      color: var(--mds-color-theme-text-tertiary);
       font-size: 0.85rem;
       margin: 0 0 1.5rem 0;
     }
@@ -49,7 +49,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       justify-content: space-between;
       padding: 0.75rem 1rem;
       border-bottom: 1px solid var(--border);
-      background: rgba(88,166,255,0.04);
+      background: var(--mds-color-state-hover);
     }
     .tar-frame-title {
       font-size: 0.95rem;
@@ -61,7 +61,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       padding: 0.35rem 0.85rem;
       font-size: 0.8rem;
       background: var(--accent);
-      color: #fff;
+      color: var(--mds-color-text-on-accent);
       border: none;
       border-radius: 0.25rem;
       cursor: pointer;
@@ -82,7 +82,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       text-align: left;
       padding: 0.5rem 0.75rem;
       border-bottom: 1px solid var(--border);
-      color: #8b949e;
+      color: var(--mds-color-theme-text-tertiary);
       font-weight: 600;
       font-size: 0.75rem;
       text-transform: uppercase;
@@ -94,45 +94,45 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       vertical-align: top;
     }
     .tar-frame-body tr:last-child td { border-bottom: none; }
-    .tar-frame-body tr:hover { background: rgba(88,166,255,0.06); }
+    .tar-frame-body tr:hover { background: var(--mds-color-state-hover); }
     .tar-frame-body .source-pill {
       display: inline-block;
       padding: 0.1rem 0.5rem;
       font-size: 0.7rem;
       font-weight: 600;
-      background: rgba(247,196,46,0.15);
-      color: #f7c42e;
+      background: var(--mds-color-bg-warning-tinted);
+      color: var(--mds-color-indicator-warning-bright);
       border-radius: 0.75rem;
     }
     .tar-frame-body .placeholder {
       padding: 2rem 0;
       text-align: center;
-      color: #8b949e;
+      color: var(--mds-color-theme-text-tertiary);
     }
     .tar-frame-body .empty-state {
       padding: 2.5rem 0;
       text-align: center;
-      color: #8b949e;
+      color: var(--mds-color-theme-text-tertiary);
       font-size: 0.9rem;
     }
     .tar-frame-body .empty-state strong { color: var(--green); }
     .tar-frame-coming-soon {
       padding: 2rem;
       text-align: center;
-      color: #8b949e;
+      color: var(--mds-color-theme-text-tertiary);
       font-size: 0.85rem;
-      background: rgba(255,255,255,0.02);
+      background: var(--mds-color-state-hover);
       border: 1px dashed var(--border);
       border-radius: 0.25rem;
       margin: 0.5rem;
     }
     .tar-frame-coming-soon code {
-      background: rgba(255,255,255,0.06);
+      background: var(--mds-color-state-hover);
       padding: 0.1rem 0.4rem;
       border-radius: 0.25rem;
       font-size: 0.8rem;
     }
-    .tar-row-error { color: #f85149; }
+    .tar-row-error { color: var(--mds-color-theme-indicator-error); }
     .tar-row-error td { font-style: italic; }
   </style>
 </head>
