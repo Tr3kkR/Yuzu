@@ -4696,7 +4696,8 @@ private:
                     metrics_.counter("yuzu_commands_dispatched_total").increment();
                 return {command_id, sent};
             },
-            approval_manager_.get());
+            approval_manager_.get(),
+            response_store_.get());
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();

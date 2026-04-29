@@ -4,8 +4,13 @@
 /// Pure utility functions for the Yuzu web server layer.
 /// Extracted here for testability.
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <ctime>
+#include <format>
 #include <string>
 #include <string_view>
 
@@ -148,6 +153,196 @@ inline std::string extract_plugin(const std::string& command_id) {
         return command_id.substr(0, dash);
     }
     return command_id;
+}
+
+// ============================================================================
+// Time formatting and now-epoch — used by the executions surface and the TAR
+// dashboard. Both surfaces standardise on UTC; relative time goes in the cell
+// text, ISO-8601 UTC goes in the title= attribute for forensic copy/paste.
+// Mixing local time anywhere is a known failure mode (BST/UTC drift).
+// ============================================================================
+
+/// Current epoch seconds (UTC). Equivalent to `std::time(nullptr)` but uses
+/// `std::chrono` so it compiles cleanly on every platform.
+inline int64_t now_epoch_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Format epoch seconds as RFC 3339 / ISO 8601 in UTC: "YYYY-MM-DDTHH:MM:SSZ".
+/// Used in `title=` attributes so operators can copy a precise timestamp.
+/// Returns "—" for non-positive input (sentinel "never").
+inline std::string format_iso_utc(int64_t epoch_secs) {
+    if (epoch_secs <= 0) return "—";
+    std::time_t t = static_cast<std::time_t>(epoch_secs);
+    std::tm tm_val{};
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
+    gmtime_r(&t, &tm_val);
+#endif
+    return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+                        tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+                        tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec);
+}
+
+/// Format a delta as a coarse "Xs/Xm/Xh/Xd ago" string. Caller passes both
+/// epochs so the function is pure and easy to test (no clock read). Argument
+/// order is (then, now) to match the existing `format_age` helper in
+/// dashboard_routes.cpp — eases a future dedup. `epoch_then <= 0` returns
+/// "—" (never-fired sentinel).
+inline std::string format_relative_time(int64_t epoch_then, int64_t epoch_now) {
+    if (epoch_then <= 0) return "—";
+    int64_t delta = epoch_now - epoch_then;
+    if (delta < 0) delta = 0;
+    if (delta < 60)    return std::format("{}s ago", delta);
+    if (delta < 3600)  return std::format("{}m ago", delta / 60);
+    if (delta < 86400) return std::format("{}h {}m ago", delta / 3600, (delta % 3600) / 60);
+    int64_t days = delta / 86400;
+    int64_t hours = (delta % 86400) / 3600;
+    if (days < 30) return std::format("{}d {}h ago", days, hours);
+    return std::format("{}d ago", days);
+}
+
+// ============================================================================
+// UTF-8 truncation — first-error preview in the executions list shows up to
+// 80 chars. Truncating mid-codepoint produces invalid UTF-8 that breaks the
+// browser's title= rendering; this walks back to the previous codepoint
+// boundary if needed.
+// ============================================================================
+
+/// Truncate `s` to at most `max_chars` *bytes*, walking back to the previous
+/// UTF-8 codepoint boundary if the cut would tear a multi-byte sequence.
+/// Appends `"…"` (3 bytes UTF-8) when truncation occurred. Returns the input
+/// unchanged if `s.size() <= max_chars`.
+inline std::string truncate_utf8(std::string_view s, std::size_t max_chars) {
+    if (s.size() <= max_chars) return std::string(s);
+    std::size_t cut = max_chars;
+    while (cut > 0) {
+        unsigned char c = static_cast<unsigned char>(s[cut]);
+        // 10xxxxxx is a continuation byte — walk back until we land on a
+        // codepoint start (0xxxxxxx or 11xxxxxx).
+        if ((c & 0xC0) != 0x80) break;
+        --cut;
+    }
+    std::string out(s.substr(0, cut));
+    out += "\xE2\x80\xA6"; // U+2026 HORIZONTAL ELLIPSIS, UTF-8
+    return out;
+}
+
+// ============================================================================
+// Status sparkbar — 4-segment stacked bar showing fan-out by agent status.
+// Encoding: count → length, status → hue. Renders as inline SVG so the list
+// view can ship it without a JS chart library and so screen readers can
+// announce a single role="img" with a summary aria-label.
+//
+// Width is fixed at 120px so all rows align. Heights at 10px so the bar is
+// dense but still legible. Buckets with count 0 emit no <rect> (avoids a
+// 0-width artifact in some browsers). When `total == 0` (no agents matched
+// scope) the bar renders a single hatched/empty cell so the row doesn't look
+// like a successful zero-agent run.
+//
+// Color tokens: Cisco Momentum success/error/stable/text-tertiary. Theme-
+// agnostic — light and dark mode both read the same SVG via CSS vars.
+// ============================================================================
+
+/// Inline SVG, ~120×10px, rendering a 4-segment stacked status sparkbar.
+/// Caller is responsible for any wrapping HTML.
+inline std::string render_status_sparkbar(int succeeded, int failed,
+                                          int running, int pending) {
+    constexpr int kWidth = 120;
+    constexpr int kHeight = 10;
+    const int total = succeeded + failed + running + pending;
+
+    auto label = total > 0
+                     ? std::format("{} succeeded, {} failed, {} running, {} pending of {}",
+                                   succeeded, failed, running, pending, total)
+                     : std::string{"no agents matched scope"};
+
+    std::string out;
+    out.reserve(512);
+    out += std::format(
+        "<svg class=\"status-sparkbar\" width=\"{}\" height=\"{}\" "
+        "viewBox=\"0 0 {} {}\" role=\"img\" aria-label=\"{}\">",
+        kWidth, kHeight, kWidth, kHeight, label);
+
+    if (total <= 0) {
+        // Hatched empty state — no agents matched scope.
+        out += std::format(
+            "<defs><pattern id=\"empty-hatch\" patternUnits=\"userSpaceOnUse\" "
+            "width=\"4\" height=\"4\" patternTransform=\"rotate(45)\">"
+            "<line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"4\" "
+            "stroke=\"var(--mds-color-theme-text-tertiary)\" "
+            "stroke-width=\"1\" aria-hidden=\"true\" /></pattern></defs>"
+            "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" "
+            "fill=\"url(#empty-hatch)\" aria-hidden=\"true\" />",
+            kWidth, kHeight);
+        out += "</svg>";
+        return out;
+    }
+
+    // Compute segment widths in fixed-point so the four rounded values sum
+    // exactly to kWidth — the last non-zero segment absorbs rounding error.
+    struct Seg { int count; const char* fill; };
+    Seg segs[4] = {
+        {succeeded, "var(--mds-color-bg-success-emphasis)"},
+        {failed,    "var(--mds-color-theme-indicator-error)"},
+        {running,   "var(--mds-color-theme-indicator-stable)"},
+        {pending,   "var(--mds-color-theme-text-tertiary)"},
+    };
+    int widths[4] = {0, 0, 0, 0};
+    int last_nonzero = -1;
+    int allocated = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (segs[i].count > 0) {
+            widths[i] = static_cast<int>(
+                static_cast<int64_t>(segs[i].count) * kWidth / total);
+            allocated += widths[i];
+            last_nonzero = i;
+        }
+    }
+    if (last_nonzero >= 0 && allocated < kWidth) {
+        widths[last_nonzero] += (kWidth - allocated);
+    }
+
+    int x = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (segs[i].count <= 0) continue;
+        out += std::format(
+            "<rect x=\"{}\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"{}\" "
+            "aria-hidden=\"true\" />",
+            x, widths[i], kHeight, segs[i].fill);
+        x += widths[i];
+    }
+    out += "</svg>";
+    return out;
+}
+
+// ============================================================================
+// Duration bar — single-axis horizontal bar inline in the per-agent table.
+// Scaled to the slowest agent in the current execution so the eye picks out
+// tail-latency outliers. Server-rendered as a div with a width percentage so
+// no JS chart library is needed.
+// ============================================================================
+
+/// Render a duration bar as an inline `<div>`. `duration_ms` and
+/// `max_duration_ms` are agent timing in this execution; `status_class` is
+/// one of "completed" / "failed" / "running" / "pending" and selects the hue.
+inline std::string render_duration_bar_html(int64_t duration_ms,
+                                            int64_t max_duration_ms,
+                                            std::string_view status_class) {
+    if (duration_ms < 0) duration_ms = 0;
+    int pct = 0;
+    if (max_duration_ms > 0) {
+        int64_t scaled = duration_ms * 100 / max_duration_ms;
+        if (scaled > 100) scaled = 100;
+        pct = static_cast<int>(scaled);
+    }
+    return std::format(
+        "<div class=\"duration-bar duration-bar--{}\" "
+        "style=\"width:{}%\" role=\"img\" aria-label=\"{} ms\"></div>",
+        status_class, pct, duration_ms);
 }
 
 } // namespace yuzu::server

@@ -1,6 +1,7 @@
 #include "workflow_routes.hpp"
 
 #include "compliance_eval.hpp"
+#include "http_route_sink.hpp"
 #include "scope_engine.hpp"
 #include "web_utils.hpp"
 
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <expected>
+#include <format>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -16,6 +18,8 @@
 
 namespace yuzu::server {
 
+// Production overload — wraps the Server in an HttplibRouteSink and forwards
+// to the sink-based body. Defined first so callers see a familiar signature.
 void WorkflowRoutes::register_routes(
     httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
     EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
@@ -26,15 +30,60 @@ void WorkflowRoutes::register_routes(
     InstructionStore* instruction_store,
     PolicyStore* policy_store,
     CommandDispatchFn command_dispatch_fn,
-    ApprovalManager* approval_manager) {
+    ApprovalManager* approval_manager,
+    ResponseStore* response_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(emit_fn), std::move(scope_fn), workflow_engine,
+                    execution_tracker, schedule_engine, product_pack_store,
+                    instruction_store, policy_store, std::move(command_dispatch_fn),
+                    approval_manager, response_store);
+}
+
+// Sink-based body — every route registration goes through `sink`, not `svr`,
+// so the in-process TestRouteSink can capture handlers and dispatch synthesised
+// requests against them without standing up an httplib::Server (#438).
+void WorkflowRoutes::register_routes(
+    HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+    EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
+    WorkflowEngine* workflow_engine,
+    ExecutionTracker* execution_tracker,
+    ScheduleEngine* schedule_engine,
+    ProductPackStore* product_pack_store,
+    InstructionStore* instruction_store,
+    PolicyStore* policy_store,
+    CommandDispatchFn command_dispatch_fn,
+    ApprovalManager* approval_manager,
+    ResponseStore* response_store) {
 
     auto cmd_dispatch = std::move(command_dispatch_fn);
 
     // -- HTMX fragments --------------------------------------------------------
 
-    // GET /fragments/executions -- execution history HTMX fragment
-    svr.Get("/fragments/executions",
-        [auth_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+    // GET /fragments/executions -- execution history HTMX fragment.
+    //
+    // Information design:
+    //   - Status icon + .exec-row--{class} carries the headline pre-attentively;
+    //     failed rows get a red left-border stripe so the eye finds them without
+    //     re-sorting.
+    //   - Fan-out is encoded as a 4-segment SVG sparkbar (succeeded / failed /
+    //     pending / running). Length = count, hue = status. See
+    //     `render_status_sparkbar` for the rounding-safe renderer.
+    //   - Time renders as a coarse "3m ago" string; ISO-8601 UTC lives in the
+    //     cell title= for forensic copy/paste. Mixed-timezone display is a
+    //     known failure mode.
+    //   - For failed rows we show a 1-line truncation (UTF-8-safe, 80 chars)
+    //     of the most recent agent error_detail, populated via correlated
+    //     subquery in `query_executions` so there is no N×M lookup.
+    //   - Each row carries `hx-trigger="click once"` so the detail fragment is
+    //     fetched at most once per row; subsequent clicks toggle visibility.
+    //
+    // The optional `definition_id` query param filters the list to one
+    // definition. Click-handling on the trend sparkline (PR 4) and the
+    // dashboard's per-instruction detail page (future) pass it through.
+    sink.Get("/fragments/executions",
+        [auth_fn, execution_tracker, instruction_store](const httplib::Request& req,
+                                                        httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -45,44 +94,421 @@ void WorkflowRoutes::register_routes(
 
             ExecutionQuery q;
             q.limit = 50;
+            if (req.has_param("definition_id")) {
+                q.definition_id = req.get_param_value("definition_id");
+            }
             auto execs = execution_tracker->query_executions(q);
             std::string html;
             if (execs.empty()) {
                 html = "<div class=\"empty-state\">No executions yet.</div>";
-            } else {
-                html = "<table><thead><tr><th>ID</th><th>Status</th><th>Progress</"
-                       "th><th>Dispatched By</th><th>Time</th></tr></thead><tbody>";
-                for (const auto& e : execs) {
-                    auto pct =
-                        e.agents_targeted > 0 ? (e.agents_responded * 100 / e.agents_targeted) : 0;
-                    auto status_cls = "status-" + e.status;
-                    html += "<tr><td><code style=\"font-size:0.7rem\">" +
-                            html_escape(e.id.substr(0, 12)) +
-                            "</code></td>"
-                            "<td><span class=\"status-badge " +
-                            status_cls + "\">" + html_escape(e.status) +
-                            "</span></td>"
-                            "<td><div class=\"progress-bar\"><div class=\"progress-fill\" "
-                            "style=\"width:" +
-                            std::to_string(pct) +
-                            "%\"></div></div>"
-                            "<span style=\"font-size:0.65rem\">" +
-                            std::to_string(e.agents_responded) + "/" +
-                            std::to_string(e.agents_targeted) +
-                            "</span></td>"
-                            "<td>" +
-                            html_escape(e.dispatched_by) +
-                            "</td>"
-                            "<td style=\"font-size:0.7rem\">" +
-                            std::to_string(e.dispatched_at) + "</td></tr>";
-                }
-                html += "</tbody></table>";
+                res.set_content(html, "text/html; charset=utf-8");
+                return;
             }
+
+            const int64_t now = now_epoch_seconds();
+            html = "<table class=\"exec-table\"><thead><tr>"
+                   "<th>Status</th>"
+                   "<th>Definition</th>"
+                   "<th>Fan-out</th>"
+                   "<th>Agents</th>"
+                   "<th>Result preview</th>"
+                   "<th>Dispatched by</th>"
+                   "<th>Time</th>"
+                   "</tr></thead><tbody>";
+
+            for (const auto& e : execs) {
+                // Status hue + row stripe.
+                std::string row_class = "exec-row exec-row--" + e.status;
+                std::string status_cls = "status-" + e.status;
+
+                // Fan-out counts. The list-view bar shows succeeded / failed /
+                // pending — running is folded into pending here because
+                // agents_responded only counts terminal statuses; PR 1.4's
+                // detail drawer queries per-agent statuses and shows the full
+                // 4-bucket breakdown.
+                int succeeded = e.agents_success;
+                int failed = e.agents_failure;
+                int responded = e.agents_responded;
+                int targeted = e.agents_targeted;
+                int pending = targeted > responded ? (targeted - responded) : 0;
+                int running = 0; // distinguishable only in the detail drawer
+
+                // Definition name (or fallback to truncated id).
+                std::string def_label;
+                std::string def_title;
+                if (instruction_store && instruction_store->is_open() &&
+                    !e.definition_id.empty()) {
+                    auto def = instruction_store->get_definition(e.definition_id);
+                    if (def && !def->name.empty()) {
+                        def_label = def->name;
+                        def_title = e.definition_id;
+                    }
+                }
+                if (def_label.empty()) {
+                    def_label = e.definition_id.empty()
+                                    ? std::string{"<unknown>"}
+                                    : e.definition_id.substr(0, 12);
+                    def_title = e.definition_id;
+                }
+
+                std::string first_error;
+                if (failed > 0 && !e.last_error_detail.empty()) {
+                    first_error = truncate_utf8(e.last_error_detail, 80);
+                }
+
+                std::string time_iso = format_iso_utc(e.dispatched_at);
+                std::string time_rel = format_relative_time(e.dispatched_at, now);
+
+                html += "<tr class=\"" + row_class +
+                        "\" tabindex=\"0\" "
+                        "onclick=\"toggleExecDetail(this)\" "
+                        "onkeydown=\"if(event.key==='Enter'||event.key===' ')"
+                        "{event.preventDefault();toggleExecDetail(this);}\" "
+                        "hx-get=\"/fragments/executions/" +
+                        html_escape(e.id) +
+                        "/detail\" "
+                        "hx-target=\"next .exec-detail-content\" "
+                        "hx-trigger=\"click once\" "
+                        "hx-swap=\"innerHTML\">";
+                html += "<td><span class=\"status-badge " + status_cls + "\">" +
+                        html_escape(e.status) + "</span></td>";
+                html += "<td><span class=\"exec-def-name\" title=\"" +
+                        html_escape(def_title) + "\">" + html_escape(def_label) +
+                        "</span></td>";
+                html += "<td>" + render_status_sparkbar(succeeded, failed, running, pending) +
+                        "</td>";
+                html += "<td class=\"exec-agent-count\">" + std::to_string(succeeded) + "/" +
+                        std::to_string(failed) + " of " + std::to_string(targeted) + "</td>";
+                html += "<td class=\"exec-error-preview\" title=\"" +
+                        html_escape(e.last_error_detail) + "\">" + html_escape(first_error) +
+                        "</td>";
+                html += "<td>" + html_escape(e.dispatched_by) + "</td>";
+                html += "<td class=\"exec-time\" title=\"" + html_escape(time_iso) + "\">" +
+                        html_escape(time_rel) + "</td>";
+                html += "</tr>";
+
+                // Empty drawer placeholder; HTMX targets the inner div on first
+                // click. CSS hides this row until JS toggles `.exec-detail.open`.
+                html += "<tr class=\"exec-detail\"><td colspan=\"7\">"
+                        "<div class=\"exec-detail-content\">"
+                        "<div class=\"empty-state\">Loading…</div>"
+                        "</div></td></tr>";
+            }
+            html += "</tbody></table>";
+            res.set_content(html, "text/html; charset=utf-8");
+        });
+
+    // GET /fragments/executions/{id}/detail -- per-execution detail drawer.
+    //
+    // Information design:
+    //   - KPI strip (top): Total, Succeeded, Failed, p50, p95 — primary scan
+    //     target. p50/p95 fall back to "—" if any agent is still running.
+    //   - Agent grid: one CSS-grid cell per agent, colored by status. Small
+    //     multiples for fan-out — discloses cluster-of-failures patterns that
+    //     a 200-row table never could. Bucketed into deciles when fan-out
+    //     exceeds 1024 to keep the DOM tractable.
+    //   - Per-agent table: failed-first, then duration DESC. Inline
+    //     server-rendered horizontal duration bars scaled to the slowest
+    //     agent in this run so tail-latency outliers pop visually.
+    //   - Responses: collapsed by default (<details>) so opening a drawer
+    //     doesn't dump 500 rows. Long output rows collapse individually.
+    //   - Sidebar: definition + scope + parameters + dispatched_by/at —
+    //     reference data, not scan data.
+    //
+    // RBAC: Read on Execution. Same securable as MCP `get_execution_status`.
+    // Correlation with responses uses the timestamp+agent join (PR 2 swaps
+    // to exact `execution_id` correlation transparently).
+    sink.Get(R"(/fragments/executions/([A-Za-z0-9_-]+)/detail)",
+        [auth_fn, perm_fn, execution_tracker, instruction_store,
+         response_store](const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "Execution", "Read"))
+                return;
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content("<div class=\"empty-state\">Tracker not available</div>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            auto exec_id = req.matches[1].str();
+            auto exec_opt = execution_tracker->get_execution(exec_id);
+            if (!exec_opt) {
+                res.status = 404;
+                res.set_content("<div class=\"empty-state\">Execution not found</div>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            const auto& exec = *exec_opt;
+            auto agents = execution_tracker->get_agent_statuses(exec_id);
+
+            // -- Definition lookup -------------------------------------------
+            std::string def_name = exec.definition_id;
+            if (instruction_store && instruction_store->is_open() &&
+                !exec.definition_id.empty()) {
+                if (auto def = instruction_store->get_definition(exec.definition_id);
+                    def && !def->name.empty()) {
+                    def_name = def->name;
+                }
+            }
+
+            // -- Per-agent metrics: bucket counts + duration vector ----------
+            int succeeded = 0, failed = 0, running = 0, pending = 0;
+            int64_t max_dur_ms = 0;
+            std::vector<int64_t> durations_ms;
+            durations_ms.reserve(agents.size());
+            bool any_running = false;
+            for (const auto& a : agents) {
+                if (a.status == "success") ++succeeded;
+                else if (a.status == "failure" || a.status == "timeout" ||
+                         a.status == "rejected") ++failed;
+                else if (a.status == "running") { ++running; any_running = true; }
+                else ++pending;
+
+                int64_t dispatched = a.dispatched_at;
+                int64_t completed = a.completed_at;
+                if (dispatched > 0 && completed > dispatched) {
+                    int64_t dur = (completed - dispatched) * 1000; // → ms
+                    durations_ms.push_back(dur);
+                    if (dur > max_dur_ms) max_dur_ms = dur;
+                }
+            }
+
+            // -- KPI strip ---------------------------------------------------
+            auto fmt_pct = [&](double p) -> std::string {
+                if (any_running || durations_ms.empty()) return std::string{"—"};
+                std::vector<int64_t> sorted = durations_ms;
+                std::sort(sorted.begin(), sorted.end());
+                std::size_t idx = static_cast<std::size_t>(p * (sorted.size() - 1));
+                if (idx >= sorted.size()) idx = sorted.size() - 1;
+                int64_t v = sorted[idx];
+                if (v < 1000) return std::format("{} ms", v);
+                if (v < 60000) return std::format("{:.1f} s", v / 1000.0);
+                return std::format("{}m {}s", v / 60000, (v % 60000) / 1000);
+            };
+
+            std::string html;
+            html.reserve(8192);
+            html += "<div class=\"exec-detail-grid\">";
+
+            // KPI strip
+            html += "<div class=\"exec-kpi-strip\">";
+            html += std::format(
+                "<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
+                "<div class=\"exec-kpi-label\">Total</div></div>",
+                exec.agents_targeted);
+            html += std::format(
+                "<div class=\"exec-kpi\"><div class=\"exec-kpi-value exec-kpi-value--ok\">{}</div>"
+                "<div class=\"exec-kpi-label\">Succeeded</div></div>",
+                succeeded);
+            html += std::format(
+                "<div class=\"exec-kpi\"><div class=\"exec-kpi-value exec-kpi-value--err\">{}</div>"
+                "<div class=\"exec-kpi-label\">Failed</div></div>",
+                failed);
+            html += std::format(
+                "<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
+                "<div class=\"exec-kpi-label\">p50 duration</div></div>",
+                fmt_pct(0.5));
+            html += std::format(
+                "<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
+                "<div class=\"exec-kpi-label\">p95 duration</div></div>",
+                fmt_pct(0.95));
+            html += "</div>";
+
+            // -- Agent grid (small multiples) -------------------------------
+            html += "<div class=\"agent-grid-wrap\">";
+            html += "<h4>Agent fan-out</h4>";
+            html += "<div class=\"agent-grid\" id=\"agent-grid-" + html_escape(exec.id) +
+                    "\">";
+
+            constexpr std::size_t kBucketThreshold = 1024;
+            if (agents.size() > kBucketThreshold) {
+                // Decile bucketing — render 10 buckets per status.
+                // Keeps DOM bounded for huge fan-outs while preserving the
+                // proportional-area read.
+                struct Bucket { int succeeded{0}, failed{0}, running{0}, pending{0}; };
+                Bucket buckets[10] = {};
+                for (std::size_t i = 0; i < agents.size(); ++i) {
+                    std::size_t b = i * 10 / agents.size();
+                    if (b >= 10) b = 9;
+                    const auto& a = agents[i];
+                    if (a.status == "success") ++buckets[b].succeeded;
+                    else if (a.status == "failure" || a.status == "timeout" ||
+                             a.status == "rejected") ++buckets[b].failed;
+                    else if (a.status == "running") ++buckets[b].running;
+                    else ++buckets[b].pending;
+                }
+                for (int i = 0; i < 10; ++i) {
+                    const auto& b = buckets[i];
+                    int total = b.succeeded + b.failed + b.running + b.pending;
+                    const char* dom_status =
+                        b.failed > 0 ? "failed"
+                                     : b.running > 0 ? "running"
+                                                     : b.pending > b.succeeded ? "pending"
+                                                                                : "succeeded";
+                    auto label = std::format(
+                        "Decile {}: {} succeeded / {} failed / {} running / {} pending",
+                        i + 1, b.succeeded, b.failed, b.running, b.pending);
+                    html += std::format(
+                        "<div class=\"agent-cell agent-cell--bucket agent-cell--{}\" "
+                        "title=\"{}\" aria-label=\"{}\">{}</div>",
+                        dom_status, html_escape(label), html_escape(label), total);
+                }
+            } else {
+                for (const auto& a : agents) {
+                    std::string dom_status;
+                    if (a.status == "success") dom_status = "succeeded";
+                    else if (a.status == "failure" || a.status == "timeout" ||
+                             a.status == "rejected") dom_status = "failed";
+                    else if (a.status == "running") dom_status = "running";
+                    else dom_status = "pending";
+
+                    int64_t dur_ms = 0;
+                    if (a.dispatched_at > 0 && a.completed_at > a.dispatched_at) {
+                        dur_ms = (a.completed_at - a.dispatched_at) * 1000;
+                    }
+                    auto title = std::format("{} · {} · {} ms",
+                                              a.agent_id, a.status, dur_ms);
+                    html += std::format(
+                        "<div class=\"agent-cell agent-cell--{}\" "
+                        "title=\"{}\" aria-label=\"{}\" data-agent-id=\"{}\" "
+                        "onclick=\"scrollToAgentRow(event, '{}', '{}')\"></div>",
+                        dom_status, html_escape(title), html_escape(title),
+                        html_escape(a.agent_id), html_escape(exec.id),
+                        html_escape(a.agent_id));
+                }
+            }
+            html += "</div></div>"; // agent-grid + agent-grid-wrap
+
+            // -- Per-agent table (failed first, then duration DESC) ----------
+            html += "<div class=\"per-agent-table-wrap\">";
+            html += "<h4>Agent results</h4>";
+            html += "<table class=\"per-agent-table\"><thead><tr>"
+                    "<th>Agent</th><th>Status</th><th>Exit</th><th>Duration</th>"
+                    "<th>Error</th></tr></thead><tbody>";
+
+            std::vector<AgentExecStatus> sorted_agents = agents;
+            std::sort(sorted_agents.begin(), sorted_agents.end(),
+                      [](const AgentExecStatus& l, const AgentExecStatus& r) {
+                          auto rank = [](const std::string& s) {
+                              if (s == "failure" || s == "timeout" || s == "rejected") return 0;
+                              if (s == "running") return 1;
+                              if (s == "pending") return 2;
+                              return 3; // success last
+                          };
+                          int rl = rank(l.status), rr = rank(r.status);
+                          if (rl != rr) return rl < rr;
+                          int64_t dl = (l.dispatched_at > 0 && l.completed_at > l.dispatched_at)
+                                            ? (l.completed_at - l.dispatched_at) : -1;
+                          int64_t dr = (r.dispatched_at > 0 && r.completed_at > r.dispatched_at)
+                                            ? (r.completed_at - r.dispatched_at) : -1;
+                          return dl > dr;
+                      });
+
+            for (const auto& a : sorted_agents) {
+                std::string dom_status;
+                std::string status_cls = "status-" + a.status;
+                if (a.status == "success") dom_status = "succeeded";
+                else if (a.status == "failure" || a.status == "timeout" ||
+                         a.status == "rejected") dom_status = "failed";
+                else if (a.status == "running") dom_status = "running";
+                else dom_status = "pending";
+
+                int64_t dur_ms = 0;
+                if (a.dispatched_at > 0 && a.completed_at > a.dispatched_at) {
+                    dur_ms = (a.completed_at - a.dispatched_at) * 1000;
+                }
+                auto err_short = truncate_utf8(a.error_detail, 120);
+
+                html += std::format(
+                    "<tr id=\"per-agent-row-{}-{}\"><td><code>{}</code></td>",
+                    html_escape(exec.id), html_escape(a.agent_id),
+                    html_escape(a.agent_id));
+                html += "<td><span class=\"status-badge " + status_cls + "\">" +
+                        html_escape(a.status) + "</span></td>";
+                html += "<td>" + std::to_string(a.exit_code) + "</td>";
+                html += "<td>" + render_duration_bar_html(dur_ms, max_dur_ms, dom_status) +
+                        std::format(" <span class=\"duration-text\">{} ms</span>", dur_ms) +
+                        "</td>";
+                html += "<td title=\"" + html_escape(a.error_detail) + "\">" +
+                        html_escape(err_short) + "</td></tr>";
+            }
+            html += "</tbody></table></div>";
+
+            // -- Responses (collapsed) ---------------------------------------
+            html += "<div class=\"per-agent-responses-wrap\">";
+            if (response_store && response_store->is_open()) {
+                ResponseQuery rq;
+                rq.since = exec.dispatched_at;
+                rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();
+                rq.limit = 500;
+                auto responses = response_store->query(exec.definition_id, rq);
+                // Filter to agents that appear in this execution's status set.
+                std::unordered_map<std::string, bool> in_set;
+                in_set.reserve(agents.size());
+                for (const auto& a : agents) in_set[a.agent_id] = true;
+                std::vector<StoredResponse> filtered;
+                filtered.reserve(responses.size());
+                for (auto& r : responses) {
+                    if (in_set.count(r.agent_id))
+                        filtered.push_back(std::move(r));
+                }
+
+                html += std::format(
+                    "<details class=\"per-agent-responses\">"
+                    "<summary>Show responses ({})</summary>",
+                    filtered.size());
+                if (filtered.empty()) {
+                    html += "<div class=\"empty-state\">No responses recorded.</div>";
+                } else {
+                    html += "<table class=\"per-agent-responses-table\"><thead><tr>"
+                            "<th>Agent</th><th>Time</th><th>Status</th><th>Output</th>"
+                            "<th>Error</th></tr></thead><tbody>";
+                    for (const auto& r : filtered) {
+                        html += "<tr><td><code>" + html_escape(r.agent_id) + "</code></td>";
+                        html += "<td title=\"" + format_iso_utc(r.timestamp) + "\">" +
+                                format_iso_utc(r.timestamp) + "</td>";
+                        html += "<td>" + std::to_string(r.status) + "</td>";
+                        html += "<td><details class=\"resp-output\"><summary>output</summary>"
+                                "<pre>" + html_escape(r.output) + "</pre></details></td>";
+                        html += "<td>" + html_escape(r.error_detail) + "</td></tr>";
+                    }
+                    html += "</tbody></table>";
+                }
+                html += "</details>";
+            } else {
+                html += "<div class=\"empty-state\">Response store not available.</div>";
+            }
+            html += "</div>";
+
+            // -- Sidebar metadata --------------------------------------------
+            html += "<aside class=\"exec-detail-sidebar\">";
+            html += "<h4>Definition</h4><div>" + html_escape(def_name) + "</div>"
+                    "<div class=\"exec-detail-meta-id\"><code>" +
+                    html_escape(exec.definition_id) + "</code></div>";
+            html += "<h4>Dispatched by</h4><div>" + html_escape(exec.dispatched_by) +
+                    "</div>";
+            html += "<h4>Dispatched at</h4><div>" + html_escape(format_iso_utc(exec.dispatched_at)) +
+                    "</div>";
+            html += "<h4>Completed at</h4><div>" + html_escape(format_iso_utc(exec.completed_at)) +
+                    "</div>";
+            if (!exec.scope_expression.empty()) {
+                html += "<h4>Scope</h4><code class=\"exec-detail-scope\">" +
+                        html_escape(exec.scope_expression) + "</code>";
+            }
+            if (!exec.parameter_values.empty()) {
+                html += "<h4>Parameters</h4><pre class=\"exec-detail-params\">" +
+                        html_escape(exec.parameter_values) + "</pre>";
+            }
+            html += "</aside>";
+
+            html += "</div>"; // exec-detail-grid
             res.set_content(html, "text/html; charset=utf-8");
         });
 
     // GET /fragments/schedules -- schedule list HTMX fragment
-    svr.Get("/fragments/schedules",
+    sink.Get("/fragments/schedules",
         [auth_fn, schedule_engine](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
@@ -129,7 +555,7 @@ void WorkflowRoutes::register_routes(
     // -- Scope estimate API ----------------------------------------------------
 
     // POST /api/scope/estimate -- scope expression target count
-    svr.Post("/api/scope/estimate",
+    sink.Post("/api/scope/estimate",
         [auth_fn, scope_fn](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
@@ -167,7 +593,7 @@ void WorkflowRoutes::register_routes(
     // -- Workflow Engine API (Phase 7) -----------------------------------------
 
     // GET /api/workflows -- list all workflows
-    svr.Get("/api/workflows",
+    sink.Get("/api/workflows",
         [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Read"))
                 return;
@@ -216,7 +642,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // POST /api/workflows -- create workflow from YAML
-    svr.Post("/api/workflows",
+    sink.Post("/api/workflows",
         [perm_fn, audit_fn, emit_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Write"))
                 return;
@@ -256,7 +682,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // GET /api/workflows/:id -- get workflow detail
-    svr.Get(R"(/api/workflows/([^/]+))",
+    sink.Get(R"(/api/workflows/([^/]+))",
         [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Read"))
                 return;
@@ -299,7 +725,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // DELETE /api/workflows/:id -- delete workflow
-    svr.Delete(R"(/api/workflows/([^/]+))",
+    sink.Delete(R"(/api/workflows/([^/]+))",
         [perm_fn, audit_fn, emit_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Delete"))
                 return;
@@ -321,7 +747,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // POST /api/workflows/:id/execute -- execute workflow against agents
-    svr.Post(R"(/api/workflows/([^/]+)/execute)",
+    sink.Post(R"(/api/workflows/([^/]+)/execute)",
         [auth_fn, perm_fn, audit_fn, emit_fn, workflow_engine, instruction_store,
          cmd_dispatch, approval_manager](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -477,7 +903,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // GET /api/workflow-executions/:id -- get execution status
-    svr.Get(R"(/api/workflow-executions/([^/]+))",
+    sink.Get(R"(/api/workflow-executions/([^/]+))",
         [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Workflow", "Read"))
                 return;
@@ -522,7 +948,7 @@ void WorkflowRoutes::register_routes(
     // -- Single Instruction Execution API --------------------------------------
 
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
-    svr.Post(R"(/api/instructions/([^/]+)/execute)",
+    sink.Post(R"(/api/instructions/([^/]+)/execute)",
         [auth_fn, perm_fn, audit_fn, emit_fn, instruction_store, cmd_dispatch,
          execution_tracker, approval_manager](
             const httplib::Request& req, httplib::Response& res) {
@@ -675,7 +1101,7 @@ void WorkflowRoutes::register_routes(
     // -- Product Pack API (Phase 7) -------------------------------------------
 
     // GET /api/product-packs -- list installed product packs
-    svr.Get("/api/product-packs",
+    sink.Get("/api/product-packs",
         [perm_fn, product_pack_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ProductPack", "Read"))
                 return;
@@ -721,7 +1147,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // POST /api/product-packs -- install product pack from YAML bundle
-    svr.Post("/api/product-packs",
+    sink.Post("/api/product-packs",
         [perm_fn, audit_fn, emit_fn, product_pack_store, instruction_store, policy_store,
          workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ProductPack", "Write"))
@@ -814,7 +1240,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // GET /api/product-packs/:id -- get product pack detail
-    svr.Get(R"(/api/product-packs/([^/]+))",
+    sink.Get(R"(/api/product-packs/([^/]+))",
         [perm_fn, product_pack_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ProductPack", "Read"))
                 return;
@@ -854,7 +1280,7 @@ void WorkflowRoutes::register_routes(
         });
 
     // DELETE /api/product-packs/:id -- uninstall product pack
-    svr.Delete(R"(/api/product-packs/([^/]+))",
+    sink.Delete(R"(/api/product-packs/([^/]+))",
         [perm_fn, audit_fn, emit_fn, product_pack_store, instruction_store, policy_store,
          workflow_engine](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ProductPack", "Delete"))

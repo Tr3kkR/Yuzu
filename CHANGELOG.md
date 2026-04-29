@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Instructions → Executions tab — clickable history + per-execution drawer
+  (PR 1 of executions-history ladder).**
+  The Executions tab is no longer a flat text list. Each row carries a
+  4-segment SVG status sparkbar (succeeded / failed / running / pending —
+  length encodes count, hue encodes status, widths sum to exactly 120 px
+  with rounding residue absorbed by the last non-zero segment), the
+  resolved definition name (with id-prefix fallback), relative time in
+  the cell with ISO-8601 UTC in `title=` for forensic copy/paste, a
+  3 px error-color left stripe on failed rows, and — for failed rows —
+  a UTF-8-safe 80-char truncation of the most recent agent error
+  populated via a gated correlated subquery on `executions` (zero query
+  cost when `agents_failure == 0`). Clicking a row lazy-loads
+  `/fragments/executions/{id}/detail` once via HTMX `hx-trigger="click once"`
+  and expands an inline drawer beneath. The drawer is laid out as four
+  scan-tiers in priority order: a KPI strip (Total / Succeeded / Failed /
+  p50 / p95 duration; "—" when any agent is still running), a
+  CSS-grid agent fan-out as small multiples (12×12 px cells colored by
+  status; bucketed into deciles when `agents_targeted > 1024` so a
+  10 000-agent execution doesn't ship 10 000 DOM nodes), a per-agent
+  table sorted failed-first then by duration descending with an inline
+  server-rendered duration bar scaled to the slowest agent in this run,
+  and a `<details>`-collapsed responses section so opening a drawer
+  doesn't dump 500 rows. Single-drawer-open invariant: clicking row B
+  collapses row A's drawer first; keyboard reach via `tabindex="0"` and
+  Enter/Space. RBAC: detail handler requires `Read` on `Execution`.
+  Information-design discipline: every status conveyed by two channels
+  (color + icon/text/shape) for WCAG + colorblind safety; SVG widgets
+  carry `role="img"` + descriptive `aria-label` with child `<rect>`
+  elements `aria-hidden`; no JS chart library on this surface
+  (server-rendered SVG/CSS only, ECharts reserved for the genuinely
+  interactive Response Visualization Engine in #253). The previously
+  ignored `definition_id` query param now filters the list. New web
+  helpers in `web_utils.hpp`: `render_status_sparkbar`,
+  `render_duration_bar_html`, `format_iso_utc`, `format_relative_time`,
+  `now_epoch_seconds`, `truncate_utf8` — all pure, header-only,
+  unit-tested. `WorkflowRoutes::register_routes` gains an `HttpRouteSink&`
+  overload (matching `SettingsRoutes` / `RestApiV1`) so future executions
+  PRs (live SSE updates, comparison view, pagination) can be unit-tested
+  in-process without httplib's TSan-hostile acceptor thread (#438).
+
 - **Yuzu design tokens + dark navy palette (dashboard re-skin).**
   91 `--mds-*` CSS custom properties (color / spacing / type / state /
   elevation / indicator) layered into `kYuzuCss`; legacy aliases
