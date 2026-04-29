@@ -519,6 +519,19 @@ TEST_CASE("InstructionStore: empty id still gets generated UUID with no conflict
 // import_definition_json and create_set MUST return kConflictPrefix-
 // prefixed errors on duplicate id; substring matches like "already exists"
 // are NOT the contract.
+TEST_CASE("InstructionStore: kConflictPrefix has the documented literal value",
+          "[instruction_store][duplicate]") {
+    // Pin the LITERAL VALUE, not just the identifier. Governance Gate 4
+    // UP-11: a future refactor that "fixes" the constant from "conflict:"
+    // to e.g. "already exists:" would move both the producer (store) and
+    // every consumer-side find(kConflictPrefix) test in lock-step, leaving
+    // no test failure — but the auto-import loop in server.cpp also uses
+    // is_conflict_error() and would silently regress if a third consumer
+    // used a substring match. Pinning the literal here is the only way to
+    // detect a constant rename that drops the documented prefix shape.
+    CHECK(std::string_view(kConflictPrefix) == "conflict:");
+}
+
 TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPrefix",
           "[instruction_store][duplicate][import]") {
     InstructionStore store(":memory:");
@@ -538,6 +551,7 @@ TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPref
 
     auto second = store.import_definition_json(envelope);
     REQUIRE_FALSE(second.has_value());
+    INFO("actual error: " << second.error());  // Catch2 prints only on failure
     CHECK(is_conflict_error(second.error()));  // contract for boot-time auto-import
     CHECK(second.error().find(kConflictPrefix) == 0);
 }
@@ -561,6 +575,7 @@ TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
     // — the boot-time auto-import substring-matched "already exists" and
     // miscounted every reboot's bundled sets as `errored`. Pin the
     // kConflictPrefix contract so a future refactor cannot regress it.
+    INFO("actual error: " << second.error());  // Catch2 prints only on failure
     CHECK(is_conflict_error(second.error()));
     CHECK(second.error().find(kConflictPrefix) == 0);
 }
