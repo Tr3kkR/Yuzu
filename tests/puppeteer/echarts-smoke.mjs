@@ -2,8 +2,15 @@
 // the Yuzu adapter are on window, calls YuzuCharts.render() against a
 // synthetic chart payload of every supported type, and verifies that
 // each chart-card host element contains a <canvas> the renderer drew.
+//
+// Failure modes that this regression net catches (governance Gate 4):
+//   UP-1  empty Momentum-token resolution → asserted non-empty below
+//   UP-15 in-page JS error mid-render → trapped via pageerror
+//   UP-3  blank-canvas-passes-OK → still partially open; canvas dimensions
+//         alone don't prove rendering happened. Pixel-content check is a
+//         separate follow-up.
+//   QA-S4 wall-clock dependency → replaced with waitForFunction below
 import puppeteer from 'puppeteer';
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
   const browser = await puppeteer.launch({
@@ -12,17 +19,30 @@ async function main() {
     defaultViewport: { width: 1400, height: 900 },
   });
   const page = await browser.newPage();
-  page.on('pageerror', err => console.log('[pageerror]', err.message));
+
+  // UP-15: page-level JS errors must fail the test, not just log. Any
+  // uncaught exception during init / render proves the adapter is
+  // broken; we collect them and assert empty at the end so a single
+  // bad payload doesn't hide downstream errors.
+  const pageErrors = [];
+  page.on('pageerror', err => { pageErrors.push(err.message); console.log('[pageerror]', err.message); });
   page.on('console', msg => {
     if (msg.type() === 'error') console.log('[console.error]', msg.text());
   });
 
-  await page.goto('http://localhost:8080/login', { waitUntil: 'networkidle2' });
+  await page.goto('http://localhost:8080/login', { waitUntil: 'networkidle2', timeout: 15000 });
   await page.type('input[name="username"]', 'admin');
   await page.type('input[name="password"]', 'YuzuUatAdmin1!');
   await page.click('button[type="submit"]');
-  await page.waitForNavigation({ waitUntil: 'networkidle2' });
-  await sleep(800);
+  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+
+  // QA-S4: wait for the adapter to finish booting deterministically
+  // rather than wall-clock-sleeping. ECharts and YuzuCharts globals
+  // are populated by the inline scripts in dashboard.html.
+  await page.waitForFunction(
+    () => typeof window.echarts === 'object' && typeof window.YuzuCharts === 'object',
+    { timeout: 15000 }
+  );
 
   // Confirm ECharts loaded
   const ec = await page.evaluate(() => ({
@@ -100,7 +120,11 @@ async function main() {
     if (!ok) allOk = false;
   }
 
-  // Snapshot of resolved Momentum tokens — confirms the bridge works
+  // Snapshot of resolved Momentum tokens — confirms the bridge works.
+  // UP-1: assert each token resolves non-empty. If yuzu.css fails to
+  // load or the :root token block is dropped, every value comes back
+  // as the empty string and the chart palette silently falls through
+  // to ECharts defaults. We refuse to pass in that state.
   const tokens = await page.evaluate(() => {
     const cs = getComputedStyle(document.documentElement);
     const keys = ['--mds-color-chart-1','--mds-color-chart-2','--mds-color-chart-3',
@@ -110,10 +134,21 @@ async function main() {
     return Object.fromEntries(keys.map(k => [k, cs.getPropertyValue(k).trim()]));
   });
   console.log('  resolved Momentum tokens:');
-  for (const [k, v] of Object.entries(tokens)) console.log(`    ${k} = ${v}`);
+  let tokensOk = true;
+  for (const [k, v] of Object.entries(tokens)) {
+    console.log(`    ${k} = ${v || '(empty!)'}`);
+    if (!v) tokensOk = false;
+  }
 
   await browser.close();
-  if (!allOk) { console.log('FAIL'); process.exit(1); }
+
+  // UP-15: pageerror trap surfaces as a fail, not just logs.
+  if (pageErrors.length > 0) {
+    console.log(`FAIL: ${pageErrors.length} page-level JS error(s) during run`);
+    process.exit(1);
+  }
+  if (!tokensOk) { console.log('FAIL: one or more Momentum tokens resolved empty'); process.exit(1); }
+  if (!allOk)    { console.log('FAIL: at least one chart did not render'); process.exit(1); }
   console.log('PASS');
 }
 

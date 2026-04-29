@@ -168,17 +168,35 @@ TEST_CASE("static_js_bundle: kEChartsJs starts with the Apache license header",
                ContainsSubstring("Licensed to the Apache Software Foundation"));
 }
 
-TEST_CASE("static_js_bundle: kEChartsJs exposes the global echarts object",
+TEST_CASE("static_js_bundle: kEChartsJs exposes the global echarts API",
           "[static-js][echarts]") {
-    // The minified bundle assigns to global `echarts` and exports `init`.
-    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("echarts"));
-    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("init"));
+    // ContainsSubstring("init") alone is too generic (every minified JS
+    // contains the substring) — governance Gate 4 UP-8. The minifier
+    // renames public methods, so `echarts.init` doesn't appear literally
+    // in the bundle. Pin two ECharts-unique tokens instead:
+    //   * the UMD wrapper assignment that exposes the global
+    //   * the internal property name used by getInstanceByDom (lib-unique)
+    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring(".echarts={})"));
+    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("echarts_instance_"));
 }
 
-TEST_CASE("static_js_bundle: kEChartsJs has no embedded NULs or stray delimiter",
+TEST_CASE("static_js_bundle: kEChartsJs is the expected vendored version",
+          "[static-js][echarts]") {
+    // Pin the upstream version string so a silent vendor swap to a newer
+    // minor (5.7.x) that happens to match the byte count fails LOUD
+    // (governance Gate 4 UP-5 / QA-N2).
+    CHECK_THAT(yuzu::server::kEChartsJs, ContainsSubstring("5.6.0"));
+}
+
+TEST_CASE("static_js_bundle: kEChartsJs has no embedded NULs",
           "[static-js][echarts]") {
     CHECK(yuzu::server::kEChartsJs.find('\0') == std::string::npos);
-    CHECK(yuzu::server::kEChartsJs.find(")ECHARTSEMBED\"") == std::string::npos);
+    // A stray `)ECHARTSEMBED"` close-delimiter cannot appear at runtime —
+    // raw-string literal grammar consumes it at compile time, and
+    // embed_js.py's collision check at build time refuses to emit if the
+    // input bytes contain it. The runtime check that earlier sat here
+    // was therefore tautological (governance Gate 6 SRE-1). Build-time
+    // protection is at server/core/scripts/embed_js.py.
 }
 
 // ── Inter variable webfont (woff2 binary) ───────────────────────────────────
@@ -220,10 +238,11 @@ TEST_CASE("static_js_bundle: kYuzuCss carries the Momentum token layer",
     CHECK_THAT(yuzu::server::kYuzuCss, ContainsSubstring("'Inter'"));
 }
 
-TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs or stray delimiter",
+TEST_CASE("static_js_bundle: kYuzuCss has no embedded NULs",
           "[static-js][yuzu-css]") {
     CHECK(yuzu::server::kYuzuCss.find('\0') == std::string::npos);
-    CHECK(yuzu::server::kYuzuCss.find(")ECHARTSEMBED\"") == std::string::npos);
+    // (See kEChartsJs counterpart — stray-delimiter check is tautological
+    // at runtime; build-time guard in embed_js.py is the real protection.)
 }
 
 // ── Yuzu chart adapter (kYuzuChartsJs) ──────────────────────────────────────
