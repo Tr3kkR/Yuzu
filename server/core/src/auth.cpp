@@ -67,6 +67,8 @@ std::vector<uint8_t> AuthManager::hex_to_bytes(const std::string& hex) {
 std::string AuthManager::pbkdf2_sha256(const std::string& password,
                                        const std::vector<uint8_t>& salt, int iterations) {
     constexpr int kKeyLen = 32; // SHA-256 output
+    constexpr int kMinIterations = 210'000;
+    iterations = std::max(iterations, kMinIterations);
     std::vector<uint8_t> derived(kKeyLen);
 
 #ifdef _WIN32
