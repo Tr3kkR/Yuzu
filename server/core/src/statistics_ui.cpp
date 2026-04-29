@@ -14,20 +14,20 @@ const char* const kStatisticsHtml = R"html(<!DOCTYPE html>
 <link rel="stylesheet" href="/static/yuzu.css">
 <script src="/static/htmx.js"></script>
 <style>
-:root{--fg:#e0e0e0;--bg:#1a1a2e;--surface:#16213e;--border:#334155;--accent:#0f7dff;--green:#22c55e;--red:#ef4444;--yellow:#eab308}
+/* Inherits Momentum tokens from /static/yuzu.css — no local :root override. */
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;padding:1.5rem}
+body{background:var(--bg);color:var(--fg);font-family:var(--mds-font-family-default);padding:1.5rem}
 h1{font-size:1.4rem;margin-bottom:1rem}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1rem}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem}
 .card h2{font-size:.95rem;margin-bottom:.5rem;color:var(--accent)}
 .big-num{font-size:2.2rem;font-weight:700}
-.sub-text{font-size:.8rem;color:#94a3b8;margin-top:2px}
+.sub-text{font-size:.8rem;color:var(--mds-color-theme-text-tertiary);margin-top:2px}
 .bar{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:.5rem}
 .bar-fill{height:100%;border-radius:4px;transition:width .3s}
 .bar-green{background:var(--green)}.bar-yellow{background:var(--yellow)}.bar-red{background:var(--red)}
 table{width:100%;border-collapse:collapse;margin-top:.5rem;font-size:.85rem}
-th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:#94a3b8;font-weight:500}
+th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);color:var(--mds-color-theme-text-tertiary);font-weight:500}
 td{padding:6px 8px;border-bottom:1px solid var(--border)}
 a.back{color:var(--accent);text-decoration:none;font-size:.9rem}
 </style>

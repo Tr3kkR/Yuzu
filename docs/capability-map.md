@@ -1067,9 +1067,9 @@ Not implemented. Per-product compliance summary with drill-down to device-level 
 
 *Chart rendering, data processing, and template management for instruction responses.*
 
-### 28.1 Response Visualization Engine :x: `T2`
+### 28.1 Response Visualization Engine :white_check_mark: `T2`
 
-Not implemented. Server-side data transformation with built-in processors (SingleSeries, MultiSeries, DateTimeSeries). Chart types: Pie, Bar, Column, Line, Area. Configured via `spec.visualization` in InstructionDefinition YAML.
+Implemented. Server-side data transformation with built-in processors (`single_series`, `multi_series`, `datetime_series`) and an optional row pre-filter (`whereField` / `whereEquals`). Chart types: pie, bar, column, line, area. Configured via `spec.visualization` (singular) or `spec.visualizations` (plural for multi-chart). REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Renderer is Apache ECharts 5 (vendored at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that reads Cisco Momentum `--mds-color-chart-*` design tokens at render time. Six chart-bearing demo definitions (vuln_scan, antivirus, bitlocker, firewall, certificates, os_info) ship as `InstructionSet demo.visualization.fleet-posture`, auto-imported on server startup.
 
 ### 28.2 Response Templates :x: `T2`
 

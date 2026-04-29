@@ -664,6 +664,25 @@ std::expected<std::string, std::string> InstructionStore::create_set(const Instr
 
     auto id = s.id.empty() ? generate_id() : s.id;
 
+    // Pre-INSERT existence check so duplicate IDs return the shared
+    // kConflictPrefix-prefixed error instead of "insert failed: UNIQUE
+    // constraint failed: ...". Mirrors create_definition_impl above and
+    // is the contract the auto-import loop in server.cpp + the REST 409
+    // handler at /api/v1/instruction-sets both rely on (Gate 4 C-B1).
+    if (!s.id.empty()) {
+        sqlite3_stmt* exists_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1",
+                               -1, &exists_stmt, nullptr) != SQLITE_OK)
+            return std::unexpected("internal: duplicate-id check failed");
+        sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
+        sqlite3_finalize(exists_stmt);
+        if (exists)
+            return std::unexpected(std::string(kConflictPrefix) +
+                                   " instruction set '" + id + "' already exists");
+    }
+
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_,
                            "INSERT INTO instruction_sets (id, name, description, created_by, "

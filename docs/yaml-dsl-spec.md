@@ -244,6 +244,8 @@ Optional chart configuration consumed by the dashboard's instruction-response vi
 
 > **Limitations.** The engine caps each chart at 10 000 underlying response rows; when truncated, the response payload includes `rows_capped: true` so the dashboard can show a banner. The engine also caps total distinct labels at 10 000 (defense-in-depth against a misbehaving plugin emitting unbounded label cardinality).
 
+> **Authoring through the dashboard YAML editor strips visualization.** When saving a definition via the dashboard's CodeMirror editor (`POST /api/instructions/yaml`), the lightweight line-scanner extracts `name`, `plugin`, `action`, `type`, `description`, `concurrency`, `approval` from the YAML source but does NOT extract `spec.visualization` into the indexed `visualization_spec` column. The chart spec is preserved in `yaml_source` (verbatim source of truth) but not indexed, so the chart deck does not render the chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or until the next server restart triggers the bundled-content auto-import. Author chart-bearing definitions through the JSON import path or the in-tree `content/definitions/` library, not the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
+
 The engine returns a self-contained payload the dashboard's renderer (`/static/yuzu-charts.js`) can draw without a second request:
 
 ```json

@@ -83,7 +83,7 @@ extern const char* const kComplianceHtml =
     .policy-table td {
       padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
     }
-    .policy-table tr:hover { background: rgba(88,166,255,0.06); }
+    .policy-table tr:hover { background: var(--mds-color-state-hover); }
     .policy-table .policy-name {
       font-weight: 500; color: var(--fg);
     }
@@ -132,28 +132,28 @@ extern const char* const kComplianceHtml =
     .detail-table td {
       padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border);
     }
-    .detail-table tr:hover { background: rgba(88,166,255,0.06); }
+    .detail-table tr:hover { background: var(--mds-color-state-hover); }
 
     /* ── Status badges ────────────────────────────────────── */
     .status-compliant {
       display: inline-block; padding: 0.1rem 0.5rem;
       border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: rgba(63,185,80,0.15); color: var(--green);
+      background: var(--mds-color-bg-success-tinted); color: var(--green);
     }
     .status-non-compliant {
       display: inline-block; padding: 0.1rem 0.5rem;
       border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: rgba(248,81,73,0.15); color: var(--red);
+      background: var(--mds-color-bg-error-tinted); color: var(--red);
     }
     .status-pending-eval {
       display: inline-block; padding: 0.1rem 0.5rem;
       border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: rgba(210,153,34,0.15); color: var(--yellow);
+      background: var(--mds-color-bg-warning-tinted); color: var(--yellow);
     }
     .status-remediated {
       display: inline-block; padding: 0.1rem 0.5rem;
       border-radius: 1rem; font-size: 0.7rem; font-weight: 600;
-      background: rgba(88,166,255,0.15); color: var(--accent);
+      background: var(--mds-color-state-selected); color: var(--accent);
     }
 
     /* ── Empty / loading states ───────────────────────────── */
