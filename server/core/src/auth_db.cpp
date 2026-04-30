@@ -126,9 +126,16 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
         return std::unexpected(AuthDBError::CannotCreateDirectory);
     }
     
-    // Open database with full mutex (thread-safe) + WAL mode
+    // Open database with full mutex (thread-safe) + WAL mode.
+    // db_path.string().c_str() (not db_path.c_str() directly) -- on
+    // Windows MSVC, std::filesystem::path::value_type is wchar_t, so
+    // path::c_str() returns const wchar_t*, which cannot bind to
+    // sqlite3_open_v2's const char* parameter (MSVC C2664). The
+    // .string() conversion narrows to const char* via the system
+    // locale; matches the pattern used in every other store
+    // (response_store, instruction_store, etc.).
     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
-    int rc = sqlite3_open_v2(impl_->db_path.c_str(), &impl_->db, flags, nullptr);
+    int rc = sqlite3_open_v2(impl_->db_path.string().c_str(), &impl_->db, flags, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to open auth DB: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::CannotOpenDatabase);
