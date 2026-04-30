@@ -10,6 +10,7 @@
  */
 
 #include <yuzu/server/auth_db.hpp>
+#include "migration_runner.hpp"
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 #include <filesystem>
@@ -180,89 +181,92 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
 }
 
 std::expected<void, AuthDBError> AuthDB::create_schema() {
-    const char* schema_sql = R"(
-        -- Users table
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            salt_hex TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_login_at DATETIME,
-            is_active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-        CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
-        
-        -- Sessions table
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_token TEXT NOT NULL UNIQUE,
-            username TEXT NOT NULL,
-            role TEXT NOT NULL,
-            auth_source TEXT NOT NULL DEFAULT 'password',
-            oidc_sub TEXT,
-            expires_at DATETIME NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            last_activity_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(session_token);
-        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-        CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
-        
-        -- Enrollment tokens table
-        CREATE TABLE IF NOT EXISTS enrollment_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_hash TEXT NOT NULL UNIQUE,
-            created_by TEXT NOT NULL,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            expires_at DATETIME NOT NULL,
-            is_used INTEGER NOT NULL DEFAULT 0,
-            used_at DATETIME,
-            used_by_agent_id TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_enrollment_token_hash ON enrollment_tokens(token_hash);
-        CREATE INDEX IF NOT EXISTS idx_enrollment_expires ON enrollment_tokens(expires_at);
-        
-        -- Pending agents table
-        CREATE TABLE IF NOT EXISTS pending_agents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_id TEXT NOT NULL UNIQUE,
-            hostname TEXT NOT NULL,
-            os TEXT,
-            arch TEXT,
-            agent_version TEXT,
-            enrollment_token_id INTEGER,
-            requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            approved_at DATETIME,
-            approved_by TEXT,
-            status TEXT NOT NULL DEFAULT 'pending'
-        );
-        CREATE INDEX IF NOT EXISTS idx_pending_agents_agent_id ON pending_agents(agent_id);
-        CREATE INDEX IF NOT EXISTS idx_pending_agents_status ON pending_agents(status);
-        
-        -- Schema migrations table
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            description TEXT
-        );
-        
-        -- Record schema version
-        INSERT OR IGNORE INTO schema_migrations (version, description)
-        VALUES (1, 'Initial auth schema: users, sessions, enrollment_tokens, pending_agents');
-    )";
-    
-    char* err_msg = nullptr;
-    int rc = sqlite3_exec(impl_->db, schema_sql, nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("Failed to create auth DB schema: {}", err_msg);
-        sqlite3_free(err_msg);
+    // Adopt the project-wide MigrationRunner pattern (governance round
+    // arch-B2). Every other yuzu store (audit_store, response_store,
+    // instruction_store, guaranteed_state_store, ~18 total) registers
+    // schema as `std::vector<Migration>{{1, sql}, {2, alter}, ...}` and
+    // delegates to MigrationRunner::run. Migrations are recorded in
+    // MigrationRunner's `schema_meta` table; the previous AuthDB-local
+    // `schema_migrations` table is left in place for forward compat
+    // (it was a leftover of the inline-schema design and reading from
+    // it elsewhere never landed) but is no longer authoritative.
+    //
+    // Backwards compatibility: every CREATE here is `IF NOT EXISTS`,
+    // so an AuthDB initialised by a pre-MigrationRunner v1 binary
+    // (PR-merge through this PR window) re-runs idempotently and
+    // MigrationRunner stamps `schema_meta` to v1. Subsequent `ALTER
+    // TABLE` migrations would land as `{2, ...}` entries.
+    const std::vector<Migration> kMigrations = {
+        {1, R"(
+            -- Users table
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                salt_hex TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_login_at DATETIME,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active) WHERE is_active = 1;
+
+            -- Sessions table
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_token TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL,
+                role TEXT NOT NULL,
+                auth_source TEXT NOT NULL DEFAULT 'password',
+                oidc_sub TEXT,
+                expires_at DATETIME NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_activity_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(session_token);
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);
+
+            -- Enrollment tokens table
+            CREATE TABLE IF NOT EXISTS enrollment_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_by TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                is_used INTEGER NOT NULL DEFAULT 0,
+                used_at DATETIME,
+                used_by_agent_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_enrollment_token_hash ON enrollment_tokens(token_hash);
+            CREATE INDEX IF NOT EXISTS idx_enrollment_expires ON enrollment_tokens(expires_at);
+
+            -- Pending agents table
+            CREATE TABLE IF NOT EXISTS pending_agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL UNIQUE,
+                hostname TEXT NOT NULL,
+                os TEXT,
+                arch TEXT,
+                agent_version TEXT,
+                enrollment_token_id INTEGER,
+                requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                approved_at DATETIME,
+                approved_by TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_agents_agent_id ON pending_agents(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_pending_agents_status ON pending_agents(status);
+        )"},
+    };
+
+    if (!MigrationRunner::run(impl_->db, "auth_db", kMigrations)) {
+        spdlog::error("AuthDB: schema migration failed");
         return std::unexpected(AuthDBError::SchemaCreationFailed);
     }
-    
+
     return {};
 }
 
