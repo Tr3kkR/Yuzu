@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live drawer updates via SSE (PR 3 of executions-history ladder).**
+  `GET /sse/executions/{id}` opens a per-execution Server-Sent Events
+  channel that pushes `agent-transition` (one per agent state change),
+  `execution-progress` (counts snapshot when the recompute crosses the
+  all-agents-responded threshold), and `execution-completed` (terminal
+  status) events. RBAC `Read` on `Execution`; 410 Gone for
+  already-terminal executions so the browser stops reconnecting; 503
+  when the bus is not configured. New `ExecutionEventBus`
+  (`server/core/src/execution_event_bus.{hpp,cpp}`) backs the channel —
+  per-execution ring buffer (1000 events, ~30s window) supports
+  `Last-Event-ID` replay on reconnect; channels GC'd 60s after terminal
+  status and zero subscribers via opportunistic sweep on `publish` so
+  no separate timer thread is required. Server constructs the bus
+  alongside `ExecutionTracker` and calls `set_event_bus` so
+  `update_agent_status` / `refresh_counts` / `mark_cancelled` publish
+  transitions automatically. Drawer JS in `instruction_ui.cpp` opens an
+  `EventSource` only when the row was rendered with status=running or
+  pending (data-execution-status / data-execution-id stamps); the
+  listener applies in-place DOM updates against `#exec-kpi-{id}`,
+  `.agent-cell[data-agent-id]`, `tr[data-agent-id]` (per-agent table
+  row), `.per-agent-status`, and `.per-agent-exit-code`. Closes the
+  reload-to-watch-fan-out UX gap.
+
+- **WorkflowRoutes deps-struct refactor (PR 2.5, #670, hard
+  predecessor for PR 3).** `WorkflowRoutes::register_routes` now takes
+  a single `Deps` aggregate instead of 16 positional arguments. Both
+  the `httplib::Server&` and `HttpRouteSink&` overloads share the same
+  signature; new dependencies (the SSE event-bus pointer was the
+  trigger) are added as fields, not parameters. Mechanical update at
+  the two call sites (`server.cpp`, `test_workflow_routes.cpp`); no
+  behaviour change.
+
 - **Exact correlation between executions and responses (PR 2 of
   executions-history ladder).**
   `responses.execution_id` is a new column (migration v2 on
@@ -269,6 +301,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared chart above the standard results table.
 
 ### Tests
+
+- **PR 3 coverage net — `tests/unit/server/test_execution_event_bus.cpp`
+  (new file)** — 10 Catch2 cases / 1039 assertions tagged
+  `[execution_event_bus][pr3]`: subscribe/publish/unsubscribe round-trip
+  on a single channel; per-execution channel partitioning (subscribers
+  on exec A receive zero events for exec B and vice versa, with each
+  channel keeping its own monotonic id space); ring buffer caps at
+  `kBufferCap=1000` with FIFO eviction; `replay_since` is strictly
+  greater-than (Last-Event-ID semantics); terminal flag and GC retention
+  (channels with subscribers are not evicted; channels with retention
+  expired AND no subscribers are); listener invocation is synchronous
+  within `publish` (no event lost across the publish→listener boundary);
+  concurrent publishers never lose events (4 threads × 250 publishes =
+  1000 monotonic ids, no gaps); `subscriber_count` / `channel_count`
+  smoke; `unsubscribe` is idempotent; `snapshot` is a copy not a view.
+- **PR 3 coverage net — `tests/unit/server/test_workflow_routes.cpp`**
+  — 12 new Catch2 cases tagged `[workflow][executions][pr3]`:
+  `/sse/executions/{id}` 404 on unknown id; 410 Gone on already-terminal
+  execution; 403 when `perm_fn` denies `Execution.Read`; 200 + correct
+  Cache-Control / X-Accel-Buffering headers on a happy-path running
+  execution; integration that `update_agent_status` publishes
+  `agent-transition` onto the bus (subscribe directly, watch the
+  events flow); integration that `refresh_counts` crossing the
+  threshold emits both `execution-progress` AND `execution-completed`
+  with progress-before-terminal ordering; `mark_cancelled` emits the
+  terminal `execution-completed`; ring buffer holds events for late
+  connectors; per-execution channel partitioning under the routes
+  layer (no cross-leak between two concurrent executions of the same
+  definition); list view stamps `data-execution-id` and
+  `data-execution-status` for the JS SSE bootstrap; detail KPI strip
+  carries `id="exec-kpi-{id}"` for partial swaps; per-agent status
+  badge has `.per-agent-status` + `.per-agent-exit-code` classes for
+  partial swaps. `ExecHarness` gained an `event_bus` member that is
+  attached to the tracker before any test runs and torn down before
+  the tracker on harness destruction (preserves the
+  bus-outlives-tracker invariant the production code relies on).
+- **PR 3 puppeteer smoke extension —
+  `tests/puppeteer/executions-drawer-smoke.mjs`** — added two new
+  assertions: every `.exec-row` carries both `data-execution-id` and
+  `data-execution-status` attributes (the drawer's SSE bootstrap
+  binding), and the open drawer's KPI strip carries an
+  `id="exec-kpi-{id}"` stamp (the partial-swap binding). Failure of
+  either is a markup contract regression that breaks live updates
+  silently.
 
 - **PR 2 coverage net — `tests/unit/server/test_response_store.cpp`**
   — 6 new Catch2 cases tagged `[response_store][execution_id]`:

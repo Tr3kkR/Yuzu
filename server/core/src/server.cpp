@@ -27,6 +27,7 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "discovery_store.hpp"
+#include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
@@ -447,8 +448,14 @@ public:
                 // so that consumers are destroyed before the pool closes the DB.
                 instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
                 if (instr_db_pool_->is_open()) {
+                    // PR 3 — per-execution SSE event bus. Constructed
+                    // before the tracker so the tracker can attach
+                    // immediately and we keep the "bus outlives tracker"
+                    // invariant that the member-order comment encodes.
+                    execution_event_bus_ = std::make_unique<ExecutionEventBus>();
                     execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
                     execution_tracker_->create_tables();
+                    execution_tracker_->set_event_bus(execution_event_bus_.get());
 
                     approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
                     approval_manager_->create_tables();
@@ -1016,6 +1023,10 @@ public:
         // Release Phase 2 components before closing shared DB
         // Release Phase 2 components before closing shared DB (RAII handles close)
         execution_tracker_.reset();
+        // PR 3 — bus outlives the tracker by member-order convention,
+        // but in the explicit reset path we drop the tracker first
+        // (it borrows `event_bus_`), then the bus.
+        execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
@@ -4634,23 +4645,33 @@ private:
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
+        //
+        // PR 2.5 (#670): deps-struct refactor. All 15 dependencies now flow
+        // through `WorkflowRoutes::Deps` so PR 3's SSE event-bus addition is
+        // a single new field, not a 17th parameter.
         workflow_routes_ = std::make_unique<WorkflowRoutes>();
-        workflow_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
-            [this](const std::string& event_type, const httplib::Request& req) {
-                emit_event(event_type, req);
-            },
-            [this](const std::string& expression) -> std::pair<std::size_t, std::size_t> {
-                auto parsed = yuzu::scope::parse(expression);
-                if (!parsed) return {0, registry_.agent_count()};
-                auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                        custom_properties_store_.get());
-                return {matched.size(), registry_.agent_count()};
-            },
-            workflow_engine_.get(), execution_tracker_.get(),
-            schedule_engine_.get(), product_pack_store_.get(),
-            instruction_store_.get(), policy_store_.get(),
-            // CommandDispatchFn — dispatch commands to agents via gRPC
+        WorkflowRoutes::Deps wf_deps;
+        wf_deps.auth_fn = auth_fn;
+        wf_deps.perm_fn = perm_fn;
+        wf_deps.audit_fn = audit_fn;
+        wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
+            emit_event(event_type, req);
+        };
+        wf_deps.scope_fn = [this](const std::string& expression)
+            -> std::pair<std::size_t, std::size_t> {
+            auto parsed = yuzu::scope::parse(expression);
+            if (!parsed) return {0, registry_.agent_count()};
+            auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                    custom_properties_store_.get());
+            return {matched.size(), registry_.agent_count()};
+        };
+        wf_deps.workflow_engine = workflow_engine_.get();
+        wf_deps.execution_tracker = execution_tracker_.get();
+        wf_deps.schedule_engine = schedule_engine_.get();
+        wf_deps.product_pack_store = product_pack_store_.get();
+        wf_deps.instruction_store = instruction_store_.get();
+        wf_deps.policy_store = policy_store_.get();
+        wf_deps.command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids,
                    const std::string& scope_expr,
@@ -4705,9 +4726,14 @@ private:
                 if (sent > 0)
                     metrics_.counter("yuzu_commands_dispatched_total").increment();
                 return {command_id, sent};
-            },
-            approval_manager_.get(),
-            response_store_.get());
+            };
+        wf_deps.approval_manager = approval_manager_.get();
+        wf_deps.response_store = response_store_.get();
+        // PR 3 — SSE event bus for live execution updates. Server owns
+        // the bus; ExecutionTracker publishes onto it; SSE handler
+        // subscribes per-connection.
+        wf_deps.execution_event_bus = execution_event_bus_.get();
+        workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
@@ -5050,6 +5076,15 @@ private:
     // Phase 2: Instruction system
     std::unique_ptr<InstructionStore> instruction_store_;
     std::unique_ptr<InstructionDbPool> instr_db_pool_;  // RAII owner — declared before consumers so it outlives them
+    /// PR 3 — per-execution SSE event bus. Process-local; the tracker
+    /// borrows this pointer and publishes onto it; `WorkflowRoutes`
+    /// registers the SSE handler that subscribes per-connection.
+    /// Declared BEFORE `execution_tracker_` so the bus outlives the
+    /// tracker — members destroy in reverse declaration order, so
+    /// `execution_tracker_` runs `~ExecutionTracker` first (releasing
+    /// its borrowed `event_bus_` pointer) and only then the bus
+    /// destructs.
+    std::unique_ptr<ExecutionEventBus> execution_event_bus_;
     std::unique_ptr<ExecutionTracker> execution_tracker_;
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;

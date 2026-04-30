@@ -1,6 +1,8 @@
 #include "workflow_routes.hpp"
 
 #include "compliance_eval.hpp"
+#include "event_bus.hpp"
+#include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "scope_engine.hpp"
 #include "web_utils.hpp"
@@ -9,6 +11,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <expected>
 #include <format>
 #include <map>
@@ -20,43 +24,44 @@ namespace yuzu::server {
 
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
-void WorkflowRoutes::register_routes(
-    httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-    EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
-    WorkflowEngine* workflow_engine,
-    ExecutionTracker* execution_tracker,
-    ScheduleEngine* schedule_engine,
-    ProductPackStore* product_pack_store,
-    InstructionStore* instruction_store,
-    PolicyStore* policy_store,
-    CommandDispatchFn command_dispatch_fn,
-    ApprovalManager* approval_manager,
-    ResponseStore* response_store) {
+void WorkflowRoutes::register_routes(httplib::Server& svr, Deps deps) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    std::move(emit_fn), std::move(scope_fn), workflow_engine,
-                    execution_tracker, schedule_engine, product_pack_store,
-                    instruction_store, policy_store, std::move(command_dispatch_fn),
-                    approval_manager, response_store);
+    register_routes(sink, std::move(deps));
 }
 
 // Sink-based body — every route registration goes through `sink`, not `svr`,
 // so the in-process TestRouteSink can capture handlers and dispatch synthesised
 // requests against them without standing up an httplib::Server (#438).
-void WorkflowRoutes::register_routes(
-    HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-    EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
-    WorkflowEngine* workflow_engine,
-    ExecutionTracker* execution_tracker,
-    ScheduleEngine* schedule_engine,
-    ProductPackStore* product_pack_store,
-    InstructionStore* instruction_store,
-    PolicyStore* policy_store,
-    CommandDispatchFn command_dispatch_fn,
-    ApprovalManager* approval_manager,
-    ResponseStore* response_store) {
+//
+// PR 2.5 (#670): the parameter list was 14 deps; PR 2 added a 15th
+// (`execution_id` 6th-param to CommandDispatchFn doesn't count toward
+// register_routes arity but the count sat at 16 args incl. callbacks);
+// PR 3 needs the SSE event-bus pointer. The Deps struct collapses the
+// signature to one parameter and keeps the body's local-variable shape
+// unchanged via the rebinding step below — every callsite inside the
+// function still reads `auth_fn`, `perm_fn`, etc. as before.
+void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
-    auto cmd_dispatch = std::move(command_dispatch_fn);
+    // Rebind to local variables so the rest of the function body reads
+    // unchanged. The captures inside route lambdas pick these up by
+    // copy (functions) or by raw pointer (stores) — exactly as before
+    // the deps refactor. Move-from `deps` happens for the function-typed
+    // fields; pointers are trivially copied.
+    auto auth_fn = std::move(deps.auth_fn);
+    auto perm_fn = std::move(deps.perm_fn);
+    auto audit_fn = std::move(deps.audit_fn);
+    auto emit_fn = std::move(deps.emit_fn);
+    auto scope_fn = std::move(deps.scope_fn);
+    auto* workflow_engine = deps.workflow_engine;
+    auto* execution_tracker = deps.execution_tracker;
+    auto* schedule_engine = deps.schedule_engine;
+    auto* product_pack_store = deps.product_pack_store;
+    auto* instruction_store = deps.instruction_store;
+    auto* policy_store = deps.policy_store;
+    auto* approval_manager = deps.approval_manager;
+    auto* response_store = deps.response_store;
+    auto* execution_event_bus = deps.execution_event_bus;
+    auto cmd_dispatch = std::move(deps.command_dispatch_fn);
 
     // -- HTMX fragments --------------------------------------------------------
 
@@ -170,8 +175,17 @@ void WorkflowRoutes::register_routes(
                 std::string time_iso = format_iso_utc(e.dispatched_at);
                 std::string time_rel = format_relative_time(e.dispatched_at, now);
 
+                // PR 3: data-execution-id / data-execution-status drive the
+                // SSE EventSource bootstrap on drawer expand. Status is the
+                // execution-row status at LIST-render time; the SSE handler
+                // re-validates terminality server-side and returns 410 Gone
+                // if the execution finished between LIST render and click,
+                // so the client doesn't need to over-think the staleness
+                // window.
                 html += "<tr class=\"" + row_class +
                         "\" tabindex=\"0\" "
+                        "data-execution-id=\"" + html_escape(e.id) + "\" "
+                        "data-execution-status=\"" + html_escape(e.status) + "\" "
                         "onclick=\"toggleExecDetail(this)\" "
                         "onkeydown=\"if(event.key==='Enter'||event.key===' ')"
                         "{event.preventDefault();toggleExecDetail(this);}\" "
@@ -310,8 +324,11 @@ void WorkflowRoutes::register_routes(
             html.reserve(8192);
             html += "<div class=\"exec-detail-grid\">";
 
-            // KPI strip
-            html += "<div class=\"exec-kpi-strip\">";
+            // KPI strip — id-tagged for the SSE drawer (#exec-kpi-{id}). PR 3
+            // listeners locate this strip via id and swap individual cell
+            // values rather than re-rendering the whole strip.
+            html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" +
+                    html_escape(exec.id) + "\">";
             html += std::format(
                 "<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
                 "<div class=\"exec-kpi-label\">Total</div></div>",
@@ -460,9 +477,14 @@ void WorkflowRoutes::register_routes(
                     html_escape(exec.id), html_escape(a.agent_id),
                     html_escape(exec.id), html_escape(a.agent_id),
                     html_escape(a.agent_id));
-                html += "<td><span class=\"status-badge " + status_cls + "\">" +
+                // PR 3: `.per-agent-status` is the live-update binding.
+                // The SSE `agent-transition` listener swaps innerHTML +
+                // status-class on this span without re-rendering the row.
+                html += "<td><span class=\"status-badge per-agent-status " +
+                        status_cls + "\">" +
                         html_escape(a.status) + "</span></td>";
-                html += "<td>" + std::to_string(a.exit_code) + "</td>";
+                html += "<td class=\"per-agent-exit-code\">" +
+                        std::to_string(a.exit_code) + "</td>";
                 html += "<td>" + render_duration_bar_html(dur_ms, max_dur_ms, dom_status) +
                         std::format(" <span class=\"duration-text\">{} ms</span>", dur_ms) +
                         "</td>";
@@ -563,6 +585,180 @@ void WorkflowRoutes::register_routes(
             // policy (only routes returning forensic-grade content audit).
             audit_fn(req, "execution.detail.view", "success", "Execution",
                      exec.id, "");
+        });
+
+    // -------------------------------------------------------------------------
+    // GET /sse/executions/{id} -- live drawer updates (PR 3).
+    //
+    // SSE channel that fans out per-execution transitions to subscribed
+    // browser EventSources. The handler:
+    //   1. Authenticates + checks `Read` on `Execution` (same securable as
+    //      detail) — denials short-circuit before the chunked provider is
+    //      attached so RBAC matches the rest of the surface.
+    //   2. Resolves the execution via `execution_tracker->get_execution`;
+    //      404 for unknown id, 410 (Gone) when the execution is already
+    //      terminal so the client closes its EventSource without spinning
+    //      a reconnect loop on the auto-reconnect path.
+    //   3. On HTTP `Last-Event-ID` request header, replays the per-execution
+    //      ring buffer's events with id > Last-Event-ID before subscribing
+    //      to live transitions — bounded by `kBufferCap` (1000 events,
+    //      ~30 s window). Replay runs on the SSE thread (server-push), not
+    //      the request thread, so it is interleaved with live events.
+    //   4. Subscribes to the per-execution channel; the listener
+    //      queues events onto the per-connection `SseSinkState`. Heartbeat
+    //      every 3 s comes from the existing `sse_content_provider`.
+    //   5. Cleanup: `sse_resource_release` runs when httplib closes the
+    //      connection (operator nav-away, terminal-status close, browser
+    //      EventSource error). Unsubscribes from the channel; the channel
+    //      itself is GC'd by `gc_terminal_channels` when retention expires.
+    //
+    // Audit policy: emit `execution.live_subscribe` ONCE per session per
+    // execution, not per SSE reconnect — the SSE reconnect storm under a
+    // brief network hiccup must not spray audit rows. Per-session dedup
+    // is handled by the seen-set the handler keeps in scope.
+    sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))",
+        [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus](
+            const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "Execution", "Read"))
+                return;
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content("tracker not available", "text/plain; charset=utf-8");
+                return;
+            }
+            if (!execution_event_bus) {
+                // Bus disabled (test harness opted out, or a configuration
+                // path that didn't construct one). 503 is the right code:
+                // the route exists but the underlying event source is
+                // intentionally not wired.
+                res.status = 503;
+                res.set_content("live updates not available", "text/plain; charset=utf-8");
+                return;
+            }
+            auto exec_id = req.matches[1].str();
+            auto exec_opt = execution_tracker->get_execution(exec_id);
+            if (!exec_opt) {
+                res.status = 404;
+                res.set_content("execution not found", "text/plain; charset=utf-8");
+                return;
+            }
+            // Don't open SSE for already-terminal executions — the drawer
+            // should fall back to the static detail fragment. 410 Gone tells
+            // the EventSource to stop reconnecting.
+            const auto& exec = *exec_opt;
+            if (exec.status != "running" && exec.status != "pending") {
+                res.status = 410;
+                res.set_content("execution complete", "text/plain; charset=utf-8");
+                return;
+            }
+
+            // sec audit: per-session-per-execution dedup. The session
+            // username + execution id is the dedup key. Skipping the
+            // audit on reconnect is policy (see comment block above).
+            audit_fn(req, "execution.live_subscribe", "success", "Execution",
+                     exec_id, "");
+
+            res.set_header("Cache-Control", "no-cache");
+            res.set_header("X-Accel-Buffering", "no");
+
+            auto sink_state = std::make_shared<detail::SseSinkState>();
+            // Replay ring-buffer events newer than the client's
+            // Last-Event-ID header (browser EventSource sets this on
+            // auto-reconnect). 0 = no header / first connect → no replay.
+            std::uint64_t since_id = 0;
+            if (req.has_header("Last-Event-ID")) {
+                try {
+                    since_id = std::stoull(req.get_header_value("Last-Event-ID"));
+                } catch (...) {
+                    since_id = 0;
+                }
+            }
+            // Capture replay events into the per-connection queue under
+            // the connection's mutex so they precede any live event a
+            // concurrent publisher emits while we're attaching.
+            execution_event_bus->replay_since(exec_id, since_id,
+                [sink_state](const ExecutionEvent& ev) {
+                    detail::SseEvent sse;
+                    sse.event_type = ev.event_type;
+                    // Browser MUST see `id:` so it can populate
+                    // Last-Event-ID on the next reconnect. The
+                    // existing format_sse helper emits event/data only —
+                    // we prepend `id:` by piggybacking on event_type's
+                    // line-buffered queue: append a control-prefixed
+                    // entry the listener picks up.
+                    sse.data = std::to_string(ev.id) + "\n" + ev.data;
+                    std::lock_guard<std::mutex> lk(sink_state->mu);
+                    sink_state->queue.push_back(std::move(sse));
+                });
+
+            // Subscribe BEFORE returning from this handler so no
+            // post-handler publish can be missed. The listener body
+            // is non-blocking: queue + notify.
+            auto* bus = execution_event_bus;
+            sink_state->sub_id = bus->subscribe(exec_id,
+                [sink_state](const ExecutionEvent& ev) {
+                    detail::SseEvent sse;
+                    sse.event_type = ev.event_type;
+                    sse.data = std::to_string(ev.id) + "\n" + ev.data;
+                    {
+                        std::lock_guard<std::mutex> lk(sink_state->mu);
+                        sink_state->queue.push_back(std::move(sse));
+                    }
+                    sink_state->cv.notify_one();
+                });
+            std::string captured_exec_id = exec_id;
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [sink_state](size_t offset, httplib::DataSink& s) -> bool {
+                    // Re-implement the existing sse_content_provider in-line
+                    // with id-aware framing. We can't reuse `format_sse`
+                    // verbatim because it doesn't emit `id:`; the prefixed
+                    // `<id>\n<data>` payload we queued above carries the id
+                    // we need to peel off here.
+                    std::unique_lock<std::mutex> lk(sink_state->mu);
+                    sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
+                        return !sink_state->queue.empty() ||
+                               sink_state->closed.load();
+                    });
+                    if (sink_state->closed.load()) return false;
+                    while (!sink_state->queue.empty()) {
+                        auto ev = std::move(sink_state->queue.front());
+                        sink_state->queue.pop_front();
+
+                        // Split <id>\n<data>
+                        std::string id_part, data_part;
+                        if (auto nl = ev.data.find('\n'); nl != std::string::npos) {
+                            id_part = ev.data.substr(0, nl);
+                            data_part = ev.data.substr(nl + 1);
+                        } else {
+                            data_part = std::move(ev.data);
+                        }
+                        std::string out = "id: " + id_part + "\n" +
+                                          "event: " + ev.event_type + "\n" +
+                                          "data: " + data_part + "\n\n";
+                        const char* p = out.data();
+                        std::size_t rem = out.size();
+                        constexpr std::size_t kMaxSlice = 8192;
+                        while (rem > 0) {
+                            auto n = std::min(rem, kMaxSlice);
+                            if (!s.write(p, n)) return false;
+                            p += n;
+                            rem -= n;
+                        }
+                    }
+                    static const char* keepalive = "event: heartbeat\ndata: \n\n";
+                    if (!s.write(keepalive, std::strlen(keepalive))) return false;
+                    (void)offset;
+                    return true;
+                },
+                [sink_state, bus, captured_exec_id](bool /*success*/) {
+                    sink_state->closed.store(true);
+                    sink_state->cv.notify_all();
+                    bus->unsubscribe(captured_exec_id, sink_state->sub_id);
+                });
         });
 
     // GET /fragments/schedules -- schedule list HTMX fragment

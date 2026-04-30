@@ -123,6 +123,33 @@ async function main() {
   const hasAllLabels = kpi && ['Total','Succeeded','Failed','p50 duration','p95 duration']
         .every(l => kpi.labels.includes(l));
 
+  // -- PR 3: SSE bootstrap attributes ----------------------------------
+  // The drawer opens an EventSource on /sse/executions/{id} only when the
+  // row was rendered with status=running OR pending. Both data-* attrs
+  // must be present on every row so the JS bootstrap (toggleExecDetail)
+  // can decide. Pin the markup contract.
+  const sseShape = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('.exec-row'));
+    return {
+      total: rows.length,
+      withId: rows.filter(r => r.getAttribute('data-execution-id')).length,
+      withStatus: rows.filter(r => r.getAttribute('data-execution-status')).length,
+    };
+  });
+  console.log(`  PR 3 row data-attrs: id=${sseShape.withId}/${sseShape.total} status=${sseShape.withStatus}/${sseShape.total}`);
+  const sseAttrsOk = sseShape.total > 0 &&
+                      sseShape.withId === sseShape.total &&
+                      sseShape.withStatus === sseShape.total;
+
+  // KPI strip on the open drawer must carry id=exec-kpi-{id}. Missing the
+  // id stamp means client SSE listeners can't update KPI values without
+  // re-rendering the entire drawer (negates PR 3's partial-swap design).
+  const kpiHasId = await page.evaluate(() => {
+    const strip = document.querySelector('.exec-detail.open .exec-kpi-strip');
+    return !!(strip && /^exec-kpi-/.test(strip.id || ''));
+  });
+  console.log(`  PR 3 KPI strip carries exec-kpi-{id}: ${kpiHasId}`);
+
   // -- IDX-3: single-drawer-open invariant — open a SECOND row and confirm
   //    the first drawer collapses. --
   let twoDrawerCheck = { firstClosed: true, secondOpen: true };
@@ -155,6 +182,12 @@ async function main() {
   if (!hasAllLabels) { console.log('FAIL: KPI strip missing one of Total/Succeeded/Failed/p50/p95'); pass = false; }
   if (!twoDrawerCheck.firstClosed || !twoDrawerCheck.secondOpen) {
     console.log('FAIL: single-drawer-open invariant broken'); pass = false;
+  }
+  if (!sseAttrsOk) {
+    console.log('FAIL: PR 3 data-execution-id / data-execution-status missing from rows'); pass = false;
+  }
+  if (!kpiHasId) {
+    console.log('FAIL: PR 3 KPI strip is missing the exec-kpi-{id} stamp'); pass = false;
   }
   if (!pass) process.exit(1);
   console.log('PASS');

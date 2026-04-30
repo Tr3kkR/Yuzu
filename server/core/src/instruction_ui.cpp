@@ -541,6 +541,117 @@ document.addEventListener('keydown', function(e) {
    never has two expanded forensic views competing for attention. The HTMX
    attributes on the row handle the lazy fetch (click once); this function
    only manages visibility state. */
+/* PR 3 — open EventSources keyed on execution_id. close() the source
+   when the drawer collapses, when the SSE handler emits
+   `execution-completed`, or when the browser navigates away. We hold
+   the Map at module scope rather than on the row so re-rendered drawer
+   markup (HTMX swap) doesn't strand the connection. */
+var execEventSources = (window.execEventSources = window.execEventSources || new Map());
+
+function execCssEsc(s) {
+  if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
+  /* Conservative fallback — escape the chars that can break attribute
+     selectors. The id charset is bounded server-side to 1-128 of
+     [A-Za-z0-9_-] so nothing here should actually need escaping, but
+     we don't trust the assumption on the client. */
+  return String(s).replace(/(["\\])/g, '\\$1');
+}
+
+function execStopLiveUpdates(execId) {
+  var es = execEventSources.get(execId);
+  if (!es) return;
+  try { es.close(); } catch (e) {}
+  execEventSources.delete(execId);
+}
+
+function execApplyAgentTransition(drawerEl, execId, payload) {
+  if (!drawerEl || !payload || !payload.agent_id) return;
+  var status = String(payload.status || '');
+  var safeAgent = execCssEsc(payload.agent_id);
+  var safeExec = execCssEsc(execId);
+  /* Map the wire status to the CSS modifier the renderer used. Server
+     emits raw status (success/failure/timeout/rejected/running/pending). */
+  var domStatus = 'pending';
+  if (status === 'success') domStatus = 'succeeded';
+  else if (status === 'failure' || status === 'timeout' || status === 'rejected') domStatus = 'failed';
+  else if (status === 'running') domStatus = 'running';
+
+  /* Swap the agent-cell modifier so the colour reflects the new status. */
+  var cells = drawerEl.querySelectorAll(
+    '.agent-cell[data-agent-id="' + safeAgent + '"][data-exec-id="' + safeExec + '"]');
+  for (var i = 0; i < cells.length; i++) {
+    var c = cells[i];
+    c.className = c.className.replace(/\bagent-cell--(succeeded|failed|running|pending|success|failure|timeout|rejected)\b/g, '').trim();
+    c.classList.add('agent-cell');
+    c.classList.add('agent-cell--' + domStatus);
+  }
+  /* Update the per-agent table row's status badge + exit code. */
+  var rows = drawerEl.querySelectorAll(
+    'tr[data-agent-id="' + safeAgent + '"][data-exec-id="' + safeExec + '"]');
+  for (var j = 0; j < rows.length; j++) {
+    var badge = rows[j].querySelector('.per-agent-status');
+    if (badge) {
+      badge.textContent = status;
+      badge.className = ('status-badge per-agent-status ' +
+        (domStatus === 'succeeded' ? 'status-success' :
+         domStatus === 'failed' ? 'status-error' :
+         domStatus === 'running' ? 'status-running' : 'status-pending'));
+    }
+    var exitTd = rows[j].querySelector('.per-agent-exit-code');
+    if (exitTd && typeof payload.exit_code === 'number') {
+      exitTd.textContent = String(payload.exit_code);
+    }
+  }
+}
+
+function execApplyProgress(drawerEl, execId, payload) {
+  if (!drawerEl || !payload) return;
+  var strip = drawerEl.querySelector('#exec-kpi-' + execCssEsc(execId));
+  if (!strip) return;
+  var values = strip.querySelectorAll('.exec-kpi-value');
+  /* Strip layout: Total / Succeeded / Failed / p50 / p95.
+     Update the first three from counts; p50 / p95 stay on "—" until the
+     next full detail-fragment fetch so we don't re-implement the
+     percentile renderer client-side. */
+  if (values.length >= 3) {
+    if (typeof payload.agents_targeted === 'number')
+      values[0].textContent = String(payload.agents_targeted);
+    if (typeof payload.agents_success === 'number')
+      values[1].textContent = String(payload.agents_success);
+    if (typeof payload.agents_failure === 'number')
+      values[2].textContent = String(payload.agents_failure);
+  }
+}
+
+function execStartLiveUpdates(drawerEl, execId) {
+  if (!execId || execEventSources.has(execId)) return;
+  /* `EventSource` is reused across reconnects via Last-Event-ID; the
+     server ring buffer replays anything we missed. The handler returns
+     410 Gone when the execution is already terminal — the browser
+     surfaces that as `error` and `readyState=CLOSED`. */
+  var url = '/sse/executions/' + encodeURIComponent(execId);
+  var es;
+  try { es = new EventSource(url); } catch (e) { return; }
+  execEventSources.set(execId, es);
+  es.addEventListener('agent-transition', function(ev) {
+    try { execApplyAgentTransition(drawerEl, execId, JSON.parse(ev.data)); }
+    catch (err) {}
+  });
+  es.addEventListener('execution-progress', function(ev) {
+    try { execApplyProgress(drawerEl, execId, JSON.parse(ev.data)); } catch (err) {}
+  });
+  es.addEventListener('execution-completed', function() {
+    execStopLiveUpdates(execId);
+  });
+  es.addEventListener('heartbeat', function() {});
+  es.onerror = function() {
+    /* CONNECTING (0) is the auto-reconnect path — let it work. CLOSED (2)
+       means the server hung up permanently (410 Gone or auth lapsed);
+       drop the source. */
+    if (es.readyState === 2 /* CLOSED */) execStopLiveUpdates(execId);
+  };
+}
+
 function toggleExecDetail(row) {
   if (!row) return;
   /* Collapse any other open drawer first. */
@@ -549,11 +660,42 @@ function toggleExecDetail(row) {
     other.classList.remove('expanded');
     var sib = other.nextElementSibling;
     if (sib && sib.classList.contains('exec-detail')) sib.classList.remove('open');
+    var otherId = other.getAttribute('data-execution-id') || '';
+    if (otherId) execStopLiveUpdates(otherId);
   });
   row.classList.toggle('expanded');
   var det = row.nextElementSibling;
-  if (det && det.classList.contains('exec-detail')) det.classList.toggle('open');
+  var isOpen = false;
+  if (det && det.classList.contains('exec-detail')) {
+    det.classList.toggle('open');
+    isOpen = det.classList.contains('open');
+  }
+  /* Bootstrap / tear down the SSE connection in step with the visual
+     state. We start it only if the row was rendered with status=running
+     or status=pending; the server re-validates and responds 410 if the
+     row turned terminal between LIST render and click. */
+  var execId = row.getAttribute('data-execution-id') || '';
+  var execStatus = row.getAttribute('data-execution-status') || '';
+  if (!execId) return;
+  if (isOpen && (execStatus === 'running' || execStatus === 'pending')) {
+    /* Defer the EventSource open one tick so the htmx swap that fills
+       the drawer body has populated `.exec-detail-content`. The
+       listener queries the DOM under `det` so a too-early connection
+       would fan out into nothing. */
+    setTimeout(function() { execStartLiveUpdates(det, execId); }, 0);
+  } else {
+    execStopLiveUpdates(execId);
+  }
 }
+
+/* Tear down all sources on browser navigation away — fail-safe path.
+   Without this the EventSource stays connected through bfcache and the
+   server holds the per-connection sink_state until httplib's keep-alive
+   timeout (~5s) expires. */
+window.addEventListener('beforeunload', function() {
+  execEventSources.forEach(function(es) { try { es.close(); } catch (e) {} });
+  execEventSources.clear();
+});
 
 /* Delegated listener for agent grid cells.
    Reads exec_id and agent_id from data-* attributes — never interpolates

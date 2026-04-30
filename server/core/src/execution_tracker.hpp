@@ -11,6 +11,8 @@
 
 namespace yuzu::server {
 
+class ExecutionEventBus;
+
 struct Execution {
     std::string id;
     std::string definition_id;
@@ -115,6 +117,13 @@ public:
 
     void create_tables();
 
+    /// PR 3 — attach a per-execution SSE bus. When set, every mutating call
+    /// (update_agent_status, refresh_counts, mark_cancelled) publishes a
+    /// transition event onto the bus's per-execution channel. The bus is
+    /// owned by the server; the tracker only borrows it. nullptr disables
+    /// publishing — used by harnesses that don't exercise SSE.
+    void set_event_bus(ExecutionEventBus* bus) { event_bus_ = bus; }
+
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
     std::optional<Execution> get_execution(const std::string& id) const;
@@ -147,6 +156,8 @@ public:
 private:
     sqlite3* db_;
     mutable std::recursive_mutex mtx_;
+    /// Borrowed — owned by the server. nullptr = no SSE publishing.
+    ExecutionEventBus* event_bus_{nullptr};
 };
 
 } // namespace yuzu::server

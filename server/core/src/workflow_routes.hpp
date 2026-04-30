@@ -60,34 +60,47 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id)>;
 
+    /// PR 2.5 — deps-struct refactor (#670).
+    ///
+    /// `register_routes` had grown to 16 arguments across two overloads.
+    /// PR 3 adds the SSE event-bus pointer — the trigger to land the
+    /// struct refactor BEFORE more callbacks accrete. Callers construct
+    /// one `Deps` and both overloads take it by value.
+    ///
+    /// Field ordering follows the original register_routes parameter
+    /// order so the diff at call sites is mechanical. Pointer fields
+    /// default to nullptr where the previous overload accepted defaults.
+    struct Deps {
+        AuthFn auth_fn;
+        PermFn perm_fn;
+        AuditFn audit_fn;
+        EmitEventFn emit_fn;
+        ScopeEstimateFn scope_fn;
+        WorkflowEngine* workflow_engine{nullptr};
+        ExecutionTracker* execution_tracker{nullptr};
+        ScheduleEngine* schedule_engine{nullptr};
+        ProductPackStore* product_pack_store{nullptr};
+        InstructionStore* instruction_store{nullptr};
+        PolicyStore* policy_store{nullptr};
+        CommandDispatchFn command_dispatch_fn;
+        ApprovalManager* approval_manager{nullptr};
+        ResponseStore* response_store{nullptr};
+        /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
+        /// When non-null, `ExecutionTracker` publishers (update_agent_status,
+        /// refresh_counts, mark_cancelled) emit transitions onto this bus
+        /// and the SSE handler subscribes per-connection. nullptr leaves
+        /// the SSE route unregistered (test harnesses that don't need it).
+        class ExecutionEventBus* execution_event_bus{nullptr};
+    };
+
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink
     /// and delegates to the sink-based overload below. New code should keep
     /// using this entrypoint; the sink overload exists for in-process unit
     /// tests that bypass httplib::Server's TSan-hostile acceptor thread (#438).
-    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
-                         WorkflowEngine* workflow_engine,
-                         ExecutionTracker* execution_tracker,
-                         ScheduleEngine* schedule_engine,
-                         ProductPackStore* product_pack_store,
-                         InstructionStore* instruction_store,
-                         PolicyStore* policy_store,
-                         CommandDispatchFn command_dispatch_fn,
-                         ApprovalManager* approval_manager = nullptr,
-                         ResponseStore* response_store = nullptr);
+    void register_routes(httplib::Server& svr, Deps deps);
 
     /// Sink-based overload — used by tests. See `tests/unit/server/test_route_sink.hpp`.
-    void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         AuditFn audit_fn, EmitEventFn emit_fn, ScopeEstimateFn scope_fn,
-                         WorkflowEngine* workflow_engine,
-                         ExecutionTracker* execution_tracker,
-                         ScheduleEngine* schedule_engine,
-                         ProductPackStore* product_pack_store,
-                         InstructionStore* instruction_store,
-                         PolicyStore* policy_store,
-                         CommandDispatchFn command_dispatch_fn,
-                         ApprovalManager* approval_manager = nullptr,
-                         ResponseStore* response_store = nullptr);
+    void register_routes(class HttpRouteSink& sink, Deps deps);
 };
 
 } // namespace yuzu::server
