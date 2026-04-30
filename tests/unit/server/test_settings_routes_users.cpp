@@ -37,6 +37,7 @@
 #include "tag_store.hpp"
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
+#include "../test_helpers.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -45,13 +46,10 @@
 
 #include <httplib.h>
 
-#include <atomic>
-#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -59,14 +57,11 @@ using namespace yuzu::server;
 
 namespace {
 
+/// Shim: callers below pass a "prefix" string; route through the canonical
+/// helper in tests/unit/test_helpers.hpp so we don't recreate the
+/// hash<thread::id>+chrono+getpid pattern that drove flake #473.
 static fs::path unique_temp_path(const std::string& prefix) {
-    static std::atomic<unsigned> seq{0};
-    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
-    auto t = std::chrono::steady_clock::now().time_since_epoch().count();
-    return fs::temp_directory_path() /
-           (prefix + "-" + std::to_string(::getpid()) + "-" +
-            std::to_string(tid) + "-" + std::to_string(t) + "-" +
-            std::to_string(seq.fetch_add(1)));
+    return yuzu::test::unique_temp_path(prefix + "-");
 }
 
 /// RAII wrapper around a temp directory. Constructing it creates the
@@ -497,4 +492,167 @@ TEST_CASE("SettingsRoutes GET /fragments/settings/users: non-self rows all get R
     CHECK(res->body.find("hx-delete=\"/api/settings/users/bob\"") != std::string::npos);
     CHECK(res->body.find("hx-delete=\"/api/settings/users/carol\"") != std::string::npos);
     CHECK(res->body.find("hx-delete=\"/api/settings/users/admin\"") == std::string::npos);
+}
+
+// ── DELETE /api/settings/users — invalid_username + user_not_found audit ─────
+//
+// PR 4 closed two evidence-chain holes on DELETE: (1) a hand-crafted DELETE
+// against an invalid username reached remove_user() with bytes that should
+// never have entered the user-store path, and (2) DELETE on an unknown user
+// silently re-rendered the fragment without auditing the privileged-mutation
+// attempt. Both are SOC 2 CC7.2 evidence-chain failures.
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: invalid username audited and 400",
+          "[settings][users][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // is_valid_username rejects anything outside [A-Za-z0-9._-]; a literal
+    // `$` survives URL canonicalisation and reaches the handler with
+    // exactly that byte, exercising the username-validation branch.
+    auto res = h.Delete("/api/settings/users/$bogus");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.has_audit("user.delete", "denied", "User", "$bogus"));
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: unknown user audited and 404",
+          "[settings][users][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Delete("/api/settings/users/nosuchuser");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.has_audit("user.delete", "denied", "User", "nosuchuser"));
+}
+
+// ── POST /api/settings/users/:username/role — success + audit ────────────────
+
+TEST_CASE("SettingsRoutes POST role: admin promotes user to admin",
+          "[settings][users][role]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto role = h.role_of("bob");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::admin);
+    CHECK(h.has_audit("user.role_change", "success", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes POST role: self-target denied and audited",
+          "[settings][users][role][self]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/admin/role", R"({"role":"user"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger") == kSelfDemoteToast);
+    auto role = h.role_of("admin");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::admin);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "admin"));
+}
+
+TEST_CASE("SettingsRoutes POST role: invalid username audited and 400",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/$evil/role", R"({"role":"user"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "$evil"));
+}
+
+TEST_CASE("SettingsRoutes POST role: invalid JSON audited and 400",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/bob/role", "not-json-at-all");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes POST role: missing role field audited and 400",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/bob/role", R"({"foo":"bar"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes POST role: invalid role value audited and 400",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"superadmin"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes POST role: unknown user audited and 404",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    auto res = h.Post("/api/settings/users/nosuchuser/role",
+                      R"({"role":"admin"})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.has_audit("user.role_change", "denied", "User", "nosuchuser"));
+}
+
+TEST_CASE("SettingsRoutes POST role: same-role no-op audited as no_op",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    // bob is seeded as Role::user; setting role=user is a no-op. The handler
+    // returns 200 and does not invoke update_role(), but the operator's
+    // intent is captured as a `no_op` audit so compliance review can
+    // distinguish "tried to set already-current role" from "no request was
+    // made at all."
+    auto res = h.Post("/api/settings/users/bob/role", R"({"role":"user"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.has_audit("user.role_change", "no_op", "User", "bob"));
+    auto role = h.role_of("bob");
+    REQUIRE(role.has_value());
+    CHECK(*role == auth::Role::user);
+}
+
+TEST_CASE("SettingsRoutes POST role: non-admin session rejected by admin_fn",
+          "[settings][users][role]") {
+    SettingsRoutesHarness h;
+    h.session_user = "bob";
+    h.session_role = auth::Role::user;
+
+    auto res = h.Post("/api/settings/users/admin/role", R"({"role":"user"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The handler is gated by admin_fn_ which fires before the body even
+    // executes, so no user.role_change audit is emitted.
+    CHECK_FALSE(h.has_audit("user.role_change", "denied", "User", "admin"));
 }

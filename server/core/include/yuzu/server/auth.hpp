@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
+namespace yuzu { class MetricsRegistry; }
 namespace yuzu::server { class AuthDB; }
 
 namespace yuzu::server::auth {
@@ -106,6 +107,11 @@ public:
     /// If set, user operations go through the DB instead of config file.
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// Set the metrics registry for emitting login-latency histograms.
+    /// Optional; if null, authenticate() emits no metric (used by tests
+    /// that don't construct the server's MetricsRegistry).
+    void set_metrics_registry(yuzu::MetricsRegistry* m) { metrics_ = m; }
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
@@ -215,6 +221,9 @@ private:
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
+    yuzu::MetricsRegistry* metrics_ = nullptr;
 
     // Enrollment tokens keyed by token_id
     std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;

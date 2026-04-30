@@ -1,5 +1,6 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -395,11 +396,25 @@ bool AuthManager::first_run_setup(const std::filesystem::path& cfg_path) {
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
                                                      const std::string& password) {
+    // Time the PBKDF2 verify path. Histogram is observed even on failure
+    // (unknown user / bad password) because the dominant cost on a busy
+    // server is the iteration loop itself, and a regression there hits
+    // both branches equally. Buckets default to ms-scale; PBKDF2 at
+    // 100k iterations runs ~50-150 ms on commodity hardware.
+    const auto t_start = std::chrono::steady_clock::now();
+
     std::unique_lock lock(mu_);
 
     auto it = users_.find(username);
     if (it == users_.end()) {
         spdlog::warn("Auth failed: unknown user '{}'", username);
+        if (metrics_) {
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            metrics_->histogram("yuzu_auth_login_duration_seconds",
+                                {{"method", "password"}, {"result", "unknown_user"}})
+                .observe(elapsed);
+        }
         return std::nullopt;
     }
 
@@ -408,6 +423,13 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
 
     if (!constant_time_compare(hash, it->second.hash_hex)) {
         spdlog::warn("Auth failed: bad password for '{}'", username);
+        if (metrics_) {
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_start).count();
+            metrics_->histogram("yuzu_auth_login_duration_seconds",
+                                {{"method", "password"}, {"result", "bad_password"}})
+                .observe(elapsed);
+        }
         return std::nullopt;
     }
 
@@ -429,6 +451,13 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     sessions_[token] = std::move(s);
 
     spdlog::info("User '{}' authenticated (role={})", username, role_to_string(it->second.role));
+    if (metrics_) {
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_start).count();
+        metrics_->histogram("yuzu_auth_login_duration_seconds",
+                            {{"method", "password"}, {"result", "success"}})
+            .observe(elapsed);
+    }
     return token;
 }
 

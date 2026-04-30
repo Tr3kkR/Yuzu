@@ -7,6 +7,8 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <filesystem>
@@ -18,28 +20,23 @@ using namespace yuzu::server::auth;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Create an AuthManager configured to use a temp directory for config files.
+/// Create an AuthManager configured to use a per-test config file.
+///
+/// Previously this used a hardcoded shared `yuzu_test_auth` directory and a
+/// process-wide cleanup_guard, which meant any two tests running in the same
+/// process saw each other's state via the on-disk file even though they
+/// thought they had a clean AuthManager. Migrated to the canonical helper —
+/// every call gets its own unique path so tests are independent.
+/// (governance qe-B2; flake-class #473.)
 static std::unique_ptr<AuthManager> make_temp_auth() {
     auto mgr = std::make_unique<AuthManager>();
-    auto tmp = fs::temp_directory_path() / "yuzu_test_auth";
-    fs::create_directories(tmp);
-    auto cfg = tmp / "auth.cfg";
-    // Ensure clean state by removing stale config
+    auto cfg = yuzu::test::unique_temp_path("yuzu-test-auth-");
+    cfg += ".cfg";
+    fs::create_directories(cfg.parent_path());
     fs::remove(cfg);
-    // Load will return false (no file yet) — that's fine, we start empty
     mgr->load_config(cfg);
     return mgr;
 }
-
-/// Clean up the temp directory after tests.
-struct TempAuthCleanup {
-    ~TempAuthCleanup() {
-        std::error_code ec;
-        fs::remove_all(fs::temp_directory_path() / "yuzu_test_auth", ec);
-    }
-};
-
-static TempAuthCleanup cleanup_guard;
 
 // ── Crypto Primitives ────────────────────────────────────────────────────────
 
@@ -313,7 +310,9 @@ TEST_CASE("list_pending_agents", "[auth][pending]") {
 // ── Config Persistence ───────────────────────────────────────────────────────
 
 TEST_CASE("save and reload config preserves users", "[auth][config]") {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_auth" / "roundtrip.cfg";
+    auto tmp = yuzu::test::unique_temp_path("yuzu-test-auth-roundtrip-");
+    tmp += ".cfg";
+    fs::create_directories(tmp.parent_path());
     fs::remove(tmp);
 
     {
