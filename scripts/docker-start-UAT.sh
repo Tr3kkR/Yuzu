@@ -45,6 +45,13 @@ COMPOSE_FILE="$YUZU_ROOT/deploy/docker/docker-compose.full-uat.yml"
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
+# Server web port. Override via SERVER_PORT=NNNN if the compose stack
+# is configured to publish on a different host port (e.g. when running
+# alongside a native server on :8080). All curl calls below interpolate
+# this variable so the health-check, login, dashboard, and metrics
+# probes track whatever the compose file actually publishes.
+SERVER_PORT="${SERVER_PORT:-8080}"
+
 # ── Docker CLI ───────────────────────────────────────────────────────────
 
 if ! command -v docker > /dev/null 2>&1; then
@@ -196,7 +203,7 @@ show_status() {
     fi
     echo ""
     echo "Endpoints:"
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:${SERVER_PORT}"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123"
@@ -302,11 +309,11 @@ start_all() {
         docker compose -f "$COMPOSE_FILE" up -d 2>&1 | tail -10
 
     # Wait for services
-    if ! wait_for_http "http://localhost:8080/login" "Server" 45; then
+    if ! wait_for_http "http://localhost:${SERVER_PORT}/login" "Server" 45; then
         fail "Server did not start — check: docker logs yuzu-uat-server"
         exit 1
     fi
-    ok "Server up (dashboard http://localhost:8080)"
+    ok "Server up (dashboard http://localhost:${SERVER_PORT})"
 
     if ! wait_for_http "http://localhost:8081/readyz" "Gateway" 30; then
         fail "Gateway did not start — check: docker logs yuzu-uat-gateway"
@@ -336,12 +343,12 @@ start_all() {
     info "Creating enrollment token..."
     local enroll_token=""
     for _attempt in 1 2 3; do
-        curl -s -L -c "$UAT_DIR/cookies.txt" http://localhost:8080/login \
+        curl -s -L -c "$UAT_DIR/cookies.txt" http://localhost:${SERVER_PORT}/login \
             -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" -o /dev/null 2>/dev/null || true
 
         local token_html
         token_html=$(curl -s -L -b "$UAT_DIR/cookies.txt" \
-            -X POST http://localhost:8080/api/settings/enrollment-tokens \
+            -X POST http://localhost:${SERVER_PORT}/api/settings/enrollment-tokens \
             -d "label=uat-auto&max_uses=1000&ttl=86400" 2>/dev/null) || true
         enroll_token=$(echo "$token_html" | python3 -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null) || true
 
@@ -451,7 +458,7 @@ start_all() {
     # Test 1: Dashboard
     tests_total=$((tests_total + 1))
     local dash_code
-    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:8080/ 2>/dev/null)
+    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:${SERVER_PORT}/ 2>/dev/null)
     if [ "$dash_code" = "200" ]; then
         ok "Dashboard reachable (HTTP $dash_code)"
         tests_passed=$((tests_passed + 1))
@@ -473,7 +480,7 @@ start_all() {
     # Test 3: Server metrics — agents registered (expect $started_agents)
     tests_total=$((tests_total + 1))
     local reg_count
-    reg_count=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+    reg_count=$(curl -s http://localhost:${SERVER_PORT}/metrics 2>/dev/null | \
         python3 -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
     if [ "$reg_count" -ge "$started_agents" ]; then
         ok "Server sees $reg_count registered agent(s) (expected $started_agents)"
@@ -542,7 +549,7 @@ except: print(0)
     tests_total=$((tests_total + 1))
     local help_html
     help_html=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        http://localhost:8080/api/help/html 2>/dev/null)
+        http://localhost:${SERVER_PORT}/api/help/html 2>/dev/null)
     local plugin_count
     plugin_count=$(echo "$help_html" | grep -o 'result-row' | wc -l)
     if [ "$plugin_count" -gt 0 ]; then
@@ -557,7 +564,7 @@ except: print(0)
     info "Sending 'os_info os_name' (full round-trip via gateway)..."
     local cmd_resp
     cmd_resp=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        -X POST http://localhost:8080/api/command \
+        -X POST http://localhost:${SERVER_PORT}/api/command \
         -H "Content-Type: application/json" \
         -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null)
     local cmd_id
@@ -572,7 +579,7 @@ except: print(0)
             sleep 1
             poll_count=$((poll_count + 1))
             os_result=$(curl -s -b "$UAT_DIR/cookies.txt" \
-                "http://localhost:8080/api/responses/$cmd_id" 2>/dev/null | \
+                "http://localhost:${SERVER_PORT}/api/responses/$cmd_id" 2>/dev/null | \
                 python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -628,7 +635,7 @@ for r in d.get('responses',[]):
     echo "       Docker UAT Stack Ready                 "
     echo "=============================================="
     echo ""
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:${SERVER_PORT}"
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
