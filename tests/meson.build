@@ -201,6 +201,14 @@ if build_server
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
     ],
+    # httplib.h is header-only and its Client/Server class layout depends on
+    # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
+    # https_cpp_args, so any test TU that includes <httplib.h> (directly or
+    # via test_route_sink.hpp / workflow_routes.hpp) MUST match or MSVC emits
+    # C4743 (vtable size mismatch) and the linked binary crashes with
+    # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
+    # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
+    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
     dependencies: [yuzu_server_core_dep, catch2_dep],
   )
   test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
