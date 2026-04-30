@@ -307,26 +307,26 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: unauthenticated session re
 
 // ── Self-demotion guard — POST upsert sibling (ca-B1) ────────────────────────
 
-TEST_CASE("SettingsRoutes POST /api/settings/users: admin cannot demote own role",
-          "[settings][users][self-demote]") {
+TEST_CASE("SettingsRoutes POST /api/settings/users: role parameter ignored on create",
+          "[settings][users][c1-fix]") {
     SettingsRoutesHarness h;
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    // Form-urlencoded body — that's what the dashboard sends and what
-    // extract_form_value parses.
+    // C1 FIX: The role parameter is IGNORED on user creation. New users are
+    // always created as 'user' role regardless of what the form sends.
+    // Role changes must go through the dedicated POST /api/settings/users/:username/role endpoint.
     auto res = h.Post("/api/settings/users",
-                        "username=admin&password=newadminpass1&role=user",
+                        "username=newadmin&password=newadminpass1&role=admin",
                         "application/x-www-form-urlencoded");
     REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(res->get_header_value("HX-Trigger") == kSelfDemoteToast);
-    // Role must remain admin — the upsert must not have run.
-    auto role = h.role_of("admin");
+    CHECK(res->status == 200);
+    // Role must be 'user' — the role=admin parameter was ignored (C1 fix).
+    auto role = h.role_of("newadmin");
     REQUIRE(role.has_value());
-    CHECK(*role == auth::Role::admin);
-    // Audit chain captures the rejection.
-    CHECK(h.has_audit("user.upsert", "denied", "User", "admin"));
+    CHECK(*role == auth::Role::user);
+    // Audit chain captures the creation.
+    CHECK(h.has_audit("user.create", "success", "User", "newadmin"));
 }
 
 TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change allowed",
@@ -335,17 +335,16 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: admin self-password-change a
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
-    // Same role — only password is changing. The self-demotion guard must
-    // NOT block this; it specifically targets role transitions.
+    // Self-password-change via the POST create endpoint is now a duplicate
+    // username rejection (C1 fix: creation always uses 'user' role, duplicates blocked).
+    // Self-password-change should use a dedicated endpoint in future.
+    // For now, creating with an existing username returns 409.
     auto res = h.Post("/api/settings/users",
                         "username=admin&password=anotherpass12&role=admin",
                         "application/x-www-form-urlencoded");
     REQUIRE(res);
-    CHECK(res->status == 200);
-    auto role = h.role_of("admin");
-    REQUIRE(role.has_value());
-    CHECK(*role == auth::Role::admin);
-    CHECK(h.has_audit("user.upsert", "success", "User", "admin"));
+    CHECK(res->status == 409);
+    CHECK(h.has_audit("user.create", "denied", "User", "admin"));
 }
 
 TEST_CASE("SettingsRoutes POST /api/settings/users: success path renders self-row guard",
@@ -368,7 +367,7 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: success path renders self-ro
     CHECK(res->body.find("hx-delete=\"/api/settings/users/carol\"") != std::string::npos);
     CHECK(res->body.find("hx-delete=\"/api/settings/users/admin\"") == std::string::npos);
     CHECK(res->body.find("Current user") != std::string::npos);
-    CHECK(h.has_audit("user.upsert", "success", "User", "carol"));
+    CHECK(h.has_audit("user.create", "success", "User", "carol"));
 }
 
 // ── Duplicate-username guard (#399) ──────────────────────────────────────────
@@ -388,7 +387,7 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: duplicate username rejected"
     REQUIRE(res);
     CHECK(res->status == 409);
     CHECK(res->get_header_value("HX-Trigger") == kDuplicateUsernameToast);
-    CHECK(h.has_audit("user.upsert", "denied", "User", "bob"));
+    CHECK(h.has_audit("user.create", "denied", "User", "bob"));
     // The original password must still authenticate — the rejection must
     // not have run upsert_user under the hood.
     CHECK(h.auth_mgr.authenticate("bob", "bobpassword12").has_value());
@@ -424,7 +423,7 @@ TEST_CASE("SettingsRoutes POST /api/settings/users: short password rejected with
     // User must NOT have been persisted.
     CHECK_FALSE(h.has_user("charlie"));
     // Audit chain must capture the denial with the weak_password reason.
-    CHECK(h.has_audit("user.upsert", "denied", "User", "charlie"));
+    CHECK(h.has_audit("user.create", "denied", "User", "charlie"));
     // And must NOT show a success row for the same target.
     CHECK_FALSE(h.has_audit("user.upsert", "success", "User", "charlie"));
 }
