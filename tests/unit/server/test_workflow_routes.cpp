@@ -149,12 +149,27 @@ struct ExecHarness {
         responses.reset();
         instructions.reset();
         tracker.reset();
-        // tracker_guard.~SqliteHandleGuard() closes the raw handle as the
-        // last member-destruction step.
+        // Close the raw SQLite handle BEFORE attempting to remove the
+        // tracker_db file. On Windows, fs::remove() fails with
+        // ERROR_SHARING_VIOLATION if any process holds the file open;
+        // tracker_guard.~SqliteHandleGuard() would close it, but only
+        // AFTER this destructor body returns -- by which point fs::remove
+        // on the still-open tracker_db has already thrown
+        // filesystem_error, escaping the destructor and terminating the
+        // process. Linux is permissive (unlink succeeds with open fds)
+        // so the bug only manifests on Windows MSVC.
+        if (tracker_guard.db) {
+            sqlite3_close(tracker_guard.db);
+            tracker_guard.db = nullptr;
+        }
+        // Use the noexcept overload -- destructors must not throw even if
+        // a separate remove failure (e.g. file already gone, parent dir
+        // missing) happens.
+        std::error_code ec;
         for (auto& p : {tracker_db, instr_db, resp_db}) {
-            fs::remove(p);
-            fs::remove(p.string() + "-wal");
-            fs::remove(p.string() + "-shm");
+            fs::remove(p, ec);
+            fs::remove(p.string() + "-wal", ec);
+            fs::remove(p.string() + "-shm", ec);
         }
     }
 
