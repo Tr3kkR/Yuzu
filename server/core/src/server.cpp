@@ -286,6 +286,28 @@ public:
                           "Number of in-flight command executions", "gauge");
         metrics_.describe("yuzu_server_uptime_seconds",
                           "Server process uptime in seconds", "gauge");
+        // PR 5b — surface ExecutionEventBus internals so SREs can alert on
+        // SSE backpressure (events_dropped non-zero rate), retention-window
+        // sizing (gc_channels_total trend), and live-subscriber load
+        // (subscribers_active gauge). Pairs with the bounded ring buffer
+        // contract documented in CLAUDE.md "Executions-history ladder PR 3".
+        metrics_.describe("yuzu_server_sse_channels_active",
+                          "Per-execution SSE channels currently in the bus map",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_subscribers_active",
+                          "Total live SSE subscribers across all channels",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_events_dropped_total",
+                          "Cumulative SSE events dropped by the ring buffer "
+                          "(slow-subscriber backpressure signal)",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_gc_sweeps_total",
+                          "Cumulative ExecutionEventBus GC sweeps run",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_gc_channels_total",
+                          "Cumulative SSE channels reaped after retention "
+                          "window + zero subscribers",
+                          "counter");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -881,6 +903,25 @@ public:
                     // OBS-4: surface audit-pipeline persistence failures.
                     metrics_.gauge("yuzu_server_audit_emit_failed_total")
                         .set(static_cast<double>(audit_store_->emit_failed_count()));
+                }
+                // PR 5b — ExecutionEventBus observability. Same scrape-as-
+                // gauge pattern used for AuditStore + GuaranteedStateStore
+                // counters above; the bus exposes the counters via lock-
+                // free atomic accessors so reading from this thread is safe.
+                if (execution_event_bus_) {
+                    metrics_.gauge("yuzu_server_sse_channels_active")
+                        .set(static_cast<double>(execution_event_bus_->channel_count()));
+                    metrics_.gauge("yuzu_server_sse_subscribers_active")
+                        .set(static_cast<double>(execution_event_bus_->subscribers_total()));
+                    metrics_.gauge("yuzu_server_sse_events_dropped_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->events_dropped_total()));
+                    metrics_.gauge("yuzu_server_sse_gc_sweeps_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->gc_sweeps_total()));
+                    metrics_.gauge("yuzu_server_sse_gc_channels_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->gc_channels_total()));
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
                 // gauges for the count-now values (SQL COUNT(*)) and for the
@@ -1852,6 +1893,13 @@ private:
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
                  guaranteed_state_store_ && guaranteed_state_store_->is_open()},
+                // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
+                // legacy config-file-only deployments (auth_db_ == nullptr
+                // in AuthManager) and false only when an opted-in AuthDB
+                // failed the integrity check or migration. SOC 2 evidence:
+                // an operator can detect a corrupt auth.db without scraping
+                // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
+                {"auth_db", auth_mgr_.is_auth_db_ok()},
             };
 
             std::string failed_list;
