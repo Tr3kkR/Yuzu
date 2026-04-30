@@ -1,4 +1,5 @@
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -215,6 +216,11 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
 }
 
 bool AuthManager::save_config() const {
+    if (auth_db_) {
+        // AuthDB handles persistence — no config file write needed
+        return true;
+    }
+
     std::shared_lock lock(mu_);
 
     auto parent = cfg_path_.parent_path();
@@ -405,6 +411,15 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         return std::nullopt;
     }
 
+    // If using DB, verify user is still active in DB (could have been soft-deleted)
+    if (auth_db_) {
+        auto db_user = auth_db_->get_user(username);
+        if (!db_user) {
+            spdlog::warn("Auth failed: user '{}' not active in AuthDB", username);
+            return std::nullopt;
+        }
+    }
+
     auto token = generate_session_token();
     Session s;
     s.username = username;
@@ -452,6 +467,15 @@ bool AuthManager::has_users() const {
 }
 
 std::vector<UserEntry> AuthManager::list_users() const {
+    if (auth_db_) {
+        auto result = auth_db_->list_users();
+        if (result) {
+            return *result;
+        }
+        // Fall through to in-memory on error
+        spdlog::warn("AuthDB list_users failed, falling back to in-memory");
+    }
+
     std::shared_lock lock(mu_);
     std::vector<UserEntry> out;
     out.reserve(users_.size());
@@ -465,7 +489,17 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     if (password.size() < 12)
         return false; // minimum password length (G2-SEC-A1-003)
     auto salt = random_bytes(16);
+    auto salt_hex = bytes_to_hex(salt);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
+
+    if (auth_db_) {
+        // Use AuthDB for persistence
+        auto result = auth_db_->upsert_user(username, hash, salt_hex, role);
+        if (!result) {
+            spdlog::error("AuthDB upsert_user failed for '{}'", username);
+            return false;
+        }
+    }
 
     std::unique_lock lock(mu_);
     // Check if role is changing for an existing user
@@ -475,7 +509,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     UserEntry entry;
     entry.username = username;
     entry.role = role;
-    entry.salt_hex = bytes_to_hex(salt);
+    entry.salt_hex = salt_hex;
     entry.hash_hex = hash;
     users_[username] = std::move(entry);
 
@@ -486,10 +520,26 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
             return pair.second.username == username;
         });
     }
+
+    // Only save config file if NOT using DB (backwards compat)
+    if (!auth_db_) {
+        // Must unlock before save_config (it takes its own lock)
+        lock.unlock();
+        save_config();
+    }
+
     return true;
 }
 
 bool AuthManager::remove_user(const std::string& username) {
+    if (auth_db_) {
+        auto result = auth_db_->remove_user(username);
+        if (!result) {
+            spdlog::error("AuthDB remove_user failed for '{}'", username);
+            return false;
+        }
+    }
+
     std::unique_lock lock(mu_);
     auto erased = users_.erase(username) > 0;
     if (erased) {
@@ -499,6 +549,12 @@ bool AuthManager::remove_user(const std::string& username) {
             return pair.second.username == username;
         });
     }
+
+    if (!auth_db_) {
+        lock.unlock();
+        save_config();
+    }
+
     return erased;
 }
 
@@ -510,6 +566,36 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
     return it->second.role;
 }
 
+bool AuthManager::update_role(const std::string& username, Role new_role) {
+    if (auth_db_) {
+        auto result = auth_db_->update_role(username, new_role);
+        if (!result) {
+            spdlog::error("AuthDB update_role failed for '{}'", username);
+            return false;
+        }
+    }
+
+    std::unique_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end()) {
+        return false;
+    }
+    it->second.role = new_role;
+
+    // Invalidate sessions so the user picks up the new role on next login
+    // Prevents stale session role from granting old privileges
+    std::erase_if(sessions_, [&](const auto& pair) {
+        return pair.second.username == username;
+    });
+
+    if (!auth_db_) {
+        lock.unlock();
+        save_config();
+    }
+
+    return true;
+}
+
 // ── OIDC session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_oidc_session(const std::string& display_name,
@@ -518,20 +604,13 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& admin_group_id) {
     std::unique_lock lock(mu_);
 
-    // Determine role: admin if user is in the configured admin group,
-    // or if email/display_name matches a local admin account
+    // Determine role: admin if user is in the configured admin group.
+    // Security (C3 fix): Admin role via OIDC ONLY through explicit group membership.
+    // Do NOT match on email/display_name — these are attacker-controlled values.
     Role role = Role::user;
     if (!admin_group_id.empty()) {
         for (const auto& gid : groups) {
             if (gid == admin_group_id) {
-                role = Role::admin;
-                break;
-            }
-        }
-    }
-    if (role != Role::admin) {
-        for (const auto& [name, entry] : users_) {
-            if (entry.role == Role::admin && (name == email || name == display_name)) {
                 role = Role::admin;
                 break;
             }

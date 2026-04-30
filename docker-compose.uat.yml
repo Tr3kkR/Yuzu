@@ -184,7 +184,7 @@ services:
     container_name: yuzu-server
     restart: unless-stopped
     ports:
-      - "8080:8080"     # Web dashboard + REST API
+      - "8092:8080"     # Web dashboard + REST API
       - "50051:50051"   # Agent gRPC (direct-connect agents)
       - "50052:50052"   # Management gRPC
       - "50055:50055"   # Gateway upstream

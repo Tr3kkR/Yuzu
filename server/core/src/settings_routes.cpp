@@ -7,6 +7,7 @@
 #include "http_route_sink.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
+#include <yuzu/server/auth_db.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -2371,7 +2372,14 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         }
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
-        auto role_str = extract_form_value(req.body, "role");
+
+        // C1 FIX: Role parameter is IGNORED on user creation.
+        // New users are ALWAYS created as 'user' role. To change a user's
+        // role, use the dedicated POST /api/settings/users/:username/role
+        // endpoint (enhanced audit logging, session invalidation).
+        // This prevents privilege escalation where a compromised admin
+        // silently creates additional admin accounts.
+        auth::Role role = auth::Role::user;
 
         if (username.empty() || password.empty()) {
             res.status = 400;
@@ -2384,17 +2392,21 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             return;
         }
 
-        auto role = auth::string_to_role(role_str);
-        // #399: reject duplicate username on the create path. The underlying
-        // helper is upsert_user, which the original POST handler called
-        // unconditionally — silently overwriting existing accounts (including
-        // password reset on an admin row) with no operator confirmation.
-        // Self-rows are still allowed through so the operator can update
-        // their own password without demotion (the role-change branch below
-        // handles the lockout case separately).
-        if (username != session->username && auth_mgr_->get_user_role(username).has_value()) {
+        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':')
+        if (!is_valid_username(username)) {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username: must be 1-64 chars, alphanumeric + ._- only","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // #399: reject duplicate username on the create path.
+        if (auth_mgr_->get_user_role(username).has_value()) {
             spdlog::warn("POST /api/settings/users: username '{}' already exists — rejected", username);
-            audit_fn_(req, "user.upsert", "denied", "User", username, "duplicate_username");
+            audit_fn_(req, "user.create", "denied", "User", username, "duplicate_username");
             res.status = 409;
             res.set_header(
                 "HX-Trigger",
@@ -2403,44 +2415,15 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                             "text/html; charset=utf-8");
             return;
         }
-        // Self-demotion lockout guard (governance Gate 4 ca-B1, sibling
-        // of #397). The upsert path is the second equivalent route to
-        // the same lockout class as the DELETE self-target case: an
-        // admin POSTing their own username with role=user demotes
-        // themselves out of admin and is locked out of every admin-
-        // gated page on the next request. Self-password-change is
-        // explicitly allowed (same role); only role transitions on the
-        // self row are rejected.
-        if (username == session->username && role != session->role) {
-            spdlog::warn("User '{}' attempted to change their own role from {} to {} via "
-                         "POST /api/settings/users — rejected",
-                         session->username,
-                         auth::role_to_string(session->role), role_str);
-            audit_fn_(req, "user.upsert", "denied", "User", username, "self_role_change_blocked");
-            res.status = 403;
-            res.set_header(
-                "HX-Trigger",
-                R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
-            res.set_content(render_users_fragment(session->username),
-                            "text/html; charset=utf-8");
-            return;
-        }
-        // Weak-password rejection. `upsert_user` returns false when the
-        // password fails the G2-SEC-A1-003 minimum-length rule (12 chars);
-        // that's the only failure mode today. Surface as a 400 with an
-        // HX-Trigger toast matching the duplicate-username / self-role-change
-        // error-toast pattern above — the prior handler fire-and-forgot the
-        // return value, then logged "User added/updated", wrote a success
-        // audit, and emitted a "User created" toast, so a UAT operator who
-        // typed a short password saw a green success toast while nothing was
-        // persisted (silently-failed UX). If more `upsert_user` rejection
-        // reasons are added, replace the bool return with a richer error
-        // signal and fan out the toast text from there.
+        // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
+        // Role changes must go through POST /api/settings/users/:username/role.
+        // The self-demotion guard is no longer needed on this path since
+        // new users are always created as 'user' role.
         if (!auth_mgr_->upsert_user(username, password, role)) {
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
                          "(weak_password — minimum 12 characters)",
                          username);
-            audit_fn_(req, "user.upsert", "denied", "User", username, "weak_password");
+            audit_fn_(req, "user.create", "denied", "User", username, "weak_password");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -2450,12 +2433,13 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             return;
         }
         if (!auth_mgr_->save_config()) {
-            spdlog::error("Failed to save config after user upsert");
+            spdlog::error("Failed to save config after user create");
         }
-        spdlog::info("User '{}' added/updated (role={})", username, role_str);
+        std::string role_str = auth::role_to_string(role);
+        spdlog::info("User '{}' created (role={})", username, role_str);
         // SOC 2 CC7.2: privileged user lifecycle operations must appear
         // in audit_store, not just spdlog (governance Gate 6 CO-1).
-        audit_fn_(req, "user.upsert", "success", "User", username, "role=" + role_str);
+        audit_fn_(req, "user.create", "success", "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
             R"({"showToast":{"message":"User created","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -2522,6 +2506,141 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"User deleted","level":"success"}})");
         }
+        res.set_content(render_users_fragment(session->username),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- Settings API: Role change (admin only, C1 fix) -------------------------
+    // Dedicated endpoint for changing user roles. Separated from user creation
+    // to enforce enhanced audit logging and session invalidation.
+    sink.Post(R"(/api/settings/users/(.+)/role)", [this](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            spdlog::error("POST /api/settings/users/:username/role: session has empty username");
+            res.status = 500;
+            return;
+        }
+        auto target_username = req.matches[1].str();
+
+        // H1 FIX: Validate username in path parameter
+        if (!is_valid_username(target_username)) {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username format","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Self-demotion guard — can't change your own role
+        if (target_username == session->username) {
+            spdlog::warn("User '{}' attempted to change their own role via "
+                         "/api/settings/users/:username/role — rejected",
+                         session->username);
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "self_role_change_blocked");
+            res.status = 403;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Parse requested role from JSON body
+        std::string requested_role;
+        try {
+            auto json = nlohmann::json::parse(req.body);
+            if (!json.contains("role") || !json["role"].is_string()) {
+                res.status = 400;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Missing or invalid 'role' field","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            requested_role = json["role"].get<std::string>();
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid JSON body","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Allowlist check — only 'admin' or 'user' allowed
+        auth::Role new_role;
+        if (requested_role == "admin") {
+            new_role = auth::Role::admin;
+        } else if (requested_role == "user") {
+            new_role = auth::Role::user;
+        } else {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid role: must be 'admin' or 'user'","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Get current role for audit logging
+        auto current_entry_opt = auth_mgr_->get_user_role(target_username);
+        if (!current_entry_opt) {
+            res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"User not found","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auth::Role old_role = *current_entry_opt;
+
+        // No-op if role unchanged
+        if (old_role == new_role) {
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Role unchanged","level":"info"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Perform role change (AuthManager.update_role() handles DB + session invalidation)
+        if (!auth_mgr_->update_role(target_username, new_role)) {
+            spdlog::error("Failed to update role for '{}'", target_username);
+            res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to update role","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Enhanced audit logging (C1 requirement)
+        std::string old_role_str = auth::role_to_string(old_role);
+        std::string new_role_str = auth::role_to_string(new_role);
+        spdlog::info("User role changed: {} {} -> {} by {}",
+                    target_username, old_role_str, new_role_str, session->username);
+        audit_fn_(req, "user.role_change", "success", "User", target_username,
+                  "old_role=" + old_role_str + ",new_role=" + new_role_str);
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"Role updated","level":"success"}})");
         res.set_content(render_users_fragment(session->username),
                         "text/html; charset=utf-8");
     });

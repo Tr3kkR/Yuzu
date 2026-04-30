@@ -1,5 +1,6 @@
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
@@ -516,7 +517,52 @@ int main(int argc, char* argv[]) {
         // The initial load_config() loaded them from cfg_path_ parent (the old
         // location) because set_data_dir() hadn't been called yet.
         auth_mgr.reload_state();
+
+        // -- Auth DB: Initialize SQLite-backed auth persistence -----------------
+        // When --data-dir is specified, create and initialize the auth DB.
+        // This provides persistent user/session/token storage that survives
+        // container restarts (fixes GitHub issues #618, #388, #527, #391, #526).
+        spdlog::info("Initializing auth DB in data directory: {}", cfg.data_dir.string());
+        yuzu::server::AuthDB auth_db(cfg.data_dir);
+        auto db_result = auth_db.initialize();
+        if (!db_result) {
+            spdlog::error("Failed to initialize auth DB: {}", 
+                         static_cast<int>(db_result.error()));
+            return EXIT_FAILURE;
+        }
+        spdlog::info("Auth DB initialized successfully");
+
+        // First-boot seeding: if auth DB has no users, seed admin from config file.
+        // This ensures backwards compatibility — existing config-based users
+        // are automatically migrated to the DB on first start.
+        auto users_result = auth_db.list_users();
+        if (users_result && users_result->empty()) {
+            spdlog::info("Auth DB is empty — seeding admin user from config file");
+            // The admin user was already loaded into auth_mgr via load_config(),
+            // so we can read it back and persist to the DB.
+            for (const auto& user : auth_mgr.list_users()) {
+                auto seed_result = auth_db.upsert_user(
+                    user.username,
+                    user.hash_hex,
+                    user.salt_hex,
+                    user.role
+                );
+                if (seed_result) {
+                    spdlog::info("Seeded user '{}' (role={}) into auth DB", 
+                               user.username, auth::role_to_string(user.role));
+                } else {
+                    spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
+                }
+            }
+        }
+
         spdlog::info("Data directory: {}", cfg.data_dir.string());
+
+        // Wire AuthDB into AuthManager AFTER seeding is complete.
+        // This ensures auth_mgr.list_users() reads from in-memory (config file)
+        // during seeding, then delegates to AuthDB for all subsequent operations.
+        auth_mgr.set_auth_db(&auth_db);
+        spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
     // -- Batch token generation mode (exits without starting server) ----------
