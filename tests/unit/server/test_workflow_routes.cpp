@@ -19,6 +19,7 @@
  *   - Detail agent grid switches to decile bucketing above 1024 agents.
  */
 
+#include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "response_store.hpp"
@@ -63,6 +64,13 @@ struct ExecHarness {
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
+    /// PR 3: per-execution SSE bus. Constructed BEFORE the tracker (see
+    /// member-order comment) so the tracker can attach. Pointer is also
+    /// passed into WorkflowRoutes::Deps so the SSE handler is registered.
+    /// Defaults to non-null in the harness so SSE-route tests do not
+    /// silently 503; tests that want to exercise the no-bus path build
+    /// the deps inline.
+    std::unique_ptr<ExecutionEventBus> event_bus;
 
     bool perm_grant{true};
     /// PR 2 hardening regression net: captures the execution_id passed to
@@ -88,8 +96,12 @@ struct ExecHarness {
         // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
         // throwing REQUIRE in any later constructor step still closes it.
         REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
+        // PR 3: bus must outlive the tracker (the tracker borrows the
+        // bus pointer). Build the bus first.
+        event_bus = std::make_unique<ExecutionEventBus>();
         tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
         tracker->create_tables();
+        tracker->set_event_bus(event_bus.get());
 
         instructions = std::make_unique<InstructionStore>(instr_db);
         REQUIRE(instructions->is_open());
@@ -134,26 +146,37 @@ struct ExecHarness {
             return {"", 0};
         };
 
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, scope_fn,
-                               /*workflow_engine=*/nullptr, tracker.get(),
-                               /*schedule_engine=*/nullptr,
-                               /*product_pack_store=*/nullptr,
-                               instructions.get(),
-                               /*policy_store=*/nullptr,
-                               cmd_dispatch,
-                               /*approval_manager=*/nullptr,
-                               responses.get());
+        // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
+        // takes a single `Deps` aggregate so PR 3's SSE bus addition is a
+        // single new field, not a 17th parameter.
+        WorkflowRoutes::Deps wf_deps;
+        wf_deps.auth_fn = auth_fn;
+        wf_deps.perm_fn = perm_fn;
+        wf_deps.audit_fn = audit_fn;
+        wf_deps.emit_fn = emit_fn;
+        wf_deps.scope_fn = scope_fn;
+        wf_deps.execution_tracker = tracker.get();
+        wf_deps.instruction_store = instructions.get();
+        wf_deps.command_dispatch_fn = cmd_dispatch;
+        wf_deps.response_store = responses.get();
+        // PR 3 — wire the per-execution event bus. The SSE handler at
+        // /sse/executions/{id} only registers when this is non-null.
+        wf_deps.execution_event_bus = event_bus.get();
+        routes.register_routes(sink, std::move(wf_deps));
     }
 
     ~ExecHarness() {
         responses.reset();
         instructions.reset();
+        // PR 3: drop tracker BEFORE the bus — tracker borrows event_bus_,
+        // so the bus must outlive the tracker through its destructor.
         tracker.reset();
+        event_bus.reset();
         // Close the raw SQLite handle BEFORE attempting to remove the
         // tracker_db file. On Windows, fs::remove() fails with
         // ERROR_SHARING_VIOLATION if any process holds the file open;
         // tracker_guard.~SqliteHandleGuard() would close it, but only
-        // AFTER this destructor body returns -- by which point fs::remove
+        // AFTER this destructor body returns — by which point fs::remove
         // on the still-open tracker_db has already thrown
         // filesystem_error, escaping the destructor and terminating the
         // process. Linux is permissive (unlink succeeds with open fds)
@@ -162,7 +185,7 @@ struct ExecHarness {
             sqlite3_close(tracker_guard.db);
             tracker_guard.db = nullptr;
         }
-        // Use the noexcept overload -- destructors must not throw even if
+        // Use the noexcept overload — destructors must not throw even if
         // a separate remove failure (e.g. file already gone, parent dir
         // missing) happens.
         std::error_code ec;
@@ -828,4 +851,256 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
     auto execs = h.tracker->query_executions(q);
     REQUIRE(execs.size() == 1);
     CHECK(execs[0].status == "cancelled");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR 3 — /sse/executions/{id} live updates handler
+//
+// The TestRouteSink dispatch path returns the response object after the
+// handler runs. For the SSE route, that means we can verify the
+// auth/RBAC/404/410/503 short-circuit logic AND confirm the chunked
+// content provider is attached when the path is happy. We do NOT exercise
+// the actual streaming body here — that is covered by the bus-level tests
+// in test_execution_event_bus.cpp plus the puppeteer smoke. The bus → DOM
+// integration is the seam these tests pin.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("SSE handler: 404 for unknown execution", "[workflow][executions][pr3]") {
+    ExecHarness h;
+    auto res = h.sink.Get("/sse/executions/does-not-exist");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("SSE handler: 410 Gone for terminal execution", "[workflow][executions][pr3]") {
+    // Already-terminal executions must not open an SSE channel — the client
+    // should fall back to the static detail fragment. 410 tells EventSource
+    // to stop reconnecting (vs 503 which it would retry).
+    ExecHarness h;
+    h.make_def("def-DONE", "Done");
+    auto exec_id = h.make_exec("def-DONE", "succeeded", 3, 3, 0);
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 410);
+}
+
+TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution",
+          "[workflow][executions][pr3]") {
+    ExecHarness h;
+    h.make_def("def-FORBID", "Forbid");
+    auto exec_id = h.make_exec("def-FORBID", "running", 5, 0, 0);
+    h.perm_grant = false;
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("SSE handler: 200 on running execution attaches event-stream",
+          "[workflow][executions][pr3]") {
+    ExecHarness h;
+    h.make_def("def-RUN", "Run");
+    auto exec_id = h.make_exec("def-RUN", "running", 5, 1, 0);
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // Cache + buffering headers are mandatory for SSE — without them
+    // intermediaries (nginx, browser bfcache) buffer the stream and the
+    // client never receives transitions until the connection closes.
+    CHECK(res->get_header_value("Cache-Control") == "no-cache");
+    CHECK(res->get_header_value("X-Accel-Buffering") == "no");
+}
+
+TEST_CASE("SSE handler: ExecutionTracker.update_agent_status publishes "
+          "agent-transition onto the bus",
+          "[workflow][executions][pr3]") {
+    // This is the bus integration the SSE handler depends on — the
+    // streaming body trusts that update_agent_status feeds the channel.
+    // Subscribe directly to the bus so we don't need a real socket.
+    ExecHarness h;
+    h.make_def("def-INT", "Integration");
+    auto exec_id = h.make_exec("def-INT", "running", 3, 0, 0);
+
+    std::vector<ExecutionEvent> seen;
+    auto sub = h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
+        seen.push_back(ev);
+    });
+
+    h.agent_status(exec_id, "agent-1", "running");
+    h.agent_status(exec_id, "agent-1", "success");
+
+    h.event_bus->unsubscribe(exec_id, sub);
+
+    // Each update_agent_status emits one agent-transition. refresh_counts
+    // is not invoked by these helpers, so the only events we expect are
+    // the two explicit transitions.
+    REQUIRE(seen.size() >= 2);
+    CHECK(seen[0].event_type == "agent-transition");
+    CHECK(seen[0].data.find("agent-1") != std::string::npos);
+    CHECK(seen.back().data.find("success") != std::string::npos);
+    // Per-execution monotonic ids; first event of a fresh channel is id=1.
+    CHECK(seen[0].id == 1);
+    CHECK(seen.back().id >= seen[0].id);
+}
+
+TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
+          "execution-progress + execution-completed",
+          "[workflow][executions][pr3]") {
+    // When refresh_counts crosses the all-agents-responded threshold, the
+    // tracker must publish BOTH a progress event (so KPI strip updates)
+    // AND a terminal event (so the SSE client closes its EventSource).
+    // Verify both, in order, on the bus.
+    ExecHarness h;
+    h.make_def("def-TERM", "Terminal");
+    auto exec_id = h.make_exec("def-TERM", "running", 2, 0, 0);
+    h.tracker->set_agents_targeted(exec_id, 2);
+
+    std::vector<ExecutionEvent> seen;
+    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
+        seen.push_back(ev);
+    });
+
+    h.agent_status(exec_id, "agent-1", "success");
+    h.tracker->refresh_counts(exec_id);
+    h.agent_status(exec_id, "agent-2", "success");
+    h.tracker->refresh_counts(exec_id);
+
+    // Filter out per-agent transitions, keep progress+completed only.
+    std::vector<std::string> kinds;
+    for (const auto& ev : seen) kinds.push_back(ev.event_type);
+    auto count = [&](const std::string& k) {
+        return static_cast<int>(std::count(kinds.begin(), kinds.end(), k));
+    };
+    CHECK(count("execution-progress") >= 1);
+    CHECK(count("execution-completed") == 1);
+
+    // execution-completed must come AFTER the corresponding progress
+    // event so a client receiving them in order sees counts THEN status.
+    auto last_progress_idx = -1;
+    auto completed_idx = -1;
+    for (std::size_t i = 0; i < seen.size(); ++i) {
+        if (seen[i].event_type == "execution-progress")
+            last_progress_idx = static_cast<int>(i);
+        if (seen[i].event_type == "execution-completed")
+            completed_idx = static_cast<int>(i);
+    }
+    REQUIRE(last_progress_idx >= 0);
+    REQUIRE(completed_idx >= 0);
+    CHECK(completed_idx > last_progress_idx);
+}
+
+TEST_CASE("SSE handler: mark_cancelled publishes terminal execution-completed",
+          "[workflow][executions][pr3]") {
+    // mark_cancelled is the cancel-on-dispatch-failure path (PR 2 Pattern-C
+    // close). PR 3 must emit a terminal event so an open SSE drawer
+    // closes its EventSource cleanly instead of waiting for a heartbeat
+    // timeout.
+    ExecHarness h;
+    h.make_def("def-CANCEL", "Cancel");
+    auto exec_id = h.make_exec("def-CANCEL", "running", 5, 0, 0);
+
+    std::vector<ExecutionEvent> seen;
+    h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) {
+        seen.push_back(ev);
+    });
+
+    h.tracker->mark_cancelled(exec_id, "tester");
+
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0].event_type == "execution-completed");
+    CHECK(seen[0].data.find("cancelled") != std::string::npos);
+}
+
+TEST_CASE("SSE handler: ring buffer holds events for late-connecting client",
+          "[workflow][executions][pr3]") {
+    // The SSE handler replays the ring buffer to a client that connects
+    // mid-execution (with Last-Event-ID=0 → all). Pin the buffer
+    // contents the replay would walk.
+    ExecHarness h;
+    h.make_def("def-LATE", "Late");
+    auto exec_id = h.make_exec("def-LATE", "running", 5, 0, 0);
+
+    h.agent_status(exec_id, "agent-1", "running");
+    h.agent_status(exec_id, "agent-2", "success");
+    h.agent_status(exec_id, "agent-3", "failure");
+
+    auto snap = h.event_bus->snapshot(exec_id);
+    REQUIRE(snap.size() == 3);
+    // Ids are 1..3 in publish order — pinning the contract that
+    // replay_since(0) returns them in arrival order.
+    CHECK(snap[0].id == 1);
+    CHECK(snap[1].id == 2);
+    CHECK(snap[2].id == 3);
+}
+
+TEST_CASE("SSE handler: per-execution channel partitioning under the routes layer",
+          "[workflow][executions][pr3]") {
+    // Two concurrent executions of the same definition; each agent
+    // transition must land on the correct channel. This is the contract
+    // the SSE handler depends on to keep one drawer's events from
+    // bleeding into another.
+    ExecHarness h;
+    h.make_def("def-PARTITION", "Partition");
+    auto a = h.make_exec("def-PARTITION", "running", 2, 0, 0);
+    auto b = h.make_exec("def-PARTITION", "running", 2, 0, 0);
+
+    h.agent_status(a, "agent-1", "success");
+    h.agent_status(b, "agent-9", "failure");
+
+    auto snap_a = h.event_bus->snapshot(a);
+    auto snap_b = h.event_bus->snapshot(b);
+    REQUIRE(snap_a.size() == 1);
+    REQUIRE(snap_b.size() == 1);
+    CHECK(snap_a[0].data.find("agent-1") != std::string::npos);
+    CHECK(snap_b[0].data.find("agent-9") != std::string::npos);
+    // No cross-leak: agent-9 must not appear in exec A's channel.
+    CHECK(snap_a[0].data.find("agent-9") == std::string::npos);
+    CHECK(snap_b[0].data.find("agent-1") == std::string::npos);
+}
+
+TEST_CASE("SSE handler: list view stamps data-execution-id and "
+          "data-execution-status for client SSE bootstrap",
+          "[workflow][executions][pr3]") {
+    // The drawer opens an EventSource only when the row was rendered with
+    // status=running OR pending. PR 3 added the data-* attributes to the
+    // list row markup; verify they are present and round-trip the status
+    // we created the execution with.
+    ExecHarness h;
+    h.make_def("def-LIST", "List");
+    auto exec_id = h.make_exec("def-LIST", "running", 3, 0, 0);
+
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto& body = res->body;
+    CHECK(body.find("data-execution-id=\"" + exec_id + "\"") != std::string::npos);
+    CHECK(body.find("data-execution-status=\"running\"") != std::string::npos);
+}
+
+TEST_CASE("SSE handler: detail KPI strip carries id=exec-kpi-{id} for partial swaps",
+          "[workflow][executions][pr3]") {
+    // Client SSE listener finds the KPI strip via #exec-kpi-{id} so it
+    // can update Total / Succeeded / Failed without re-rendering the
+    // whole drawer. Pin the id stamp.
+    ExecHarness h;
+    h.make_def("def-KPI", "KPI");
+    auto exec_id = h.make_exec("def-KPI", "running", 3, 0, 0);
+    auto res = h.sink.Get("/fragments/executions/" + exec_id + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("id=\"exec-kpi-" + exec_id + "\"") != std::string::npos);
+}
+
+TEST_CASE("SSE handler: per-agent status badge has .per-agent-status class for partial swaps",
+          "[workflow][executions][pr3]") {
+    // Client SSE listener swaps the status badge in place via
+    // .per-agent-status. Pin the class stamp.
+    ExecHarness h;
+    h.make_def("def-BADGE", "Badge");
+    auto exec_id = h.make_exec("def-BADGE", "running", 1, 0, 0);
+    h.agent_status(exec_id, "a-1", "running");
+    auto res = h.sink.Get("/fragments/executions/" + exec_id + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("per-agent-status") != std::string::npos);
+    CHECK(res->body.find("per-agent-exit-code") != std::string::npos);
 }
