@@ -59,6 +59,14 @@ public:
     /// Prometheus scraping; reset at process start. Lock-free reads.
     uint64_t events_written(const std::string& result) const noexcept;
 
+    /// Cumulative count of audit events that failed to persist (sqlite3_step
+    /// did not return SQLITE_DONE). Audit pipeline degradation is a SOC 2
+    /// CC7.2 evidence-chain risk; surface it on /metrics so operators can
+    /// page on a non-zero rate.
+    uint64_t emit_failed_count() const noexcept {
+        return emit_failed_.load(std::memory_order_relaxed);
+    }
+
     void start_cleanup();
     void stop_cleanup();
 
@@ -73,6 +81,9 @@ private:
     std::atomic<uint64_t> events_failure_{0};
     std::atomic<uint64_t> events_denied_{0};
     std::atomic<uint64_t> events_other_{0};
+    // Persistence-failure counter: rows where the INSERT step returned
+    // anything other than SQLITE_DONE.
+    std::atomic<uint64_t> emit_failed_{0};
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else

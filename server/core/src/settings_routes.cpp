@@ -2471,6 +2471,20 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             return;
         }
         auto username = req.matches[1].str();
+        // Username allowlist before any state mutation. Without this a
+        // hand-crafted DELETE against `..%2Ffoo` or characters that
+        // bypass URL canonicalisation reaches remove_user() with bytes
+        // that should never have entered the user-store path.
+        if (!is_valid_username(username)) {
+            audit_fn_(req, "user.delete", "denied", "User", username, "invalid_username");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username format","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         // Self-deletion lockout guard (#397). Deleting the currently
         // authenticated operator — typically the sole admin on a single-
         // seat deployment — leaves the running server with zero usable
@@ -2505,6 +2519,15 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             audit_fn_(req, "user.delete", "success", "User", username, "");
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"User deleted","level":"success"}})");
+        } else {
+            // remove_user() returns false when the username is not in the
+            // user store. A no-op DELETE is still a privileged-mutation
+            // attempt and must surface in the audit chain.
+            audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
+            res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"User not found","level":"error"}})");
         }
         res.set_content(render_users_fragment(session->username),
                         "text/html; charset=utf-8");
@@ -2531,6 +2554,11 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
 
         // H1 FIX: Validate username in path parameter
         if (!is_valid_username(target_username)) {
+            // SOC 2 CC7.2: every denied branch on a privileged-mutation
+            // endpoint emits an audit event so the SIEM evidence chain is
+            // complete (governance PR4 audit-coverage).
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_username");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -2561,6 +2589,8 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         try {
             auto json = nlohmann::json::parse(req.body);
             if (!json.contains("role") || !json["role"].is_string()) {
+                audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                          "missing_role");
                 res.status = 400;
                 res.set_header(
                     "HX-Trigger",
@@ -2571,6 +2601,8 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
             }
             requested_role = json["role"].get<std::string>();
         } catch (const std::exception& e) {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_json");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -2587,6 +2619,8 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         } else if (requested_role == "user") {
             new_role = auth::Role::user;
         } else {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_role");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -2599,6 +2633,8 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         // Get current role for audit logging
         auto current_entry_opt = auth_mgr_->get_user_role(target_username);
         if (!current_entry_opt) {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "user_not_found");
             res.status = 404;
             res.set_header(
                 "HX-Trigger",
@@ -2611,6 +2647,11 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
 
         // No-op if role unchanged
         if (old_role == new_role) {
+            // No state change, but audit the operator's intent — distinguishes
+            // "tried to set already-current role" from "no request was made"
+            // for compliance review.
+            audit_fn_(req, "user.role_change", "no_op", "User", target_username,
+                      "same_role=" + auth::role_to_string(new_role));
             res.set_header(
                 "HX-Trigger",
                 R"({"showToast":{"message":"Role unchanged","level":"info"}})");
@@ -2622,6 +2663,8 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
         // Perform role change (AuthManager.update_role() handles DB + session invalidation)
         if (!auth_mgr_->update_role(target_username, new_role)) {
             spdlog::error("Failed to update role for '{}'", target_username);
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "db_failure");
             res.status = 500;
             res.set_header(
                 "HX-Trigger",
