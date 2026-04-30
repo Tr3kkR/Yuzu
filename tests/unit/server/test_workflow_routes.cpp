@@ -29,6 +29,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -42,11 +43,23 @@ fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
 
+// RAII holder for the raw sqlite3* that ExecutionTracker takes by handle.
+// Declared as the FIRST member of ExecHarness so its destructor runs LAST
+// in member-destruction order — guarantees the handle closes even if a
+// later REQUIRE in the constructor throws (qa-B2 fixture leak fix).
+struct SqliteHandleGuard {
+    sqlite3* db{nullptr};
+    ~SqliteHandleGuard() { if (db) sqlite3_close(db); }
+};
+
 struct ExecHarness {
+    // Order matters: tracker_guard outlives `tracker` so the handle is still
+    // alive while ~ExecutionTracker runs (it doesn't close, only finalizes
+    // statements), then SqliteHandleGuard closes the handle on destruction.
+    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
     fs::path tracker_db, instr_db, resp_db;
-    sqlite3* tracker_raw{nullptr};
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
@@ -54,15 +67,23 @@ struct ExecHarness {
     bool perm_grant{true};
     WorkflowRoutes routes;
 
+    /// Per-process monotonic counter for execution IDs. Replaces the prior
+    /// `std::hash<std::string>(...)` which violates the CLAUDE.md test rule
+    /// against hash-of-thread-id / clock as uniqueness salt — the same
+    /// principle applies to hash-of-string under MSVC's hash, which has had
+    /// collision edge cases. Atomic so parallel test workers cannot collide.
+    static inline std::atomic<int> exec_counter{0};
+
     ExecHarness()
         : tracker_db(uniq("wf-routes-exec")),
           instr_db(uniq("wf-routes-inst")),
           resp_db(uniq("wf-routes-resp")) {
         for (auto& p : {tracker_db, instr_db, resp_db}) fs::remove(p);
 
-        // ExecutionTracker takes a raw sqlite3* — open it directly.
-        REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_raw) == SQLITE_OK);
-        tracker = std::make_unique<ExecutionTracker>(tracker_raw);
+        // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
+        // throwing REQUIRE in any later constructor step still closes it.
+        REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
+        tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
         tracker->create_tables();
 
         instructions = std::make_unique<InstructionStore>(instr_db);
@@ -114,7 +135,8 @@ struct ExecHarness {
         responses.reset();
         instructions.reset();
         tracker.reset();
-        if (tracker_raw) sqlite3_close(tracker_raw);
+        // tracker_guard.~SqliteHandleGuard() closes the raw handle as the
+        // last member-destruction step.
         for (auto& p : {tracker_db, instr_db, resp_db}) {
             fs::remove(p);
             fs::remove(p.string() + "-wal");
@@ -139,10 +161,8 @@ struct ExecHarness {
                           int agents_targeted, int agents_success, int agents_failure,
                           int64_t dispatched_at = 1735689600 /* 2025-01-01 */) {
         Execution e;
-        e.id = "exec-" + std::to_string(std::hash<std::string>{}(
-                                 definition_id + status +
-                                 std::to_string(dispatched_at)) %
-                             0xFFFFFF);
+        // Atomic counter, not std::hash, per CLAUDE.md test isolation rules.
+        e.id = "exec-" + std::to_string(exec_counter.fetch_add(1));
         e.definition_id = definition_id;
         e.status = status;
         e.dispatched_by = "tester";
@@ -445,8 +465,98 @@ TEST_CASE("executions detail: sidebar carries dispatched_by + ISO timestamps",
 
 // ── ExecutionTracker last_error_detail correlated subquery ─────────────────
 
-TEST_CASE("ExecutionTracker.query_executions: last_error_detail empty for "
-          "fully-successful run",
+// ── arch-B2: opt-out is the default ────────────────────────────────────────
+
+TEST_CASE("ExecutionTracker.query_executions: include_error_detail default "
+          "false leaves the field empty (arch-B2 hot-path)",
+          "[workflow][executions][tracker]") {
+    // server.cpp:1727 calls query_executions({.limit = 1000}) on every
+    // metrics tick; that path must NOT pay the correlated-subquery cost.
+    // Default-constructed ExecutionQuery leaves include_error_detail == false.
+    ExecHarness h;
+    h.make_def("def-OPTOUT", "OPTOUT");
+    auto eid = h.make_exec("def-OPTOUT", "completed", 1, 0, 1);
+    h.agent_status(eid, "a", "failure", 1, "should not appear", 1735689602);
+
+    ExecutionQuery q; // include_error_detail defaults to false
+    auto execs = h.tracker->query_executions(q);
+    REQUIRE(execs.size() == 1);
+    CHECK(execs[0].last_error_detail.empty());
+}
+
+TEST_CASE("ExecutionTracker.get_execution: always populates last_error_detail "
+          "(single-row read is rare, opts in unconditionally)",
+          "[workflow][executions][tracker]") {
+    ExecHarness h;
+    h.make_def("def-GE", "GE");
+    auto eid = h.make_exec("def-GE", "completed", 1, 0, 1);
+    h.agent_status(eid, "a", "failure", 1, "single-row read sees this", 1735689602);
+
+    auto exec = h.tracker->get_execution(eid);
+    REQUIRE(exec.has_value());
+    CHECK(exec->last_error_detail == "single-row read sees this");
+}
+
+// ── qa-S4: failure with empty error_detail ─────────────────────────────────
+
+TEST_CASE("ExecutionTracker.query_executions: agents_failure>0 with empty "
+          "error_detail yields empty last_error_detail (qa-S4)",
+          "[workflow][executions][tracker]") {
+    ExecHarness h;
+    h.make_def("def-NE", "NoError");
+    auto eid = h.make_exec("def-NE", "completed", 1, 0, 1);
+    // Failure status but empty error_detail — exit code only.
+    h.agent_status(eid, "a", "failure", 99, "", 1735689601);
+
+    ExecutionQuery q;
+    q.include_error_detail = true;
+    auto execs = h.tracker->query_executions(q);
+    REQUIRE(execs.size() == 1);
+    // Subquery WHERE clause filters out empty error_detail; SELECT returns
+    // no rows; `col_text` returns empty. Pin the silent contract.
+    CHECK(execs[0].last_error_detail.empty());
+}
+
+// ── sec-M1: LIST handler now gates on Execution:Read ───────────────────────
+
+TEST_CASE("executions list: 403 when perm_fn denies (sec-M1)",
+          "[workflow][executions][list][rbac]") {
+    ExecHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/fragments/executions");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── UP-1 / qa-S1: agent_id with single-quote does not produce JS injection ─
+
+TEST_CASE("executions detail: agent_id containing single-quote is bound via "
+          "data-* attrs, not interpolated into JS (UP-1)",
+          "[workflow][executions][detail][xss]") {
+    ExecHarness h;
+    h.make_def("def-XSS", "XSS-safe");
+    auto eid = h.make_exec("def-XSS", "completed", 1, 1, 0);
+    // Agent emerges with a single quote in its id — wire-provided, no
+    // intake validation today. The detail handler must NOT interpolate
+    // this into `onclick="scrollToAgentRow('AGENT-ID')"` style.
+    h.agent_status(eid, "agent'with'quote", "success", 0, "", 1735689601);
+
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The dangerous pattern: agent_id quoted-and-interpolated into a JS
+    // string literal. The mitigation is to use data-agent-id="..." and
+    // bind via addEventListener client-side; the rendered HTML must NOT
+    // contain `scrollToAgentRow(` followed by an interpolated agent_id.
+    CHECK(res->body.find("scrollToAgentRow(") == std::string::npos);
+    // The agent_id must appear as a data-agent-id attribute value (with
+    // its single quote escaped to &#39; for HTML attribute context).
+    CHECK(res->body.find("data-agent-id=\"agent&#39;with&#39;quote\"")
+          != std::string::npos);
+}
+
+TEST_CASE("ExecutionTracker.query_executions: last_error_detail opt-in default "
+          "is empty for fully-successful run",
           "[workflow][executions][tracker]") {
     ExecHarness h;
     h.make_def("def-L", "L");
@@ -454,13 +564,15 @@ TEST_CASE("ExecutionTracker.query_executions: last_error_detail empty for "
     h.agent_status(eid, "a", "success", 0, "", 1735689601);
     h.agent_status(eid, "b", "success", 0, "", 1735689602);
 
-    auto execs = h.tracker->query_executions({});
+    ExecutionQuery q;
+    q.include_error_detail = true;
+    auto execs = h.tracker->query_executions(q);
     REQUIRE(execs.size() == 1);
     CHECK(execs[0].last_error_detail.empty());
 }
 
 TEST_CASE("ExecutionTracker.query_executions: last_error_detail surfaces "
-          "most recent failure",
+          "most recent failure when caller opts in",
           "[workflow][executions][tracker]") {
     ExecHarness h;
     h.make_def("def-LE", "LE");
@@ -470,7 +582,9 @@ TEST_CASE("ExecutionTracker.query_executions: last_error_detail surfaces "
     h.agent_status(eid, "b", "failure", 1, "OLDER ERROR", 1735689602);
     h.agent_status(eid, "c", "failure", 1, "NEWER ERROR", 1735689610);
 
-    auto execs = h.tracker->query_executions({});
+    ExecutionQuery q;
+    q.include_error_detail = true;
+    auto execs = h.tracker->query_executions(q);
     REQUIRE(execs.size() == 1);
     CHECK(execs[0].last_error_detail == "NEWER ERROR");
 }
