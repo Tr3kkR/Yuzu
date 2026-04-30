@@ -24,6 +24,11 @@ th{color:var(--muted);font-weight:600}
 .status-pending{background:var(--yellow);color: var(--mds-color-theme-background-canvas)}
 .status-running{background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent)}
 .status-completed{background:var(--green);color:var(--mds-color-text-on-accent)}
+/* PR 3 hardening (ca-PR3-7): per-agent renderer + SSE swap canonicalised
+   on DOM vocabulary status-{succeeded,failed,running,pending}. .status-succeeded
+   is the canonical agent/exec success class going forward; .status-completed
+   stays for backwards-compat on existing fragments. */
+.status-succeeded{background:var(--green);color:var(--mds-color-text-on-accent)}
 .status-cancelled{background:var(--subtle);color:var(--mds-color-text-on-accent)}
 .status-failed{background:var(--red);color:var(--mds-color-text-on-accent)}
 .status-approved{background:var(--green);color:var(--mds-color-text-on-accent)}
@@ -592,10 +597,13 @@ function execApplyAgentTransition(drawerEl, execId, payload) {
     var badge = rows[j].querySelector('.per-agent-status');
     if (badge) {
       badge.textContent = status;
-      badge.className = ('status-badge per-agent-status ' +
-        (domStatus === 'succeeded' ? 'status-success' :
-         domStatus === 'failed' ? 'status-error' :
-         domStatus === 'running' ? 'status-running' : 'status-pending'));
+      // Canonical class vocabulary (ca-PR3-7) — matches the server
+      // renderer in workflow_routes.cpp. Both produce
+      // `.status-{succeeded,failed,running,pending}` so initial
+      // render and SSE live update yield identical class strings.
+      // CSS rules `.status-succeeded` / `.status-failed` /
+      // `.status-running` / `.status-pending` cover the set.
+      badge.className = 'status-badge per-agent-status status-' + domStatus;
     }
     var exitTd = rows[j].querySelector('.per-agent-exit-code');
     if (exitTd && typeof payload.exit_code === 'number') {

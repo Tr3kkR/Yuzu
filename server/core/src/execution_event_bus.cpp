@@ -56,7 +56,13 @@ void ExecutionEventBus::publish(const std::string& execution_id, const std::stri
         std::lock_guard<std::mutex> g(ch->mu);
         ev.id = ch->next_id++;
         ch->buffer.push_back(ev);
-        while (ch->buffer.size() > kBufferCap) ch->buffer.pop_front();
+        while (ch->buffer.size() > kBufferCap) {
+            ch->buffer.pop_front();
+            // OBS-3: per-channel ring overflow counter, aggregated bus-wide.
+            // Operators tune kBufferCap (or upgrade to per-execution sizing
+            // — see Deferred-1 / issue #696) when this counter starts moving.
+            events_dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
         if (is_terminal && !ch->terminal) {
             ch->terminal = true;
             ch->terminal_at_ms = ev.timestamp_ms;
@@ -69,9 +75,9 @@ void ExecutionEventBus::publish(const std::string& execution_id, const std::stri
         }
     }
 
-    // Opportunistic GC — runs at most every publish, but is guarded
-    // by a timestamp check inside `gc_terminal_channels` so the cost
-    // amortises to O(1) on the hot path.
+    // Opportunistic GC. Throttled to at most once per kMinGcIntervalMs
+    // (perf-B2) — the previous comment claimed amortised O(1) but no
+    // throttle existed; every publish walked the entire channels_ map.
     gc_terminal_channels();
 }
 
@@ -107,6 +113,17 @@ std::size_t ExecutionEventBus::channel_count() const {
 
 std::size_t ExecutionEventBus::gc_terminal_channels() {
     auto now = now_ms();
+
+    // perf-B2 throttle. The previous comment claimed amortised O(1) but
+    // no throttle existed — every publish walked all channels_, took
+    // each per-channel lock, and dropped under contention. Now the full
+    // sweep runs at most once per kMinGcIntervalMs; the early-return
+    // path is a single relaxed atomic load + compare.
+    auto last_gc = last_gc_at_ms_.load(std::memory_order_relaxed);
+    if (now - last_gc < kMinGcIntervalMs) {
+        return 0;
+    }
+
     auto deadline = now - kRetentionAfterTerminalSec * 1000;
 
     // First pass: collect candidates under the read lock so we never
@@ -122,6 +139,13 @@ std::size_t ExecutionEventBus::gc_terminal_channels() {
             }
         }
     }
+
+    // Stamp the sweep timestamp regardless of whether anything was
+    // actually collected — we paid the O(channels) inspection cost,
+    // throttle should reflect that. OBS-3: increment sweeps counter.
+    last_gc_at_ms_.store(now, std::memory_order_relaxed);
+    gc_sweeps_.fetch_add(1, std::memory_order_relaxed);
+
     if (victims.empty()) return 0;
 
     std::size_t removed = 0;
@@ -138,7 +162,20 @@ std::size_t ExecutionEventBus::gc_terminal_channels() {
             ++removed;
         }
     }
+    if (removed > 0) {
+        gc_channels_.fetch_add(removed, std::memory_order_relaxed);
+    }
     return removed;
+}
+
+std::size_t ExecutionEventBus::subscribers_total() const {
+    std::size_t total = 0;
+    std::shared_lock<std::shared_mutex> rl(map_mu_);
+    for (const auto& [_, ch] : channels_) {
+        std::lock_guard<std::mutex> g(ch->mu);
+        total += ch->listeners.size();
+    }
+    return total;
 }
 
 } // namespace yuzu::server

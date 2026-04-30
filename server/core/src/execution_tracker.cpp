@@ -323,51 +323,64 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
                                            const AgentExecStatus& s) {
     if (!db_)
         return;
-    std::lock_guard lock(mtx_);
 
-    const char* sql = R"(
-        INSERT INTO agent_exec_status
-        (execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, error_detail)
-        VALUES (?,?,?,?,?,?,?,?)
-        ON CONFLICT(execution_id, agent_id) DO UPDATE SET
-            status=excluded.status,
-            first_response_at=CASE WHEN agent_exec_status.first_response_at=0 THEN excluded.first_response_at ELSE agent_exec_status.first_response_at END,
-            completed_at=excluded.completed_at,
-            exit_code=excluded.exit_code,
-            error_detail=excluded.error_detail
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    // Snapshot-and-release (governance round perf-B1 / UP-A9). Build the
+    // SSE payload while holding mtx_, then exit the locked region BEFORE
+    // calling event_bus_->publish. Holding mtx_ across publish compounds
+    // the lock chain — bus channel mutex acquired inside publish, then
+    // each listener body runs under that mutex and grabs a per-connection
+    // sink mutex. A slow / backpressured SSE client (TCP RWND=0,
+    // malicious slowloris) blocks the listener, blocks the channel mutex,
+    // blocks publish, blocks the tracker mutex — and every other agent
+    // reporting onto this execution stalls. The previous comment claimed
+    // the pattern was already release-then-publish; in fact the publish
+    // sat inside the lock_guard scope. This is the actual fix.
+    bool should_publish = false;
+    nlohmann::json payload;
 
-    auto now = now_epoch();
-    int i = 1;
-    sqlite3_bind_text(stmt, i++, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, i++, s.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, i++, s.status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, i++, s.dispatched_at > 0 ? s.dispatched_at : now);
-    sqlite3_bind_int64(stmt, i++, s.first_response_at > 0 ? s.first_response_at : now);
-    sqlite3_bind_int64(stmt, i++, s.completed_at);
-    sqlite3_bind_int(stmt, i++, s.exit_code);
-    sqlite3_bind_text(stmt, i++, s.error_detail.c_str(), -1, SQLITE_TRANSIENT);
+    {
+        std::lock_guard lock(mtx_);
 
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+        const char* sql = R"(
+            INSERT INTO agent_exec_status
+            (execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, error_detail)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(execution_id, agent_id) DO UPDATE SET
+                status=excluded.status,
+                first_response_at=CASE WHEN agent_exec_status.first_response_at=0 THEN excluded.first_response_at ELSE agent_exec_status.first_response_at END,
+                completed_at=excluded.completed_at,
+                exit_code=excluded.exit_code,
+                error_detail=excluded.error_detail
+        )";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+            return;
 
-    // PR 3 — publish an `agent-transition` event onto the per-execution
-    // SSE channel. The publish runs OUTSIDE the recursive mutex
-    // (release-then-publish pattern) only because the publish path is
-    // already non-blocking and listeners do queue-and-notify. We keep
-    // the call inside the lock here to preserve sequential consistency
-    // between the DB write and the event the SSE client sees — if a
-    // reader observes the row, it must also observe the event.
-    if (event_bus_) {
-        nlohmann::json payload;
-        payload["agent_id"] = s.agent_id;
-        payload["status"] = s.status;
-        payload["exit_code"] = s.exit_code;
-        payload["completed_at"] = s.completed_at;
-        if (!s.error_detail.empty()) payload["error_detail"] = s.error_detail;
+        auto now = now_epoch();
+        int i = 1;
+        sqlite3_bind_text(stmt, i++, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, i++, s.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, i++, s.status.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, i++, s.dispatched_at > 0 ? s.dispatched_at : now);
+        sqlite3_bind_int64(stmt, i++, s.first_response_at > 0 ? s.first_response_at : now);
+        sqlite3_bind_int64(stmt, i++, s.completed_at);
+        sqlite3_bind_int(stmt, i++, s.exit_code);
+        sqlite3_bind_text(stmt, i++, s.error_detail.c_str(), -1, SQLITE_TRANSIENT);
+
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        if (event_bus_) {
+            should_publish = true;
+            payload["agent_id"] = s.agent_id;
+            payload["status"] = s.status;
+            payload["exit_code"] = s.exit_code;
+            payload["completed_at"] = s.completed_at;
+            if (!s.error_detail.empty()) payload["error_detail"] = s.error_detail;
+        }
+    }  // mtx_ released here — publish below runs lock-free.
+
+    if (should_publish) {
         event_bus_->publish(execution_id, "agent-transition", payload.dump());
     }
 }
@@ -391,73 +404,85 @@ void ExecutionTracker::set_agents_targeted(const std::string& execution_id,
 void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     if (!db_)
         return;
-    std::lock_guard lock(mtx_);
 
-    // Recompute aggregate counts from agent_exec_status
-    const char* sql = R"(
-        UPDATE executions SET
-            agents_responded = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status IN ('success','failure','timeout','rejected')),
-            agents_success   = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status='success'),
-            agents_failure   = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status IN ('failure','timeout','rejected'))
-        WHERE id=?
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
+    // the full rationale. We snapshot up to two SSE payloads under the
+    // tracker mutex, then drop the lock before publishing.
+    bool publish_progress = false;
+    bool publish_terminal = false;
+    nlohmann::json progress_payload;
+    nlohmann::json terminal_payload;
+    bool transitioned_terminal_was = false;
 
-    sqlite3_bind_text(stmt, 1, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    {
+        std::lock_guard lock(mtx_);
 
-    // Check if all agents responded and update status
-    auto exec = get_execution(execution_id);
-    bool transitioned_terminal = false;
-    std::string final_status_str;
-    if (exec && exec->agents_targeted > 0 && exec->agents_responded >= exec->agents_targeted) {
-        auto final_status = (exec->agents_failure == 0) ? "succeeded" : "completed";
-        sqlite3_stmt* upd = nullptr;
-        if (sqlite3_prepare_v2(
-                db_,
-                "UPDATE executions SET status=?, completed_at=? WHERE id=? AND status='running'",
-                -1, &upd, nullptr) == SQLITE_OK) {
-            auto now = now_epoch();
-            sqlite3_bind_text(upd, 1, final_status, -1, SQLITE_STATIC);
-            sqlite3_bind_int64(upd, 2, now);
-            sqlite3_bind_text(upd, 3, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0) {
-                transitioned_terminal = true;
-                final_status_str = final_status;
+        // Recompute aggregate counts from agent_exec_status
+        const char* sql = R"(
+            UPDATE executions SET
+                agents_responded = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status IN ('success','failure','timeout','rejected')),
+                agents_success   = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status='success'),
+                agents_failure   = (SELECT COUNT(*) FROM agent_exec_status WHERE execution_id=? AND status IN ('failure','timeout','rejected'))
+            WHERE id=?
+        )";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+            return;
+
+        sqlite3_bind_text(stmt, 1, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        // Check if all agents responded and update status
+        auto exec = get_execution(execution_id);
+        bool transitioned_terminal = false;
+        std::string final_status_str;
+        if (exec && exec->agents_targeted > 0 && exec->agents_responded >= exec->agents_targeted) {
+            auto final_status = (exec->agents_failure == 0) ? "succeeded" : "completed";
+            sqlite3_stmt* upd = nullptr;
+            if (sqlite3_prepare_v2(
+                    db_,
+                    "UPDATE executions SET status=?, completed_at=? WHERE id=? AND status='running'",
+                    -1, &upd, nullptr) == SQLITE_OK) {
+                auto now = now_epoch();
+                sqlite3_bind_text(upd, 1, final_status, -1, SQLITE_STATIC);
+                sqlite3_bind_int64(upd, 2, now);
+                sqlite3_bind_text(upd, 3, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0) {
+                    transitioned_terminal = true;
+                    final_status_str = final_status;
+                }
+                sqlite3_finalize(upd);
             }
-            sqlite3_finalize(upd);
         }
-    }
+        transitioned_terminal_was = transitioned_terminal;
 
-    // PR 3 — emit a progress event so the SSE drawer's KPI strip
-    // refreshes. When the recompute crossed the all-agents-responded
-    // threshold, also emit a terminal event so the client can close
-    // its EventSource cleanly. Both events carry the same updated
-    // counts so a client that connected late receives a coherent
-    // snapshot from the ring buffer alone.
-    if (event_bus_ && exec) {
-        nlohmann::json payload;
-        payload["agents_targeted"] = exec->agents_targeted;
-        payload["agents_responded"] = exec->agents_responded;
-        payload["agents_success"] = exec->agents_success;
-        payload["agents_failure"] = exec->agents_failure;
-        if (transitioned_terminal) payload["status"] = final_status_str;
-        event_bus_->publish(execution_id, "execution-progress", payload.dump(),
-                            transitioned_terminal);
-        if (transitioned_terminal) {
-            nlohmann::json terminal;
-            terminal["status"] = final_status_str;
-            terminal["agents_success"] = exec->agents_success;
-            terminal["agents_failure"] = exec->agents_failure;
-            event_bus_->publish(execution_id, "execution-completed", terminal.dump(),
-                                /*is_terminal=*/true);
+        if (event_bus_ && exec) {
+            publish_progress = true;
+            progress_payload["agents_targeted"] = exec->agents_targeted;
+            progress_payload["agents_responded"] = exec->agents_responded;
+            progress_payload["agents_success"] = exec->agents_success;
+            progress_payload["agents_failure"] = exec->agents_failure;
+            if (transitioned_terminal) progress_payload["status"] = final_status_str;
+            if (transitioned_terminal) {
+                publish_terminal = true;
+                terminal_payload["status"] = final_status_str;
+                terminal_payload["agents_success"] = exec->agents_success;
+                terminal_payload["agents_failure"] = exec->agents_failure;
+            }
         }
+    }  // mtx_ released — publishes below run lock-free.
+
+    if (publish_progress) {
+        event_bus_->publish(execution_id, "execution-progress", progress_payload.dump(),
+                            transitioned_terminal_was);
+    }
+    if (publish_terminal) {
+        event_bus_->publish(execution_id, "execution-completed", terminal_payload.dump(),
+                            /*is_terminal=*/true);
     }
 }
 
@@ -496,24 +521,32 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
 void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& /*user*/) {
     if (!db_)
         return;
-    std::lock_guard lock(mtx_);
 
-    auto now = now_epoch();
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE executions SET status='cancelled', completed_at=? WHERE id=?",
-                           -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
+    // the full rationale.
+    bool should_publish = false;
 
-    sqlite3_bind_int64(stmt, 1, now);
-    sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    {
+        std::lock_guard lock(mtx_);
 
-    // PR 3 — emit terminal event for the SSE drawer so live clients
-    // close their EventSource. is_terminal=true so the channel's
-    // ring buffer is held for the retention window then GC'd.
-    if (event_bus_) {
+        auto now = now_epoch();
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "UPDATE executions SET status='cancelled', completed_at=? WHERE id=?",
+                               -1, &stmt, nullptr) != SQLITE_OK)
+            return;
+
+        sqlite3_bind_int64(stmt, 1, now);
+        sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+
+        if (event_bus_) {
+            should_publish = true;
+        }
+    }  // mtx_ released — publish below runs lock-free.
+
+    if (should_publish) {
         nlohmann::json payload;
         payload["status"] = "cancelled";
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);

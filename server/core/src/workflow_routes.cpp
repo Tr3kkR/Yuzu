@@ -451,13 +451,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       });
 
             for (const auto& a : sorted_agents) {
+                // Wire vocabulary for `a.status`: success / failure /
+                // timeout / rejected / running / pending. DOM/CSS
+                // vocabulary is a separate set: succeeded / failed /
+                // running / pending. Previous code emitted
+                // `"status-" + a.status` — producing `.status-success` /
+                // `.status-failure` / `.status-timeout` which had NO
+                // matching CSS rule, so failed/timed-out agents
+                // rendered with no colour. SSE swap then emitted yet a
+                // third spelling (`.status-error`). Three vocabularies
+                // for one concept (governance round ca-PR3-7).
+                // Canonicalise here on the DOM vocabulary; the SSE swap
+                // in instruction_ui.cpp does the same translation, so
+                // initial render and live update produce identical
+                // class strings. CSS gains `.status-succeeded` to
+                // cover the new value alongside the existing
+                // `.status-failed` / `.status-running` / `.status-pending`.
                 std::string dom_status;
-                std::string status_cls = "status-" + a.status;
                 if (a.status == "success") dom_status = "succeeded";
                 else if (a.status == "failure" || a.status == "timeout" ||
                          a.status == "rejected") dom_status = "failed";
                 else if (a.status == "running") dom_status = "running";
                 else dom_status = "pending";
+                std::string status_cls = "status-" + dom_status;
 
                 int64_t dur_ms = 0;
                 if (a.dispatched_at > 0 && a.completed_at > a.dispatched_at) {
