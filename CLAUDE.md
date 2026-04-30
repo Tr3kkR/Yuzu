@@ -210,6 +210,53 @@ query against this index must include `AND execution_id != ''` redundantly,
 or SQLite falls back to a full table scan. See `query_by_execution`'s SQL
 in `response_store.cpp` for the canonical form.
 
+### Executions-history ladder — PR 3 SSE live updates
+
+`ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is
+the per-execution SSE bus that backs `GET /sse/executions/{id}`. Owned by
+`ServerImpl`, declared BEFORE `execution_tracker_` in the member list so
+the bus outlives the tracker (the tracker borrows the bus pointer via
+`set_event_bus`). On the explicit shutdown path the order is also tracker
+first, then bus.
+
+**Publisher invariant.** Three `ExecutionTracker` mutators publish onto
+the bus when set:
+- `update_agent_status` → `agent-transition` (one event per agent
+  state change; payload is the `AgentExecStatus` JSON).
+- `refresh_counts` → `execution-progress` (counts snapshot) AND, when the
+  recompute crosses the all-agents-responded threshold, a terminal
+  `execution-completed` (status=succeeded|completed). The progress event
+  precedes the terminal event so an SSE client receives counts then
+  status.
+- `mark_cancelled` → terminal `execution-completed` (status=cancelled).
+
+**Bounded ring buffer.** Per execution: `kBufferCap=1000` events FIFO,
+~30 s window in practice. Replay walks events with `id > Last-Event-ID`
+on reconnect. Channels marked terminal are GC'd by
+`gc_terminal_channels` once `kRetentionAfterTerminalSec=60` elapses AND
+no live subscribers remain. GC runs opportunistically from `publish` so
+no separate timer thread is required.
+
+**Client-side bootstrap is data-attribute-driven.** The list-row markup
+carries `data-execution-id` and `data-execution-status`; the drawer's
+KPI strip carries `id="exec-kpi-{id}"`; per-agent table rows carry
+`id="per-agent-row-{exec_id}-{agent_id}"`; per-agent status badges carry
+`.per-agent-status` and `.per-agent-exit-code` classes. **Every PR that
+touches drawer markup MUST keep these stamps stable** — they are the
+client SSE listener's binding contract. Renaming any of them is a
+silent regression: the listener falls back to no-op and the drawer
+freezes mid-execution with no error.
+
+**Audit policy.** `execution.live_subscribe` audits on first connect per
+session-per-execution (deduped). SSE auto-reconnect inside the dedup
+window does NOT re-audit. The forensic-grade audit on read remains on
+`/fragments/executions/{id}/detail`'s `execution.detail.view`.
+
+**Hard predecessor for PR 3.** PR 2.5 (#670) replaced the 16-arg
+`WorkflowRoutes::register_routes` with a `WorkflowRoutes::Deps` struct.
+**Do not regress that signature** — adding new dependencies to the
+workflow routes goes through the struct, not new positional arguments.
+
 ## Enterprise Readiness and SOC 2
 
 The path from feature-complete to enterprise-deployable is scoped in `docs/enterprise-readiness-soc2-first-customer.md` across 7 workstreams (A GRC, B Identity, C AppSec, D Reliability, E Data, F Secure SDLC, G Customer Assurance). Every code change is evaluated against this plan by the compliance-officer, sre, and enterprise-readiness agents during Gate 6 of the governance pipeline.

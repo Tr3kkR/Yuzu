@@ -1,6 +1,8 @@
 #include "execution_tracker.hpp"
+#include "execution_event_bus.hpp"
 #include "migration_runner.hpp"
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -351,6 +353,23 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
 
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+
+    // PR 3 — publish an `agent-transition` event onto the per-execution
+    // SSE channel. The publish runs OUTSIDE the recursive mutex
+    // (release-then-publish pattern) only because the publish path is
+    // already non-blocking and listeners do queue-and-notify. We keep
+    // the call inside the lock here to preserve sequential consistency
+    // between the DB write and the event the SSE client sees — if a
+    // reader observes the row, it must also observe the event.
+    if (event_bus_) {
+        nlohmann::json payload;
+        payload["agent_id"] = s.agent_id;
+        payload["status"] = s.status;
+        payload["exit_code"] = s.exit_code;
+        payload["completed_at"] = s.completed_at;
+        if (!s.error_detail.empty()) payload["error_detail"] = s.error_detail;
+        event_bus_->publish(execution_id, "agent-transition", payload.dump());
+    }
 }
 
 void ExecutionTracker::set_agents_targeted(const std::string& execution_id,
@@ -395,6 +414,8 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
 
     // Check if all agents responded and update status
     auto exec = get_execution(execution_id);
+    bool transitioned_terminal = false;
+    std::string final_status_str;
     if (exec && exec->agents_targeted > 0 && exec->agents_responded >= exec->agents_targeted) {
         auto final_status = (exec->agents_failure == 0) ? "succeeded" : "completed";
         sqlite3_stmt* upd = nullptr;
@@ -406,8 +427,36 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
             sqlite3_bind_text(upd, 1, final_status, -1, SQLITE_STATIC);
             sqlite3_bind_int64(upd, 2, now);
             sqlite3_bind_text(upd, 3, execution_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(upd);
+            if (sqlite3_step(upd) == SQLITE_DONE && sqlite3_changes(db_) > 0) {
+                transitioned_terminal = true;
+                final_status_str = final_status;
+            }
             sqlite3_finalize(upd);
+        }
+    }
+
+    // PR 3 — emit a progress event so the SSE drawer's KPI strip
+    // refreshes. When the recompute crossed the all-agents-responded
+    // threshold, also emit a terminal event so the client can close
+    // its EventSource cleanly. Both events carry the same updated
+    // counts so a client that connected late receives a coherent
+    // snapshot from the ring buffer alone.
+    if (event_bus_ && exec) {
+        nlohmann::json payload;
+        payload["agents_targeted"] = exec->agents_targeted;
+        payload["agents_responded"] = exec->agents_responded;
+        payload["agents_success"] = exec->agents_success;
+        payload["agents_failure"] = exec->agents_failure;
+        if (transitioned_terminal) payload["status"] = final_status_str;
+        event_bus_->publish(execution_id, "execution-progress", payload.dump(),
+                            transitioned_terminal);
+        if (transitioned_terminal) {
+            nlohmann::json terminal;
+            terminal["status"] = final_status_str;
+            terminal["agents_success"] = exec->agents_success;
+            terminal["agents_failure"] = exec->agents_failure;
+            event_bus_->publish(execution_id, "execution-completed", terminal.dump(),
+                                /*is_terminal=*/true);
         }
     }
 }
@@ -460,6 +509,15 @@ void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+
+    // PR 3 — emit terminal event for the SSE drawer so live clients
+    // close their EventSource. is_terminal=true so the channel's
+    // ring buffer is held for the retention window then GC'd.
+    if (event_bus_) {
+        nlohmann::json payload;
+        payload["status"] = "cancelled";
+        event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
+    }
 }
 
 // ---------------------------------------------------------------------------
