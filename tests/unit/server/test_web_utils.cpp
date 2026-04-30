@@ -430,19 +430,21 @@ TEST_CASE("render_status_sparkbar: zero total emits hatched empty state",
     auto rect_count = std::count(svg.begin(), svg.end(), '<') -
                       std::count(svg.begin(), svg.begin() + 1, '<');
     (void)rect_count; // silence unused — count is a smoke check below.
-    // The hatched empty SVG must NOT contain segment fills.
-    REQUIRE(svg.find("var(--mds-color-bg-success-emphasis)") == std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-indicator-error)") == std::string::npos);
+    // The hatched empty SVG must NOT contain segment fills (token names).
+    REQUIRE(svg.find("--mds-color-bg-success-emphasis") == std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-indicator-error") == std::string::npos);
 }
 
 TEST_CASE("render_status_sparkbar: zero-count buckets emit no <rect>",
           "[web_utils][sparkbar]") {
     auto svg = render_status_sparkbar(50, 0, 0, 0);
-    // Only the success-emphasis fill should appear.
-    REQUIRE(svg.find("var(--mds-color-bg-success-emphasis)") != std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-indicator-error)") == std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-indicator-stable)") == std::string::npos);
-    REQUIRE(svg.find("var(--mds-color-theme-text-tertiary)") == std::string::npos);
+    // Only the success-emphasis fill should appear. UP-13 added two-arg
+    // var(...) fallbacks, so the substring carries a comma-separated
+    // fallback tail; assert on the token name only.
+    REQUIRE(svg.find("--mds-color-bg-success-emphasis") != std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-indicator-error") == std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-indicator-stable") == std::string::npos);
+    REQUIRE(svg.find("--mds-color-theme-text-tertiary") == std::string::npos);
 }
 
 TEST_CASE("render_status_sparkbar: aria-label summarises the four counts",
@@ -519,6 +521,23 @@ TEST_CASE("render_duration_bar_html: status class flows through",
     auto html = render_duration_bar_html(500, 1000, "failed");
     REQUIRE(html.find("duration-bar--failed") != std::string::npos);
     REQUIRE(html.find("aria-label=\"500 ms\"") != std::string::npos);
+}
+
+// ── UP-13: sparkbar fills carry CSS-variable fallbacks ─────────────────────
+
+TEST_CASE("render_status_sparkbar: every fill has a two-arg var() fallback (UP-13)",
+          "[web_utils][sparkbar][fallback]") {
+    auto svg = render_status_sparkbar(1, 1, 1, 1);
+    // All four token-named fills carry a fallback so a yuzu.css load failure
+    // doesn't render the bar invisible.
+    REQUIRE(svg.find("var(--mds-color-bg-success-emphasis,var(--green))")
+            != std::string::npos);
+    REQUIRE(svg.find("var(--mds-color-theme-indicator-error,var(--red))")
+            != std::string::npos);
+    REQUIRE(svg.find("var(--mds-color-theme-indicator-stable,var(--accent))")
+            != std::string::npos);
+    REQUIRE(svg.find("var(--mds-color-theme-text-tertiary,var(--muted))")
+            != std::string::npos);
 }
 
 TEST_CASE("render_duration_bar_html: negative duration clamped to zero",

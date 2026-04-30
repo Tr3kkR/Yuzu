@@ -176,6 +176,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **Gate-7 hardening regression net for executions PR 1** — 5 new
+  Catch2 cases pinning the contracts that closed the governance
+  hardening-round findings.
+  - `executions list: 403 when perm_fn denies (sec-M1)` —
+    `[workflow][executions][list][rbac]`. Dispatches LIST with
+    `perm_grant=false` and asserts 403, proving the new
+    `perm_fn(Execution, Read)` gate fires before any rendering work.
+  - `executions detail: agent_id with single-quote is bound via data-*
+    attrs, not interpolated into JS (UP-1)` —
+    `[workflow][executions][detail][xss]`. Feeds `agent'with'quote`
+    through the renderer; asserts (a) `scrollToAgentRow(` does not
+    appear in the rendered HTML, (b) `data-agent-id="agent&#39;with&#39;quote"`
+    does. Pins the JS-context-XSS fix against any future revert that
+    re-introduces the inline-onclick interpolation pattern.
+  - `ExecutionTracker.query_executions: include_error_detail default
+    false leaves the field empty (arch-B2 hot-path)` —
+    `[workflow][executions][tracker]`. Default-constructed
+    ExecutionQuery does NOT trigger the correlated subquery; protects
+    server.cpp:1727's `query_executions({.limit=1000})` health-tick
+    from regressing back to 1000 partition sorts per call.
+  - `ExecutionTracker.get_execution: always populates last_error_detail`
+    — `[workflow][executions][tracker]`. Single-row reads (rare) opt
+    in unconditionally; pins the contract that detail handler / MCP
+    `get_execution_status` / unit tests get the field populated.
+  - `ExecutionTracker.query_executions: agents_failure>0 with empty
+    error_detail yields empty last_error_detail (qa-S4)` —
+    `[workflow][executions][tracker]`. Pins the silent SQLite
+    `col_text(NULL) == ""` contract — an exit-code-only failure with
+    no agent error message produces an empty preview, not a crash.
+  Two prior cases at `[workflow][executions][tracker]` updated to set
+  `q.include_error_detail = true` explicitly so they exercise the
+  intended path post-arch-B2.
+- **Sparkbar fallback-chain regression test** —
+  `render_status_sparkbar: every fill has a two-arg var() fallback (UP-13)`
+  in `tests/unit/server/test_web_utils.cpp` `[web_utils][sparkbar][fallback]`.
+  Pins all four token-named fills (`--mds-color-bg-success-emphasis`,
+  `--mds-color-theme-indicator-error`, `--mds-color-theme-indicator-stable`,
+  `--mds-color-theme-text-tertiary`) carry the `,var(--green|red|accent|muted)`
+  fallback so a yuzu.css load failure or token rename does not render
+  the bar invisible. Two prior sparkbar tests adjusted to match the
+  new fill-string format (token-name substring check rather than
+  full-`var(...)`-string equality).
+- **Test fixture hardening on `ExecHarness`** in
+  `tests/unit/server/test_workflow_routes.cpp`:
+  - `SqliteHandleGuard` first-member RAII guarantees `sqlite3_close`
+    runs even if a constructor `REQUIRE` throws between the
+    `sqlite3_open` and the `tracker.reset()` in the destructor (qa-B2
+    fixture-leak P0 per `feedback_test_quality.md`).
+  - Execution IDs generated via `static std::atomic<int>` counter
+    instead of `std::hash<std::string>` (qa-B1) — matches CLAUDE.md
+    test-isolation rule against hash-based uniqueness salts.
 - **`tests/unit/server/test_web_utils.cpp`** — extended with 18 new
   Catch2 cases for the executions-tab rendering primitives.
   - `format_iso_utc`: dash sentinel for `<= 0`; canonical RFC 3339 form
