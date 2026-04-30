@@ -15,11 +15,14 @@
  * - Separate update_role() method (never touches credentials)
  */
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "yuzu/server/auth.hpp"  // For Role, UserEntry, Session, etc.
@@ -28,7 +31,9 @@ namespace yuzu::server {
 
 // ── Error Types ──────────────────────────────────────────────────────────────
 
-enum class AuthDBError {
+// Explicit underlying type — locks ABI/serialization width so adding new
+// values can never silently widen the enum across the plugin/wire boundary.
+enum class AuthDBError : std::uint8_t {
     CannotCreateDirectory,
     CannotOpenDatabase,
     DatabaseCorrupt,
@@ -97,6 +102,17 @@ public:
     );
 
     // ── Session Operations ───────────────────────────────────────────────
+    //
+    // v1 status: AuthManager retains its in-memory `sessions_` map and does
+    // NOT delegate session lifecycle to AuthDB. The methods below WRITE
+    // through to the DB (so role-change / user-delete cascades hit the
+    // sessions table) but the in-memory map is the authoritative read path.
+    // Persistence-across-restart for sessions is v2 (see governance H-Round
+    // arch-S1) — when that lands, AuthManager will call validate_session
+    // on AuthDB during validate_session() and the dead-write gap closes.
+    //
+    // The methods are kept on the surface (rather than #if-gated out) so
+    // the v2 wire-up is mechanical: only the AuthManager call sites change.
 
     /// Create a new session. Returns the session token.
     /// Note: Sessions do NOT persist across restarts (by design, v1).
@@ -120,6 +136,8 @@ public:
     std::expected<void, AuthDBError> invalidate_all_sessions(const std::string& username);
 
     /// Remove expired sessions. Returns count of sessions removed.
+    /// Called periodically by the background cleanup thread that
+    /// `initialize()` spawns; safe to call manually as well.
     std::expected<int, AuthDBError> cleanup_expired_sessions();
 
     // ── Enrollment Token Operations ───────────────────────────────────────

@@ -12,9 +12,18 @@
 #include <yuzu/server/auth_db.hpp>
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
-#include <filesystem>
-#include <regex>
+
+// MSVC's STL does not transitively include these via <regex>/<chrono>/<filesystem>.
+// Keep them explicit (cf. governance round 7ea7be6 + xp-B1 / cpp-SH-2).
+#include <atomic>
+#include <cctype>     // std::isalnum
 #include <chrono>
+#include <cstring>
+#include <ctime>      // std::time_t (downstream dependency for chrono format)
+#include <filesystem>
+#include <format>     // std::format chrono — replaces thread-unsafe std::gmtime
+#include <regex>
+#include <thread>
 
 namespace yuzu::server {
 
@@ -41,12 +50,49 @@ bool is_valid_username(const std::string& username) {
     return true;
 }
 
+// ── SQLite column-text accessor (null-safe) ──────────────────────────────────
+//
+// sqlite3_column_text returns nullptr when the column value is SQL NULL.
+// Direct construction of std::string from nullptr is UB. The previous code
+// reinterpret_cast'd and assigned without a null check at every call site;
+// any column with a nullable type (e.g. oidc_sub at sessions.oidc_sub) was
+// a latent UB site (governance round cpp-SH-1).
+//
+// Returns "" on null, the UTF-8 column text otherwise.
+namespace {
+std::string col_text(sqlite3_stmt* stmt, int idx) {
+    const unsigned char* p = sqlite3_column_text(stmt, idx);
+    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+}
+
+// Replaces std::strftime + std::gmtime, which on glibc returns a pointer
+// into a single static buffer shared across all threads — concurrent
+// create_session / create_enrollment_token calls produced corrupt
+// timestamps under load (governance round xp-S1). std::format chrono is
+// thread-safe and requires no scratch buffer.
+std::string format_sqlite_utc(std::chrono::system_clock::time_point tp) {
+    return std::format("{:%Y-%m-%d %H:%M:%S}",
+                       std::chrono::floor<std::chrono::seconds>(tp));
+}
+} // namespace
+
 // ── AuthDB Implementation ────────────────────────────────────────────────────
 
 struct AuthDB::Impl {
     sqlite3* db = nullptr;
     std::filesystem::path db_path;
-    
+
+    // Background expired-session reaper (governance round comp-B3).
+    // Mirrors the AuditStore / GuaranteedStateStore pattern: jthread when
+    // available (libstdc++ 11+, libc++ 18+, MSVC STL 19.34+), fallback to
+    // std::thread + atomic stop flag for older toolchains.
+#ifdef __cpp_lib_jthread
+    std::jthread cleanup_thread;
+#else
+    std::thread cleanup_thread;
+    std::atomic<bool> stop_cleanup{false};
+#endif
+
     // Prepared statements (initialized once, reused for lifetime)
     sqlite3_stmt* stmt_upsert_user = nullptr;
     sqlite3_stmt* stmt_get_user = nullptr;
@@ -71,6 +117,22 @@ struct AuthDB::Impl {
     sqlite3_stmt* stmt_reject_agent = nullptr;
     
     ~Impl() {
+        // Stop the cleanup thread BEFORE finalizing statements / closing
+        // the connection. The thread may be mid-step on
+        // stmt_cleanup_expired_sessions (or its inline counterpart) and a
+        // race here would land sqlite3_step on a half-finalized statement.
+#ifdef __cpp_lib_jthread
+        if (cleanup_thread.joinable()) {
+            cleanup_thread.request_stop();
+            cleanup_thread.join();
+        }
+#else
+        stop_cleanup.store(true);
+        if (cleanup_thread.joinable()) {
+            cleanup_thread.join();
+        }
+#endif
+
         // Finalize all prepared statements
         finalize_statement(stmt_upsert_user);
         finalize_statement(stmt_get_user);
@@ -118,14 +180,29 @@ AuthDB::~AuthDB() = default;
 // ── Database Initialization ──────────────────────────────────────────────────
 
 std::expected<void, AuthDBError> AuthDB::initialize() {
+    namespace fs = std::filesystem;
+
     // Ensure parent directory exists
     std::error_code ec;
-    std::filesystem::create_directories(impl_->db_path.parent_path(), ec);
+    fs::create_directories(impl_->db_path.parent_path(), ec);
     if (ec) {
         spdlog::error("Failed to create auth DB directory: {}", ec.message());
         return std::unexpected(AuthDBError::CannotCreateDirectory);
     }
-    
+
+    // Tighten parent-dir permissions to owner-only (governance round
+    // sec-H1 / comp-B2). Best-effort — on Windows std::filesystem maps
+    // owner_all to a no-op; the production-deploy doc note covers the
+    // ACL-equivalent posture there. Errors are logged but non-fatal so
+    // deployments on read-only / squashfs / unusual mounts still boot.
+    fs::permissions(impl_->db_path.parent_path(),
+                    fs::perms::owner_all,
+                    fs::perm_options::replace, ec);
+    if (ec) {
+        spdlog::warn("Failed to chmod 0700 auth DB parent dir: {}", ec.message());
+        ec.clear();
+    }
+
     // Open database with full mutex (thread-safe) + WAL mode.
     // db_path.string().c_str() (not db_path.c_str() directly) -- on
     // Windows MSVC, std::filesystem::path::value_type is wchar_t, so
@@ -140,15 +217,35 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
         spdlog::error("Failed to open auth DB: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::CannotOpenDatabase);
     }
-    
+
+    // Tighten the auth.db file mode to 0600 (owner read+write only).
+    // SQLite creates the file using the process umask, which is 0644
+    // (world-readable) in default Docker / systemd contexts — leaving
+    // PBKDF2 hashes + session tokens readable to any unprivileged
+    // co-tenant on the host (governance round sec-H1 HIGH). Apply on
+    // every open so a chmod-changed file gets restored.
+    // The same call is made for auth.db-wal / auth.db-shm sidecars
+    // immediately below; SQLite creates those lazily, so the chmod call
+    // may no-op until WAL writes happen — re-running the tightening is
+    // harmless.
+    fs::permissions(impl_->db_path,
+                    fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+    if (ec) {
+        spdlog::warn("Failed to chmod 0600 auth.db: {}", ec.message());
+        ec.clear();
+    }
+
     // QA FIX: Run integrity check on startup
     sqlite3_stmt* integrity_stmt = nullptr;
     rc = sqlite3_prepare_v2(impl_->db, "PRAGMA integrity_check", -1, &integrity_stmt, nullptr);
     if (rc == SQLITE_OK) {
         rc = sqlite3_step(integrity_stmt);
         if (rc == SQLITE_ROW) {
-            const char* result = reinterpret_cast<const char*>(sqlite3_column_text(integrity_stmt, 0));
-            if (std::string(result) != "ok") {
+            // col_text is null-safe (cpp-SH-1) — sqlite3_column_text on
+            // a NULL column would otherwise UB on std::string ctor.
+            std::string result = col_text(integrity_stmt, 0);
+            if (result != "ok") {
                 spdlog::error("Auth DB integrity check failed: {}", result);
                 sqlite3_finalize(integrity_stmt);
                 sqlite3_close(impl_->db);
@@ -174,7 +271,47 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
     if (!schema_result) {
         return std::unexpected(schema_result.error());
     }
-    
+
+    // Spawn the expired-session reaper (governance round comp-B3). The
+    // sessions table grows monotonically without it; under SOC 2 CC6.6
+    // an unbounded credential store is a finding. Sweep cadence is fixed
+    // at 60 s for v1 — every other store uses minutes; sessions need
+    // tighter cadence because session expiry windows are typically <1h.
+    constexpr int kCleanupIntervalSec = 60;
+#ifdef __cpp_lib_jthread
+    impl_->cleanup_thread = std::jthread([this](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            for (int i = 0; i < kCleanupIntervalSec && !stop.stop_requested(); ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            if (stop.stop_requested()) break;
+            auto result = cleanup_expired_sessions();
+            if (!result) {
+                spdlog::warn("AuthDB: periodic session cleanup failed: error={}",
+                             static_cast<int>(result.error()));
+            } else if (*result > 0) {
+                spdlog::info("AuthDB: reaped {} expired sessions", *result);
+            }
+        }
+    });
+#else
+    impl_->cleanup_thread = std::thread([this]() {
+        while (!impl_->stop_cleanup.load()) {
+            for (int i = 0; i < kCleanupIntervalSec && !impl_->stop_cleanup.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            if (impl_->stop_cleanup.load()) break;
+            auto result = cleanup_expired_sessions();
+            if (!result) {
+                spdlog::warn("AuthDB: periodic session cleanup failed: error={}",
+                             static_cast<int>(result.error()));
+            } else if (*result > 0) {
+                spdlog::info("AuthDB: reaped {} expired sessions", *result);
+            }
+        }
+    });
+#endif
+
     spdlog::info("Auth DB initialized at {}", impl_->db_path.string());
     return {};
 }
@@ -357,10 +494,14 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     }
     
     auth::UserEntry entry;
-    entry.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    entry.role = auth::string_to_role(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-    entry.hash_hex = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-    entry.salt_hex = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+    // col_text is null-safe (cpp-SH-1) — every nullable column on the
+    // users table goes through it. Schema declares NOT NULL on these
+    // columns, so the safety net is defense-in-depth against schema
+    // drift / missed migration.
+    entry.username = col_text(stmt, 0);
+    entry.role     = auth::string_to_role(col_text(stmt, 1));
+    entry.hash_hex = col_text(stmt, 2);
+    entry.salt_hex = col_text(stmt, 3);
     // Note: is_active and last_login_at exist in DB but not in UserEntry struct.
     // DB query filters is_active=1, so all returned users are active.
     
@@ -386,8 +527,8 @@ std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
     std::vector<auth::UserEntry> users;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         auth::UserEntry entry;
-        entry.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        entry.role = auth::string_to_role(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+        entry.username = col_text(stmt, 0);
+        entry.role     = auth::string_to_role(col_text(stmt, 1));
         users.push_back(std::move(entry));
     }
     
@@ -426,8 +567,17 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
     bool removed = sqlite3_changes(impl_->db) > 0;
     if (removed) {
         spdlog::info("User removed: {}", username);
-        // Also invalidate all sessions for this user
-        invalidate_all_sessions(username);
+        // Also invalidate all sessions for this user. Per cpp-SH-5, the
+        // return must be checked: a swallowed failure here means a
+        // demoted-or-deleted user could still authenticate via a
+        // session row that AuthDB believed it had wiped. Failure is
+        // logged but does not propagate — the user-row write already
+        // committed and the in-memory sessions_ map is the v1
+        // authoritative read path (see header).
+        if (auto inv = invalidate_all_sessions(username); !inv) {
+            spdlog::error("remove_user: invalidate_all_sessions for '{}' failed: error={}",
+                          username, static_cast<int>(inv.error()));
+        }
     } else {
         spdlog::warn("User not found for removal: {}", username);
     }
@@ -474,12 +624,13 @@ std::expected<std::string, AuthDBError> AuthDB::create_session(
     // Calculate expiry (24 hours from now)
     auto now = std::chrono::system_clock::now();
     auto expires = now + std::chrono::hours(24);
-    
-    // Convert to ISO 8601 string for SQLite
-    auto expires_time_t = std::chrono::system_clock::to_time_t(expires);
-    char expires_str[32];
-    std::strftime(expires_str, sizeof(expires_str), "%Y-%m-%d %H:%M:%S", std::gmtime(&expires_time_t));
-    
+
+    // Format thread-safely via std::format chrono (xp-S1). The previous
+    // std::strftime + std::gmtime path raced on a process-wide static
+    // buffer under glibc and emitted corrupt timestamps under concurrent
+    // create_session calls.
+    std::string expires_str = format_sqlite_utc(expires);
+
     const char* sql = R"(
         INSERT INTO sessions (session_token, username, role, auth_source, oidc_sub, expires_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -501,11 +652,11 @@ std::expected<std::string, AuthDBError> AuthDB::create_session(
     } else {
         sqlite3_bind_null(stmt, 5);
     }
-    sqlite3_bind_text(stmt, 6, expires_str, -1, SQLITE_STATIC);
-    
+    sqlite3_bind_text(stmt, 6, expires_str.c_str(), -1, SQLITE_STATIC);
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("create_session failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
@@ -544,14 +695,12 @@ std::expected<auth::Session, AuthDBError> AuthDB::validate_session(const std::st
     }
     
     auth::Session session;
-    session.username = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    session.role = auth::string_to_role(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-    session.auth_source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-    
-    const char* oidc_sub = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-    if (oidc_sub) {
-        session.oidc_sub = oidc_sub;
-    }
+    session.username    = col_text(stmt, 0);
+    session.role        = auth::string_to_role(col_text(stmt, 1));
+    session.auth_source = col_text(stmt, 2);
+    // sessions.oidc_sub is genuinely nullable; col_text returns "" on
+    // NULL which is the same shape as the previous explicit check.
+    session.oidc_sub    = col_text(stmt, 3);
     
     // Note: Expiry check is done by caller (AuthManager) — this is intentional
     // to allow session cleanup without modifying this function's signature.
@@ -653,26 +802,25 @@ std::expected<std::string, AuthDBError> AuthDB::create_enrollment_token(
     // Calculate expiry
     auto now = std::chrono::system_clock::now();
     auto expires = now + validity;
-    
-    auto expires_time_t = std::chrono::system_clock::to_time_t(expires);
-    char expires_str[32];
-    std::strftime(expires_str, sizeof(expires_str), "%Y-%m-%d %H:%M:%S", std::gmtime(&expires_time_t));
-    
+
+    // Thread-safe via std::format chrono (xp-S1) — same fix as create_session.
+    std::string expires_str = format_sqlite_utc(expires);
+
     const char* sql = R"(
         INSERT INTO enrollment_tokens (token_hash, created_by, expires_at)
         VALUES (?, ?, ?)
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare create_enrollment_token statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, token_hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, created_by.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 3, expires_str, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, expires_str.c_str(), -1, SQLITE_STATIC);
     
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -812,7 +960,15 @@ std::expected<void, AuthDBError> AuthDB::update_role(
     // Without this, a demoted admin retains admin access for up to 24 hours
     // via their cached session. Consistent with remove_user() which also
     // invalidates sessions.
-    invalidate_all_sessions(username);
+    //
+    // Per cpp-SH-4, the return must be checked. A swallowed failure here
+    // means a demoted admin could continue to authenticate as admin via
+    // their pre-change session. We log loudly; the in-memory sessions_
+    // erasure that AuthManager performs in parallel is the v1 hard cut.
+    if (auto inv = invalidate_all_sessions(username); !inv) {
+        spdlog::error("update_role: invalidate_all_sessions for '{}' failed: error={}",
+                      username, static_cast<int>(inv.error()));
+    }
     spdlog::info("Sessions invalidated for role change: {}", username);
     
     return {};
@@ -872,11 +1028,13 @@ std::expected<std::vector<auth::PendingAgent>, AuthDBError> AuthDB::list_pending
     std::vector<auth::PendingAgent> agents;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         auth::PendingAgent agent;
-        agent.agent_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        agent.hostname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        agent.os = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        agent.arch = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-        agent.agent_version = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+        // pending_agents.os/arch/agent_version are nullable per schema;
+        // col_text guards the std::string ctor against the NULL case.
+        agent.agent_id      = col_text(stmt, 0);
+        agent.hostname      = col_text(stmt, 1);
+        agent.os            = col_text(stmt, 2);
+        agent.arch          = col_text(stmt, 3);
+        agent.agent_version = col_text(stmt, 4);
         agents.push_back(agent);
     }
     
