@@ -612,10 +612,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     //      EventSource error). Unsubscribes from the channel; the channel
     //      itself is GC'd by `gc_terminal_channels` when retention expires.
     //
-    // Audit policy: emit `execution.live_subscribe` ONCE per session per
-    // execution, not per SSE reconnect — the SSE reconnect storm under a
-    // brief network hiccup must not spray audit rows. Per-session dedup
-    // is handled by the seen-set the handler keeps in scope.
+    // Audit policy: emit `execution.live_subscribe` on every successful
+    // Subscribe. The handler does NOT dedup per session-per-execution
+    // currently — dedup is deferred (governance Deferred-5 / #700) because
+    // a correct implementation needs lock-protected seen-set state, and a
+    // naive dedup has a TOCTOU window where a concurrent reconnect can
+    // both observe "not seen" and both emit. Operators on the SOC 2 evidence
+    // chain currently get a row per reconnect; the forensic-grade audit on
+    // first-load remains on /fragments/executions/{id}/detail's
+    // `execution.detail.view`.
     sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))",
         [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus](
             const httplib::Request& req, httplib::Response& res) {
@@ -655,9 +660,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
 
-            // sec audit: per-session-per-execution dedup. The session
-            // username + execution id is the dedup key. Skipping the
-            // audit on reconnect is policy (see comment block above).
+            // Audit every successful subscribe. Dedup is deferred per
+            // governance Deferred-5 / #700; the comment block above this
+            // route registration explains the contract.
             audit_fn(req, "execution.live_subscribe", "success", "Execution",
                      exec_id, "");
 

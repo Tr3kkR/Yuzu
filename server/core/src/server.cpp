@@ -249,6 +249,19 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // Audit-pipeline observability (governance PR4 OBS-4). Increments when
+        // audit_store->add_event()'s SQLite step does not return DONE — pages
+        // operators that the audit chain itself is degraded.
+        metrics_.describe("yuzu_server_audit_emit_failed_total",
+                          "Audit events that failed to persist (sqlite3_step != DONE)",
+                          "counter");
+        // Login-latency observability (governance PR4 OBS-2). Histogram of
+        // PBKDF2 verify duration, labelled by result so alerts can fire on
+        // success-path regressions independently of brute-force noise on
+        // bad_password / unknown_user.
+        metrics_.describe("yuzu_auth_login_duration_seconds",
+                          "Login PBKDF2 verify latency in seconds, by method and result",
+                          "histogram");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -276,6 +289,11 @@ public:
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
+
+        // Wire metrics registry into auth manager so authenticate() can
+        // observe login latency. Optional in tests/CLI tools that don't
+        // construct a ServerImpl (auth_mgr_.metrics_ stays nullptr there).
+        auth_mgr_.set_metrics_registry(&metrics_);
 
         // Create gateway upstream service if configured
         if (!cfg_.gateway_upstream_address.empty()) {
@@ -860,6 +878,9 @@ public:
                         .set(static_cast<double>(audit_store_->events_written("denied")));
                     metrics_.gauge("yuzu_server_audit_events_total", {{"result", "other"}})
                         .set(static_cast<double>(audit_store_->events_written("other")));
+                    // OBS-4: surface audit-pipeline persistence failures.
+                    metrics_.gauge("yuzu_server_audit_emit_failed_total")
+                        .set(static_cast<double>(audit_store_->emit_failed_count()));
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
                 // gauges for the count-now values (SQL COUNT(*)) and for the

@@ -78,6 +78,13 @@ struct ExecHarness {
     /// registered BEFORE dispatch). Empty when the dispatch path has no
     /// tracker context.
     std::string last_dispatch_execution_id;
+    /// PR 4 audit-coverage regression net: captures every audit_fn call
+    /// the routes layer makes so tests can assert the SSE handler's
+    /// audit-on-success / audit-absence-on-denied policy (qe-S4).
+    struct AuditCall {
+        std::string action, result, target_type, target_id, detail;
+    };
+    std::vector<AuditCall> audit_calls;
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -87,7 +94,11 @@ struct ExecHarness {
     /// collision edge cases. Atomic so parallel test workers cannot collide.
     static inline std::atomic<int> exec_counter{0};
 
-    ExecHarness()
+    /// `with_bus = false` opts out of constructing the per-execution event
+    /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
+    /// the route is registered but the underlying bus is intentionally
+    /// not wired (governance qe-S1).
+    explicit ExecHarness(bool with_bus = true)
         : tracker_db(uniq("wf-routes-exec")),
           instr_db(uniq("wf-routes-inst")),
           resp_db(uniq("wf-routes-resp")) {
@@ -97,11 +108,17 @@ struct ExecHarness {
         // throwing REQUIRE in any later constructor step still closes it.
         REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
         // PR 3: bus must outlive the tracker (the tracker borrows the
-        // bus pointer). Build the bus first.
-        event_bus = std::make_unique<ExecutionEventBus>();
+        // bus pointer). Build the bus first when wanted; the no-bus
+        // harness leaves event_bus as nullptr so the route registration
+        // takes the 503 path.
+        if (with_bus) {
+            event_bus = std::make_unique<ExecutionEventBus>();
+        }
         tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
         tracker->create_tables();
-        tracker->set_event_bus(event_bus.get());
+        if (event_bus) {
+            tracker->set_event_bus(event_bus.get());
+        }
 
         instructions = std::make_unique<InstructionStore>(instr_db);
         REQUIRE(instructions->is_open());
@@ -124,9 +141,11 @@ struct ExecHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&,
-                           const std::string&, const std::string&,
-                           const std::string&, const std::string&) {};
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                                const std::string& result, const std::string& target_type,
+                                const std::string& target_id, const std::string& detail) {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+        };
         auto emit_fn = [](const std::string&, const httplib::Request&) {};
         auto scope_fn = [](const std::string&) -> std::pair<std::size_t, std::size_t> {
             return {0, 0};
@@ -160,7 +179,8 @@ struct ExecHarness {
         wf_deps.command_dispatch_fn = cmd_dispatch;
         wf_deps.response_store = responses.get();
         // PR 3 — wire the per-execution event bus. The SSE handler at
-        // /sse/executions/{id} only registers when this is non-null.
+        // /sse/executions/{id} returns 503 at request time when this is
+        // nullptr but is still registered, which is the qe-S1 path.
         wf_deps.execution_event_bus = event_bus.get();
         routes.register_routes(sink, std::move(wf_deps));
     }
@@ -1103,4 +1123,76 @@ TEST_CASE("SSE handler: per-agent status badge has .per-agent-status class for p
     CHECK(res->status == 200);
     CHECK(res->body.find("per-agent-status") != std::string::npos);
     CHECK(res->body.find("per-agent-exit-code") != std::string::npos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR 4 — SSE handler audit + no-bus 503 contracts
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("SSE handler: 503 when execution_event_bus is null (no-bus path)",
+          "[workflow][executions][pr3][pr4]") {
+    // qe-S1: the route is registered even when the bus is intentionally
+    // not wired (test harness opt-out, configuration path that omits the
+    // bus). Hitting it must return 503, not 200 — opening an EventSource
+    // against a missing bus would freeze the drawer waiting for events
+    // that will never publish.
+    ExecHarness h(/*with_bus=*/false);
+    h.make_def("def-NO-BUS", "NoBus");
+    auto exec_id = h.make_exec("def-NO-BUS", "running", 3, 0, 0);
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // Audit must NOT fire on the no-bus path — the request never reached
+    // the live-subscribe success branch.
+    bool saw_subscribe = false;
+    for (const auto& a : h.audit_calls) {
+        if (a.action == "execution.live_subscribe") saw_subscribe = true;
+    }
+    CHECK_FALSE(saw_subscribe);
+}
+
+TEST_CASE("SSE handler: 200 path emits execution.live_subscribe audit",
+          "[workflow][executions][pr3][pr4]") {
+    // Positive control for the audit-absence test below: the happy path
+    // DOES emit the audit. Without this pin, a refactor that drops the
+    // emit entirely would silently pass the absence test.
+    ExecHarness h;
+    h.make_def("def-SUB", "Sub");
+    auto exec_id = h.make_exec("def-SUB", "running", 1, 0, 0);
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    bool saw = false;
+    for (const auto& a : h.audit_calls) {
+        if (a.action == "execution.live_subscribe" && a.result == "success" &&
+            a.target_type == "Execution" && a.target_id == exec_id) {
+            saw = true;
+            break;
+        }
+    }
+    CHECK(saw);
+}
+
+TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
+          "[workflow][executions][pr3][pr4]") {
+    // qe-S4: a denied subscribe must not leave a forensic ghost row in
+    // audit_store — the success-shaped audit only fires after perm_fn
+    // approves. Pin this so a future refactor that hoists the audit
+    // ahead of perm_fn (the kind of "log first, check later" pattern
+    // that surfaces in compliance reviews) is caught.
+    ExecHarness h;
+    h.make_def("def-DENY", "Deny");
+    auto exec_id = h.make_exec("def-DENY", "running", 1, 0, 0);
+    h.perm_grant = false;
+
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+
+    for (const auto& a : h.audit_calls) {
+        CHECK_FALSE(a.action == "execution.live_subscribe");
+    }
 }
