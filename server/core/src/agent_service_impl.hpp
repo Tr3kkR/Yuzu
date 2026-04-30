@@ -74,6 +74,15 @@ public:
     // Record send time for latency measurement.
     void record_send_time(const std::string& command_id);
 
+    /// Register the executions-tracker row id that this command_id belongs
+    /// to (PR 2). Called by the dispatch path after `create_execution`
+    /// returns the new id. The mapping is consumed by the response-receipt
+    /// handlers and stamped onto every StoredResponse so the executions
+    /// detail drawer can correlate exactly via `query_by_execution`. Empty
+    /// `execution_id` removes any existing mapping for this command_id.
+    void record_execution_id(const std::string& command_id,
+                              const std::string& execution_id);
+
     // Process a CommandResponse forwarded from the gateway.
     void process_gateway_response(const std::string& agent_id,
                                    const pb::CommandResponse& resp);
@@ -129,6 +138,32 @@ private:
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
+    /// PR 2 in-memory mapping `command_id → execution_id`. Populated by
+    /// the dispatch path (currently only `/api/instructions/:id/execute`
+    /// in `workflow_routes.cpp`; MCP / dashboard / scheduled / rerun are
+    /// known gaps tracked as PR 2.x follow-ups); consumed by the
+    /// response-receipt branches in process_gateway_response / Subscribe
+    /// to stamp the new responses.execution_id column. Guarded by
+    /// cmd_times_mu_ for locality with the existing send-time map.
+    ///
+    /// **Multi-agent fan-out invariant (HF-1).** A single command_id is
+    /// dispatched to N agents; each agent sends its own response with
+    /// the same command_id. Entries are NOT erased on terminal status —
+    /// erasing on the first agent's terminal would leave agents 2..N
+    /// stamping empty execution_id. Entries persist until a future
+    /// sweeper (PR 2.x) lands.
+    ///
+    /// **Known leak surface (sec-M1 / perf-S1).** Without a periodic
+    /// sweeper, entries grow over time:
+    ///   - Multi-agent dispatches: N entries until process restart.
+    ///   - Agent crash / network drop / server restart with in-flight:
+    ///     entries persist forever until process exits.
+    /// Per-entry cost ~64 bytes (two SSO strings). Acceptable for typical
+    /// dispatch rates over a service lifetime; bounded fix is a sweeper
+    /// keyed on a steady_clock timestamp stored alongside each entry,
+    /// evicting > max-command-timeout (default 1h). Filed as a hard
+    /// predecessor for closing the executions-history ladder.
+    std::unordered_map<std::string, std::string> cmd_execution_ids_;
     std::atomic<size_t> output_row_count_{0};
     std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};

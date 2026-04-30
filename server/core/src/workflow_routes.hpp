@@ -46,10 +46,19 @@ public:
 
     /// Command dispatch callback — sends a command to agents via gRPC.
     /// Returns (command_id, number_of_agents_reached).
+    ///
+    /// PR 2: optional `execution_id` parameter threads the
+    /// command_id→execution_id mapping into the dispatch path so the
+    /// mapping is registered with `AgentServiceImpl` BEFORE any RPC is
+    /// sent (closes the UP2-4 FAST-agent race where a sub-millisecond
+    /// loopback agent could reply before the post-dispatch
+    /// register-mapping call). Empty `execution_id` skips registration
+    /// (callers that don't track executions, e.g. raw command path).
     using CommandDispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters)>;
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink
     /// and delegates to the sink-based overload below. New code should keep

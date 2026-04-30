@@ -213,6 +213,97 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### Executions-history PR 2 — `responses.execution_id` exact correlation
+
+PR 2 of the executions-history ladder closes a forensic-data correctness
+gap (UP-8) where two concurrent executions of the same definition to
+overlapping agent sets could show each other's responses in the
+Instructions → Executions detail drawer. Operators upgrading to a
+release that includes PR 2 should expect the following:
+
+**Schema migration v2 on `response_store`.** The migration adds an
+`execution_id TEXT NOT NULL DEFAULT ''` column to the `responses` table
+plus a partial index `idx_resp_execution_ts ON responses(execution_id,
+timestamp) WHERE execution_id != ''`. The migration is automatic and
+data-preserving — `MigrationRunner::run` wraps the ALTER + CREATE INDEX
+in a single transaction. Pre-upgrade rows are NOT deleted; they receive
+the empty-string sentinel value `''`. The migration is idempotent: a
+pre-stamp probe at startup detects an already-altered DB and skips the
+duplicate ALTER (mirrors the precedent at `instruction_store.cpp` v2).
+
+Observable after upgrade:
+
+```sql
+SELECT execution_id, COUNT(*) FROM responses GROUP BY execution_id;
+```
+
+will show ALL pre-upgrade rows under the empty string `''`. This is
+expected — there's no way to retroactively attribute pre-upgrade
+responses to executions because the dispatch path didn't record the
+linkage. The Executions drawer detects empty-`execution_id` rows and
+falls back to the legacy timestamp-window-plus-agent-set join so they
+render correctly without operator action. **No operator action
+required** for the migration itself.
+
+**Dispatch-path coverage gap (PR 2.x follow-ups).** Only executions
+dispatched via `POST /api/instructions/:id/execute` (the dashboard's
+Execute Instruction form goes through this path) get exact correlation
+in PR 2. Three dispatch surfaces continue to write rows with
+`execution_id=''` until follow-up PRs close them:
+
+- **MCP `execute_instruction`** — agent dispatches issued through the
+  MCP protocol.
+- **Workflow steps** (`POST /api/workflows/:id/execute` step dispatch
+  via `cmd_dispatch` callback) — multi-step workflows.
+- **Scheduled / approval-triggered dispatches** — the dispatch path
+  inside `schedule_engine` / approval-fired execution.
+- **Reruns** (`/api/executions/:id/rerun`) — `create_rerun` creates
+  the execution row but does not dispatch; the operator-triggered
+  follow-up dispatch will be wired in PR 2.x.
+
+For runs from these surfaces, the drawer's responses section uses the
+legacy timestamp-window join. Cross-execution contamination (UP-8) is
+still possible if two such runs overlap on the same definition + agent
+set. Track via the executions-history follow-up issues.
+
+**Mixed-mode detail drawer behaviour.** During an upgrade transition
+window (executions in flight at restart time, or in-progress executions
+that started pre-upgrade and finished post-upgrade), some responses for
+a single execution may carry `execution_id=''` while others are
+correctly tagged. The drawer prefers exact-correlation rows when they
+exist and only falls back to the legacy join when zero exact rows are
+returned — this means **mixed-mode runs may show only the
+post-upgrade subset of their responses** in the drawer. Pre-upgrade
+responses for those runs remain in the database and are queryable via
+SQL; the upcoming admin backfill CLI (PR 2.1) will stamp them with
+their correct execution_id once it ships.
+
+**Server restart caveat.** The dispatch-time `command_id → execution_id`
+mapping is held in memory inside `AgentServiceImpl`. If the server is
+restarted while a command is in flight, the mapping is lost and any
+agent responses arriving post-restart will be tagged `execution_id=''`
+and use the legacy fallback. Avoid restarting the server during active
+executions where possible, or accept that the affected runs will use
+legacy correlation.
+
+**Admin backfill (planned in PR 2.1, not in this release).** A
+`yuzu-server admin backfill-responses` CLI is filed as a follow-up. It
+will walk the executions table cross-store and stamp pre-upgrade
+responses with their best-effort execution_id (timestamp + agent set
+heuristic). Until it ships, pre-upgrade rows remain queryable via the
+legacy fallback in the drawer; no operator action is required.
+
+**Verifying the migration.** After upgrade, the server log should
+contain `MigrationRunner: response_store migrated to v2`. To verify the
+column directly:
+
+```bash
+sqlite3 /var/lib/yuzu/responses.db ".schema responses"
+# Expected: execution_id TEXT NOT NULL DEFAULT ''
+sqlite3 /var/lib/yuzu/responses.db ".schema idx_resp_execution_ts"
+# Expected: CREATE INDEX idx_resp_execution_ts ON responses(...) WHERE execution_id != ''
+```
+
 ### v0.12.0 — Guardian PR 2
 
 Guardian PR 2 ships the Guaranteed State control plane + agent skeleton. Two items require operator awareness on upgrade:

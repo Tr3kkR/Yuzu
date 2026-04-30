@@ -478,17 +478,31 @@ void WorkflowRoutes::register_routes(
                 rq.since = exec.dispatched_at;
                 rq.until = exec.completed_at > 0 ? exec.completed_at : now_epoch_seconds();
                 rq.limit = 500;
-                auto responses = response_store->query(exec.definition_id, rq);
-                // Filter to agents that appear in this execution's status set.
-                std::unordered_map<std::string, bool> in_set;
-                in_set.reserve(agents.size());
-                for (const auto& a : agents) in_set[a.agent_id] = true;
-                std::vector<StoredResponse> filtered;
-                filtered.reserve(responses.size());
-                for (auto& r : responses) {
-                    if (in_set.count(r.agent_id))
-                        filtered.push_back(std::move(r));
+                // PR 2: prefer exact correlation via the new execution_id
+                // column. Falls back to the legacy timestamp-window-+-agent
+                // join on stores that haven't been backfilled to v2 yet
+                // (response rows with execution_id='' from a pre-PR-2
+                // server upgrade). Once an admin runs the backfill CLI
+                // (PR 2.1 follow-up) and audits show 100% coverage, the
+                // fallback can be removed.
+                auto responses = response_store->query_by_execution(exec.id, rq);
+                if (responses.empty()) {
+                    auto legacy = response_store->query(exec.definition_id, rq);
+                    // Filter to agents that appear in this execution's
+                    // status set, mirroring the pre-PR-2 best-effort join.
+                    std::unordered_map<std::string, bool> in_set;
+                    in_set.reserve(agents.size());
+                    for (const auto& a : agents) in_set[a.agent_id] = true;
+                    for (auto& r : legacy) {
+                        // Only fall back for legacy rows (empty
+                        // execution_id). PR-2-tagged rows with a different
+                        // execution_id are NOT this run's responses; the
+                        // empty `responses` vector is the correct answer.
+                        if (r.execution_id.empty() && in_set.count(r.agent_id))
+                            responses.push_back(std::move(r));
+                    }
                 }
+                std::vector<StoredResponse> filtered = std::move(responses);
 
                 html += std::format(
                     "<details class=\"per-agent-responses\">"
@@ -907,9 +921,15 @@ void WorkflowRoutes::register_routes(
                     }
                 } catch (...) {}
 
-                // Dispatch via gRPC
+                // Dispatch via gRPC. PR 2: workflow-step dispatch path
+                // does not yet wire execution_id correlation (CONSIST-2 /
+                // sec-M2 — PR 2.x will close); pass empty execution_id so
+                // record_execution_id is skipped and responses arrive with
+                // the legacy sentinel (legacy fallback in detail handler
+                // covers the rendering).
                 auto [command_id, sent] = cmd_dispatch(
-                    def->plugin, def->action, target_ids, "", params);
+                    def->plugin, def->action, target_ids, "", params,
+                    /*execution_id=*/"");
 
                 if (sent == 0)
                     return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -1099,35 +1119,66 @@ void WorkflowRoutes::register_routes(
 
             // Empty agent_ids + empty scope = broadcast to all agents
 
-            // Dispatch
-            std::string command_id;
-            int sent = 0;
-            try {
-                std::tie(command_id, sent) = cmd_dispatch(
-                    def->plugin, def->action, agent_ids, scope_expr, params);
-            } catch (const std::exception& e) {
-                spdlog::error("instruction dispatch failed: {}", e.what());
-                res.status = 500;
-                res.set_content(R"({"error":{"code":500,"message":"dispatch failed"},"meta":{"api_version":"v1"}})", "application/json");
-                return;
-            }
-
-            if (sent == 0) {
-                res.status = 503;
-                res.set_content(R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})", "application/json");
-                return;
-            }
-
-            // Record execution if tracker available
+            // PR 2: create the execution row BEFORE dispatch so the
+            // execution_id is known when cmd_dispatch generates command_id —
+            // closes the UP2-4 FAST-agent race where a sub-millisecond
+            // loopback agent could reply before a post-dispatch
+            // register-mapping call landed. cmd_dispatch registers the
+            // mapping in `agent_service_.cmd_execution_ids_` BEFORE any
+            // RPC is sent so the response handler always finds the entry.
+            // agents_targeted is updated below once dispatch confirms `sent`.
+            std::string execution_id;
             if (execution_tracker) {
                 Execution exec;
                 exec.definition_id = def_id;
                 exec.status = "running";
                 exec.scope_expression = scope_expr;
                 exec.parameter_values = nlohmann::json(params).dump();
-                exec.agents_targeted = sent;
                 exec.dispatched_by = session->username;
-                execution_tracker->create_execution(exec);
+                if (auto created = execution_tracker->create_execution(exec);
+                    created.has_value()) {
+                    execution_id = *created;
+                }
+            }
+
+            // Dispatch
+            std::string command_id;
+            int sent = 0;
+            try {
+                std::tie(command_id, sent) = cmd_dispatch(
+                    def->plugin, def->action, agent_ids, scope_expr, params,
+                    execution_id);
+            } catch (const std::exception& e) {
+                spdlog::error("instruction dispatch failed: {}", e.what());
+                // Pattern C / hardening regression close: the pre-created
+                // execution row would otherwise sit at status='running'
+                // forever on dispatch failure. mark_cancelled records the
+                // attempt for forensic audit instead of orphaning it as a
+                // phantom in-flight run that the LIST handler keeps showing.
+                if (execution_tracker && !execution_id.empty()) {
+                    execution_tracker->mark_cancelled(execution_id,
+                                                       session->username);
+                }
+                res.status = 500;
+                res.set_content(R"({"error":{"code":500,"message":"dispatch failed"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+
+            if (sent == 0) {
+                if (execution_tracker && !execution_id.empty()) {
+                    execution_tracker->mark_cancelled(execution_id,
+                                                       session->username);
+                }
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"no agents reached"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+
+            // Update the pre-created execution row with the actual targeted
+            // count and refresh agents_responded counters now that dispatch
+            // has confirmed how many agents the command went to.
+            if (execution_tracker && !execution_id.empty()) {
+                execution_tracker->set_agents_targeted(execution_id, sent);
             }
 
             audit_fn(req, "instruction.execute", "success", "instruction", def_id,

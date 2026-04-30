@@ -4654,7 +4654,8 @@ private:
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids,
                    const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> std::pair<std::string, int> {
                 // Normalize action to lowercase — agent plugins register actions
                 // in lowercase and match case-sensitively.
                 auto norm_action = action;
@@ -4669,6 +4670,15 @@ private:
                 for (const auto& [k, v] : parameters)
                     (*cmd.mutable_parameters())[k] = v;
                 agent_service_.record_send_time(command_id);
+                // PR 2 / UP2-4: register the command_id → execution_id
+                // mapping BEFORE any RPC is sent so a sub-millisecond
+                // loopback agent's response cannot win the race against
+                // mapping registration. Empty execution_id (out-of-band
+                // dispatch with no tracker row) skips registration —
+                // record_execution_id is a no-op for empty values.
+                if (!execution_id.empty()) {
+                    agent_service_.record_execution_id(command_id, execution_id);
+                }
                 int sent = 0;
                 if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
                     auto group_id = scope_expr.substr(6);
