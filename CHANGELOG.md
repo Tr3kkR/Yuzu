@@ -39,8 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry `role="img"` + descriptive `aria-label` with child `<rect>`
   elements `aria-hidden`; no JS chart library on this surface
   (server-rendered SVG/CSS only, ECharts reserved for the genuinely
-  interactive Response Visualization Engine in #253). The previously
-  ignored `definition_id` query param now filters the list. New web
+  interactive Response Visualization Engine in #253). New web
   helpers in `web_utils.hpp`: `render_status_sparkbar`,
   `render_duration_bar_html`, `format_iso_utc`, `format_relative_time`,
   `now_epoch_seconds`, `truncate_utf8` — all pure, header-only,
@@ -232,6 +231,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--mds-color-theme-text-tertiary`, `--mds-color-state-hover`,
   `--mds-color-state-selected`) resolve non-empty so silent palette
   drift is detected. Same shape as `tests/puppeteer/echarts-smoke.mjs`.
+
+### Changed
+
+- **`GET /fragments/executions` now honours the `definition_id` query
+  parameter.** Previously the parameter was accepted but silently ignored.
+  After this release, passing `?definition_id=<id>` filters the list to
+  executions of that definition only. Any operator or automation that
+  embedded the executions fragment URL with `definition_id` expecting
+  the full list must drop the parameter. Behaviour change, not a wire
+  break — the URL shape and response Content-Type are unchanged.
+
+- **Executions surface — Gate-7 hardening round on PR 1.** Information-design
+  PR 1 (the clickable executions history + per-execution drawer) shipped
+  with the visible feature; this round addresses governance findings
+  produced by the `/governance` pipeline:
+  - **`/fragments/executions` LIST handler now gates on `Execution:Read`**
+    (sec-M1). The LIST exposes resolved definition_name and a per-row
+    `last_error_detail` preview — same data class as the DETAIL handler,
+    earns the same RBAC gate. Mirrors MCP `list_executions` and REST
+    `/api/v1/execution-statistics`.
+  - **Detail handler emits an audit event on success** (sec-M2):
+    `audit_fn(req, "execution.detail.view", "success", "Execution",
+    exec_id, "")` — closes the SOC 2 evidence chain for forensic-grade
+    reads. The LIST and other read-only fragment routes continue to skip
+    audit per the documented fragment-route policy (forensic-grade
+    content audits; aggregate / presentation surfaces do not).
+  - **Detail path regex tightened to `[A-Za-z0-9_-]{1,128}`** (sec-L3) —
+    matches the visualization route's bound from #253; prevents
+    unbounded path lengths from reaching `get_execution()`.
+  - **Agent grid uses `data-*` attributes + delegated event listener**
+    (UP-1 / sec-L1): `agent_id` and `exec_id` are no longer interpolated
+    into a JS string literal inside an inline `onclick` attribute. The
+    pre-fix path was: `html_escape` converts `'` to `&#39;` which the
+    HTML parser un-escapes BEFORE the JS lexer sees the attribute value
+    — a malicious or compromised agent registering with `agent_id` like
+    `'); evil(); //` could land arbitrary JS in the operator's session.
+    Mitigated by binding via `addEventListener` against `data-agent-id`
+    / `data-exec-id` so wire-provided bytes never enter a JS-string
+    context. Per-agent table rows also gain matching `data-*` attrs;
+    grid → row scroll lookup uses `getAttribute` not string-concat ID.
+  - **`ExecutionQuery::include_error_detail` opt-in flag** (arch-B2 /
+    perf-B1): the `last_error_detail` correlated subquery on
+    `kSelectAll` is now off by default. The LIST fragment opts in (it
+    renders the field); `get_execution` for single-row reads opts in
+    (rare callers). Hot-path callers (server.cpp:886/963/1721/1727/1871
+    metrics + health ticks at limit=1000) leave the default false and
+    pay zero subquery cost. Eliminates the regression where every 15s
+    metrics tick scanned `agent_exec_status` partitions and sorted by
+    `completed_at` for every row with `agents_failure > 0`.
+  - **KPI percentile sort hoisted out of `fmt_pct` lambda** (perf-B2 /
+    cpp-S3): the durations vector is now sorted once per drawer request
+    rather than twice (once per p50, again per p95).
+  - **Sparkbar SVG fills carry CSS-variable fallbacks** (UP-13): every
+    `var(--mds-color-*)` now declares a second-arg fallback to the
+    pre-token alias (`--green` / `--red` / `--accent` / `--muted`) so a
+    yuzu.css load failure or token rename leaves the bar legible
+    instead of rendering invisible.
+  - **`Execution.last_error_detail` carries a PII-adjacent struct
+    comment** (arch-B1): the field is gated by `Execution:Read` at every
+    serializer; a future contributor adding it to a JSON-blanket-emit
+    REST handler will see the warning at IDE-hover time.
 
 ### Removed
 
