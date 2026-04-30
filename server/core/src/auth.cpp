@@ -495,6 +495,16 @@ bool AuthManager::has_users() const {
     return !users_.empty();
 }
 
+bool AuthManager::is_auth_db_ok() const noexcept {
+    // Legacy config-file-only deployments leave auth_db_ as nullptr.
+    // That is not a /readyz failure — the readyz check should report ok
+    // unless the operator opted into AuthDB and the DB is unhealthy.
+    if (!auth_db_) {
+        return true;
+    }
+    return auth_db_->is_ready();
+}
+
 std::vector<UserEntry> AuthManager::list_users() const {
     if (auth_db_) {
         auto result = auth_db_->list_users();

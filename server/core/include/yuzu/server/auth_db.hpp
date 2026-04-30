@@ -67,6 +67,12 @@ public:
     /// Must be called once before any other method.
     std::expected<void, AuthDBError> initialize();
 
+    /// True iff initialize() succeeded AND the SQLite handle is still
+    /// open (integrity_check passed, schema migrations ran cleanly).
+    /// Wired into /readyz so an operator can detect a corrupt or
+    /// half-migrated auth.db without having to scrape spdlog. Lock-free.
+    bool is_ready() const noexcept;
+
     // ── User Operations ──────────────────────────────────────────────────
 
     /// Create or update a user.

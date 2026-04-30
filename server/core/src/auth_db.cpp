@@ -178,6 +178,15 @@ AuthDB::AuthDB(const std::filesystem::path& data_dir)
 
 AuthDB::~AuthDB() = default;
 
+bool AuthDB::is_ready() const noexcept {
+    // initialize() closes impl_->db on every failure path: open error,
+    // migration failure, integrity_check != "ok". So a non-null handle
+    // here is a true positive for "ready to serve queries". No lock —
+    // the pointer is set once during initialize() before the server
+    // starts accepting traffic, and never reassigned thereafter.
+    return impl_ && impl_->db != nullptr;
+}
+
 // ── Database Initialization ──────────────────────────────────────────────────
 
 std::expected<void, AuthDBError> AuthDB::initialize() {
