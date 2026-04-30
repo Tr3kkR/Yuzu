@@ -9,6 +9,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Exact correlation between executions and responses (PR 2 of
+  executions-history ladder).**
+  `responses.execution_id` is a new column (migration v2 on
+  `response_store`) populated at write time by an in-memory
+  `command_id → execution_id` mapping that the dispatch path registers
+  with `AgentServiceImpl::record_execution_id` after
+  `ExecutionTracker::create_execution` returns the new id. The mapping
+  is auto-erased on terminal status (DONE / ERROR) so the map size is
+  bounded by the number of in-flight commands. Backed by partial index
+  `idx_resp_execution_ts ON responses(execution_id, timestamp) WHERE
+  execution_id != ''` — the index is slim because legacy / out-of-band
+  rows with the empty-string sentinel are excluded. New helper
+  `ResponseStore::query_by_execution(execution_id, ResponseQuery{...})`
+  returns rows whose `execution_id` matches; rejects empty input
+  (returns no rows) so callers can detect "no PR-2 data" and fall back
+  to the timestamp-window join.
+
+  Closes UP-8 (response cross-contamination) from PR 1's governance
+  Gate 4 risk register: two concurrent executions of the same
+  definition to overlapping agent sets no longer show each other's
+  responses in the inline drawer. The timestamp+agent join was a
+  best-effort heuristic; PR 2 makes correlation exact going forward.
+
+  Pre-PR-2 rows (execution_id='') stay legible via a fallback in the
+  detail handler that runs the legacy `query()` and filters to agents
+  in this execution's set. The fallback is gated on "no PR-2 rows
+  exist for this id" so it cannot dilute correctly-tagged drawers.
+  An admin backfill CLI (`yuzu-server admin backfill-responses`) is
+  **planned in PR 2.1 — not yet shipped in this release**; the command
+  does not exist on disk. Once it lands and confirms 100% coverage, the
+  fallback branch in the detail handler can be removed.
+
+  **Dispatch-path coverage scope.** Only `POST /api/instructions/:id/execute`
+  is wired to register the mapping in PR 2. Workflow-step dispatch
+  (`POST /api/workflows/:id/execute`), MCP `execute_instruction`,
+  scheduled / approval-triggered dispatch, and rerun-via-`create_rerun`
+  produce responses with `execution_id=''` and use the legacy fallback.
+  Closing those surfaces is the scope of PR 2.x follow-ups.
+
+  **Server-restart caveat.** The `command_id → execution_id` mapping
+  is held in memory inside `AgentServiceImpl::cmd_execution_ids_`. If
+  the server restarts mid-execution, the mapping is lost — agent
+  responses arriving post-restart for in-flight commands stamp empty
+  `execution_id` and use the legacy fallback.
+
+  **Performance contract — partial-index predicate** (governance
+  perf-B1). SQLite's planner does NOT use `idx_resp_execution_ts` for
+  a `WHERE execution_id = ?` bind alone; the WHERE clause must
+  syntactically subsume the partial-index predicate `execution_id != ''`.
+  `query_by_execution`'s SQL includes the redundant `AND execution_id != ''`
+  exclusively for planner eligibility — the early-return guard at the
+  top of the method ensures the clause is always trivially true.
+
+  **FAST-agent race close** (governance UP2-4). The dispatch path now
+  creates the execution row BEFORE calling `cmd_dispatch` and threads
+  `execution_id` THROUGH the dispatch closure (new parameter on
+  `CommandDispatchFn`). The closure registers the
+  `command_id → execution_id` mapping with `AgentServiceImpl` BEFORE
+  any RPC is sent — closing the race where a sub-millisecond loopback
+  agent could reply before a post-dispatch register-mapping call
+  landed. Backwards-compatible: callers passing empty `execution_id`
+  (workflow steps + non-tracker dispatch surfaces) skip registration
+  with no behaviour change vs. pre-PR-2.
+
+  **Multi-agent fan-out invariant** (governance HF-1). A single
+  `command_id` is dispatched to N agents and produces N responses;
+  the terminal-status branches in `agent_service_impl.cpp` no longer
+  erase `cmd_execution_ids_` (erasing on the first agent's terminal
+  would leave agents 2..N stamping empty `execution_id`). Map entries
+  persist for the process lifetime; a periodic sweeper is filed as
+  PR 2.x — accepted bounded leak (sec-M1 / perf-S1) for the same
+  reason `cmd_send_times_` and `cmd_first_seen_` carry the same
+  shape today.
+
+  **Phantom-execution-row close** (governance Pattern-C re-review).
+  The reorder of `create_execution` BEFORE `cmd_dispatch` (needed for
+  the UP2-4 race fix above) initially left an orphan row at
+  `status='running'` whenever dispatch failed (sent=0 or thrown).
+  Both failure paths in `/api/instructions/:id/execute` now call
+  `ExecutionTracker::mark_cancelled` to record the failed-dispatch
+  attempt for forensic audit instead of orphaning a phantom in-flight
+  row. Pinned by a regression test.
+
+  Migration uses the same probe-and-stamp idempotency dance as
+  `instruction_store`'s v2 migration (governance arch-B2 / CP-5) so
+  re-opening a DB that already has the column does not wedge on
+  duplicate-column ALTER. Forward-compat: writers always bind the
+  column; readers that don't care leave the field empty in
+  StoredResponse.
+
+  No proto changes, no plugin ABI changes, no agent-side changes —
+  the agent's CommandResponse already carries `command_id` and the
+  server-side mapping handles the rest.
+
 - **Instructions → Executions tab — clickable history + per-execution drawer
   (PR 1 of executions-history ladder).**
   The Executions tab is no longer a flat text list. Each row carries a

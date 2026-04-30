@@ -23,6 +23,15 @@ struct StoredResponse {
     std::string error_detail;
     int64_t ttl_expires_at{0}; // 0 = use default retention
     std::string plugin;        // plugin name (for schema lookup + facets)
+    /// Execution row id (from `executions.id`) that produced this response.
+    /// Empty for legacy rows (pre-PR-2) and for out-of-band dispatch paths
+    /// (CLI / direct gRPC) that don't go through the workflow routes.
+    /// Populated by the in-memory command_id→execution_id mapping in
+    /// AgentServiceImpl when a response arrives. Indexed via
+    /// idx_resp_execution_ts for the `query_by_execution` exact-correlation
+    /// path; legacy callers continue to use `query()` keyed by
+    /// instruction_id+timestamp window.
+    std::string execution_id;
 };
 
 /// A facet value from the response_facets index.
@@ -74,6 +83,14 @@ public:
     void store(const StoredResponse& resp);
     std::vector<StoredResponse> query(const std::string& instruction_id,
                                       const ResponseQuery& q = {}) const;
+    /// Exact-correlation lookup keyed on the new `execution_id` column
+    /// (PR 2). Returns rows whose `execution_id` matches; honours the same
+    /// agent_id / status / since / until / limit filters as `query()`.
+    /// Empty `execution_id` is rejected (returns no rows) — that sentinel
+    /// is the legacy path; callers must fall back to `query()` if they
+    /// support pre-PR-2 data. Backed by `idx_resp_execution_ts`.
+    std::vector<StoredResponse> query_by_execution(const std::string& execution_id,
+                                                    const ResponseQuery& q = {}) const;
     std::vector<StoredResponse> get_by_instruction(const std::string& instruction_id) const;
     std::vector<AggregationResult> aggregate(const std::string& instruction_id,
                                              const AggregationQuery& aq,

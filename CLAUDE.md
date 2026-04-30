@@ -162,6 +162,54 @@ The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` →
 - DSL spec: `docs/yaml-dsl-spec.md`
 - Beginner tutorial: `docs/getting-started.md`
 
+### Executions-history ladder — `command_id → execution_id` mapping invariant (PR 2+)
+
+`responses.execution_id` is populated at write time by an in-memory
+`cmd_execution_ids_` map inside `AgentServiceImpl` (under `cmd_times_mu_`).
+The mapping is registered at dispatch time INSIDE `cmd_dispatch` BEFORE any
+RPC is sent — closes the FAST-agent race where a sub-millisecond loopback
+agent could reply before a post-dispatch registration. The `CommandDispatchFn`
+typedef carries `execution_id` as its sixth parameter; pass empty to opt out
+(out-of-band dispatch / no-tracker callers).
+
+**Known coverage gap (every PR in this ladder must check this).** Only
+`/api/instructions/:id/execute` (`workflow_routes.cpp`) creates an execution
+row AND threads `execution_id` into `cmd_dispatch`. The following dispatch
+surfaces produce `execution_id=''` responses, falling back to the legacy
+timestamp-window join in the executions detail drawer:
+
+- Workflow-step dispatch (`/api/workflows/:id/execute` step `cmd_dispatch`
+  callback at `workflow_routes.cpp` line ~925)
+- MCP `execute_instruction` (`mcp_server.cpp`)
+- Schedule / approval-triggered dispatch
+- Rerun (`/api/executions/:id/rerun` via `create_rerun` — does not currently
+  dispatch a command, so the gap is structural, not a wiring bug)
+
+Closing each gap is the scope of PR 2.x follow-ups. **When adding any new
+dispatch path that creates an execution row, it MUST thread `execution_id`
+into `cmd_dispatch`** — failure produces silent empty-string tagging with
+no error or warning.
+
+**Multi-agent fan-out invariant.** A single `command_id` is dispatched to N
+agents; each agent sends its own response with the same `command_id`.
+Terminal-status branches in `agent_service_impl.cpp` do NOT erase
+`cmd_execution_ids_` — erasing on the first agent's terminal would leave
+agents 2..N stamping empty `execution_id`. Map entries persist for process
+lifetime; a periodic sweeper is filed as PR 2.x. The accepted bounded leak
+matches the existing `cmd_send_times_` / `cmd_first_seen_` shape under the
+same `cmd_times_mu_`.
+
+**Server restart caveat.** The mapping is in-memory; restart loses it.
+In-flight commands at restart time produce responses tagged `execution_id=''`
+that use the legacy fallback in the drawer.
+
+**Partial-index planner contract.** `idx_resp_execution_ts ON
+responses(execution_id, timestamp) WHERE execution_id != ''` requires the
+WHERE clause to syntactically subsume the partial-index predicate. Every
+query against this index must include `AND execution_id != ''` redundantly,
+or SQLite falls back to a full table scan. See `query_by_execution`'s SQL
+in `response_store.cpp` for the canonical form.
+
 ## Enterprise Readiness and SOC 2
 
 The path from feature-complete to enterprise-deployable is scoped in `docs/enterprise-readiness-soc2-first-customer.md` across 7 workstreams (A GRC, B Identity, C AppSec, D Reliability, E Data, F Secure SDLC, G Customer Assurance). Every code change is evaluated against this plan by the compliance-officer, sre, and enterprise-readiness agents during Gate 6 of the governance pipeline.

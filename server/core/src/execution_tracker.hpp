@@ -127,6 +127,13 @@ public:
     void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
+    /// PR 2: set agents_targeted post-creation. Used by the workflow execute
+    /// handler which now creates the execution row BEFORE dispatch (to thread
+    /// execution_id into cmd_dispatch and close the FAST-agent race UP2-4),
+    /// then updates `agents_targeted` once dispatch confirms how many agents
+    /// the command actually reached.
+    void set_agents_targeted(const std::string& execution_id, int agents_targeted);
+
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
 

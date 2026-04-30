@@ -353,6 +353,22 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     sqlite3_finalize(stmt);
 }
 
+void ExecutionTracker::set_agents_targeted(const std::string& execution_id,
+                                            int agents_targeted) {
+    if (!db_)
+        return;
+    std::lock_guard lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE executions SET agents_targeted=? WHERE id=?",
+                           -1, &stmt, nullptr) != SQLITE_OK)
+        return;
+    sqlite3_bind_int(stmt, 1, agents_targeted);
+    sqlite3_bind_text(stmt, 2, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
 void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     if (!db_)
         return;
