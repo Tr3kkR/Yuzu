@@ -110,13 +110,16 @@ The server stores its configuration in files located in the **same directory as 
 
 | File | Purpose |
 |---|---|
-| `yuzu-server.cfg` | User credentials. Passwords are stored as PBKDF2 hashes with per-user salts. Never contains plaintext passwords. |
-| `enrollment-tokens.cfg` | Enrollment tokens for Tier 2 agent enrollment. Each token has an ID, creation time, expiry, and remaining use count. |
+| `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt. After first boot, `auth.db` is authoritative and this file is no longer read for live state — keep it as the seed for disaster-recovery (re-creating `auth.db` from scratch). |
+| `auth.db` | SQLite-backed authentication database. Holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256 hashed passwords. Created in `--data-dir` on first boot. Mode `0600` on Linux; restricted ACL on Windows. **This is the live source of truth for authentication state from v0.12.0 onwards.** |
+| `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up all three `.cfg` files regularly. Losing `yuzu-server.cfg` requires re-running first-run setup. Losing `enrollment-tokens.cfg` invalidates all issued tokens. Losing `pending-agents.cfg` loses the pending approval queue (agents will re-register on next heartbeat).
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, and the rest of the `--data-dir` SQLite stores on the same schedule. Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
 
-> **File permissions (Unix):** On Unix systems, the server automatically sets file permissions to `0600` (owner-only read/write) on `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` after every write. This protects credential hashes and enrollment tokens from being read by other users on the system. No manual `chmod` is required for these files.
+> **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
+
+> **Windows Defender exclusion:** On Windows production deploys, exclude `auth.db`, `auth.db-wal`, and `auth.db-shm` from real-time scan. See `docs/ops-runbooks/auth-db-recovery.md` for the `Add-MpPreference` commands.
 
 ---
 
@@ -334,6 +337,45 @@ Yuzu supports two built-in roles for local users:
 3. Click **Create User**.
 
 The password is hashed with PBKDF2 before storage. Plaintext passwords are never written to disk.
+
+> **Breaking change in v0.12.0** — the `role` field is **ignored** on
+> create. New users are always created as `user`. To grant admin, use
+> the **Change Role** button on the user's row, or `POST
+> /api/settings/users/{username}/role` programmatically. This is a
+> deliberate split (security finding C1): collapsing role assignment
+> into the create endpoint allowed a 4xx-on-create + audit-as-success
+> pattern that operators couldn't audit cleanly. Each role transition
+> now produces a single `user.role_change` audit event with `old_role`
+> and `new_role` recorded in the detail field.
+
+### Changing a User's Role
+
+1. Navigate to **Settings > User Management**.
+2. Click **Change Role** next to the target user.
+3. Pick `admin` or `user` and confirm.
+
+The server emits an audit event on every branch:
+
+| Branch | Audit `result` | Detail |
+|---|---|---|
+| Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
+| Same role requested | `no_op` | `same_role=admin` (or `user`) |
+| Self-target rejected | `denied` | `self_role_change_blocked` |
+| Invalid username | `denied` | `invalid_username` |
+| Invalid JSON body | `denied` | `invalid_json` |
+| Missing `role` field | `denied` | `missing_role` |
+| Invalid role value | `denied` | `invalid_role` |
+| User not found | `denied` | `user_not_found` |
+| DB write failed | `denied` | `db_failure` |
+
+> **You cannot change your own role.** The endpoint rejects self-target
+> with HTTP 403, audited as `denied:self_role_change_blocked`. The same
+> motivation as the self-delete guard: prevent an operator from locking
+> themselves out via a misclick or scripted demotion.
+
+> **Active sessions are invalidated atomically.** After a successful
+> `user.role_change`, every active session for the target user is
+> destroyed; the user must re-authenticate to pick up the new role.
 
 ### Deleting a User
 

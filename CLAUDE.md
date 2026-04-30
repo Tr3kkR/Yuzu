@@ -471,6 +471,56 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | TAR dashboard — three frames (retention-paused sources, scope-walking SQL, process tree viewer), URL structure, permissions | `docs/tar-dashboard.md` | `architect` on `/tar` or `/fragments/tar/...` change; `plugin-developer` on TAR action surface; `docs-writer` on dashboard nav |
 | Scope walking — composable scope from previous query results (Yuzu's product differentiator). Result-set primitive, `result_sets.db`, `from_result_set:<id>` Scope kind, REST/DSL surface, lineage, audit chain | `docs/scope-walking-design.md` | `architect` + `dsl-engineer` on scope-engine/DSL/result-set change; `consistency-auditor` on audit chain; `security-guardian` on cross-operator authz |
 
+## AuthDB — persistent authentication store
+
+`auth.db` (lives in `--data-dir`) is the v0.12.0 SQLite-backed store
+for user accounts, sessions, and enrollment tokens. Replaces the prior
+in-memory + on-config-flush model that lost users on every restart
+(#618, #388, #527). Design + migrations: `docs/auth-architecture.md`.
+Operator recovery: `docs/ops-runbooks/auth-db-recovery.md`. Security
+review record: `docs/security-reviews/authdb-2026-04-30.md`.
+
+### AuthDB invariants that keep reappearing in governance
+
+- **Mode 0600 on Linux at create time, restricted ACL on Windows.** Set in
+  `AuthDB::initialize()`. Tested in `test_auth_db.cpp`; do not remove the
+  permission write (or the test) — a world-readable `auth.db` exposes salt
+  and hash for offline crack attempts.
+- **`MigrationRunner::run` is the canonical schema pattern.** Use the same
+  `std::vector<Migration>{{1, sql}, {2, alter}}` shape every other store
+  uses. PR 2 of the governance ladder (#695) corrected the original direct
+  `sqlite3_exec(schema_sql)` to this pattern; do not regress.
+- **Lifetime: `unique_ptr<AuthDB>` owned at function scope outliving
+  `Server::create()`.** PR 1 of the governance ladder (#694) widened the
+  scope so the DB destructor does not run before the server starts using
+  it. AuthManager holds a non-owning pointer via `set_auth_db()` injection.
+  Do not move ownership inside any if-block at `main.cpp:526-567`.
+- **`yuzu-server.cfg` is a one-shot first-boot seed, not a live source of
+  truth.** After `auth.db` exists, edits to the config file do NOT
+  re-seed users. The dashboard (`POST /api/settings/users` for create,
+  `POST /api/settings/users/{username}/role` for role change) is the only
+  live mutation path.
+- **`POST /api/settings/users` `role` field is ignored.** Privilege
+  escalation via the role parameter (security finding C1) was the
+  motivation for the v0.12.0 split. New users always land as `user`. The
+  dedicated role endpoint emits `user.role_change` audit events with
+  `old_role` / `new_role` in the detail.
+- **`AuthRoutes::require_admin` emits `auth.admin_required` denied audit
+  on every 403.** Centralised at the gate so every privileged-endpoint
+  rejection surfaces in the SOC 2 CC7.2 evidence chain. Threading
+  `audit_fn` into every caller instead would have been a 30+ site change
+  for the same effect.
+- **Cleanup thread cadence is 60 seconds for AuthDB**, different from
+  AuditStore's minute-based cadence, because session expiry windows are
+  typically < 1 hour and a 1-minute lag adds up fast at fleet scale. See
+  `auth_db.cpp` `run_cleanup_thread` for the contract; if you tune this,
+  update the comment.
+- **Snapshot-and-release pattern for sibling subsystems.** When AuthDB
+  needs to publish on the SSE event bus or any future bus, never call
+  `event_bus_->publish()` while holding `AuthDB::mu_`. Same rule as
+  ExecutionTracker → ExecutionEventBus (PR 3 / #702). Build the payload
+  under the lock, exit the locked scope, then publish lock-free.
+
 ## Guardian engine — stores and architectural notes
 
 The Guardian rollout is Windows-first per the delivery plan. Server-side state lives in one new SQLite file opened at startup next to `policy_store_`:

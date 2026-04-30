@@ -1118,8 +1118,11 @@ Query audit events.
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
-| `user.upsert` | Local account created, password changed, or role changed. `result` ∈ {`success`, `denied`}. Denied detail values: `self_role_change_blocked` (403, self attempted role change), `duplicate_username` (409, attempted create on an existing name). |
-| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail value: `self_delete_blocked` (403, self attempted to delete own account). |
+| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 characters). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
+| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
+| `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `quarantine.enable` | Device quarantined |
@@ -2692,44 +2695,68 @@ Render the user table fragment.
 
 **`POST /api/settings/users`**
 
-Create a new local account, or change the caller's own password.
+Create a new local account.
 
-> **Behavior change in v0.11.0:** Prior versions treated this endpoint as a
-> blanket upsert and silently overwrote existing accounts on a duplicate
-> POST. As of v0.11.0 the endpoint rejects duplicates with **409** unless
-> the request targets the caller's own row (self-password-change is still
-> permitted). To update another user's password or role, delete and re-create
-> the account.
+> **Breaking change in v0.12.0:** The `role` field is now **ignored**. New users
+> are always created as `user`. To assign or change a role use the dedicated
+> `POST /api/settings/users/{username}/role` endpoint documented below — this
+> closes security finding C1 (privilege escalation via the role parameter on
+> create). Operators that scripted user-create with `role=admin` should expect
+> the user to land as `user` and explicitly promote via the role endpoint.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `username` | string | Yes | Account name. Must be non-empty. |
+| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only. |
 | `password` | string | Yes | New password. Minimum 12 characters. |
-| `role` | string | Yes | `admin` or `user`. |
+| `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
-- **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.upsert / success`.
-- **Response (400):** Re-rendered fragment with an inline error script. Returned when `username` or `password` is empty.
-- **Response (403):** Returned when `username` matches the caller's own session username AND `role` differs from the caller's current role — the **self-demotion guard**. Body is the re-rendered user table fragment. Header includes:
-
-  ```
-  HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}
-  ```
-
-  Audit event recorded as `user.upsert / denied / self_role_change_blocked`. The rejected attempt is logged at warn level. Self-password-change (same username, same role, different password) is **explicitly allowed** and returns 200.
-
-- **Response (409):** Returned when `username` already exists and the request is not a self-password-change. Body is the re-rendered user table fragment. Header includes:
-
-  ```
-  HX-Trigger: {"showToast":{"message":"Username already exists","level":"error"}}
-  ```
-
-  Audit event recorded as `user.upsert / denied / duplicate_username`.
-
+- **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
+- **Response (400):** Returned when `username` is invalid, `password` is empty, or password is shorter than 12 characters. Audit `user.create / denied / weak_password` (or `invalid_username`).
+- **Response (409):** Returned when `username` already exists. Body is the re-rendered user table fragment with the duplicate-username toast. Audit `user.create / denied / duplicate_username`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
+
+**`POST /api/settings/users/:username/role`**
+
+Change the role of an existing user. Dedicated endpoint introduced in
+v0.12.0 to give role transitions their own audit chain (governance C1).
+
+- **Permission:** Admin only
+- **Request body (JSON):**
+
+```json
+{ "role": "admin" }
+```
+
+The `role` field must be exactly `admin` or `user`.
+
+- **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
+- **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
+- **Response (400) invalid request:**
+  - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
+  - `invalid_json` — body is not valid JSON.
+  - `missing_role` — body has no `role` field, or `role` is not a string.
+  - `invalid_role` — `role` value is not `admin` or `user`.
+
+  Each branch emits `user.role_change / denied / <reason>`.
+
+- **Response (403):** Self-target rejected. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}`. Audit `user.role_change / denied / self_role_change_blocked`. To demote yourself, create a second admin, log out, log in as the second admin, and use this endpoint to demote the first.
+
+- **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
+
+- **Response (500):** AuthDB write failed. Audit `user.role_change / denied / db_failure`.
+
+**Example — promote `bob` to admin:**
+
+```bash
+curl -X POST https://yuzu-server:8080/api/settings/users/bob/role \
+  -H "Content-Type: application/json" \
+  -H "X-Yuzu-Token: yzt_..." \
+  -d '{"role":"admin"}'
+```
 
 **`DELETE /api/settings/users/:name`**
 
@@ -2737,6 +2764,8 @@ Delete the named account.
 
 - **Permission:** Admin only
 - **Response (200):** Account deleted. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"User deleted","level":"success"}}`. Audit event recorded as `user.delete / success`.
+- **Response (400):** `:name` fails the username allowlist (e.g. contains `$`, `:`, or other disallowed bytes). Audit `user.delete / denied / invalid_username`.
+- **Response (404):** `:name` does not match any persisted user. Audit `user.delete / denied / user_not_found`. Returned with a `User not found` toast in the re-rendered fragment.
 - **Response (403):** Returned when `:name` matches the caller's own session username — the **self-deletion guard**. Body is the re-rendered user table fragment. Header includes:
 
   ```
@@ -2750,7 +2779,9 @@ Delete the named account.
 
 | HTTP status | Condition |
 |---|---|
-| 200 | Account deleted successfully (or no-op if `:name` does not exist) |
+| 200 | Account deleted successfully |
+| 400 | Username failed the allowlist regex |
+| 404 | No persisted user matched `:name` |
 | 403 | Target equals the caller's own username (self-delete guard) |
 | 403 | Caller is not an admin (rejected by admin gate before handler) |
 | 401 | Defensive — admin gate / session callbacks disagree |
@@ -3135,6 +3166,74 @@ data: {"agent_id":"agent-01","hostname":"web-server-01"}
 
 event: command_response
 data: {"agent_id":"agent-01","command_id":"cmd-abc","status":"COMPLETED"}
+```
+
+#### `GET /sse/executions/{id}`
+
+Per-execution Server-Sent Events stream introduced in v0.12.0. Backs the
+inline drawer's live updates on the **Instructions → Executions** tab.
+
+- **Permission:** `Execution:Read` (RBAC) or admin role
+- **`{id}`:** the execution id returned by `POST /api/instructions/:id/execute` or visible in the executions list (regex: `[A-Za-z0-9_-]{1,128}`).
+- **Content-Type:** `text/event-stream`
+- **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
+
+**Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
+
+**Event types:**
+
+| Event | Emitted on | Payload (JSON in `data:`) |
+|---|---|---|
+| `agent-transition` | One per agent state change (`update_agent_status` write) | `AgentExecStatus` snapshot — `agent_id`, `status`, `exit_code`, `duration_ms`, `error` |
+| `execution-progress` | Every `refresh_counts` recompute | counts snapshot — `total`, `succeeded`, `failed`, `running`, `pending` |
+| `execution-completed` | Crossing the all-agents-responded threshold OR `mark_cancelled` | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`. Client should close the EventSource after this event. |
+
+**Status-code map:**
+
+| HTTP status | Condition |
+|---|---|
+| 200 | Stream attached; events follow |
+| 401 | No session / token |
+| 403 | RBAC `Execution:Read` denied |
+| 404 | `{id}` does not exist in the execution tracker |
+| 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
+| 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
+
+**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
+
+**Example (curl):**
+
+```bash
+curl -N -H "Cookie: yuzu_session=abc123" \
+  https://yuzu.example.com/sse/executions/exec-abc123
+```
+
+**Example output (running execution, two agents, one in progress):**
+
+```
+event: agent-transition
+id: 1
+data: {"agent_id":"a-1","status":"running","exit_code":null,"duration_ms":null}
+
+event: agent-transition
+id: 2
+data: {"agent_id":"a-1","status":"success","exit_code":0,"duration_ms":4218}
+
+event: execution-progress
+id: 3
+data: {"total":2,"succeeded":1,"failed":0,"running":1,"pending":0}
+
+event: agent-transition
+id: 4
+data: {"agent_id":"a-2","status":"success","exit_code":0,"duration_ms":5102}
+
+event: execution-progress
+id: 5
+data: {"total":2,"succeeded":2,"failed":0,"running":0,"pending":0}
+
+event: execution-completed
+id: 6
+data: {"status":"succeeded"}
 ```
 
 ---
