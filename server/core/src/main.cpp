@@ -481,6 +481,17 @@ int main(int argc, char* argv[]) {
 
     cfg.auth_config_path = cfg_path;
 
+    // AuthDB lifetime — declared at function scope (NOT inside the
+    // --data-dir block) so the unique_ptr outlives Server::create() and
+    // server->run(). Storing &auth_db in AuthManager from inside the
+    // else block (the previous shape) destroyed the AuthDB at the close
+    // of the block, leaving AuthManager holding a dangling pointer for
+    // the rest of main() — every authenticate() / upsert_user /
+    // update_role / list_users call hit use-after-free in production
+    // deployments with --data-dir set (governance round arch-B1
+    // CRITICAL). Stays nullptr when no --data-dir is configured.
+    std::unique_ptr<yuzu::server::AuthDB> auth_db;
+
     // If --data-dir was specified, ensure it exists and resolve to canonical path
     if (!cfg.data_dir.empty()) {
         std::error_code ec;
@@ -522,11 +533,15 @@ int main(int argc, char* argv[]) {
         // When --data-dir is specified, create and initialize the auth DB.
         // This provides persistent user/session/token storage that survives
         // container restarts (fixes GitHub issues #618, #388, #527, #391, #526).
+        //
+        // arch-B1 fix: assign through the function-scope unique_ptr declared
+        // above. Do NOT redeclare a local AuthDB inside this block — the
+        // pointer must outlive Server::create() and server->run() below.
         spdlog::info("Initializing auth DB in data directory: {}", cfg.data_dir.string());
-        yuzu::server::AuthDB auth_db(cfg.data_dir);
-        auto db_result = auth_db.initialize();
+        auth_db = std::make_unique<yuzu::server::AuthDB>(cfg.data_dir);
+        auto db_result = auth_db->initialize();
         if (!db_result) {
-            spdlog::error("Failed to initialize auth DB: {}", 
+            spdlog::error("Failed to initialize auth DB: {}",
                          static_cast<int>(db_result.error()));
             return EXIT_FAILURE;
         }
@@ -535,20 +550,20 @@ int main(int argc, char* argv[]) {
         // First-boot seeding: if auth DB has no users, seed admin from config file.
         // This ensures backwards compatibility — existing config-based users
         // are automatically migrated to the DB on first start.
-        auto users_result = auth_db.list_users();
+        auto users_result = auth_db->list_users();
         if (users_result && users_result->empty()) {
             spdlog::info("Auth DB is empty — seeding admin user from config file");
             // The admin user was already loaded into auth_mgr via load_config(),
             // so we can read it back and persist to the DB.
             for (const auto& user : auth_mgr.list_users()) {
-                auto seed_result = auth_db.upsert_user(
+                auto seed_result = auth_db->upsert_user(
                     user.username,
                     user.hash_hex,
                     user.salt_hex,
                     user.role
                 );
                 if (seed_result) {
-                    spdlog::info("Seeded user '{}' (role={}) into auth DB", 
+                    spdlog::info("Seeded user '{}' (role={}) into auth DB",
                                user.username, auth::role_to_string(user.role));
                 } else {
                     spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
@@ -561,7 +576,10 @@ int main(int argc, char* argv[]) {
         // Wire AuthDB into AuthManager AFTER seeding is complete.
         // This ensures auth_mgr.list_users() reads from in-memory (config file)
         // during seeding, then delegates to AuthDB for all subsequent operations.
-        auth_mgr.set_auth_db(&auth_db);
+        // The raw pointer is safe: auth_db (the unique_ptr) lives in the outer
+        // function scope and is destroyed only after server->run() returns
+        // and AuthManager has gone out of scope.
+        auth_mgr.set_auth_db(auth_db.get());
         spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
