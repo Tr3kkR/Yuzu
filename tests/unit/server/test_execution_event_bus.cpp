@@ -20,6 +20,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>  // std::sort -- not transitively pulled in by <vector>
+                      // on MSVC's STL (Linux libstdc++ + libc++ both happen
+                      // to include it indirectly, masking the omission).
 #include <atomic>
 #include <thread>
 #include <vector>
