@@ -5086,6 +5086,17 @@ private:
     /// destructs.
     std::unique_ptr<ExecutionEventBus> execution_event_bus_;
     std::unique_ptr<ExecutionTracker> execution_tracker_;
+    // [BUS-BEFORE-TRACKER] — DO NOT reorder these two members or insert
+    // a new member between them. ExecutionTracker borrows a raw
+    // ExecutionEventBus* via set_event_bus(); destructor order is
+    // reverse-of-declaration, so the tracker must destruct FIRST
+    // (releasing the borrow) and the bus must destruct LAST. Reordering
+    // produces a SIGTERM-during-publish UAF that only surfaces under
+    // chaos. Compile-time enforcement was tried (offsetof) but the
+    // class is non-standard-layout — offsetof is conditionally
+    // supported and emits warnings. This comment is the contract
+    // (governance round arch-N1 / UP-A13). Code reviewers — grep
+    // [BUS-BEFORE-TRACKER] before approving any change to this block.
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
 

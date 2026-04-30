@@ -59,15 +59,57 @@ struct ExecutionEvent {
 class ExecutionEventBus {
 public:
     using Listener = std::function<void(const ExecutionEvent&)>;
+    /// Test seam — replace `std::chrono::system_clock::now()` with a
+    /// fake clock so unit tests can advance past `kRetentionAfterTerminalSec`
+    /// without `std::this_thread::sleep_for(60s)`. Set to nullptr to
+    /// restore real time. governance round qe-S3.
+    using ClockFn = std::function<std::int64_t()>;
 
     static constexpr std::size_t kBufferCap = 1000;
     static constexpr std::int64_t kRetentionAfterTerminalSec = 60;
+    /// Min time between full GC sweeps. Gate `gc_terminal_channels` on
+    /// this to amortise the O(channels) cost claimed in the comment but
+    /// previously not enforced (governance round perf-B2). Half the
+    /// retention window — late enough to not waste CPU, early enough
+    /// that drained channels are reclaimed before they pile up.
+    static constexpr std::int64_t kMinGcIntervalMs = (kRetentionAfterTerminalSec * 1000) / 2;
 
     ExecutionEventBus() = default;
     ~ExecutionEventBus() = default;
 
     ExecutionEventBus(const ExecutionEventBus&) = delete;
     ExecutionEventBus& operator=(const ExecutionEventBus&) = delete;
+
+    /// Install a fake clock for tests. Pass nullptr to restore the
+    /// system_clock default. Only safe to call when no publishers /
+    /// subscribers are active.
+    void set_clock_fn(ClockFn fn) { clock_fn_ = std::move(fn); }
+
+    // ── Observability counters (governance round OBS-3) ──────────────────
+    //
+    // These are simple atomics that production exposes via a Prometheus
+    // gauge/counter scrape — see server.cpp's `register_sse_metrics`. The
+    // bus itself doesn't depend on the metrics library so it stays
+    // standalone-testable.
+
+    /// Total events evicted from the ring buffer (FIFO drop when
+    /// `buffer.size() > kBufferCap`). Increments lock-free relative to
+    /// the publisher mutex.
+    std::uint64_t events_dropped_total() const noexcept {
+        return events_dropped_.load(std::memory_order_relaxed);
+    }
+    /// Total channels GC'd by `gc_terminal_channels` since process start.
+    std::uint64_t gc_channels_total() const noexcept {
+        return gc_channels_.load(std::memory_order_relaxed);
+    }
+    /// Total GC sweeps that ran a full O(channels) inspection (vs the
+    /// throttle-skip path).
+    std::uint64_t gc_sweeps_total() const noexcept {
+        return gc_sweeps_.load(std::memory_order_relaxed);
+    }
+    /// Total subscribers across all channels. O(channels) snapshot —
+    /// intended for /metrics scrape, not hot-path use.
+    std::size_t subscribers_total() const;
 
     /// Subscribe to a per-execution channel. Returns a subscription token
     /// scoped to `execution_id` — tokens from different channels are not
@@ -131,7 +173,11 @@ private:
     /// Lookup-only — returns nullptr if the channel is absent.
     std::shared_ptr<Channel> find(const std::string& execution_id) const;
 
-    static std::int64_t now_ms() {
+    /// Member function rather than static so tests can inject a fake
+    /// clock via `set_clock_fn` (qe-S3). Falls back to `system_clock`
+    /// when no override is installed.
+    std::int64_t now_ms() const {
+        if (clock_fn_) return clock_fn_();
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
@@ -139,6 +185,19 @@ private:
 
     mutable std::shared_mutex map_mu_;
     std::unordered_map<std::string, std::shared_ptr<Channel>> channels_;
+
+    // GC throttle (perf-B2). Updated under `map_mu_` write lock when a
+    // sweep actually runs; read lock-free on the publish hot path.
+    std::atomic<std::int64_t> last_gc_at_ms_{0};
+
+    // OBS-3 counters. Atomic so we don't need to extend the per-channel
+    // mutex into accountancy.
+    std::atomic<std::uint64_t> events_dropped_{0};
+    std::atomic<std::uint64_t> gc_channels_{0};
+    std::atomic<std::uint64_t> gc_sweeps_{0};
+
+    // Test-clock seam.
+    ClockFn clock_fn_;
 };
 
 } // namespace yuzu::server
