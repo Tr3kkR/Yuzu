@@ -7,7 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **`POST /api/settings/users` `role` field is now ignored.** New users are
+  always created with `role=user` regardless of what the form body sends.
+  Operators that scripted user-create calls with `role=admin` should expect
+  the user to land as `user` and explicitly promote them via the new
+  dedicated endpoint:
+
+  ```
+  POST /api/settings/users/{username}/role
+  Content-Type: application/json
+  { "role": "admin" }
+  ```
+
+  Rationale (security C1, governance Gate 4): collapsing privilege change
+  into the create endpoint allowed a 4xx-on-create + audit-as-success
+  pattern that was hard to reason about. The dedicated role endpoint emits
+  a single `user.role_change` audit event with `old_role` / `new_role` in
+  the detail field, invalidates active sessions for the target user, and
+  has its own RBAC + denied-branch audit chain (see `### Security` below).
+
 ### Added
+
+- **Persistent SQLite-backed authentication.** `auth.db` (in `--data-dir`)
+  now holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256
+  hashed passwords. Replaces the prior in-memory + on-config-flush model
+  that lost users on every restart (#618). File is created with mode 0600
+  on Linux; migrations are versioned via the same `MigrationRunner`
+  pattern as the other stores (instruction, response, audit, etc.).
+  Backup procedure: `sqlite3 /var/lib/yuzu/auth.db ".backup ..."` — never
+  `cp` against a live WAL. First-boot seeds from `yuzu-server.cfg`; on
+  restart the DB is authoritative and the config seed is no-op. Recovery
+  procedure for a corrupt `auth.db`: see `docs/ops-runbooks/auth-db-recovery.md`.
+
+- **Dedicated role-change endpoint with full audit chain.**
+  `POST /api/settings/users/{username}/role` (admin-only) accepts
+  `{"role": "admin"|"user"}` and emits `user.role_change` audit on every
+  branch — success, self-target denied, invalid_username, missing_role,
+  invalid_json, invalid_role, user_not_found, db_failure, plus a `no_op`
+  result when the requested role matches the current role. Closes
+  governance PR4 audit-coverage gap. Sessions for the demoted/promoted
+  user are invalidated atomically with the role write so existing tabs
+  re-authenticate against the new role.
+
+- **`/sse/executions/{id}` audit policy clarification.** Every successful
+  subscribe emits `execution.live_subscribe` (target_type=Execution,
+  target_id={id}, result=success). Per-session-per-execution dedup is
+  deferred (#700) — until then, operators on the SOC 2 evidence chain
+  receive a row per reconnect; the forensic-grade audit on first-load
+  remains on `/fragments/executions/{id}/detail`'s
+  `execution.detail.view`.
+
+- **Login-latency observability.** New histogram
+  `yuzu_auth_login_duration_seconds{method="password",result=...}`
+  observes PBKDF2 verify time on every login attempt. Result label is
+  `success`, `bad_password`, or `unknown_user` so SREs can alert on
+  success-path regressions independently of brute-force noise on the
+  failure paths.
+
+- **Audit-pipeline observability.** New counter
+  `yuzu_server_audit_emit_failed_total` increments when
+  `AuditStore::log()`'s `sqlite3_step` returns anything other than
+  `SQLITE_DONE`. SOC 2 CC7.2 gate — alerting on a non-zero rate
+  surfaces audit-chain degradation that was previously silent.
+
+- **`auth.admin_required` audit on every privileged-endpoint 403.**
+  `AuthRoutes::require_admin` emits an audit row with
+  `target_type=endpoint, target_id=req.path, result=denied` on every
+  role-mismatch rejection. Closes the gap where dozens of admin-only
+  routes rejected non-admin callers without surfacing the attempt in
+  `audit_store`. SOC 2 CC7.2.
+
+- **Restart-loop guard on systemd units.**
+  `deploy/systemd/yuzu-server.service` and
+  `deploy/systemd/yuzu-gateway.service` now declare
+  `StartLimitIntervalSec=60` + `StartLimitBurst=3` in `[Unit]` so a
+  recurring crash (e.g. corrupt `auth.db` failing the integrity check)
+  puts the unit cleanly into `failed` instead of spinning indefinitely.
+  See `docs/ops-runbooks/auth-db-recovery.md` for the recovery
+  procedure once a unit lands in `failed`.
+
+- **`LimitNOFILE=65536` on systemd units + `ulimits.nofile` 65536 on
+  Docker compose.** Default 1024 caps the server at ~16k SSE
+  connections and the gateway at ~700 agents under fanout. Aligned
+  systemd + compose so containerised and bare-metal deployments
+  behave identically.
+
+- **`docs/ops-runbooks/auth-db-recovery.md`** — Linux + Windows
+  recovery procedure when `auth.db` integrity check fails at startup,
+  WAL-aware backup procedure, Windows Defender exclusion list for
+  `auth.db*`, filesystem-permission audit (0600 on Linux).
 
 - **Live drawer updates via SSE (PR 3 of executions-history ladder).**
   `GET /sse/executions/{id}` opens a per-execution Server-Sent Events
@@ -300,6 +390,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demo fleet; running any of the six instructions then auto-renders the
   declared chart above the standard results table.
 
+### Security
+
+- **C1 closed — privilege-escalation via the user-create role parameter.**
+  `POST /api/settings/users` ignores the `role` field; the only path to
+  promote/demote is `POST /api/settings/users/{username}/role`. Audit
+  events on the new endpoint emit `old_role` and `new_role` so SIEMs
+  can detect anomalous role transitions without inferring intent from
+  the request body.
+
+- **C2 closed — atomic enrollment-token consumption.** Token validation
+  + use_count increment now happens inside a single `BEGIN IMMEDIATE`
+  transaction, eliminating the TOCTOU window where two concurrent
+  enrollments against the same single-use token could both succeed.
+
+- **C3 closed — OIDC admin role assignment.** Admin role is granted
+  ONLY when the OIDC `groups` claim contains the configured admin
+  group id (`--oidc-admin-group`). Email/name match no longer escalates
+  to admin. Operators relying on the legacy email-match shortcut must
+  add their admins to the configured Entra group.
+
+- **`auth.db` is created with mode 0600 on Linux** (owner read/write
+  only). On Windows the equivalent restricted ACL is applied via
+  `CreateFile`. World-readable hashes are not produced.
+
+- **Audit chain coverage on every privileged-mutation denied branch.**
+  `POST /api/settings/users/{username}/role` (8 denied codes), `DELETE
+  /api/settings/users/{name}` (`invalid_username`, `user_not_found`,
+  `self_delete_blocked`), and the centralised `auth.admin_required`
+  rejection in `AuthRoutes::require_admin` now all emit `audit_fn_(...,
+  "denied", ..., reason)`. SOC 2 CC7.2 evidence chain.
+
 ### Tests
 
 - **PR 3 coverage net — `tests/unit/server/test_execution_event_bus.cpp`
@@ -571,6 +692,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory is now gitignored.
 
 ### Fixed
+
+- **#618 — users lost across server restarts.** Pre-`auth.db` the user
+  list was held in memory, written back to `yuzu-server.cfg` on save,
+  but state created via the dashboard between saves was lost on a
+  crash or hard restart. AuthDB persists every write atomically.
+
+- **#388 — config write failure was silent.** `save_config()` now
+  returns explicit `bool` and is checked on every callsite; auth
+  state and on-disk config diverge no longer.
+
+- **#527 — auth state lifecycle unclear.** Server now has a single
+  authoritative `AuthDB` instance whose lifetime is tied to
+  `ServerImpl`; `AuthManager::set_auth_db()` injection makes the
+  contract explicit at construction.
+
+- **Windows MSVC compile fixes that landed alongside the AuthDB
+  rollout** — explicit `<algorithm>` / `<ctime>` / `<cctype>` /
+  `<cstring>` includes for the strict MSVC STL transitive-include
+  policy, destructor SQLite-handle ordering on the workflow_routes
+  test (so `fs::remove` runs after `sqlite3_close`), and
+  `path.string().c_str()` conversion for `sqlite3_open_v2` (C2664).
 
 - **`InstructionStore::create_set` now uses the `kConflictPrefix`
   contract on duplicate-id.** Previously returned

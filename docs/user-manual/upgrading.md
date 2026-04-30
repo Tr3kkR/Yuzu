@@ -30,7 +30,7 @@ Before upgrading any component:
 
 - [ ] Back up all data (see [Server Administration](server-administration.md))
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
-  - All `.db` files (response store, audit, policies, etc.)
+  - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -303,6 +303,68 @@ sqlite3 /var/lib/yuzu/responses.db ".schema responses"
 sqlite3 /var/lib/yuzu/responses.db ".schema idx_resp_execution_ts"
 # Expected: CREATE INDEX idx_resp_execution_ts ON responses(...) WHERE execution_id != ''
 ```
+
+### v0.12.0 — AuthDB persistent authentication (#618)
+
+v0.12.0 replaces the in-memory + on-config-flush authentication model
+with a SQLite-backed `auth.db` that holds user accounts, sessions, and
+enrollment tokens.
+
+**First boot after upgrade:**
+
+- The server probes `--data-dir` for `auth.db`. If absent, it creates
+  the file with mode `0600` (Linux) or restricted ACL (Windows), runs
+  the initial schema migration via `MigrationRunner`, then seeds users
+  from `yuzu-server.cfg`. Subsequent boots read from `auth.db`
+  directly; the config file is no longer the live source of truth.
+- The seed is one-shot. Editing `yuzu-server.cfg` after first boot
+  does NOT re-seed users into `auth.db` — use the dashboard or
+  `POST /api/settings/users` instead.
+- Existing in-flight sessions are NOT preserved across the upgrade
+  (sessions live in memory before this release; `auth.db` starts fresh
+  on first boot). Operators must log in again.
+
+**`role` parameter ignored on `POST /api/settings/users`.** New users
+are always created as `user` (security finding C1). To assign or
+change a role, use the dedicated `POST
+/api/settings/users/{username}/role` endpoint introduced in v0.12.0
+(see [REST API → Settings → User Management](rest-api.md#settings--user-management)).
+The dashboard exposes a **Change Role** button on each user row that
+calls the new endpoint.
+
+**Live drawer updates via SSE.** The Executions tab opens an
+`EventSource` to `/sse/executions/{id}` for in-progress runs. Reverse
+proxies in the request path must NOT buffer SSE — the server emits
+`X-Accel-Buffering: no` and `Cache-Control: no-cache` but a poorly-
+configured proxy can still chunk the stream. Verify with
+`curl -N https://<server>/sse/executions/<id>` from inside your
+network if the drawer freezes mid-execution.
+
+**`LimitNOFILE=65536` on systemd units.** v0.12.0 raises the systemd
+file-descriptor limit from the default 1024 to 65536. SSE
+connections + agent gRPC streams + SQLite WAL handles can saturate
+the default soft limit on busy fleets. The new value matches Docker
+compose's `ulimits.nofile` so containerised and bare-metal deployments
+behave identically.
+
+**Restart-loop guard.** `StartLimitIntervalSec=60` +
+`StartLimitBurst=3` in the systemd `[Unit]` section so a corrupt
+`auth.db` failing the integrity check at startup puts the unit
+cleanly into `failed` instead of spinning. Recovery procedure:
+[`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md).
+
+**Rollback to a pre-AuthDB release** (only if you have not yet
+written user state via the new dashboard):
+
+1. Stop the v0.12.0 server.
+2. Move `auth.db` aside (`mv auth.db auth.db.v0.12.0`).
+3. Restore `yuzu-server.cfg` from your pre-upgrade backup.
+4. Reinstall the prior release binary.
+5. Start the server. It reads `yuzu-server.cfg` as before.
+
+If you HAVE written user state via v0.12.0's dashboard, that state
+is in `auth.db` only — rolling back loses it. Export users via
+`GET /api/v1/settings/users` first if rollback is required.
 
 ### v0.12.0 — Guardian PR 2
 
