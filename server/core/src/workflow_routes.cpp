@@ -82,10 +82,16 @@ void WorkflowRoutes::register_routes(
     // definition. Click-handling on the trend sparkline (PR 4) and the
     // dashboard's per-instruction detail page (future) pass it through.
     sink.Get("/fragments/executions",
-        [auth_fn, execution_tracker, instruction_store](const httplib::Request& req,
-                                                        httplib::Response& res) {
+        [auth_fn, perm_fn, execution_tracker, instruction_store](const httplib::Request& req,
+                                                                  httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
+                return;
+            // sec-M1: Execution:Read gate. The LIST exposes definition_name
+            // and last_error_detail (per-agent error preview) — same data
+            // class as the DETAIL handler, so it earns the same RBAC gate.
+            // Mirrors MCP list_executions and REST /api/v1/execution-statistics.
+            if (!perm_fn(req, res, "Execution", "Read"))
                 return;
             if (!execution_tracker) {
                 res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
@@ -94,6 +100,11 @@ void WorkflowRoutes::register_routes(
 
             ExecutionQuery q;
             q.limit = 50;
+            // Only the LIST fragment renders last_error_detail inline; opt
+            // into the correlated subquery here. Other consumers (health
+            // probes, metrics ticks at server.cpp:1727) leave the default
+            // false and pay zero subquery cost (arch-B2 / perf-B1).
+            q.include_error_detail = true;
             if (req.has_param("definition_id")) {
                 q.definition_id = req.get_param_value("definition_id");
             }
@@ -218,8 +229,8 @@ void WorkflowRoutes::register_routes(
     // RBAC: Read on Execution. Same securable as MCP `get_execution_status`.
     // Correlation with responses uses the timestamp+agent join (PR 2 swaps
     // to exact `execution_id` correlation transparently).
-    sink.Get(R"(/fragments/executions/([A-Za-z0-9_-]+)/detail)",
-        [auth_fn, perm_fn, execution_tracker, instruction_store,
+    sink.Get(R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
+        [auth_fn, perm_fn, audit_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
@@ -276,13 +287,20 @@ void WorkflowRoutes::register_routes(
             }
 
             // -- KPI strip ---------------------------------------------------
+            // Sort once; both p50 and p95 index into the same sorted vector
+            // (perf-B2 / cpp-S3). Empty when any agent is still running, the
+            // sentinel branch in fmt_pct returns "—" without a sort.
+            std::vector<int64_t> sorted_durations;
+            if (!any_running && !durations_ms.empty()) {
+                sorted_durations = durations_ms;
+                std::sort(sorted_durations.begin(), sorted_durations.end());
+            }
             auto fmt_pct = [&](double p) -> std::string {
-                if (any_running || durations_ms.empty()) return std::string{"—"};
-                std::vector<int64_t> sorted = durations_ms;
-                std::sort(sorted.begin(), sorted.end());
-                std::size_t idx = static_cast<std::size_t>(p * (sorted.size() - 1));
-                if (idx >= sorted.size()) idx = sorted.size() - 1;
-                int64_t v = sorted[idx];
+                if (sorted_durations.empty()) return std::string{"—"};
+                std::size_t idx = static_cast<std::size_t>(
+                    p * (sorted_durations.size() - 1));
+                if (idx >= sorted_durations.size()) idx = sorted_durations.size() - 1;
+                int64_t v = sorted_durations[idx];
                 if (v < 1000) return std::format("{} ms", v);
                 if (v < 60000) return std::format("{:.1f} s", v / 1000.0);
                 return std::format("{}m {}s", v / 60000, (v % 60000) / 1000);
@@ -370,13 +388,22 @@ void WorkflowRoutes::register_routes(
                     }
                     auto title = std::format("{} · {} · {} ms",
                                               a.agent_id, a.status, dur_ms);
+                    // Bind agent_id and exec_id via data-* attributes rather
+                    // than interpolating into a JS string literal in an
+                    // onclick handler. html_escape converts ' to &#39; which
+                    // the HTML parser un-escapes BEFORE the JS lexer sees the
+                    // attribute value, so a single quote in agent_id would
+                    // terminate the JS literal and inject (UP-1). agent_id is
+                    // wire-provided by the agent on Register and is not yet
+                    // schema-validated. data-attribute + delegated listener
+                    // in instruction_ui.cpp keeps the user-controlled bytes
+                    // out of any JS-string context.
                     html += std::format(
                         "<div class=\"agent-cell agent-cell--{}\" "
-                        "title=\"{}\" aria-label=\"{}\" data-agent-id=\"{}\" "
-                        "onclick=\"scrollToAgentRow(event, '{}', '{}')\"></div>",
+                        "title=\"{}\" aria-label=\"{}\" "
+                        "data-agent-id=\"{}\" data-exec-id=\"{}\"></div>",
                         dom_status, html_escape(title), html_escape(title),
-                        html_escape(a.agent_id), html_escape(exec.id),
-                        html_escape(a.agent_id));
+                        html_escape(a.agent_id), html_escape(exec.id));
                 }
             }
             html += "</div></div>"; // agent-grid + agent-grid-wrap
@@ -421,8 +448,16 @@ void WorkflowRoutes::register_routes(
                 }
                 auto err_short = truncate_utf8(a.error_detail, 120);
 
+                // data-* attributes (not id=) are the binding contract for
+                // the agent-grid → row scroll. The legacy id is kept for any
+                // future deep-link case but the click handler in
+                // instruction_ui.cpp matches via getAttribute('data-agent-id')
+                // so dash-in-id collisions (UP-19) cannot occur.
                 html += std::format(
-                    "<tr id=\"per-agent-row-{}-{}\"><td><code>{}</code></td>",
+                    "<tr id=\"per-agent-row-{}-{}\" "
+                    "data-exec-id=\"{}\" data-agent-id=\"{}\">"
+                    "<td><code>{}</code></td>",
+                    html_escape(exec.id), html_escape(a.agent_id),
                     html_escape(exec.id), html_escape(a.agent_id),
                     html_escape(a.agent_id));
                 html += "<td><span class=\"status-badge " + status_cls + "\">" +
@@ -505,6 +540,15 @@ void WorkflowRoutes::register_routes(
 
             html += "</div>"; // exec-detail-grid
             res.set_content(html, "text/html; charset=utf-8");
+
+            // sec-M2: emit audit on the forensic-data read so SOC 2 can
+            // answer "who viewed execution X's per-agent error data and
+            // parameters between dates A and B?". Mirrors MCP
+            // get_execution_status's audit pattern. The LIST handler
+            // intentionally does not audit per the documented fragment-route
+            // policy (only routes returning forensic-grade content audit).
+            audit_fn(req, "execution.detail.view", "success", "Execution",
+                     exec.id, "");
         });
 
     // GET /fragments/schedules -- schedule list HTMX fragment

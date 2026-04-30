@@ -555,17 +555,35 @@ function toggleExecDetail(row) {
   if (det && det.classList.contains('exec-detail')) det.classList.toggle('open');
 }
 
-/* Click on an agent grid cell — scroll to the matching row in the per-agent
-   table and flash a highlight so the eye picks it up. */
-function scrollToAgentRow(event, execId, agentId) {
-  if (event) event.stopPropagation();
-  var rowId = 'per-agent-row-' + execId + '-' + agentId;
-  var row = document.getElementById(rowId);
-  if (!row) return;
-  row.scrollIntoView({behavior: 'smooth', block: 'center'});
-  row.classList.add('per-agent-row-highlight');
-  setTimeout(function() { row.classList.remove('per-agent-row-highlight'); }, 1500);
-}
+/* Delegated listener for agent grid cells.
+   Reads exec_id and agent_id from data-* attributes — never interpolates
+   user-controlled bytes into a JS string literal (UP-1 / sec-L1 fix).
+   Event delegated to document so newly-loaded drawers inherit the binding
+   without re-wiring on every fragment swap. */
+document.addEventListener('click', function(event) {
+  var cell = event.target.closest && event.target.closest('.agent-cell[data-agent-id]');
+  if (!cell) return;
+  event.stopPropagation();
+  var execId = cell.getAttribute('data-exec-id') || '';
+  var agentId = cell.getAttribute('data-agent-id') || '';
+  if (!execId || !agentId) return;
+  /* Build the row id via DOM traversal rather than string concat to avoid
+     any id-collision pitfalls where agent_id contains "row-". */
+  var drawer = cell.closest('.exec-detail-content');
+  if (!drawer) return;
+  var rows = drawer.querySelectorAll('tr[data-agent-id]');
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute('data-agent-id') === agentId &&
+        rows[i].getAttribute('data-exec-id') === execId) {
+      rows[i].scrollIntoView({behavior: 'smooth', block: 'center'});
+      rows[i].classList.add('per-agent-row-highlight');
+      (function(r) {
+        setTimeout(function() { r.classList.remove('per-agent-row-highlight'); }, 1500);
+      })(rows[i]);
+      return;
+    }
+  }
+});
 </script>
 </body></html>
 )HTM";

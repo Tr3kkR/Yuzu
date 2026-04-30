@@ -26,10 +26,13 @@ struct Execution {
     int64_t completed_at{0};
     std::string parent_id;
     std::string rerun_of;
-    /// Most recent non-empty agent error_detail for this execution, computed
-    /// via correlated subquery in `query_executions` / `get_execution` when
-    /// the row had at least one agent failure. Empty otherwise. Populated for
-    /// the executions list "first error" preview without an N×M lookup.
+    /// Most recent non-empty agent error_detail for this execution. Populated
+    /// only when the caller passes `ExecutionQuery::include_error_detail =
+    /// true` (LIST fragment) or via `get_execution(id)` which always opts in.
+    /// **PII-adjacent: contains agent stderr** — paths, hostnames, env values,
+    /// possibly customer data captured from a broken plugin invocation. Gate
+    /// behind `perm_fn(req, res, "Execution", "Read")` before serializing to
+    /// any caller (mirrors mcp_server.cpp:get_execution_status).
     std::string last_error_detail;
 };
 
@@ -37,6 +40,13 @@ struct ExecutionQuery {
     std::string definition_id;
     std::string status;
     int limit{100};
+    /// When true, populate `Execution::last_error_detail` via a correlated
+    /// subquery on `agent_exec_status`. Default false because most callers
+    /// (health probes, metrics ticks, server.cpp:1727 with limit=1000) do
+    /// not consume the field, and the per-row subquery cost amortises
+    /// poorly on hot paths (arch-B2). Set true only on the executions
+    /// LIST fragment, which renders a per-row error preview.
+    bool include_error_detail{false};
 };
 
 struct ExecutionSummary {

@@ -52,18 +52,27 @@ Execution row_to_exec(sqlite3_stmt* stmt) {
     return e;
 }
 
-const char* kSelectAll = "id, definition_id, status, scope_expression, parameter_values, "
-                         "dispatched_by, dispatched_at, agents_targeted, agents_responded, "
-                         "agents_success, agents_failure, completed_at, parent_id, rerun_of, "
-                         // Correlated subquery: most recent non-empty agent error_detail.
-                         // Gated by `agents_failure > 0` so successful runs pay zero cost
-                         // (CASE short-circuits the subquery). Indexed on
-                         // (execution_id, agent_id) by primary key.
-                         "(CASE WHEN agents_failure > 0 THEN ("
-                         "  SELECT error_detail FROM agent_exec_status "
-                         "  WHERE execution_id = executions.id AND error_detail != '' "
-                         "  ORDER BY completed_at DESC LIMIT 1"
-                         ") ELSE '' END) AS last_error_detail";
+// Base column list — every consumer pays this. The 14 fixed columns are
+// indexed via the executions PK / status / dispatched / definition indexes.
+const char* kSelectBase = "id, definition_id, status, scope_expression, parameter_values, "
+                          "dispatched_by, dispatched_at, agents_targeted, agents_responded, "
+                          "agents_success, agents_failure, completed_at, parent_id, rerun_of";
+
+// Opt-in correlated subquery surfacing the most-recent non-empty agent
+// error. CASE-gated on `agents_failure > 0` so fully-successful runs pay
+// zero cost. Out-of-band consumers (health probes, metrics tick at
+// server.cpp:1727) opt OUT via ExecutionQuery::include_error_detail = false
+// to avoid the partition sort on every tick (arch-B2 / perf-B1).
+const char* kSelectErrorDetailExpr =
+    ", (CASE WHEN agents_failure > 0 THEN ("
+    "  SELECT error_detail FROM agent_exec_status "
+    "  WHERE execution_id = executions.id AND error_detail != '' "
+    "  ORDER BY completed_at DESC LIMIT 1"
+    ") ELSE '' END) AS last_error_detail";
+
+// Empty-string placeholder so `row_to_exec` can read column 14
+// unconditionally without branching on which column list was used.
+const char* kSelectErrorDetailEmpty = ", '' AS last_error_detail";
 
 } // namespace
 
@@ -124,7 +133,10 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
         return results;
     std::lock_guard lock(mtx_);
 
-    std::string sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE 1=1";
+    std::string sql = std::string("SELECT ") + kSelectBase +
+                      (q.include_error_detail ? kSelectErrorDetailExpr
+                                              : kSelectErrorDetailEmpty) +
+                      " FROM executions WHERE 1=1";
     std::vector<std::string> binds;
 
     if (!q.definition_id.empty()) {
@@ -152,12 +164,16 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
     return results;
 }
 
+// Single-row reads (`get_execution` / `get_summary`) always opt into the
+// error-detail subquery — they're rare, called from the detail handler /
+// MCP / tests, never from health-tick paths.
 std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) const {
     if (!db_)
         return std::nullopt;
     std::lock_guard lock(mtx_);
 
-    auto sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE id = ?";
+    auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailExpr +
+               " FROM executions WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
@@ -178,7 +194,8 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
         return s;
 
     std::lock_guard lock(mtx_);
-    auto sql = std::string("SELECT ") + kSelectAll + " FROM executions WHERE id = ?";
+    auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailExpr +
+               " FROM executions WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return s;
@@ -234,7 +251,9 @@ std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_
         return results;
     std::lock_guard lock(mtx_);
 
-    auto sql = std::string("SELECT ") + kSelectAll +
+    // get_children is used by workflow drill-down — opt out of the
+    // error-detail subquery to keep the workflow-step expansion cheap.
+    auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailEmpty +
                " FROM executions WHERE parent_id = ? ORDER BY dispatched_at DESC";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)

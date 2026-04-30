@@ -284,12 +284,16 @@ inline std::string render_status_sparkbar(int succeeded, int failed,
 
     // Compute segment widths in fixed-point so the four rounded values sum
     // exactly to kWidth — the last non-zero segment absorbs rounding error.
+    // Two-arg `var(...)` fallbacks ensure the sparkbar still renders a
+    // legible color when the design-token CSS fails to load (UP-13). The
+    // legacy `--green` / `--red` / `--accent` / `--muted` fallbacks are
+    // declared in yuzu.css's :root and are unlikely to vanish together.
     struct Seg { int count; const char* fill; };
     Seg segs[4] = {
-        {succeeded, "var(--mds-color-bg-success-emphasis)"},
-        {failed,    "var(--mds-color-theme-indicator-error)"},
-        {running,   "var(--mds-color-theme-indicator-stable)"},
-        {pending,   "var(--mds-color-theme-text-tertiary)"},
+        {succeeded, "var(--mds-color-bg-success-emphasis,var(--green))"},
+        {failed,    "var(--mds-color-theme-indicator-error,var(--red))"},
+        {running,   "var(--mds-color-theme-indicator-stable,var(--accent))"},
+        {pending,   "var(--mds-color-theme-text-tertiary,var(--muted))"},
     };
     int widths[4] = {0, 0, 0, 0};
     int last_nonzero = -1;
