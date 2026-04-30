@@ -125,6 +125,7 @@ yuzu_server_core_lib = static_library(
     'src/agent_service_impl.cpp',
     'src/gateway_service_impl.cpp',
     'src/auth.cpp',
+    'src/auth_db.cpp',
     'src/auth_routes.cpp',
     'src/auto_approve.cpp',
     'src/dashboard_ui.cpp',

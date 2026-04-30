@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace yuzu::server { class AuthDB; }
+
 namespace yuzu::server::auth {
 
 enum class Role { user, admin };
@@ -90,11 +92,20 @@ public:
     /// Remove a user by name.
     bool remove_user(const std::string& username);
 
+    /// Change a user's role. Uses AuthDB if available, otherwise updates in-memory + config.
+    /// Returns false if user not found.
+    bool update_role(const std::string& username, Role new_role);
+
     /// Look up a user's legacy role. Returns nullopt if user not found.
     std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;
+
+    /// Set the AuthDB instance to use for persistence.
+    /// If set, user operations go through the DB instead of config file.
+    /// If not set, falls back to config file I/O (backwards compatible).
+    void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
@@ -201,6 +212,9 @@ private:
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;
+
+    // Non-owning pointer to AuthDB; if set, persistence goes through DB.
+    yuzu::server::AuthDB* auth_db_ = nullptr;
 
     // Enrollment tokens keyed by token_id
     std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;
