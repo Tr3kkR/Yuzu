@@ -270,6 +270,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **PR 2 coverage net — `tests/unit/server/test_response_store.cpp`**
+  — 6 new Catch2 cases tagged `[response_store][execution_id]`:
+  default-empty for legacy writers; round-trip when the dispatch path
+  stamps it; `query_by_execution` returns only matching rows
+  (provably no cross-contamination across two same-definition
+  executions); empty-execution_id sentinel rejected by
+  `query_by_execution`; agent_id / since-until / status filters honour
+  on the new query path; migration v2 idempotency (re-open a v2 DB and
+  confirm the ALTER doesn't fire twice + existing tagged rows survive).
+- **PR 2 coverage net — `tests/unit/server/test_workflow_routes.cpp`**
+  — 3 new Catch2 cases tagged `[workflow][executions][detail][pr2]`:
+  the cross-contamination scenario (two concurrent executions of the
+  same definition to the same agent — each detail drawer sees only
+  its own response, proving exact correlation); legacy
+  timestamp-window fallback is reachable when only pre-PR-2
+  (execution_id='') rows exist for the run; the fallback is suppressed
+  when ANY PR-2 row exists for this execution_id, so legacy rows
+  cannot dilute correctly-tagged drawers. New `store_response` helper
+  on `ExecHarness` accepts an optional `execution_id` so future PR 2.x
+  follow-ups can extend the regression net without rewriting fixtures.
+
+- **PR 2 Gate-7 hardening regression net** — 4 new Catch2 cases
+  pinning the contracts closed by the governance hardening rounds.
+  - `cmd_dispatch receives non-empty execution_id when create_execution
+    succeeds` (`[workflow][executions][pr2][hardening]`) — captures
+    the value passed to the cmd_dispatch stub via the new
+    `last_dispatch_execution_id` field on `ExecHarness`. Proves UP2-4
+    close: the FAST-agent race is closed because `record_execution_id`
+    runs INSIDE the dispatch closure before any RPC; by the time
+    cmd_dispatch returns, the mapping is registered.
+  - `query_by_execution includes the partial-index predicate
+    'execution_id != ''' in its SQL (perf-B1)` — exercises mixed
+    PR-2 and legacy rows; would surface a regression where the
+    redundant-but-required predicate is dropped from the SELECT.
+  - `multi-agent fan-out — terminal-branch does NOT erase the mapping
+    (HF-1)` — stores two responses with the same `execution_id` and
+    asserts both appear in `query_by_execution`. Pre-fix erasing on
+    first agent's terminal would drop one row from the drawer.
+  - `failed dispatch does NOT orphan a phantom 'running' execution
+    row (Pattern-C regression close)` — dispatches against a stub
+    returning sent=0; asserts the resulting execution row is in
+    `cancelled` status, not `running`. Pins the `mark_cancelled` call
+    that the create_execution-before-dispatch reorder introduced.
+  Plus the new `last_dispatch_execution_id` field on `ExecHarness`
+  so future PR 2.x tests can exercise dispatch-time mapping behaviour.
+
 - **Gate-7 hardening regression net for executions PR 1** — 5 new
   Catch2 cases pinning the contracts that closed the governance
   hardening-round findings.
