@@ -31,6 +31,14 @@ services:
       - "50052:50052"   # gRPC (management)
     volumes:
       - server-data:/var/lib/yuzu
+    # File-descriptor headroom mirrors the systemd unit
+    # (deploy/systemd/yuzu-server.service). The Docker default is 1024;
+    # 65536 absorbs SSE EventSource fan-in + agent gRPC streams + SQLite
+    # WAL + log handles for fleets up to ~50k agents.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
 
   # ── Prometheus ──────────────────────────────────────────────────────

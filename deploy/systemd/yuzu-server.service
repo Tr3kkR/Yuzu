@@ -3,6 +3,18 @@ Description=Yuzu Endpoint Management Server
 Documentation=https://github.com/Tr3kkR/Yuzu
 After=network-online.target
 Wants=network-online.target
+# Restart-loop guard. If the process crashes more than StartLimitBurst
+# times within StartLimitIntervalSec, systemd stops restarting it and
+# the unit enters `failed` state. Without this, an auth.db corruption
+# (e.g. WAL truncation, disk-full, Defender quarantine on Windows) that
+# fails the integrity check at startup would put the unit into a tight
+# crash-restart loop that masks the underlying problem behind log noise.
+# Operators reading `systemctl status yuzu-server` see a clean failure
+# instead. See docs/ops-runbooks/auth-db-recovery.md for the recovery
+# procedure once the unit lands in `failed`. Keys live in [Unit] in
+# systemd >= 230; older releases ignore them here, which is acceptable.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -14,6 +26,14 @@ ExecStart=/usr/local/bin/yuzu-server \
     --web-port 8080
 Restart=on-failure
 RestartSec=5
+
+# File-descriptor headroom. The default 1024 soft limit is comfortably
+# exhausted on a busy fleet by SSE EventSource connections + agent gRPC
+# streams + SQLite WAL + log handles. 65536 matches the Linux kernel's
+# fs.nr_open default and gives single-server deployments room to grow
+# beyond ~16k concurrent agent connections.
+LimitNOFILE=65536
+
 WorkingDirectory=/var/lib/yuzu
 StateDirectory=yuzu
 LogsDirectory=yuzu
