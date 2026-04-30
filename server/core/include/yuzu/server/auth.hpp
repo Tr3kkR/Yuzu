@@ -108,6 +108,14 @@ public:
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
 
+    /// True iff a configured AuthDB is set AND it reports `is_ready()`.
+    /// Wired into /readyz; operators rely on this to detect a corrupt or
+    /// half-migrated auth.db without having to scrape spdlog. Returns
+    /// true in the legacy config-file-only path (auth_db_ == nullptr is
+    /// fine — the deployment isn't using AuthDB) so the readyz signal
+    /// only fires on an actual AuthDB integrity failure.
+    bool is_auth_db_ok() const noexcept;
+
     /// Set the metrics registry for emitting login-latency histograms.
     /// Optional; if null, authenticate() emits no metric (used by tests
     /// that don't construct the server's MetricsRegistry).
