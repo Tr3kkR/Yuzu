@@ -16,7 +16,6 @@
 #define YUZU_SO_EXT ".dll"
 #else
 #include <dlfcn.h>
-#include <openssl/evp.h>
 #define YUZU_DLOPEN(p) dlopen((p).c_str(), RTLD_LAZY | RTLD_LOCAL)
 #define YUZU_DLSYM(h, s) dlsym(h, s)
 #define YUZU_DLCLOSE(h) dlclose(h)
@@ -26,6 +25,16 @@
 #define YUZU_SO_EXT ".so"
 #endif
 #endif
+
+#include <openssl/bio.h>
+// pem.h must come before cms.h so the PEM_*_CMS macros are declared
+// (cms.h gates them on OPENSSL_PEM_H).
+#include <openssl/pem.h>
+#include <openssl/cms.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 
 namespace yuzu::agent {
 
@@ -99,6 +108,157 @@ std::string sha256_file(const std::filesystem::path& path) {
         hex.push_back(kHex[digest[i] & 0x0F]);
     }
     return hex;
+}
+
+// ── Plugin code-signing verification ─────────────────────────────────────────
+//
+// Wire format:
+//   * Signature file lives at `<plugin-path>.sig` (e.g. chargen.so.sig).
+//   * Content is a PEM-armoured CMS detached signature, exactly what
+//     `openssl cms -sign -binary -nodetach=false -outform PEM` produces.
+//   * Trust anchor is a PEM file with one or more X.509 root/intermediate
+//     certificates the operator chooses to trust. The bundle is
+//     deployment-format-agnostic — it can hold a public CA root, an
+//     internal-CA root, or (when shipped) the Yuzu self-managed CA root.
+//
+// What the verifier checks: CMS_verify with X509_V_FLAG inherits from the
+// store. The store is built fresh per scan() call from the trust bundle.
+// CMS_verify validates the embedded signing cert chain, the signature over
+// the plugin file bytes, and basic cert validity (notBefore/notAfter,
+// signature alg sanity). It does *not* fetch CRLs by default — CRL/OCSP
+// integration is a future enhancement (issue follow-up).
+//
+// What the verifier does *not* claim: it does not bind the signature to
+// the plugin filename. That binding is provided by the existing allowlist
+// (which maps filename → expected SHA-256 of file content). When both
+// allowlist and signature are enforced, an attacker cannot cross-replay
+// signatures because: stolen-sig-on-different-file → CMS_verify fails
+// (digest mismatch); stolen-sig-on-renamed-original → allowlist filename
+// mismatch.
+
+namespace {
+
+struct OpenSslDeleter {
+    void operator()(BIO* p) const noexcept { BIO_free_all(p); }
+    void operator()(CMS_ContentInfo* p) const noexcept { CMS_ContentInfo_free(p); }
+    void operator()(X509_STORE* p) const noexcept { X509_STORE_free(p); }
+    void operator()(X509* p) const noexcept { X509_free(p); }
+};
+
+template <typename T>
+using openssl_ptr = std::unique_ptr<T, OpenSslDeleter>;
+
+// Drain the OpenSSL error queue into (text, classification). The
+// classification flag is true if any drained error came from the
+// X.509 chain validation path (CMS or X509 lib reporting cert-verify
+// failure) — so the caller can pick between
+// kSignatureUntrustedReason and kSignatureInvalidReason without
+// re-parsing free-form text.
+struct DrainedErrors {
+    std::string text;
+    bool chain_failure{false};
+};
+
+DrainedErrors drain_openssl_errors() {
+    DrainedErrors out;
+    char buf[256];
+    unsigned long e;
+    while ((e = ERR_get_error()) != 0) {
+        const int lib = ERR_GET_LIB(e);
+        const int reason = ERR_GET_REASON(e);
+        // ERR_LIB_CMS / CMS_R_CERTIFICATE_VERIFY_ERROR == 100
+        // ERR_LIB_X509 covers all chain-validation surfaces.
+        if (lib == ERR_LIB_X509 ||
+            (lib == ERR_LIB_CMS && reason == CMS_R_CERTIFICATE_VERIFY_ERROR)) {
+            out.chain_failure = true;
+        }
+        ERR_error_string_n(e, buf, sizeof(buf));
+        if (!out.text.empty()) out.text += "; ";
+        out.text += buf;
+    }
+    return out;
+}
+
+openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_path) {
+    openssl_ptr<X509_STORE> store{X509_STORE_new()};
+    if (!store) return nullptr;
+
+    // X509_STORE_load_locations interprets a *file* parameter as one or
+    // more concatenated PEM certs — exactly the format we promise the
+    // operator. The third arg (path) lets OpenSSL also accept a hashed
+    // dir; we only support a single bundle file today, so pass nullptr.
+    if (X509_STORE_load_locations(store.get(), bundle_path.string().c_str(), nullptr) != 1) {
+        spdlog::error("Failed to load plugin trust bundle '{}': {}",
+                      bundle_path.string(), drain_openssl_errors().text);
+        return nullptr;
+    }
+    // Plugin signing certs typically carry EKU=codeSigning. CMS_verify's
+    // default S/MIME purpose check would reject those — set the store's
+    // purpose to "any" so EKU does not enter the trust decision; what
+    // matters is that the cert chains to a trust anchor and the signature
+    // is valid over the file bytes.
+    X509_STORE_set_purpose(store.get(), X509_PURPOSE_ANY);
+    return store;
+}
+
+} // namespace
+
+std::optional<std::string>
+verify_plugin_signature(const std::filesystem::path& plugin_path,
+                        const std::filesystem::path& trust_bundle_path) {
+    auto sig_path = plugin_path;
+    sig_path += ".sig";
+
+    std::error_code ec;
+    if (!std::filesystem::exists(sig_path, ec)) {
+        return std::string{kSignatureMissingReason};
+    }
+
+    auto store = load_trust_store(trust_bundle_path);
+    if (!store) {
+        // Bundle path unreadable → we cannot prove anything, refuse to
+        // trust. Operator misconfiguration must surface, not silently
+        // pass plugins through.
+        return std::string{kSignatureUntrustedReason} + ": trust bundle unreadable";
+    }
+
+    openssl_ptr<BIO> sig_bio{BIO_new_file(sig_path.string().c_str(), "rb")};
+    if (!sig_bio) {
+        const auto err = drain_openssl_errors();
+        return std::string{kSignatureInvalidReason} + ": cannot open signature file: " +
+               err.text;
+    }
+
+    openssl_ptr<CMS_ContentInfo> cms{
+        PEM_read_bio_CMS(sig_bio.get(), nullptr, nullptr, nullptr)};
+    if (!cms) {
+        const auto err = drain_openssl_errors();
+        return std::string{kSignatureInvalidReason} + ": malformed PEM CMS: " + err.text;
+    }
+
+    openssl_ptr<BIO> content_bio{BIO_new_file(plugin_path.string().c_str(), "rb")};
+    if (!content_bio) {
+        const auto err = drain_openssl_errors();
+        return std::string{kSignatureInvalidReason} + ": cannot open plugin file: " +
+               err.text;
+    }
+
+    // Single CMS_verify does both checks atomically:
+    //   * chain-validates each signer cert against the trust store
+    //     (purpose was set to ANY in load_trust_store so codeSigning EKU
+    //     is not rejected).
+    //   * verifies the signature digest over the detached payload.
+    //   * CMS_BINARY suppresses CRLF canonicalisation we do not want on
+    //     a binary payload.
+    if (CMS_verify(cms.get(), nullptr, store.get(), content_bio.get(), nullptr,
+                   CMS_BINARY | CMS_DETACHED) != 1) {
+        const auto err = drain_openssl_errors();
+        const std::string_view prefix =
+            err.chain_failure ? kSignatureUntrustedReason : kSignatureInvalidReason;
+        return std::string{prefix} + ": " + err.text;
+    }
+
+    return std::nullopt; // verified
 }
 
 std::unordered_map<std::string, std::string>
@@ -221,7 +381,8 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
 
 PluginLoader::ScanResult PluginLoader::scan(
     const std::filesystem::path& plugin_dir,
-    const std::unordered_map<std::string, std::string>& allowlist) {
+    const std::unordered_map<std::string, std::string>& allowlist,
+    const PluginSigningPolicy& signing) {
     ScanResult result;
 
     if (!std::filesystem::is_directory(plugin_dir)) {
@@ -230,8 +391,13 @@ PluginLoader::ScanResult PluginLoader::scan(
     }
 
     const bool enforce_allowlist = !allowlist.empty();
+    const bool enforce_signing = signing.enabled();
     if (enforce_allowlist) {
         spdlog::info("Plugin allowlist enforcement active ({} entries)", allowlist.size());
+    }
+    if (enforce_signing) {
+        spdlog::info("Plugin code-signing enforcement active (trust bundle '{}', require={})",
+                     signing.trust_bundle_path.string(), signing.require_signature);
     }
 
     for (const auto& entry : std::filesystem::recursive_directory_iterator(plugin_dir)) {
@@ -268,6 +434,33 @@ PluginLoader::ScanResult PluginLoader::scan(
                 continue;
             }
             spdlog::debug("Plugin {} hash verified: {}", fname, actual_hash);
+        }
+
+        // Code-signing verification — runs after allowlist (cheap-fail-first)
+        // and before dlopen so a malformed/sig-bad library is never mapped.
+        // Two-mode contract:
+        //   * require_signature=true  → no sig OR bad sig = reject
+        //   * require_signature=false → no sig is allowed (transitional);
+        //     a sig file present must still verify or the plugin is
+        //     rejected (defence against attacker-supplied malicious .sig).
+        if (enforce_signing) {
+            auto sig_path = entry.path();
+            sig_path += ".sig";
+            const bool sig_present = std::filesystem::exists(sig_path);
+            if (!sig_present && !signing.require_signature) {
+                spdlog::debug("Plugin {} has no signature (require=false), allowing",
+                              entry.path().filename().string());
+            } else {
+                auto err = verify_plugin_signature(entry.path(), signing.trust_bundle_path);
+                if (err) {
+                    spdlog::error("Plugin {} signature rejected: {}",
+                                  entry.path().string(), *err);
+                    result.errors.push_back(
+                        LoadError{entry.path().string(), std::move(*err)});
+                    continue;
+                }
+                spdlog::info("Plugin {} signature verified", entry.path().filename().string());
+            }
         }
 
         // Symlink check: reject symlinks to prevent directory traversal attacks

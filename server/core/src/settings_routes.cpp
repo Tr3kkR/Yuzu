@@ -5,6 +5,7 @@
 #include "settings_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -1726,6 +1727,165 @@ std::string SettingsRoutes::render_directory_fragment() {
     return html;
 }
 
+// ── Plugin code-signing settings ────────────────────────────────────────────
+//
+// Storage model (intentionally minimal — see SKILL.md auth-and-authz §10
+// for the full design):
+//   * The PEM trust bundle lives at <cert-dir>/plugin-trust-bundle.pem.
+//   * Presence of that file = "signing enabled". No separate enabled flag
+//     so disk + DB cannot drift out of sync — clearing the file disables
+//     signing atomically.
+//   * The require flag lives in runtime_config under the
+//     "plugin_signing_required" key.
+//   * Bundle metadata (cert count, SHA-256) is recomputed from the file
+//     each render rather than denormalised — keeps the source of truth
+//     single (the file), at cost of a few-ms re-parse per /settings load.
+
+namespace {
+
+using ::yuzu::server::plugin_signing::TrustBundleStats;
+using ::yuzu::server::plugin_signing::trust_bundle_path;
+using ::yuzu::server::plugin_signing::validate_trust_bundle_pem;
+
+// Read+validate the on-disk bundle (may be missing). Returns nullopt if the
+// file is absent. Returns an error string if present but unreadable / parse
+// failure (so the UI can surface "bundle on disk is corrupt" rather than
+// silently downgrading to "no bundle").
+std::optional<std::expected<TrustBundleStats, std::string>>
+read_on_disk_bundle() {
+    std::error_code ec;
+    auto path = trust_bundle_path();
+    if (!std::filesystem::exists(path, ec)) {
+        return std::nullopt;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return std::expected<TrustBundleStats, std::string>(
+            std::unexpect, "cannot open " + path.string());
+    }
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    return validate_trust_bundle_pem(content);
+}
+
+} // namespace
+
+std::string SettingsRoutes::render_plugin_signing_fragment() {
+    std::string html;
+
+    auto bundle = read_on_disk_bundle();
+    const bool enabled = bundle && bundle->has_value();
+    const bool required =
+        runtime_config_store_ &&
+        runtime_config_store_->get_value("plugin_signing_required") == "true";
+
+    // Status badge
+    std::string badge_color, badge_text;
+    if (enabled && required) {
+        badge_color = "#238636"; // green
+        badge_text = "Enforced (required)";
+    } else if (enabled) {
+        badge_color = "#9e6a03"; // amber
+        badge_text = "Trust bundle loaded (transitional)";
+    } else {
+        badge_color = "#484f58"; // muted
+        badge_text = "Disabled";
+    }
+    html += "<div style=\"margin-bottom:1rem\">"
+            "  <span style=\"font-size:0.75rem;background:" + badge_color +
+            ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
+            badge_text + "</span></div>";
+
+    // Current state
+    if (enabled && bundle->has_value()) {
+        const auto& stats = bundle->value();
+        html += "<div class=\"form-row\"><label>Trust anchors</label>"
+                "<span style=\"font-size:0.8rem\">" +
+                std::to_string(stats.cert_count) + " certificate(s)</span></div>";
+        html += "<div class=\"form-row\"><label>Bundle SHA-256</label>"
+                "<code style=\"font-size:0.7rem;word-break:break-all\">" +
+                stats.sha256_hex + "</code></div>";
+        if (!stats.subjects.empty()) {
+            html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
+                    "<label>Subjects</label>"
+                    "<div style=\"font-size:0.75rem;flex:1;min-width:0\">";
+            for (const auto& s : stats.subjects) {
+                html += "<div style=\"font-family:monospace;color:var(--mds-color-theme-text-secondary);"
+                        "overflow-wrap:anywhere\">" + html_escape(s) + "</div>";
+            }
+            html += "</div></div>";
+        }
+    } else if (bundle && !bundle->has_value()) {
+        html += "<div class=\"feedback feedback-error\">Bundle on disk is unreadable: " +
+                html_escape(bundle->error()) + "</div>";
+    } else {
+        html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "No trust bundle uploaded. Plugin signature verification is off "
+                "for every agent connected to this server.</p>";
+    }
+
+    // Upload form (multipart so curl/UI both work)
+    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+            "margin:1rem 0\">";
+    html += "<form hx-post=\"/api/settings/plugin-signing/upload\" "
+            "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+            "hx-encoding=\"multipart/form-data\">";
+    html += "<div class=\"form-row\" style=\"align-items:center\">"
+            "<label style=\"min-width:140px\">PEM trust bundle</label>"
+            "<input type=\"file\" name=\"file\" accept=\".pem,.crt,application/x-pem-file\" "
+            "required style=\"flex:1;min-width:0\"></div>";
+    html += "<div class=\"form-row\"><label></label>"
+            "<button type=\"submit\" class=\"btn btn-primary\">"
+            "Upload &amp; verify</button></div>";
+    html += "</form>";
+
+    // Toggle: require signature (only meaningful when bundle is loaded)
+    if (enabled) {
+        html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+                "style=\"margin-top:0.75rem\">";
+        html += "<div class=\"form-row\">"
+                "<label style=\"min-width:140px\">Require signed plugins</label>"
+                "<label style=\"display:flex;align-items:center;gap:0.5rem;flex:1\">"
+                "<input type=\"checkbox\" name=\"required\" value=\"true\"" +
+                std::string(required ? " checked" : "") +
+                "><span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Reject unsigned plugins instead of allowing them through (transitional vs enforced).</span>"
+                "</label></div>";
+        html += "<div class=\"form-row\"><label></label>"
+                "<button type=\"submit\" class=\"btn btn-secondary\">Save</button></div>";
+        html += "</form>";
+
+        // Clear button — separate form so it can have a confirm
+        html += "<form hx-post=\"/api/settings/plugin-signing/clear\" "
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+                "hx-confirm=\"Remove the plugin trust bundle? Agents that already pulled this "
+                "policy will continue verifying with their cached copy until they refresh.\" "
+                "style=\"margin-top:0.75rem\">";
+        html += "<div class=\"form-row\"><label></label>"
+                "<button type=\"submit\" class=\"btn btn-danger\">Remove trust bundle</button>"
+                "</div></form>";
+    }
+
+    // Operator help
+    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+            "margin:1rem 0\">";
+    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+            "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
+            "is served to authenticated agents at "
+            "<code>/api/v1/agent/plugin-policy</code>. Agents started with "
+            "<code>--plugin-trust-bundle</code> pointing at a local file can be "
+            "configured by curling this endpoint into that file at startup; "
+            "fully automatic fetch is a forthcoming agent-side change.</p>";
+    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+            "<strong>Signing recipe:</strong> "
+            "<code>openssl cms -sign -binary -nodetach=false -signer signer.pem "
+            "-inkey signer.key -in plugin.so -outform pem -out plugin.so.sig</code>. "
+            "See <a href=\"/docs#plugin-code-signing\">user manual</a> for the full workflow.</p>";
+
+    return html;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -1947,6 +2107,210 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                     return;
                 res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
             });
+
+    sink.Get("/fragments/settings/plugin-signing",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!admin_fn_(req, res))
+                    return;
+                res.set_content(render_plugin_signing_fragment(),
+                                "text/html; charset=utf-8");
+            });
+
+    // -- Plugin Code Signing: upload PEM trust bundle (admin) -----------------
+    sink.Post("/api/settings/plugin-signing/upload",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+
+                  std::string content;
+                  if (SETTINGS_REQ_HAS_FILE(req, "file")) {
+                      content = SETTINGS_REQ_GET_FILE(req, "file").content;
+                  }
+                  if (content.empty()) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Upload a PEM file.</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  if (content.size() > 256 * 1024) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">PEM bundle too large (max 256 KB).</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+
+                  auto stats = validate_trust_bundle_pem(content);
+                  if (!stats) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Rejected: " +
+                              html_escape(stats.error()) + "</span>",
+                          "text/html; charset=utf-8");
+                      audit_fn_(req, "plugin_signing.bundle.uploaded", "rejected",
+                                "PluginSigning", "trust-bundle", stats.error());
+                      return;
+                  }
+
+                  auto cert_dir = auth::default_cert_dir();
+                  std::error_code ec;
+                  std::filesystem::create_directories(cert_dir, ec);
+                  if (ec) {
+                      res.status = 500;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Cannot create cert directory.</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto out_path = trust_bundle_path();
+                  {
+                      std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                      if (!f.is_open()) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget", "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Cannot write trust bundle file.</span>",
+                              "text/html; charset=utf-8");
+                          return;
+                      }
+                      f.write(content.data(),
+                              static_cast<std::streamsize>(content.size()));
+                  }
+                  // Trust bundles are public-readable (only contains
+                  // X.509 certs, no private keys).
+
+                  spdlog::info("Plugin trust bundle uploaded: {} ({} certs, sha256 {})",
+                               out_path.string(), stats->cert_count, stats->sha256_hex);
+                  audit_fn_(req, "plugin_signing.bundle.uploaded", "success",
+                            "PluginSigning", "trust-bundle",
+                            std::to_string(stats->cert_count) + " cert(s), sha256=" +
+                                stats->sha256_hex);
+
+                  res.set_header("HX-Trigger",
+                      R"({"showToast":{"message":"Trust bundle uploaded","level":"success"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: clear trust bundle (admin) ----------------------
+    sink.Post("/api/settings/plugin-signing/clear",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+
+                  auto path = trust_bundle_path();
+                  std::error_code ec;
+                  bool removed = std::filesystem::remove(path, ec);
+                  // Removing a non-existent file is a no-op; we still
+                  // clear the require flag for symmetry with the UI.
+                  if (runtime_config_store_) {
+                      (void)runtime_config_store_->set("plugin_signing_required",
+                                                        "false", "system");
+                  }
+
+                  spdlog::info(
+                      "Plugin trust bundle cleared (file {}, require flag reset)",
+                      removed ? "removed" : "absent");
+                  audit_fn_(req, "plugin_signing.bundle.cleared", "success",
+                            "PluginSigning", "trust-bundle",
+                            removed ? "file removed" : "no file present");
+
+                  res.set_header("HX-Trigger",
+                      R"({"showToast":{"message":"Trust bundle cleared","level":"info"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: toggle require flag (admin) ---------------------
+    sink.Post("/api/settings/plugin-signing/require",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+                  // HTML checkbox semantics: present-and-"true" = required;
+                  // absent = not required. Reuse the form parser the rest
+                  // of settings uses.
+                  const std::string val =
+                      extract_form_value(req.body, "required");
+                  const std::string new_val =
+                      (val == "true" || val == "on") ? "true" : "false";
+                  if (runtime_config_store_) {
+                      auto rc = runtime_config_store_->set(
+                          "plugin_signing_required", new_val, "ui");
+                      if (!rc) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget",
+                                         "#plugin-signing-section");
+                          res.set_content("<span class=\"feedback-error\">" +
+                                              html_escape(rc.error()) +
+                                              "</span>",
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
+                  audit_fn_(req, "plugin_signing.require.changed", "success",
+                            "PluginSigning", "require_signature", new_val);
+                  res.set_header(
+                      "HX-Trigger",
+                      R"({"showToast":{"message":"Require flag updated","level":"success"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: agent-facing fetch ------------------------------
+    //
+    // Returns the current trust bundle and require flag as JSON. Agents
+    // call this with their existing operator API token (Bearer/X-Yuzu-Token)
+    // to pull the latest policy at startup or on a periodic refresh.
+    // Bundle absent → 404 with empty JSON, so an agent can distinguish
+    // "no policy configured" from "policy says signing is off".
+    sink.Get("/api/v1/agent/plugin-policy",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 // auth_fn_ accepts either session or API token; callers
+                 // (agent at startup) will use a token. No admin gate —
+                 // any authenticated principal can read so the agent's
+                 // own token is enough.
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+
+                 auto disk = read_on_disk_bundle();
+                 const bool required =
+                     runtime_config_store_ &&
+                     runtime_config_store_->get_value(
+                         "plugin_signing_required") == "true";
+
+                 if (!disk) {
+                     res.status = 404;
+                     res.set_content(
+                         R"({"enabled":false,"required":false,"trust_bundle_pem":""})",
+                         "application/json");
+                     return;
+                 }
+                 if (!disk->has_value()) {
+                     res.status = 500;
+                     nlohmann::json err;
+                     err["error"] = disk->error();
+                     res.set_content(err.dump(), "application/json");
+                     return;
+                 }
+
+                 // Re-read the file so the response carries the actual
+                 // bytes, not a regenerated copy.
+                 std::ifstream f(trust_bundle_path(), std::ios::binary);
+                 std::string pem((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+                 nlohmann::json out;
+                 out["enabled"] = true;
+                 out["required"] = required;
+                 out["trust_bundle_pem"] = pem;
+                 out["cert_count"] = disk->value().cert_count;
+                 out["sha256"] = disk->value().sha256_hex;
+                 res.set_content(out.dump(), "application/json");
+             });
 
     sink.Get("/fragments/settings/nvd",
             [this](const httplib::Request& req, httplib::Response& res) {
