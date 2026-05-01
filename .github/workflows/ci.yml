@@ -210,6 +210,24 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # OTP + rebar3 for the gateway test legs. Without these, meson's
+      # `find_program('rebar3', required: false)` returns not-found,
+      # `gateway eunit` and `gateway ct` are silently skipped, and the
+      # Linux matrix can't catch gateway regressions until they hit the
+      # Windows leg (where rebar3 is pre-baked via choco). Pin matches
+      # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
+      # both halves together — see CLAUDE.md "Toolchain activation".
+      # ImageOS is required because erlef/setup-beam can't auto-detect
+      # the runner OS on self-hosted; set at step scope so the rest of
+      # the job doesn't see it.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
       # runner, which persists in the github-runner user's home between
       # jobs by definition. No actions/cache round-trip needed — paying
