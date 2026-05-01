@@ -30,6 +30,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Plugin code signing — Settings page operator surface** (#80, server side).
+  Admins can now manage the plugin trust bundle from the dashboard:
+  - New **Settings → Plugin Code Signing** card with status badge,
+    multipart PEM upload, "Require signed plugins" toggle, and a clear
+    button. The server validates the uploaded PEM via OpenSSL on the
+    way in (counts certs, computes SHA-256, surfaces subjects), so
+    operators get instant feedback on broken bundles.
+  - PEM persists to `<cert-dir>/plugin-trust-bundle.pem`; the require
+    flag persists in `runtime_config` under key
+    `plugin_signing_required` (added to the allowlist). Bundle metadata
+    is recomputed from the file at render time so disk + DB cannot
+    drift.
+  - New REST routes: `GET /fragments/settings/plugin-signing` (admin
+    HTML), `POST /api/settings/plugin-signing/{upload,clear,require}`
+    (admin), `GET /api/v1/agent/plugin-policy` (any authenticated
+    principal — agent fetches the JSON `{enabled, required,
+    trust_bundle_pem, cert_count, sha256}` here).
+  - Audit events: `plugin_signing.bundle.uploaded` /
+    `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
+  - Helper extracted to `plugin_signing_helpers.{hpp,cpp}` so the PEM
+    validation path is unit-tested independently of the route surface
+    (8 Catch2 cases at `[plugin_signing][validation]` /
+    `[plugin_signing][path]`).
+
+- **Plugin code signing — provenance verification before `dlopen`** (#80).
+  The agent now accepts two new flags that, together with the existing
+  `--plugin-allowlist`, give a two-layer supply-chain check on every plugin:
+  - `--plugin-trust-bundle <path>` — PEM file with one or more X.509 CA
+    certificates. When set, the agent looks for a sibling
+    `<plugin>.so.sig` (PEM CMS detached signature) for each plugin and
+    verifies it chains to a cert in the bundle and the digest matches
+    the plugin file bytes. Trust anchor is deployment-format-agnostic —
+    accepts public-CA, internal-CA, or (forthcoming) Yuzu self-managed
+    CA-issued signing certs equally. Env: `YUZU_PLUGIN_TRUST_BUNDLE`.
+  - `--plugin-require-signature` — when set, plugins without a `.sig`
+    sibling are rejected. When unset (default), unsigned plugins still
+    load (transitional mode for ops rolling out signing).
+    Env: `YUZU_PLUGIN_REQUIRE_SIGNATURE`.
+
+  Verification runs **before** `dlopen`/`LoadLibrary` so a tampered or
+  untrusted binary never executes code. Rejection reasons surface as
+  stable labels on the existing `yuzu_agent_plugin_rejected_total`
+  counter: `signature_missing`, `signature_invalid`,
+  `signature_untrusted_chain` — distinct from the existing
+  `reserved_name` and `load_failed` buckets so operators can alert per
+  category. Default behaviour for deployments that do not set the new
+  flags is unchanged. Operator workflow + `openssl cms -sign` recipe in
+  `docs/user-manual/agent-plugins.md` §Plugin Code Signing.
+
 - **Persistent SQLite-backed authentication.** `auth.db` (in `--data-dir`)
   now holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256
   hashed passwords. Replaces the prior in-memory + on-config-flush model

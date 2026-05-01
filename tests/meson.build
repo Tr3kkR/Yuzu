@@ -80,6 +80,11 @@ else
   agent_test_proto_dep = yuzu_proto_headers_dep
 endif
 
+# test_plugin_loader.cpp uses OpenSSL CMS APIs to mint test fixtures
+# (CA + signing cert + detached PEM signature) so the verifier tests do not
+# depend on `openssl(1)` at runtime or pre-baked .pem files that drift.
+agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -101,7 +106,7 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
   # Ensure the fixture plugin is built before the test runs so the lookup
   # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
   link_depends: reserved_name_fixture_plugin,
@@ -194,6 +199,7 @@ if build_server
       'unit/server/test_security_headers.cpp',
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
+      'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_visualization_engine.cpp',

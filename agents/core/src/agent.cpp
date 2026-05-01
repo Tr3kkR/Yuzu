@@ -410,9 +410,10 @@ public:
     void run() override {
         spdlog::info("Yuzu agent starting (id={})", cfg_.agent_id);
 
-        // 1. Load plugins (with optional allowlist verification)
+        // 1. Load plugins (with optional allowlist + code-signing verification)
         auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
-        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist);
+        PluginSigningPolicy signing{cfg_.plugin_trust_bundle, cfg_.plugin_require_signature};
+        auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
 
         // Collect successfully loaded handles first (before init)
         std::vector<PluginHandle> candidates;
@@ -480,11 +481,20 @@ public:
         for (const auto& err : scan.errors) {
             auto module_name = std::filesystem::path{err.path}.stem().string();
             record_module(module_name, "", err.reason, "load_failed");
-            // #453: categorise rejections so operators can alert on
-            // reserved-name attempts distinct from generic load failures.
-            const std::string_view reason =
-                err.reason.starts_with(yuzu::agent::kReservedNameReason) ? "reserved_name"
-                                                                         : "load_failed";
+            // #453 + #80: categorise rejections so operators can alert on
+            // reserved-name attempts, signature failures, and generic
+            // load failures separately. Order is most-specific first;
+            // fall through to "load_failed" for everything else.
+            std::string_view reason = "load_failed";
+            if (err.reason.starts_with(yuzu::agent::kReservedNameReason)) {
+                reason = "reserved_name";
+            } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
+                reason = "signature_missing";
+            } else if (err.reason.starts_with(yuzu::agent::kSignatureUntrustedReason)) {
+                reason = "signature_untrusted_chain";
+            } else if (err.reason.starts_with(yuzu::agent::kSignatureInvalidReason)) {
+                reason = "signature_invalid";
+            }
             metrics_
                 .counter("yuzu_agent_plugin_rejected_total", {{"reason", std::string{reason}}})
                 .increment();
