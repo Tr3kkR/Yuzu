@@ -24,6 +24,7 @@ Plugins are organized by functional category. The **Platforms** column uses: **W
 14. [Stub Plugins (Planned)](#stub-plugins-planned)
 15. [Plugin Architecture](#plugin-architecture)
 16. [Plugin Allowlist](#plugin-allowlist)
+17. [Plugin Code Signing](#plugin-code-signing)
 
 ---
 
@@ -739,7 +740,7 @@ A **C++23 CRTP wrapper** (`sdk/include/yuzu/plugin.hpp`) provides ergonomic C++ 
 
 ### Plugin Lifecycle
 
-1. The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified **before loading** (see [Plugin Allowlist](#plugin-allowlist) below).
+1. The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified **before loading** (see [Plugin Allowlist](#plugin-allowlist) below). If a code-signing trust bundle is configured, the library's CMS detached signature is verified against it as well (see [Plugin Code Signing](#plugin-code-signing) below) — both checks run before `dlopen`/`LoadLibrary` so tampered or untrusted binaries never execute code.
 2. Each shared library (`.dll` on Windows, `.so` on Linux, `.dylib` on macOS) is loaded dynamically.
 3. The agent calls the plugin's `init` function, passing a context with configuration and callbacks.
 4. When the server sends an instruction targeting a plugin action, the agent dispatches it to the correct plugin.
@@ -777,6 +778,99 @@ sha256sum /opt/yuzu/plugins/*.so > /etc/yuzu/plugin-allowlist.txt
 - If set, only plugins listed in the allowlist file are loaded, and only if their hash matches.
 - Plugins not in the allowlist or with a hash mismatch are logged as errors and skipped.
 - The allowlist is checked **before** `dlopen`/`LoadLibrary`, so tampered binaries never execute code.
+
+### Plugin Code Signing
+
+The agent can verify a CMS detached signature for each plugin shared library and reject any plugin whose signature does not chain to an operator-configured trust anchor. This is the **provenance** layer that complements the allowlist's **integrity** layer: the allowlist binds *this filename to this hash on this host*, and the signature binds *this file content to a CA-issued signing identity*. With both enabled, an attacker who drops a malicious `.so` plus a fresh `.sig` is rejected because their cert does not chain to the trusted CA.
+
+**Trust anchor.** A standard PEM file containing one or more X.509 root or intermediate certificates the operator chooses to trust. The bundle is *deployment-format-agnostic* — it can hold a public CA root, an internal-CA root, or (when shipped) the Yuzu self-managed CA root. The verifier does not care which authority issued the signing cert as long as the chain validates against the bundle.
+
+**Signature file convention.** For each plugin file `<plugin>.so` (or `.dll` / `.dylib`), the agent looks for a sibling `<plugin>.so.sig` containing a PEM-armoured CMS detached signature over the plugin file bytes. Inspect a signature with:
+
+```bash
+openssl cms -inform pem -text -noout -in chargen.so.sig
+```
+
+**Configuration.** There are two paths — server-managed (recommended for fleets) and agent-local (for one-off hosts or air-gapped environments).
+
+**Server-managed (Settings → Plugin Code Signing).** An admin operator goes to the Settings page and uploads the PEM trust bundle through the **Plugin Code Signing** card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it atomically (temp file + rename) under the server's cert directory, and exposes it at `GET /api/v1/agent/plugin-policy` (admin-only, returns JSON containing the bundle PEM + the require flag). The card also has a "Require signed plugins" checkbox that flips the require flag and a "Remove trust bundle" button that disables signing for new agent starts. Every change emits an `audit_event` with action `plugin_signing.bundle.uploaded` / `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
+
+In this mode, agents are configured by curling the policy endpoint (with an admin token) into a local file at startup:
+
+```bash
+curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
+  https://server.example.com:8443/api/v1/agent/plugin-policy \
+  | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+
+yuzu-agent --plugin-trust-bundle /etc/yuzu/plugin-trust-bundle.pem \
+           --plugin-require-signature
+```
+
+> **Important — fail-closed when require is set.** If you pass `--plugin-require-signature` without `--plugin-trust-bundle` (or with an empty path), the agent **refuses to start** rather than silently fail-open. This is intentional: the prior behaviour would have skipped the entire signing block and quietly loaded unsigned plugins while the operator believed enforcement was active.
+
+> **Important — Yuzu-shipped plugins are not signed yet.** This release ships the verifier; it does not yet sign the in-tree `agents/plugins/`. If you turn on Require with a trust bundle anchored only at your own CA, every Yuzu-bundled plugin will be rejected at next agent restart. Use the transitional mode (bundle uploaded, Require off) until you have signed every plugin your fleet uses, including the in-tree ones. The Settings card displays this warning inline.
+
+> **Windows admins.** The curl/jq recipe above assumes a Unix host; equivalent PowerShell using `Invoke-RestMethod` + `ConvertFrom-Json` works against the same endpoint. Place the resulting PEM at `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem` and pass the path via `--plugin-trust-bundle`.
+
+(Fully automatic agent-side fetch is a planned follow-up; today's contract is "the bundle is hosted on the server, the agent is told where the local copy lives via CLI flags".)
+
+**Agent-local CLI flags:**
+
+```bash
+yuzu-agent \
+  --plugin-trust-bundle /etc/yuzu/plugin-trust-bundle.pem \
+  --plugin-require-signature
+```
+
+| Flag | Effect |
+|---|---|
+| `--plugin-trust-bundle <path>` | Enables signature verification. PEM file with one or more CA certs. Env: `YUZU_PLUGIN_TRUST_BUNDLE`. |
+| `--plugin-require-signature` | When set, plugins without a `.sig` sibling are rejected. When unset (default), unsigned plugins are allowed (transitional mode for ops rolling out signing). Env: `YUZU_PLUGIN_REQUIRE_SIGNATURE`. |
+
+**Signing a plugin (operator workflow with openssl(1)):**
+
+```bash
+# One-time: generate an operator CA + signing leaf, or use your existing PKI.
+openssl ecparam -genkey -name prime256v1 -out ca.key
+openssl req -new -x509 -key ca.key -out ca.pem -days 3650 \
+  -subj "/CN=My Yuzu Plugin CA" \
+  -addext "basicConstraints=critical,CA:TRUE"
+
+openssl ecparam -genkey -name prime256v1 -out signer.key
+openssl req -new -key signer.key -out signer.csr \
+  -subj "/CN=Plugin Signer"
+# extendedKeyUsage=codeSigning is REQUIRED — the agent's verifier
+# enforces X509_PURPOSE_CODE_SIGN, so a leaf without this EKU is
+# rejected even if it chains to the trusted CA. This prevents a CA that
+# also issues mTLS or S/MIME certs from being a plugin-signing
+# authority for those siblings.
+openssl x509 -req -in signer.csr -CA ca.pem -CAkey ca.key \
+  -CAcreateserial -out signer.pem -days 365 \
+  -extfile <(printf "extendedKeyUsage=codeSigning\nkeyUsage=critical,digitalSignature")
+
+# Per-plugin: sign with the leaf, distribute ca.pem as the trust bundle.
+openssl cms -sign -binary -nodetach=false \
+  -signer signer.pem -inkey signer.key \
+  -in chargen.so -outform pem -out chargen.so.sig
+```
+
+Distribute `ca.pem` to every agent (e.g. as `/etc/yuzu/plugin-trust-bundle.pem`) and ship the `.sig` files alongside each `.so` in the plugin directory.
+
+**Behavior:**
+
+- If `--plugin-trust-bundle` is not set, signature checking is off entirely (default).
+- If set + plugin has a `.sig` → must verify, else rejected.
+- If set + plugin has no `.sig` + `--plugin-require-signature` not set → loaded (transitional mode).
+- If set + plugin has no `.sig` + `--plugin-require-signature` set → rejected.
+- Verification happens **before** `dlopen`/`LoadLibrary`. Cert validity (`notBefore`/`notAfter`), digest match over file bytes, and chain anchor are all enforced.
+- Rejection reason is recorded as a stable label on `yuzu_agent_plugin_rejected_total`: `signature_missing`, `signature_invalid`, or `signature_untrusted_chain` — alert distinctly on each.
+
+**Self-managed CA roadmap.** A future Yuzu release will ship a server-managed CA whose root cert is published at a known URL; pointing `--plugin-trust-bundle` at that file lets operators sign plugins against the same CA they use for mTLS. The verifier itself does not change — the same code path accepts public-CA, internal-CA, and Yuzu-CA issued certs.
+
+**Not yet supported (follow-up work):**
+
+- CRL / OCSP revocation checking. Today only `notBefore`/`notAfter` and chain anchor are enforced; revoke a compromised signing cert by removing its issuing CA from the trust bundle or rotating to a new CA.
+- Authenticode-signed Windows DLLs. The agent uses the same CMS PEM format on every platform; Authenticode is a separate signature format and is not currently consumed.
 
 ### Output Format
 

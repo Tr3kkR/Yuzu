@@ -134,6 +134,7 @@ yuzu_server_core_lib = static_library(
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
+    'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',

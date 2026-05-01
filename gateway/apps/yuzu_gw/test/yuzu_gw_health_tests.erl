@@ -23,9 +23,14 @@ health_test_() ->
      ]}.
 
 setup() ->
-    %% Use a high port to avoid conflicts
-    Port = 18080,
-    application:set_env(yuzu_gw, health_port, Port),
+    %% Bind to port 0 — the OS picks an ephemeral free port and we read
+    %% it back from the started gen_server via yuzu_gw_health:port/0.
+    %% A previous version of this test hardcoded port 18080, which is
+    %% squatted on the Windows CI runner by an unidentified HTTP server
+    %% that returns 302 Found for every request — making the eunit
+    %% assertion `?assertEqual(200, Status)` fail with `value, 302`.
+    %% Ephemeral binding eliminates that whole class of port collision.
+    application:set_env(yuzu_gw, health_port, 0),
 
     %% Start mock processes for readiness checks.
     %% Only register names that aren't already taken by other test suites.
@@ -62,9 +67,12 @@ setup() ->
             whereis(yuzu_gw_upstream)
     end,
 
-    %% Start the health endpoint
+    %% Start the health endpoint, then read back the actual ephemeral
+    %% port the OS assigned. The 100ms sleep keeps the original timing
+    %% margin so the listener's accept loop is up before any test fires.
     {ok, HealthPid} = yuzu_gw_health:start_link(),
     timer:sleep(100),
+    {ok, Port} = yuzu_gw_health:port(),
     {Port, HealthPid, UpPid, NeedUpstream, MockPids}.
 
 cleanup({_Port, HealthPid, UpPid, NeedUpstream, MockPids}) ->
@@ -100,13 +108,19 @@ mock_loop() ->
 %%% Tests
 %%%===================================================================
 
+%% setup() bound the listener on port 0 (OS-assigned). Each test reads
+%% the actual port from the running gen_server. Eunit's `{setup, …, [Tests]}`
+%% form does not pass the setup return value to the tests, so the indirection
+%% via yuzu_gw_health:port/0 is the cheapest way to thread the port through.
 healthz_ok() ->
-    {Status, Body} = http_get(18080, "/healthz"),
+    {ok, Port} = yuzu_gw_health:port(),
+    {Status, Body} = http_get(Port, "/healthz"),
     ?assertEqual(200, Status),
     ?assert(binary:match(Body, <<"ok">>) =/= nomatch).
 
 readyz_ok() ->
-    {Status, Body} = http_get(18080, "/readyz"),
+    {ok, Port} = yuzu_gw_health:port(),
+    {Status, Body} = http_get(Port, "/readyz"),
     ?assertEqual(200, Status),
     ?assert(binary:match(Body, <<"ready">>) =/= nomatch),
     %% Core checks should be true
@@ -115,7 +129,8 @@ readyz_ok() ->
     ?assert(binary:match(Body, <<"\"circuit_breaker\":true">>) =/= nomatch).
 
 unknown_path_404() ->
-    {Status, _Body} = http_get(18080, "/unknown"),
+    {ok, Port} = yuzu_gw_health:port(),
+    {Status, _Body} = http_get(Port, "/unknown"),
     ?assertEqual(404, Status).
 
 %%%===================================================================

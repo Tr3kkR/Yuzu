@@ -236,7 +236,7 @@ Open `http://localhost:8080` for the web dashboard.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.
 
-See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (184 capabilities across 24 domains, 150 done — 82%).
+See [`docs/capability-map.md`](docs/capability-map.md) for the live capability inventory and progress.
 
 ## Contributing
 

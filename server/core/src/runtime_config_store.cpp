@@ -23,6 +23,7 @@ static const std::vector<std::string> kAllowedKeys = {
     "oidc_redirect_uri",       // OIDC redirect URI
     "oidc_admin_group",        // OIDC admin group ID
     "oidc_skip_tls_verify",    // "true" or "false"
+    "plugin_signing_required", // see plugin_signing::kPluginSigningRequiredKey — must match
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
@@ -168,7 +169,7 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         }
     }
 
-    if (key == "auto_approve_enabled") {
+    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
         if (value != "true" && value != "false")
             return std::unexpected("value must be 'true' or 'false'");
     }

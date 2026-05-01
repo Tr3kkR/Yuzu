@@ -1590,6 +1590,89 @@ macOS equivalents using Apple's Endpoint Security (ES) framework — *requires t
 
 ---
 
+## Phase 17: Agentic Surface Hardening (Proposed)
+
+*Implements the four agentic-first invariants from `docs/agentic-first-principle.md` (A1 dashboard parity, A2 discovery, A3 observability, A4 error envelope). Source: `docs/capability-agentic-audit-2026-05.md` §7 P1. Every operation a human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface.*
+
+### Issue 17.1: Introspection Endpoints (`/api/v1/discover/*`)
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+
+`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**.
+
+**Files:** new `server/core/src/discovery_routes.{cpp,hpp}`, `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
+
+### Issue 17.2: Dashboard JSON Content Negotiation
+**Capability:** new | **Scope:** Server (dashboard) | **Status:** Proposed
+
+Honor `Accept: application/json` on `/fragments/*` page routes; return structured rows/columns/links/actions parallel to the HTML fragment. First-cut targets the admin surfaces (user mgmt, enrollment-token administration, settings panels). Existing fragments are not retroactively required to comply — backfill is opportunistic, A1 applies to new routes from the date of adoption. Implements **A1**.
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `dashboard_ui.cpp`, fragment route handlers.
+
+### Issue 17.3: Agent-Facing JSON SSE Channel
+**Capability:** new | **Scope:** Server (REST) | **Status:** Proposed
+
+`/api/v1/events?since=&filter=execution_id:X|agent_id:Y` emits structured JSON envelopes (not HTML fragments) on the same `event_bus_` and `ExecutionEventBus` that drive the existing HTMX `/events`. Patterns after `/api/v1/guaranteed-state/events` (`rest_api_v1.cpp:2498`). Decide separately whether to deprecate the HTML-fragment `/events` channel or keep both. Implements **A3**.
+
+**Files:** new `server/core/src/agent_sse_routes.{cpp,hpp}`, reuse `server.cpp:2450-2478` infrastructure.
+
+### Issue 17.4: Service-Account Principal Type
+**Capability:** new | **Scope:** Server (auth) | **Status:** Proposed
+
+`auth_db` migration adds `principal_type IN ('user','service_account')`. Service accounts can be scoped to mgmt-group / plugin / operation subsets. Token rotation pair-overlap workflow exposed via REST. Required for least-privilege agentic worker identity in multi-tenant deployments. Touches A2 (discovery surface for service-account scopes).
+
+**Files:** `server/core/src/auth_db.{cpp,hpp}`, `auth_routes.{cpp,hpp}`, `auth_manager.cpp`, new migration.
+
+### Issue 17.5: Structured Error Envelope Rev
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+
+Every failure response includes `correlation_id`, `retry_after_ms` (nullable), `remediation` (URL or hint, nullable). On `kPermissionDenied` name the missing `securable_type:operation`. On `kApprovalRequired` return `approval_id` + `status_url`. Implements **A4**.
+
+**Files:** `mcp_jsonrpc.hpp`, every REST handler emitting an error response, OpenAPI spec.
+
+---
+
+## Phase 18: Compliance & Lifecycle (Proposed)
+
+*Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: `docs/capability-agentic-audit-2026-05.md` §7 P3.*
+
+### Issue 18.1: Vulnerability Lifecycle
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CVE → CVSS → owner → SLA → remediation tracking. Supplements existing `vuln_scan` plugin with a server-side lifecycle store. Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
+
+### Issue 18.2: Compliance Reporting Templates
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CIS Benchmarks, NIST 800-171, SOC 2 evidence-pack templates that compose PolicyStore rules + audit log entries into auditor-ready PDF/CSV bundles.
+
+### Issue 18.3: Certificate Lifecycle
+**Capability:** new | **Scope:** Server + agent | **Status:** Proposed
+
+Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate inventory (capability §3.8) with lifecycle.
+
+### Issue 18.4: Secrets-Vault Integration
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+HashiCorp Vault, Azure Key Vault, AWS Secrets Manager connectors for connector credentials and enrollment tokens. Replaces SQLite-encrypted-at-rest for shops with a vault.
+
+### Issue 18.5: SBOM Ingest
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on `openssl-1.1.1k` lights up every fleet host carrying that component.
+
+### Issue 18.6: Hardware Attestation
+**Capability:** new | **Scope:** Agent + server | **Status:** Proposed
+
+TPM, Secure Boot, UEFI verification. Reports posture state into compliance reporting (18.2).
+
+### Out of scope (documented exclusions)
+
+- **MDM (mobile)** — partner integration only; Yuzu's agent surface is workstation + server, not iOS / Android.
+- **OS deployment / imaging / PXE** — partner integration only; out of scope for endpoint management.
+- **EDR-class telemetry at the agent** — integrate via Phase 9 connectors to existing EDR (CrowdStrike, SentinelOne, MS Defender for Endpoint); do not re-implement at the agent.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |

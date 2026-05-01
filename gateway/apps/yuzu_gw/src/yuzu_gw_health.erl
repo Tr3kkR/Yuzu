@@ -14,7 +14,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/0, port/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -32,6 +32,16 @@
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+%% Returns the actual port the health endpoint is listening on. Useful
+%% when the configured port is 0 (OS-assigned ephemeral), as is the case
+%% in eunit tests that need to avoid colliding with whatever already owns
+%% a fixed port on the host (Windows dev tools squatting on 18080 was
+%% the trigger — 302 instead of 200 because the test was hitting a
+%% different HTTP server bound to the same port).
+-spec port() -> {ok, inet:port_number()} | {error, term()}.
+port() ->
+    gen_server:call(?SERVER, get_port, 5000).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -54,6 +64,8 @@ init([]) ->
             {stop, {listen_failed, Reason}}
     end.
 
+handle_call(get_port, _From, #state{listen_sock = LSock} = State) ->
+    {reply, inet:port(LSock), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 

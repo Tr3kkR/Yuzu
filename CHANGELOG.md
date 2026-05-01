@@ -30,6 +30,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Plugin code signing — CMS detached-signature verification + Settings UI** (#80).
+  Two-layer supply-chain check on every plugin: the existing
+  `--plugin-allowlist` (filename → SHA-256) is now joined by an
+  operator-managed CA trust bundle that the agent uses to verify a
+  sibling `<plugin>.so.sig` (PEM CMS detached) before `dlopen`.
+  Verification runs **before** `dlopen`/`LoadLibrary` so a tampered or
+  untrusted binary never executes code. The trust anchor is
+  deployment-format-agnostic — operators can use a public CA, an
+  internal CA, or (forthcoming) the Yuzu self-managed CA. The Yuzu
+  release pipeline does not yet sign the in-tree `agents/plugins/`;
+  see the *Fleet-suicide caveat* in `docs/user-manual/server-admin.md`
+  for rollout guidance.
+
+  **Agent surface.** Two new CLI flags + env-var equivalents:
+  - `--plugin-trust-bundle <path>` (`YUZU_PLUGIN_TRUST_BUNDLE`) — PEM
+    file with one or more X.509 CA certificates. Enables verification.
+  - `--plugin-require-signature` (`YUZU_PLUGIN_REQUIRE_SIGNATURE`) —
+    when set, plugins without a `.sig` sibling are rejected. When
+    unset (default), unsigned plugins still load (transitional mode
+    for ops rolling out signing). Passing this flag with an empty
+    trust-bundle path causes the agent to refuse to start, preventing
+    the silent fail-open that would otherwise occur.
+
+  Default behaviour for deployments that do not set the new flags is
+  unchanged. The verifier enforces `X509_PURPOSE_CODE_SIGN` — a leaf
+  without `EKU=codeSigning` is rejected even if it chains to a CA in
+  the trust bundle, so a single internal PKI does not implicitly
+  authorise its mTLS / S/MIME / TLS-server siblings to sign plugins.
+
+  **Server surface.** New **Settings → Plugin Code Signing** card with
+  status badge, multipart PEM upload (256 KB cap, OpenSSL-validated on
+  the way in), Require-signed-plugins toggle, and Remove-bundle
+  button. Bundle metadata (cert count, SHA-256, up to 16 subjects) is
+  recomputed from the file at render time so disk + DB cannot drift.
+  PEM persists atomically (temp + rename) at
+  `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in
+  `runtime_config` as `plugin_signing_required`.
+
+  **REST routes.** `GET /fragments/settings/plugin-signing` (admin
+  HTML), `POST /api/settings/plugin-signing/{upload,clear,require}`
+  (admin, HTMX), `GET /api/v1/agent/plugin-policy` (admin only,
+  returns JSON `{enabled, required, trust_bundle_pem, cert_count,
+  sha256}` for out-of-band operator distribution to agents — automatic
+  agent-side fetch is a forthcoming change).
+
+  **Audit + metrics.** Three new actions
+  (`plugin_signing.bundle.uploaded` /
+  `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`)
+  using the standard `success/failure/denied` result vocabulary, with
+  `target_type` of `PluginTrustBundle` (bundle ops) or `RuntimeConfig`
+  (require-flag toggle). Three new label values on
+  `yuzu_agent_plugin_rejected_total{reason}`: `signature_missing`,
+  `signature_invalid`, `signature_untrusted_chain` — distinct from
+  the existing `reserved_name` and `load_failed` buckets so operators
+  can alert per category. Operator workflow + `openssl cms -sign`
+  recipe in `docs/user-manual/agent-plugins.md` § Plugin Code
+  Signing; full REST contract in `docs/user-manual/rest-api.md`
+  § Settings — Plugin Code Signing; upgrade notes in
+  `docs/user-manual/upgrading.md`.
+
 - **Persistent SQLite-backed authentication.** `auth.db` (in `--data-dir`)
   now holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256
   hashed passwords. Replaces the prior in-memory + on-config-flush model

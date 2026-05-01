@@ -314,6 +314,23 @@ heartbeat_batch_scale() ->
     %% without blocking callers.
     N = 10000,
 
+    %% Defensive unload of grpcbox_channel/grpcbox_client before re-mocking.
+    %% setup() at the top of this module mocks only telemetry and does NOT
+    %% pre-unload these two — every other test in the file leaves them
+    %% alone, so on most discovery orders they are absent. But other test
+    %% modules in apps/yuzu_gw/test (circuit_breaker_*, upstream, health,
+    %% heartbeat_metrics, perf_helpers→perf_SUITE, integration, e2e,
+    %% metrics_e2e, fullstack) all mock grpcbox_client and rely on their
+    %% own setup/teardown to balance. If any of them crash mid-test or
+    %% are run with `--dir apps/yuzu_gw/test` discovery interleaving
+    %% scale_tests after them, grpcbox_client/grpcbox_channel are still
+    %% registered when we reach this line and `meck:new` aborts with
+    %% `{already_started, <pid>}`. CI Linux saw this on first eunit run
+    %% with the full module set; local WSL2 happened to discover scale
+    %% before the leakers.
+    catch meck:unload(grpcbox_channel),
+    catch meck:unload(grpcbox_client),
+
     %% Mock upstream so it doesn't actually connect.
     meck:new(grpcbox_channel, [non_strict, no_link]),
     meck:expect(grpcbox_channel, pick, fun(_, _) -> {ok, fake_ch} end),

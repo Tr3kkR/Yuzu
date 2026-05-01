@@ -6,6 +6,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -34,6 +35,47 @@ inline constexpr std::array<std::string_view, 3> kReservedPluginNames{
 /// (e.g. agent metrics) can match on this prefix to count rejections by
 /// category without re-parsing free-form text.
 inline constexpr std::string_view kReservedNameReason = "reserved plugin name";
+
+/// Stable reason prefixes for code-signing rejections. The metric label
+/// derives from the prefix so operators can alert distinctly on
+/// "no signature on plugin in require-mode" vs "bad signature" vs
+/// "signature does not chain to a trusted CA".
+inline constexpr std::string_view kSignatureMissingReason = "plugin signature missing";
+inline constexpr std::string_view kSignatureInvalidReason = "plugin signature invalid";
+inline constexpr std::string_view kSignatureUntrustedReason = "plugin signature untrusted chain";
+
+/// Plugin code-signing trust anchor. When `trust_bundle_path` is non-empty,
+/// PluginLoader::scan() looks for a sibling `<plugin-file>.sig` (PEM CMS
+/// detached signature) for every candidate plugin. If a sig is present it
+/// must verify against the bundle. If `require_signature` is true an
+/// unsigned plugin is rejected; if false an unsigned plugin still loads
+/// (allowlist still applies) — a transitional mode for operators rolling
+/// out signing.
+///
+/// The trust bundle is a PEM file containing one or more X.509 root or
+/// intermediate certificates. Today it is operator-supplied; once the
+/// self-managed CA (auth-and-authz skill, Section 3 #10) ships the same
+/// file path can point at the CA-published root.
+struct PluginSigningPolicy {
+    std::filesystem::path trust_bundle_path;
+    bool require_signature{false};
+
+    [[nodiscard]] bool enabled() const noexcept { return !trust_bundle_path.empty(); }
+};
+
+/// Verify a CMS detached PEM signature over the bytes of `plugin_path`,
+/// chain-validating the embedded signing cert against the certs loaded
+/// from `trust_bundle_path`. Returns std::nullopt on success; on failure
+/// returns a stable reason prefix from kSignature*Reason that the loader
+/// surfaces to the caller and metrics. Treat the return as "is bad" so
+/// the call site reads as `if (auto err = verify_plugin_signature(...))`.
+///
+/// Sig file convention: same path as the plugin with `.sig` appended
+/// (e.g. `chargen.so.sig`). PEM-armoured CMS so it inspects with
+/// `openssl cms -inform pem -text -noout -in chargen.so.sig`.
+[[nodiscard]] YUZU_EXPORT std::optional<std::string>
+verify_plugin_signature(const std::filesystem::path& plugin_path,
+                        const std::filesystem::path& trust_bundle_path);
 
 /// True if name matches one of kReservedPluginNames exactly (case-sensitive).
 [[nodiscard]] constexpr bool is_reserved_plugin_name(std::string_view name) noexcept {
@@ -86,11 +128,19 @@ public:
         std::vector<LoadError> errors;
     };
 
-    /// Scan plugin_dir, optionally verifying each plugin against an allowlist.
-    /// If allowlist is non-empty, plugins whose hash doesn't match are rejected.
+    /// Scan plugin_dir, optionally verifying each plugin against an allowlist
+    /// (sha256 integrity) and/or a code-signing trust anchor (CMS provenance).
+    ///
+    /// Verification order per file: allowlist (cheap, fail-fast) → signature
+    /// (expensive). A plugin must clear *every* enabled check; the two layers
+    /// answer different questions — allowlist binds *this filename to this
+    /// hash on this host*, signing binds *this file content to a CA-issued
+    /// signing identity*. Operators with internal builds typically enable
+    /// both.
     [[nodiscard]] static ScanResult scan(
         const std::filesystem::path& plugin_dir,
-        const std::unordered_map<std::string, std::string>& allowlist = {});
+        const std::unordered_map<std::string, std::string>& allowlist = {},
+        const PluginSigningPolicy& signing = {});
 };
 
 } // namespace yuzu::agent

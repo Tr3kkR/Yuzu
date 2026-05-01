@@ -124,6 +124,14 @@ int main(int argc, char* argv[]) {
     app.add_option("--plugin-allowlist", cfg.plugin_allowlist,
                    "Path to sha256sum-format allowlist file for plugin verification")
         ->envname("YUZU_PLUGIN_ALLOWLIST");
+    app.add_option("--plugin-trust-bundle", cfg.plugin_trust_bundle,
+                   "PEM CA bundle for plugin code-signing verification (operator-supplied "
+                   "or pointing at the Yuzu self-managed CA root)")
+        ->envname("YUZU_PLUGIN_TRUST_BUNDLE");
+    app.add_flag("--plugin-require-signature", cfg.plugin_require_signature,
+                 "Reject plugins that have no .sig sibling file (default: allow unsigned "
+                 "if --plugin-trust-bundle is set, for transitional rollouts)")
+        ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
     app.add_flag("--no-auto-update", "Disable OTA auto-updates")->each([&cfg](const std::string&) {
         cfg.auto_update = false;
     });

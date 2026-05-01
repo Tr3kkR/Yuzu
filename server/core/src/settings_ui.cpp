@@ -327,6 +327,24 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── Plugin Code Signing ─────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Plugin Code Signing</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Operator-managed trust bundle for agent plugin code signing.
+          Upload a PEM bundle of CA certificates that should anchor plugin signatures;
+          enable "Require signed plugins" to reject unsigned plugins on every agent.
+        </p>
+        <div id="plugin-signing-section"
+             hx-get="/fragments/settings/plugin-signing"
+             hx-trigger="load, refreshPluginSigning from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Agent Updates (OTA) ────────────────────────────── -->
     <div class="section">
       <div class="section-header">Agent Updates (OTA)</div>

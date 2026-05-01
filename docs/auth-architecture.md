@@ -75,3 +75,17 @@ Any handler that destroys, demotes, or otherwise revokes a principal's privilege
 3. Corresponding fragment renderers must accept the session username and suppress destructive controls on the matching row (see `render_users_fragment(const std::string& current_username)` — no default arg, every caller must pass explicitly so a future caller forgetting it is a compile-time failure rather than a silent UI regression).
 
 **Scaling note:** when the third such handler ships, lift the comparison logic into a helper.
+
+## AuthDB — persistent authentication store (v0.12.0+)
+
+`auth.db` (lives in `--data-dir`) is the v0.12.0 SQLite-backed store for user
+accounts, sessions, and enrollment tokens. Replaces the prior in-memory +
+on-config-flush model that lost users on every restart (#618, #388, #527).
+Operator recovery: `docs/ops-runbooks/auth-db-recovery.md`. Security review
+record: `docs/security-reviews/authdb-2026-04-30.md`.
+
+The hard invariants for AuthDB-touching changes (file-mode, migration
+pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
+cleanup cadence, snapshot-and-release publishing) live in
+`.claude/agents/authdb.md` — the AuthDB review agent loads them on any
+change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth_manager.cpp`.
