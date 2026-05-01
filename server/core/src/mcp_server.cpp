@@ -224,8 +224,9 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 // ── Write/execute tools (blocked by read_only_mode) ──────────────────────
 // These tool names perform Write/Execute/Delete operations.
 // The read_only_mode guard rejects them proactively.
-//   Implemented: set_tag, delete_tag, execute_instruction
-//   Planned:     approve_request, reject_request, quarantine_device
+//   Implemented dispatch: execute_instruction (line 1313)
+//   Security-mapped but no dispatch yet (Issue 13.5): set_tag, delete_tag,
+//                                                     approve_request, reject_request, quarantine_device
 static const std::unordered_set<std::string> kWriteTools = {
     "set_tag", "delete_tag", "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",

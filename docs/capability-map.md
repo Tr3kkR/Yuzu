@@ -70,6 +70,8 @@ Overall      [======================---------]   166/225 done (74%)
 | 31. System Guardian | 10 | 1 | 2 | 7 |
 | **TOTAL** | **225** | **166** | **3** | **56** |
 
+> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
+
 ---
 
 ## 1. Agent Lifecycle Management
@@ -132,11 +134,7 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 ### 2.2 Multi-Agent Broadcast :white_check_mark: `T1`
 
-`SendCommandRequest.agent_ids` supports broadcast (empty = all agents).
-
-> **Gap:** No scope/filter-based targeting (e.g., "all Windows agents").
-
-> **Gap:** Contradicts the stated capability to filter scope based on asset tag values as stated in asset-tagging-guide.md.
+`SendCommandRequest.agent_ids` supports broadcast (empty = all agents). Scope/filter targeting is also supported: `AgentRegistry::evaluate_scope` (`server/core/src/agent_registry.cpp:820-861`) instantiates an `AttributeResolver` lambda that resolves `ostype`, `hostname`, `arch`, `agent_version`, `tag:X` (in-memory `scopable_tags` plus persistent `TagStore` fallback), and `props.X` (custom properties), composed via the scope DSL's `AND` / `OR` / `NOT`. See `docs/asset-tagging-guide.md` and `docs/scope-walking-design.md` for operator-level usage.
 
 ### 2.3 Streaming Command Output :white_check_mark: `T1`
 
