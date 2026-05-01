@@ -1170,7 +1170,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write   # gh release create
-      id-token: write   # cosign sign-blob keyless (SHA256SUMS.bundle)
+      id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1268,8 +1268,47 @@ jobs:
           # See "Sign image (keyless)" earlier in this file for the same
           # fix. v0.11.0-rc0 was the first release to hit this after the
           # cosign-installer 3 → 4 dependabot bump (#495).
-          cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.bundle
+          #
+          # Output extension is .sigstore (canonical Sigstore Bundle format
+          # name) rather than the historical .bundle so the OpenSSF
+          # Scorecard Signed-Releases check recognises the asset — its
+          # extension regex is `\.(minisig|asc|sig|sign|sigstore)$`. v0.11.0
+          # and v0.11.0-rc2 also carry a backfilled .sigstore copy alongside
+          # their original .bundle for the same reason; this rename makes
+          # every future release Scorecard-visible by default.
+          cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.sigstore
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+
+      - name: Bundle SLSA attestations as .intoto.jsonl release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifacts
+          # Each build job calls actions/attest-build-provenance, which
+          # uploads the SLSA bundle to GitHub's Attestations API keyed by
+          # the artifact's sha256 digest. That registry is invisible to
+          # OpenSSF Scorecard's Signed-Releases check, which only walks
+          # release *assets* and matches `*.intoto.jsonl` for provenance.
+          # Re-attach each bundle as <artifact>.intoto.jsonl so Scorecard
+          # sees the attestation. `gh attestation verify` continues to work
+          # against the API; offline verification can also now use
+          # `gh attestation verify --bundle <file>.intoto.jsonl <file>`.
+          while IFS=' ' read -r digest name; do
+            name="${name#\*}"
+            case "$name" in
+              ''|*.cdx.json|*.spdx.json|yuzu-compose-wizard-*) continue ;;
+            esac
+            # gh api --jq does not apply on 4xx responses, so capture the
+            # raw body and require a non-null bundle to materialise.
+            body=$(gh api "repos/${{ github.repository }}/attestations/sha256:$digest" 2>/dev/null || true)
+            bundle=$(printf '%s' "$body" | jq -c '.attestations[0].bundle // empty' 2>/dev/null || true)
+            if [ -z "$bundle" ]; then
+              echo "::warning::no attestation for $name (digest sha256:$digest) — skipping"
+              continue
+            fi
+            printf '%s\n' "$bundle" > "${name}.intoto.jsonl"
+            echo "wrote ${name}.intoto.jsonl ($(wc -c < "${name}.intoto.jsonl") bytes)"
+          done < SHA256SUMS
 
       - name: Determine if prerelease
         id: prerelease
@@ -1393,7 +1432,7 @@ jobs:
           ### Verify signature (cosign)
 
           \`\`\`bash
-          cosign verify-blob --bundle SHA256SUMS.bundle \\
+          cosign verify-blob --bundle SHA256SUMS.sigstore \\
             --certificate-identity-regexp '.*' \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
@@ -1448,6 +1487,7 @@ jobs:
             artifacts/*.rpm \
             artifacts/*.cdx.json \
             artifacts/*.spdx.json \
+            artifacts/*.intoto.jsonl \
             artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.bundle \
+            artifacts/SHA256SUMS.sigstore \
             "${WIZARD_ASSET[@]}"

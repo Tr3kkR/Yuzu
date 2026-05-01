@@ -682,6 +682,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Release supply-chain assets renamed and expanded for OpenSSF Scorecard
+  visibility.** The cosign signature on `SHA256SUMS` is now published as
+  `SHA256SUMS.sigstore` rather than `SHA256SUMS.bundle`, matching the
+  canonical Sigstore Bundle filename and the
+  `\.(minisig|asc|sig|sign|sigstore)$` extension regex Scorecard's
+  Signed-Releases check requires. Each binary archive, installer, and
+  Docker image now also publishes its SLSA build provenance attestation
+  as a sibling `<artifact>.intoto.jsonl` release asset, so Scorecard can
+  see the provenance without reaching the GitHub Attestations API. v0.11.0
+  and v0.11.0-rc2 were backfilled with `SHA256SUMS.sigstore` and per-asset
+  `*.intoto.jsonl` files alongside their original `SHA256SUMS.bundle`;
+  v0.12.0 onwards will ship only the canonical `.sigstore` filename.
+  Customers should update verification scripts to use the `.sigstore`
+  filename — both files are byte-identical Sigstore bundles and `cosign
+  verify-blob --bundle` accepts either path. See
+  `docs/user-manual/release-verification.md` for the migration table.
+
 - **`GET /fragments/executions` now honours the `definition_id` query
   parameter.** Previously the parameter was accepted but silently ignored.
   After this release, passing `?definition_id=<id>` filters the list to
