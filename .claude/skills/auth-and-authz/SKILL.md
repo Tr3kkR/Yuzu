@@ -41,25 +41,25 @@ skill claims anything is "done."
 
 | Capability | Status | Source of truth |
 |---|---|---|
-| Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp`, `auth_db.cpp` |
-| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `.claude/agents/authdb.md`, `auth_db.cpp` |
-| Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp` |
-| API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` |
-| Owner-scoped token revocation (#222) | Shipped | `auth_routes.cpp` |
-| Granular RBAC — 6 roles × 14 securable types × per-op | Shipped (Phase 3) | `rbac_store.cpp` |
-| Self-target principal-destruction guard (#397/#403) | Shipped | `docs/auth-architecture.md` §self-target |
-| OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp` |
-| AD/Entra group-to-role mapping via Microsoft Graph | Shipped | `oidc_provider.cpp` (group import) |
-| mTLS for agent ↔ server | Shipped | `cert_store.cpp` |
-| Windows certificate-store mTLS (CryptoAPI/CNG) | Shipped | `cert_store.cpp` |
-| HTTPS-by-default, secure bind default (127.0.0.1) | Shipped (hard invariant) | `docs/auth-architecture.md` |
-| HTTP security headers (CSP, HSTS, frame, referrer, permissions) | Shipped (SOC2-C1) | `security_headers.{hpp,cpp}` |
-| Cert hot-reload (HTTPS) with audit + metrics | Shipped | `cert_store.cpp` |
-| Agent enrollment — manual / pre-shared / platform-trust (3 tiers) | Shipped | `enrollment_token_store.cpp` |
-| MCP token issuance + tier-before-RBAC ordering | Shipped | `docs/mcp-server.md` |
-| `auth.admin_required` denied audit on every 403 | Shipped (gate) | `auth_routes.cpp` `require_admin` |
-| Private-key permission validation | Shipped | `cert_store.cpp` |
-| Metrics endpoint localhost-only-no-auth | Shipped | `auth.cpp` |
+| Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp:69` `pbkdf2_sha256()` (OpenSSL `PKCS5_PBKDF2_HMAC` + BCrypt path) |
+| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.claude/agents/authdb.md` |
+| Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
+| API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
+| Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
+| Granular RBAC — 6 roles × **19** securable types × 6 ops | Shipped (Phase 3) | `rbac_store.cpp:129-193` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState; ops: Read/Write/Execute/Delete/Approve/Push |
+| Self-target principal-destruction guard (#397/#403) | Shipped | `settings_routes.cpp:434,1830,2488-2504` (3 call sites); design in `docs/auth-architecture.md` §self-target |
+| OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp:189` `generate_code_verifier()`, L194 `compute_code_challenge()`, L385 `code_verifier` post, L766 `/.well-known/openid-configuration` discovery, L542/L623 JWKS fetch + JWT signature verify |
+| Directory Sync — AD/Entra users + groups + role mapping via Microsoft Graph v1.0 | Shipped | `directory_sync.cpp:336,509,556,608` calls `https://graph.microsoft.com/v1.0/users`, `/groups`, `/groups/{id}/members`; persisted `directory_group_role_mappings` + `directory_sync_status` tables (`directory_sync.cpp:147`). NOTE: `oidc_provider.cpp:248` only parses the JWT `groups` claim — Graph integration is the separate Directory Sync subsystem. |
+| mTLS for agent ↔ server | Shipped | `main.cpp:111` `--ca-cert` flag; peer-cert identity match in `agent_service_impl.cpp:47,354` |
+| Windows certificate-store mTLS (CryptoAPI/CNG) — **agent-side only** | Shipped | `agents/core/src/cert_store.cpp:78,84,199-201` (`CertOpenStore`, `NCrypt` CNG export) |
+| HTTPS-by-default, secure bind default (127.0.0.1) | Shipped (hard invariant) | `main.cpp:100` 127.0.0.1 default, L216 `--no-https` opt-out; design in `docs/auth-architecture.md` |
+| HTTP security headers — six (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy) | Shipped (SOC2-C1) | `security_headers.cpp:187-195` (HSTS conditional on HTTPS responses) |
+| Cert hot-reload (HTTPS) with audit + metrics | Shipped | `cert_reloader.cpp:31` audit `cert.reload`, L80 watcher loop, L114-191 atomic `SSL_CTX` swap |
+| Agent enrollment — pre-shared / platform-trust (auto-approve via attestation_provider) / admin-approval queue (3 tiers) | Shipped | `auth.cpp:717-948` + `agent_service_impl.cpp:67-189` (pre-shared L70, attestation auto-approve L101-136, pending-admin queue L138-189) |
+| MCP token issuance + tier-before-RBAC ordering | Shipped | `mcp_server.cpp:556-557,591,599` (tier check at L591 precedes RBAC at L599); design in `docs/mcp-server.md` |
+| `auth.admin_required` denied audit on every 403 | Shipped (gate) | `auth_routes.cpp:150` inside `require_admin` |
+| Private-key permission validation | Shipped | `cert_reloader.cpp:120` `validate_key_file_permissions()` (helper in `file_utils.hpp`); called at startup from `server.cpp` and on hot-reload |
+| Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
 
 ---
 
@@ -81,10 +81,10 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |
 | **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.8 | **MISSING** |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **MISSING** |
-| **Inactivity session timeout** (currently expiry-only) | "inactivity timeout" | CC6.3 | **PARTIAL** |
-| **Session revocation API** (kill all sessions for a user) | "expiration, revocation" | CC6.3 | **PARTIAL** |
-| **API token rotation workflow** (UI-driven, with overlap window) | "rotation process" | CC6.3 | **PARTIAL** |
-| **API token inventory + last-used view** | "token inventory" | CC6.6 | **PARTIAL** |
+| **Inactivity session timeout** — `auth_db.cpp:363` reserves `last_activity_at` column with DEFAULT but **no `UPDATE` writes anywhere** in the codebase; expiry-only today. Treat as from-scratch work, not a tweak. | "inactivity timeout" | CC6.3 | **MISSING (column reserved)** |
+| **Session revocation REST surface** — DB primitive `AuthDB::invalidate_all_sessions()` shipped at `auth_db.cpp:740` / `auth_db.hpp:136`, fires only via `remove_user`/`update_role`. **No `DELETE /api/v1/sessions` route, no admin UI button.** | "expiration, revocation" | CC6.3 | **PARTIAL — DB only** |
+| **API token rotation workflow** — UI-driven pair-of-tokens overlap. No `rotate` symbols in `api_token_store.{cpp,hpp}` today; only create + revoke. | "rotation process" | CC6.3 | **MISSING** |
+| **API token inventory + last-used view** — data layer shipped (`api_tokens.last_used_at` written/read at `api_token_store.cpp:291,325-345`); dashboard inventory view missing. | "token inventory" | CC6.6 | **PARTIAL — UI only** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **MISSING** |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **MISSING** |
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
@@ -133,7 +133,8 @@ matches the customer ask.
 2. **Account lockout after N failed logins.** Simple: per-user counter +
    timestamp in `auth.db`, reset on success, configurable threshold. Audit:
    `auth.lockout.applied`, `auth.lockout.cleared`. Closes a basic
-   credential-stuffing surface.
+   credential-stuffing surface. *Lowest-risk P0 to implement first — good
+   workflow shake-out.*
 3. **Hardened-mode local-password disable.** New CLI flag
    `--auth-mode=sso-only`; `auth_routes.cpp` rejects local-password login
    with a clear message and logs `auth.local_disabled`. Break-glass account
@@ -143,22 +144,25 @@ matches the customer ask.
    `GET /api/v1/audit/auth-sample?from=...&to=...&limit=N` admin-only,
    gated by `require_admin`, returning a pseudo-random sample. SOC 2 CC7.2
    evidence chain.
+5. **Session revocation REST surface** *(promoted from P1 — DB primitive
+   already shipped)*. `DELETE /api/v1/sessions?user=<name>` admin-only that
+   calls the existing `AuthDB::invalidate_all_sessions()` (`auth_db.cpp:740`)
+   plus an admin-UI "Revoke all sessions" button. Audit: `session.revoke_all`.
+   Self-target guard applies (admin can't lock themselves out). Cheaper than
+   MFA, same SOC 2 control box (CC6.3 / CC6.8).
 
 ### Priority 1 — enterprise-friction reducers
 
-5. **SAML 2.0 SP** with metadata exchange + signed assertion validation.
+6. **SAML 2.0 SP** with metadata exchange + signed assertion validation.
    Mirrors OIDC's group-to-role mapping. Same enforcement surface as OIDC.
-6. **SCIM v2 provisioning** — auto-create/disable users from the IdP.
+7. **SCIM v2 provisioning** — auto-create/disable users from the IdP.
    Reuses `auth.db` user table; new endpoint surface under `/scim/v2/`
    with bearer-token auth (separate from operator API tokens).
-7. **Inactivity session timeout** — extend session validation with a
-   `last_activity_ts` write on each authenticated request; expire when
-   `now - last_activity_ts > inactivity_window`. Configurable per
-   deployment.
-8. **Session revocation** — `DELETE /api/v1/sessions?user=<name>` admin-only;
-   wipes all sessions for the named principal. Audit:
-   `session.revoke_all`. Self-target guard applies (admin can't lock
-   themselves out).
+8. **Inactivity session timeout** — wire the reserved `last_activity_at`
+   column at `auth_db.cpp:363` end-to-end: per-request `UPDATE` on every
+   authenticated touch, expiry check inside `validate_session()` against
+   `now - last_activity_at > inactivity_window`, configurable per
+   deployment. Treat as from-scratch since no `UPDATE` writes exist today.
 9. **JIT admin elevation** — `POST /api/v1/elevate` accepting a justification
    + duration; promotes the caller's effective role for the window, audits
    `role.elevation.requested|granted|expired`. Returns to base role on TTL.
@@ -168,8 +172,10 @@ matches the customer ask.
 10. **API token rotation workflow** — pair-of-tokens overlap window in the
     dashboard; "Rotate" creates a new token while the old keeps working
     until the operator confirms cutover.
-11. **API token inventory view** — last-used timestamp, IP, owner; surface
-    in Settings → API Tokens with sortable columns.
+11. **API token inventory view** — surface the existing `last_used_at` /
+    owner / created_at columns from `api_token_store.cpp:325-345` into a
+    sortable Settings → API Tokens UI. (Data layer already shipped; this
+    is a dashboard-only PR.)
 12. **Periodic access-review export** — JSON/CSV of `(user, role, last_login)`
     triples plus an attestation upload endpoint.
 13. **Service-account principal type** — distinct from human users, no
