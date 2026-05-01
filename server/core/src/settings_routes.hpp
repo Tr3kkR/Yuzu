@@ -135,6 +135,14 @@ private:
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
     std::string render_directory_fragment();
+    /// Plugin code-signing settings — operator-managed trust bundle and
+    /// require-signature toggle. The PEM bundle lives in
+    /// auth::default_cert_dir() / "plugin-trust-bundle.pem"; the require
+    /// flag persists in `runtime_config` under key
+    /// "plugin_signing_required". Bundle metadata (cert count, SHA-256)
+    /// is recomputed at render time directly from the PEM file rather
+    /// than denormalised, to avoid drift between disk + DB.
+    std::string render_plugin_signing_fragment();
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 

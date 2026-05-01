@@ -90,6 +90,8 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Service-account governance** (separate principal type, no human login) | "Privileged access controls" | CC6.6 | **MISSING** |
 | **Conditional access** (geo / IP / device posture, optional) | implicit ("MFA requirements") | CC6.1 | **MISSING (P3)** |
 | **Sampled auth-log evidence export** for auditors | "sampled auth logs" | CC7.2 | **MISSING** |
+| **Self-managed Certificate Authority** — issuer for (a) mTLS server + agent certs and (b) plugin code-signing certs. CSR API, lifecycle (issue / renew / revoke), audit chain. Today operators must bring their own PKI for both surfaces. | implicit ("certificate management lifecycle") | CC6.1 / CC6.7 | **MISSING** |
+| **Plugin code-signing trust anchor** — operator-configured PEM trust bundle on the agent, CMS-verify of `<plugin>.sig` against it before `dlopen`. *Trust bundle accepts any X.509 root — Yuzu's self-managed CA (future) or any public CA / operator-internal CA today*. | implicit ("supply-chain integrity") | CC6.1 / CC7.1 | **PARTIAL — verifier shipped, CA upstream pending** |
 
 ### Hard invariants that must NOT regress when adding any of the above
 
@@ -166,6 +168,39 @@ matches the customer ask.
 9. **JIT admin elevation** — `POST /api/v1/elevate` accepting a justification
    + duration; promotes the caller's effective role for the window, audits
    `role.elevation.requested|granted|expired`. Returns to base role on TTL.
+10. **Self-managed Certificate Authority (mTLS + code signing).** A single
+    PKI root, server-managed, that operators can use instead of standing up
+    their own CA. Two consumers:
+    - **mTLS** — issue server certs and per-agent client certs against the
+      Yuzu CA so an out-of-the-box deployment doesn't require an external
+      PKI. Today `--ca-cert` consumes whatever bundle the operator hands
+      over; the new flow lets the server *be* the CA.
+    - **Plugin code signing** — issue developer signing certs whose chain
+      anchors at the same root, so the agent's `--plugin-trust-bundle`
+      points at one PEM and the operator can sign their own plugins. The
+      verifier (issue #80, shipped) is already deployment-format-agnostic:
+      same code path accepts public-CA, internal-CA, and self-managed-CA
+      issued certs. The CA closes the operator UX gap, not a security gap.
+
+    Surface required:
+    - Schema additions via `MigrationRunner`: `ca_root` table (root key +
+      cert + lifecycle), `ca_issued` table (issued cert inventory + status
+      + revocation reason), `ca_crl_versions` table.
+    - REST: `POST /api/v1/ca/issue` (CSR in, cert chain out),
+      `POST /api/v1/ca/revoke`, `GET /api/v1/ca/crl` (DER CRL stream),
+      `GET /api/v1/ca/root` (root cert PEM, public).
+    - Audit actions: `ca.root.created`, `ca.cert.issued`, `ca.cert.revoked`,
+      `ca.crl.published`.
+    - RBAC: gated under the existing `Security` securable type with
+      `Read` (root + CRL) / `Write` (issue) / `Delete` (revoke) ops.
+    - Hardening: root key encrypted at rest using existing
+      `auth.db`-style 0600 file or, preferred, an HSM/keyring abstraction
+      that today wraps OpenSSL `EVP_PKEY` and tomorrow can target PKCS#11.
+
+    Plugin code-signing intersects this: when the CA ships, the agent's
+    `--plugin-trust-bundle` simply points at `/var/lib/yuzu/ca/root.pem`
+    and the operator's plugin build pipeline calls `POST /api/v1/ca/issue`
+    to mint a signing cert. No verifier change required.
 
 ### Priority 2 — long-tail polish
 
