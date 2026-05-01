@@ -1,5 +1,7 @@
 #include <yuzu/agent/plugin_loader.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <openssl/bio.h>
@@ -112,8 +114,11 @@ ssl_ptr<X509> mint_cert(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
     }
     REQUIRE(X509_set_pubkey(cert.get(), subject_key) == 1);
 
-    // Basic constraints — distinguishes CA cert from leaf so the verifier's
-    // chain check is meaningful.
+    // Basic constraints + keyUsage + EKU. Required for OpenSSL's
+    // X509_PURPOSE_CODE_SIGN chain check (governance hardening round 1):
+    //   * CA cert: basicConstraints=CA:TRUE, keyUsage=keyCertSign,cRLSign
+    //   * Leaf: basicConstraints=CA:FALSE, keyUsage=digitalSignature,
+    //           extendedKeyUsage=codeSigning
     X509V3_CTX v3ctx;
     X509V3_set_ctx_nodb(&v3ctx);
     X509V3_set_ctx(&v3ctx, issuer_cert ? issuer_cert : cert.get(), cert.get(), nullptr,
@@ -121,6 +126,13 @@ ssl_ptr<X509> mint_cert(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
     const char* bc = is_ca ? "critical,CA:TRUE" : "critical,CA:FALSE";
     if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_basic_constraints,
                                         const_cast<char*>(bc))) {
+        X509_add_ext(cert.get(), ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    const char* ku = is_ca ? "critical,keyCertSign,cRLSign"
+                           : "critical,digitalSignature";
+    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_key_usage,
+                                        const_cast<char*>(ku))) {
         X509_add_ext(cert.get(), ext, -1);
         X509_EXTENSION_free(ext);
     }
@@ -168,11 +180,60 @@ struct SigningFixtures {
     }
 };
 
+// Same as mint_cert but takes an explicit EKU string (or null for none).
+// Used by the EKU-enforcement negative test which mints a leaf with
+// EKU=serverAuth instead of codeSigning to prove X509_PURPOSE_CODE_SIGN
+// rejects it (governance hardening round 1, sec-LOW-2 negative coverage).
+ssl_ptr<X509> mint_cert_eku(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
+                            X509* issuer_cert, const std::string& cn,
+                            const char* leaf_eku) {
+    ssl_ptr<X509> cert{X509_new()};
+    REQUIRE(cert);
+    REQUIRE(X509_set_version(cert.get(), 2) == 1);
+    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()),
+                     static_cast<long>(std::random_device{}()));
+    X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
+    X509_gmtime_adj(X509_getm_notAfter(cert.get()), 60 * 60 * 24);
+    X509_NAME* name = X509_get_subject_name(cert.get());
+    X509_NAME_add_entry_by_txt(
+        name, "CN", MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+    REQUIRE(X509_set_issuer_name(cert.get(),
+                                  X509_get_subject_name(issuer_cert)) == 1);
+    REQUIRE(X509_set_pubkey(cert.get(), subject_key) == 1);
+    X509V3_CTX v3ctx;
+    X509V3_set_ctx_nodb(&v3ctx);
+    X509V3_set_ctx(&v3ctx, issuer_cert, cert.get(), nullptr, nullptr, 0);
+    if (auto* ext = X509V3_EXT_conf_nid(
+            nullptr, &v3ctx, NID_basic_constraints,
+            const_cast<char*>("critical,CA:FALSE"))) {
+        X509_add_ext(cert.get(), ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    if (auto* ext = X509V3_EXT_conf_nid(
+            nullptr, &v3ctx, NID_key_usage,
+            const_cast<char*>("critical,digitalSignature"))) {
+        X509_add_ext(cert.get(), ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    if (leaf_eku) {
+        if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_ext_key_usage,
+                                            const_cast<char*>(leaf_eku))) {
+            X509_add_ext(cert.get(), ext, -1);
+            X509_EXTENSION_free(ext);
+        }
+    }
+    REQUIRE(X509_sign(cert.get(), issuer_key, EVP_sha256()) > 0);
+    return cert;
+}
+
 SigningFixtures build_signing_fixtures() {
     SigningFixtures f;
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    f.dir = fs::temp_directory_path() / ("yuzu_test_plugin_sign_" + std::to_string(gen()));
+    // Use the shared monotonic-counter helper from test_helpers.hpp
+    // (#482 / Windows MSVC Defender-flake fix). Bare random_device +
+    // mt19937_64 has no monotonic counter and can collide under
+    // Defender-induced I/O serialisation.
+    f.dir = yuzu::test::unique_temp_path("yuzu_test_plugin_sign_");
     fs::create_directories(f.dir);
 
     // Trusted CA + leaf
@@ -214,7 +275,7 @@ TEST_CASE("PluginLoader returns empty result for nonexistent directory", "[plugi
 }
 
 TEST_CASE("PluginLoader returns empty result for empty directory", "[plugin_loader]") {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_empty_plugins";
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_empty_plugins_");
     fs::create_directories(tmp);
 
     auto result = yuzu::agent::PluginLoader::scan(tmp);
@@ -318,6 +379,42 @@ TEST_CASE("verify_plugin_signature rejects malformed PEM in sig file",
     REQUIRE(err->starts_with(yuzu::agent::kSignatureInvalidReason));
 }
 
+TEST_CASE("verify_plugin_signature rejects a leaf without codeSigning EKU",
+          "[plugin_loader][signing]") {
+    // Governance hardening round 1 negative coverage for sec-LOW-2 / UP-8:
+    // a leaf signed by a CA in the bundle but lacking EKU=codeSigning
+    // (e.g. a sibling mTLS server cert from the same internal CA) MUST
+    // be rejected. Without X509_PURPOSE_CODE_SIGN on the trust store,
+    // any leaf chaining to the trust anchor would pass — turning a
+    // single PKI into a plugin-signing authority across all its issued
+    // certs.
+    auto fx = build_signing_fixtures();
+
+    // Re-mint a leaf chained to the SAME CA but with EKU=serverAuth
+    // (TLS server) instead of codeSigning. Re-sign the plugin file with it.
+    auto ca_key = generate_ec_key();
+    auto ca_cert =
+        mint_cert(ca_key.get(), ca_key.get(), nullptr, "Yuzu Test CA EKU", true);
+    auto srv_leaf_key = generate_ec_key();
+    auto srv_leaf =
+        mint_cert_eku(srv_leaf_key.get(), ca_key.get(), ca_cert.get(),
+                      "TLS server (not a code signer)", "serverAuth");
+
+    // Replace the trust bundle with the new CA, replace the .sig with
+    // one minted by the serverAuth leaf.
+    write_pem_cert(fx.trust_bundle, ca_cert.get());
+    write_cms_signature(fx.sig_file, fx.plugin_file, srv_leaf.get(),
+                        srv_leaf_key.get());
+
+    auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file,
+                                                    fx.trust_bundle);
+    REQUIRE(err.has_value());
+    // Chain is technically valid (CA issued the leaf), but the EKU
+    // gate rejects it — surfaces as untrusted-chain via the
+    // X509-error classifier.
+    REQUIRE(err->starts_with(yuzu::agent::kSignatureUntrustedReason));
+}
+
 TEST_CASE("PluginSigningPolicy::enabled flips with bundle path",
           "[plugin_loader][signing]") {
     yuzu::agent::PluginSigningPolicy off{};
@@ -363,11 +460,10 @@ TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
     // is generated from mt19937_64 rather than ::getpid() so the code
     // compiles on MSVC (`_getpid` in <process.h>) and Apple Clang
     // (`<unistd.h>` not transitively available) without per-platform
-    // guards. Same pattern sibling store tests use.
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    auto tmp = fs::temp_directory_path() /
-               ("yuzu_test_reserved_plugin_" + std::to_string(gen()));
+    // guards. Adopts yuzu::test::unique_temp_path (#482) over the
+    // earlier raw mt19937_64 path which lacked the monotonic counter
+    // that protects against Defender-induced collision flakes.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_reserved_plugin_");
     fs::create_directories(tmp);
     auto staged = tmp / fixture.filename();
     std::error_code ec;

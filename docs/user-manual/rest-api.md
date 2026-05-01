@@ -2678,6 +2678,81 @@ Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11)
 
 ---
 
+### Settings — Plugin Code Signing
+
+These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v1/agent/plugin-policy` returns JSON. See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes.
+
+**`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment showing status badge (Disabled / Trust bundle loaded / Enforced), bundle metadata (cert count, SHA-256, up to 16 subjects), upload form, require-flag toggle, and Remove button.
+
+**`POST /api/settings/plugin-signing/upload`** — Upload a PEM trust bundle.
+
+- **Permission:** Admin only
+- **Request body (multipart/form-data):** `file` (.pem/.crt; max 256 KB)
+- **Validation:** the server validates the PEM with OpenSSL on the way in — at least one parsable X.509 certificate must be present, BEGIN/END markers required.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Bundle is written atomically to `<cert-dir>/plugin-trust-bundle.pem` (temp + rename).
+- **Response (400):** Validation failure. Body: `<span class="feedback-error">Rejected: …</span>`. Audit row emitted with `result=failure`, `target_type=PluginTrustBundle`, detail = the validation error.
+- **Response (500):** I/O failure (cannot create cert dir, write tmp file, or rename to destination). Body: `<span class="feedback-error">…</span>`.
+
+**`POST /api/settings/plugin-signing/clear`** — Remove the trust bundle and reset the require flag.
+
+- **Permission:** Admin only
+- **Request body:** None (HTMX hx-confirm)
+- **Effect:** Two-phase commit — writes `plugin_signing_required=false` to `runtime_config` first, then removes `<cert-dir>/plugin-trust-bundle.pem`. If the DB write fails the file is **not** removed (prevents disk/DB desync) and a 500 is returned.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=info`. Audit `plugin_signing.bundle.cleared` / `success`.
+- **Response (500):** DB write failure. Audit `plugin_signing.bundle.cleared` / `failure` with the store error in `detail`. Bundle file untouched.
+
+**`POST /api/settings/plugin-signing/require`** — Toggle the require-signature flag.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):** `required` = `true`/`on` (checkbox checked) or absent (checkbox unchecked, treated as false).
+- **Effect:** Writes `plugin_signing_required=<true|false>` to `runtime_config`.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Audit `plugin_signing.require.changed` / `success`, `target_type=RuntimeConfig`, `target_id=plugin_signing_required`, `detail=<new_val>`.
+- **Response (500):** DB write failure with the store error.
+
+**`GET /api/v1/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows. Returns the current trust bundle PEM and require flag as JSON.
+
+- **Permission:** Admin only. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Stability:** pilot-stable. The path `/api/v1/agent/...` and the JSON response shape may change before the GA `/v1/` contract is finalized; the field set is unlikely to shrink (forward-compatible additions only).
+- **Response (200, bundle uploaded):**
+
+  ```json
+  {
+    "enabled": true,
+    "required": false,
+    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n",
+    "cert_count": 2,
+    "sha256": "abc123…"
+  }
+  ```
+
+- **Response (200, no bundle uploaded):**
+
+  ```json
+  {"enabled": false, "required": false, "trust_bundle_pem": ""}
+  ```
+
+  (Status is 200, not 404 — "no bundle uploaded" is a normal operational state, not a fetch failure.)
+
+- **Response (500, bundle on disk is unreadable):** standard `/api/v1/*` error envelope.
+
+  ```json
+  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable"},
+   "meta": {"api_version": "v1"}}
+  ```
+
+- **Operator usage:** curl this into a local file on each agent host, then point the agent at that file with `--plugin-trust-bundle`:
+
+  ```bash
+  curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
+    https://server.example.com:8443/api/v1/agent/plugin-policy \
+    | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+  ```
+
+---
+
 ### Settings — User Management
 
 These endpoints drive the **Settings → Users** tab. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than the standard JSON envelope. All three require an admin session and the dashboard swaps the response body into `#user-section`.
