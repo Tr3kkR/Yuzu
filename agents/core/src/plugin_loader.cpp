@@ -192,12 +192,20 @@ openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_pat
                       bundle_path.string(), drain_openssl_errors().text);
         return nullptr;
     }
-    // Plugin signing certs typically carry EKU=codeSigning. CMS_verify's
-    // default S/MIME purpose check would reject those — set the store's
-    // purpose to "any" so EKU does not enter the trust decision; what
-    // matters is that the cert chains to a trust anchor and the signature
-    // is valid over the file bytes.
-    X509_STORE_set_purpose(store.get(), X509_PURPOSE_ANY);
+    // Plugin signing certs MUST carry EKU=codeSigning (RFC 5280 §4.2.1.12).
+    // Setting the X509_STORE purpose forces OpenSSL to enforce the EKU
+    // during chain validation. A leaf without codeSigning EKU — e.g. an
+    // mTLS server cert, S/MIME cert, or TLS client cert minted by the
+    // *same* CA the operator trusts — is rejected. Without this, a
+    // single CA whose downstream issues a non-code-signing cert (very
+    // common in internal PKIs that issue mTLS + S/MIME from one root)
+    // becomes a plugin-signing authority too. Fixed in governance
+    // hardening round 1 (sec-LOW-2 / UP-8).
+    if (X509_STORE_set_purpose(store.get(), X509_PURPOSE_CODE_SIGN) != 1) {
+        spdlog::error("Failed to set X509 purpose to codeSigning: {}",
+                      drain_openssl_errors().text);
+        return nullptr;
+    }
     return store;
 }
 
@@ -245,11 +253,17 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
 
     // Single CMS_verify does both checks atomically:
     //   * chain-validates each signer cert against the trust store
-    //     (purpose was set to ANY in load_trust_store so codeSigning EKU
-    //     is not rejected).
+    //     (purpose was set to CODE_SIGN in load_trust_store so any leaf
+    //     without EKU=codeSigning is rejected — even if the leaf chains
+    //     to a CA the operator trusts).
     //   * verifies the signature digest over the detached payload.
     //   * CMS_BINARY suppresses CRLF canonicalisation we do not want on
     //     a binary payload.
+    //   * MUST NOT pass CMS_NO_SIGNER_CERT_VERIFY or CMS_NO_CONTENT_VERIFY
+    //     — those flags individually disable the chain check or the
+    //     digest check and would silently weaken the verifier. Pinning
+    //     the policy here as a load-bearing invariant for future edits
+    //     (governance hardening round 1, sec-INFO-8).
     if (CMS_verify(cms.get(), nullptr, store.get(), content_bio.get(), nullptr,
                    CMS_BINARY | CMS_DETACHED) != 1) {
         const auto err = drain_openssl_errors();
@@ -258,6 +272,12 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
         return std::string{prefix} + ": " + err.text;
     }
 
+    // Drain any benign residual error-queue entries from the success
+    // path so a httplib worker thread that handles a /tls call after
+    // this one does not see stale OpenSSL errors. PEM_read_bio_X509 +
+    // friends push end-of-stream sentinels onto the thread-local queue
+    // even on success (cpp-S5 / sec-LOW-6).
+    ERR_clear_error();
     return std::nullopt; // verified
 }
 

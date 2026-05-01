@@ -413,6 +413,20 @@ public:
         // 1. Load plugins (with optional allowlist + code-signing verification)
         auto allowlist = load_plugin_allowlist(cfg_.plugin_allowlist);
         PluginSigningPolicy signing{cfg_.plugin_trust_bundle, cfg_.plugin_require_signature};
+        // Fail-closed guard against silent fail-open. If the operator passed
+        // --plugin-require-signature but forgot --plugin-trust-bundle (or
+        // passed an empty path), PluginSigningPolicy::enabled() would be
+        // false and the entire signing block in PluginLoader::scan() would
+        // be skipped — so unsigned plugins would silently load while the
+        // operator believed enforcement was active. Refuse to start.
+        // Governance hardening round 1 (UP-7).
+        if (cfg_.plugin_require_signature && !signing.enabled()) {
+            spdlog::critical(
+                "--plugin-require-signature is set but --plugin-trust-bundle "
+                "is empty. Refusing to start: this combination would silently "
+                "fail-open (every plugin would load unverified).");
+            std::exit(EXIT_FAILURE);
+        }
         auto scan = PluginLoader::scan(cfg_.plugin_dir, allowlist, signing);
 
         // Collect successfully loaded handles first (before init)
