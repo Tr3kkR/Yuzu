@@ -5,6 +5,7 @@
 // pem.h before bio.h — keeps PEM_*_X509 macros declared.
 #include <openssl/pem.h>
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -44,6 +45,11 @@ validate_trust_bundle_pem(std::string_view pem) {
         X509_free(cert);
     }
     BIO_free(bio);
+    // PEM_read_bio_X509 pushes a benign PEM_R_NO_START_LINE entry onto
+    // the thread-local error queue when it hits end-of-stream. Drain it
+    // so a later TLS handshake on the same httplib worker thread does
+    // not surface stale errors (governance hardening round 1, sec-LOW-6).
+    ERR_clear_error();
 
     if (stats.cert_count == 0) {
         return std::unexpected("no X.509 certificates found in PEM");

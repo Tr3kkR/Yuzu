@@ -23,7 +23,7 @@ static const std::vector<std::string> kAllowedKeys = {
     "oidc_redirect_uri",       // OIDC redirect URI
     "oidc_admin_group",        // OIDC admin group ID
     "oidc_skip_tls_verify",    // "true" or "false"
-    "plugin_signing_required", // "true" or "false" — agent rejects unsigned plugins
+    "plugin_signing_required", // see plugin_signing::kPluginSigningRequiredKey — must match
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {

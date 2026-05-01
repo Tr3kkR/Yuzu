@@ -1736,7 +1736,7 @@ std::string SettingsRoutes::render_directory_fragment() {
 //     so disk + DB cannot drift out of sync — clearing the file disables
 //     signing atomically.
 //   * The require flag lives in runtime_config under the
-//     "plugin_signing_required" key.
+//     plugin_signing::kPluginSigningRequiredKey key.
 //   * Bundle metadata (cert count, SHA-256) is recomputed from the file
 //     each render rather than denormalised — keeps the source of truth
 //     single (the file), at cost of a few-ms re-parse per /settings load.
@@ -1777,7 +1777,7 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     const bool enabled = bundle && bundle->has_value();
     const bool required =
         runtime_config_store_ &&
-        runtime_config_store_->get_value("plugin_signing_required") == "true";
+        runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
 
     // Status badge
     std::string badge_color, badge_text;
@@ -1824,6 +1824,22 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                 "for every agent connected to this server.</p>";
     }
 
+    // Fleet-suicide warning: Yuzu-shipped plugins are not currently
+    // signed. An operator who enables Require=on without first signing
+    // the in-tree plugins will reject every Yuzu-shipped plugin
+    // fleet-wide on next agent restart. Make the risk explicit before
+    // they touch the toggle (governance hardening round 1, ER-1).
+    html += "<div class=\"feedback feedback-warning\" "
+            "style=\"font-size:0.75rem;background:#664d03;color:#fff;"
+            "padding:0.5rem 0.75rem;border-radius:4px;margin-top:0.5rem\">"
+            "<strong>Heads up.</strong> Yuzu-shipped plugins do not yet "
+            "include CMS signatures. Enabling <em>Require signed plugins</em> "
+            "will cause agents to reject every Yuzu-bundled plugin at next "
+            "scan. Use the transitional mode (bundle uploaded, Require off) "
+            "until you have signed every plugin your fleet uses, including "
+            "the ones shipped under <code>agents/plugins/</code>."
+            "</div>";
+
     // Upload form (multipart so curl/UI both work)
     html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
             "margin:1rem 0\">";
@@ -1856,11 +1872,21 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
                 "<button type=\"submit\" class=\"btn btn-secondary\">Save</button></div>";
         html += "</form>";
 
-        // Clear button — separate form so it can have a confirm
+        // Clear button — separate form so it can have a confirm.
+        // Confirm copy is deliberate about what is and isn't possible
+        // today: there is no automatic agent-side bundle refresh, so a
+        // running agent that already loaded plugins continues to use
+        // its in-process verification state. The bundle on the server
+        // is removed; new agent starts (or future auto-refresh) will
+        // see no bundle. Operators rotating away from a compromised CA
+        // need to also restart agents (governance hardening round 1,
+        // UP-5).
         html += "<form hx-post=\"/api/settings/plugin-signing/clear\" "
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
-                "hx-confirm=\"Remove the plugin trust bundle? Agents that already pulled this "
-                "policy will continue verifying with their cached copy until they refresh.\" "
+                "hx-confirm=\"Remove the plugin trust bundle and reset the require flag? "
+                "This stops new agent starts from verifying signatures, but already-running "
+                "agents keep their in-process state until they restart. "
+                "If you are rotating away from a compromised CA, restart your agents.\" "
                 "style=\"margin-top:0.75rem\">";
         html += "<div class=\"form-row\"><label></label>"
                 "<button type=\"submit\" class=\"btn btn-danger\">Remove trust bundle</button>"
@@ -1872,11 +1898,12 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "margin:1rem 0\">";
     html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
             "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
-            "is served to authenticated agents at "
-            "<code>/api/v1/agent/plugin-policy</code>. Agents started with "
-            "<code>--plugin-trust-bundle</code> pointing at a local file can be "
-            "configured by curling this endpoint into that file at startup; "
-            "fully automatic fetch is a forthcoming agent-side change.</p>";
+            "is served at <code>GET /api/v1/agent/plugin-policy</code> "
+            "(<em>admin-only</em> — operators distribute to agents via the "
+            "standard config-management flow). Agents are pointed at a local "
+            "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
+            "fetch is a forthcoming change, at which point this endpoint will "
+            "gain a dedicated agent identity.</p>";
     html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
             "<strong>Signing recipe:</strong> "
             "<code>openssl cms -sign -binary -nodetach=false -signer signer.pem "
@@ -2151,8 +2178,13 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                           "<span class=\"feedback-error\">Rejected: " +
                               html_escape(stats.error()) + "</span>",
                           "text/html; charset=utf-8");
-                      audit_fn_(req, "plugin_signing.bundle.uploaded", "rejected",
-                                "PluginSigning", "trust-bundle", stats.error());
+                      // result="failure" — PEM validation rejected the operator's input.
+                      // Vocabulary: success/failure/denied per audit_store.hpp:28.
+                      // ("rejected" was a novel token that silently undercounts
+                      // the Prometheus events_other_ bucket — fixed in
+                      // governance hardening round 1, arch-B1 / CONS-B2 / CC7.2.)
+                      audit_fn_(req, "plugin_signing.bundle.uploaded", "failure",
+                                "PluginTrustBundle", "trust-bundle", stats.error());
                       return;
                   }
 
@@ -2167,9 +2199,19 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                           "text/html; charset=utf-8");
                       return;
                   }
+                  // Atomic write: stage in a sibling temp file, then rename
+                  // over the destination. Same-directory rename is
+                  // POSIX-atomic and Windows-replace-atomic via MoveFileExW.
+                  // Prevents the torn-read window where a concurrent
+                  // /api/v1/agent/plugin-policy fetch reads a 0-byte or
+                  // partial PEM mid-write (sec-MED-1 / UP-1 / UP-2 / UP-16
+                  // / hp-S1).
                   auto out_path = trust_bundle_path();
+                  auto tmp_path = out_path;
+                  tmp_path += ".tmp";
                   {
-                      std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+                      std::ofstream f(tmp_path,
+                                      std::ios::binary | std::ios::trunc);
                       if (!f.is_open()) {
                           res.status = 500;
                           res.set_header("HX-Retarget", "#plugin-signing-section");
@@ -2180,6 +2222,35 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                       }
                       f.write(content.data(),
                               static_cast<std::streamsize>(content.size()));
+                      f.flush();
+                      // Surface short-write / disk-full / EIO before we
+                      // attempt the atomic rename. Without this, a partial
+                      // tmp file would be renamed into place and the
+                      // operator would see "uploaded" while agents see
+                      // a corrupt bundle (hp-S1 / UP-16).
+                      if (!f.good()) {
+                          std::error_code rmec;
+                          std::filesystem::remove(tmp_path, rmec);
+                          res.status = 500;
+                          res.set_header("HX-Retarget", "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Trust bundle write failed (disk full?).</span>",
+                              "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
+                  std::error_code rnec;
+                  std::filesystem::rename(tmp_path, out_path, rnec);
+                  if (rnec) {
+                      std::error_code rmec;
+                      std::filesystem::remove(tmp_path, rmec);
+                      res.status = 500;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Atomic rename of trust bundle failed: " +
+                              html_escape(rnec.message()) + "</span>",
+                          "text/html; charset=utf-8");
+                      return;
                   }
                   // Trust bundles are public-readable (only contains
                   // X.509 certs, no private keys).
@@ -2187,7 +2258,7 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                   spdlog::info("Plugin trust bundle uploaded: {} ({} certs, sha256 {})",
                                out_path.string(), stats->cert_count, stats->sha256_hex);
                   audit_fn_(req, "plugin_signing.bundle.uploaded", "success",
-                            "PluginSigning", "trust-bundle",
+                            "PluginTrustBundle", "trust-bundle",
                             std::to_string(stats->cert_count) + " cert(s), sha256=" +
                                 stats->sha256_hex);
 
@@ -2203,21 +2274,40 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                   if (!admin_fn_(req, res))
                       return;
 
+                  // Two-phase commit: clear the DB flag FIRST, then remove
+                  // the file. If the flag write fails we surface a 500 and
+                  // never touch the file — agents continue to verify
+                  // against the existing bundle and the operator sees an
+                  // explicit error rather than a silent "file gone but
+                  // require still on" state (UP-4).
+                  if (runtime_config_store_) {
+                      auto rc = runtime_config_store_->set(
+                          plugin_signing::kPluginSigningRequiredKey, "false", "system");
+                      if (!rc) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget",
+                                         "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Cannot clear "
+                              "require flag: " + html_escape(rc.error()) +
+                                  ". Trust bundle was not removed.</span>",
+                              "text/html; charset=utf-8");
+                          audit_fn_(req, "plugin_signing.bundle.cleared",
+                                    "failure", "PluginTrustBundle",
+                                    "trust-bundle",
+                                    "require-flag write failed: " + rc.error());
+                          return;
+                      }
+                  }
                   auto path = trust_bundle_path();
                   std::error_code ec;
                   bool removed = std::filesystem::remove(path, ec);
-                  // Removing a non-existent file is a no-op; we still
-                  // clear the require flag for symmetry with the UI.
-                  if (runtime_config_store_) {
-                      (void)runtime_config_store_->set("plugin_signing_required",
-                                                        "false", "system");
-                  }
 
                   spdlog::info(
                       "Plugin trust bundle cleared (file {}, require flag reset)",
                       removed ? "removed" : "absent");
                   audit_fn_(req, "plugin_signing.bundle.cleared", "success",
-                            "PluginSigning", "trust-bundle",
+                            "PluginTrustBundle", "trust-bundle",
                             removed ? "file removed" : "no file present");
 
                   res.set_header("HX-Trigger",
@@ -2240,7 +2330,7 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                       (val == "true" || val == "on") ? "true" : "false";
                   if (runtime_config_store_) {
                       auto rc = runtime_config_store_->set(
-                          "plugin_signing_required", new_val, "ui");
+                          plugin_signing::kPluginSigningRequiredKey, new_val, "ui");
                       if (!rc) {
                           res.status = 500;
                           res.set_header("HX-Retarget",
@@ -2253,7 +2343,7 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                       }
                   }
                   audit_fn_(req, "plugin_signing.require.changed", "success",
-                            "PluginSigning", "require_signature", new_val);
+                            "RuntimeConfig", plugin_signing::kPluginSigningRequiredKey, new_val);
                   res.set_header(
                       "HX-Trigger",
                       R"({"showToast":{"message":"Require flag updated","level":"success"}})");
@@ -2261,39 +2351,53 @@ void SettingsRoutes::register_routes(HttpRouteSink& sink,
                                   "text/html; charset=utf-8");
               });
 
-    // -- Plugin Code Signing: agent-facing fetch ------------------------------
+    // -- Plugin Code Signing: distribution endpoint --------------------------
     //
-    // Returns the current trust bundle and require flag as JSON. Agents
-    // call this with their existing operator API token (Bearer/X-Yuzu-Token)
-    // to pull the latest policy at startup or on a periodic refresh.
-    // Bundle absent → 404 with empty JSON, so an agent can distinguish
-    // "no policy configured" from "policy says signing is off".
+    // Returns the current trust bundle and require flag as JSON for
+    // out-of-band distribution to agents (operators curl this into
+    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
+    // --plugin-trust-bundle to the agent). Future automatic agent-side
+    // fetch will use the same shape.
+    //
+    // Authorization: admin only. The bundle PEM holds X.509 certificates
+    // (no private keys) so the security blast radius of disclosure is
+    // small, but a non-admin token holder learning when the trust anchor
+    // rotates (sha256 changes) is useful reconnaissance for a
+    // supply-chain attacker. CC6.1 least-privilege requires we restrict
+    // even read access to security-critical config to admin principals
+    // (governance hardening round 1: sec-LOW-4 / UP-13 / CC6.1).
     sink.Get("/api/v1/agent/plugin-policy",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 // auth_fn_ accepts either session or API token; callers
-                 // (agent at startup) will use a token. No admin gate —
-                 // any authenticated principal can read so the agent's
-                 // own token is enough.
-                 auto session = auth_fn_(req, res);
-                 if (!session) return;
+                 if (!admin_fn_(req, res)) return;
 
                  auto disk = read_on_disk_bundle();
                  const bool required =
                      runtime_config_store_ &&
                      runtime_config_store_->get_value(
-                         "plugin_signing_required") == "true";
+                         plugin_signing::kPluginSigningRequiredKey) == "true";
 
+                 // Bundle absent → 200 success-shape with enabled=false.
+                 // Status code 404 was misleading: "no bundle uploaded" is
+                 // a normal operational state, not a fetch failure
+                 // (CONS-B1 part 2).
                  if (!disk) {
-                     res.status = 404;
-                     res.set_content(
-                         R"({"enabled":false,"required":false,"trust_bundle_pem":""})",
-                         "application/json");
+                     nlohmann::json out;
+                     out["enabled"] = false;
+                     out["required"] = required;
+                     out["trust_bundle_pem"] = "";
+                     res.set_content(out.dump(), "application/json");
                      return;
                  }
                  if (!disk->has_value()) {
+                     // Structured envelope (A4 / CONS-B1) — same shape as
+                     // every other /api/v1/* error site (auth_routes,
+                     // rest_api_v1, etc.).
                      res.status = 500;
-                     nlohmann::json err;
-                     err["error"] = disk->error();
+                     nlohmann::json err = {
+                         {"error",
+                          {{"code", 500},
+                           {"message", "Trust bundle on disk is unreadable"}}},
+                         {"meta", {{"api_version", "v1"}}}};
                      res.set_content(err.dump(), "application/json");
                      return;
                  }

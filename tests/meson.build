@@ -216,7 +216,14 @@ if build_server
     # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
     # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
     cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
-    dependencies: [yuzu_server_core_dep, catch2_dep],
+    # Server unit tests #include <openssl/...> directly (e.g.
+    # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
+    # propagate the OpenSSL include path, so declare it explicitly here
+    # rather than relying on the transitive declare_dependency carry —
+    # makes the dependency visible to Meson's graph and survives a
+    # future static-merge refactor of yuzu_server_core (governance
+    # hardening round 1, qe-B2).
+    dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
 endif

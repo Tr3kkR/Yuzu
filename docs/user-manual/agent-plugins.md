@@ -793,20 +793,26 @@ openssl cms -inform pem -text -noout -in chargen.so.sig
 
 **Configuration.** There are two paths — server-managed (recommended for fleets) and agent-local (for one-off hosts or air-gapped environments).
 
-**Server-managed (Settings → Plugin Code Signing).** An admin operator goes to the Settings page and uploads the PEM trust bundle through the **Plugin Code Signing** card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it under the server's cert directory, and exposes it at `/api/v1/agent/plugin-policy` (authenticated, JSON containing the bundle PEM + the require flag). The card also has a "Require signed plugins" checkbox that flips the agent-side require flag and a "Remove trust bundle" button that disables signing fleet-wide. Every change emits an `audit_event` with action `plugin_signing.bundle.uploaded` / `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
+**Server-managed (Settings → Plugin Code Signing).** An admin operator goes to the Settings page and uploads the PEM trust bundle through the **Plugin Code Signing** card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it atomically (temp file + rename) under the server's cert directory, and exposes it at `GET /api/v1/agent/plugin-policy` (admin-only, returns JSON containing the bundle PEM + the require flag). The card also has a "Require signed plugins" checkbox that flips the require flag and a "Remove trust bundle" button that disables signing for new agent starts. Every change emits an `audit_event` with action `plugin_signing.bundle.uploaded` / `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`.
 
-In this mode, agents can be configured by curling the policy endpoint into a local file at startup:
+In this mode, agents are configured by curling the policy endpoint (with an admin token) into a local file at startup:
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $YUZU_AGENT_TOKEN" \
-  https://server.example.com/api/v1/agent/plugin-policy \
+curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
+  https://server.example.com:8443/api/v1/agent/plugin-policy \
   | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
 
 yuzu-agent --plugin-trust-bundle /etc/yuzu/plugin-trust-bundle.pem \
            --plugin-require-signature
 ```
 
-(Fully automatic agent-side fetch is a planned follow-up; today's contract is "the bundle is hosted, the agent is told where the file is via CLI flags".)
+> **Important — fail-closed when require is set.** If you pass `--plugin-require-signature` without `--plugin-trust-bundle` (or with an empty path), the agent **refuses to start** rather than silently fail-open. This is intentional: the prior behaviour would have skipped the entire signing block and quietly loaded unsigned plugins while the operator believed enforcement was active.
+
+> **Important — Yuzu-shipped plugins are not signed yet.** This release ships the verifier; it does not yet sign the in-tree `agents/plugins/`. If you turn on Require with a trust bundle anchored only at your own CA, every Yuzu-bundled plugin will be rejected at next agent restart. Use the transitional mode (bundle uploaded, Require off) until you have signed every plugin your fleet uses, including the in-tree ones. The Settings card displays this warning inline.
+
+> **Windows admins.** The curl/jq recipe above assumes a Unix host; equivalent PowerShell using `Invoke-RestMethod` + `ConvertFrom-Json` works against the same endpoint. Place the resulting PEM at `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem` and pass the path via `--plugin-trust-bundle`.
+
+(Fully automatic agent-side fetch is a planned follow-up; today's contract is "the bundle is hosted on the server, the agent is told where the local copy lives via CLI flags".)
 
 **Agent-local CLI flags:**
 
@@ -833,9 +839,14 @@ openssl req -new -x509 -key ca.key -out ca.pem -days 3650 \
 openssl ecparam -genkey -name prime256v1 -out signer.key
 openssl req -new -key signer.key -out signer.csr \
   -subj "/CN=Plugin Signer"
+# extendedKeyUsage=codeSigning is REQUIRED — the agent's verifier
+# enforces X509_PURPOSE_CODE_SIGN, so a leaf without this EKU is
+# rejected even if it chains to the trusted CA. This prevents a CA that
+# also issues mTLS or S/MIME certs from being a plugin-signing
+# authority for those siblings.
 openssl x509 -req -in signer.csr -CA ca.pem -CAkey ca.key \
   -CAcreateserial -out signer.pem -days 365 \
-  -extfile <(printf "extendedKeyUsage=codeSigning")
+  -extfile <(printf "extendedKeyUsage=codeSigning\nkeyUsage=critical,digitalSignature")
 
 # Per-plugin: sign with the leaf, distribute ca.pem as the trust bundle.
 openssl cms -sign -binary -nodetach=false \
