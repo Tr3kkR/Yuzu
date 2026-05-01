@@ -162,100 +162,16 @@ The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` →
 - DSL spec: `docs/yaml-dsl-spec.md`
 - Beginner tutorial: `docs/getting-started.md`
 
-### Executions-history ladder — `command_id → execution_id` mapping invariant (PR 2+)
+### Executions-history ladder
 
-`responses.execution_id` is populated at write time by an in-memory
-`cmd_execution_ids_` map inside `AgentServiceImpl` (under `cmd_times_mu_`).
-The mapping is registered at dispatch time INSIDE `cmd_dispatch` BEFORE any
-RPC is sent — closes the FAST-agent race where a sub-millisecond loopback
-agent could reply before a post-dispatch registration. The `CommandDispatchFn`
-typedef carries `execution_id` as its sixth parameter; pass empty to opt out
-(out-of-band dispatch / no-tracker callers).
-
-**Known coverage gap (every PR in this ladder must check this).** Only
-`/api/instructions/:id/execute` (`workflow_routes.cpp`) creates an execution
-row AND threads `execution_id` into `cmd_dispatch`. The following dispatch
-surfaces produce `execution_id=''` responses, falling back to the legacy
-timestamp-window join in the executions detail drawer:
-
-- Workflow-step dispatch (`/api/workflows/:id/execute` step `cmd_dispatch`
-  callback at `workflow_routes.cpp` line ~925)
-- MCP `execute_instruction` (`mcp_server.cpp`)
-- Schedule / approval-triggered dispatch
-- Rerun (`/api/executions/:id/rerun` via `create_rerun` — does not currently
-  dispatch a command, so the gap is structural, not a wiring bug)
-
-Closing each gap is the scope of PR 2.x follow-ups. **When adding any new
-dispatch path that creates an execution row, it MUST thread `execution_id`
-into `cmd_dispatch`** — failure produces silent empty-string tagging with
-no error or warning.
-
-**Multi-agent fan-out invariant.** A single `command_id` is dispatched to N
-agents; each agent sends its own response with the same `command_id`.
-Terminal-status branches in `agent_service_impl.cpp` do NOT erase
-`cmd_execution_ids_` — erasing on the first agent's terminal would leave
-agents 2..N stamping empty `execution_id`. Map entries persist for process
-lifetime; a periodic sweeper is filed as PR 2.x. The accepted bounded leak
-matches the existing `cmd_send_times_` / `cmd_first_seen_` shape under the
-same `cmd_times_mu_`.
-
-**Server restart caveat.** The mapping is in-memory; restart loses it.
-In-flight commands at restart time produce responses tagged `execution_id=''`
-that use the legacy fallback in the drawer.
-
-**Partial-index planner contract.** `idx_resp_execution_ts ON
-responses(execution_id, timestamp) WHERE execution_id != ''` requires the
-WHERE clause to syntactically subsume the partial-index predicate. Every
-query against this index must include `AND execution_id != ''` redundantly,
-or SQLite falls back to a full table scan. See `query_by_execution`'s SQL
-in `response_store.cpp` for the canonical form.
-
-### Executions-history ladder — PR 3 SSE live updates
-
-`ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is
-the per-execution SSE bus that backs `GET /sse/executions/{id}`. Owned by
-`ServerImpl`, declared BEFORE `execution_tracker_` in the member list so
-the bus outlives the tracker (the tracker borrows the bus pointer via
-`set_event_bus`). On the explicit shutdown path the order is also tracker
-first, then bus.
-
-**Publisher invariant.** Three `ExecutionTracker` mutators publish onto
-the bus when set:
-- `update_agent_status` → `agent-transition` (one event per agent
-  state change; payload is the `AgentExecStatus` JSON).
-- `refresh_counts` → `execution-progress` (counts snapshot) AND, when the
-  recompute crosses the all-agents-responded threshold, a terminal
-  `execution-completed` (status=succeeded|completed). The progress event
-  precedes the terminal event so an SSE client receives counts then
-  status.
-- `mark_cancelled` → terminal `execution-completed` (status=cancelled).
-
-**Bounded ring buffer.** Per execution: `kBufferCap=1000` events FIFO,
-~30 s window in practice. Replay walks events with `id > Last-Event-ID`
-on reconnect. Channels marked terminal are GC'd by
-`gc_terminal_channels` once `kRetentionAfterTerminalSec=60` elapses AND
-no live subscribers remain. GC runs opportunistically from `publish` so
-no separate timer thread is required.
-
-**Client-side bootstrap is data-attribute-driven.** The list-row markup
-carries `data-execution-id` and `data-execution-status`; the drawer's
-KPI strip carries `id="exec-kpi-{id}"`; per-agent table rows carry
-`id="per-agent-row-{exec_id}-{agent_id}"`; per-agent status badges carry
-`.per-agent-status` and `.per-agent-exit-code` classes. **Every PR that
-touches drawer markup MUST keep these stamps stable** — they are the
-client SSE listener's binding contract. Renaming any of them is a
-silent regression: the listener falls back to no-op and the drawer
-freezes mid-execution with no error.
-
-**Audit policy.** `execution.live_subscribe` audits on first connect per
-session-per-execution (deduped). SSE auto-reconnect inside the dedup
-window does NOT re-audit. The forensic-grade audit on read remains on
-`/fragments/executions/{id}/detail`'s `execution.detail.view`.
-
-**Hard predecessor for PR 3.** PR 2.5 (#670) replaced the 16-arg
-`WorkflowRoutes::register_routes` with a `WorkflowRoutes::Deps` struct.
-**Do not regress that signature** — adding new dependencies to the
-workflow routes goes through the struct, not new positional arguments.
+PR 2 (`responses.execution_id` correlation) and PR 3 (SSE live updates) ship
+a stack of invariants every successor PR must check — `cmd_execution_ids_`
+race-free dispatch registration, the `execution_id=''` coverage-gap list,
+multi-agent fan-out non-erase rule, partial-index `WHERE execution_id != ''`
+planner contract, `ExecutionEventBus` lifetime ordering, the data-attribute
+binding contract on drawer markup, and the `WorkflowRoutes::Deps` struct that
+PR 2.5 (#670) made the **hard predecessor** for any new dispatch surface.
+Full reference: `docs/executions-history-ladder.md`.
 
 ## Enterprise Readiness and SOC 2
 
@@ -390,59 +306,23 @@ docs/             Architecture docs, conventions, roadmap, capability map
 
 ## CI architecture
 
-The CI overhaul (April 2026) split work into three tiers. Plan: `/home/dornbrn/.claude/plans/our-ci-has-been-piped-castle.md`. The `build-ci` agent owns the matrix; `cross-platform` owns Windows/macOS specifics.
+Three-tier split (April 2026 overhaul). Full reference + cache-key contract +
+runner topology + persistence rules + canary + corruption-recovery:
+`docs/ci-architecture.md`. The `build-ci` agent owns the matrix;
+`cross-platform` owns Windows/macOS specifics.
 
-**Tier 1 — PR fast-path** (`ci.yml` on `pull_request`): one Linux variant (gcc-13 debug on `yuzu-wsl2-linux`), one Windows variant (MSVC debug on `yuzu-local-windows`), one macOS variant (appleclang debug on GHA-hosted `macos-15`), plus `proto-compat`. Wall target: <10 min per leg.
+- **Tier 1 — PR fast-path** (`ci.yml` on PRs): one Linux (gcc-13 debug,
+  `yuzu-wsl2-linux`) + one Windows (MSVC debug, `yuzu-local-windows`) + one
+  macOS (appleclang debug, `macos-15`) + `proto-compat`. <10 min wall.
+- **Tier 2 — push to dev/main**: full 4-way Linux matrix, 2-way Windows,
+  2-way macOS. No sanitizers, no coverage (#410).
+- **Tier 3 — nightly cron** (`nightly.yml`, 0 6 * * * UTC): ASan+UBSan, TSan,
+  coverage, on Linux self-hosted. Failure auto-opens a `nightly-broken` issue.
+  **Discipline norm: no merge to main while `nightly-broken` is open.**
 
-**Tier 2 — push to dev/main** (`ci.yml` on push to those branches): full 4-way Linux matrix (gcc-13 / clang-19 × debug / release), 2-way Windows, 2-way macOS. **No sanitizers, no coverage** — those moved out (#410 closed as not-planned).
-
-**Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC + `workflow_dispatch`): ASan+UBSan, TSan, coverage, all on the self-hosted Linux runner. On any leg failure, the `alert` job auto-opens or comments on a `nightly-broken` issue. **Discipline norm: no merge to main while a `nightly-broken` issue is open.** That's the lever — sanitizers don't gate every PR; nightly catches regressions and gates main.
-
-`workflow_dispatch` only works once a workflow file exists on the **default branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are dormant until merged.
-
-### Self-hosted runner topology
-
-One runner process per OS, single source of throughput:
-
-| Runner | Host | Jobs |
-|---|---|---|
-| `yuzu-wsl2-linux` | Shulgi 5950X WSL2 Ubuntu 24.04 | proto-compat, linux matrix, nightly (asan/tsan/coverage), cache-prune-linux |
-| `yuzu-local-windows` | Shulgi native Windows 11 | windows matrix, cache-prune-windows |
-| `macos-15` | GitHub-hosted | macos matrix |
-
-Inventory declared in `.github/runner-inventory.json`. The sentinel at `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel and the new ci.yml `preflight` job share `scripts/ci/runner-health-check.py` (`--mode sentinel` vs `--mode preflight`). Preflight gates downstream self-hosted jobs with explicit `if: needs.preflight.outputs.<runner>_healthy == 'true'` — fail-closed: a degraded runner skips its jobs in <30 s rather than queueing 30 min into a stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight returns false and self-hosted jobs are skipped with a clear reason.
-
-### Universal vcpkg cache-key contract
-
-`scripts/ci/vcpkg-triplet-sentinel.sh` is the single source of truth for "have the inputs to vcpkg actually changed?". Key:
-
-```
-sha256(vcpkg.json + vcpkg-configuration.json + triplets/<triplet>.cmake + $VCPKG_COMMIT)
-```
-
-Stored at `vcpkg_installed/.<triplet>-cachekey.sha256`. On drift, wipes ONLY `vcpkg_installed/<triplet>/` — never `vcpkg/`, never `runner.tool_cache`, never ccache. Persistence: self-hosted in `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}` (per-triplet, outside workspace). macOS uses `actions/cache@v5` keyed on the same invariant.
-
-The script must run cleanly under MSYS2 bash on Windows. **Do NOT use `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under MSYS2 (cost us run #25051196135). Use `if/fi` blocks and explicit per-command error checks.
-
-### Persistence + recovery
-
-Self-hosted checkouts use `clean: false`. Pre-checkout wipes `build-<os>/` ONLY on branch change; vcpkg state is invalidated by the sentinel above. `meson setup --reconfigure` when `meson-info/` exists. Manual recovery: `bash scripts/ci/runner-reset.sh` (`git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`) — **the only sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory `feedback_vcpkg_cache.md`).
-
-### Per-OS build directory names
-
-Matrix: `build-{linux,windows,macos}`. Nightly variants: `build-linux-{asan,tsan,coverage}`. sanitizer-tests.yml + release.yml + pre-release.yml follow the same convention so the warm asan binary cache is shared. Closes #406.
-
-### Workflow-PR canary
-
-`ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. Canary mirrors the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for vcpkg — catches workflow regressions before main.
-
-### Cache pruning
-
-`cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner. Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
-
-### vcpkg state corruption — recovery path
-
-If a Windows CI run repeatedly fails at `Install vcpkg packages` with a missing `.pc` file under `vcpkg_installed/x64-windows/lib/pkgconfig/`, the corruption is in `vcpkg/packages/` (which the cache-key sentinel does NOT reach). Recovery procedure + full corruption-path inventory: `docs/ci-troubleshooting.md` §7. Don't leave the recovery step in `ci.yml` after an incident — it defeats the cache.
+`workflow_dispatch` and cron schedules only fire once the workflow file is
+on the **default branch** (`main`) — new workflows added on `dev` are dormant
+until merged.
 
 ## Release workflow gates
 
@@ -461,79 +341,33 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Concern | Doc | Loaded by |
 |---|---|---|
 | Authentication, RBAC, headers, tokens, self-target principal-destruction guard (#397/#403) | `docs/auth-architecture.md` | `security-guardian` on auth/RBAC/crypto/header/token change |
+| AuthDB invariants — `auth.db` mode, migration, lifetime, seed-vs-live, role-field-ignored, gate audit, cleanup cadence, snapshot-and-release | `.claude/agents/authdb.md` | `authdb` agent on `auth_db.{hpp,cpp}` / `auth_routes.*` / `auth_manager.cpp` change |
+| Enterprise A&A roadmap — RBAC, OIDC, SAML, SCIM, MFA, AD/Entra, API tokens, session lifecycle, audit | `.claude/skills/auth-and-authz/SKILL.md` | invoke `/auth-and-authz` for any A&A planning, audit, or implementation work |
 | MCP server architecture, tier-before-RBAC ordering, kill switches, audit pattern | `docs/mcp-server.md` | `security-guardian` on `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, `mcp_policy.hpp` change |
+| Executions-history ladder — `command_id → execution_id` map, partial-index planner contract, SSE event bus, drawer data-attribute binding | `docs/executions-history-ladder.md` | any change to `agent_service_impl.cpp` `cmd_execution_ids_`, `response_store` execution queries, `execution_event_bus.*`, `execution_tracker.*`, or executions-drawer markup |
 | C++23 conventions, naming, headers, plugin ABI boundary | `docs/cpp-conventions.md` | `cpp-expert` on any C++ source change |
 | macOS workflow + Darwin pitfalls table | `docs/darwin-compat.md` | `cross-platform` on any macOS-affecting change |
 | Prometheus metrics, label set, audit envelope, event format | `docs/observability-conventions.md` | `sre` and `architect` on any metrics/audit/event change |
 | Response data types, audit envelope, inventory data for analytics | `docs/data-architecture.md` | `architect` and `sre` when designing schemas |
 | User manual / YAML defs / REST API / Substrate primitive registration | docs-writer agent (`.claude/agents/docs-writer.md`) | docs-writer on every change as part of governance gate 2 |
-| Guardian / Guaranteed State — real-time agent-side policy enforcement, guard categories, YAML DSL, `__guard__` wire protocol, server store, approval workflow, quarantine | `docs/yuzu-guardian-design-v1.1.md` + delivery plan `docs/yuzu-guardian-windows-implementation-plan.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guard_engine*`, `guard_*.{hpp,cpp}`, or `__guard__` change |
+| Guardian / Guaranteed State — real-time agent-side policy enforcement, guard categories, YAML DSL, `__guard__` wire protocol, server store, approval workflow, quarantine, **standing invariants §24** | `docs/yuzu-guardian-design-v1.1.md` + delivery plan `docs/yuzu-guardian-windows-implementation-plan.md` | `security-guardian` + `docs-writer` on any `guaranteed_state*`, `guard_engine*`, `guard_*.{hpp,cpp}`, or `__guard__` change |
 | TAR dashboard — three frames (retention-paused sources, scope-walking SQL, process tree viewer), URL structure, permissions | `docs/tar-dashboard.md` | `architect` on `/tar` or `/fragments/tar/...` change; `plugin-developer` on TAR action surface; `docs-writer` on dashboard nav |
 | Scope walking — composable scope from previous query results (Yuzu's product differentiator). Result-set primitive, `result_sets.db`, `from_result_set:<id>` Scope kind, REST/DSL surface, lineage, audit chain | `docs/scope-walking-design.md` | `architect` + `dsl-engineer` on scope-engine/DSL/result-set change; `consistency-auditor` on audit chain; `security-guardian` on cross-operator authz |
 
-## AuthDB — persistent authentication store
+## Guardian engine — stores
 
-`auth.db` (lives in `--data-dir`) is the v0.12.0 SQLite-backed store
-for user accounts, sessions, and enrollment tokens. Replaces the prior
-in-memory + on-config-flush model that lost users on every restart
-(#618, #388, #527). Design + migrations: `docs/auth-architecture.md`.
-Operator recovery: `docs/ops-runbooks/auth-db-recovery.md`. Security
-review record: `docs/security-reviews/authdb-2026-04-30.md`.
-
-### AuthDB invariants that keep reappearing in governance
-
-- **Mode 0600 on Linux at create time, restricted ACL on Windows.** Set in
-  `AuthDB::initialize()`. Tested in `test_auth_db.cpp`; do not remove the
-  permission write (or the test) — a world-readable `auth.db` exposes salt
-  and hash for offline crack attempts.
-- **`MigrationRunner::run` is the canonical schema pattern.** Use the same
-  `std::vector<Migration>{{1, sql}, {2, alter}}` shape every other store
-  uses. PR 2 of the governance ladder (#695) corrected the original direct
-  `sqlite3_exec(schema_sql)` to this pattern; do not regress.
-- **Lifetime: `unique_ptr<AuthDB>` owned at function scope outliving
-  `Server::create()`.** PR 1 of the governance ladder (#694) widened the
-  scope so the DB destructor does not run before the server starts using
-  it. AuthManager holds a non-owning pointer via `set_auth_db()` injection.
-  Do not move ownership inside any if-block at `main.cpp:526-567`.
-- **`yuzu-server.cfg` is a one-shot first-boot seed, not a live source of
-  truth.** After `auth.db` exists, edits to the config file do NOT
-  re-seed users. The dashboard (`POST /api/settings/users` for create,
-  `POST /api/settings/users/{username}/role` for role change) is the only
-  live mutation path.
-- **`POST /api/settings/users` `role` field is ignored.** Privilege
-  escalation via the role parameter (security finding C1) was the
-  motivation for the v0.12.0 split. New users always land as `user`. The
-  dedicated role endpoint emits `user.role_change` audit events with
-  `old_role` / `new_role` in the detail.
-- **`AuthRoutes::require_admin` emits `auth.admin_required` denied audit
-  on every 403.** Centralised at the gate so every privileged-endpoint
-  rejection surfaces in the SOC 2 CC7.2 evidence chain. Threading
-  `audit_fn` into every caller instead would have been a 30+ site change
-  for the same effect.
-- **Cleanup thread cadence is 60 seconds for AuthDB**, different from
-  AuditStore's minute-based cadence, because session expiry windows are
-  typically < 1 hour and a 1-minute lag adds up fast at fleet scale. See
-  `auth_db.cpp` `run_cleanup_thread` for the contract; if you tune this,
-  update the comment.
-- **Snapshot-and-release pattern for sibling subsystems.** When AuthDB
-  needs to publish on the SSE event bus or any future bus, never call
-  `event_bus_->publish()` while holding `AuthDB::mu_`. Same rule as
-  ExecutionTracker → ExecutionEventBus (PR 3 / #702). Build the payload
-  under the lock, exit the locked scope, then publish lock-free.
-
-## Guardian engine — stores and architectural notes
-
-The Guardian rollout is Windows-first per the delivery plan. Server-side state lives in one new SQLite file opened at startup next to `policy_store_`:
-
-- **`guaranteed-state.db`** (PR 1) — `GuaranteedStateStore` with `guaranteed_state_rules` + `guaranteed_state_events`. Rule yaml_source is authoritative; denormalised columns (severity, os_target, scope_expr) are indexes. Events are an immutable audit-style log (no FK cascade on rule delete; historical events persist for forensic review — matches `audit_store` retention discipline). Proto lives at `proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1` — deliberately separate from `yuzu.agent.v1` so Guardian wire contracts evolve independently). Full schema + design: `docs/yuzu-guardian-design-v1.1.md` §9.1.
-
-Agent-side Guardian PR 2 shipped in `agents/core/src/guardian_engine.{hpp,cpp}`. Two-phase startup (`start_local()` pre-network, `sync_with_server()` post-Register), KV namespace `__guardian__`, reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop. Actions: `push_rules`, `get_status`. Every rule reports `errored` until PR 3 lands the Registry Guard. The `guard_*.{hpp,cpp}` files remain PR 3+ (guard implementations per guard_category / guard_type). See `docs/yuzu-guardian-windows-implementation-plan.md` for the PR ladder.
-
-### Guardian invariants that keep reappearing in governance
-
-- **RBAC `Push` seed is Guardian-only.** `rbac_store.cpp` has TWO operation arrays: `ops[]` (the full catalogue, 6 entries including `Push`) and `crud_ops[]` (the 5 ops cross-seeded to every securable type in the Administrator + ITServiceOwner role loops). `Push` is deliberately absent from `crud_ops[]` and is granted explicitly per role on `GuaranteedState` alone. **Do not add `Push` to `crud_ops[]` or cross-seed it** — every role gaining `*:Push` silently grants a privilege that any future handler consulting `perm_fn(..., "Push")` on a non-Guardian securable would accept. This is the H-4 invariant from Guardian PR 2 hardening round 2; see issue #485 for the upgrade-path migration that removes stale cross-type grants on deployments that ran pre-H-4 code.
-- **Reserved plugin name `__guard__` is intercepted before the plugin match loop.** Load-time rejection lives in `plugin_loader.cpp` (PR #453); dispatch-time intercept lives in `agent.cpp` in front of the plugin scan (PR 2). Both halves must stay — the load-time check is the primary defence, the dispatch-time intercept is defence-in-depth. See #477 for the known `dlopen`-before-name-check gap that the load-time check inherits.
-- **Guardian wire payloads in `CommandRequest.parameters` are not gateway-safe.** Any field that carries raw proto bytes (serialised `GuaranteedStatePush`, binary signatures, etc.) must NOT be placed in a `map<string, string>` that the gateway will re-encode via `gpb:e_type_string`. The Erlang gateway runs `unicode:characters_to_binary/1` which rejects invalid UTF-8 varints — the crash surface lands the moment Guardian PR 3 wires fan-out. See #478 for the schema/wire fix.
+`guaranteed-state.db` (PR 1) holds `GuaranteedStateStore` with rules + events
+tables; rule `yaml_source` is authoritative, denormalised columns are
+indexes; events are an immutable audit-style log. Proto lives at
+`proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1` —
+separate from `yuzu.agent.v1` so wire contracts evolve independently).
+Agent-side `guardian_engine.{hpp,cpp}` (PR 2) does two-phase startup
+(`start_local()` pre-network, `sync_with_server()` post-Register), KV
+namespace `__guardian__`, reserved plugin name `__guard__` intercepted in
+`agent.cpp` before the plugin match loop. Schema: `docs/yuzu-guardian-design-v1.1.md`
+§9.1; standing invariants (`Push`-seed scope, `__guard__` defence-in-depth,
+gateway-safe wire payloads): same doc §24; PR ladder:
+`docs/yuzu-guardian-windows-implementation-plan.md`.
 
 ## Test conventions — shared helpers
 
