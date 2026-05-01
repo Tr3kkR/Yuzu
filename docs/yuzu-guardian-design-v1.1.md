@@ -2390,3 +2390,36 @@ The main weakness is tamper resistance: a local admin can kill the agent process
 If a future release requires preventive enforcement (blocking changes before they happen rather than reverting after), the industry-standard approach is a hybrid architecture: a small, stable kernel component acts as a sensor and optional gate, while the userspace agent retains all policy logic, remediation, communication, and reporting. The kernel component observes events, optionally blocks operations (e.g., returning `STATUS_ACCESS_DENIED` from a Windows minifilter callback), and passes event data to userspace. It is deliberately minimal (a few thousand lines), changes infrequently, and on Windows is the only piece requiring WHQL certification. This is the architecture used by CrowdStrike, SentinelOne, and Microsoft Defender for Endpoint.
 
 This would be a Phase 15+ addition, not a rearchitecture of the current Phases A–X design.
+
+---
+
+## 24. Standing Guardian invariants (governance reference)
+
+Pulled out of CLAUDE.md so the design doc carries them. Every PR in the
+Guardian ladder must check these.
+
+- **RBAC `Push` seed is Guardian-only.** `rbac_store.cpp` has TWO operation
+  arrays: `ops[]` (the full catalogue, 6 entries including `Push`) and
+  `crud_ops[]` (the 5 ops cross-seeded to every securable type in the
+  Administrator + ITServiceOwner role loops). `Push` is deliberately absent
+  from `crud_ops[]` and is granted explicitly per role on `GuaranteedState`
+  alone. **Do not add `Push` to `crud_ops[]` or cross-seed it** — every role
+  gaining `*:Push` silently grants a privilege that any future handler
+  consulting `perm_fn(..., "Push")` on a non-Guardian securable would accept.
+  This is the H-4 invariant from Guardian PR 2 hardening round 2; see issue
+  #485 for the upgrade-path migration that removes stale cross-type grants
+  on deployments that ran pre-H-4 code.
+- **Reserved plugin name `__guard__` is intercepted before the plugin match
+  loop.** Load-time rejection lives in `plugin_loader.cpp` (PR #453);
+  dispatch-time intercept lives in `agent.cpp` in front of the plugin scan
+  (PR 2). Both halves must stay — the load-time check is the primary
+  defence, the dispatch-time intercept is defence-in-depth. See #477 for the
+  known `dlopen`-before-name-check gap that the load-time check inherits.
+- **Guardian wire payloads in `CommandRequest.parameters` are not
+  gateway-safe.** Any field that carries raw proto bytes (serialised
+  `GuaranteedStatePush`, binary signatures, etc.) must NOT be placed in a
+  `map<string, string>` that the gateway will re-encode via
+  `gpb:e_type_string`. The Erlang gateway runs
+  `unicode:characters_to_binary/1` which rejects invalid UTF-8 varints — the
+  crash surface lands the moment Guardian PR 3 wires fan-out. See #478 for
+  the schema/wire fix.
