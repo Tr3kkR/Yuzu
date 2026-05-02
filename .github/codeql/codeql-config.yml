@@ -1,20 +1,52 @@
 name: "Yuzu CodeQL config"
 
-# Exclude third-party and generated code from CodeQL scanning.
+# Restrict the CodeQL alert surface to first-party code.
 #
-# vcpkg_installed/  — vendored dependency headers (protobuf, abseil,
-#   grpc, httplib, etc.). Any finding here is an upstream bug we cannot
-#   fix in-tree and would be erased by the next vcpkg cache rebuild.
-# build-*/          — per-OS Meson build trees (build-linux,
-#   build-windows, build-macos, build-linux-codeql, etc.). Contains
-#   generated .pb.cc files and moc output; findings are derivative of
-#   the source headers CodeQL already scans directly.
-# builddir*/        — legacy build tree names from before the per-OS
-#   convention landed (kept for belt-and-braces; currently .gitignored).
-# _build/           — rebar3 Erlang build dir (Erlang isn't in the
-#   scanned languages but this avoids stray .beam / source scans).
+# Why both `paths` and `paths-ignore`:
+#   For compiled languages, the build tracer extracts every TU it
+#   observes — including #include'd vendored headers reached from a
+#   first-party source file. `paths` and `paths-ignore` are applied
+#   to alerts post-analysis. A previous iteration of this file (#471)
+#   carried only `paths-ignore: vcpkg_installed/**`, and the
+#   2026-04-26 scheduled scan still uploaded `cpp/...` alerts located
+#   in `vcpkg_installed/x64-linux/include/...` and
+#   `vcpkg_installed/x64-windows/include/...`. Empirically the
+#   ignore-glob alone does not bound the SARIF for vendored headers
+#   reached transitively. A positive `paths:` include list is the
+#   reliable bound; the `paths-ignore` block stays as belt-and-braces
+#   so the vendored/generated trees are documented in one place.
+#
+# Trees included (first-party C++ + actions YAML):
+#   agents/, server/, sdk/, proto/, tests/  — Yuzu source
+#   .github/                                 — actions language scans
+#
+# Trees excluded:
+#   vcpkg_installed/  — vendored dependency headers (protobuf, abseil,
+#     grpc, httplib, CLI11, Catch2, etc.); upstream bugs we cannot fix
+#     in-tree and which would be erased by the next vcpkg cache rebuild.
+#   build-*/          — per-OS Meson build trees (build-linux,
+#     build-windows, build-macos, build-linux-codeql, etc.). Contains
+#     generated .pb.cc / .pb.h files; findings are derivative of the
+#     proto sources CodeQL already reads directly.
+#   builddir*/        — legacy build tree names from before the per-OS
+#     convention landed (kept for belt-and-braces; currently
+#     .gitignored).
+#   _build/           — rebar3 Erlang build dir.
+#   **/*.pb.{cc,h}    — generated protobuf sources, in case any leak
+#     into the first-party paths above.
+
+paths:
+  - agents
+  - server
+  - sdk
+  - proto
+  - tests
+  - .github
+
 paths-ignore:
-  - "vcpkg_installed/**"
-  - "build-*/**"
-  - "builddir*/**"
-  - "_build/**"
+  - vcpkg_installed/**
+  - build-*/**
+  - builddir*/**
+  - _build/**
+  - "**/*.pb.cc"
+  - "**/*.pb.h"
