@@ -64,8 +64,11 @@ jobs:
         id: prev
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind tag to env so a tag with shell metacharacters can't be
+          # interpolated into the script body (CodeQL
+          # actions/code-injection/critical).
+          CURRENT: ${{ steps.ver.outputs.tag }}
         run: |
-          CURRENT="${{ steps.ver.outputs.tag }}"
           PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
             -q "[.[] | select(.tagName != \"$CURRENT\" and .isPrerelease == false)] | .[0].tagName // empty")
           if [[ -n "$PREV" ]]; then
@@ -80,8 +83,9 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind tag to env to avoid code-injection via crafted ref name.
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
           mkdir -p artifacts
           gh release download "$TAG" --dir artifacts/ || {
             echo "Release $TAG not found yet, waiting 60s..."
@@ -121,8 +125,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull release images
+        env:
+          # Bind tag to env to avoid code-injection via crafted ref name.
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          TAG="${{ needs.resolve.outputs.tag }}"
           for img in yuzu-server yuzu-agent yuzu-gateway; do
             docker pull "$REGISTRY/$img:${TAG#v}"
           done
@@ -918,9 +924,10 @@ jobs:
           R_SECURITY: ${{ needs.security-scan.result }}
           R_SOAK: ${{ needs.soak-test.result }}
           R_UPGRADE: ${{ needs.upgrade-test.result }}
+          # Bind tag/version to env to avoid code-injection via crafted ref name.
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
-          TAG="${{ needs.resolve.outputs.tag }}"
 
           status_icon() {
             case "$1" in
