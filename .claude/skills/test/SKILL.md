@@ -259,6 +259,23 @@ bash scripts/test/test-db-write.sh gate \
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
 
+### Pre-warm rebar3 dep caches (mandatory, sequential)
+
+EUnit, Dialyzer, CT suites, and CT real-upstream all invoke `rebar3` against the same project. Run in parallel, they race on dep fetching: each calls `Verifying dependencies...` and decides to re-fetch `proper`/`meck`/`covertool` into `_build/{default,test}/lib/`, and concurrent extraction corrupts the partially-fetched packages so the loser sees `Dependency failure: source for proper does not contain a recognizable project`. Once a fetch is in-flight a sibling rebar3 also can't `rm -rf` the partial dir (`Directory not empty`) because the writer still has open file handles. This was observed in run `1777704747-244808` and is a property of rebar3, not of the gates.
+
+The cure is to fetch deps **serially** before the fan-out. Both the `test` and `default` profiles need warming because EUnit/CT use `_build/test/` while Dialyzer uses `_build/default/`. After this step the parallel rebar3 commands skip the fetch path and just compile + run their stage:
+
+```bash
+(
+    cd gateway
+    source ../scripts/ensure-erlang.sh 2>/dev/null
+    rebar3 as test compile > "$LOG_DIR/prewarm-test.log" 2>&1 || true
+    rebar3 compile         > "$LOG_DIR/prewarm-default.log" 2>&1 || true
+)
+```
+
+Pre-warm failures use `|| true` because if either profile genuinely can't compile, the corresponding gate (EUnit / Dialyzer / CT) will fail with the same error and that gate's log is the right reporting surface — the pre-warm step is for cache correctness, not for gating.
+
 The pattern for every gate (note: `eval "$cmd"` is safe here because every
 caller below passes a literal string constructed inline in this same skill;
 the `cmd` argument is never read from operator input or external state):
