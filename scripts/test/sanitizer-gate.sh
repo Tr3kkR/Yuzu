@@ -50,7 +50,14 @@ Required:
   --run-id ID
 
 Optional:
-  --ref SHA                (default: git rev-parse HEAD)
+  --ref REF                git ref to dispatch against (default: current
+                           branch name from \`git rev-parse --abbrev-ref
+                           HEAD\`). MUST be a branch or tag name —
+                           GitHub's workflow_dispatch API rejects bare
+                           commit SHAs with "No ref found for: <SHA>"
+                           even when the SHA is on origin. Branch
+                           dispatch resolves to the branch's tip, so
+                           push your changes before running this gate.
   --out-dir DIR            (default: /tmp/yuzu-test-\${RUN_ID}/sanitizer)
   --timeout-minutes N      (default: 90)
   --suite asan|tsan|both   (default: both)
@@ -82,7 +89,14 @@ if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
     exit 2
 fi
 
-REF="${REF:-$(git -C "$YUZU_ROOT" rev-parse HEAD)}"
+# GitHub's workflow_dispatch API only accepts branch/tag names for `--ref`,
+# not commit SHAs (HTTP 422 "No ref found"). Default to the current branch
+# name; the workflow runs against whatever the branch's tip is at dispatch
+# time. Operators must push before running this gate; if local HEAD is
+# ahead of origin, dispatch-runner-job's run-discovery filter
+# (headSha == TARGET_SHA on local) will fail to find the run since the
+# remote branch tip differs from local HEAD.
+REF="${REF:-$(git -C "$YUZU_ROOT" rev-parse --abbrev-ref HEAD)}"
 OUT_DIR="${OUT_DIR:-/tmp/yuzu-test-${RUN_ID}/sanitizer}"
 mkdir -p "$OUT_DIR"
 
