@@ -71,7 +71,11 @@ void CertReloader::start() {
 }
 
 void CertReloader::stop() {
-    stop_requested_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(stop_mu_);
+        stop_requested_.store(true, std::memory_order_release);
+    }
+    stop_cv_.notify_all();
     if (thread_.joinable())
         thread_.join();
 }
@@ -80,16 +84,18 @@ void CertReloader::run_loop() {
     spdlog::info("Certificate reload watcher started (interval={}s, cert={}, key={})",
                  params_.interval.count(), params_.cert_path.string(), params_.key_path.string());
 
-    while (!stop_requested_.load(std::memory_order_acquire)) {
-        // Sleep in 5-second increments for responsive shutdown
-        auto interval_secs = std::max(int64_t{10}, params_.interval.count());
-        auto increments = interval_secs / 5;
-        for (int64_t i = 0; i < increments && !stop_requested_.load(std::memory_order_acquire);
-             ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds{5});
-        }
-        if (stop_requested_.load(std::memory_order_acquire))
+    auto interval_secs = std::max(int64_t{10}, params_.interval.count());
+    while (true) {
+        // wait_for(pred) returns true iff the predicate is true at exit (i.e.
+        // stop was requested). Returns false if the timeout elapsed without
+        // stop, which is our cue to poll the cert files.
+        std::unique_lock<std::mutex> lk(stop_mu_);
+        if (stop_cv_.wait_for(lk, std::chrono::seconds{interval_secs}, [this] {
+                return stop_requested_.load(std::memory_order_acquire);
+            })) {
             break;
+        }
+        lk.unlock();
 
         if (files_changed()) {
             (void)try_reload();
@@ -186,7 +192,10 @@ bool CertReloader::try_reload() {
         return false;
     }
 
-    SSL_CTX* ctx = ssl_server->ssl_context();
+    // tls_context() supersedes ssl_context() in cpp-httplib (the latter is
+    // marked [[deprecated]]). Both return the same underlying SSL_CTX*; the
+    // typed cast keeps the rest of this function unchanged.
+    SSL_CTX* ctx = static_cast<SSL_CTX*>(ssl_server->tls_context());
     if (!ctx) {
         spdlog::error("cert-reload: SSL context is null");
         ++failure_count_;
