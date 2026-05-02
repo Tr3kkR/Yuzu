@@ -292,22 +292,30 @@ bash scripts/test/test-db-write.sh gate \
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
 
-### Pre-warm rebar3 dep caches (mandatory, sequential)
+### Race-free parallel rebar3 via `REBAR_BASE_DIR`
 
-EUnit, Dialyzer, CT suites, and CT real-upstream all invoke `rebar3` against the same project. Run in parallel, they race on dep fetching: each calls `Verifying dependencies...` and decides to re-fetch `proper`/`meck`/`covertool` into `_build/{default,test}/lib/`, and concurrent extraction corrupts the partially-fetched packages so the loser sees `Dependency failure: source for proper does not contain a recognizable project`. Once a fetch is in-flight a sibling rebar3 also can't `rm -rf` the partial dir (`Directory not empty`) because the writer still has open file handles. This was observed in run `1777704747-244808` and is a property of rebar3, not of the gates.
+EUnit, CT suites, and CT real-upstream all consume `_build/test/lib/yuzu_gw/test/` for the same set of compiled `*_tests.beam` and `*_SUITE.beam` files. When run in parallel against a shared `_build/` they race on **two** different things:
 
-The cure is to fetch deps **serially** before the fan-out. Both the `test` and `default` profiles need warming because EUnit/CT use `_build/test/` while Dialyzer uses `_build/default/`. After this step the parallel rebar3 commands skip the fetch path and just compile + run their stage:
+1. **Dep fetching.** Each invocation calls `Verifying dependencies...`, decides to re-fetch `proper`/`meck`/`covertool` into `_build/{default,test}/lib/`, and concurrent extraction corrupts the partially-fetched packages — the loser sees `Dependency failure: source for proper does not contain a recognizable project`, and the post-failure `rm -rf` fails with `Directory not empty` because the writer still has open file handles. (Observed in run `1777704747-244808`.)
+2. **Test source compile.** When any `test/` `.erl` is edited, both rebar3 processes recompile the entire test/ directory, racing on `.bea#` → `.beam` atomic-rename of every test module — manifests as `failed to rename .../yuzu_gw_health_nf_tests.bea# to .../yuzu_gw_health_nf_tests.beam: no such file or directory` (the writer's tempfile gets unlinked underneath it). Observed in run `1777727834-294523` after the first race fix landed.
+
+Sequential pre-warming would fix (1) but not (2) — rebar3 has no clean way to compile test/ without running tests, and any test-running pre-warm doubles the wall time of the slowest gate. The cleaner cure is to give each parallel gate **its own `_build/` tree** via `REBAR_BASE_DIR`. EUnit writes to `_build_eunit/`, CT suites to `_build_ct/`, CT real-upstream to `_build_ct_realup/`, Dialyzer keeps the shared `_build/`. They cannot collide because they touch different filesystem paths.
+
+The fan-out below sets `REBAR_BASE_DIR` per gate. First-run cost is one-time deps refetch into each tree (~10s); subsequent runs find both trees warm. Total Phase 5 wall time goes 60s pre-fix → 105-140s with REBAR_BASE_DIR (cold first run) → ~95s warm — comparable to the broken parallel fan-out, but actually correct.
+
+Dialyzer keeps the default `_build/` because it's the only consumer of `_build/default/` in Phase 5 — there is no race partner. Keeping its tree separate also means a `rebar3 dialyzer` run from outside `/test` reuses the same PLT cache.
+
+A pre-warm of the default `_build/` (compiling `src/` + `_build/default/lib/` deps) is no longer needed for race-correctness; it's still cheap (~17s) and shaves a few seconds off Dialyzer first-run cold starts, so we keep it as a small optimisation. It MUST NOT touch `_build_eunit/` or `_build_ct/`:
 
 ```bash
 (
     cd gateway
     source ../scripts/ensure-erlang.sh 2>/dev/null
-    rebar3 as test compile > "$LOG_DIR/prewarm-test.log" 2>&1 || true
-    rebar3 compile         > "$LOG_DIR/prewarm-default.log" 2>&1 || true
+    rebar3 compile > "$LOG_DIR/prewarm-default.log" 2>&1 || true
 )
 ```
 
-Pre-warm failures use `|| true` because if either profile genuinely can't compile, the corresponding gate (EUnit / Dialyzer / CT) will fail with the same error and that gate's log is the right reporting surface — the pre-warm step is for cache correctness, not for gating.
+Pre-warm failures use `|| true` because if `src/` genuinely can't compile, every gate will fail with the same error and that's the right reporting surface — the pre-warm step is just for first-run cold-start latency, not for gating.
 
 The pattern for every gate (note: `eval "$cmd"` is safe here because every
 caller below passes a literal string constructed inline in this same skill;
@@ -346,13 +354,13 @@ gate_run "C++ unit (Catch2)" "unit-cpp.log" \
     "meson test -C build-linux --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 eunit --dir apps/yuzu_gw/test"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test"
 
 gate_run "Dialyzer" "dialyzer.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 dialyzer"
 
 gate_run "CT suites" "ct.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
@@ -366,7 +374,7 @@ gate_run "CT suites" "ct.log" \
 # "No enrollment token: …"} per-case rather than a useful skip — file
 # an upstream issue if you hit that during /test.
 gate_run "CT real-upstream" "ct-real-upstream.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct_realup rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
 
 gate_run "Integration" "integration.log" \
     "bash scripts/integration-test.sh"

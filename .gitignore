@@ -18,6 +18,7 @@ out/
 gateway/_build/
 gateway/_build_eunit/
 gateway/_build_ct/
+gateway/_build_ct_realup/
 gateway/.deps_cache/
 gateway/ebin/
 erl_crash.dump
