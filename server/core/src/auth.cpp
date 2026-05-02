@@ -418,6 +418,13 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
 }
 
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {
+    // Reject overly-long tokens early to prevent DoS via map key exhaustion (#630).
+    // This check intentionally fires BEFORE the mutex acquire below — rejecting
+    // obviously invalid tokens without contention reduces lock contention under
+    // token-spray attacks.
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
+
     std::shared_lock lock(mu_);
 
     auto it = sessions_.find(token);

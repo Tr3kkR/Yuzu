@@ -11,6 +11,9 @@
 
 namespace yuzu::server::auth {
 
+/// Maximum session token length (64 hex chars = 32 bytes random). Reject longer to prevent DoS.
+inline constexpr std::size_t kMaxSessionTokenLength = 64;
+
 enum class Role { user, admin };
 
 struct UserEntry {
