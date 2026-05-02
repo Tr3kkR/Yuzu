@@ -28,14 +28,27 @@ Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
 Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
-Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent)
+Phase 7a — Perf gate            (--full only — runs HERE on a quiet box,
+                                 BEFORE Phase 4 brings up the UAT stack;
+                                 perf is fully self-contained and contention-
+                                 sensitive, so it must measure with no other
+                                 yuzu processes running)
+Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
+                                 through Phase 8 so humans can poke at the
+                                 stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / e2e-security /
                                  synthetic UAT / puppeteer)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
-Phase 7 — Coverage + Perf       (--full only — enforce baselines)
-Phase 8 — Teardown + Summary    (down stacks, finalize test_runs row, print table)
+Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
+Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
+                                 finalises run row; LEAVES THE UAT ALIVE on
+                                 purpose — do NOT call linux-start-UAT.sh stop)
 ```
+
+**Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
+
+**Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `linux-start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/linux-start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
 Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
@@ -236,6 +249,26 @@ bash scripts/test/test-ota-agent-windows.sh --run-id "$RUN_ID"
 bash scripts/test/test-ota-agent-macos.sh   --run-id "$RUN_ID"   # SKIP until hardware arrives
 ```
 
+## Phase 7a — Perf gate (runs HERE, before Phase 4)
+
+`--full` only. Despite the `7a` label (rows are tagged `phase=7` in the DB so they group with coverage in the report), the perf gate runs **here** in wall-clock order — after Phase 3 has finished but before Phase 4 brings up the UAT stack. This is the most-quiesced point in the pipeline:
+
+- Phase 1 build is done (binaries exist; ccache hits stop competing).
+- Phase 2 docker compose has been torn down.
+- Phase 3 is just DB writes.
+- Phase 4 hasn't started, so no native server/gateway/agent.
+- Phase 5 hasn't started, so no parallel fan-out CPU pressure.
+
+The perf suite is fully self-contained (every upstream RPC meck'd, gateway components in-process), so it has no functional dependency on the live stack. Running it here avoids the contention failure mode observed in run `1777704747-244808` where measurements taken while the Phase 4 UAT stack was still up landed below the 10% tolerance.
+
+```bash
+if [[ "$MODE" == "full" ]]; then
+    bash scripts/test/perf-gate.sh --run-id "$RUN_ID"
+fi
+```
+
+`perf-gate.sh` enforces this contract from its own side too: at startup it scans the seven UAT-related ports (8080, 50051, 50052, 50055, 50063, 8081, 9568) and refuses to run if any are listening, with a clear FAIL row noting which ports were busy. The `--allow-busy` flag bypasses the check for debug invocations but is rejected when combined with `--capture-baselines` so contended numbers can never anchor a committed baseline. The gate also records `perf_loadavg_pre` / `perf_loadavg_post` metrics so trend queries can distinguish a real regression from a measurement taken under load.
+
 ## Phase 4 — Fresh Stack Stand-up
 
 Skipped in `--quick`. Default and `--full` use the existing `linux-start-UAT.sh` to bring up server+gateway+agent natively (faster than docker for Phase 5 e2e gates that hit the live stack):
@@ -400,14 +433,13 @@ The gate script:
 
 **Suite selection.** Default runs both (ASan+UBSan and TSan). Override with `--suite asan` or `--suite tsan` on the gate script — useful when diagnosing a single finding and you don't want the second rebuild to compete for runner time.
 
-## Phase 7 — Coverage + Perf (PR2)
+## Phase 7b — Coverage (PR2)
 
-Both gates run locally on the operator's dev box. Coverage uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact); perf drives `rebar3 ct --suite=yuzu_gw_perf_SUITE`.
+Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf gate (Phase 7a) already ran on a quiet box.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
     bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"
-    bash scripts/test/perf-gate.sh     --run-id "$RUN_ID"
 elif [[ "$MODE" == "default" ]]; then
     # Default mode: coverage in report-only (metric recorded, no enforce);
     # perf skipped (default-mode budget is too tight for the ~3-5 min

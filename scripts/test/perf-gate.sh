@@ -53,6 +53,7 @@ PERF_AGENTS="5000"
 PERF_HEARTBEATS="20000"
 PERF_FANOUT="5000"
 PERF_GROUPS="registration,heartbeat,fanout,churn"
+ALLOW_BUSY=0
 
 usage() {
     cat <<EOF
@@ -66,6 +67,8 @@ Optional:
   --tolerance-pct F          (default: 10)
   --capture-baselines        rewrite baseline from current run (then PASS)
   --report-only              parse + record metrics, don't enforce
+  --allow-busy               skip the quiesce check (debug-only — measurements
+                             will be contended; do NOT use to capture baselines)
   --agents N                 YUZU_PERF_AGENTS (default: 5000)
   --heartbeats N             YUZU_PERF_HEARTBEATS (default: 20000)
   --fanout N                 YUZU_PERF_FANOUT (default: 5000)
@@ -80,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --tolerance-pct)      TOLERANCE_PCT="$2"; shift 2 ;;
         --capture-baselines)  CAPTURE=1; shift ;;
         --report-only)        REPORT_ONLY=1; shift ;;
+        --allow-busy)         ALLOW_BUSY=1; shift ;;
         --agents)             PERF_AGENTS="$2"; shift 2 ;;
         --heartbeats)         PERF_HEARTBEATS="$2"; shift 2 ;;
         --fanout)             PERF_FANOUT="$2"; shift 2 ;;
@@ -156,6 +160,77 @@ if ! command -v rebar3 >/dev/null 2>&1; then
     exit 2
 fi
 
+# ── Quiesce check ───────────────────────────────────────────────────────
+#
+# The perf suite is fully self-contained — every upstream RPC is meck'd and
+# all gateway components run in-process — so it has no functional dependency
+# on the live UAT stack. But measurements are extremely sensitive to CPU,
+# scheduler, and memory-bandwidth contention: in run 1777704747-244808 the
+# live UAT stack from Phase 4 was still up while perf measured, and the
+# numbers landed below the 10% tolerance.
+#
+# This check refuses to run if any of the well-known UAT ports is listening,
+# protecting future runs from the same trap. --allow-busy bypasses it for
+# debug invocations; --capture-baselines refuses --allow-busy because a
+# contended baseline locks bad numbers into git.
+
+# Listed once so additions land in one place.
+QUIET_PORTS=(
+    8080   # server dashboard / REST
+    50051  # server agent gRPC + gateway agent-facing gRPC
+    50052  # server management gRPC
+    50055  # server gateway upstream
+    50063  # gateway management/command forwarding
+    8081   # gateway health
+    9568   # gateway prometheus
+)
+
+ports_in_use() {
+    if ! command -v ss >/dev/null 2>&1; then
+        return 0  # no ss → cannot prove busy; assume quiet
+    fi
+    local -a busy=()
+    local listeners
+    listeners=$(ss -tnlH 2>/dev/null || true)
+    for port in "${QUIET_PORTS[@]}"; do
+        if echo "$listeners" | awk '{print $4}' | grep -qE ":${port}$"; then
+            busy+=("$port")
+        fi
+    done
+    if [[ ${#busy[@]} -eq 0 ]]; then
+        echo ""
+    else
+        local IFS=,
+        echo "${busy[*]}"
+    fi
+}
+
+if [[ "$CAPTURE" == "1" && "$ALLOW_BUSY" == "1" ]]; then
+    echo "perf-gate: refusing --capture-baselines with --allow-busy — contended numbers must not anchor a baseline" | tee -a "$GATE_LOG" >&2
+    write_gate FAIL 0 "refused: --capture-baselines with --allow-busy"
+    exit 2
+fi
+
+if [[ "$ALLOW_BUSY" == "0" ]]; then
+    BUSY_PORTS=$(ports_in_use)
+    if [[ -n "$BUSY_PORTS" ]]; then
+        cat <<EOF | tee -a "$GATE_LOG" >&2
+perf-gate: refusing to run — UAT stack appears to be up (ports: $BUSY_PORTS)
+  Perf measurements are too sensitive to CPU/scheduler contention to coexist
+  with a running stack. Run \`bash scripts/linux-start-UAT.sh stop\` first,
+  or pass --allow-busy if you understand the numbers will be contended (this
+  flag is rejected with --capture-baselines).
+EOF
+        write_gate FAIL 0 "refused: UAT ports listening ($BUSY_PORTS)"
+        exit 2
+    fi
+fi
+
+# Record loadavg as a metric so future trend queries can distinguish a real
+# regression from a measurement taken under load.
+LOADAVG_PRE=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")
+echo "perf-gate: loadavg pre=$LOADAVG_PRE" | tee -a "$GATE_LOG"
+
 # ── Hardware fingerprint ────────────────────────────────────────────────
 
 fingerprint() {
@@ -200,6 +275,11 @@ CT_RC=0
 ) || CT_RC=$?
 
 echo "perf-gate: rebar3 ct exit=$CT_RC" | tee -a "$GATE_LOG"
+
+LOADAVG_POST=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")
+echo "perf-gate: loadavg post=$LOADAVG_POST" | tee -a "$GATE_LOG"
+write_metric "perf_loadavg_pre" "$LOADAVG_PRE" "load"
+write_metric "perf_loadavg_post" "$LOADAVG_POST" "load"
 
 # Copy the raw log into the gate log so the summary table points at one file.
 {
