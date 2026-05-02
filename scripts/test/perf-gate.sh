@@ -552,46 +552,95 @@ if baseline_hw and baseline_hw != hw:
     print(f"WARN: hw mismatch (baseline='{baseline_hw[:40]}' current='{hw[:40]}') — report-only")
     sys.exit(2)
 
+# Per-metric bounds. Each entry in b_metrics may be either:
+#   - a bare number (legacy %-tolerance schema): floor/ceiling computed from
+#     baseline.tolerance_pct
+#   - a dict {"method": "sigma", "central": float, "stdev": float,
+#             "k_sigma": float, ...}: floor/ceiling = central ± k_sigma·stdev
+#
+# σ-based bounds replace fixed-percentage thresholds for metrics whose
+# natural CV makes 10 % tolerance produce false-positive regressions
+# (#738). The σ values come from a calibration sample (see
+# scripts/test/perf-sample.sh); as the underlying benchmark gets less
+# noisy, σ shrinks and the tolerance band tightens automatically — a
+# percentage threshold cannot do that.
+#
+# A metric flipping from number → dict is a forward-compatible schema
+# upgrade: older perf-gate.sh checkouts treat the dict as a non-numeric
+# baseline value and fall into the bad_baseline guard, producing WARN
+# instead of a misread floor.
+
+def resolve_bounds(name, entry):
+    """Return (floor, ceiling, method_label) for a baseline entry. Both
+    floor and ceiling apply: throughput uses floor, latency uses ceiling.
+    """
+    if isinstance(entry, (int, float)):
+        b = float(entry)
+        tol_frac = effective_tol / 100.0
+        return (b * (1.0 - tol_frac),
+                b * (1.0 + tol_frac),
+                f"baseline={b:.4g}, tol_pct={effective_tol:.1f}")
+    if isinstance(entry, dict):
+        method = entry.get("method", "sigma")
+        if method == "sigma":
+            try:
+                central = float(entry["central"])
+                stdev = float(entry["stdev"])
+                k = float(entry.get("k_sigma", 2.0))
+            except (KeyError, TypeError, ValueError) as e:
+                raise ValueError(f"sigma entry missing/invalid: {e}")
+            if not (math.isfinite(central) and math.isfinite(stdev) and stdev > 0):
+                raise ValueError(f"sigma entry has invalid central/stdev: central={central}, stdev={stdev}")
+            return (central - k * stdev,
+                    central + k * stdev,
+                    f"central={central:.4g}, σ={stdev:.4g}, k={k}, N={entry.get('n_samples','?')}")
+        raise ValueError(f"unknown method='{method}'")
+    raise ValueError(f"unsupported baseline entry type: {type(entry).__name__}")
+
 # sec-L4: guard against baseline corruption. A non-finite, zero, or
-# negative baseline value would create trivial-pass conditions.
+# negative central value would create trivial-pass conditions.
 bad_baseline = []
-for name, v in b_metrics.items():
+for name, entry in b_metrics.items():
     try:
-        fv = float(v)
-    except (TypeError, ValueError):
-        bad_baseline.append(f"{name}=nan")
+        floor, ceiling, _label = resolve_bounds(name, entry)
+    except (ValueError, TypeError) as e:
+        bad_baseline.append(f"{name}: {e}")
         continue
-    if not math.isfinite(fv) or fv <= 0:
-        bad_baseline.append(f"{name}={fv}")
+    if not (math.isfinite(floor) and math.isfinite(ceiling)) or floor < 0:
+        bad_baseline.append(f"{name}: floor={floor}, ceiling={ceiling}")
 if bad_baseline:
-    print(f"WARN: baseline has invalid metric values: {', '.join(bad_baseline[:5])} — re-capture")
+    print(f"WARN: baseline has invalid metric values: {'; '.join(bad_baseline[:5])} — re-capture")
     sys.exit(2)
 
-# Throughput metrics (*_ops_sec): regression if current < baseline * (1 - tol)
-# Latency metrics   (*_ms / *_ms_per_agent): regression if current > baseline * (1 + tol)
+# Throughput metrics (*_ops_sec): regression if current < floor
+# Latency metrics   (*_ms / *_ms_per_agent): regression if current > ceiling
 regressions = []
 improvements = []
 missing = []
 checked = 0
-for name, b in b_metrics.items():
+sigma_count = 0
+pct_count = 0
+for name, entry in b_metrics.items():
     if name not in current:
         missing.append(name)
         continue
     c = current[name]
     checked += 1
-    tol_frac = effective_tol / 100.0
-    if name.endswith("_ops_sec"):
-        floor = b * (1.0 - tol_frac)
-        if c + 1e-9 < floor:
-            regressions.append(f"{name}: {c:.0f} < floor {floor:.0f} (baseline {b:.0f})")
-        elif c > b * 1.05:
-            improvements.append(f"{name}: {c:.0f} > {b:.0f}")
+    floor, ceiling, label = resolve_bounds(name, entry)
+    if isinstance(entry, dict):
+        sigma_count += 1
     else:
-        ceiling = b * (1.0 + tol_frac)
+        pct_count += 1
+    if name.endswith("_ops_sec"):
+        if c + 1e-9 < floor:
+            regressions.append(f"{name}: {c:.0f} < floor {floor:.0f} ({label})")
+        elif c > ceiling:
+            improvements.append(f"{name}: {c:.0f} > {ceiling:.0f}")
+    else:
         if c > ceiling + 1e-9:
-            regressions.append(f"{name}: {c:.2f} > ceiling {ceiling:.2f} (baseline {b:.2f})")
-        elif c < b * 0.95:
-            improvements.append(f"{name}: {c:.2f} < {b:.2f}")
+            regressions.append(f"{name}: {c:.2f} > ceiling {ceiling:.2f} ({label})")
+        elif c < floor:
+            improvements.append(f"{name}: {c:.2f} < {floor:.2f}")
 
 # UP-13: if the current run is missing baseline metrics, something in
 # the suite silently didn't produce output. Surface this as WARN so
@@ -605,7 +654,11 @@ if regressions:
     for r in regressions[:5]:
         print(f"  {r}")
     sys.exit(1)
-print(f"PASS: {checked} metrics within {effective_tol}% tolerance, {len(improvements)} improved, {len(missing)} missing")
+parts = []
+if pct_count: parts.append(f"{pct_count} %-bound")
+if sigma_count: parts.append(f"{sigma_count} σ-bound")
+print(f"PASS: {checked} metrics within tolerance ({', '.join(parts) if parts else 'none'}), "
+      f"{len(improvements)} improved, {len(missing)} missing")
 PY
 ) || COMPARE_RC=$?
 
