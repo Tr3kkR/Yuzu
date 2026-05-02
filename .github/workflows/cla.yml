@@ -33,14 +33,16 @@ on:
     types: [opened, synchronize, closed]
 
 permissions:
-  actions: write
   contents: read
-  pull-requests: write
-  statuses: write
 
 jobs:
   cla-check:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+      statuses: write
     # Deliberately disabled; flip to the live condition when ready.
     if: false
     steps:

@@ -203,7 +203,8 @@ yuzu-agent_X.Y.Z_amd64.deb
 yuzu-agent-X.Y.Z-1.x86_64.rpm
 yuzu-compose-wizard-X.Y.Z.zip       ← Compose Wizard bundle (PR #405, fjarvis)
 SHA256SUMS
-SHA256SUMS.bundle                     ← cosign keyless signature
+SHA256SUMS.sigstore                   ← cosign keyless signature (v0.12.0+; legacy releases shipped this as SHA256SUMS.bundle)
+<artifact>.intoto.jsonl × N           ← SLSA provenance, one per binary archive/installer (v0.12.0+)
 ```
 
 If any expected asset is missing, the workflow's `Create GitHub Release` step likely failed silently on a single asset (the `gh release create` call is one big command and a single missing asset returns non-zero). Re-upload the missing one:
@@ -252,7 +253,7 @@ sha256sum -c SHA256SUMS
 # cosign: verify the keyless signature on SHA256SUMS + both images
 if command -v cosign >/dev/null 2>&1; then
   cosign verify-blob \
-    --bundle SHA256SUMS.bundle \
+    --bundle SHA256SUMS.sigstore \
     --certificate-identity-regexp '.*' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     SHA256SUMS
@@ -351,7 +352,7 @@ Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) h
 - **Self-hosted runner required for Linux + Windows + gateway.** macOS uses a GitHub-hosted runner. The workflow assumes both self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
 - **No rollback.** Once `gh release create` runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.
 - **Compose Wizard requires the tag's commit to have `tools/compose-wizard/`.** PR #405 merged to `main` directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.
-- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.bundle` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
+- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
 
 ## Files this skill touches
 

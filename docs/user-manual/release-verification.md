@@ -15,11 +15,11 @@ that the tag under verification is `v0.11.0`. Substitute as needed.
 |------------|-------|---------------|
 | Platform archives | `yuzu-{linux-x64,gateway-linux-x64,windows-x64,macos-arm64}.{tar.gz,zip}` | `sha256sum -c SHA256SUMS` |
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuServerSetup-*.exe`, `YuzuAgent-*.pkg` | `sha256sum -c SHA256SUMS` |
-| Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.bundle` |
-| Cosign bundle | `SHA256SUMS.bundle` | Sigstore OIDC identity |
+| Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
+| Cosign bundle | `SHA256SUMS.sigstore` (legacy: `SHA256SUMS.bundle` for releases ≤ v0.11.0) | Sigstore OIDC identity |
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, `yuzu-{server,gateway}-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, `yuzu-{server,gateway}-image.spdx.json` | `spdx-tools validate` |
-| SLSA provenance | Stored in GitHub's attestation registry | `gh attestation verify` |
+| SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/tr3kkr/yuzu-{server,gateway}:<tag>` | `cosign verify` |
 
 ## Prerequisites
@@ -57,12 +57,12 @@ prove authenticity — use the cosign step below for that.
 
 ## 2. Verify the checksum manifest signature (cosign)
 
-`SHA256SUMS.bundle` is a Sigstore cosign bundle proving `SHA256SUMS`
+`SHA256SUMS.sigstore` is a Sigstore cosign bundle proving `SHA256SUMS`
 was signed by the GitHub Actions workflow that produced this release.
 
 ```bash
 cosign verify-blob \
-  --bundle SHA256SUMS.bundle \
+  --bundle SHA256SUMS.sigstore \
   --certificate-identity-regexp 'https://github.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/v[0-9].*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
@@ -182,7 +182,7 @@ sha256sum -c SHA256SUMS
 
 echo "→ cosign verify-blob (SHA256SUMS)"
 cosign verify-blob \
-  --bundle SHA256SUMS.bundle \
+  --bundle SHA256SUMS.sigstore \
   --certificate-identity-regexp "$IDENTITY_RE" \
   --certificate-oidc-issuer "$OIDC_ISSUER" \
   SHA256SUMS
@@ -222,6 +222,13 @@ echo "✓ all checks passed for v${VERSION}"
 verifying predates signing, or the `--certificate-identity-regexp` is
 too strict for the tag format. Widen to `--certificate-identity-regexp
 '.*'` to diagnose, then tighten once you have confirmed the identity.
+
+**`SHA256SUMS.sigstore: no such file`** — releases up to and including
+v0.11.0 ship the same bundle under the legacy filename
+`SHA256SUMS.bundle`. Both files contain a byte-identical Sigstore bundle
+and either can be passed to `cosign verify-blob --bundle`. v0.11.0 and
+v0.11.0-rc2 carry both names side-by-side; v0.12.0 onwards ship only
+the canonical `.sigstore` filename.
 
 **`gh attestation verify: no attestations found`** — run `gh auth login`
 first; the GitHub CLI must be able to query
