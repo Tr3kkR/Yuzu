@@ -102,6 +102,9 @@ auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
+    // Guard against oversized cookie values before passing to validate_session (#630).
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
     auto session = auth_mgr_.validate_session(token);
     if (session)
         return session;
@@ -222,6 +225,8 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // Scoped tokens cannot be used when RBAC is disabled.
     if (!session->token_scope_service.empty()) {
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
             res.set_content(
                 R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
@@ -229,12 +234,12 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"detail", "service-scoped token does not grant " +
-                                               securable_type + ":" + operation}})
-                    .dump(),
+                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
                 "application/json");
             return false;
         }
@@ -332,6 +337,8 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
             res.set_content(
                 R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
@@ -340,18 +347,19 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         }
         // Check that the ITServiceOwner role grants this permission type
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"detail", "service-scoped token does not grant " +
-                                               securable_type + ":" + operation}})
-                    .dump(),
+                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
                 "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
         if (!tag_store_) {
-            // Cannot verify scope without TagStore — deny rather than silently grant (UH-6)
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: tag store unavailable");
             res.status = 503;
             res.set_content(R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
                             "application/json");
@@ -360,12 +368,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         if (!agent_id.empty()) {
             auto agent_service = tag_store_->get_tag(agent_id, "service");
             if (agent_service != session->token_scope_service) {
+                audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                          "agent service '" + agent_service + "' does not match token scope '" + session->token_scope_service + "'");
                 res.status = 403;
                 res.set_content(
-                    nlohmann::json(
-                        {{"error", "forbidden"},
-                         {"detail", "agent is not in service '" +
-                                        session->token_scope_service + "'"}})
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"detail", "agent is not in service '" + session->token_scope_service + "'"}})
                         .dump(),
                     "application/json");
                 return false;
