@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -63,6 +65,12 @@ private:
     std::filesystem::file_time_type last_key_mtime_{};
     std::thread thread_;
     std::atomic<bool> stop_requested_{false};
+    // stop_cv_ + stop_mu_ make stop() wake the worker immediately rather than
+    // forcing it to wait out a 5-second sleep increment. The 5-second poll
+    // version pushed the server-tests suite over its 120s budget on contended
+    // runners (#flake from PR 734); CV-based wait keeps shutdown < 1ms.
+    std::mutex stop_mu_;
+    std::condition_variable stop_cv_;
     std::atomic<uint64_t> reload_count_{0};
     std::atomic<uint64_t> failure_count_{0};
 };

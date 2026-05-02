@@ -753,6 +753,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`CertReloader` shutdown latency drops from up to 5s per teardown to
+  near-zero.** The watcher thread used to sleep in 5-second increments and
+  only check the stop flag between increments, so each `stop()` (and each
+  destructor, since `~CertReloader()` calls `stop()`) blocked for up to
+  one full sleep window. With multiple `[cert-reload][lifecycle]` test
+  cases each paying that cost, the `server unit tests` suite was creeping
+  up to its 120-second meson budget — close enough that PR #734's run on
+  a contended `yuzu-wsl2-linux` runner overran by 4.6s and got SIGTERM'd
+  mid-`CertReloader: destructor stops cleanly`. Replaced the polling
+  sleep with a `std::condition_variable::wait_for` whose predicate the
+  `stop()` path notifies, so shutdown is bounded by `notify_all` + thread
+  join (sub-millisecond) rather than the next 5-second poll. Also
+  silences the `[[deprecated]]` warning on `httplib::SSLServer::ssl_context()`
+  by routing through `tls_context()` with a typed cast — same underlying
+  `SSL_CTX*`, no behaviour change.
+
 - **#618 — users lost across server restarts.** Pre-`auth.db` the user
   list was held in memory, written back to `yuzu-server.cfg` on save,
   but state created via the dashboard between saves was lost on a
