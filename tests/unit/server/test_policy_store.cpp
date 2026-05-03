@@ -212,6 +212,10 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][frag
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
     CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    // Governance Gate 7 (consistency S2 / QA SHOULD): docs link must be
+    // pinned on this branch too — not just the wrong-kind branch — so the
+    // operator-facing UX is symmetric across both `kind`-failure modes.
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: fragment with check only (no fix, no postCheck)",
@@ -443,6 +447,20 @@ TEST_CASE("PolicyStore: create policy with wrong kind", "[policy_store][policy]"
     CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
     // Issue #621: same UX expectation as create_fragment — operators must
     // see a worked example in the error body, not just the prefix.
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
+}
+
+TEST_CASE("PolicyStore: create policy with missing kind", "[policy_store][policy]") {
+    PolicyStore store(":memory:");
+
+    // Governance Gate 7 (consistency S2 / QA SHOULD): symmetric coverage
+    // with the create_fragment "missing kind" case above. Without this
+    // test the asymmetry would let a future regression that drops the
+    // worked-example body from create_policy alone slip through CI.
+    auto r = store.create_policy("name: no-kind\ndescription: missing kind field\n");
+    REQUIRE(!r.has_value());
+    CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
     CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
     CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }

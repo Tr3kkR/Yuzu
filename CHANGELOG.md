@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong-kind / missing-kind cases to assert the new helpful content
   (`apiVersion: yuzu.io/v1alpha1` substring + docs link), so the
   improvement is pinned by the test surface rather than relying on a
-  fragile substring match.
+  fragile substring match. Adds a missing-`kind:` test for `create_policy`
+  (governance Gate 7 hardening — was asymmetric with `create_fragment`)
+  and pins the docs link on the `create_fragment` missing-kind branch
+  for the same symmetry reason.
 
 ## [0.12.0] - 2026-05-03
 
