@@ -163,11 +163,6 @@ jobs:
           output-file: yuzu-linux-x64.cdx.json
           artifact-name: yuzu-linux-x64.cdx.json
           upload-artifact: false
-          # Explicit source name + version stops Syft from deriving the
-          # artifact ID from the working-directory path ("(which is not
-          # ideal)" warning emitted on every release run otherwise).
-          source-name: yuzu-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -177,8 +172,6 @@ jobs:
           output-file: yuzu-linux-x64.spdx.json
           artifact-name: yuzu-linux-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-linux-x64
-          source-version: ${{ github.ref_name }}
 
       # ── SLSA build provenance ───────────────────────────────────────
       # Records that these specific artifacts came from this specific
@@ -327,8 +320,6 @@ jobs:
           output-file: yuzu-gateway-linux-x64.cdx.json
           artifact-name: yuzu-gateway-linux-x64.cdx.json
           upload-artifact: false
-          source-name: yuzu-gateway-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate gateway SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -338,8 +329,6 @@ jobs:
           output-file: yuzu-gateway-linux-x64.spdx.json
           artifact-name: yuzu-gateway-linux-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-gateway-linux-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest gateway provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -629,8 +618,6 @@ jobs:
           output-file: yuzu-windows-x64.cdx.json
           artifact-name: yuzu-windows-x64.cdx.json
           upload-artifact: false
-          source-name: yuzu-windows-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate Windows SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -640,8 +627,6 @@ jobs:
           output-file: yuzu-windows-x64.spdx.json
           artifact-name: yuzu-windows-x64.spdx.json
           upload-artifact: false
-          source-name: yuzu-windows-x64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest Windows provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
@@ -955,8 +940,6 @@ jobs:
           output-file: yuzu-macos-arm64.cdx.json
           artifact-name: yuzu-macos-arm64.cdx.json
           upload-artifact: false
-          source-name: yuzu-macos-arm64
-          source-version: ${{ github.ref_name }}
 
       - name: Generate macOS SBOM (SPDX)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
@@ -966,8 +949,6 @@ jobs:
           output-file: yuzu-macos-arm64.spdx.json
           artifact-name: yuzu-macos-arm64.spdx.json
           upload-artifact: false
-          source-name: yuzu-macos-arm64
-          source-version: ${{ github.ref_name }}
 
       - name: Attest macOS provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
