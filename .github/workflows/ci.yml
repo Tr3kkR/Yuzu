@@ -674,15 +674,25 @@ jobs:
           key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
 
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
-  # Detects whether a PR touches CI infrastructure (workflows / actions /
-  # CI helper scripts). If it does, the canary leg runs the linux build
-  # on GHA-hosted ubuntu-24.04 — a fresh-disk runner with no warm caches
-  # and no self-hosted assumptions — so workflow regressions are caught
-  # against a vanilla environment BEFORE the change lands on main and
-  # becomes the next CI run for everyone.
+  # Detects whether a PR (or a push to main) touches CI infrastructure
+  # (workflows / actions / CI helper scripts). If it does, the canary leg
+  # runs the linux build on GHA-hosted ubuntu-24.04 — a fresh-disk runner
+  # with no warm caches and no self-hosted assumptions — so workflow
+  # regressions are caught against a vanilla environment BEFORE the
+  # change lands on main and becomes the next CI run for everyone.
+  #
+  # Cache-warming rationale for the push-to-main trigger: GHA cache scope
+  # is branch-isolated. PR runs save to `refs/pull/<N>/merge`, which
+  # sibling PRs cannot read, so without a push-to-main run the canary's
+  # vcpkg + ccache caches never land on `refs/heads/main` and every PR
+  # cold-starts (~25 min from-source vcpkg). Running on push to main
+  # populates the default-branch cache scope, which every subsequent PR
+  # inherits as its restore fallback (~10 s warm restore). Limited to
+  # main only — dev pushes are pre-merge churn, the warm canonical state
+  # we want operators to inherit is what landed on main.
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
@@ -693,7 +703,24 @@ jobs:
           fetch-depth: 0
       - id: detect
         run: |
-          base_sha="${{ github.event.pull_request.base.sha }}"
+          # PRs diff against the base ref; pushes diff against the SHA
+          # before the push (`github.event.before`). For push-to-main
+          # that's the previous main tip, which is exactly the boundary
+          # we want — anything in this push that touched CI infra needs
+          # to (re)warm the canary cache scope.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+          fi
+          # Defensive: a brand-new branch push has before = 40 zeros.
+          # main is protected and never created from scratch in normal
+          # flow, but if it happens fall back to HEAD~1 so we don't
+          # diff against the empty tree (which would mark every file
+          # changed and run the canary unconditionally).
+          if [[ "$base_sha" =~ ^0{40}$ ]]; then
+            base_sha="HEAD~1"
+          fi
           if git diff --name-only "$base_sha"..HEAD \
               | grep -qE '^\.github/(workflows|actions)/|^scripts/ci/'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
