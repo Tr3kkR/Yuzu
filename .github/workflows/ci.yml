@@ -705,6 +705,22 @@ jobs:
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-
 
+      - name: Cache ccache (canary)
+        # ccache is `apt-get install`-ed and used as the compiler wrapper
+        # below, but the GHA-hosted runner is fresh-disk per job — without
+        # this cache step every TU compiles cold every run. Mirrors the
+        # macOS pattern (line 564). Source-hash key triggers a fresh save
+        # on any source change but cascading restore-keys keep most of the
+        # cache warm. Closes the canary's biggest unforced-loss perf hole
+        # (#743).
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          save-always: true
+          path: ~/.cache/ccache
+          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-canary-x64-linux-
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
@@ -740,5 +756,8 @@ jobs:
       - name: Build
         run: meson compile -C build-linux
 
-      - name: Test
-        run: meson test -C build-linux --print-errorlogs
+      # Test step intentionally absent — the canary's purpose is
+      # workflow-regression detection on a fresh-disk runner, not test
+      # regression. `meson test` runs on every other linux leg
+      # (linux_matrix, nightly asan/tsan/coverage). Skipping it here saves
+      # ~10 min per canary run without reducing coverage. #743.

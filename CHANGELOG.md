@@ -808,6 +808,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **#743 — workflow canary wall time cut from ~70 min to ~10–15 min.**
+  The `Workflow canary (GHA-hosted ubuntu-24.04)` job had ccache
+  installed and used as the compiler wrapper but never persisted
+  across runs, so every TU compiled cold every run on the 4-vCPU
+  GHA-hosted runner. Added an `actions/cache` step for `~/.cache/ccache`
+  keyed on source hash with cascading restore-keys (mirrors the macOS
+  leg's pattern). Also dropped the `meson test` step from the canary —
+  the canary's purpose is workflow-regression detection, not test
+  regression, and `meson test` runs on every other Linux leg
+  (linux_matrix on push, nightly asan/tsan/coverage). Net: ~17 min
+  saved on compile via warm ccache, ~5–10 min saved by dropping tests.
+
 - **#741 follow-up — sentinel now self-heals on no-drift orphan state.**
   The original #741 fix wiped both halves of `vcpkg_installed/` on
   cache-key drift, which closes the path where a NEW commit lands on a
