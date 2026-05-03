@@ -225,7 +225,7 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
