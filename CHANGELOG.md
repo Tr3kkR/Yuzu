@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treatment `/livez` and `/readyz` already get. Restores the path that
   operators had been pointing monitors at before the #401 fix moved the
   canonical health endpoint to `/health`.
+
+  **Body shape now varies by auth.** Unauthenticated callers get the cheap
+  probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`,
+  `version`. Authenticated callers additionally get `agents.pending`,
+  `executions.{in_flight, completed_last_hour, failed_last_hour}`, and
+  `system.*` — these were always populated for everyone before, but
+  involve SQLite scans on every request and would be a DoS amplification
+  primitive now that the rate limiter no longer caps probe rate. Monitoring
+  dashboards that displayed `executions.*` from `/health` should switch
+  to the authenticated alternative or query an authenticated REST endpoint.
 - **Docs:** `docs/user-manual/server-admin.md` gains a "File Logging"
   section covering `--log-file` semantics and the implicit-default
   fallback, and a "Health Endpoints" section enumerating `/livez`,
