@@ -167,19 +167,75 @@ assert_msg "[[ -f '$WS3/vcpkg_installed/.${TRIPLET}-cachekey.sha256' ]]" \
 rm -rf "$TMPROOT"
 
 # -----------------------------------------------------------------------
-# Test 4 — error on missing manifest
+# Test 4 — orphaned-registry recovery on no-drift run (#741 follow-up)
 # -----------------------------------------------------------------------
-echo "Test 4: missing vcpkg.json must fail"
+# Reproduces the PR #742 CI failure: the same commit re-runs against a
+# workspace that an earlier crash, abort, or pre-#741 sentinel left in
+# the orphaned-registry state. The cache key has not drifted (it's the
+# same commit) so the "wipe both halves on drift" rule doesn't fire.
+# The defensive invariant must detect that the registry exists but the
+# triplet tree does not, and wipe the registry to recover.
+echo "Test 4: orphaned-registry recovery on no-drift run"
 TMPROOT="$(mktemp -d)"
 WS4="$TMPROOT/t4"
-mkdir -p "$WS4"
+mk_workspace "$WS4"
+
+# Establish the canonical sentinel hash for this manifest+baseline.
+OUT_BOOT4=""; RC_BOOT4=0
+run_sentinel "$WS4" "orphan-test-baseline" OUT_BOOT4 RC_BOOT4
+
+# Now plant the bad state: registry present with phantom info entry,
+# triplet tree absent. This is exactly what was on yuzu-local-windows
+# when PR #742 CI ran.
+mkdir -p "$WS4/vcpkg_installed/vcpkg/info"
+cat > "$WS4/vcpkg_installed/vcpkg/info/abseil_20260107.1_${TRIPLET}.list" <<EOF
+${TRIPLET}/lib/pkgconfig/absl_absl_check.pc
+EOF
+echo "Package: abseil" > "$WS4/vcpkg_installed/vcpkg/status"
+# Triplet tree intentionally missing.
+
+# Re-run with the same VCPKG_COMMIT — sentinel should NOT drift but
+# should detect the orphan and wipe.
+OUT4=""; RC4=0
+run_sentinel "$WS4" "orphan-test-baseline" OUT4 RC4
+
+assert_msg "[[ $RC4 -eq 0 ]]" "exit code is 0 (got $RC4)"
+assert_msg "echo \"\$OUT4\" | grep -q 'sentinel unchanged'" \
+  "sentinel reports unchanged (key did not drift)"
+assert_msg "echo \"\$OUT4\" | grep -q 'orphaned registry detected'" \
+  "orphan detection log line fires"
+assert_msg "[[ ! -d '$WS4/vcpkg_installed/vcpkg' ]]" \
+  "orphaned registry is wiped"
+
+# Verify the orphan check is a no-op on a healthy workspace.
+mkdir -p "$WS4/vcpkg_installed/vcpkg/info" \
+         "$WS4/vcpkg_installed/$TRIPLET/lib/pkgconfig"
+echo "fake .pc" > "$WS4/vcpkg_installed/$TRIPLET/lib/pkgconfig/foo.pc"
+OUT4b=""; RC4b=0
+run_sentinel "$WS4" "orphan-test-baseline" OUT4b RC4b
+
+assert_msg "[[ $RC4b -eq 0 ]]" "exit code is 0 on healthy workspace (got $RC4b)"
+assert_msg "! echo \"\$OUT4b\" | grep -q 'orphaned registry detected'" \
+  "orphan detection does NOT fire when triplet tree is present"
+assert_msg "[[ -d '$WS4/vcpkg_installed/vcpkg' ]]" \
+  "registry preserved on healthy workspace"
+
+rm -rf "$TMPROOT"
+
+# -----------------------------------------------------------------------
+# Test 5 — error on missing manifest
+# -----------------------------------------------------------------------
+echo "Test 5: missing vcpkg.json must fail"
+TMPROOT="$(mktemp -d)"
+WS5="$TMPROOT/t5"
+mkdir -p "$WS5"
 # Deliberately do NOT create vcpkg.json.
 
-OUT4=""; RC4=0
-run_sentinel "$WS4" "any-baseline" OUT4 RC4
+OUT5=""; RC5=0
+run_sentinel "$WS5" "any-baseline" OUT5 RC5
 
-assert_msg "[[ $RC4 -ne 0 ]]" "exit code is non-zero (got $RC4)"
-assert_msg "echo \"\$OUT4\" | grep -q 'no vcpkg.json'" \
+assert_msg "[[ $RC5 -ne 0 ]]" "exit code is non-zero (got $RC5)"
+assert_msg "echo \"\$OUT5\" | grep -q 'no vcpkg.json'" \
   "error message names the missing manifest"
 
 rm -rf "$TMPROOT"

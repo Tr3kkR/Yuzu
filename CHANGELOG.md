@@ -808,6 +808,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **#741 follow-up — sentinel now self-heals on no-drift orphan state.**
+  The original #741 fix wiped both halves of `vcpkg_installed/` on
+  cache-key drift, which closes the path where a NEW commit lands on a
+  corrupt workspace. PR #742's CI then failed with the same abseil
+  `read_lines` symptom because the workspace was already corrupt and the
+  inputs hadn't drifted: the sentinel correctly reported "unchanged",
+  the orphaned `vcpkg/info/abseil_*.list` survived, and `vcpkg install`
+  short-circuited again. Sentinel now runs a defensive invariant on every
+  invocation — if `vcpkg_installed/vcpkg/` exists but
+  `vcpkg_installed/<triplet>/` does not, the registry is orphaned by
+  definition and gets wiped regardless of cache-key state. Test 4 in
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the new behaviour
+  (orphan detection fires on no-drift run; no-op on healthy workspace).
+
 - **#741 — vcpkg sentinel registry-desync wedged Windows CI.** Two
   related defects converged on today's CodeQL Windows job:
   (a) `scripts/ci/vcpkg-triplet-sentinel.sh` wiped
