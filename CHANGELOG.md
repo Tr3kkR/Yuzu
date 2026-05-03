@@ -483,6 +483,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **Gateway perf baseline calibration captured at N=300 (#738, ref
+  #530).** Five-hour overnight run on Shulgi (5950X, quiet box,
+  2026-05-02 23:00 UTC → 2026-05-03 04:16 UTC, exit=0, 300/300
+  samples). Raw data at `tests/perf-baseline-provenance-N300.jsonl`,
+  derived stats at `tests/perf-baseline-provenance-N300.json`. The
+  capture confirms what the N=20 trial suggested: 3 of the 4
+  gateway perf metrics (`registration_ops_sec`,
+  `burst_registration_ops_sec`, `session_cleanup_ms_per_agent`) are
+  not Gaussian and σ-bounding them is statistically inappropriate —
+  `registration_ops_sec` is hard-ceiling-bounded with 70% of samples
+  within 5% of the 19,200 ops/sec ceiling; `session_cleanup_ms_per_agent`
+  is dominated by a single race-condition outlier; only
+  `heartbeat_queue_ops_sec` (CV 6.45%, |skew| 0.11, |kurt-3| 0.33,
+  280/300 distinct values) fits the Gaussian assumption. The full
+  finding plus inline ASCII histograms is recorded in
+  `docs/perf-baseline-calibration-2026-05-03.md`. Perf-gate redesign
+  to percentile floors for ceiling-bounded metrics is deferred to a
+  later cycle; in the interim the gate runs as-is and human
+  judgement is the loop.
 - **PR 3 coverage net — `tests/unit/server/test_execution_event_bus.cpp`
   (new file)** — 10 Catch2 cases / 1039 assertions tagged
   `[execution_event_bus][pr3]`: subscribe/publish/unsubscribe round-trip
@@ -682,6 +701,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/test/perf-gate.sh` is no longer a regression-detecting
+  gate.** It runs `yuzu_gw_perf_SUITE`, parses throughput/latency from
+  `ct:pal` output, records each metric into the test-runs DB, and exits
+  PASS. It does not read a baseline file, has no tolerance, and never
+  FAILs on a metric value. The N=300 calibration captured in this same
+  release showed 3 of the 4 gateway perf metrics are ceiling-bounded
+  with long left tails — neither σ nor %-tolerance bands fit them — so
+  perf is moved to measure-and-report until the gate can be rebuilt
+  around percentile primitives. Removed: `tests/perf-baselines.json`
+  file, `--baseline`, `--tolerance-pct`, `--capture-baselines`, and
+  `--report-only` flags (the script now rejects them with a one-line
+  pointer to the calibration doc). Kept: the quiesce check (refuses to
+  run with UAT ports listening), `--allow-busy` debug bypass, hardware
+  fingerprint and loadavg metric capture, parser-drift WARN. SKILL.md,
+  CLAUDE.md, `tests/shell/test_pr2_gates.sh`, and
+  `scripts/test/perf-sample.sh` all updated to match. Coverage gate is
+  unchanged — it still enforces `tests/coverage-baseline.json`. Full
+  rationale and the deferred percentile-redesign live in
+  `docs/perf-baseline-calibration-2026-05-03.md`.
 - **Release supply-chain assets renamed and expanded for OpenSSF Scorecard
   visibility.** The cosign signature on `SHA256SUMS` is now published as
   `SHA256SUMS.sigstore` rather than `SHA256SUMS.bundle`, matching the
@@ -769,6 +807,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory is now gitignored.
 
 ### Fixed
+
+- **#743 — workflow canary wall time cut from ~70 min to ~10–15 min.**
+  The `Workflow canary (GHA-hosted ubuntu-24.04)` job had ccache
+  installed and used as the compiler wrapper but never persisted
+  across runs, so every TU compiled cold every run on the 4-vCPU
+  GHA-hosted runner. Added an `actions/cache` step for `~/.cache/ccache`
+  keyed on source hash with cascading restore-keys (mirrors the macOS
+  leg's pattern). Also dropped the `meson test` step from the canary —
+  the canary's purpose is workflow-regression detection, not test
+  regression, and `meson test` runs on every other Linux leg
+  (linux_matrix on push, nightly asan/tsan/coverage). Net: ~17 min
+  saved on compile via warm ccache, ~5–10 min saved by dropping tests.
+
+- **#741 follow-up — sentinel now self-heals on no-drift orphan state.**
+  The original #741 fix wiped both halves of `vcpkg_installed/` on
+  cache-key drift, which closes the path where a NEW commit lands on a
+  corrupt workspace. PR #742's CI then failed with the same abseil
+  `read_lines` symptom because the workspace was already corrupt and the
+  inputs hadn't drifted: the sentinel correctly reported "unchanged",
+  the orphaned `vcpkg/info/abseil_*.list` survived, and `vcpkg install`
+  short-circuited again. Sentinel now runs a defensive invariant on every
+  invocation — if `vcpkg_installed/vcpkg/` exists but
+  `vcpkg_installed/<triplet>/` does not, the registry is orphaned by
+  definition and gets wiped regardless of cache-key state. Test 4 in
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the new behaviour
+  (orphan detection fires on no-drift run; no-op on healthy workspace).
+
+- **#741 — vcpkg sentinel registry-desync wedged Windows CI.** Two
+  related defects converged on today's CodeQL Windows job:
+  (a) `scripts/ci/vcpkg-triplet-sentinel.sh` wiped
+  `vcpkg_installed/<triplet>/` on cache-key drift but left the sibling
+  per-workspace registry (`vcpkg_installed/vcpkg/{info,status,updates}/`)
+  intact, so orphaned `info/<port>_<triplet>.list` entries persuaded the
+  next `vcpkg install` to short-circuit to "already installed" and then
+  fail post-install pkgconfig validation with
+  `read_lines("…/lib/pkgconfig/<pkg>.pc"): no such file or directory`
+  (today's failure hit on `absl_absl_check.pc`); (b) `codeql.yml` had
+  its **own** inline sentinel (`.x64-windows-triplet.sha256`) that
+  hashed only `triplets/x64-windows.cmake` — missing manifest + baseline
+  drift — and shared the same registry-orphan bug. The shared sentinel
+  now wipes both halves of `vcpkg_installed/` together; `codeql.yml` now
+  calls the shared script instead of its own inline logic;
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the four behaviours the
+  sentinel must preserve and runs from the `canary` job in `ci.yml`.
+  `docs/ci-troubleshooting.md` §7 separates this from the pre-existing
+  `vcpkg/packages/` buildtree corruption path.
 
 - **`CertReloader` shutdown latency drops from up to 5s per teardown to
   near-zero.** The watcher thread used to sleep in 5-second increments and

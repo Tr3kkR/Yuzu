@@ -240,11 +240,16 @@ registration_latency_distribution(_Config) ->
 %%%===================================================================
 
 %% @doc Queue N heartbeats (async cast). Assert 50K in < 500 ms.
+%% Uses microsecond-resolution timing: at the default 20K-op count this
+%% benchmark completes in ~8 ms, and millisecond timing only resolves to
+%% 7 / 8 / 9 ms (3 buckets) — too few for the perf gate's 10% tolerance
+%% to survive a single-tick boundary jump. Microsecond resolution gives
+%% ~thousands of buckets and a continuous distribution.
 heartbeat_throughput(_Config) ->
     N = yuzu_gw_perf_helpers:get_env("YUZU_PERF_HEARTBEATS", 50000),
     ct:pal("--- heartbeat_throughput: ~B heartbeats ---", [N]),
 
-    {WallMs, _} = yuzu_gw_perf_helpers:measure_wall_clock(fun() ->
+    {WallUs, _} = yuzu_gw_perf_helpers:measure_wall_clock_us(fun() ->
         lists:foreach(fun(I) ->
             ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(
                      #{agent_id => integer_to_binary(I),
@@ -252,10 +257,10 @@ heartbeat_throughput(_Config) ->
         end, lists:seq(1, N))
     end),
 
-    yuzu_gw_perf_helpers:assert_throughput("Heartbeat queue", N, WallMs),
-    ?assert(WallMs < 500,
+    yuzu_gw_perf_helpers:assert_throughput_us("Heartbeat queue", N, WallUs),
+    ?assert(WallUs < 500_000,
             lists:flatten(io_lib:format(
-                "Queueing ~B HBs took ~B ms (limit 500 ms)", [N, WallMs]))),
+                "Queueing ~B HBs took ~B us (limit 500_000 us)", [N, WallUs]))),
 
     %% Drain the buffer.
     trigger_hb_flush().
@@ -475,6 +480,12 @@ reconnection_storm(_Config) ->
 
 %% @doc Kill N agents simultaneously, measure how long until
 %% the registry processes all DOWN messages and reaches count 0.
+%%
+%% Microsecond timing + ~.5f formatting: at N=1000 the cleanup completes
+%% in ~50 ms, giving ~0.05 ms/agent. Millisecond timing combined with
+%% ~.2f rounding turned every sample into the literal string "0.05" with
+%% zero variance — the metric was effectively unmeasured. Microsecond
+%% resolution + 5 dp exposes ~3-4 significant digits of natural noise.
 session_cleanup_latency(_Config) ->
     N = min(1000, yuzu_gw_perf_helpers:get_env("YUZU_PERF_CHURN_AGENTS", 5000)),
     ct:pal("--- session_cleanup_latency: ~B agents ---", [N]),
@@ -483,13 +494,14 @@ session_cleanup_latency(_Config) ->
                         N, #{prefix => <<"clean">>}),
     ?assertEqual(N, yuzu_gw_registry:agent_count()),
 
-    {CleanupMs, _} = yuzu_gw_perf_helpers:measure_wall_clock(fun() ->
+    {CleanupUs, _} = yuzu_gw_perf_helpers:measure_wall_clock_us(fun() ->
         lists:foreach(fun(Pid) -> exit(Pid, kill) end, Pids),
         ok = yuzu_gw_perf_helpers:wait_for_registry_count(0, 30000)
     end),
 
-    ct:pal("Cleanup ~B agents: ~B ms (~.2f ms/agent)",
-           [N, CleanupMs, CleanupMs / N]).
+    MsPerAgent = (CleanupUs / 1000.0) / N,
+    ct:pal("Cleanup ~B agents: ~B us (~.5f ms/agent)",
+           [N, CleanupUs, MsPerAgent]).
 
 %% @doc Register/deregister N agents over several cycles.
 %% Assert monitor_refs map is 0 after each full cleanup.

@@ -154,13 +154,15 @@ Three modes:
 
 - `/test --quick` — sanity check (~10 min): build + unit + EUnit + dialyzer + synthetic UAT
 - `/test` (default, ~30-45 min): build + upgrade test + standard gates + fresh stack + coverage report
-- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers dispatched to `yuzu-wsl2-linux`, coverage enforce + perf enforce
+- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers dispatched to `yuzu-wsl2-linux`, coverage enforce + perf measurement (no enforcement, see below)
 
 Query historical runs via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend timing=phase2.image-swap|--flaky --days 14|--export RUN_ID|--prune 100`. Power users can `python3 scripts/test/test_db.py query ...` directly.
 
 The DB lives outside the repo (XDG data dir) so it persists across `git clean` and survives repo re-clones. Override with `YUZU_TEST_DB=path`.
 
-**Coverage / perf baselines.** `--full` enforces `tests/coverage-baseline.json` (real numbers as of 2026-04-25 captured against `40acd33`: branch 26.8% / line 51.8% on the 5950X dev box, 0.5 pp slack) and `tests/perf-baselines.json` (4 metrics on 5950X, 10% tolerance, hardware fingerprint locked). The PR2 `__seed: true` sentinel is gone and the gates enforce in `--full`. The perf baseline records hardware fingerprint (CPU + RAM); mismatch auto-downgrades the gate to WARN so a 5950X baseline doesn't produce false failures on the MBP and vice versa. Both gates refuse `--capture-baselines` when the underlying test suite exited non-zero, so a broken environment cannot permanently anchor a bad baseline. The `__seed: true` sentinel is still honored as a defensive WARN if anyone re-introduces it (do not — to disable enforcement temporarily, edit `slack_pp` / `tolerance_pct` and document why). Regenerate on the target box with `bash scripts/test/{coverage,perf}-gate.sh --run-id manual --capture-baselines` after a clean test run, and commit the updated JSON alongside the change that earned it — `git blame` is the audit trail.
+**Coverage baseline.** `--full` enforces `tests/coverage-baseline.json` (real numbers as of 2026-04-25 captured against `40acd33`: branch 26.8% / line 51.8% on the 5950X dev box, 0.5 pp slack). The PR2 `__seed: true` sentinel is gone; current numbers are real and the gate enforces. Refuses `--capture-baselines` when the underlying test suite exited non-zero, so a broken environment cannot anchor a bad baseline. Regenerate with `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines` after a clean test run, and commit the JSON alongside the change that earned it.
+
+**Perf is measure-and-report (no baseline) as of 2026-05-03.** `tests/perf-baselines.json` is removed; the gate runs `yuzu_gw_perf_SUITE`, records `perf_*` metrics into the test-runs DB, and exits PASS without comparison. The N=300 calibration on Shulgi (raw at `tests/perf-baseline-provenance-N300.{jsonl,json}`, findings in `docs/perf-baseline-calibration-2026-05-03.md`) showed 3 of the 4 throughput/latency metrics are ceiling-bounded with long left tails — so neither σ nor %-tolerance bands fit them. Operator inspects shape against the calibration capture and trend via `bash scripts/test/test-db-query.sh --trend` until the gate is rebuilt around percentile primitives.
 
 **Sanitizers.** `--full` Phase 6 dispatches `.github/workflows/sanitizer-tests.yml` on the `yuzu-wsl2-linux` self-hosted runner via `scripts/test/dispatch-runner-job.sh`. Local runs would pin the dev box for ~15 min per sanitizer rebuild; the runner absorbs that cost in the background. Runner offline → WARN, not FAIL, with operator retry instructions in the gate notes.
 
@@ -367,6 +369,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Tag/scope DSL operator reference — `tag:X`, `props.X`, `ostype`, `hostname`, `arch`, `agent_version` resolution; recipes for asset tagging | `docs/asset-tagging-guide.md` | `dsl-engineer` on scope/tag-DSL changes; `architect` when a new scope kind is added |
 | Agentic-first invariants A1–A4 (dashboard parity, discovery, observability, error envelope) — applies to every new MCP tool, REST route, dashboard fragment, or error site | `docs/agentic-first-principle.md` | `consistency-auditor` on every PR; `security-guardian` + `architect` on relevant surfaces |
 | Enterprise-platform parity matrix — competitor capability comparison and gap analysis (complements `docs/capability-map.md`) | `docs/enterprise-parity-plan.md` | `architect` on capability-map / roadmap changes; `enterprise-readiness` agent during Gate 6 |
+| CI cache patterns — split `actions/cache/restore` + paired `actions/cache/save` for GHA-hosted; local `runner.tool_cache` for self-hosted; **never `save-always: true`** (zizmor guard enforces) | `.claude/skills/ci-cache/SKILL.md` | `build-ci` on any change touching `actions/cache@`, vcpkg cache scope, ccache scope, or self-hosted-runner cache wiring |
 
 ## Guardian engine — stores
 

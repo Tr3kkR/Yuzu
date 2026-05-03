@@ -13,11 +13,13 @@
     measure_latency/2,
     stats_from_timings/1,
     measure_wall_clock/1,
+    measure_wall_clock_us/1,
     spawn_agents/2,
     spawn_and_register/2,
     cleanup_agents/1,
     assert_latency/2,
     assert_throughput/3,
+    assert_throughput_us/3,
     memory_snapshot/0,
     memory_delta/2,
     format_report/2,
@@ -65,6 +67,20 @@ measure_wall_clock(Fun) ->
     T0 = erlang:monotonic_time(millisecond),
     Result = Fun(),
     T1 = erlang:monotonic_time(millisecond),
+    {T1 - T0, Result}.
+
+%% @doc Measure wall-clock time of Fun() in microseconds.
+%% Use this for sub-millisecond benchmarks. heartbeat_throughput at the
+%% default 20K-op count completes in ~8 ms, which gave only 7/8/9 ms
+%% (3 buckets) under measure_wall_clock/1; the corresponding ops/sec
+%% values were quantized to 2.22M / 2.5M / 2.86M and a 10% perf-gate
+%% tolerance couldn't survive a single-ms tick. Microsecond resolution
+%% turns those 3 buckets into thousands.
+-spec measure_wall_clock_us(fun(() -> T)) -> {non_neg_integer(), T}.
+measure_wall_clock_us(Fun) ->
+    T0 = erlang:monotonic_time(microsecond),
+    Result = Fun(),
+    T1 = erlang:monotonic_time(microsecond),
     {T1 - T0, Result}.
 
 %%%===================================================================
@@ -138,6 +154,18 @@ assert_throughput(Label, N, WallMs) when WallMs > 0 ->
     OpsPerSec;
 assert_throughput(Label, N, _WallMs) ->
     ct:pal("~s: ~B ops in <1 ms (instant)", [Label, N]),
+    infinity.
+
+%% @doc Log throughput from a microsecond elapsed time. Output format
+%% keeps the trailing "(NNN ops/sec)" so the perf-gate.sh parser regex
+%% (which is unit-agnostic) continues to match without changes.
+-spec assert_throughput_us(string(), non_neg_integer(), non_neg_integer()) -> float().
+assert_throughput_us(Label, N, WallUs) when WallUs > 0 ->
+    OpsPerSec = N * 1000000.0 / WallUs,
+    ct:pal("~s: ~B ops in ~B us (~B ops/sec)", [Label, N, WallUs, round(OpsPerSec)]),
+    OpsPerSec;
+assert_throughput_us(Label, N, _WallUs) ->
+    ct:pal("~s: ~B ops in <1 us (instant)", [Label, N]),
     infinity.
 
 %%%===================================================================

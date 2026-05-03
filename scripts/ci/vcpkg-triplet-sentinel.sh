@@ -136,10 +136,10 @@ fi
 # --- defensive invariant: registry-without-tree is always orphaned --------
 #
 # Runs whether or not the cache key drifted. The "wipe both halves on
-# drift" rule from #741 plugs the path where a NEW commit lands on a
-# corrupt workspace; this rule plugs the path where the SAME commit
-# re-runs on a workspace that an earlier crash, abort, or pre-#741 run
-# left in the orphaned-registry state. Without it, every sentinel-passes
+# drift" rule above plugs the path where a NEW commit lands on a corrupt
+# workspace; this rule plugs the path where the SAME commit re-runs on a
+# workspace that an earlier crash, abort, or pre-#741 sentinel run left
+# in the orphaned-registry state. Without it, every sentinel-passes
 # branch would happily preserve `vcpkg/info/<port>_<triplet>.list`
 # entries pointing at files in a `<triplet>/` tree that doesn't exist —
 # vcpkg short-circuits to "already installed" and then fails post-install

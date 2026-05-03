@@ -17,7 +17,7 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 - **Meson build files** — Every new, renamed, or deleted source file must be reflected in the appropriate `meson.build`. Build must succeed on all targets.
 - **CI matrix** — Maintain the GitHub Actions CI matrix: Linux (GCC 13, Clang 18), Windows (MSVC), macOS (Apple Clang), ARM64 cross-compile.
 - **vcpkg manifest** — Keep `vcpkg.json` baseline pinning and platform filters in sync. Manage the `builtin-baseline` for version constraints.
-- **Build performance** — Optimize ccache hit rates, build parallelism, and CI cache strategies (`actions/cache` for vcpkg).
+- **Build performance** — Optimize ccache hit rates, build parallelism, and CI cache strategies. **Cache pattern is fixed: split `actions/cache/restore` + paired `actions/cache/save` gated on `if: always() && steps.<id>.outputs.cache-hit != 'true'`.** Never use `save-always: true` — it's deprecated by the cache maintainers as "does not work as intended" and the `Guard — no save-always on actions/cache` step in `.github/workflows/zizmor.yml` will fail the workflow audit if it reappears. Self-hosted runners skip the GHA cache entirely and pin to `runner.tool_cache` instead. Both patterns documented in `.claude/skills/ci-cache/SKILL.md` — read it before adding any new cache step.
 - **Proto codegen** — Maintain `proto/meson.build` and `proto/gen_proto.py`. Ensure `#include` path rewriting works on all platforms.
 - **CI capabilities** — Add missing CI features: vulnerability scanning, coverage gates, artifact publishing, release workflows.
 - **Build reproducibility** — Pin tool versions, use lock files, ensure builds are deterministic.

@@ -12,7 +12,7 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 ```
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
-/test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf, coverage enforce
+/test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -28,20 +28,33 @@ Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
 Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
 Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
 Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
-Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent)
+Phase 7a — Perf gate            (--full only — runs HERE on a quiet box,
+                                 BEFORE Phase 4 brings up the UAT stack;
+                                 perf is fully self-contained and contention-
+                                 sensitive, so it must measure with no other
+                                 yuzu processes running)
+Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
+                                 through Phase 8 so humans can poke at the
+                                 stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / e2e-security /
                                  synthetic UAT / puppeteer)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
-Phase 7 — Coverage + Perf       (--full only — enforce baselines)
-Phase 8 — Teardown + Summary    (down stacks, finalize test_runs row, print table)
+Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
+Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
+                                 finalises run row; LEAVES THE UAT ALIVE on
+                                 purpose — do NOT call linux-start-UAT.sh stop)
 ```
+
+**Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
+
+**Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `linux-start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/linux-start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
 Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
 **Every phase emits structured timing data into the test-runs DB.** Top-level gate timings land in `test_gates.duration_seconds`; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in `test_timings`. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.
 
-> **PR2 status.** Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 (coverage + perf) runs locally against `tests/coverage-baseline.json` and `tests/perf-baselines.json` — PR2 ships these as **permissive seeds**, and the first operator run on a new dev box should use `--capture-baselines` to lock real numbers then commit the updated JSON alongside their next change.
+> **PR2 status.** Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as `SKIP` with a "planned for PR3" note. Phase 6 (sanitizers) dispatches `.github/workflows/sanitizer-tests.yml` onto the `yuzu-wsl2-linux` self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against `tests/coverage-baseline.json` (real captured numbers; the original PR2 `__seed: true` permissive baseline is gone). Phase 7 perf is **measure-and-report** as of 2026-05-03: the gate records `perf_*` metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Step 0 — Initialise run state
 
@@ -236,6 +249,26 @@ bash scripts/test/test-ota-agent-windows.sh --run-id "$RUN_ID"
 bash scripts/test/test-ota-agent-macos.sh   --run-id "$RUN_ID"   # SKIP until hardware arrives
 ```
 
+## Phase 7a — Perf measurement (runs HERE, before Phase 4)
+
+`--full` only. Despite the `7a` label (rows are tagged `phase=7` in the DB so they group with coverage in the report), perf runs **here** in wall-clock order — after Phase 3 has finished but before Phase 4 brings up the UAT stack. This is the most-quiesced point in the pipeline:
+
+- Phase 1 build is done (binaries exist; ccache hits stop competing).
+- Phase 2 docker compose has been torn down.
+- Phase 3 is just DB writes.
+- Phase 4 hasn't started, so no native server/gateway/agent.
+- Phase 5 hasn't started, so no parallel fan-out CPU pressure.
+
+The perf suite is fully self-contained (every upstream RPC meck'd, gateway components in-process), so it has no functional dependency on the live stack. Running it here keeps measurements off contended cores.
+
+```bash
+if [[ "$MODE" == "full" ]]; then
+    bash scripts/test/perf-gate.sh --run-id "$RUN_ID"
+fi
+```
+
+**Measure-and-report, not enforce (as of 2026-05-03).** `perf-gate.sh` runs `yuzu_gw_perf_SUITE`, parses throughput and latency from `ct:pal` output, records each metric into the test-runs DB as `perf_*`, and exits PASS. It does **not** read a baseline file or fail on a regression — the N=300 calibration found that 3 of the 4 gateway perf metrics are ceiling-bounded with long left tails (not Gaussian), so neither σ nor %-tolerance bands are statistically defensible. Until the gate is rebuilt around percentile primitives, perf is human-judgement-driven: the operator inspects trend via `bash scripts/test/test-db-query.sh --trend timing=phase7.perf` and shape via `tests/perf-baseline-provenance-N300.{jsonl,json}`. Full rationale and the deferred redesign live in `docs/perf-baseline-calibration-2026-05-03.md`. The script still scans the seven UAT-related ports (8080, 50051, 50052, 50055, 50063, 8081, 9568) and refuses to run if any are listening (contended measurements mislead the human eyeball too), with `--allow-busy` as an explicit debug bypass. Loadavg pre/post and the hardware fingerprint stay recorded as metric context.
+
 ## Phase 4 — Fresh Stack Stand-up
 
 Skipped in `--quick`. Default and `--full` use the existing `linux-start-UAT.sh` to bring up server+gateway+agent natively (faster than docker for Phase 5 e2e gates that hit the live stack):
@@ -258,6 +291,31 @@ bash scripts/test/test-db-write.sh gate \
 ## Phase 5 — Test Gates (parallel)
 
 Run all gates concurrently via `&` + `wait`. Each is a self-contained bash invocation that captures its own log to `$LOG_DIR/<gate>.log`. Don't try to collect their stdout — read the log paths in the failure summary instead.
+
+### Race-free parallel rebar3 via `REBAR_BASE_DIR`
+
+EUnit, CT suites, and CT real-upstream all consume `_build/test/lib/yuzu_gw/test/` for the same set of compiled `*_tests.beam` and `*_SUITE.beam` files. When run in parallel against a shared `_build/` they race on **two** different things:
+
+1. **Dep fetching.** Each invocation calls `Verifying dependencies...`, decides to re-fetch `proper`/`meck`/`covertool` into `_build/{default,test}/lib/`, and concurrent extraction corrupts the partially-fetched packages — the loser sees `Dependency failure: source for proper does not contain a recognizable project`, and the post-failure `rm -rf` fails with `Directory not empty` because the writer still has open file handles. (Observed in run `1777704747-244808`.)
+2. **Test source compile.** When any `test/` `.erl` is edited, both rebar3 processes recompile the entire test/ directory, racing on `.bea#` → `.beam` atomic-rename of every test module — manifests as `failed to rename .../yuzu_gw_health_nf_tests.bea# to .../yuzu_gw_health_nf_tests.beam: no such file or directory` (the writer's tempfile gets unlinked underneath it). Observed in run `1777727834-294523` after the first race fix landed.
+
+Sequential pre-warming would fix (1) but not (2) — rebar3 has no clean way to compile test/ without running tests, and any test-running pre-warm doubles the wall time of the slowest gate. The cleaner cure is to give each parallel gate **its own `_build/` tree** via `REBAR_BASE_DIR`. EUnit writes to `_build_eunit/`, CT suites to `_build_ct/`, CT real-upstream to `_build_ct_realup/`, Dialyzer keeps the shared `_build/`. They cannot collide because they touch different filesystem paths.
+
+The fan-out below sets `REBAR_BASE_DIR` per gate. First-run cost is one-time deps refetch into each tree (~10s); subsequent runs find both trees warm. Total Phase 5 wall time goes 60s pre-fix → 105-140s with REBAR_BASE_DIR (cold first run) → ~95s warm — comparable to the broken parallel fan-out, but actually correct.
+
+Dialyzer keeps the default `_build/` because it's the only consumer of `_build/default/` in Phase 5 — there is no race partner. Keeping its tree separate also means a `rebar3 dialyzer` run from outside `/test` reuses the same PLT cache.
+
+A pre-warm of the default `_build/` (compiling `src/` + `_build/default/lib/` deps) is no longer needed for race-correctness; it's still cheap (~17s) and shaves a few seconds off Dialyzer first-run cold starts, so we keep it as a small optimisation. It MUST NOT touch `_build_eunit/` or `_build_ct/`:
+
+```bash
+(
+    cd gateway
+    source ../scripts/ensure-erlang.sh 2>/dev/null
+    rebar3 compile > "$LOG_DIR/prewarm-default.log" 2>&1 || true
+)
+```
+
+Pre-warm failures use `|| true` because if `src/` genuinely can't compile, every gate will fail with the same error and that's the right reporting surface — the pre-warm step is just for first-run cold-start latency, not for gating.
 
 The pattern for every gate (note: `eval "$cmd"` is safe here because every
 caller below passes a literal string constructed inline in this same skill;
@@ -296,13 +354,13 @@ gate_run "C++ unit (Catch2)" "unit-cpp.log" \
     "meson test -C build-linux --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 eunit --dir apps/yuzu_gw/test"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test"
 
 gate_run "Dialyzer" "dialyzer.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 dialyzer"
 
 gate_run "CT suites" "ct.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
@@ -316,7 +374,7 @@ gate_run "CT suites" "ct.log" \
 # "No enrollment token: …"} per-case rather than a useful skip — file
 # an upstream issue if you hit that during /test.
 gate_run "CT real-upstream" "ct-real-upstream.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct_realup rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE"
 
 gate_run "Integration" "integration.log" \
     "bash scripts/integration-test.sh"
@@ -383,14 +441,13 @@ The gate script:
 
 **Suite selection.** Default runs both (ASan+UBSan and TSan). Override with `--suite asan` or `--suite tsan` on the gate script — useful when diagnosing a single finding and you don't want the second rebuild to compete for runner time.
 
-## Phase 7 — Coverage + Perf (PR2)
+## Phase 7b — Coverage (PR2)
 
-Both gates run locally on the operator's dev box. Coverage uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact); perf drives `rebar3 ct --suite=yuzu_gw_perf_SUITE`.
+Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
     bash scripts/test/coverage-gate.sh --run-id "$RUN_ID"
-    bash scripts/test/perf-gate.sh     --run-id "$RUN_ID"
 elif [[ "$MODE" == "default" ]]; then
     # Default mode: coverage in report-only (metric recorded, no enforce);
     # perf skipped (default-mode budget is too tight for the ~3-5 min
@@ -398,26 +455,24 @@ elif [[ "$MODE" == "default" ]]; then
     bash scripts/test/coverage-gate.sh --run-id "$RUN_ID" --report-only || true
     bash scripts/test/test-db-write.sh gate \
         --run-id "$RUN_ID" --phase 7 --gate "Perf" \
-        --status SKIP --duration 0 --notes "perf gate runs in --full only"
+        --status SKIP --duration 0 --notes "perf measurement runs in --full only"
 fi
 ```
 
 **Coverage enforcement.** The gate parses gcovr `--json-summary` (filter set mirrored from `.github/workflows/ci.yml` so local/CI numbers match Codecov; gate also passes `--native-file meson/native/linux-gcc13.ini` so the compiler matches CI's coverage job), records `branch_coverage_overall` and `line_coverage_overall` metrics, and compares against `tests/coverage-baseline.json`. In `--full` mode the gate fails if branch coverage drops below `baseline.branch_percent - slack_pp` (default 0.5 pp). Default mode records the metric but doesn't enforce — `--report-only` short-circuits the comparison. The default-mode invocation wraps the script in `|| true` so a transient gcovr or build failure writes its own WARN row and does not block the rest of the run; in `--full` mode the gate is called without `|| true`, so build or parse failures surface as FAIL.
 
-**Perf enforcement.** The gate runs the `registration,heartbeat,fanout,churn` CT groups (endurance deliberately excluded — it runs for 5 minutes and belongs in a scheduled nightly), parses throughput and latency metrics from `ct:pal` output, records them as `perf_*` metrics (ops/sec for throughput, ms or ms/agent for latency), and compares against `tests/perf-baselines.json` with a 10% tolerance. Throughput metrics (`*_ops_sec`) regress when current < baseline × 0.9; latency metrics (`*_ms`, `*_ms_per_agent`) regress when current > baseline × 1.1.
+**Perf is no longer enforced (2026-05-03).** Phase 7a runs `yuzu_gw_perf_SUITE` and records `perf_registration_ops_sec`, `perf_burst_registration_ops_sec`, `perf_heartbeat_queue_ops_sec`, `perf_fanout_*_ms`, `perf_session_cleanup_ms_per_agent`, and `perf_loadavg_pre/post` into the test-runs DB. There is no baseline file and no regression check. The N=300 calibration showed 3 of the 4 throughput/latency metrics are ceiling-bounded with long left tails — neither σ nor %-tolerance bands fit them — so until the gate is rebuilt around percentile primitives the operator does the inspection: `bash scripts/test/test-db-query.sh --trend timing=phase7.perf` for run-over-run movement, `python3 scripts/test/perf-histograms.py tests/perf-baseline-provenance-N300.jsonl` (gitignored scratch tool) for shape comparison against the calibration capture, and the inline histograms in `docs/perf-baseline-calibration-2026-05-03.md` for the empirical reference distributions. Full rationale and the deferred redesign live in the same doc.
 
-**Hardware fingerprint guard.** The perf baseline records the hardware fingerprint (CPU model + RAM) of the machine that captured it. When the current fingerprint doesn't match, the gate auto-downgrades to WARN regardless of regressions — a 30% delta between the 5950X dev box and the Apple Silicon MBP is not a real regression. Both baselines need a separate capture per machine.
-
-**Baseline update workflow.**
-1. Make a change you believe deserves a new baseline (coverage up, perf up, or an accepted trade-off).
-2. **Pre-flight**: run `bash scripts/test/preflight.sh` and a clean `meson test -C build-linux-coverage` (for coverage) or a clean `rebar3 ct --suite yuzu_gw_perf_SUITE` (for perf). If tests are failing, the gate will now refuse `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` — this is the UP-18 guard protecting you from anchoring a broken-environment baseline.
-3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines` and/or `bash scripts/test/perf-gate.sh --run-id manual --capture-baselines`. Both rewrite the JSON file with current numbers + `captured_at` + `captured_commit` + (perf only) hardware fingerprint, AND print a diff of old-vs-new values before overwrite so you can sanity-check the direction.
-4. `git add tests/coverage-baseline.json tests/perf-baselines.json` alongside your feature commit. `git blame` on those files is the audit trail.
+**Coverage baseline update workflow.**
+1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
+2. **Pre-flight**: a clean `meson test -C build-linux-coverage` must pass — the gate refuses `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` if it doesn't (UP-18 guard protecting you from anchoring a broken-environment baseline).
+3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines`. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
+4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
 
-**Baseline refresh cadence.** Recapture both baselines at every `vX.Y.0` release tag on the canonical dev box (5950X for perf, any Linux with GCC 13 for coverage). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data; perf drift across hardware generations is silenced by the hardware-fingerprint auto-downgrade, so recapture-at-release keeps each train's perf baseline honest for its target hardware.
+**Coverage baseline refresh cadence.** Recapture at every `vX.Y.0` release tag on the canonical dev box (any Linux with GCC 13). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data.
 
-**Seed sentinel (historical + defensive).** The `__seed: true` sentinel was the PR2 mechanism that kept the gates from silently green-passing while baselines were placeholders. Both gate scripts honor it: `__seed: true` forces WARN regardless of measured numbers, even alongside otherwise-real values. The seed phase has concluded — current `tests/coverage-baseline.json` and `tests/perf-baselines.json` hold real captured numbers (branch 26.8% / line 51.8% on the 5950X; perf metrics with hardware fingerprint locked) and the sentinel is absent, so enforcement is live. Do **not** re-add `__seed: true` to a real baseline file as a "temporary disable" knob — the gates will WARN as designed, but this defeats the regression detector. To adjust thresholds, edit `slack_pp` or `tolerance_pct` directly (and document why in the commit message). To regenerate after a legitimate coverage / perf shift, follow the Baseline update workflow above.
+**Seed sentinel (historical, coverage only).** The `__seed: true` sentinel was the PR2 mechanism that kept the coverage gate from silently green-passing while the baseline was a placeholder. The gate still honors it: `__seed: true` forces WARN regardless of measured numbers. The seed phase has concluded — current `tests/coverage-baseline.json` holds real captured numbers (branch 26.8% / line 51.8% on the 5950X) and the sentinel is absent, so enforcement is live. Do **not** re-add `__seed: true` as a "temporary disable" knob; to adjust thresholds, edit `slack_pp` directly and document why in the commit message.
 
 **Concurrent --full runs on the same ref.** The sanitizer workflow's `concurrency: cancel-in-progress: false` group means a second dispatch queues behind the first until it completes (Phase 6 only — coverage/perf run locally and have their own coverage-gate race behavior). If you re-run `/test --full` immediately after a successful run on the same commit, expect Phase 6 to sit queued. Use `--suite asan` or `--suite tsan` on the gate script to halve runtime when re-running a specific finding.
 
@@ -519,7 +574,7 @@ After a successful run, the operator typically wants to:
 1. **Commit and push** — the green run is the gate. Reference `RUN_ID` in the commit message for traceability.
 2. **Compare to the prior run** — `test-db-query.sh --diff <prev> <current>` shows what changed in gate status and timings.
 3. **Investigate WARN gates** — these don't block but accumulate as tech debt. File issues if patterns emerge across runs.
-4. **Bump baselines** (PR2+) — if a legitimate coverage drop or perf regression is intentional, run `coverage-gate.sh --capture-baselines` or `perf-gate.sh --capture-baselines` and commit the updated JSON files.
+4. **Bump the coverage baseline** if a legitimate drop or trade-off is intentional — `coverage-gate.sh --capture-baselines` and commit the updated `tests/coverage-baseline.json`. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against `tests/perf-baseline-provenance-N300.{jsonl,json}` and is not blocking.
 
 After a failed run:
 
