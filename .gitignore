@@ -135,4 +135,11 @@ __pycache__/
 # exclusions.ps1 with its host-allowlist guard, the autologon-
 # diagnose script) stay tracked.
 /scripts/windows-runner-status.ps1
+
+# One-off scratch tool — ASCII histograms over perf-sample JSONL output.
+# Useful for eyeballing distribution shape (skew, outliers, multimodality)
+# but not part of the gated pipeline; perf-stats.py is the canonical
+# stats consumer of perf-baseline-provenance-*.jsonl.
+/scripts/test/perf-histograms.py
+
 .screenshots/

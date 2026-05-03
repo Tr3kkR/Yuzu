@@ -483,6 +483,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **Gateway perf baseline calibration captured at N=300 (#738, ref
+  #530).** Five-hour overnight run on Shulgi (5950X, quiet box,
+  2026-05-02 23:00 UTC → 2026-05-03 04:16 UTC, exit=0, 300/300
+  samples). Raw data at `tests/perf-baseline-provenance-N300.jsonl`,
+  derived stats at `tests/perf-baseline-provenance-N300.json`. The
+  capture confirms what the N=20 trial suggested: 3 of the 4
+  gateway perf metrics (`registration_ops_sec`,
+  `burst_registration_ops_sec`, `session_cleanup_ms_per_agent`) are
+  not Gaussian and σ-bounding them is statistically inappropriate —
+  `registration_ops_sec` is hard-ceiling-bounded with 70% of samples
+  within 5% of the 19,200 ops/sec ceiling; `session_cleanup_ms_per_agent`
+  is dominated by a single race-condition outlier; only
+  `heartbeat_queue_ops_sec` (CV 6.45%, |skew| 0.11, |kurt-3| 0.33,
+  280/300 distinct values) fits the Gaussian assumption. The full
+  finding plus inline ASCII histograms is recorded in
+  `docs/perf-baseline-calibration-2026-05-03.md`. Perf-gate redesign
+  to percentile floors for ceiling-bounded metrics is deferred to a
+  later cycle; in the interim the gate runs as-is and human
+  judgement is the loop.
 - **PR 3 coverage net — `tests/unit/server/test_execution_event_bus.cpp`
   (new file)** — 10 Catch2 cases / 1039 assertions tagged
   `[execution_event_bus][pr3]`: subscribe/publish/unsubscribe round-trip

@@ -1,0 +1,10 @@
+exit=0
+duration_seconds=19011
+wall_minutes=316
+started_at=2026-05-02T23:00:00Z
+finished_at=2026-05-03T04:16:51Z
+host=Shulgi
+n_samples_requested=300
+n_samples_actual=300
+label=v0.12.0-baseline-calibration
+log=/home/dornbrn/.local/share/yuzu/perf-cron-N300.log
