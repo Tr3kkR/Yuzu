@@ -396,9 +396,16 @@ public:
             std::filesystem::create_directories(parent, ec);
             parent_ready = !ec;
             if (ec) {
-                spdlog::debug("Default log directory {} not creatable ({}); "
-                              "skipping default file logger. Pass --log-file to override.",
-                              parent.string(), ec.message());
+                // INFO not DEBUG (governance Gate 7): default loglevel is INFO,
+                // so DEBUG is invisible — operators auditing the SOC 2 evidence
+                // chain or troubleshooting "where did my logs go?" need a single
+                // visible breadcrumb. WARN was the original UX bug (false-positive
+                // scary message on every container boot when the directory simply
+                // didn't exist). INFO is the canonical "single startup crumb"
+                // level — appears in default operator output, no alarm semantics.
+                spdlog::info("Default log directory {} not creatable ({}); "
+                             "skipping default file logger. Pass --log-file to override.",
+                             parent.string(), ec.message());
             }
         }
         if (parent_ready) {
@@ -408,8 +415,10 @@ public:
                 file_logger_->flush_on(spdlog::level::info);
                 spdlog::info("Log file: {}", log_path.string());
             } catch (const spdlog::spdlog_ex& ex) {
-                spdlog::debug("Default file logger unavailable ({}); "
-                              "pass --log-file to override.", ex.what());
+                // INFO not DEBUG — see rationale on the create_directories
+                // branch above.
+                spdlog::info("Default file logger unavailable ({}); "
+                             "pass --log-file to override.", ex.what());
             }
         }
 
@@ -1653,8 +1662,14 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Lightweight probes — always allowed, no auth, no rate limit
-                if (req.path == "/livez" || req.path == "/readyz") {
+                // Lightweight probes — always allowed, no auth, no rate limit.
+                // /health and /api/health are included here (governance Gate 7,
+                // unhappy-path UP-1) so monitoring integrations behind a NAT or
+                // sharing a source-IP bucket with authed REST traffic cannot
+                // 429-starve the health probe. The endpoints themselves are
+                // strictly read-only and documented as unauthenticated.
+                if (req.path == "/livez" || req.path == "/readyz" ||
+                    req.path == "/health" || req.path == "/api/health") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -1878,6 +1893,11 @@ private:
 
             res.set_content(health.dump(), "application/json");
         };
+        // Both URLs MUST be served by the SAME handler instance — do not split
+        // into two lambda bodies. The unauthenticated `system.*` gating above
+        // is load-bearing and must run identically on both routes; forking the
+        // body invites a future regression where the alias diverges in subtle
+        // ways. Governance Gate 7, architect NICE-2.
         web_server_->Get("/health", health_handler);
         web_server_->Get("/api/health", health_handler);
 

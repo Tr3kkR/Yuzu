@@ -12,8 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/api/health` alias** of the existing `/health` endpoint (#620).
   Both URLs now serve the same JSON body and both bypass authentication so
   monitoring integrations that prefix every REST call with `/api/` keep
-  working. Restores the path that operators had been pointing monitors at
-  before the #401 fix moved the canonical health endpoint to `/health`.
+  working. Both are also exempt from API rate limiting (so a NAT'd or
+  shared-bucket monitoring host can't 429-starve the probe), matching the
+  treatment `/livez` and `/readyz` already get. Restores the path that
+  operators had been pointing monitors at before the #401 fix moved the
+  canonical health endpoint to `/health`.
+- **Docs:** `docs/user-manual/server-admin.md` gains a "File Logging"
+  section covering `--log-file` semantics and the implicit-default
+  fallback, and a "Health Endpoints" section enumerating `/livez`,
+  `/readyz`, `/health`, and `/api/health` with guidance on which to use
+  for which monitoring scenario.
+- **Docs:** `docs/user-manual/rest-api.md` `GET /health` entry now notes
+  the `/api/health` alias and the explicit non-draining-aware contract.
+- **Docs:** `docs/user-manual/upgrading.md` v0.12.0 section gains an
+  "A3 UX ladder (#620, #622, #624)" sub-entry with the operator action
+  required for local compose overrides.
 
 ### Fixed
 
@@ -25,20 +38,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (gateway, no shell required). The compose stack now reports `healthy`
   in `docker inspect`. Operators with a local copy of the same broken
   pattern (e.g. an untracked `docker-compose.local.yml`) should mirror
-  the same change.
+  the same change — see `docs/user-manual/upgrading.md`.
+  The bash healthcheck explicitly closes FD 3 after the grep to avoid
+  leaking CLOSE_WAIT sockets under sustained probe cadence.
 - **Server log directory in container deployments** (#624).
-  `Dockerfile.server` now creates `/var/log/yuzu` with the right ownership
-  during the runtime stage, eliminating the "Could not create log
-  directory" warning on every boot. The unconditional file-logger setup in
-  `server.cpp` no longer logs WARN/ERROR on failure — when the default log
-  path is not writable it now drops to a single DEBUG line and proceeds,
-  since file logging is best-effort observability and operators who want
-  it can pass `--log-file` explicitly.
+  `Dockerfile.server` now creates `/var/log/yuzu` with mode 0750 and the
+  right ownership during the runtime stage, aligning with the deb postinst
+  and preventing log disclosure to other UIDs in the container. The
+  unconditional file-logger setup in `server.cpp` no longer logs
+  WARN/ERROR on failure — when the default log path is not writable it
+  now drops to a single INFO line and proceeds, since file logging is
+  best-effort observability. INFO (not DEBUG) is the right level so
+  operators auditing the SOC 2 evidence chain or troubleshooting "where
+  did my logs go?" still get a visible breadcrumb at default loglevel.
+  Operators who want explicit on-disk logs can pass `--log-file <path>`;
+  explicit-path failures still log at ERROR.
 
 ### Tests
 
 - `scripts/linux-start-UAT.sh` — added regression assertion that `/health`
-  and `/api/health` both return 200, guarding against the #620 regression.
+  and `/api/health` return 200 AND identical JSON bodies, guarding
+  against both the #620 regression and a future split of the dual-mount
+  handler lambda.
 
 ## [0.12.0] - 2026-05-03
 

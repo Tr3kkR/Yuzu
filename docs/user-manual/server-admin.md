@@ -62,6 +62,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
 
@@ -684,6 +685,30 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
 ---
+
+## File Logging
+
+Yuzu writes logs to stdout by default. File logging is opt-in via `--log-file`, with a best-effort fallback at the platform default path (`/var/log/yuzu/server.log` on Linux, `C:\ProgramData\Yuzu\logs\server.log` on Windows, `~/Library/Logs/Yuzu/server.log` on macOS).
+
+| Path | Behaviour | Failure mode |
+|---|---|---|
+| `--log-file <path>` (explicit) | Writes to `<path>` in addition to stdout. | If the file/directory cannot be opened, server logs an ERROR and continues without file logging. |
+| Platform default path (implicit) | Writes to the platform default path if it exists and is writable. | If the directory cannot be created or the file cannot be opened, server logs a single INFO line and continues without file logging. The default fallback is best-effort observability, not load-bearing. |
+
+The Docker server image pre-creates `/var/log/yuzu` (mode 0750, owned by the `yuzu` user) so the implicit default path works out of the box. When mounting an external host volume at `/var/log/yuzu`, ensure the host directory is owned by the same UID as the in-container `yuzu` user (verify with `docker exec yuzu-server id yuzu`); a wrong-ownership mount silently degrades to stdout-only logging.
+
+## Health Endpoints
+
+Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and monitoring integrations. All four are unauthenticated and exempt from the API rate limiter.
+
+| Path | Use case | Body | Draining-aware |
+|---|---|---|---|
+| `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200) or `{"status":"draining"}` (503) | **Yes** |
+| `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
+| `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
+
+**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches.
 
 ## Deployment
 

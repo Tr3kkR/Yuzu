@@ -3546,7 +3546,11 @@ OIDC callback endpoint. The identity provider redirects here after authenticatio
 
 ## Health
 
-#### `GET /health`
+#### `GET /health` (alias: `GET /api/health`)
+
+> **Note:** `/api/health` is an identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Both paths are unauthenticated, exempt from rate limiting, and return the same JSON body. The canonical path is `/health`; use `/api/health` only when your tooling enforces the `/api/` prefix unconditionally. (Restored in v0.12.0 — see issue #620.)
+>
+> **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 

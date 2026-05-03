@@ -229,12 +229,15 @@ services:
     # `curl` is not installed in the server runtime image, and `CMD-SHELL`
     # invokes `/bin/sh` which on Ubuntu 24.04 is `dash` and does not
     # implement /dev/tcp — so we must invoke `bash` explicitly.
+    # Trailing `exec 3>&-` explicitly closes FD 3 to avoid leaking
+    # CLOSE_WAIT sockets under sustained healthcheck cadence (governance
+    # Gate 7, unhappy-path UP-18 / sre SHOULD).
     healthcheck:
       test:
         - "CMD"
         - "bash"
         - "-c"
-        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /livez HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"
+        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /livez HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3 ; rc=$$? ; exec 3>&- ; exit $$rc"
       interval: 10s
       timeout: 5s
       retries: 5
