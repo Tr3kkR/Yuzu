@@ -9,7 +9,7 @@ Runbook for cutting a Yuzu release. Like `/test`, this skill is a **bash-first o
 
 Releases publish to two destinations from one tag push:
 1. **GitHub Releases page** — platform tarballs/zips, .deb/.rpm packages, Windows/.macOS installers, SHA256SUMS + cosign signature, and the Compose Wizard zip
-2. **GHCR** — `ghcr.io/<owner>/yuzu-server:vX.Y.Z` and `:yuzu-gateway:vX.Y.Z` Docker images
+2. **GHCR** — `ghcr.io/<owner>/yuzu-server:X.Y.Z` and `:yuzu-gateway:X.Y.Z` Docker images. **NOTE: GHCR tags strip the leading `v`** — git tag is `v0.12.0-rc0`, GHCR image tag is `0.12.0-rc0`. The release workflow's `docker buildx push` step strips the prefix; verification commands must match.
 
 Both go out from `.github/workflows/release.yml`, triggered by `git push origin vX.Y.Z`.
 
@@ -31,7 +31,7 @@ Before invoking the skill, the operator should already have:
 - All commits intended for this release merged to `main` (releases tag from main, not dev — confirm `git log origin/main..origin/dev` is empty or only contains intentional dev-only changes).
 - CHANGELOG `[Unreleased]` section content moved to `## [X.Y.Z] - YYYY-MM-DD`.
 - `meson.build` `version: 'X.Y.Z'` updated.
-- All tracked compose files updated to `${YUZU_VERSION:-X.Y.Z}` defaults (the workflow's first gate enforces this and will hard-fail the release after ~30 min of build matrix runs if it's wrong — preflight catches it in 2 sec).
+- All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
 If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. **It does NOT auto-bump versions** — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.
 
@@ -164,7 +164,7 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Validate docker-compose image versions` fails on the `release` job | A tracked compose file's `${YUZU_VERSION:-X.Y.Z}` default doesn't match the tag | Bump the default in the offending file, commit, retag with `git tag -d` + `git tag -a` + `git push --force-with-lease origin vX.Y.Z`. **All matrix jobs re-run** — costs ~30-60 min wall clock. Better: catch in preflight. |
+| `Validate docker-compose image versions` fails on the `Create Release` job | A tracked compose file's `${YUZU_VERSION:-...}` default doesn't equal the **base** version (rc/beta suffix stripped). E.g. for `v0.12.0-rc0` the default must be `0.12.0`, not `0.12.0-rc0`. | Bump the default in the offending file to BASE version, commit, retag with `git tag -fa vX.Y.Z` + `git push --force origin vX.Y.Z`. **Confirm with the operator before force-pushing the tag** — auto mode treats tag rewrites as destructive even mid-recovery. **All matrix jobs re-run** — costs ~30–60 min wall clock. Better: catch in preflight (it does the right thing because it strips the suffix internally). |
 | `Artifact download failed after 5 retries` on the `release` job, complaining about a `*.dockerbuild` file | Docker buildx provenance/attestation artifacts have unstable names that download-artifact occasionally cannot resolve | Already filtered in workflow with `pattern: 'yuzu-*'` — if regression, re-add filter. v0.10.0 hit this and was assembled manually. |
 | `ccache stats: 0 hits` on a re-run that should have been cached | ccache key changed (any C++ file edit invalidates) | Normal; subsequent build hits. If repeated 0% on identical input, check `~/.cache/ccache` writability on the runner. |
 | `signtool sign /f` fails on Windows | `WINDOWS_SIGNING_CERT` secret missing or expired | The signing step is conditional on `env.HAS_SIGNING_CERT == 'true'` — release proceeds unsigned if absent. Confirm with operator whether unsigned is acceptable for this release; if not, refresh secret and retag. |
@@ -218,10 +218,11 @@ The artifacts are still in the workflow run — `gh run download "$RUN_ID"` retr
 Verify the GHCR images:
 
 ```bash
+# GHCR tags strip the leading `v` — git tag is vX.Y.Z, image tag is X.Y.Z.
 OWNER=$(echo "Tr3kkR" | tr '[:upper:]' '[:lower:]')
-docker pull "ghcr.io/$OWNER/yuzu-server:vX.Y.Z"
-docker pull "ghcr.io/$OWNER/yuzu-gateway:vX.Y.Z"
-docker image inspect "ghcr.io/$OWNER/yuzu-server:vX.Y.Z" --format '{{.Config.Labels}}' | grep -E "version|revision"
+docker pull "ghcr.io/$OWNER/yuzu-server:X.Y.Z"
+docker pull "ghcr.io/$OWNER/yuzu-gateway:X.Y.Z"
+docker image inspect "ghcr.io/$OWNER/yuzu-server:X.Y.Z" --format '{{.Config.Labels}}' | grep -E "version|revision"
 ```
 
 For non-prerelease tags, also verify the floating tags moved:
@@ -229,7 +230,7 @@ For non-prerelease tags, also verify the floating tags moved:
 ```bash
 docker pull "ghcr.io/$OWNER/yuzu-server:latest"
 docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigests}}'
-# Expect the same digest as :vX.Y.Z
+# Expect the same digest as :X.Y.Z
 ```
 
 Verify the cosign signature + GitHub attestation provenance. **Before running either command, gate on the client being installed** — first-time runs on a fresh dev box will hit one or both missing, and burning 30 min to discover "oh, I need cosign" post-release is exactly the gap v0.11.0-rc2 surfaced:
