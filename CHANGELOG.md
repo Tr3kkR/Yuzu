@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_(no changes since v0.12.0-rc0 — first commit on top of the rc starts a new section here)_
+
+## [0.12.0] - 2026-05-03
+
 ### Breaking
 
 - **`POST /api/settings/users` `role` field is now ignored.** New users are

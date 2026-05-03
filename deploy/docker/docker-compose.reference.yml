@@ -55,7 +55,7 @@
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.11.0}
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0-rc0}
     container_name: yuzu-server
     restart: unless-stopped
     ports:
