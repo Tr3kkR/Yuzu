@@ -561,10 +561,19 @@ jobs:
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
-      - name: Cache ccache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      # Split restore + always-save: `save-always: true` is deprecated and
+      # documented as "does not work as intended" by the actions/cache
+      # maintainers (https://github.com/actions/cache/tree/main/save#always-save-cache).
+      # Pattern: restore on the way in, then a paired `actions/cache/save`
+      # at the job tail gated on `if: always() && cache-hit != 'true'`. The
+      # `always()` lets the save run even if the build step failed (which
+      # is the only behaviour `save-always` was meant to deliver); the
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already exists, matching the default `actions/cache` semantics.
+      - name: Restore ccache
+        id: cache-ccache-macos
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/Library/Caches/ccache
           key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -581,14 +590,17 @@ jobs:
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Cache vcpkg installed packages
+      - name: Restore vcpkg installed packages
         # Universal cache-key contract: vcpkg.json + vcpkg-configuration.json
         # + every overlay triplet + the pinned VCPKG_COMMIT baseline.
         # Without the triplet/baseline components a port edit or baseline
         # bump silently restores stale binaries (D3 in the CI overhaul plan).
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Save side is the paired `actions/cache/save` step at the job tail
+        # — see comment on `Restore ccache` above for the save-always
+        # deprecation rationale.
+        id: cache-vcpkg-macos
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
@@ -642,6 +654,25 @@ jobs:
         if: always()
         run: ccache -s
 
+      # Paired saves for the two restore-only steps above. `if: always()`
+      # is the documented replacement for `save-always: true` and lets
+      # the cache populate even when Build/Test failed. The
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already matched on restore (no new content to save).
+      - name: Save ccache
+        if: always() && steps.cache-ccache-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/ccache
+          key: ${{ steps.cache-ccache-macos.outputs.cache-primary-key }}
+
+      - name: Save vcpkg installed packages
+        if: always() && steps.cache-vcpkg-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
+
   # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
   # Detects whether a PR touches CI infrastructure (workflows / actions /
   # CI helper scripts). If it does, the canary leg runs the linux build
@@ -692,30 +723,33 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache vcpkg installed packages (canary)
+      - name: Restore vcpkg installed packages (canary)
         # Universal cache key — invalidates only when manifest, triplet,
         # or vcpkg baseline changes. First canary run on a stable manifest
         # is ~25 min from-source; subsequent runs restore in ~10 s.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # Save side is the paired `actions/cache/save` step at the job tail
+        # — see comment on the macOS `Restore ccache` step (line ~564) for
+        # the save-always deprecation rationale and the documented split
+        # restore + always-save pattern.
+        id: cache-vcpkg-canary
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
           key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-
 
-      - name: Cache ccache (canary)
+      - name: Restore ccache (canary)
         # ccache is `apt-get install`-ed and used as the compiler wrapper
         # below, but the GHA-hosted runner is fresh-disk per job — without
         # this cache step every TU compiles cold every run. Mirrors the
-        # macOS pattern (line 564). Source-hash key triggers a fresh save
-        # on any source change but cascading restore-keys keep most of the
-        # cache warm. Closes the canary's biggest unforced-loss perf hole
-        # (#743).
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        # macOS pattern. Source-hash key triggers a fresh save on any
+        # source change but cascading restore-keys keep most of the cache
+        # warm. Closes the canary's biggest unforced-loss perf hole (#743).
+        id: cache-ccache-canary
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/.cache/ccache
           key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -761,3 +795,22 @@ jobs:
       # regression. `meson test` runs on every other linux leg
       # (linux_matrix, nightly asan/tsan/coverage). Skipping it here saves
       # ~10 min per canary run without reducing coverage. #743.
+
+      # Paired saves for the two restore-only steps above. `if: always()`
+      # is the documented replacement for `save-always: true` and lets
+      # the cache populate even when Build failed. The
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already matched on restore (no new content to save).
+      - name: Save vcpkg installed packages (canary)
+        if: always() && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
+
+      - name: Save ccache (canary)
+        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.cache-ccache-canary.outputs.cache-primary-key }}

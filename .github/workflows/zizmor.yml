@@ -55,6 +55,32 @@ jobs:
         with:
           persist-credentials: false
 
+      # Deterministic guard against the deprecated `save-always: true`
+      # input on `actions/cache`. The cache maintainers documented it as
+      # "does not work as intended" and recommend a split
+      # `actions/cache/restore` + `actions/cache/save` (gated on
+      # `if: always() && cache-hit != 'true'`) instead. This step fails
+      # the workflow if `save-always` reappears in any workflow YAML so
+      # the non-use becomes structural rather than convention.
+      # Reference: https://github.com/actions/cache/tree/main/save#always-save-cache
+      - name: Guard — no save-always on actions/cache
+        run: |
+          set -eu
+          # Match only the actual YAML key (line begins, after optional
+          # whitespace, with `save-always:`). Comments containing the
+          # phrase — including this one — are excluded by the leading
+          # whitespace + literal `s` anchor. `|| true` keeps set -e happy
+          # on the no-match case.
+          hits=$(grep -rIn --include='*.yml' --include='*.yaml' \
+            -E '^[[:space:]]*save-always:' \
+            .github/workflows .github/actions 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::save-always: is deprecated and forbidden — see https://github.com/actions/cache/tree/main/save#always-save-cache"
+            echo "$hits"
+            exit 1
+          fi
+          echo "save-always check: clean"
+
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
         with:
