@@ -12,10 +12,16 @@
 #
 # Scope of action on key drift:
 #   - rm -rf vcpkg_installed/<triplet>/         (the per-triplet install root)
+#   - rm -rf vcpkg_installed/vcpkg/             (per-workspace registry —
+#     info/, status, updates/. Leaving this in place after wiping the
+#     triplet tree leaves orphaned `info/<port>_<triplet>.list` entries
+#     that make the next `vcpkg install` short-circuit to "already
+#     installed" and then fail post-install pkgconfig validation. #741.)
 #   - write the new key to vcpkg_installed/.<triplet>-cachekey.sha256
 #
 # Scope NEVER touched:
-#   - vcpkg/                       (vcpkg itself, owned by lukka/run-vcpkg)
+#   - $WS/vcpkg/                   (vcpkg tool root, owned by lukka/run-vcpkg
+#                                    — distinct from $WS/vcpkg_installed/vcpkg/)
 #   - runner.tool_cache/...        (binary cache zips — that's the warm tier)
 #   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache)
 #   - any other vcpkg_installed/<other-triplet>/ tree
@@ -110,6 +116,16 @@ if [[ "$want" != "$have" ]]; then
     rm -rf "$installed_dir"
   else
     echo "  no existing tree to wipe"
+  fi
+  # Wipe the per-workspace registry alongside the triplet tree so vcpkg
+  # cannot short-circuit to "already installed" against a phantom entry
+  # in `vcpkg/info/<port>_<triplet>.list`. #741.
+  registry_dir="$sentinel_dir/vcpkg"
+  if [[ -d "$registry_dir" ]]; then
+    echo "  wiping ${registry_dir} (workspace registry)"
+    rm -rf "$registry_dir"
+  else
+    echo "  no existing registry to wipe"
   fi
   echo "$want" > "$sentinel_file"
 else

@@ -195,38 +195,29 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Force fresh vcpkg install when triplet changed (windows only)
-        if: matrix.os == 'windows'
-        run: |
-          # The self-hosted Windows runner has a persistent
-          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
-          # incremental install keys off the manifest only — it does NOT
-          # detect overlay-triplet content edits. So a triplet change
-          # like removing `VCPKG_BUILD_TYPE release` (which gates whether
-          # vcpkg builds the debug variant of every package) silently
-          # leaves the existing release-only tree in place, and the
-          # debug build then fails to link with LNK2038
-          # `RuntimeLibrary` / `_ITERATOR_DEBUG_LEVEL` mismatches against
-          # absl_*.lib.
-          #
-          # We reconcile by wiping the install root whenever the recorded
-          # triplet hash drifts from the current `triplets/x64-windows.cmake`
-          # SHA. The sentinel is a 1-line file under vcpkg_installed itself
-          # so it lives and dies with the tree it describes.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
-          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
-          have=$(cat "$sentinel" 2>/dev/null || echo "")
-          if [[ "$want" != "$have" ]]; then
-            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
-            rm -rf "$installed_dir"
-            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
-            echo "$want" > "$sentinel"
-          else
-            echo "x64-windows triplet sha256 unchanged ($want) — keeping persistent vcpkg_installed/x64-windows"
-          fi
+      - name: vcpkg sentinel
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        # Replaces the prior inline Windows-only sentinel that hashed only
+        # `triplets/x64-windows.cmake`, missed manifest + baseline drift,
+        # and left `vcpkg_installed/vcpkg/` orphaned after wiping the
+        # triplet tree (#741). The shared script invalidates both halves
+        # of vcpkg_installed/ together and uses the same key as ci.yml so
+        # the binary cache is shared cleanly across workflows.
+        shell: bash
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace. Without this
+          # lukka/run-vcpkg defaults to a per-run UUID temp dir under its
+          # own state path → 0% hit rate every run → every port rebuilt
+          # from source (~25 min on this runner for grpc + abseil +
+          # protobuf). The path matches ci.yml's
+          # `yuzu-vcpkg-binary-cache-${matrix.os}` so the binary cache is
+          # shared across workflows — the abseil zip is the same artifact
+          # whichever workflow built it. runner.tool_cache survives
+          # actions/checkout's default clean. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-${{ matrix.os }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -236,6 +227,7 @@ jobs:
           # without the backslash, collapsing the path. $GITHUB_WORKSPACE
           # is read by bash at runtime so escape rules don't apply, and
           # MSYS2 handles path translation when calling native binaries.
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE"
