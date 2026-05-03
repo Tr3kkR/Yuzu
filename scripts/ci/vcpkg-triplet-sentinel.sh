@@ -105,6 +105,8 @@ installed_dir="$sentinel_dir/${TRIPLET}"
 mkdir -p "$sentinel_dir"
 have=$(cat "$sentinel_file" 2>/dev/null || echo "")
 
+registry_dir="$sentinel_dir/vcpkg"
+
 if [[ "$want" != "$have" ]]; then
   echo "vcpkg sentinel drift for triplet=${TRIPLET}"
   echo "  inputs:   ${inputs[*]}"
@@ -120,7 +122,6 @@ if [[ "$want" != "$have" ]]; then
   # Wipe the per-workspace registry alongside the triplet tree so vcpkg
   # cannot short-circuit to "already installed" against a phantom entry
   # in `vcpkg/info/<port>_<triplet>.list`. #741.
-  registry_dir="$sentinel_dir/vcpkg"
   if [[ -d "$registry_dir" ]]; then
     echo "  wiping ${registry_dir} (workspace registry)"
     rm -rf "$registry_dir"
@@ -130,6 +131,25 @@ if [[ "$want" != "$have" ]]; then
   echo "$want" > "$sentinel_file"
 else
   echo "vcpkg sentinel unchanged for triplet=${TRIPLET} — keeping vcpkg_installed/${TRIPLET}"
+fi
+
+# --- defensive invariant: registry-without-tree is always orphaned --------
+#
+# Runs whether or not the cache key drifted. The "wipe both halves on
+# drift" rule from #741 plugs the path where a NEW commit lands on a
+# corrupt workspace; this rule plugs the path where the SAME commit
+# re-runs on a workspace that an earlier crash, abort, or pre-#741 run
+# left in the orphaned-registry state. Without it, every sentinel-passes
+# branch would happily preserve `vcpkg/info/<port>_<triplet>.list`
+# entries pointing at files in a `<triplet>/` tree that doesn't exist —
+# vcpkg short-circuits to "already installed" and then fails post-install
+# pkgconfig validation. Self-healing on the very first run after the
+# orphan appears, regardless of when the sentinel was last bumped.
+if [[ -d "$registry_dir" && ! -d "$installed_dir" ]]; then
+  echo "vcpkg sentinel: orphaned registry detected for triplet=${TRIPLET}"
+  echo "  ${registry_dir} exists but ${installed_dir} does not"
+  echo "  wiping ${registry_dir} (workspace registry) to recover"
+  rm -rf "$registry_dir"
 fi
 
 exit 0
