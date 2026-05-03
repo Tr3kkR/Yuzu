@@ -711,6 +711,11 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: Sentinel unit tests
+        # Pin the sentinel's drift / no-op / first-run / missing-manifest
+        # behaviour before running it for real. Closes #741.
+        run: bash scripts/ci/test-vcpkg-sentinel.sh
+
       - name: vcpkg sentinel (x64-linux)
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
 

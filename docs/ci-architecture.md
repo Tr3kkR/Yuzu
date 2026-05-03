@@ -56,9 +56,15 @@ returns false and self-hosted jobs are skipped with a clear reason.
 sha256(vcpkg.json + vcpkg-configuration.json + triplets/<triplet>.cmake + $VCPKG_COMMIT)
 ```
 
-Stored at `vcpkg_installed/.<triplet>-cachekey.sha256`. On drift, wipes ONLY
-`vcpkg_installed/<triplet>/` — never `vcpkg/`, never `runner.tool_cache`,
-never ccache. Persistence: self-hosted in
+Stored at `vcpkg_installed/.<triplet>-cachekey.sha256`. On drift, wipes
+`vcpkg_installed/<triplet>/` AND `vcpkg_installed/vcpkg/` (the
+per-workspace registry — `info/`, `status`, `updates/`. Leaving the
+registry behind after wiping the triplet tree leaves orphaned
+`info/<port>_<triplet>.list` entries that make the next `vcpkg install`
+short-circuit to "already installed" and then fail post-install
+pkgconfig validation; this was #741.) Never touches `$WS/vcpkg/` (the
+sibling vcpkg tool root, owned by lukka/run-vcpkg), never
+`runner.tool_cache`, never ccache. Persistence: self-hosted in
 `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}`
 (per-triplet, outside workspace). macOS uses `actions/cache@v5` keyed on
 the same invariant.

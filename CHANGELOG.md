@@ -808,6 +808,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **#741 — vcpkg sentinel registry-desync wedged Windows CI.** Two
+  related defects converged on today's CodeQL Windows job:
+  (a) `scripts/ci/vcpkg-triplet-sentinel.sh` wiped
+  `vcpkg_installed/<triplet>/` on cache-key drift but left the sibling
+  per-workspace registry (`vcpkg_installed/vcpkg/{info,status,updates}/`)
+  intact, so orphaned `info/<port>_<triplet>.list` entries persuaded the
+  next `vcpkg install` to short-circuit to "already installed" and then
+  fail post-install pkgconfig validation with
+  `read_lines("…/lib/pkgconfig/<pkg>.pc"): no such file or directory`
+  (today's failure hit on `absl_absl_check.pc`); (b) `codeql.yml` had
+  its **own** inline sentinel (`.x64-windows-triplet.sha256`) that
+  hashed only `triplets/x64-windows.cmake` — missing manifest + baseline
+  drift — and shared the same registry-orphan bug. The shared sentinel
+  now wipes both halves of `vcpkg_installed/` together; `codeql.yml` now
+  calls the shared script instead of its own inline logic;
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the four behaviours the
+  sentinel must preserve and runs from the `canary` job in `ci.yml`.
+  `docs/ci-troubleshooting.md` §7 separates this from the pre-existing
+  `vcpkg/packages/` buildtree corruption path.
+
 - **`CertReloader` shutdown latency drops from up to 5s per teardown to
   near-zero.** The watcher thread used to sleep in 5-second increments and
   only check the stop flag between increments, so each `stop()` (and each
