@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_(no changes since v0.12.0-rc0 — first commit on top of the rc starts a new section here)_
+### Changed
+
+- **Better error message when `POST /api/policy-fragments` (or `/api/policies`)
+  receives YAML without a `kind:` field** (#621). The previous body
+  `kind must be 'PolicyFragment', got ''` left operators stuck because they
+  often sent JSON like `{"kind":"PolicyFragment", "yaml_source":"..."}`
+  expecting `kind` to be a request parameter. The error now includes a
+  full worked YAML example and a link to `docs/user-manual/policy-engine.md`,
+  while keeping the original `kind must be 'PolicyFragment'` (and `'Policy'`)
+  prefix so existing operator scripts that grep on it continue to work.
+  `docs/user-manual/policy-engine.md` gains a worked `curl` example covering
+  both the JSON-envelope and raw-YAML body forms.
+
+### Tests
+
+- `tests/unit/server/test_policy_store.cpp` — extended the existing
+  wrong-kind / missing-kind cases to assert the new helpful content
+  (`apiVersion: yuzu.io/v1alpha1` substring + docs link), so the
+  improvement is pinned by the test surface rather than relying on a
+  fragile substring match.
 
 ## [0.12.0] - 2026-05-03
 

@@ -197,6 +197,12 @@ TEST_CASE("PolicyStore: create fragment with wrong kind", "[policy_store][fragme
     auto result = store.create_fragment("kind: Policy\nname: oops\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    // Issue #621: error must include a worked example so operators sending
+    // partial YAML (or sending `kind` as a request param) get unstuck without
+    // having to find the docs separately. The prefix above stays stable so
+    // existing scripts that grep on it keep working.
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][fragment]") {
@@ -205,6 +211,7 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][frag
     auto result = store.create_fragment("name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: fragment with check only (no fix, no postCheck)",
@@ -434,6 +441,10 @@ TEST_CASE("PolicyStore: create policy with wrong kind", "[policy_store][policy]"
     auto r = store.create_policy("kind: PolicyFragment\nname: wrong\n");
     REQUIRE(!r.has_value());
     CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
+    // Issue #621: same UX expectation as create_fragment — operators must
+    // see a worked example in the error body, not just the prefix.
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create policy with missing fragment", "[policy_store][policy]") {
