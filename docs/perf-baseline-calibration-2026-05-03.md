@@ -1,15 +1,17 @@
 # Gateway perf baseline calibration — N=300 (2026-05-03)
 
-**Status:** evidence captured; gate redesign deferred. The data shows
-that algorithmic σ-bounding is the wrong tool for 3 of the 4 gateway
-perf metrics. Until the gate is rebuilt around the right primitives
-(percentile floors for ceiling-bounded metrics, deterministic
-measurement for the cleanup race), perf-gate stays as it is and human
-judgement is the loop. Future operators investigating a perf-gate
-flake should run `python3 scripts/test/perf-histograms.py` against a
-fresh capture and eyeball the shape — the modal value, the left tail,
-and any pile-up at the right edge tell more than `mean ± 2σ` ever
-will.
+**Status:** evidence captured; gate moved to measure-and-report;
+percentile-based redesign deferred. The data shows that algorithmic
+σ-bounding is the wrong tool for 3 of the 4 gateway perf metrics.
+Until the gate is rebuilt around the right primitives (percentile
+floors for ceiling-bounded metrics, deterministic measurement for
+the cleanup race), `scripts/test/perf-gate.sh` records `perf_*`
+metrics into the test-runs DB and exits PASS — no baseline file, no
+regression check. Operators inspect the numbers in context: trend
+via `bash scripts/test/test-db-query.sh --trend timing=phase7.perf`,
+shape via `python3 scripts/test/perf-histograms.py` (gitignored
+scratch tool) against a fresh capture, and the inline histograms
+below for the empirical reference distributions.
 
 ## Method
 

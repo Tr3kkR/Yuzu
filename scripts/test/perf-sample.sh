@@ -96,10 +96,11 @@ for i in $(seq "$START_ITER" "$RUNS"); do
         --branch "$(git rev-parse --abbrev-ref HEAD)" \
         --mode full > /dev/null 2>&1
 
-    # --report-only so the gate parses + records metrics but doesn't enforce
-    # the (currently broken) baseline. Capture exit so a failed iteration
-    # doesn't kill the whole sampling run.
-    bash "$HERE/perf-gate.sh" --run-id "$RUN_ID" --report-only \
+    # As of 2026-05-03 perf-gate.sh is measure-and-report by default —
+    # no --report-only flag needed (and the flag is now rejected). The
+    # gate parses + records metrics, exits PASS. Capture exit so a failed
+    # iteration doesn't kill the whole sampling run.
+    bash "$HERE/perf-gate.sh" --run-id "$RUN_ID" \
         > "$LOG_DIR/perf-gate.out" 2>&1
     PG_RC=$?
 

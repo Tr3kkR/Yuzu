@@ -701,6 +701,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`scripts/test/perf-gate.sh` is no longer a regression-detecting
+  gate.** It runs `yuzu_gw_perf_SUITE`, parses throughput/latency from
+  `ct:pal` output, records each metric into the test-runs DB, and exits
+  PASS. It does not read a baseline file, has no tolerance, and never
+  FAILs on a metric value. The N=300 calibration captured in this same
+  release showed 3 of the 4 gateway perf metrics are ceiling-bounded
+  with long left tails — neither σ nor %-tolerance bands fit them — so
+  perf is moved to measure-and-report until the gate can be rebuilt
+  around percentile primitives. Removed: `tests/perf-baselines.json`
+  file, `--baseline`, `--tolerance-pct`, `--capture-baselines`, and
+  `--report-only` flags (the script now rejects them with a one-line
+  pointer to the calibration doc). Kept: the quiesce check (refuses to
+  run with UAT ports listening), `--allow-busy` debug bypass, hardware
+  fingerprint and loadavg metric capture, parser-drift WARN. SKILL.md,
+  CLAUDE.md, `tests/shell/test_pr2_gates.sh`, and
+  `scripts/test/perf-sample.sh` all updated to match. Coverage gate is
+  unchanged — it still enforces `tests/coverage-baseline.json`. Full
+  rationale and the deferred percentile-redesign live in
+  `docs/perf-baseline-calibration-2026-05-03.md`.
 - **Release supply-chain assets renamed and expanded for OpenSSF Scorecard
   visibility.** The cosign signature on `SHA256SUMS` is now published as
   `SHA256SUMS.sigstore` rather than `SHA256SUMS.bundle`, matching the
