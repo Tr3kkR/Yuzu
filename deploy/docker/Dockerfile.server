@@ -66,14 +66,26 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
     && ccache -s
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────
+#
+# RUNTIME INVARIANT: bash is required by docker-compose.uat.yml's healthcheck
+# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). Ubuntu 24.04 ships
+# /bin/bash by default. Do not switch this base image to a minimal/distroless
+# variant or strip bash without first updating every compose file's healthcheck
+# block to use a tool that the new base provides (busybox wget, nc, etc.).
+# Governance Gate 7, architect SHOULD-2.
 FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 
+# /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
+# (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs
+# in the container. Governance Gate 7, security LOW + release-deploy S-1 +
+# consistency N2.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     && mkdir -p /var/lib/yuzu /etc/yuzu \
-    && chown yuzu:yuzu /var/lib/yuzu
+    && mkdir -m 0750 -p /var/log/yuzu \
+    && chown yuzu:yuzu /var/lib/yuzu /var/log/yuzu
 
 COPY --from=builder /src/builddir/server/core/yuzu-server /usr/local/bin/
 COPY --from=builder /src/content/definitions/ /usr/share/yuzu/definitions/
