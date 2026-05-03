@@ -376,24 +376,41 @@ public:
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
-        // Setup file logger
+        // Setup file logger.
+        //
+        // The default platform log paths (/var/log/yuzu on Linux,
+        // C:\ProgramData\Yuzu\logs on Windows, ~/Library/Logs/Yuzu on macOS)
+        // may not exist or be writable in containerised or rootless
+        // deployments. Issue #624: when the directory cannot be created we
+        // used to log a WARN + ERROR pair on every boot which made operators
+        // think the server was broken. The file logger is best-effort
+        // observability, not load-bearing — if the path is unwritable we
+        // log a single info line and proceed. Operators who want file
+        // logging can pass --log-file explicitly (handled separately in
+        // main.cpp).
         auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
+        bool parent_ready = parent.empty();
         if (!parent.empty()) {
             std::error_code ec;
             std::filesystem::create_directories(parent, ec);
+            parent_ready = !ec;
             if (ec) {
-                spdlog::warn("Could not create log directory {}: {}", parent.string(),
-                             ec.message());
+                spdlog::debug("Default log directory {} not creatable ({}); "
+                              "skipping default file logger. Pass --log-file to override.",
+                              parent.string(), ec.message());
             }
         }
-        try {
-            file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
-            file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
-            file_logger_->flush_on(spdlog::level::info);
-            spdlog::info("Log file: {}", log_path.string());
-        } catch (const spdlog::spdlog_ex& ex) {
-            spdlog::error("Failed to create file logger: {}", ex.what());
+        if (parent_ready) {
+            try {
+                file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
+                file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
+                file_logger_->flush_on(spdlog::level::info);
+                spdlog::info("Log file: {}", log_path.string());
+            } catch (const spdlog::spdlog_ex& ex) {
+                spdlog::debug("Default file logger unavailable ({}); "
+                              "pass --log-file to override.", ex.what());
+            }
         }
 
         // Initialize NVD CVE database
@@ -1651,8 +1668,11 @@ private:
                     return httplib::Server::HandlerResponse::Handled;
                 }
 
-                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
-                if (req.path == "/login" || req.path == "/health" ||
+                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+                // /api/health is an alias of /health for monitoring integrations
+                // that prefix all REST endpoints with /api/ (issue #620 — was
+                // returning 401 unauth + 404 authed because the alias didn't exist).
+                if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
                     req.path == "/api/v1/openapi.json" ||
                     req.path.starts_with("/static/")) {
@@ -1765,7 +1785,10 @@ private:
         });
 
         // -- Health endpoint (7.2) ------------------------------------------------
-        web_server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+        // Mounted on both /health and /api/health (issue #620). The /api alias
+        // exists so monitoring integrations that prefix every REST call with
+        // /api/ keep working — a side-effect of #401's move from /api/health → /health.
+        auto health_handler = [this](const httplib::Request& req, httplib::Response& res) {
             auto now = std::chrono::steady_clock::now();
             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
                                   now - server_start_time_)
@@ -1854,7 +1877,9 @@ private:
             }
 
             res.set_content(health.dump(), "application/json");
-        });
+        };
+        web_server_->Get("/health", health_handler);
+        web_server_->Get("/api/health", health_handler);
 
         // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
         web_server_->Get("/livez", [](const httplib::Request&, httplib::Response& res) {

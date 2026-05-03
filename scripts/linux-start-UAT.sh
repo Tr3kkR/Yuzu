@@ -313,6 +313,22 @@ start_all() {
         fail "Gateway health: $gw_health"
     fi
 
+    # Test 2.5 (#620): /api/health alias parity with /health.
+    # Both must return 200 and identical JSON without auth so monitoring
+    # integrations using either path keep working.
+    tests_total=$((tests_total + 1))
+    local h1 h2 c1 c2
+    h1=$(curl -s -w "\n%{http_code}" --fail-with-body http://localhost:8080/health 2>/dev/null)
+    h2=$(curl -s -w "\n%{http_code}" --fail-with-body http://localhost:8080/api/health 2>/dev/null)
+    c1=$(printf '%s\n' "$h1" | tail -n1)
+    c2=$(printf '%s\n' "$h2" | tail -n1)
+    if [ "$c1" = "200" ] && [ "$c2" = "200" ]; then
+        ok "/health and /api/health both return 200 (alias works)"
+        tests_passed=$((tests_passed + 1))
+    else
+        fail "/health=$c1, /api/health=$c2 (#620 regression)"
+    fi
+
     # Test 3: Server metrics show registered agent
     tests_total=$((tests_total + 1))
     local reg_count

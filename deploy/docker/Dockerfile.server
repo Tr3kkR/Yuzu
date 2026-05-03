@@ -72,8 +72,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
-    && mkdir -p /var/lib/yuzu /etc/yuzu \
-    && chown yuzu:yuzu /var/lib/yuzu
+    && mkdir -p /var/lib/yuzu /etc/yuzu /var/log/yuzu \
+    && chown yuzu:yuzu /var/lib/yuzu /var/log/yuzu
 
 COPY --from=builder /src/builddir/server/core/yuzu-server /usr/local/bin/
 COPY --from=builder /src/content/definitions/ /usr/share/yuzu/definitions/

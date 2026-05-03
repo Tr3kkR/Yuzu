@@ -225,8 +225,16 @@ services:
         target: /etc/yuzu/yuzu-server.cfg
     volumes:
       - server-data:/var/lib/yuzu
+    # Healthcheck uses bash's /dev/tcp pseudo-device (issue #622).
+    # `curl` is not installed in the server runtime image, and `CMD-SHELL`
+    # invokes `/bin/sh` which on Ubuntu 24.04 is `dash` and does not
+    # implement /dev/tcp — so we must invoke `bash` explicitly.
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /livez HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"
       interval: 10s
       timeout: 5s
       retries: 5
@@ -249,8 +257,10 @@ services:
     configs:
       - source: gateway-sys-config
         target: /opt/yuzu_gw/releases/0.2.0/sys.config
+    # Gateway runtime is alpine:3.23 — busybox `wget` is available;
+    # `bash` is not. `--spider` exits non-zero on HTTP failure.
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

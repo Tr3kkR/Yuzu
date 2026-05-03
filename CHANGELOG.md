@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_(no changes since v0.12.0-rc0 — first commit on top of the rc starts a new section here)_
+### Added
+
+- **`/api/health` alias** of the existing `/health` endpoint (#620).
+  Both URLs now serve the same JSON body and both bypass authentication so
+  monitoring integrations that prefix every REST call with `/api/` keep
+  working. Restores the path that operators had been pointing monitors at
+  before the #401 fix moved the canonical health endpoint to `/health`.
+
+### Fixed
+
+- **Docker healthchecks for `docker-compose.uat.yml`** (#622).
+  The server check used `curl` (not installed in the runtime image); the
+  gateway check used `CMD-SHELL` which on Alpine resolves to busybox `sh`
+  with no `/dev/tcp`. Replaced with `bash` + `/dev/tcp` (server, matches
+  `deploy/docker/docker-compose.reference.yml`) and busybox `wget --spider`
+  (gateway, no shell required). The compose stack now reports `healthy`
+  in `docker inspect`. Operators with a local copy of the same broken
+  pattern (e.g. an untracked `docker-compose.local.yml`) should mirror
+  the same change.
+- **Server log directory in container deployments** (#624).
+  `Dockerfile.server` now creates `/var/log/yuzu` with the right ownership
+  during the runtime stage, eliminating the "Could not create log
+  directory" warning on every boot. The unconditional file-logger setup in
+  `server.cpp` no longer logs WARN/ERROR on failure — when the default log
+  path is not writable it now drops to a single DEBUG line and proceeds,
+  since file logging is best-effort observability and operators who want
+  it can pass `--log-file` explicitly.
+
+### Tests
+
+- `scripts/linux-start-UAT.sh` — added regression assertion that `/health`
+  and `/api/health` both return 200, guarding against the #620 regression.
 
 ## [0.12.0] - 2026-05-03
 
