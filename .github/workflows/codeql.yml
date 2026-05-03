@@ -207,6 +207,17 @@ jobs:
         run: bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace. Without this
+          # lukka/run-vcpkg defaults to a per-run UUID temp dir under its
+          # own state path → 0% hit rate every run → every port rebuilt
+          # from source (~25 min on this runner for grpc + abseil +
+          # protobuf). The path matches ci.yml's
+          # `yuzu-vcpkg-binary-cache-${matrix.os}` so the binary cache is
+          # shared across workflows — the abseil zip is the same artifact
+          # whichever workflow built it. runner.tool_cache survives
+          # actions/checkout's default clean. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-${{ matrix.os }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -216,6 +227,7 @@ jobs:
           # without the backslash, collapsing the path. $GITHUB_WORKSPACE
           # is read by bash at runtime so escape rules don't apply, and
           # MSYS2 handles path translation when calling native binaries.
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE"
