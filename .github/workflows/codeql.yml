@@ -135,6 +135,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       # ─── MSVC environment (Windows only) ──────────────────────────
       # CLAUDE.md forbids direct use of vcvars64.bat because it returns

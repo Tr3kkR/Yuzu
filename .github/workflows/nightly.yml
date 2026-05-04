@@ -62,6 +62,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -143,6 +144,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -223,6 +225,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -335,6 +338,8 @@ jobs:
     steps:
       - name: Open or update nightly-broken issue
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
         with:
           script: |
             const label = 'nightly-broken';
@@ -348,8 +353,9 @@ jobs:
               : 'unknown (alert fired without specific job failures)';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             const sha = '${{ github.sha }}';
+            const refName = process.env.REF_NAME;
             const body = [
-              `Nightly run failed on \`${{ github.ref_name }}\` @ \`${sha.substring(0, 7)}\`.`,
+              `Nightly run failed on \`${refName}\` @ \`${sha.substring(0, 7)}\`.`,
               ``,
               `**Failed jobs:** ${summary}`,
               ``,

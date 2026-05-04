@@ -96,6 +96,8 @@ jobs:
       all_healthy: ${{ steps.health.outputs.all_healthy }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Probe runner health
         id: health
         env:
@@ -131,6 +133,7 @@ jobs:
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
+          persist-credentials: false
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
@@ -200,6 +203,7 @@ jobs:
           # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
           # runner-reset.sh.
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -399,6 +403,7 @@ jobs:
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: false
+          persist-credentials: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -553,6 +558,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -701,6 +707,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: detect
         run: |
           # PRs diff against the base ref; pushes diff against the SHA
@@ -740,6 +747,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install system packages
         run: |

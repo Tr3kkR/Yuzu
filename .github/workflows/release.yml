@@ -52,6 +52,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Verify build dependencies
         run: |
@@ -246,6 +247,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Erlang/OTP and rebar3
         uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
@@ -401,6 +404,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
@@ -520,7 +524,7 @@ jobs:
       - name: Package archive
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
           $staging = "yuzu-${version}-windows-x64"
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
 
@@ -548,7 +552,7 @@ jobs:
       - name: Build Windows installers (InnoSetup)
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           # Install InnoSetup 6
           choco install innosetup -y --no-progress
@@ -590,7 +594,7 @@ jobs:
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           $certPath = "${{ runner.temp }}\signing-cert.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
@@ -692,6 +696,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -1026,6 +1031,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Lowercase repository owner
         id: owner
@@ -1170,6 +1176,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Validate docker-compose image versions
         run: |
@@ -1339,7 +1347,7 @@ jobs:
       - name: Generate release notes
         run: |
           OWNER="${{ github.repository_owner }}"
-          TAG="${{ github.ref_name }}"
+          TAG="${GITHUB_REF_NAME}"
 
           # Start with changelog content if available
           if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
@@ -1468,8 +1476,8 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          gh release create "${{ github.ref_name }}" \
-            --title "Yuzu ${{ github.ref_name }}" \
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Yuzu ${GITHUB_REF_NAME}" \
             --notes-file release-notes.md \
             ${PRERELEASE_FLAG} \
             artifacts/yuzu-linux-x64.tar.gz \
