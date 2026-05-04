@@ -340,6 +340,21 @@ jobs:
         # CodeQL's tracer wraps this step's compile invocations to build
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
+        #
+        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # tracer attaches to compiler processes; if ccache returns a
+        # cached object file without invoking the compiler, the tracer
+        # never sees that translation unit and CodeQL's database omits
+        # it entirely. With persistent ccache on the self-hosted runner
+        # this silently dropped 98% of TUs from the database (e.g. only
+        # 1 of 47 plugin .cpp files was reaching analysis), making most
+        # custom and standard queries report 0 alerts on plugin code.
+        # `RECACHE` forces the compiler to actually run while still
+        # updating the cache, so non-CodeQL CI builds keep their cache
+        # warm. `CCACHE_DISABLE=true` would also work but would skip
+        # the cache update and degrade subsequent CI builds.
+        env:
+          CCACHE_RECACHE: "true"
         run: meson compile -C ${{ matrix.build_dir }}
 
       - name: ccache stats
