@@ -265,14 +265,18 @@ jobs:
         uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
           languages: ${{ matrix.languages }}
-          # +security-and-quality — generic CWE coverage (memory leaks,
+          # The leading `+` means "augment the default suite" (applies
+          # to the whole comma-separated list, not to individual items —
+          # a stray `+` on the second entry triggers
+          # "Specifier for external repository is invalid").
+          # security-and-quality — generic CWE coverage (memory leaks,
           #   UAF, null deref, taint to system/popen, etc.).
-          # +./.github/codeql/queries — Yuzu-specific queries that the
+          # ./.github/codeql/queries — Yuzu-specific queries that the
           #   generic suite cannot encode (per-project directory scope,
           #   plugin ABI conventions, threat model). See qlpack.yml in
           #   that directory and the close-out comment on issue #371
           #   for the design rationale and deferred catalog.
-          queries: +security-and-quality,+./.github/codeql/queries
+          queries: +security-and-quality,./.github/codeql/queries
           # Scope the scan to first-party code; see the config file for
           # the list of vendored/generated paths that are excluded.
           config-file: ./.github/codeql/codeql-config.yml
