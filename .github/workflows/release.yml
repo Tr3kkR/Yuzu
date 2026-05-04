@@ -17,13 +17,12 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  # Top-level baseline = least-privilege read. id-token + attestations are
-  # shared across every build job (each calls actions/attest-build-provenance);
-  # contents:write and packages:write are scoped per-job to only the jobs
-  # that actually need them (Scorecard Token-Permissions hardening).
+  # Top-level baseline = least-privilege read. Every elevated scope
+  # (id-token, attestations, packages, contents:write) is opted into
+  # per-job — Scorecard Token-Permissions zeroes the score on any
+  # workflow-level write to a sensitive scope, even one shared across
+  # multiple jobs.
   contents: read
-  id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
-  attestations: write   # actions/attest-build-provenance across all build jobs
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -37,6 +36,10 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     # 90 = backstop for the slow GHA cache backend / 9P filesystem
     # observed during v0.11.0 retags. Cache surgery (restore-only)
     # should make this irrelevant in practice; keeping the wider
@@ -233,6 +236,10 @@ jobs:
     name: "Build Gateway (Erlang)"
     needs: [build-linux]
     runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 30
     env:
       ImageOS: ubuntu24
@@ -378,6 +385,10 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: [self-hosted, Windows]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     # 90 = backstop. Same rationale as Build Linux x64. Defender
     # exclusions on the runner should keep tar/zstd extraction off
     # the Defender scan path, but if exclusions ever drift the wider
@@ -668,6 +679,10 @@ jobs:
   build-macos:
     name: "Build macOS ARM64"
     runs-on: macos-14
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 90
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
