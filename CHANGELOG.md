@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "A3 UX ladder (#620, #622, #624)" sub-entry with the operator action
   required for local compose overrides.
 
+### Changed
+
+- **Better error message when `POST /api/policy-fragments` (or `/api/policies`)
+  receives YAML without a `kind:` field** (#621). The previous body
+  `kind must be 'PolicyFragment', got ''` left operators stuck because they
+  often sent JSON like `{"kind":"PolicyFragment", "yaml_source":"..."}`
+  expecting `kind` to be a request parameter. The error now includes a
+  full worked YAML example and a link to `docs/user-manual/policy-engine.md`,
+  while keeping the original `kind must be 'PolicyFragment'` (and `'Policy'`)
+  prefix so existing operator scripts that grep on it continue to work.
+  `docs/user-manual/policy-engine.md` gains a worked `curl` example covering
+  both the JSON-envelope and raw-YAML body forms.
+
 ### Fixed
 
 - **Docker healthchecks for `docker-compose.uat.yml`** (#622).
@@ -70,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `/api/health` return 200 AND identical JSON bodies, guarding
   against both the #620 regression and a future split of the dual-mount
   handler lambda.
+- `tests/unit/server/test_policy_store.cpp` — extended the existing
+  wrong-kind / missing-kind cases to assert the new helpful content
+  (`apiVersion: yuzu.io/v1alpha1` substring + docs link), so the
+  improvement is pinned by the test surface rather than relying on a
+  fragile substring match. Adds a missing-`kind:` test for `create_policy`
+  (governance Gate 7 hardening — was asymmetric with `create_fragment`)
+  and pins the docs link on the `create_fragment` missing-kind branch
+  for the same symmetry reason.
 
 ## [0.12.0] - 2026-05-03
 
