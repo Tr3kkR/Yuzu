@@ -88,6 +88,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Defensive hardening of `pre-release.yml` against template-injection.**
+  Eight `run:` blocks that interpolated `${{ needs.resolve.outputs.version }}`,
+  `${{ needs.resolve.outputs.prev_tag }}`, or related workflow_run-tainted
+  values directly into bash were refactored to bind them via the step's
+  `env:` block and reference the values as `"$VERSION"` / `"$PREV_TAG"` /
+  `"$NEW_VER"` in the script body. CodeQL flagged 4 critical
+  `actions/code-injection/critical` alerts on this file (lines 68, 84,
+  125, 923 in older revisions) — three of those four were already fixed
+  in earlier work; this pass extends the same env-binding pattern to
+  every other run-block interpolation in the file so future CodeQL
+  scans don't re-discover the same shape. Matrix-driven values
+  (`${{ matrix.distro }}` in the .deb / .rpm install steps) are kept
+  as-is because matrix entries are workflow-author-defined and not
+  externally controllable.
+
 - **Static-analysis alert cleanup pass.** Reduced the open code-scanning
   alert backlog by ~70% in one pass:
   - 15 vendored security-severity false-positives in `vcpkg_installed/`

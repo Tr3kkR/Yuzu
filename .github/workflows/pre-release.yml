@@ -147,8 +147,9 @@ jobs:
           " > /tmp/yuzu-qa/yuzu-server.cfg
 
       - name: Create Docker Compose for QA
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           cat > /tmp/yuzu-qa/docker-compose.yml <<COMPOSE
           services:
             server:
@@ -501,9 +502,10 @@ jobs:
           path: artifacts
 
       - name: Verify archive contents
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
-          VERSION="${{ needs.resolve.outputs.version }}"
 
           echo "=== Linux x64 archive ==="
           tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: server binary"
@@ -545,9 +547,10 @@ jobs:
           fi
 
       - name: Inspect DEB metadata
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
-          VERSION="${{ needs.resolve.outputs.version }}"
           for deb in *.deb; do
             echo "=== $deb ==="
             dpkg-deb --field "$deb" Package Version
@@ -566,8 +569,9 @@ jobs:
           '
 
       - name: Inspect Docker images
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           for img in yuzu-server yuzu-agent yuzu-gateway; do
             echo "=== $img ==="
             docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
@@ -606,8 +610,9 @@ jobs:
       # published as a container image; only server + gateway are
       # scanned here.
       - name: Pull images for scanning
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           for img in yuzu-server yuzu-gateway; do
             docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
               || echo "SKIP: $img:$VERSION not found"
@@ -661,8 +666,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start stack
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           mkdir -p /tmp/yuzu-soak
 
           python3 -c "
@@ -815,10 +821,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start previous release
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          PREV_VER="${{ needs.resolve.outputs.prev_tag }}"
-          PREV_VER="${PREV_VER#v}"
-          NEW_VER="${{ needs.resolve.outputs.version }}"
+          PREV_VER="${PREV_TAG#v}"
           mkdir -p /tmp/yuzu-upgrade
 
           python3 -c "
@@ -868,8 +875,9 @@ jobs:
           echo "Previous release stack ready ($PREV_VER)"
 
       - name: Upgrade to new release
+        env:
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          NEW_VER="${{ needs.resolve.outputs.version }}"
           cd /tmp/yuzu-upgrade
 
           echo "Upgrading to: $NEW_VER"
@@ -884,6 +892,9 @@ jobs:
           done
 
       - name: Verify post-upgrade
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
           # Dashboard reachable
           CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
@@ -897,7 +908,7 @@ jobs:
           # Gateway healthy
           curl -sf http://localhost:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
 
-          echo "PASS: Upgrade from ${{ needs.resolve.outputs.prev_tag }} to v${{ needs.resolve.outputs.version }} succeeded"
+          echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
       - name: Collect logs
         if: always()
