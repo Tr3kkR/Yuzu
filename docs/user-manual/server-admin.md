@@ -189,6 +189,48 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
 
+### vNEXT — Response templates (#254, Phase 8.2)
+
+Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
+
+**Schema migration.** `instruction_definitions` gains one column: `response_templates_spec TEXT NOT NULL DEFAULT '[]'`. The migration ledger advances from v2 to v3. `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.
+
+**Pre-upgrade snapshot (recommended).** Take a backup of the InstructionStore database before upgrade:
+
+```bash
+cp /var/lib/yuzu/instructions.db /var/lib/yuzu/instructions.db.bak
+# or, for a hot-running server, use SQLite's online backup:
+sqlite3 /var/lib/yuzu/instructions.db ".backup /var/lib/yuzu/instructions.db.bak"
+```
+
+**Post-upgrade validation.**
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT version FROM schema_meta WHERE store='instruction_store';"
+# expected output: 3
+```
+
+If the value is `2` instead of `3`, the migration did not run — check the server logs for `MigrationRunner: instruction_store migrated to v3` (or for a `probe-and-stamp failed` line in the InstructionStore section).
+
+**Boot wedge recovery.** A corrupt schema_meta row or a pre-existing `response_templates_spec` column with a missing schema_meta v3 stamp will trip the probe-and-stamp guard, which fails closed (server logs `InstructionStore: probe-and-stamp failed; closing database`). To recover, restore the snapshot or apply the column manually:
+
+```bash
+# Stop the server first.
+systemctl stop yuzu-server
+
+sqlite3 /var/lib/yuzu/instructions.db \
+  "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec TEXT NOT NULL DEFAULT '[]';"
+sqlite3 /var/lib/yuzu/instructions.db \
+  "INSERT OR REPLACE INTO schema_meta (store, version, upgraded_at) VALUES ('instruction_store', 3, strftime('%s','now'));"
+
+systemctl start yuzu-server
+```
+
+**New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
+
+**Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
+
 ---
 
 ## Settings Page

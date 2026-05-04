@@ -91,19 +91,30 @@ private:
     /// summary. When @p definition_id is non-empty AND the definition has a
     /// `spec.visualization`, an OOB chart deck fragment is appended to
     /// re-populate `#chart-deck-host` (issue #587).
+    ///
+    /// Issue #254 (Phase 8.2) — when @p visible_columns is non-empty, only
+    /// the listed plugin column names are rendered (the "Agent" pseudo-
+    /// column is always shown). @p template_id is propagated through pager
+    /// / sort URLs so that switching pages doesn't drop the chosen template.
     std::string render_results(const std::string& command_id, const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
                                const std::vector<FacetFilter>& filters,
                                const std::string& text_query,
-                               const std::string& definition_id = {});
+                               const std::string& definition_id = {},
+                               const std::string& template_id = {},
+                               const std::vector<std::string>& visible_columns = {});
 
     /// Render filter controls for a plugin schema. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent
     /// `hx-include="#filter-bar"` requests propagate it through to
     /// `/fragments/results` (which uses it to keep the chart deck live).
+    /// Issue #254 — also renders a response-template selector dropdown at
+    /// the top of the bar listing the synthesised default plus any
+    /// operator-defined templates on the definition.
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
-                                   const std::string& definition_id = {});
+                                   const std::string& definition_id = {},
+                                   const std::string& template_id = {});
 
     /// Render group creation form.
     std::string render_create_group_form(const std::string& command_id,

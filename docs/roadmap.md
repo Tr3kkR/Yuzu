@@ -81,7 +81,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
 | **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
-| | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | Open |
+| | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | **Done** |
 | | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
 | **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
 | | 9.2 | [#257](https://github.com/Tr3kkR/Yuzu/issues/257) | Inventory Repository Model | Open |
@@ -147,7 +147,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
-| 8: Visualization & Response Experience | 1 | 2 | 3 | 33% |
+| 8: Visualization & Response Experience | 2 | 1 | 3 | 67% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% |
 | 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
@@ -156,7 +156,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
 | 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
 | 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
-| **Total** | **73** | **53** | **126** | **58%** |
+| **Total** | **74** | **52** | **126** | **59%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -957,17 +957,15 @@ Six demo charts ship as default examples — `content/definitions/visualization_
 
 **Files:** `server/core/src/visualization_engine.{hpp,cpp}`, `server/core/src/charts_js_bundle.cpp`, `server/core/src/instruction_store.{hpp,cpp}` (visualization_spec column + MigrationRunner v2), `server/core/src/rest_api_v1.cpp`, `server/core/src/dashboard_routes.{hpp,cpp}`, `docs/yaml-dsl-spec.md` § `spec.visualization`, `docs/user-manual/instructions.md` § Response Visualization, plus `tests/unit/server/test_visualization_engine.cpp` and `tests/unit/server/test_rest_visualization.cpp`.
 
-### Issue 8.2: Response Templates
-**Capability:** 20.6 | **Scope:** Server | **Status:** Open
+### Issue 8.2: Response Templates :white_check_mark:
+**Capability:** 20.6 | **Scope:** Server | **Status:** Done
 **Depends on:** 8.1
 
-Named response view configurations:
-- Column selection, sort order, filter presets stored per InstructionDefinition in `spec.responseTemplates`
-- Default template auto-generated from result schema
-- Template CRUD via REST API
-- Dashboard: template selector dropdown in execution results view
+Named response view configurations on `InstructionDefinition` — column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. Storage is the `response_templates_spec` JSON column on `instruction_definitions` (migration v3); a `__default__` template is synthesised on read from `spec.result.columns` (preferred) or the plugin's column schema, so the dropdown is never empty even before an operator authors anything.
 
-**Files:** `server/core/src/instruction_store.cpp`, `server/core/src/rest_api_v1.cpp`
+REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]`. Filter ops accepted: `equals`, `not_equals`, `contains`, `starts_with`, `ends_with`. Reads gated on `InstructionDefinition:Read`, mutations on `InstructionDefinition:Write`. Audit events: `response_template.create`, `response_template.update`, `response_template.delete`. Dashboard auto-applies the `equals`-op clauses to the URL filter map; other ops are honoured by REST consumers but not auto-applied client-side in this revision.
+
+**Files:** `server/core/src/response_templates_engine.{hpp,cpp}` (new), `server/core/src/instruction_store.{hpp,cpp}` (column + migration v3), `server/core/src/rest_api_v1.cpp` (5 routes), `server/core/src/dashboard_routes.{hpp,cpp}` (selector + visibility + template-driven sort/filter defaults), `docs/yaml-dsl-spec.md` § `spec.responseTemplates`, `docs/user-manual/instructions.md` § Response Templates, `docs/user-manual/rest-api.md` § Response Templates, `tests/unit/server/test_response_templates_engine.cpp`, `tests/unit/server/test_rest_response_templates.cpp`.
 
 ### Issue 8.3: Response Offloading (Data Export Streams)
 **Capability:** 20.7 | **Scope:** Server | **Status:** Open
@@ -1758,7 +1756,7 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates and 8.3 Response Offloading remain.
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading remains.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)

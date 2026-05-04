@@ -9,6 +9,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Response Templates governance hardening — round 2.** Round-2
+  re-review of the round-1 hardening commit caught a BLOCKING and three
+  SHOULD regressions that round-1 introduced or left unaddressed:
+  - **B-2** — OpenAPI PUT `requestBody.schema` referenced `#/components/
+    schemas/ResponseTemplate` but the schema was never defined; spec
+    validators / SDK generators would fail. Added the `ResponseTemplate`
+    schema to `components.schemas` (with required field, sort/filter
+    sub-schemas, `default` flag) and switched the POST inline schema to
+    the same `$ref` for sibling parity with `ManagementGroup`/`Tag`/
+    `GuaranteedStateRule`.
+  - **S-7** — round-1 emitted `result="failure"` on every 4xx audit
+    branch, but `audit-log.md` is explicit that 4xx is `denied` and only
+    internal 5xx is `failure`. Switched the 16 4xx audit emissions to
+    `denied`; the 3 persist-failure 500 emissions remain `failure` per
+    the documented vocabulary. `audit-log.md` table extended with the
+    explicit branch→result mapping for each new action.
+  - **S-8** — `rest-api.md` POST/PUT/DELETE error tables did not list
+    the new 413 (body cap) or 500 (persist failure) status codes.
+    Added explicit Errors tables on every verb and a bold callout that
+    the 64 KiB cap fires before parsing.
+  - **S-9** — `kRtMaxBodyBytes` is now annotated as scoped specifically
+    to the response-templates routes, with a comment pointing to the
+    follow-up hardening pass that would lift the convention to other
+    POST/PUT mutations (Guardian rules, management-group create, tag
+    PUT, token POST).
+  - **I-2** — `capability-map.md` headline figure updated from
+    `166/225 (74%)` to `168/225 (75%)`, matching the per-phase table
+    that round-1 already updated.
+
+- **Response Templates governance hardening round.** Single-pass fixes for
+  governance Gates 2–6 BLOCKING and critical-SHOULD items on the Phase 8.2
+  Response Templates work below.
+
+  **Code BLOCKING:**
+  - **UP-4 / sec-M3** — InstructionStore probe-and-stamp guard now checks
+    every `sqlite3_prepare_v2` and `sqlite3_step` return; failure
+    fails-closed (closes the DB) instead of silently falling through to
+    the migration ledger and tripping the `ALTER TABLE … ADD COLUMN`
+    duplicate-column error that would wedge boot with no diagnostic.
+  - **UP-8 / sec-M2 + sec-M4** — POST/PUT bodies on
+    `/api/v1/definitions/{id}/response-templates[/{tid}]` are now capped
+    at 64 KiB (returns 413). The YAML-import path's string-form re-parse
+    of `responseTemplates` is capped at 256 KiB and a malformed string
+    is dropped with a logged warning rather than passed through verbatim.
+    Closes the operator-tier JSON-bomb DoS that crashed the
+    single-process server via nlohmann's recursive-descent stack
+    overflow.
+  - **B-1 / arch-B1** — OpenAPI spec now lists the 5 new response-template
+    routes (List/Get/Create/Update/Delete). Closes the `agentic-first`
+    A2 (discovery) violation.
+  - **S-4 / sec-L3 / dsl-S2** — `import_definition_json` now silently
+    drops any `responseTemplates` element with `id == "__default__"`,
+    closing the stuck-state bug where an imported pack could inject a
+    reserved-id row that REST PUT/DELETE refused to remove.
+
+  **Code critical-SHOULD bundled in:**
+  - **sec-M1 / S-1** — failure-path audit emissions added to all three
+    response-template mutations (`response_template.{create,update,
+    delete}`) with `reason=<r>` codes
+    (`malformed_definition_id`, `body_too_large`, `invalid_json`,
+    `definition_not_found`, `template_not_found`, `validation_failed`,
+    `reserved_id`, `persist_failure`, `malformed_id`). Sibling parity
+    with `execution.visualization.fetch`.
+  - **F-3** — dashboard `/fragments/results` now treats the standalone
+    `?dir=` query param as evidence of operator sort intent
+    (`sort_explicit = req.has_param("sort") || req.has_param("dir")`),
+    so a URL with `dir=desc` and `template_id=X` no longer silently
+    overrides the operator's chosen direction.
+  - **OBS-3** — 500 (persist failure) branches now log at ERROR with
+    `def_id`, `tid`, and the underlying error string before returning
+    a generic `"persist failure"` envelope (no SQLite error text leaked
+    to clients).
+
+  **Docs BLOCKING:**
+  - **doc-B1** — `docs/user-manual/audit-log.md` table extended with
+    the three `response_template.*` actions and their failure-reason
+    vocabulary.
+  - **doc-B2** — `docs/capability-map.md` § 20.6 and § 28.2 flipped from
+    `:x:` to `:white_check_mark:`; phase totals updated (20: +1 done,
+    -1 open; 28: +1 done, -1 open; grand total 167→168 done, 55→54
+    open).
+  - **doc-B3** — `docs/user-manual/rest-api.md` Table of Contents now
+    lists "Response Templates" under Definitions.
+  - **doc-B4** — `docs/user-manual/server-admin.md` Upgrade Notes
+    section gains a vNEXT entry for migration v3 covering the
+    pre-upgrade snapshot command, the post-upgrade `schema_meta`
+    validation query, and the manual recovery path for the
+    probe-and-stamp boot-wedge case.
+
+- **Response Templates (Phase 8.2, issue #254).** Named response-view
+  configurations attached to an `InstructionDefinition` — column subset,
+  sort order, and filter presets the dashboard's filter-bar **View**
+  dropdown surfaces. Storage is a new `response_templates_spec` JSON
+  column on `instruction_definitions` (migration v3 with the same
+  probe-and-stamp guard used for v2). Every definition gets a synthesised
+  `__default__` template derived from `spec.result.columns` (preferred)
+  or the plugin's column schema, so the dropdown is never empty even
+  before an operator authors anything.
+
+  REST CRUD at
+  `/api/v1/definitions/{id}/response-templates[/{template_id}]` (List/Get
+  on `InstructionDefinition:Read`; POST/PUT/DELETE on
+  `InstructionDefinition:Write`). Reserved id `__default__` cannot be
+  authored, replaced, or deleted. Filter ops accepted: `equals`,
+  `not_equals`, `contains`, `starts_with`, `ends_with`. The dashboard
+  auto-applies `equals`-op filters to the URL filter map; other ops
+  are honoured by REST consumers but not auto-applied client-side in
+  this revision (planned to follow when `FacetFilter` grows an op field).
+
+  YAML authoring is `spec.responseTemplates: [{...}]`. Same caveat as
+  `spec.visualization`: the dashboard YAML editor's lightweight
+  line-scanner does not extract the templates spec into the indexed
+  column — author through `POST /api/v1/definitions/import` or the
+  REST template endpoints. Audit events: `response_template.create`,
+  `response_template.update`, `response_template.delete`. Files:
+  `server/core/src/response_templates_engine.{hpp,cpp}` (new),
+  `server/core/src/instruction_store.{hpp,cpp}` (column + migration v3),
+  `server/core/src/rest_api_v1.cpp` (5 routes),
+  `server/core/src/dashboard_routes.{hpp,cpp}` (selector + visibility +
+  template-driven sort/filter defaults), `docs/yaml-dsl-spec.md` §
+  `spec.responseTemplates`, `docs/user-manual/instructions.md` §
+  Response Templates, `docs/user-manual/rest-api.md` § Response
+  Templates.
+
 - **CodeQL SARIF post-processing filter** at `scripts/ci/filter-codeql-sarif.sh`
   wedged between `analyze` and `upload-sarif` in `codeql.yml`. CodeQL's
   `paths` / `paths-ignore` config keys do not reliably suppress C/C++
@@ -219,6 +343,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit-path failures still log at ERROR.
 
 ### Tests
+
+- **Response Templates governance hardening test additions.** 11 new cases
+  in `tests/unit/server/test_rest_response_templates.cpp` covering the
+  Gate 7 hardening round: PUT-with-non-existent-template_id 404
+  (qe-B1), DELETE-of-operator-default re-instates synth (qe-B2),
+  malformed template_id rejected by route regex (qe-B4), PUT/DELETE/POST
+  403 paths (qe-S2), 503 path on POST/PUT/DELETE with null store
+  (qe-S6), oversized POST body returns 413 + failure audit (UP-8 +
+  sec-M1), success audits asserted on POST/PUT/DELETE (qe-S1 / sec-M1),
+  POST validation failure emits failure audit (sec-M1),
+  `import_definition_json` strips reserved `__default__` id (S-4),
+  oversized string-form import dropped to `[]` (sec-M4), and a
+  full-cycle migration v3 probe-and-stamp regression test (qe-B3) that
+  pre-seeds a DB with the column already present + `schema_meta` at v1
+  and verifies the InstructionStore opens cleanly. Total response-
+  templates suite now 43 cases / 237 assertions (was 32 / 154).
+
+- **Response Templates engine + REST coverage** (issue #254). New
+  `tests/unit/server/test_response_templates_engine.cpp` (18 cases /
+  pure-engine: parse round-trip incl. singular form, malformed JSON,
+  default synthesis from `result_schema` and from plugin column schema,
+  `resolve()` precedence rules, `validate_payload()` rejecting
+  `__default__` as authored id / missing name / unknown filter op /
+  multiple `default:true` / id collisions, serialise→parse round-trip)
+  and `tests/unit/server/test_rest_response_templates.cpp` (14 cases,
+  HTTP-level via `TestRouteSink`: synth-default visibility rules,
+  POST→list→PUT→DELETE round-trip, 400 on `__default__` mutation,
+  `result_schema` populating synthesised columns, 403/503/404 paths).
+  All 32 cases / 154 assertions green on first run; `[instruction_store]`
+  + `[visualization]` + `[rest][visualization]` regression-set still
+  green (62 cases, 285 assertions).
 
 - `tests/unit/test_trigger_engine.cpp`,
   `tests/unit/server/test_patch_manager.cpp` — `[[maybe_unused]]` on three

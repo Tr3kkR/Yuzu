@@ -29,10 +29,10 @@ Each capability is rated on two axes:
 ```
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
-Future       [====================------------]  31/50 done  (62%)
-New (Ph 8-16)[=---------------------------]     1/41 done   (2%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
+Future       [====================------------]  32/50 done  (64%)
+New (Ph 8-16)[=---------------------------]     2/41 done   (5%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   166/225 done (74%)
+Overall      [======================---------]   168/225 done (75%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -56,7 +56,7 @@ Overall      [======================---------]   166/225 done (74%)
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
 | 18. Auth & Authorization | 10 | 9 | 0 | 1 |
 | 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
-| 20. Response Collection | 7 | 5 | 0 | 2 |
+| 20. Response Collection | 7 | 6 | 0 | 1 |
 | 21. Notifications & Audit | 5 | 4 | 0 | 1 |
 | 22. System & Infrastructure | 10 | 7 | 0 | 3 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
@@ -64,11 +64,11 @@ Overall      [======================---------]   166/225 done (74%)
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
 | 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 6 | 0 | 1 | 5 |
+| 28. Response Visualization | 6 | 0 | 2 | 4 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **225** | **166** | **3** | **56** |
+| **TOTAL** | **225** | **168** | **3** | **54** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -841,9 +841,9 @@ SSE-based streaming to dashboard. gRPC streaming for programmatic access.
 
 CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV with streaming via chunked transfer encoding. Generic JSON-to-CSV conversion.
 
-### 20.6 Response Templates :x: `T3`
+### 20.6 Response Templates :white_check_mark: `T2`
 
-Not implemented. Pre-defined response formats and views.
+Named response-view configurations (column subset, sort order, filter presets) attached to an `InstructionDefinition`. Synthesised `__default__` view derived from `spec.result.columns` (or the plugin's column schema) so every definition has at least one selectable view. REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]` gated on `InstructionDefinition:Read` (List/Get) and `InstructionDefinition:Write` (POST/PUT/DELETE). Dashboard surfaces the templates as a **View** dropdown in the filter bar; selecting one re-renders the table with the template's column subset, sort order, and equals-op filters auto-applied. YAML authoring via `spec.responseTemplates`. Phase 8.2, issue #254.
 
 ### 20.7 Response Offloading :x: `T3`
 
@@ -1069,9 +1069,9 @@ Not implemented. Per-product compliance summary with drill-down to device-level 
 
 Implemented. Server-side data transformation with built-in processors (`single_series`, `multi_series`, `datetime_series`) and an optional row pre-filter (`whereField` / `whereEquals`). Chart types: pie, bar, column, line, area. Configured via `spec.visualization` (singular) or `spec.visualizations` (plural for multi-chart). REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Renderer is Apache ECharts 5 (vendored at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that reads `--mds-color-chart-*` Yuzu design tokens at render time. Six chart-bearing demo definitions (vuln_scan, antivirus, bitlocker, firewall, certificates, os_info) ship as `InstructionSet demo.visualization.fleet-posture`, auto-imported on server startup.
 
-### 28.2 Response Templates :x: `T2`
+### 28.2 Response Templates :white_check_mark: `T2`
 
-Not implemented. Named response view configurations (column selection, sort order, filter presets) stored per InstructionDefinition.
+Implemented. Named response view configurations stored per `InstructionDefinition` in a `response_templates_spec` JSON column. Synthesised `__default__` view from `spec.result.columns` or plugin schema. REST CRUD + dashboard View dropdown. See §20.6 for the full contract. Phase 8.2, issue #254.
 
 ### 28.3 Response Offloading :x: `T2`
 

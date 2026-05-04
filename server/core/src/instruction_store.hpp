@@ -41,6 +41,11 @@ struct InstructionDefinition {
     // the definition has no visualization configured and the
     // /api/v1/executions/{id}/visualization endpoint returns 404 for it.
     std::string visualization_spec;
+    // Issue #254 (8.2): spec.responseTemplates serialized as a JSON array of
+    // template objects. Empty (or "[]") means no operator-defined templates;
+    // the response-templates engine synthesises a __default__ from
+    // result_schema / plugin columns at read time.
+    std::string response_templates_spec;
 };
 
 struct InstructionQuery {

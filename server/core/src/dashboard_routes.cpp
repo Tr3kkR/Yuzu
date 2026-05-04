@@ -18,6 +18,7 @@
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "response_store.hpp"
+#include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -212,6 +213,11 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                     return;
                 }
 
+                // Hardening (governance F-3): treat ?dir= as evidence the
+                // operator set sort intent. Without this, a URL of
+                // ?template_id=X&dir=desc silently overrides the operator's
+                // chosen direction with whatever the template carries.
+                bool sort_explicit = req.has_param("sort") || req.has_param("dir");
                 auto sort_col = req.get_param_value("sort");
                 auto sort_dir = req.get_param_value("dir");
                 if (sort_col.empty()) sort_col = "agent";
@@ -221,6 +227,7 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 int per_page = clamp(param_int(req, "per_page", 50), 10, 200);
 
                 auto filters = parse_filters(req, plugin);
+                bool filters_explicit = !filters.empty();
                 auto text_query = req.get_param_value("q");
 
                 // Issue #587: when the dispatcher knew the definition_id
@@ -238,9 +245,66 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                     // results table still renders.
                 }
 
+                // Issue #254 (Phase 8.2) — response template resolution.
+                // When the operator picks a template from the dropdown,
+                // the chosen template_id arrives here. We resolve it
+                // against the definition and use its sort/filter/columns
+                // as defaults for any axis the URL did not explicitly
+                // override. Operator URL state always wins.
+                std::string template_id;
+                std::vector<std::string> visible_columns;
+                static const std::regex kTplIdRegex{"^[A-Za-z0-9_-]{1,64}$"};
+                if (req.has_param("template_id")) {
+                    auto raw = req.get_param_value("template_id");
+                    if (std::regex_match(raw, kTplIdRegex)) template_id = raw;
+                }
+                if (!template_id.empty() && !definition_id.empty() &&
+                    instruction_store_ && instruction_store_->is_open()) {
+                    auto def = instruction_store_->get_definition(definition_id);
+                    if (def) {
+                        ResponseTemplatesEngine engine;
+                        std::vector<ResponseTemplate> templates;
+                        if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+                            templates = std::move(*parsed);
+                        auto resolved = engine.resolve(templates, template_id,
+                                                      def->result_schema, def->plugin);
+                        // Sort default — only when URL didn't supply one.
+                        if (!sort_explicit && !resolved.sort_column.empty()) {
+                            // The dashboard sort param uses lowercased,
+                            // space-as-underscore column keys (matches
+                            // the convention in render_results below).
+                            std::string key;
+                            for (char c : resolved.sort_column) {
+                                if (c == ' ' || c == '-') key += '_';
+                                else key += static_cast<char>(std::tolower(c));
+                            }
+                            sort_col = key;
+                            sort_dir = resolved.sort_dir.empty() ? "asc" : resolved.sort_dir;
+                        }
+                        // Filter defaults — only the equals-op filters
+                        // map onto FacetFilter's exact-match contract.
+                        // Other ops (contains/starts_with/...) are
+                        // honoured by REST consumers but not auto-applied
+                        // by the dashboard for now.
+                        if (!filters_explicit) {
+                            for (const auto& tf : resolved.filters) {
+                                if (tf.op != "equals") continue;
+                                int col_idx = col_index_for_name(plugin, tf.column);
+                                if (col_idx < 0) continue;
+                                FacetFilter f;
+                                f.col_idx = col_idx;
+                                f.value = tf.value;
+                                filters.push_back(std::move(f));
+                            }
+                        }
+                        visible_columns = resolved.columns;
+                    }
+                }
+
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
-                                           definition_id);
+                                           definition_id, template_id,
+                                           visible_columns);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -265,8 +329,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                     if (std::regex_match(raw, kIdRegex))
                         definition_id = raw;
                 }
+                static const std::regex kTplIdRegex{"^[A-Za-z0-9_-]{1,64}$"};
+                std::string template_id;
+                if (req.has_param("template_id")) {
+                    auto raw = req.get_param_value("template_id");
+                    if (std::regex_match(raw, kTplIdRegex)) template_id = raw;
+                }
 
-                auto html = render_filter_bar(command_id, plugin, definition_id);
+                auto html = render_filter_bar(command_id, plugin, definition_id, template_id);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -1197,7 +1267,9 @@ std::string DashboardRoutes::render_results(
     int page, int per_page,
     const std::vector<FacetFilter>& filters,
     const std::string& text_query,
-    const std::string& definition_id) {
+    const std::string& definition_id,
+    const std::string& template_id,
+    const std::vector<std::string>& visible_columns) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -1205,6 +1277,34 @@ std::string DashboardRoutes::render_results(
     }
 
     auto& col_names = columns_for_plugin(plugin);
+
+    // Issue #254 (Phase 8.2): when a template specified a visible-column
+    // subset, build the set of plugin column indices to render. Index 0
+    // is the "Agent" pseudo-column which is always shown. Indices ≥ 1
+    // are filtered by name match (case-insensitive). An empty
+    // visible_columns list means "render everything" (legacy behaviour).
+    std::vector<size_t> visible_indices; // includes 0 (Agent) when non-empty
+    if (!visible_columns.empty()) {
+        visible_indices.push_back(0); // Agent always
+        for (size_t i = 1; i < col_names.size(); ++i) {
+            for (const auto& vc : visible_columns) {
+                if (vc.size() == col_names[i].size() &&
+                    std::equal(col_names[i].begin(), col_names[i].end(), vc.begin(),
+                               [](char a, char b) {
+                                   return std::tolower(static_cast<unsigned char>(a)) ==
+                                          std::tolower(static_cast<unsigned char>(b));
+                               })) {
+                    visible_indices.push_back(i);
+                    break;
+                }
+            }
+        }
+    }
+    auto is_visible = [&](size_t plugin_col_idx) {
+        if (visible_indices.empty()) return true;
+        for (auto idx : visible_indices) if (idx == plugin_col_idx) return true;
+        return false;
+    };
 
     // Phase 1: determine which responses match the filters
     std::vector<StoredResponse> responses;
@@ -1304,6 +1404,8 @@ std::string DashboardRoutes::render_results(
                           "&amp;per_page=" + std::to_string(per_page);
         if (!definition_id.empty())
             url += "&amp;definition_id=" + html_escape(definition_id);
+        if (!template_id.empty())
+            url += "&amp;template_id=" + html_escape(template_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -1323,28 +1425,39 @@ std::string DashboardRoutes::render_results(
     std::string html;
     html.reserve(all_lines.size() * 300 + 4096);
 
+    // Compute the visible-column count once for colspans below.
+    size_t visible_col_count =
+        visible_indices.empty() ? col_names.size() : visible_indices.size();
+
     // Primary: tbody rows
     html += "<tbody id=\"results-tbody\">";
     if (all_lines.empty()) {
-        html += "<tr><td colspan=\"" + std::to_string(col_names.size()) +
+        html += "<tr><td colspan=\"" + std::to_string(visible_col_count) +
                 "\" class=\"empty-state\">No results match your filters.</td></tr>";
     } else {
         for (int64_t i = start; i < end; ++i) {
             const auto& rl = all_lines[i];
             // Data row
             html += "<tr class=\"result-row\" onclick=\"toggleDetail(this)\">";
-            // Agent column
-            html += "<td class=\"col-agent\" title=\"" + html_escape(rl.agent_name) +
-                    "\">" + html_escape(rl.agent_name) + "</td>";
-            // Field columns
+            // Agent column (always visible when visible_indices is empty
+            // OR contains 0; render_results currently always pushes 0).
+            if (is_visible(0)) {
+                html += "<td class=\"col-agent\" title=\"" + html_escape(rl.agent_name) +
+                        "\">" + html_escape(rl.agent_name) + "</td>";
+            }
+            // Field columns — only render columns whose plugin index
+            // (c + 1 because rl.fields skips Agent) is visible.
             for (size_t c = 0; c < rl.fields.size(); ++c) {
+                if (!is_visible(c + 1)) continue;
                 auto esc = html_escape(rl.fields[c]);
                 html += "<td title=\"" + esc + "\">" + esc + "</td>";
             }
             html += "</tr>";
-            // Detail drawer
+            // Detail drawer — show every column regardless of template
+            // visibility. The drawer is the "expand for full record"
+            // affordance; hiding values there would defeat its purpose.
             html += "<tr class=\"result-detail\"><td colspan=\"" +
-                    std::to_string(1 + rl.fields.size()) +
+                    std::to_string(visible_col_count) +
                     "\"><div class=\"detail-content\">";
             html += "<div class=\"detail-label\">Agent</div>"
                     "<div class=\"detail-value\">" + html_escape(rl.agent_name) + "</div>";
@@ -1362,7 +1475,7 @@ std::string DashboardRoutes::render_results(
     // OOB: thead with sort indicators
     html += "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr>";
     // Agent column header
-    {
+    if (is_visible(0)) {
         auto new_dir = (sort_col == "agent" && sort_dir == "asc") ? "desc" : "asc";
         html += "<th class=\"col-agent sortable\" hx-get=\"" +
                 base_url("agent", new_dir, 1) +
@@ -1375,6 +1488,7 @@ std::string DashboardRoutes::render_results(
     }
     // Other column headers
     for (size_t i = 1; i < col_names.size(); ++i) {
+        if (!is_visible(i)) continue;
         std::string col_key;
         for (char c : col_names[i]) {
             if (c == ' ' || c == '-') col_key += '_';
@@ -1480,7 +1594,8 @@ std::string DashboardRoutes::render_results(
 
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
                                                 const std::string& plugin,
-                                                const std::string& definition_id) {
+                                                const std::string& definition_id,
+                                                const std::string& template_id) {
     auto& cols = columns_for_plugin(plugin);
 
     std::string html;
@@ -1492,6 +1607,52 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
     if (!definition_id.empty()) {
         html += "<input type=\"hidden\" name=\"definition_id\" value=\"" +
                 html_escape(definition_id) + "\">";
+    }
+
+    // Issue #254 (Phase 8.2) — response template selector.
+    // Rendered as the first control in the filter bar so operators can
+    // pick a saved view without scrolling. The synthesised default
+    // (kDefaultId) is always available, even when no operator templates
+    // are authored. Selecting an option triggers an HTMX swap of
+    // /fragments/results with template_id=<chosen>; the route handler
+    // resolves the template and applies sort/filter/columns defaults.
+    if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
+        auto def = instruction_store_->get_definition(definition_id);
+        if (def) {
+            ResponseTemplatesEngine engine;
+            std::vector<ResponseTemplate> templates;
+            if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+                templates = std::move(*parsed);
+            // The dropdown lists the synthesised default first when no
+            // operator template is marked default; otherwise it omits
+            // the synth default and uses the operator default instead.
+            bool operator_has_default = false;
+            for (const auto& t : templates) if (t.is_default) {
+                operator_has_default = true; break;
+            }
+            std::string current = template_id.empty()
+                                    ? std::string(ResponseTemplatesEngine::kDefaultId)
+                                    : template_id;
+            html += "<label>View</label>";
+            html += "<select name=\"template_id\""
+                    " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
+                    " hx-include=\"#filter-bar\" hx-indicator=\"#results-loading\""
+                    " hx-sync=\"closest form:abort\">";
+            if (!operator_has_default) {
+                html += "<option value=\"" +
+                        html_escape(ResponseTemplatesEngine::kDefaultId) + "\"";
+                if (current == ResponseTemplatesEngine::kDefaultId) html += " selected";
+                html += ">Default</option>";
+            }
+            for (const auto& t : templates) {
+                html += "<option value=\"" + html_escape(t.id) + "\"";
+                if (current == t.id) html += " selected";
+                html += ">" + html_escape(t.name);
+                if (t.is_default) html += " (default)";
+                html += "</option>";
+            }
+            html += "</select>";
+        }
     }
 
     // Per-column filter controls (skip Agent at index 0)

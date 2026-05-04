@@ -1308,6 +1308,30 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Then dispatch any of the six from the dashboard "Send" panel — the chart deck auto-renders above the results table.
 
+### Response Templates (saved views)
+
+A response template is a named bundle of *column subset + sort order + filter presets* attached to an `InstructionDefinition`. When the operator opens the execution results view for a definition, the filter bar's **View** dropdown lists every available template; selecting one re-renders the table with the chosen columns visible, the chosen sort applied, and any equals-op filters auto-populated.
+
+**Synthesised default.** Every definition has at least one template — the engine synthesises a `__default__` view from `spec.result.columns` (or, when omitted, from the plugin's hard-coded column schema) so the dropdown is never empty. The synthesised default lists all columns, applies no sort, and applies no filters — i.e. it matches the legacy "show everything" behaviour.
+
+**Authoring.** Operators can author additional templates either by including a `spec.responseTemplates` array in the YAML definition (see `docs/yaml-dsl-spec.md` § `spec.responseTemplates`) or via the REST CRUD surface:
+
+| Verb | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/definitions/{id}/response-templates` | List, with the synthesised default auto-prepended when no operator default is set |
+| `GET` | `/api/v1/definitions/{id}/response-templates/{tid}` | Fetch one |
+| `POST` | `/api/v1/definitions/{id}/response-templates` | Create (auto-assigns id when absent) |
+| `PUT` | `/api/v1/definitions/{id}/response-templates/{tid}` | Replace in place |
+| `DELETE` | `/api/v1/definitions/{id}/response-templates/{tid}` | Remove. Rejects `__default__` |
+
+Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefinition:Write`.
+
+**Limitations operators should expect:**
+
+- **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
+- **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
+
 ---
 
 ## 14. Planned Features

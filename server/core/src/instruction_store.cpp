@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "migration_runner.hpp"
+#include "response_templates_engine.hpp"
 #include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
@@ -86,6 +87,7 @@ InstructionDefinition row_to_def(sqlite3_stmt* stmt) {
     d.required_plugins = col_text(stmt, 21);
     d.readable_payload = col_text(stmt, 22);
     d.visualization_spec = col_text(stmt, 23);
+    d.response_templates_spec = col_text(stmt, 24);
     return d;
 }
 
@@ -94,7 +96,7 @@ const char* kSelectAllCols = "id, name, version, type, plugin, action, descripti
                              "created_by, created_at, updated_at, "
                              "yaml_source, parameter_schema, result_schema, approval_mode, "
                              "concurrency_mode, platforms, min_agent_version, required_plugins, "
-                             "readable_payload, visualization_spec";
+                             "readable_payload, visualization_spec, response_templates_spec";
 
 } // namespace
 
@@ -189,41 +191,97 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
         // ALTER entirely (governance arch-B2 / CP-5).
         {2, "ALTER TABLE instruction_definitions ADD COLUMN visualization_spec "
             "TEXT NOT NULL DEFAULT '{}';"},
+        // Issue #254 (8.2): named response view configurations
+        // (column subset + sort + filters) on InstructionDefinition. Same
+        // probe-and-stamp pattern as v2.
+        {3, "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec "
+            "TEXT NOT NULL DEFAULT '[]';"},
     };
-    // Pre-migration probe: if `instruction_definitions` already has the
-    // visualization_spec column AND `schema_meta` says we're below v2,
-    // stamp v2 directly so the runner skips the duplicate-column ALTER.
-    // The probe is a read-only PRAGMA query — safe to run on any state.
-    {
+    // Pre-migration probe: stamp schema_meta past any version whose ALTER
+    // would duplicate-column on the live DB (so the runner skips it). Same
+    // technique as the original v2 guard (governance arch-B2 / CP-5),
+    // generalised so v3 inherits the protection.
+    //
+    // UP-4 hardening (Gate 4 governance): every SQLite step return is
+    // checked. If the stamp insert fails, we close the DB rather than
+    // letting the migration runner attempt the duplicate-column ALTER —
+    // a silent-stamp + duplicate-column-ALTER chain wedged the store
+    // (`is_open()` false) with no diagnostic, leaving the operator
+    // staring at /readyz="ok" while every definition call returned 503.
+    bool stamp_failed = false;
+    auto probe_and_stamp = [&](const char* column_name, int target_version) {
+        if (stamp_failed) return; // earlier stamp failed; skip remaining
         sqlite3_stmt* probe = nullptr;
         bool col_exists = false;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM pragma_table_info('instruction_definitions') "
-                               "WHERE name='visualization_spec' LIMIT 1",
-                               -1, &probe, nullptr) == SQLITE_OK) {
-            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+        int rc = sqlite3_prepare_v2(db_,
+                                    "SELECT 1 FROM pragma_table_info('instruction_definitions') "
+                                    "WHERE name=? LIMIT 1",
+                                    -1, &probe, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error(
+                "InstructionStore: probe prepare failed for {} (rc={}): {}",
+                column_name, rc, sqlite3_errmsg(db_));
+            stamp_failed = true;
+            return;
+        }
+        sqlite3_bind_text(probe, 1, column_name, -1, SQLITE_TRANSIENT);
+        int probe_rc = sqlite3_step(probe);
+        if (probe_rc != SQLITE_ROW && probe_rc != SQLITE_DONE) {
+            spdlog::error(
+                "InstructionStore: probe step failed for {} (rc={}): {}",
+                column_name, probe_rc, sqlite3_errmsg(db_));
             sqlite3_finalize(probe);
+            stamp_failed = true;
+            return;
         }
+        col_exists = (probe_rc == SQLITE_ROW);
+        sqlite3_finalize(probe);
+
         int current_v = MigrationRunner::current_version(db_, "instruction_store");
-        if (col_exists && current_v < 2) {
-            // Stamp schema_meta directly. MigrationRunner::set_version is
-            // private, but the table layout is stable.
+        if (col_exists && current_v < target_version) {
             sqlite3_stmt* stamp = nullptr;
-            if (sqlite3_prepare_v2(db_,
-                                   "INSERT OR REPLACE INTO schema_meta "
-                                   "(store, version, upgraded_at) VALUES (?, 2, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
-                auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-                sqlite3_bind_text(stamp, 1, "instruction_store", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now);
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
-                spdlog::info("InstructionStore: visualization_spec column already "
-                             "present, stamping schema_meta to v2 (arch-B2)");
+            int prep_rc = sqlite3_prepare_v2(
+                db_,
+                "INSERT OR REPLACE INTO schema_meta "
+                "(store, version, upgraded_at) VALUES (?, ?, ?)",
+                -1, &stamp, nullptr);
+            if (prep_rc != SQLITE_OK) {
+                spdlog::error(
+                    "InstructionStore: stamp prepare failed for v{} ({}): {}",
+                    target_version, column_name, sqlite3_errmsg(db_));
+                stamp_failed = true;
+                return;
             }
+            auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+            sqlite3_bind_text(stamp, 1, "instruction_store", -1, SQLITE_STATIC);
+            sqlite3_bind_int(stamp, 2, target_version);
+            sqlite3_bind_int64(stamp, 3, now);
+            int step_rc = sqlite3_step(stamp);
+            sqlite3_finalize(stamp);
+            if (step_rc != SQLITE_DONE) {
+                spdlog::error(
+                    "InstructionStore: stamp step failed for v{} ({}, rc={}): {}; "
+                    "refusing to run migration ledger to avoid duplicate-column ALTER",
+                    target_version, column_name, step_rc, sqlite3_errmsg(db_));
+                stamp_failed = true;
+                return;
+            }
+            spdlog::info(
+                "InstructionStore: {} column already present, stamping schema_meta to v{} "
+                "(arch-B2)",
+                column_name, target_version);
         }
+    };
+    probe_and_stamp("visualization_spec", 2);
+    probe_and_stamp("response_templates_spec", 3);
+    if (stamp_failed) {
+        spdlog::error("InstructionStore: probe-and-stamp failed; closing database "
+                      "(governance UP-4 hardening — fail-closed instead of wedging boot)");
+        sqlite3_close(db_);
+        db_ = nullptr;
+        return;
     }
     if (!MigrationRunner::run(db_, "instruction_store", kMigrations)) {
         spdlog::error("InstructionStore: schema migration failed, closing database");
@@ -373,8 +431,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
          created_by, created_at, updated_at,
          yaml_source, parameter_schema, result_schema, approval_mode,
          concurrency_mode, platforms, min_agent_version, required_plugins,
-         readable_payload, visualization_spec)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         readable_payload, visualization_spec, response_templates_spec)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -410,6 +468,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
     auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
     sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
+    auto rts = def.response_templates_spec.empty() ? "[]" : def.response_templates_spec;
+    sqlite3_bind_text(stmt, i++, rts.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
@@ -435,7 +495,7 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
             updated_at=?,
             yaml_source=?, parameter_schema=?, result_schema=?, approval_mode=?,
             concurrency_mode=?, platforms=?, min_agent_version=?, required_plugins=?,
-            readable_payload=?, visualization_spec=?
+            readable_payload=?, visualization_spec=?, response_templates_spec=?
         WHERE id=?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -469,6 +529,8 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
     auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
     sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
+    auto rts = def.response_templates_spec.empty() ? "[]" : def.response_templates_spec;
+    sqlite3_bind_text(stmt, i++, rts.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
@@ -535,6 +597,7 @@ std::string InstructionStore::export_definition_json(const std::string& id) cons
     j["required_plugins"] = def->required_plugins;
     j["readable_payload"] = def->readable_payload;
     j["visualization_spec"] = def->visualization_spec;
+    j["response_templates_spec"] = def->response_templates_spec;
     return j.dump(2);
 }
 
@@ -620,6 +683,75 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     };
     if (auto v = pick_spec_field(); v) {
         def.visualization_spec = normalize_to_array(*v);
+    }
+
+    // Issue #254 (8.2): spec.responseTemplates — accept canonical
+    // `responseTemplates` (camelCase YAML), the snake-case storage column
+    // name `response_templates_spec`, and the explicit pre-serialised
+    // string form. Always normalises to a JSON array string at rest.
+    auto pick_templates_field = [&]() -> std::optional<nlohmann::json> {
+        if (parsed.contains("response_templates_spec") && !parsed["response_templates_spec"].is_null())
+            return parsed["response_templates_spec"];
+        if (parsed.contains("responseTemplates") && !parsed["responseTemplates"].is_null())
+            return parsed["responseTemplates"];
+        if (parsed.contains("response_templates") && !parsed["response_templates"].is_null())
+            return parsed["response_templates"];
+        return std::nullopt;
+    };
+    // Hardening (governance S-4 / sec-L3 / dsl-S2 / F-2): build the storage
+    // form via a single normalisation pass that (a) accepts string / object /
+    // array shapes, (b) bounds the inner string-form parse depth + size to
+    // mitigate sec-M4 (operator-tier JSON bomb on import), and (c) silently
+    // strips any element with `id == "__default__"` so an imported pack
+    // cannot inject a stuck reserved-id row that REST PUT/DELETE refuse to
+    // remove. UP-15 / UP-17: a malformed inner string is dropped with a
+    // logged warning rather than passed through verbatim, so a bad import
+    // surfaces in logs instead of silently wedging the templates view.
+    static constexpr size_t kMaxImportTemplateStringBytes = 256 * 1024; // 256 KiB
+    auto strip_reserved_id = [](const nlohmann::json& el) -> bool {
+        if (!el.is_object()) return true; // drop non-objects entirely
+        if (el.contains("id") && el["id"].is_string() &&
+            el["id"].get<std::string>() ==
+                std::string(::yuzu::server::ResponseTemplatesEngine::kDefaultId)) {
+            return true; // drop reserved id
+        }
+        return false;
+    };
+    auto normalise_templates_array = [&](const nlohmann::json& src) -> nlohmann::json {
+        nlohmann::json out = nlohmann::json::array();
+        if (src.is_array()) {
+            for (const auto& el : src) {
+                if (strip_reserved_id(el)) continue;
+                out.push_back(el);
+            }
+        } else if (src.is_object()) {
+            if (!strip_reserved_id(src)) out.push_back(src);
+        }
+        return out;
+    };
+    if (auto v = pick_templates_field(); v) {
+        if (v->is_string()) {
+            const std::string& s = v->get_ref<const std::string&>();
+            if (s.size() > kMaxImportTemplateStringBytes) {
+                spdlog::warn("InstructionStore::import_definition_json: "
+                             "responseTemplates string exceeds {} bytes; dropped "
+                             "(governance sec-M4 / UP-15)",
+                             kMaxImportTemplateStringBytes);
+                def.response_templates_spec = "[]";
+            } else {
+                auto inner = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
+                if (inner.is_discarded()) {
+                    spdlog::warn("InstructionStore::import_definition_json: "
+                                 "responseTemplates string is not valid JSON; dropped "
+                                 "(governance UP-15)");
+                    def.response_templates_spec = "[]";
+                } else {
+                    def.response_templates_spec = normalise_templates_array(inner).dump();
+                }
+            }
+        } else {
+            def.response_templates_spec = normalise_templates_array(*v).dump();
+        }
     }
 
     return create_definition_impl(def);

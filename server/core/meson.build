@@ -201,6 +201,7 @@ yuzu_server_core_lib = static_library(
     'src/static_js_bundle.cpp',
     'src/charts_js_bundle.cpp',
     'src/visualization_engine.cpp',
+    'src/response_templates_engine.cpp',
     'src/icons_svg.cpp',
     'src/migration_runner.cpp',
     'src/rate_limiter.cpp',

@@ -300,6 +300,39 @@ spec:
       title: Process count over time
 ```
 
+#### `spec.responseTemplates`
+
+Optional list of named response-view configurations consumed by the dashboard's filter bar dropdown and the `GET/POST/PUT/DELETE /api/v1/definitions/{id}/response-templates` REST endpoints (issue #254, Phase 8.2). When omitted, the engine synthesises a single `__default__` template from `spec.result.columns` (preferred) or the plugin's column schema, so every definition has at least one selectable view without authoring.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | string | No | auto | Stable 32-hex id. Auto-generated on POST when omitted. The reserved id `__default__` is rejected — operators cannot author or overwrite the synthesised default. |
+| `name` | string | Yes | -- | Operator-facing label shown in the dropdown. Max 200 characters. |
+| `description` | string | No | `""` | Optional longer description. Reserved for future tooltip rendering. |
+| `columns` | array of strings | No | `[]` | Subset of plugin column names to render. Empty / omitted means "show all". The `Agent` pseudo-column is always shown regardless of this list. |
+| `sort` | object | No | -- | `{column: <name>, dir: asc\|desc}`. Defines the initial sort applied when the operator picks the template. The dashboard's column-header click still wins. |
+| `filters` | array of objects | No | `[]` | List of `{column, op, value}` clauses. `op` ∈ `equals`, `not_equals`, `contains`, `starts_with`, `ends_with`. The dashboard auto-applies `equals`-op clauses to the URL filter map; other ops are honoured by REST consumers but not auto-applied client-side in this revision. |
+| `default` | boolean | No | `false` | When `true` this template replaces the synthesised `__default__` in the dropdown. At most one operator-authored template may be marked `default` per definition. |
+
+Example — a "Failures only" view for a vulnerability scan definition:
+
+```yaml
+spec:
+  responseTemplates:
+    - name: Failures only
+      columns: [Severity, Title, Detail]
+      sort: {column: Severity, dir: desc}
+      filters:
+        - {column: Severity, op: equals, value: high}
+    - name: Critical view
+      default: true
+      columns: [Severity, Category, Title]
+      filters:
+        - {column: Severity, op: equals, value: critical}
+```
+
+> **Authoring through the dashboard YAML editor strips response templates.** Same caveat as `spec.visualization` — the lightweight line-scanner used by `POST /api/instructions/yaml` does not extract `spec.responseTemplates` into the indexed column. Use `POST /api/v1/definitions/import` (JSON envelope) or the in-tree `content/definitions/` library, or call `POST /api/v1/definitions/{id}/response-templates` directly to author templates against an already-imported definition.
+
 #### `status`
 
 | Field | Type | Required | Default | Description |

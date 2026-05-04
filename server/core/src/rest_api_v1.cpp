@@ -1,6 +1,7 @@
 #include "rest_api_v1.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "response_templates_engine.hpp"
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
@@ -249,6 +250,19 @@ const std::string& openapi_spec() {
           "verified": {"type": "boolean", "description": "Whether the pack signature was verified"}
         }
       },
+      "ResponseTemplate": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "id": {"type": "string", "description": "32-hex template id; auto-generated on POST when omitted. Reserved id __default__ rejected."},
+          "name": {"type": "string", "maxLength": 200},
+          "description": {"type": "string"},
+          "columns": {"type": "array", "items": {"type": "string"}, "description": "Subset of plugin column names to render. Empty/omitted means show all."},
+          "sort": {"type": "object", "properties": {"column": {"type": "string"}, "dir": {"type": "string", "enum": ["asc", "desc"]}}},
+          "filters": {"type": "array", "items": {"type": "object", "properties": {"column": {"type": "string"}, "op": {"type": "string", "enum": ["equals", "not_equals", "contains", "starts_with", "ends_with"]}, "value": {"type": "string"}}}},
+          "default": {"type": "boolean", "description": "At most one operator template may be marked default per definition."}
+        }
+      },
       "GuaranteedStateRule": {
         "type": "object",
         "properties": {
@@ -382,6 +396,15 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}/visualization": {
       "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Requires Response:Read. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
+    },
+    "/definitions/{id}/response-templates": {
+      "get": {"summary": "List response templates for an InstructionDefinition", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Read. Returns the operator-authored templates plus a synthesised __default__ template (auto-prepended when no operator template is marked default). The synthesised default lists columns from spec.result.columns when populated, otherwise from the plugin's column schema (issue #254, Phase 8.2).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"}}], "responses": {"200": {"description": "List of response templates"}, "400": {"description": "Malformed definition id"}, "404": {"description": "Definition not found"}, "503": {"description": "Service unavailable"}}},
+      "post": {"summary": "Create a response template", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Write. Body is a single template object. Reserved id __default__ is rejected. Body size capped at 64 KiB.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResponseTemplate"}}}}, "responses": {"201": {"description": "Template created"}, "400": {"description": "Invalid JSON / validation failure / reserved id"}, "404": {"description": "Definition not found"}, "413": {"description": "Body exceeds 64 KiB cap"}, "500": {"description": "Persist failure"}, "503": {"description": "Service unavailable"}}}
+    },
+    "/definitions/{id}/response-templates/{template_id}": {
+      "get": {"summary": "Get a response template", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Read. The reserved id __default__ always returns the synthesised default.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"}}, {"name": "template_id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"}}], "responses": {"200": {"description": "Template"}, "400": {"description": "Malformed id"}, "404": {"description": "Definition or template not found"}, "503": {"description": "Service unavailable"}}},
+      "put": {"summary": "Replace a response template in place", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Write. PUT against template_id=__default__ returns 400 (synthesised default cannot be overwritten). Body size capped at 64 KiB.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "template_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResponseTemplate"}}}}, "responses": {"200": {"description": "Template replaced"}, "400": {"description": "Reserved id / malformed / invalid JSON / validation failure"}, "404": {"description": "Definition or template not found"}, "413": {"description": "Body exceeds 64 KiB cap"}, "500": {"description": "Persist failure"}, "503": {"description": "Service unavailable"}}},
+      "delete": {"summary": "Delete a response template", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Write. Reserved id __default__ cannot be deleted (returns 400).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "template_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Template removed"}, "400": {"description": "Malformed id or reserved id"}, "404": {"description": "Definition or template not found"}, "500": {"description": "Persist failure"}, "503": {"description": "Service unavailable"}}}
     })json"
     // Split here so each raw-string literal stays under MSVC's 16,380-byte
     // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -1372,6 +1395,403 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 .add("created_at", d.created_at));
                 }
                 res.set_content(list_json(arr.str(), static_cast<int64_t>(defs.size())),
+                                "application/json");
+            });
+
+    // ── Response Templates (issue #254, capability 20.6) ─────────────────
+    //
+    // Named response-view configurations (column subset + sort + filters)
+    // attached to an InstructionDefinition under `spec.responseTemplates`.
+    // Persisted in the `response_templates_spec` JSON column on
+    // instruction_definitions; the engine synthesises a `__default__`
+    // template from result_schema (or the plugin's column list) when the
+    // operator hasn't authored one. Closes Phase 8.2.
+    //
+    // Path: /api/v1/definitions/{id}/response-templates[/{template_id}]
+    // RBAC: List/Get   = InstructionDefinition:Read
+    //       POST/PUT/DELETE = InstructionDefinition:Write
+    //
+    // The {id} regex matches the existing /api/v1/executions/{id}/visualization
+    // shape; {template_id} permits the synth-default sentinel `__default__`
+    // alongside the 32-hex auto-generated ids by allowing underscores.
+
+    static const std::regex kRtDefIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+    static const std::regex kRtTemplateIdRegex{"^[A-Za-z0-9_-]{1,64}$"};
+    // Hardening (governance UP-8 / sec-M2): cap incoming JSON body size on
+    // POST/PUT to prevent an authenticated operator from DoS'ing the
+    // single-process server with a JSON bomb (nested-array stack overflow
+    // through nlohmann's recursive DOM parser). 64 KiB is several
+    // orders of magnitude above any realistic template payload.
+    //
+    // S-9 (governance round-2): this constant is scoped to the response-
+    // templates routes only. The other POST/PUT mutation routes in this
+    // file (Guardian rule.create, management-group create, tag PUT, token
+    // POST, etc.) do not yet enforce a body cap; widening the cap to all
+    // mutation routes is tracked as a separate hardening pass so each
+    // route can pick a cap appropriate to its payload shape.
+    static constexpr size_t kRtMaxBodyBytes = 64 * 1024;
+
+    // Helper: persist a mutated template list back to the definition.
+    // Returns std::nullopt on success, an error message on failure.
+    auto persist_templates =
+        [instruction_store](const std::string& definition_id,
+                             const std::vector<ResponseTemplate>& templates)
+            -> std::optional<std::string> {
+            auto def = instruction_store->get_definition(definition_id);
+            if (!def) return std::string("definition not found");
+            ResponseTemplatesEngine engine;
+            def->response_templates_spec = engine.serialise(templates);
+            auto upd = instruction_store->update_definition(*def);
+            if (!upd) return upd.error();
+            return std::nullopt;
+        };
+
+    // GET /api/v1/definitions/{id}/response-templates ─ list
+    sink.Get(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
+            [perm_fn, instruction_store]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Read")) return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+                auto def_id = req.matches[1].str();
+                if (!std::regex_match(def_id, kRtDefIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                                    "application/json");
+                    return;
+                }
+                auto def = instruction_store->get_definition(def_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("definition not found"),
+                                    "application/json");
+                    return;
+                }
+                ResponseTemplatesEngine engine;
+                auto parsed = engine.parse(def->response_templates_spec);
+                std::vector<ResponseTemplate> templates;
+                if (parsed) templates = std::move(*parsed);
+                // Always prepend the synthesised default unless the
+                // operator has authored their own default-marked one.
+                bool operator_has_default = false;
+                for (const auto& t : templates) if (t.is_default) {
+                    operator_has_default = true; break;
+                }
+                JArr arr;
+                if (!operator_has_default) {
+                    auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                    arr.add_raw(engine.to_json(synth).dump());
+                }
+                for (const auto& t : templates) {
+                    arr.add_raw(engine.to_json(t).dump());
+                }
+                int64_t total = static_cast<int64_t>(templates.size())
+                                + (operator_has_default ? 0 : 1);
+                res.set_content(list_json(arr.str(), total), "application/json");
+            });
+
+    // GET /api/v1/definitions/{id}/response-templates/{tid} ─ get one
+    sink.Get(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
+            [perm_fn, instruction_store]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Read")) return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+                auto def_id = req.matches[1].str();
+                auto tid = req.matches[2].str();
+                if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                    !std::regex_match(tid, kRtTemplateIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("malformed id"), "application/json");
+                    return;
+                }
+                auto def = instruction_store->get_definition(def_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("definition not found"),
+                                    "application/json");
+                    return;
+                }
+                ResponseTemplatesEngine engine;
+                auto parsed = engine.parse(def->response_templates_spec);
+                std::vector<ResponseTemplate> templates;
+                if (parsed) templates = std::move(*parsed);
+
+                if (tid == ResponseTemplatesEngine::kDefaultId) {
+                    // Always return the synthesised default for the
+                    // sentinel id, even when an operator has authored
+                    // their own default — the synth view is "what the
+                    // dashboard shows when nothing is configured", and
+                    // operators introspecting it shouldn't have to know
+                    // which path they're on.
+                    auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                    res.set_content(ok_json(engine.to_json(synth).dump()),
+                                    "application/json");
+                    return;
+                }
+                for (const auto& t : templates) {
+                    if (t.id == tid) {
+                        res.set_content(ok_json(engine.to_json(t).dump()),
+                                        "application/json");
+                        return;
+                    }
+                }
+                res.status = 404;
+                res.set_content(error_json("template not found"), "application/json");
+            });
+
+    // POST /api/v1/definitions/{id}/response-templates ─ create
+    sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
+            [perm_fn, audit_fn, instruction_store, persist_templates]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+                auto def_id = req.matches[1].str();
+                if (!std::regex_match(def_id, kRtDefIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                                    "application/json");
+                    audit_fn(req, "response_template.create", "denied",
+                             "InstructionDefinition", def_id, "reason=malformed_definition_id");
+                    return;
+                }
+                if (req.body.size() > kRtMaxBodyBytes) {
+                    res.status = 413;
+                    res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                                    "application/json");
+                    audit_fn(req, "response_template.create", "denied",
+                             "InstructionDefinition", def_id, "reason=body_too_large");
+                    return;
+                }
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded()) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid JSON"), "application/json");
+                    audit_fn(req, "response_template.create", "denied",
+                             "InstructionDefinition", def_id, "reason=invalid_json");
+                    return;
+                }
+                auto def = instruction_store->get_definition(def_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("definition not found"),
+                                    "application/json");
+                    audit_fn(req, "response_template.create", "denied",
+                             "InstructionDefinition", def_id, "reason=definition_not_found");
+                    return;
+                }
+                ResponseTemplatesEngine engine;
+                auto parsed = engine.parse(def->response_templates_spec);
+                std::vector<ResponseTemplate> templates;
+                if (parsed) templates = std::move(*parsed);
+                auto validated = engine.validate_payload(body, templates,
+                                                         /*expected_id=*/"",
+                                                         /*assign_id=*/true);
+                if (!validated) {
+                    res.status = 400;
+                    res.set_content(error_json(validated.error()),
+                                    "application/json");
+                    audit_fn(req, "response_template.create", "denied",
+                             "InstructionDefinition", def_id,
+                             "reason=validation_failed");
+                    return;
+                }
+                templates.push_back(*validated);
+                if (auto err = persist_templates(def_id, templates); err) {
+                    spdlog::error("response_template.create persist failed: def={} err={}",
+                                  def_id, *err);
+                    res.status = 500;
+                    res.set_content(error_json("persist failure"), "application/json");
+                    audit_fn(req, "response_template.create", "failure",
+                             "InstructionDefinition", def_id, "reason=persist_failure");
+                    return;
+                }
+                audit_fn(req, "response_template.create", "success",
+                         "InstructionDefinition", def_id, validated->id);
+                res.status = 201;
+                res.set_content(ok_json(engine.to_json(*validated).dump()),
+                                "application/json");
+            });
+
+    // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
+    sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
+            [perm_fn, audit_fn, instruction_store, persist_templates]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+                auto def_id = req.matches[1].str();
+                auto tid = req.matches[2].str();
+                if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                    !std::regex_match(tid, kRtTemplateIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("malformed id"), "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=malformed_id");
+                    return;
+                }
+                if (tid == ResponseTemplatesEngine::kDefaultId) {
+                    res.status = 400;
+                    res.set_content(error_json("'__default__' is reserved for the synthesised "
+                                               "default; create a new template instead"),
+                                    "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=reserved_id");
+                    return;
+                }
+                if (req.body.size() > kRtMaxBodyBytes) {
+                    res.status = 413;
+                    res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                                    "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=body_too_large");
+                    return;
+                }
+                auto body = nlohmann::json::parse(req.body, nullptr, false);
+                if (body.is_discarded()) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid JSON"), "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=invalid_json");
+                    return;
+                }
+                auto def = instruction_store->get_definition(def_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("definition not found"),
+                                    "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=definition_not_found");
+                    return;
+                }
+                ResponseTemplatesEngine engine;
+                auto parsed = engine.parse(def->response_templates_spec);
+                std::vector<ResponseTemplate> templates;
+                if (parsed) templates = std::move(*parsed);
+                bool found = false;
+                for (const auto& t : templates) if (t.id == tid) { found = true; break; }
+                if (!found) {
+                    res.status = 404;
+                    res.set_content(error_json("template not found"),
+                                    "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=template_not_found");
+                    return;
+                }
+                auto validated = engine.validate_payload(body, templates,
+                                                         /*expected_id=*/tid,
+                                                         /*assign_id=*/false);
+                if (!validated) {
+                    res.status = 400;
+                    res.set_content(error_json(validated.error()),
+                                    "application/json");
+                    audit_fn(req, "response_template.update", "denied",
+                             "InstructionDefinition", def_id, "reason=validation_failed");
+                    return;
+                }
+                for (auto& t : templates) {
+                    if (t.id == tid) { t = *validated; break; }
+                }
+                if (auto err = persist_templates(def_id, templates); err) {
+                    spdlog::error("response_template.update persist failed: def={} tid={} err={}",
+                                  def_id, tid, *err);
+                    res.status = 500;
+                    res.set_content(error_json("persist failure"), "application/json");
+                    audit_fn(req, "response_template.update", "failure",
+                             "InstructionDefinition", def_id, "reason=persist_failure");
+                    return;
+                }
+                audit_fn(req, "response_template.update", "success",
+                         "InstructionDefinition", def_id, tid);
+                res.set_content(ok_json(engine.to_json(*validated).dump()),
+                                "application/json");
+            });
+
+    // DELETE /api/v1/definitions/{id}/response-templates/{tid}
+    sink.Delete(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
+            [perm_fn, audit_fn, instruction_store, persist_templates]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+                auto def_id = req.matches[1].str();
+                auto tid = req.matches[2].str();
+                if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                    !std::regex_match(tid, kRtTemplateIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("malformed id"), "application/json");
+                    audit_fn(req, "response_template.delete", "denied",
+                             "InstructionDefinition", def_id, "reason=malformed_id");
+                    return;
+                }
+                if (tid == ResponseTemplatesEngine::kDefaultId) {
+                    res.status = 400;
+                    res.set_content(error_json("the synthesised default template "
+                                               "cannot be deleted"),
+                                    "application/json");
+                    audit_fn(req, "response_template.delete", "denied",
+                             "InstructionDefinition", def_id, "reason=reserved_id");
+                    return;
+                }
+                auto def = instruction_store->get_definition(def_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("definition not found"),
+                                    "application/json");
+                    audit_fn(req, "response_template.delete", "denied",
+                             "InstructionDefinition", def_id, "reason=definition_not_found");
+                    return;
+                }
+                ResponseTemplatesEngine engine;
+                auto parsed = engine.parse(def->response_templates_spec);
+                std::vector<ResponseTemplate> templates;
+                if (parsed) templates = std::move(*parsed);
+                auto before = templates.size();
+                templates.erase(
+                    std::remove_if(templates.begin(), templates.end(),
+                                   [&](const ResponseTemplate& t) { return t.id == tid; }),
+                    templates.end());
+                if (templates.size() == before) {
+                    res.status = 404;
+                    res.set_content(error_json("template not found"),
+                                    "application/json");
+                    audit_fn(req, "response_template.delete", "denied",
+                             "InstructionDefinition", def_id, "reason=template_not_found");
+                    return;
+                }
+                if (auto err = persist_templates(def_id, templates); err) {
+                    spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
+                                  def_id, tid, *err);
+                    res.status = 500;
+                    res.set_content(error_json("persist failure"), "application/json");
+                    audit_fn(req, "response_template.delete", "failure",
+                             "InstructionDefinition", def_id, "reason=persist_failure");
+                    return;
+                }
+                audit_fn(req, "response_template.delete", "success",
+                         "InstructionDefinition", def_id, tid);
+                res.set_content(ok_json(JObj().add("deleted", true).str()),
                                 "application/json");
             });
 

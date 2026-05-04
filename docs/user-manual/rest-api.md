@@ -51,6 +51,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
+  - [Response Templates](#response-templates)
   - [Audit Log](#audit-log)
   - [Policy Fragments](#policy-fragments)
   - [Policies](#policies)
@@ -1046,6 +1047,118 @@ List all instruction definitions.
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Response Templates
+
+Named response-view configurations attached to an `InstructionDefinition` — column subset, sort order, and filter presets the dashboard's filter-bar dropdown surfaces (issue #254, Phase 8.2). Storage is the `response_templates_spec` JSON array column on `instruction_definitions`; the `__default__` template is synthesised on read from `spec.result.columns` (or the plugin's column schema) and never persists.
+
+#### `GET /api/v1/definitions/{id}/response-templates`
+
+List all response templates for the definition. The synthesised `__default__` is auto-prepended when no operator template is marked `default`.
+
+**Permission:** `InstructionDefinition:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "__default__",
+      "name": "Default",
+      "description": "Auto-generated default view derived from the result schema.",
+      "columns": ["PID", "Name", "Path", "SHA-1"],
+      "filters": [],
+      "default": true
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `GET /api/v1/definitions/{id}/response-templates/{template_id}`
+
+Fetch a single template. The reserved id `__default__` always returns the synthesised default (even when an operator default exists).
+
+**Permission:** `InstructionDefinition:Read`
+
+#### `POST /api/v1/definitions/{id}/response-templates`
+
+Create a new template. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
+
+**Permission:** `InstructionDefinition:Write`
+
+**Body:**
+
+```json
+{
+  "name": "Failures only",
+  "columns": ["Severity", "Title"],
+  "sort": {"column": "Severity", "dir": "desc"},
+  "filters": [{"column": "Severity", "op": "equals", "value": "high"}],
+  "default": false
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | string | No | Auto-generated if omitted. The reserved id `__default__` is rejected. |
+| `name` | string | Yes | Operator-facing label. Max 200 characters. |
+| `description` | string | No | Optional longer description. |
+| `columns` | array of strings | No | Subset of plugin column names. Empty / omitted means "show all". |
+| `sort` | object | No | `{column: <name>, dir: asc\|desc}`. `dir` requires `column`. |
+| `filters` | array of objects | No | `{column, op, value}` clauses. `op` ∈ `equals`, `not_equals`, `contains`, `starts_with`, `ends_with`. |
+| `default` | boolean | No | At most one operator template may be marked default per definition. |
+
+**Body size cap.** POST and PUT bodies are capped at **64 KiB**. Larger bodies receive a 413 response and a failure-audit emission with `reason=body_too_large` before parsing — preventing operator-tier JSON-bomb DoS against the single-process server.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | invalid JSON / missing name / unknown filter op / id collision / multiple default templates / `__default__` as authored id |
+| 404 | Definition not found |
+| 413 | Body exceeds 64 KiB cap |
+| 500 | Persist failure (rare; see server logs) |
+| 503 | Service unavailable |
+
+#### `PUT /api/v1/definitions/{id}/response-templates/{template_id}`
+
+Replace the named template in place.
+
+**Permission:** `InstructionDefinition:Write`
+
+Returns 400 when `template_id` is `__default__` (the synthesised default cannot be overwritten). Same 64 KiB body cap as POST.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | malformed id / `__default__` reserved / invalid JSON / validation failure |
+| 404 | Definition or template not found |
+| 413 | Body exceeds 64 KiB cap |
+| 500 | Persist failure |
+| 503 | Service unavailable |
+
+#### `DELETE /api/v1/definitions/{id}/response-templates/{template_id}`
+
+Remove a template. Returns 400 when `template_id` is `__default__`.
+
+**Permission:** `InstructionDefinition:Write`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | malformed id / `__default__` reserved |
+| 404 | Definition or template not found |
+| 500 | Persist failure |
+| 503 | Service unavailable |
+
+**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`. See `audit-log.md` for the full reason vocabulary.
 
 ---
 
