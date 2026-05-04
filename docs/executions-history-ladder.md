@@ -43,6 +43,14 @@ first agent's terminal would leave agents 2..N stamping empty
 sweeper is filed as PR 2.x. The accepted bounded leak matches the existing
 `cmd_send_times_` / `cmd_first_seen_` shape under the same `cmd_times_mu_`.
 
+Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
+47 assertions) drives `process_gateway_response` end-to-end into a real
+`ResponseStore` and pins the no-erase rule (HF-1 fan-out across 4 agents
+with mixed terminal statuses), the RUNNING/terminal stamping branches,
+and the `__timing__|...` sentinel early-return. The
+`test_workflow_routes.cpp:814` sibling case covers the response-store
+level only.
+
 ### Server restart caveat
 
 The mapping is in-memory; restart loses it. In-flight commands at restart

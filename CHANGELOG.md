@@ -79,6 +79,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- `tests/unit/server/test_agent_service_impl.cpp` — new file, 9 cases /
+  47 assertions covering `AgentServiceImpl::record_execution_id` and
+  `AgentServiceImpl::process_gateway_response`. Closes the gap explicitly
+  deferred at `tests/unit/server/test_workflow_routes.cpp:820` ("no
+  AgentServiceImpl in ExecHarness") by constructing a real
+  AgentServiceImpl and driving response receipt end-to-end into a real
+  `ResponseStore`. Pins four contracts from #117's response-streaming
+  call-out: (1) `record_execution_id` registers and clears the
+  command_id → execution_id mapping; (2) `process_gateway_response`
+  stamps execution_id on RUNNING streaming rows, terminal SUCCESS rows,
+  terminal FAILURE rows (with `error_detail`), and degrades to empty
+  execution_id for unmapped command_ids; (3) the HF-1 multi-agent
+  fan-out invariant — the terminal branch does NOT erase the mapping,
+  so 4 agents responding to the same `command_id` (with mixed terminal
+  statuses SUCCESS/FAILURE/TIMEOUT) all stamp the same `execution_id`;
+  (4) the `__timing__|...` sentinel takes the early-return branch in
+  the RUNNING handler and does NOT persist a row. The pre-existing
+  `test_workflow_routes.cpp:814` pin exercised the response-store level
+  only; this new file exercises the `process_gateway_response` upstream
+  path that the comment said had to be deferred to UAT. (#117)
 - `scripts/linux-start-UAT.sh` — added regression assertion that `/health`
   and `/api/health` return 200 AND identical JSON bodies, guarding
   against both the #620 regression and a future split of the dual-mount
