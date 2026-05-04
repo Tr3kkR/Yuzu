@@ -560,6 +560,48 @@ patch._
 
 ### Fixed
 
+- **MCP token authorization restored to documented tier-first design
+  (#520, #630, branch `fix/520-630-auth-hardening`).** An earlier
+  hardening pass (`5fcb346`..`7c8d4ac`) conflated MCP tokens with
+  service-scoped tokens — required RBAC to be enabled and capped MCP
+  tokens at `ITServiceOwner` permissions regardless of the creator's
+  role. That broke the documented design (`docs/user-manual/mcp.md`
+  §"Authorization Tiers"): the tier (`readonly`/`operator`/`supervised`)
+  is the primary access boundary, applied independently of RBAC, with
+  the creator's actual role as the secondary RBAC layer. The regression
+  made MCP unusable for its intended purpose — agentic fleet management —
+  on every RBAC-disabled deployment.
+
+  Restored behavior:
+  - `auth_routes::require_permission()` and `require_scoped_permission()`
+    now call `mcp::tier_allows()` first, then fall through to the
+    standard RBAC/role check using the creator's actual role.
+  - Tier enforcement now applies on **all** transports (MCP JSON-RPC and
+    REST API) — closes a path-bypass where an MCP token used directly
+    on `/api/v1/...` could skip the tier check that `/mcp/v1/` enforces.
+  - Approval-gated operations (supervised tier on destructive ops) are
+    blocked on every transport with a new `auth.approval_required`
+    audit action until the Phase 2 re-dispatch path is built. This
+    closes a separation-of-duties gap where a supervised MCP token
+    issued by an admin could execute destructive operations via REST
+    without approval.
+  - `require_admin()` MCP block kept — admin/settings routes (user
+    management, TLS, OIDC) are not the MCP use case.
+  - RBAC-enabled and legacy-fallback denial paths now emit
+    `audit_log()` and use the structured JSON envelope, closing prior
+    audit-evidence gaps (CC7.2).
+  - `settings_routes.cpp` tier-string validation replaced with
+    `mcp::is_valid_tier()` to keep the canonical tier set in
+    `mcp_policy.hpp` as the single source of truth.
+
+  Audit detail string format changed for MCP-token denials. Operators
+  with SIEM rules pattern-matching the old strings (`"MCP token
+  blocked: RBAC not enabled"`, `"MCP token blocked: lacks
+  ITServiceOwner permission"`) must update them; see
+  `docs/user-manual/authentication.md` § "Audit Actions". The broken
+  intermediate (`5fcb346`..`7c8d4ac`) never shipped in a release —
+  no customer-facing upgrade notes are required.
+
 - **Windows MSVC LNK2038 closed end-to-end via "option D" — static
   triplet override + hand-rolled `cxx.find_library()` wiring for
   grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as

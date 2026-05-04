@@ -320,7 +320,9 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 | `operator` | Read-only tools + tag writes + auto-approved instruction executions |
 | `supervised` | All operations, but destructive actions require admin approval via the approval workflow |
 
-Tier enforcement happens *before* RBAC checks. Even if RBAC would permit an operation, the MCP tier can restrict it.
+Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
+
+The `supervised` tier marks destructive operations as approval-gated. Until the Phase 2 approval re-dispatch path lands, supervised-tier writes are blocked on every transport (MCP JSON-RPC and REST API) with `auth.approval_required` audit; only Reads and trivially-allowed operations succeed.
 
 ### Creating an MCP Token
 
@@ -343,10 +345,10 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 
 MCP tokens have the following restrictions:
 
-- Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
-- Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
-- Must have `ITServiceOwner` role permission for the target operation
-- Require the target agent to have a valid `service` tag
+- Cannot access admin-only routes (user management, settings) — 403 Forbidden regardless of creator's role
+- The tier restricts which operations are permitted (`readonly` → read only; `operator` → read + tag writes + execute; `supervised` → all ops with approval workflow)
+- If RBAC is enabled, the creator's actual RBAC role applies after the tier check
+- If RBAC is disabled, the creator's legacy role (user/admin) applies after the tier check
 
   "data": {
     "token": "yuzu_Ab3xK9m2...",
@@ -399,13 +401,18 @@ The following audit actions are emitted for authentication and authorization eve
 | `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
 | `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from approval-gated operation (Phase 2 re-dispatch not yet implemented) |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
 | `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
 
-All `denied` results include a `detail` field explaining the reason (e.g., "MCP token blocked from admin route", "service-scoped token blocked: RBAC not enabled").
+All `denied` results include a `detail` field explaining the reason. Examples per action:
+- `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
+- `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
+- `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
+- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"`
 
 ### JSON Error Envelope
 

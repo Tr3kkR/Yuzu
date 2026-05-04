@@ -4,6 +4,7 @@
 
 #include "settings_routes.hpp"
 
+#include "mcp_policy.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 
@@ -2420,7 +2421,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             return;
         }
 
-        if (!mcp_tier.empty() && mcp_tier != "readonly" && mcp_tier != "operator" && mcp_tier != "supervised") {
+        if (!mcp::is_valid_tier(mcp_tier)) {
             res.set_content(
                 "<span class=\"feedback-error\">Invalid MCP tier. Must be readonly, operator, or supervised.</span>",
                 "text/html; charset=utf-8");
