@@ -1,11 +1,11 @@
 #ifdef _WIN32
 #include <io.h>
 #pragma section(".CRT$XCB", read)
-static void __cdecl diag_dll_static_init() {
+[[maybe_unused]] static void __cdecl diag_dll_static_init() {
     const char msg[] = "[DIAG] DLL static-init starting (before proto registration)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
+__declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
@@ -513,8 +513,6 @@ public:
                 .counter("yuzu_agent_plugin_rejected_total", {{"reason", std::string{reason}}})
                 .increment();
         }
-
-        auto* raw_plugin_ctx = reinterpret_cast<YuzuPluginContext*>(&plugin_ctx_);
 
         for (auto& handle : candidates) {
             const auto* descriptor = handle.descriptor();

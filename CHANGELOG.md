@@ -75,7 +75,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "A3 UX ladder (#620, #622, #624)" sub-entry with the operator action
   required for local compose overrides.
 
+### Removed
+
+- **Qodana code-quality workflow and `qodana.yaml`.** The JetBrains Qodana
+  scanner was wired up but unused; carrying the workflow added third-party-
+  action attack surface and a Token-Permissions Scorecard finding for no
+  benefit. Deleted `.github/workflows/qodana_code_quality.yml` and root
+  `qodana.yaml`; `scripts/check-compose-versions.sh`-style baseline-bump
+  references in `.github/workflows/vcpkg-baseline-update.yml` updated
+  accordingly. CodeQL + Scorecard + zizmor remain the active static-analysis
+  surface.
+
 ### Changed
+
+- **Static-analysis alert cleanup pass.** Reduced the open code-scanning
+  alert backlog by ~70% in one pass:
+  - 15 vendored security-severity false-positives in `vcpkg_installed/`
+    and `vcpkg/buildtrees/` (abseil/protobuf/httplib/cli11) bulk-dismissed
+    as "won't fix" — outside Yuzu's patch surface; will re-dismiss on each
+    scan until upstream feedback is sent.
+  - 30 stale `zizmor/artipacked` alerts will auto-clear on next zizmor run
+    (every active `actions/checkout@v6.0.2` already carries
+    `persist-credentials: false`; alerts predate that fix).
+  - 8 Scorecard `TokenPermissionsID` alerts dismissed: 5 reflect
+    job-level write scopes the action documentation requires (release,
+    CLA bot, peter-evans/create-pull-request, Qodana before deletion),
+    matching the "top-level read, opt-in per job" policy noted in
+    `release.yml`'s comment block; 3 are stale against pre-permissions-
+    block commits.
+  - 9 cpp/unused-* deletions of truly dead code: unused `run_command*`
+    helpers in `network_actions_plugin.cpp` and `event_logs_plugin.cpp`,
+    `deployment_status_to_string` in `patch_manager.cpp`, the duplicate
+    `json_quoted` and unused `add_cors_headers` in `rest_api_v1.cpp`,
+    plus a few stale local-variable bindings.
+  - 4 platform-conditional helpers wrapped in matching `#if` so CodeQL
+    stops seeing them on the wrong platform: `run_command` in
+    `network_diag_plugin.cpp` (`__APPLE__` only), `run_command_exit` in
+    `services_plugin.cpp` (`__linux__ || __APPLE__`), `run_command` in
+    `ioc_plugin.cpp` (tightened from linux+apple to apple-only),
+    `run_command` in `sccm_plugin.cpp` (`_WIN32` only).
+  - 24 `[[maybe_unused]]` annotations on idiomatic `std::from_chars`
+    structured-binding `[ptr, ec]` / `[_, ec]` sites where only the
+    error code is needed.
+  - 8 cpp/unused-static-function alerts dismissed where CodeQL ignores
+    `[[maybe_unused]]`: settings_routes refactor-staging family pre-
+    extracted from the server.cpp god-object decomposition, plus the
+    `.CRT$XCB` Windows static-init function-pointer pair in `agent.cpp`
+    / `main.cpp` that's reached via linker-section magic CodeQL can't
+    follow.
 
 - **Better error message when `POST /api/policy-fragments` (or `/api/policies`)
   receives YAML without a `kind:` field** (#621). The previous body
@@ -115,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit-path failures still log at ERROR.
 
 ### Tests
+
+- `tests/unit/test_trigger_engine.cpp`,
+  `tests/unit/server/test_patch_manager.cpp` — `[[maybe_unused]]` on three
+  `auto& [plugin, action, params]` structured bindings (only one binding
+  is asserted on per test) and removal of an unused `bool found_reboot`
+  in the patch_manager Windows-reboot test, in step with the
+  static-analysis alert-cleanup pass.
 
 - `tests/unit/server/test_agent_service_impl.cpp` — new file, 9 cases /
   47 assertions covering `AgentServiceImpl::record_execution_id` and

@@ -212,7 +212,6 @@ void ResponseStore::store(const StoredResponse& resp) {
 
     // Extract facets from the output using the plugin schema
     if (facet_insert_stmt_ && !resp.plugin.empty() && !resp.output.empty()) {
-        auto& cols = columns_for_plugin(resp.plugin);
         auto lines = split_output_lines(resp.output);
 
         // Accumulate (col_idx, value) → line_count.

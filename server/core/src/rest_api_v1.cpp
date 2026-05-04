@@ -111,16 +111,6 @@ public:
     [[nodiscard]] int64_t size() const { return n_; }
 };
 
-/// Quote a string as a JSON value: "escaped content"
-std::string json_quoted(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size() + 2);
-    out += '"';
-    json_escape(out, sv);
-    out += '"';
-    return out;
-}
-
 // ── Envelope helpers ────────────────────────────────────────────────────
 
 std::string ok_json(std::string_view data_json) {
@@ -147,16 +137,6 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .raw("pagination", pag)
         .raw("meta", R"({"api_version":"v1"})")
         .str();
-}
-
-// ── CORS helpers ────────────────────────────────────────────────────────
-
-void add_cors_headers(httplib::Response& res, const httplib::Request& /* req */) {
-    // Do NOT reflect arbitrary Origin — that defeats CORS.
-    // API is same-origin by design; external integrations use API tokens.
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Yuzu-Token");
-    res.set_header("Access-Control-Max-Age", "86400");
 }
 
 // ── OpenAPI 3.0 spec ────────────────────────────────────────────────────
@@ -2514,7 +2494,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (req.has_param("limit")) {
                 int v = 0;
                 auto s = req.get_param_value("limit");
-                auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
                 if (ec != std::errc{} || v < 0) {
                     res.status = 400;
                     res.set_content(error_json("invalid limit"), "application/json");
@@ -2525,7 +2505,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             if (req.has_param("offset")) {
                 int v = 0;
                 auto s = req.get_param_value("offset");
-                auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
                 if (ec != std::errc{} || v < 0) {
                     res.status = 400;
                     res.set_content(error_json("invalid offset"), "application/json");

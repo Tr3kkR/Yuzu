@@ -43,28 +43,22 @@ namespace {
 
 // ── subprocess helper ──────────────────────────────────────────────────────
 
+#if defined(__APPLE__)
 std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
     FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
     pclose(pipe);
-#endif
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
 }
+#endif
 
 #ifdef _WIN32
 

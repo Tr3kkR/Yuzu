@@ -301,27 +301,21 @@ bool is_safe_service_name(std::string_view name) {
 
 /// Run a command via popen and return its exit code.
 /// Drains stdout so the child process doesn't block on a full pipe.
+#if defined(__linux__) || defined(__APPLE__)
 int run_command_exit(const char* cmd) {
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
     FILE* pipe = popen(cmd, "r");
-#endif
     if (!pipe)
         return -1;
     std::array<char, 256> buf{};
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
     }
-#ifdef _WIN32
-    return _pclose(pipe);
-#else
     int raw = pclose(pipe);
     // pclose returns the wait status; extract the actual exit code
     if (WIFEXITED(raw))
         return WEXITSTATUS(raw);
     return -1;
-#endif
 }
+#endif
 
 // ── set_start_mode — platform implementations ──────────────────────────────
 

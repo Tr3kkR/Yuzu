@@ -38,20 +38,6 @@ std::string gen_id() {
     return std::string(buf, 32);
 }
 
-std::string deployment_status_to_string(DeploymentStatus s) {
-    switch (s) {
-    case DeploymentStatus::kPending:     return "pending";
-    case DeploymentStatus::kScanning:    return "scanning";
-    case DeploymentStatus::kDownloading: return "downloading";
-    case DeploymentStatus::kInstalling:  return "installing";
-    case DeploymentStatus::kVerifying:   return "verifying";
-    case DeploymentStatus::kCompleted:   return "completed";
-    case DeploymentStatus::kFailed:      return "failed";
-    case DeploymentStatus::kCancelled:   return "cancelled";
-    }
-    return "unknown";
-}
-
 } // namespace
 
 // ── Construction / teardown ──────────────────────────────────────────────────

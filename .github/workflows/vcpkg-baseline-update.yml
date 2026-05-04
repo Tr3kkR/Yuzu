@@ -73,7 +73,6 @@ jobs:
           files=(
             vcpkg.json
             vcpkg-configuration.json
-            qodana.yaml
             CLAUDE.md
             .github/workflows/ci.yml
             .github/workflows/release.yml
@@ -114,7 +113,6 @@ jobs:
             Updates every tracked reference of the baseline SHA:
             - `vcpkg.json` `builtin-baseline`
             - `vcpkg-configuration.json` default registry `baseline`
-            - `qodana.yaml` vcpkg fetch step
             - `CLAUDE.md` vcpkg documentation line
             - `.github/workflows/ci.yml` `VCPKG_COMMIT`
             - `.github/workflows/release.yml` `VCPKG_COMMIT`

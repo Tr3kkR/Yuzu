@@ -4,11 +4,11 @@
 #include <cstdio>
 #include <io.h>
 #pragma section(".CRT$XCB", read)
-static void __cdecl diag_before_static_init() {
+[[maybe_unused]] static void __cdecl diag_before_static_init() {
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_diag_init)() = diag_before_static_init;
+__declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>

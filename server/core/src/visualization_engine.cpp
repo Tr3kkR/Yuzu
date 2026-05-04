@@ -364,7 +364,7 @@ void render_datetime_series(const json& spec, const std::string& plugin,
                 auto raw = field_or_empty(fields, x_field.col_idx);
                 if (raw.empty()) continue;
                 int64_t parsed = 0;
-                auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), parsed);
+                [[maybe_unused]] auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), parsed);
                 if (ec != std::errc{}) continue;
                 x_val = parsed;
             }
