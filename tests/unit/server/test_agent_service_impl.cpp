@@ -42,7 +42,6 @@
 #include <memory>
 #include <string>
 
-namespace apb = ::yuzu::agent::v1;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
 using yuzu::server::detail::AgentRegistry;
@@ -51,21 +50,31 @@ using yuzu::server::detail::EventBus;
 
 namespace {
 
+namespace apb = ::yuzu::agent::v1;
+
 /// Minimal harness: real AgentServiceImpl wired against in-memory
 /// ResponseStore. analytics/notification/webhook stores stay null so
 /// the side-effect branches in process_gateway_response short-circuit
 /// on their `if (store_)` guards — keeps the test focused on the
 /// execution_id stamping invariant.
+///
+/// MEMBER ORDER LOAD-BEARING: members below are declared in topological
+/// order so that every reference captured by `svc` (and by `registry`)
+/// points at an already-constructed member, AND so that `responses`
+/// destructs AFTER `svc` (it is declared earlier than `svc`, so it
+/// destructs later than `svc`). `svc` holds `response_store_` as a raw
+/// `ResponseStore*` (set in the body); reordering would create a
+/// dangling-pointer hazard at `~svc`. Do not alphabetise.
 struct GatewayResponseHarness {
     yuzu::MetricsRegistry metrics;
     EventBus bus;
     AgentRegistry registry{bus, metrics};
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
+    ResponseStore responses{":memory:"};
     AgentServiceImpl svc{
         registry, bus, /*require_client_identity=*/false, auth_mgr, auto_approve, metrics,
         /*gateway_mode=*/false};
-    ResponseStore responses{":memory:"};
 
     GatewayResponseHarness() {
         REQUIRE(responses.is_open());
@@ -189,21 +198,62 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
     // The fix at agent_service_impl.cpp:672-674 keeps the mapping live
     // until a future sweeper. This test drives the path the test_workflow_
     // routes pin couldn't reach (it operated on ResponseStore directly).
+    //
+    // Fan out across 4 agents and mix terminal statuses (SUCCESS / FAILURE /
+    // TIMEOUT) to pin two distinct invariants simultaneously: (a) the
+    // mapping survives every terminal-status code path (`else` branch at
+    // agent_service_impl.cpp:656 covers all non-RUNNING statuses uniformly,
+    // a future split that re-introduces an erase on FAILURE-only or
+    // TIMEOUT-only would slip past a SUCCESS-only test); and (b) tail
+    // agents (#4) past the smallest fan-out width still stamp correctly,
+    // closing the off-by-one window where a regression could erase after
+    // exactly N=3 calls.
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-fan", "exec-fan");
 
-    for (const auto& agent_id : {"agent-1", "agent-2", "agent-3"}) {
-        auto r = GatewayResponseHarness::make_response("cmd-fan",
-                                                      apb::CommandResponse::SUCCESS);
-        h.svc.process_gateway_response(agent_id, r);
+    struct AgentTerminal {
+        const char* agent;
+        apb::CommandResponse::Status status;
+    };
+    const AgentTerminal terminals[] = {
+        {"agent-1", apb::CommandResponse::SUCCESS},
+        {"agent-2", apb::CommandResponse::FAILURE},
+        {"agent-3", apb::CommandResponse::TIMEOUT},
+        {"agent-4", apb::CommandResponse::SUCCESS},
+    };
+    for (const auto& t : terminals) {
+        auto r = GatewayResponseHarness::make_response("cmd-fan", t.status);
+        h.svc.process_gateway_response(t.agent, r);
     }
 
     auto rows = h.responses.query_by_execution("exec-fan");
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
     for (const auto& row : rows) {
         CHECK(row.execution_id == "exec-fan");
-        CHECK(row.status == static_cast<int>(apb::CommandResponse::SUCCESS));
+        CHECK(row.error_detail.empty()); // SUCCESS path must not invent error_detail
     }
+}
+
+TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return "
+          "branch and does NOT store",
+          "[agent_service][executions][pr2]") {
+    // The RUNNING branch at agent_service_impl.cpp:599-606 short-circuits
+    // for output starting with "__timing__|" — these are out-of-band
+    // dashboard-stat payloads, not command output. They must NOT appear
+    // in ResponseStore (no execution_id stamp, no instruction row).
+    // Without this pin, a refactor that hoists the store block above the
+    // sentinel guard would silently start persisting timing rows under the
+    // execution_id, which the drawer would then surface as bogus output.
+    GatewayResponseHarness h;
+    h.svc.record_execution_id("cmd-time", "exec-time");
+
+    auto timing = GatewayResponseHarness::make_response("cmd-time",
+                                                       apb::CommandResponse::RUNNING,
+                                                       /*output=*/"__timing__|elapsed=42");
+    h.svc.process_gateway_response("agent-1", timing);
+
+    CHECK(h.responses.query_by_execution("exec-time").empty());
+    CHECK(h.responses.get_by_instruction("cmd-time").empty());
 }
 
 TEST_CASE("process_gateway_response: streaming + terminal both carry execution_id",
