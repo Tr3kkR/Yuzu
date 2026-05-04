@@ -29,11 +29,23 @@
 #   Input  : a CodeQL SARIF v2.1.0 file written by
 #            github/codeql-action/analyze.
 #   Output : the same file in place, with results array filtered.
-#   Filter : drop a result iff
-#              location is in vendored/generated path
-#              AND rule has no security-severity (or it's null/absent)
+#   Filter : drop a result iff EITHER
+#            (A) location is in vendored/generated path
+#                AND rule has no security-severity (or it's null/absent)
+#            OR
+#            (B) ruleId is `cpp/unused-static-function`
+#                AND location is under `tests/`
+#                — Catch2 TEST_CASE / SECTION / SCENARIO / GIVEN / WHEN /
+#                THEN macros emit a static function whose only "caller"
+#                is a runtime test-registry function-pointer indirection
+#                that CodeQL cannot see across. Uniformly false-positive
+#                for every Catch2 test in the project. Full writeup:
+#                https://gist.github.com/Tr3kkR/1a31108d32e7d98dab2e30fc38e78311
 #   Keep   : every result with security-severity, regardless of path
 #            every result on first-party code, regardless of severity
+#            (except condition B above)
+#            cpp/unused-static-function in agents/server/sdk/proto stays
+#            visible — only `tests/` is suppressed
 #
 # USAGE:
 #   filter-codeql-sarif.sh <path-to-sarif-file>
@@ -78,7 +90,12 @@ def has_security_severity(rule_index; rules):
     | (.["security-severity"] // null)
     | . != null;
 
-# Walk every run; rebuild .results dropping vendored/generated non-security findings.
+def is_catch2_unused_static_function(rule_id; uri):
+    rule_id == "cpp/unused-static-function"
+    and ((uri // "") | startswith("tests/"));
+
+# Walk every run; rebuild .results dropping (A) vendored/generated
+# non-security findings and (B) Catch2 TEST_CASE false-positives.
 .runs |= map(
     . as $run
     | .results = (
@@ -87,8 +104,11 @@ def has_security_severity(rule_index; rules):
             . as $result
             | (.locations[0].physicalLocation.artifactLocation.uri // "") as $uri
             | (.ruleIndex // -1) as $idx
-            | if is_vendored_or_generated($uri)
-                  and ($idx < 0 or (has_security_severity($idx; $run.tool.driver.rules // []) | not))
+            | (.ruleId // "") as $rid
+            | if (is_vendored_or_generated($uri)
+                  and ($idx < 0 or (has_security_severity($idx; $run.tool.driver.rules // []) | not)))
+              then empty
+              elif is_catch2_unused_static_function($rid; $uri)
               then empty
               else .
               end
@@ -111,4 +131,4 @@ dropped=$((before - after))
 echo "filter-codeql-sarif.sh: ${SARIF}"
 echo "  before:  ${before} results"
 echo "  after:   ${after} results"
-echo "  dropped: ${dropped} (non-security results in vendored/generated paths)"
+echo "  dropped: ${dropped} (non-security in vendored/generated paths + Catch2 TEST_CASE noise in tests/)"
