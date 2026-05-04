@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Custom CodeQL query pack at `.github/codeql/queries/`** — Yuzu-specific
+  queries that the standard `security-and-quality` suite cannot encode
+  because the rules depend on per-project directory scope and the plugin
+  threat model (#371). First pass ships two queries:
+  `cpp/yuzu/plugin-command-exec-non-literal` (POSIX `system`/`popen`/`exec*`
+  in `agents/plugins/<name>/src/*` with a non-literal command argument)
+  and `cpp/yuzu/plugin-windows-process-spawn-non-literal` (the Windows
+  `CreateProcess*`/`ShellExecute*`/`WinExec` equivalent). The pattern
+  matches the four CRITICAL command-injection findings in waves 1-4 — a
+  custom query against the Yuzu CodeQL database would have caught all
+  four before they shipped. Wired into `codeql.yml` via
+  `queries: +security-and-quality,+./.github/codeql/queries`. The
+  remaining catalog from #371 (RBAC, audit-field, plugin-export, header-
+  bundle queries) is deferred to better-fit tooling — see #371's close-
+  out comment for the rationale.
 - **`/api/health` alias** of the existing `/health` endpoint (#620).
   Both URLs now serve the same JSON body and both bypass authentication so
   monitoring integrations that prefix every REST call with `/api/` keep
