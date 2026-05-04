@@ -206,11 +206,16 @@ jobs:
         # triplet tree (#741). The shared script invalidates both halves
         # of vcpkg_installed/ together and uses the same key as ci.yml so
         # the binary cache is shared cleanly across workflows.
-        # Inherits matrix.shell (MSYS2 bash on Windows) — do NOT set
-        # `shell: bash` here: on the Windows self-hosted runner that
-        # resolves to WSL bash, which refuses to run under the runner's
-        # LocalSystem service account (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
-        run: bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
+        # `/usr/bin/bash` (absolute path) — matches the Windows callers
+        # in ci.yml:464 and release.yml:439. A bare `bash` does a PATH
+        # lookup; on the Windows self-hosted runner `C:\WINDOWS\system32`
+        # sits ahead of `C:\msys64\usr\bin`, so bare `bash` resolves to
+        # WSL's `C:\Windows\System32\bash.EXE`, which refuses to run
+        # under the runner's LocalSystem service account
+        # (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED). `/usr/bin/bash` works on
+        # both Linux (real path) and MSYS2 (maps to
+        # C:/msys64/usr/bin/bash.exe).
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
 
       - name: Install vcpkg packages
         env:
