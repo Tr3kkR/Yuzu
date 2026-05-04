@@ -32,12 +32,15 @@ gen = custom_target(
     input: [
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
+        proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],
     output: [
         'common.pb.cc', 'common.pb.h', 'common.grpc.pb.cc', 'common.grpc.pb.h',
         'agent.pb.cc',  'agent.pb.h',  'agent.grpc.pb.cc',  'agent.grpc.pb.h',
+        'guaranteed_state.pb.cc', 'guaranteed_state.pb.h',
+        'guaranteed_state.grpc.pb.cc', 'guaranteed_state.grpc.pb.h',
         'management.pb.cc', 'management.pb.h', 'management.grpc.pb.cc', 'management.grpc.pb.h',
         'gateway.pb.cc', 'gateway.pb.h', 'gateway.grpc.pb.cc', 'gateway.grpc.pb.h',
     ],
@@ -50,26 +53,53 @@ gen = custom_target(
         proto_root,
         proto_root / 'yuzu/common/v1/common.proto',
         proto_root / 'yuzu/agent/v1/agent.proto',
+        proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
     ],
 )
 
-gen_srcs = [gen[0], gen[2], gen[4], gen[6], gen[8], gen[10], gen[12], gen[14]]
-gen_hdrs = [gen[1], gen[3], gen[5], gen[7], gen[9], gen[11], gen[13], gen[15]]
+# Ten source files (even indices) and ten headers (odd indices), in input order:
+#   common, agent, guaranteed_state, management, gateway — each with .pb + .grpc.pb pairs.
+gen_srcs = [gen[0],  gen[2],  gen[4],  gen[6],  gen[8],
+            gen[10], gen[12], gen[14], gen[16], gen[18]]
+gen_hdrs = [gen[1],  gen[3],  gen[5],  gen[7],  gen[9],
+            gen[11], gen[13], gen[15], gen[17], gen[19]]
+
+# Override the project-wide -fvisibility=hidden so that proto symbols baked
+# into a consumer shared_library (libyuzu_agent_core.so /
+# libyuzu_server_core.so) end up in the .so's dynamic symbol table. Without
+# this, downstream test binaries that need proto symbols are forced to
+# relink yuzu_proto.a directly, which puts a second copy of every .pb.o's
+# static descriptor-registration into the process and trips protobuf's
+# "File already exists in database" CHECK at startup under ASan (#572).
+# Per-target cpp_args wins because project arguments are emitted first; the
+# meson `gnu_symbol_visibility` kwarg is emitted before project args and
+# loses the last-flag-wins fight against `add_project_arguments`. MSVC has
+# no default-hidden behaviour, so the override is GCC/Clang only.
+_proto_visibility_args = cxx.get_id() == 'msvc' ? [] : ['-fvisibility=default']
 
 yuzu_proto_lib = static_library(
     'yuzu_proto',
     gen_srcs,
-    cpp_args: cxx.get_id() == 'msvc'
+    cpp_args: (cxx.get_id() == 'msvc'
       ? ['/wd4100','/wd4267','/wd4244','/wd4458','/wd4018','/wd4996']
-      : ['-Wno-unused-parameter', '-Wno-array-bounds'],
+      : ['-Wno-unused-parameter', '-Wno-array-bounds']) + _proto_visibility_args,
     include_directories: include_directories('.'),
     dependencies: [grpcpp_dep, protobuf_dep],
 )
 
 yuzu_proto_dep = declare_dependency(
     link_with: yuzu_proto_lib,
+    sources: gen_hdrs,
+    include_directories: include_directories('.'),
+    dependencies: [grpcpp_dep, protobuf_dep],
+)
+
+# Header-only sibling of yuzu_proto_dep — same include path + generated-
+# header ordering, but no link_with. Use this for any target that already
+# pulls the proto symbols in transitively via a shared_library (#572).
+yuzu_proto_headers_dep = declare_dependency(
     sources: gen_hdrs,
     include_directories: include_directories('.'),
     dependencies: [grpcpp_dep, protobuf_dep],

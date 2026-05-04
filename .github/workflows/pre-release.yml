@@ -15,7 +15,6 @@ on:
 permissions:
   contents: read
   packages: read
-  security-events: write
 
 env:
   REGISTRY: ghcr.io/${{ github.repository_owner }}
@@ -36,17 +35,26 @@ jobs:
       prev_tag: ${{ steps.prev.outputs.prev_tag }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Determine version
         id: ver
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind externally-influenced values to env vars rather than
+          # interpolating them into bash source — a branch name or
+          # workflow_dispatch input can carry shell metacharacters, and
+          # direct `${{ ... }}` expansion into a `run:` block is a code-
+          # injection sink (CodeQL actions/code-injection/critical).
+          EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            TAG="${{ inputs.tag }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$EVENT_BRANCH"
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -57,8 +65,11 @@ jobs:
         id: prev
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind tag to env so a tag with shell metacharacters can't be
+          # interpolated into the script body (CodeQL
+          # actions/code-injection/critical).
+          CURRENT: ${{ steps.ver.outputs.tag }}
         run: |
-          CURRENT="${{ steps.ver.outputs.tag }}"
           PREV=$(gh release list --limit 20 --json tagName,isPrerelease \
             -q "[.[] | select(.tagName != \"$CURRENT\" and .isPrerelease == false)] | .[0].tagName // empty")
           if [[ -n "$PREV" ]]; then
@@ -73,8 +84,9 @@ jobs:
       - name: Download release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind tag to env to avoid code-injection via crafted ref name.
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
           mkdir -p artifacts
           gh release download "$TAG" --dir artifacts/ || {
             echo "Release $TAG not found yet, waiting 60s..."
@@ -90,7 +102,7 @@ jobs:
           echo "All checksums verified"
 
       - name: Upload verified artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-artifacts
           path: artifacts/
@@ -104,18 +116,22 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull release images
+        env:
+          # Bind tag to env to avoid code-injection via crafted ref name.
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          TAG="${{ needs.resolve.outputs.tag }}"
           for img in yuzu-server yuzu-agent yuzu-gateway; do
             docker pull "$REGISTRY/$img:${TAG#v}"
           done
@@ -131,8 +147,9 @@ jobs:
           " > /tmp/yuzu-qa/yuzu-server.cfg
 
       - name: Create Docker Compose for QA
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           cat > /tmp/yuzu-qa/docker-compose.yml <<COMPOSE
           services:
             server:
@@ -286,7 +303,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-logs
           path: /tmp/yuzu-qa/integration-logs.txt
@@ -309,7 +326,7 @@ jobs:
         distro: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-artifacts
           path: artifacts
@@ -351,7 +368,7 @@ jobs:
         distro: ["fedora:40", "rockylinux:9"]
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-artifacts
           path: artifacts
@@ -386,7 +403,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-artifacts
           path: artifacts
@@ -437,7 +454,7 @@ jobs:
 
       - name: Upload install log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-install-log
           path: install.log
@@ -451,7 +468,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-artifacts
           path: artifacts
@@ -479,15 +496,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-artifacts
           path: artifacts
 
       - name: Verify archive contents
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
-          VERSION="${{ needs.resolve.outputs.version }}"
 
           echo "=== Linux x64 archive ==="
           tar tzf yuzu-linux-x64.tar.gz | grep -q 'bin/yuzu-server' && echo "PASS: server binary"
@@ -529,9 +547,10 @@ jobs:
           fi
 
       - name: Inspect DEB metadata
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           cd artifacts
-          VERSION="${{ needs.resolve.outputs.version }}"
           for deb in *.deb; do
             echo "=== $deb ==="
             dpkg-deb --field "$deb" Package Version
@@ -550,8 +569,9 @@ jobs:
           '
 
       - name: Inspect Docker images
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           for img in yuzu-server yuzu-agent yuzu-gateway; do
             echo "=== $img ==="
             docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: image not found"; continue; }
@@ -570,47 +590,61 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Scan Docker images
+      # Scope: Trivy is used here ONLY for vulnerability scanning of
+      # published container images. SBOM generation is NOT done here —
+      # the authoritative SBOMs ship from release.yml via
+      # `anchore/sbom-action` (Syft). Two generators would produce two
+      # SBOMs that disagree on component enumeration for the same image.
+      # Agents are installed natively on managed endpoints and not
+      # published as a container image; only server + gateway are
+      # scanned here.
+      - name: Pull images for scanning
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
-
-          # Install Trivy
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-          FAILED=0
-          for img in yuzu-server yuzu-agent yuzu-gateway; do
-            echo "=== Scanning $img ==="
-            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null || { echo "SKIP: not found"; continue; }
-
-            # Scan for HIGH/CRITICAL vulns (warn but don't fail on unfixed)
-            trivy image --severity HIGH,CRITICAL \
-              --ignore-unfixed \
-              --exit-code 0 \
-              "$REGISTRY/$img:$VERSION" | tee "trivy-${img}.txt"
-
-            # Generate SBOM
-            trivy image --format spdx-json \
-              -o "sbom-${img}.json" \
-              "$REGISTRY/$img:$VERSION" 2>/dev/null || true
+          for img in yuzu-server yuzu-gateway; do
+            docker pull "$REGISTRY/$img:$VERSION" 2>/dev/null \
+              || echo "SKIP: $img:$VERSION not found"
           done
+
+      - name: Scan yuzu-server
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-server:${{ needs.resolve.outputs.version }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: trivy-yuzu-server.txt
+
+      - name: Scan yuzu-gateway
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '0'
+          format: table
+          output: trivy-yuzu-gateway.txt
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-scan
           path: |
             trivy-*.txt
-            sbom-*.json
           retention-days: 7
 
   # ── Soak test (10 min stability) ────────────────────────────────────
@@ -620,18 +654,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start stack
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
           mkdir -p /tmp/yuzu-soak
 
           python3 -c "
@@ -752,7 +789,7 @@ jobs:
 
       - name: Upload soak data
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: soak-test
           path: |
@@ -772,20 +809,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start previous release
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          PREV_VER="${{ needs.resolve.outputs.prev_tag }}"
-          PREV_VER="${PREV_VER#v}"
-          NEW_VER="${{ needs.resolve.outputs.version }}"
+          PREV_VER="${PREV_TAG#v}"
           mkdir -p /tmp/yuzu-upgrade
 
           python3 -c "
@@ -835,8 +875,9 @@ jobs:
           echo "Previous release stack ready ($PREV_VER)"
 
       - name: Upgrade to new release
+        env:
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
-          NEW_VER="${{ needs.resolve.outputs.version }}"
           cd /tmp/yuzu-upgrade
 
           echo "Upgrading to: $NEW_VER"
@@ -851,6 +892,9 @@ jobs:
           done
 
       - name: Verify post-upgrade
+        env:
+          PREV_TAG: ${{ needs.resolve.outputs.prev_tag }}
+          NEW_VER: ${{ needs.resolve.outputs.version }}
         run: |
           # Dashboard reachable
           CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login)
@@ -864,7 +908,7 @@ jobs:
           # Gateway healthy
           curl -sf http://localhost:8081/readyz | grep -q '"ready"' && echo "PASS: Gateway healthy" || { echo "FAIL: Gateway unhealthy"; exit 1; }
 
-          echo "PASS: Upgrade from ${{ needs.resolve.outputs.prev_tag }} to v${{ needs.resolve.outputs.version }} succeeded"
+          echo "PASS: Upgrade from $PREV_TAG to v$NEW_VER succeeded"
 
       - name: Collect logs
         if: always()
@@ -872,7 +916,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upgrade-logs
           path: /tmp/yuzu-upgrade/upgrade-logs.txt
@@ -900,9 +944,10 @@ jobs:
           R_SECURITY: ${{ needs.security-scan.result }}
           R_SOAK: ${{ needs.soak-test.result }}
           R_UPGRADE: ${{ needs.upgrade-test.result }}
+          # Bind tag/version to env to avoid code-injection via crafted ref name.
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          VERSION="${{ needs.resolve.outputs.version }}"
-          TAG="${{ needs.resolve.outputs.tag }}"
 
           status_icon() {
             case "$1" in

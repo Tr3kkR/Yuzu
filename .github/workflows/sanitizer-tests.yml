@@ -53,13 +53,18 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 75
     env:
-      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+      # detect_odr_violation=0 mirrors ci.yml's sanitize-asan job: gRPC's
+      # libgpr.so embeds a static copy of abseil's kToUpper while the
+      # application links abseil dynamically (vcpkg port-linkage artefact),
+      # so ASan otherwise aborts before any Yuzu test runs.
+      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1:detect_odr_violation=0"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Assert toolchain available
         run: |
@@ -93,28 +98,46 @@ jobs:
         run: ccache -z
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Install vcpkg packages
+      - name: vcpkg sentinel (x64-linux-asan)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-asan
+
+      - name: Install vcpkg packages (ASan-instrumented)
+        # Use the x64-linux-asan overlay triplet (matches ci.yml's
+        # sanitize-asan job) so vcpkg builds protobuf/abseil/grpc with
+        # -fsanitize=address,undefined; the regular x64-linux binaries
+        # would surface phantom use-after-poison at protobuf static
+        # init and abort before any Yuzu test could execute.
+        #
+        # VCPKG_DEFAULT_BINARY_CACHE points at the SAME runner-local dir
+        # that ci.yml's sanitize-asan populates, so the dispatched
+        # /test --full path inherits the warm cache instead of
+        # rebuilding all instrumented ports from source. Closes #441.
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-asan
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
+            --triplet x64-linux-asan \
+            --overlay-triplets=${{ github.workspace }}/triplets \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + ASan/UBSan)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-asan/lib/pkgconfig
         run: |
           rm -rf build-linux-asan
           meson setup build-linux-asan \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-asan \
             -Dbuild_tests=true \
             -Db_sanitize=address,undefined
 
@@ -137,7 +160,7 @@ jobs:
 
       - name: Upload ASan artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanitizer-asan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |
@@ -156,9 +179,10 @@ jobs:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Assert toolchain available
         run: |
@@ -185,13 +209,26 @@ jobs:
         run: ccache -z
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: vcpkg sentinel (x64-linux)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+
       - name: Install vcpkg packages
+        # TSan shares the matrix linux cache: TSan instruments the
+        # consumer code, not the vcpkg ports (no x64-linux-tsan
+        # triplet — TSan & ASan are mutually exclusive at the port
+        # level). Sharing yuzu-vcpkg-binary-cache-linux with ci.yml's
+        # matrix Linux + tsan jobs means the dispatched /test --full
+        # path restores the warm cache. Closes the TSan half of #441.
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
@@ -225,7 +262,7 @@ jobs:
 
       - name: Upload TSan artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sanitizer-tsan${{ inputs.run_id && format('-{0}', inputs.run_id) || '' }}
           path: |

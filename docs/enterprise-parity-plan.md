@@ -1,42 +1,43 @@
-# Tachyon 8.1 Parity Plan
+# Enterprise Endpoint Management Parity Plan
 
 **Version:** 1.0 | **Date:** 2026-03-30 | **Status:** Draft
 
-This document analyzes 1e Tachyon 8.1 capabilities against Yuzu's current state (v0.7.0, 165/184 capabilities done) and defines a phased implementation plan to achieve feature parity.
+This document analyzes the capabilities of leading commercial endpoint-management platforms against Yuzu's current state (v0.7.0, 165/184 capabilities done) and defines a phased implementation plan to achieve feature parity.
 
 ---
 
 ## Part 1: Architectural Comparison
 
-| Dimension | 1e Tachyon 8.1 | Yuzu v0.7.0 |
+| Dimension | Leading commercial peer | Yuzu v0.7.0 |
 |-----------|---------------|-------------|
-| **Language** | C# / .NET (server), custom SCALE (agent) | C++23 (server+agent), Erlang/OTP (gateway) |
-| **Agent Instruction Model** | SCALE scripting language (SQL + control flow) | Plugin ABI (C/C++ shared libraries) |
+| **Language** | C# / .NET (server), proprietary scripting language (agent) | C++23 (server+agent), Erlang/OTP (gateway) |
+| **Agent Instruction Model** | proprietary scripting language (SQL + control flow) | Plugin ABI (C/C++ shared libraries) |
 | **Wire Protocol** | WebSocket Secure (TCP 4000) | gRPC/Protobuf with mTLS |
 | **Server Database** | SQL Server (multiple DBs) | SQLite (embedded, WAL mode) |
 | **Scaling Architecture** | Switches (50K devices each, 5 per stack) | Erlang/OTP gateway (10K+ tested) |
 | **Content Definition** | XML with XSD schema, digital signing | YAML with `yuzu.io/v1alpha1` DSL, Ed25519 signing |
 | **Auth Model** | Windows AD (Kerberos), 2FA email | PBKDF2 sessions, OIDC/PKCE, API tokens, mTLS |
 | **Content Delivery** | Background Channel (HTTPS) + Nomad P2P | HTTP content staging + execution |
-| **Policy Engine** | Guaranteed State (SCALE-based check/fix) | PolicyStore with CEL expressions + triggers |
+| **Policy Engine — Server side** | Guaranteed State (proprietary-script check/fix) | PolicyStore with CEL expressions + triggers |
+| **Policy Engine — Real-time agent-side enforcement** | Guaranteed State (kernel-event-driven enforcement, pre-login activation, offline-capable) | **System Guardian** — agent-side guard engine using kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS). PRs 1-2 shipped (proto, server store, agent scaffolding); PR 3+ in flight per `docs/yuzu-guardian-windows-implementation-plan.md`. Phase 16 of the roadmap. |
 | **API** | Consumer API (.NET SDK) | REST API v1 (70+ endpoints) + gRPC + MCP |
 | **Dashboard** | ASP.NET web portal | HTMX server-rendered + SSE |
 | **DMZ Support** | Dedicated DMZ Server (Response Stack) | Gateway node (Erlang, can be DMZ-deployed) |
 
 ### Key Architectural Differences
 
-**Yuzu's advantages over Tachyon:**
+**Yuzu's advantages over commercial peers:**
 - **No SQL Server dependency** — SQLite is embedded, zero-ops
 - **Cross-platform from day one** — C++23 compiles on Win/Linux/macOS/ARM64
 - **gRPC/Protobuf** — strongly typed, bidirectional streaming, native mTLS
-- **MCP server** — AI-native fleet management (Tachyon has no equivalent)
+- **MCP server** — AI-native fleet management (commercial peers have no equivalent)
 - **Modern auth** — OIDC/PKCE, API tokens, session cookies (vs AD-only)
-- **CEL for policy** — industry-standard expression language (vs proprietary SCALE)
-- **Plugin ABI** — compiled native plugins are faster than interpreted SCALE
+- **CEL for policy** — industry-standard expression language (vs proprietary peer scripting)
+- **Plugin ABI** — compiled native plugins are faster than an interpreted peer language
 - **Erlang gateway** — OTP supervision trees, hot code upgrade, fault isolation
 
-**Tachyon's advantages over Yuzu (gaps to close):**
-- **SCALE language** — composable agent-side scripting with SQL, tables, control flow
+**Commercial peers' advantages over Yuzu (gaps to close):**
+- **Proprietary peer scripting** — composable agent-side scripting with SQL, tables, control flow
 - **Connector framework** — 12 bidirectional integrations (SCCM, Intune, ServiceNow, etc.)
 - **Response visualization** — chart types, custom processors, server-side rendering
 - **Software catalog** — normalized vendor/title/version with AI auto-curation
@@ -53,9 +54,9 @@ This document analyzes 1e Tachyon 8.1 capabilities against Yuzu's current state 
 
 ### Already Equivalent or Superior (No Action Needed)
 
-These Tachyon features have functional equivalents in Yuzu that are as good or better:
+These commercial-peer features have functional equivalents in Yuzu that are as good or better:
 
-| Tachyon Feature | Yuzu Equivalent |
+| Commercial Peer Feature | Yuzu Equivalent |
 |----------------|-----------------|
 | Agent registration | 3-tier enrollment (manual, token, platform trust) |
 | Heartbeat / keepalive | gRPC Heartbeat RPC with status_tags |
@@ -88,7 +89,7 @@ These Tachyon features have functional equivalents in Yuzu that are as good or b
 | File operations | `filesystem` plugin (17 actions) |
 | Registry | `registry` plugin (CRUD + per-user) |
 | WMI | `wmi` plugin (query + instance) |
-| Policy engine | PolicyStore + CEL + 6 trigger types |
+| Policy engine — server-side compliance | PolicyStore + CEL + 6 trigger types (poll-based desired-state evaluation; this is the *server* half of guaranteed state — see "Major Gaps" G14 for the agent-side real-time half delivered by System Guardian) |
 | Compliance dashboard | Fleet/policy/agent drill-down |
 | Agent-side storage | `storage` plugin (SQLite KV) |
 | Triggers | 7 types (interval, file, dir, service, eventlog, registry, startup) |
@@ -111,7 +112,7 @@ These Tachyon features have functional equivalents in Yuzu that are as good or b
 
 These are already tracked as "Not Started" T3 items:
 
-| # | Capability | Tachyon Equivalent |
+| # | Capability | Commercial Peer Equivalent |
 |---|-----------|-------------------|
 | 3.8 | Mapped Drive History | Device.GetInbound/OutboundMappedDriveHistory |
 | 3.9 | Printer Inventory | Device.GetInbound/OutboundPrinters |
@@ -133,7 +134,7 @@ These are already tracked as "Not Started" T3 items:
 | 24.4 | Consumer Registration | Consumer application model |
 | 24.7 | SDK Libraries | .NET Consumer SDK |
 
-### Gaps: Major Features Tachyon Has That Yuzu Lacks Entirely
+### Gaps: Major Features Commercial Peers Have That Yuzu Lacks Entirely
 
 These are significant capability areas not represented in Yuzu's capability map at all:
 
@@ -141,17 +142,18 @@ These are significant capability areas not represented in Yuzu's capability map 
 |---|---------|-------------|--------|
 | G1 | **Connector Framework** | Bidirectional data sync with SCCM, Intune, BigFix, ServiceNow, vCenter, WSUS, Oracle LMS, OpenLM, O365 | HIGH — core enterprise integration |
 | G2 | **Response Visualization Engine** | Chart types (Pie, Bar, Column, Line, Area, SmartBar), built-in + custom processors, server-side rendering | MEDIUM — dashboard richness |
-| G3 | **Software Catalog & Normalization** | Vendor/Title/Version/Edition normalization, AI auto-curation, 1E Catalog integration | HIGH — license compliance |
+| G3 | **Software Catalog & Normalization** | Vendor/Title/Version/Edition normalization, AI auto-curation, third-party software-catalog integration | HIGH — license compliance |
 | G4 | **Inventory Repositories** | Multiple named repositories per type, connector-based population, consolidation/dedup/normalization | HIGH — multi-source inventory |
 | G5 | **Software Usage Tracking** | Application usage categorization (Used/Rarely Used/Unused), metering data from agents | MEDIUM — license optimization |
 | G6 | **Consumer Application Model** | Formal registration of third-party consumers with rate limits, offloading, custom data | MEDIUM — platform extensibility |
 | G7 | **2FA for Approvals** | Email/token-based second factor on instruction approval | LOW — security hardening |
-| G8 | **SCALE-like Composable Instructions** | Agent-side scripting with SQL, @tables, FOREACH, IF/ELSE, chained method calls | MEDIUM — instruction flexibility |
+| G8 | **Composable Instruction Chains** | Agent-side scripting with SQL, @tables, FOREACH, IF/ELSE, chained method calls | MEDIUM — instruction flexibility |
 | G9 | **Data Offloading** | Route response data to external HTTP endpoints in real time | MEDIUM — analytics integration |
 | G10 | **PowerShell Toolkit** | Cmdlet library wrapping the management API | LOW — admin convenience |
 | G11 | **Branding / White-Label** | Custom logos, colors, names in dashboard | LOW — enterprise customization |
 | G12 | **Process/Provider/Sync Logging** | Separate log views for sync jobs, provider operations, infrastructure | LOW — operational visibility |
 | G13 | **Multi-Database Architecture** | Separate databases for responses, catalog, inventory, SLA, BI | MEDIUM — scale separation |
+| G14 | **System Guardian — Real-Time Agent-Side Guaranteed State** | the category leader's flagship: kernel-event-driven enforcement on Windows (RegNotifyChangeKeyValue, ETW, WFP, SCM), Linux (inotify, netlink, D-Bus, sysctl, audit), macOS (Endpoint Security, fseventsd, launchd). Pre-login activation. Fully offline-capable. Millisecond-level enforcement for event-driven rules. Auditable journal of every detection and remediation. **In flight** — PRs 1-2 shipped (proto, `guaranteed_state_store`, agent `GuardianEngine` scaffolding, `__guard__` dispatch hook); PR 3+ pending per `docs/yuzu-guardian-windows-implementation-plan.md`. PolicyStore alone does *not* deliver this — its 5-minute poll cycle is unacceptable for "this setting must never be in a non-compliant state" use cases (firewall ports, registry-backed security settings, EDR process always-running). Guardian is the agent-side primitive that closes that gap. | **CRITICAL** — this is the headline parity feature for enterprise endpoint management |
 
 ---
 
@@ -160,7 +162,7 @@ These are significant capability areas not represented in Yuzu's capability map 
 ### Prioritization Criteria
 
 1. **Enterprise value** — Features most commonly required in RFP/RFI responses
-2. **Competitive differentiation** — What makes Yuzu credibly replace Tachyon
+2. **Competitive differentiation** — What makes Yuzu credibly replace incumbent commercial platforms
 3. **Build complexity** — Estimated effort and architectural impact
 4. **Dependencies** — What must exist before other things can be built
 
@@ -178,7 +180,7 @@ These are significant capability areas not represented in Yuzu's capability map 
 
 **8.1 — Response Visualization Engine**
 - Add chart rendering to instruction response views
-- Server-side data transformation (equivalent to Tachyon's PostProcessors)
+- Server-side data transformation (equivalent to comparable platforms' post-processors)
 - Built-in processors: SingleSeries, MultiSeries, DateTimeSeries
 - Chart types: Pie, Bar, Column, Line, Area (rendered via lightweight JS chart library in HTMX)
 - Configuration via `spec.visualization` in InstructionDefinition YAML:
@@ -212,7 +214,7 @@ These are significant capability areas not represented in Yuzu's capability map 
 
 ### Phase 9: Connector Framework & Multi-Source Inventory
 
-*Federate inventory data from external systems. This is the single biggest gap vs. Tachyon.*
+*Federate inventory data from external systems. This is the single biggest gap vs. commercial peers.*
 
 **Duration estimate: 2 sprints**
 
@@ -348,7 +350,7 @@ Each connector is a self-contained class implementing the Connector interface:
 
 ### Phase 12: Remaining Agent Capabilities
 
-*Close the 19 "Not Started" items from the capability map plus Tachyon-specific agent features.*
+*Close the 19 "Not Started" items from the capability map plus commercial-peer-specific agent features.*
 
 **Duration estimate: 1 sprint**
 
@@ -451,7 +453,7 @@ Each connector is a self-contained class implementing the Connector interface:
 | Issue | Title | Scope |
 |-------|-------|-------|
 | 13.1 | 2FA for Instruction Approval | Server |
-| 13.2 | Composable Instruction Chains (SCALE-equivalent) | Agent + Server |
+| 13.2 | Composable Instruction Chains | Agent + Server |
 | 13.3 | Process / Sync Logging UI | Server |
 | 13.4 | Dashboard Branding | Server |
 | 13.5 | MCP Phase 2 (Write Tools) | Server |
@@ -464,7 +466,7 @@ Each connector is a self-contained class implementing the Connector interface:
 - Fallback: email-based one-time code (requires SMTP config)
 
 **13.2 — Composable Instruction Chains**
-This is the closest Yuzu can get to Tachyon's SCALE language without building an interpreter. The approach: server-side multi-step instruction composition using the existing WorkflowEngine.
+This is the closest Yuzu can get to the category leader's proprietary scripting language without building an interpreter. The approach: server-side multi-step instruction composition using the existing WorkflowEngine.
 
 - Workflow definitions in YAML with step chaining:
   ```yaml
@@ -485,7 +487,7 @@ This is the closest Yuzu can get to Tachyon's SCALE language without building an
   ```
 - Variables from previous steps available via `${step_name.field}` interpolation
 - CEL conditions for conditional execution
-- This provides SCALE-equivalent composability without a new scripting language
+- This provides equivalent composability without a new scripting language
 
 **13.3 — Process / Sync Logging UI**
 - Dashboard page: `/monitoring`
@@ -562,7 +564,7 @@ This is the closest Yuzu can get to Tachyon's SCALE language without building an
 
 ## Part 4: Priority Matrix
 
-| Phase | Priority | Effort | Enterprise Value | Tachyon Parity Impact |
+| Phase | Priority | Effort | Enterprise Value | Parity Impact |
 |-------|----------|--------|------------------|-----------------------|
 | **8: Visualization** | HIGH | Small | HIGH | Closes visible UX gap |
 | **9: Connectors** | CRITICAL | Large | CRITICAL | #1 gap — every enterprise RFP asks for this |
@@ -571,6 +573,8 @@ This is the closest Yuzu can get to Tachyon's SCALE language without building an
 | **12: Agent Caps** | MEDIUM | Medium | LOW-MEDIUM | Completes capability map to 184/184 |
 | **13: Polish** | MEDIUM | Medium | MEDIUM | Security + operational maturity |
 | **14: Scale** | LOW | Large | HIGH (at scale) | Only needed for 100K+ deployments |
+| **15: TAR Dashboard & Scope Walking** | HIGH | Medium | HIGH | Composable scope is Yuzu's product differentiator; commercial peers have no equivalent — TAR page also unifies retention awareness and process-tree forensics |
+| **16: System Guardian** | **CRITICAL** | Large | **CRITICAL** | **The headline parity feature** — real-time agent-side guaranteed state. Without this, "policy engine equivalent" is an overclaim. PR ladder defined; first 2 PRs shipped. |
 
 ### Recommended Execution Order
 
@@ -588,40 +592,46 @@ Phase 11 (Consumer) ────────── 1 sprint ──── Platfor
 Phase 13 (Polish) ──────────── 1 sprint ──── Security + UX
     │
 Phase 14 (Scale) ───────────── 2 sprints ─── Large deployment readiness
+    │
+Phase 15 (TAR + Scope Walking) ─ 2 sprints ─ Product differentiator (composable scope)
+    │
+Phase 16 (System Guardian) ──── 4-6 sprints ─ THE headline parity feature; PRs 1-2 done, PRs 3-17 in ladder
 ```
 
-**Total estimated effort: ~9 sprints (Phases 8-14)**
+**Total estimated effort: ~15-17 sprints (Phases 8-16). Phase 16 is the longest single phase because real-time agent-side enforcement spans three OS platform-specific delivery tracks (Windows-first per `docs/yuzu-guardian-windows-implementation-plan.md`, then Linux, then macOS) and each kernel-event API integration is independently load-bearing.**
 
 ---
 
 ## Part 5: New Capability Map Entries
 
-After all phases complete, the capability map would grow from 184 to ~215 capabilities:
+After all phases complete, the capability map would grow from 184 to ~225 capabilities:
 
 | New Domain | Capabilities |
 |-----------|-------------|
 | 25. Connector Framework | Connector CRUD, Sync Engine, Connection Testing, Sync Scheduling, Sync Logging |
 | 26. Inventory Repositories | Repository CRUD, Consolidation, Deduplication, Normalization, Multi-Source Merge |
 | 27. Software Catalog | Catalog Store, Software Normalization, AI Curation (stub), Usage Tracking, License Entitlements |
-| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management |
+| 28. Response Visualization | Chart Rendering, Built-in Processors, Custom Processors, Template Management, **TAR Dashboard Page** (Phase 15.A — Partial), **TAR Process Tree Viewer** (Phase 15.H), **Retention Awareness Surface** (Phase 15.A) |
 | 29. Consumer Applications | Consumer Registration, Rate Limiting, Data Offloading, Custom Data |
+| **30. Scope Walking & Result Sets** | Result Set Persistence and Lineage (15.B), Composable Scope from Previous Query (15.C), YAML DSL `fromResultSet:` (15.E), Operational Hardening (15.G) |
+| **31. System Guardian — Real-Time Agent-Side Guaranteed State** | Kernel-event-driven enforcement primitives, event guards (Registry / SCM / WFP / ETW / inotify / netlink / D-Bus / Endpoint Security), condition guards (process / software / compliance / WMI), pre-login activation, offline-capable cached policy, audit journal, dashboard, push protocol, signing, quarantine integration |
 
-Plus the 19 existing "Not Started" items moved to "Done" = **~215 total, all done**.
+Plus the 19 existing "Not Started" items moved to "Done" = **~225 total, all done**.
 
 ---
 
 ## Part 6: What We Will NOT Build
 
-Some Tachyon features are not worth replicating because Yuzu has superior alternatives:
+Some commercial-peer features are not worth replicating because Yuzu has superior alternatives:
 
-| Tachyon Feature | Why Not | Yuzu Alternative |
+| Commercial Peer Feature | Why Not | Yuzu Alternative |
 |----------------|---------|-----------------|
-| SCALE language interpreter | Massive effort, proprietary lock-in | WorkflowEngine + script_exec + plugin ABI |
+| Proprietary-script language interpreter | Massive effort, proprietary lock-in | WorkflowEngine + script_exec + plugin ABI |
 | XML instruction definitions | Legacy format | YAML DSL (cleaner, more readable) |
 | Windows-only authentication | Limits platform reach | OIDC/PKCE (universal) |
 | SQL Server dependency | Ops burden, licensing cost | SQLite (embedded, zero-ops) |
 | .NET Consumer SDK | Platform-specific | REST API + Python SDK + PowerShell module |
-| TIMS desktop IDE | Desktop app maintenance burden | Web-based YAML editor (CodeMirror) |
+| Vendor-specific desktop IDE | Desktop app maintenance burden | Web-based YAML editor (CodeMirror) |
 | Nomad (full P2P suite) | Years of engineering | Simpler P2P mesh (Phase 14.1) |
 | AI Auto-Curation | Requires ML training data | Manual curation + LLM-assisted (via MCP) |
 | Shopping / Self-Service Portal | Full separate product | SoftwareDeploymentStore + approval workflow |

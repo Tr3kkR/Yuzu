@@ -179,8 +179,11 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     }
 
     if (session->role != auth::Role::admin) {
-        audit_log(req, "auth.admin_required", "denied", "", "",
-                  "non-admin user blocked from admin route");
+        // SOC 2 CC7.2: every privileged-endpoint denial must surface in
+        // the audit chain, not just the request log. Emitting here closes
+        // the gap for every caller in one place rather than threading an
+        // audit_fn through dozens of route registrations (governance PR4).
+        audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
         res.status = 403;
         res.set_content(
             R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",

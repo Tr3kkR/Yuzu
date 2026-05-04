@@ -31,15 +31,13 @@ name: Runner inventory sentinel
 # RUNNER_INVENTORY_TOKEN < pat.txt`. See docs/ci-troubleshooting.md.
 
 on:
-  # Scheduled trigger DISABLED until RUNNER_INVENTORY_TOKEN PAT is created.
-  # See docs/ci-troubleshooting.md (TODO Saturday) for PAT setup. Until
-  # the PAT exists, scheduled runs would fail every 30 min on the 403
-  # from /actions/runners, training operators to ignore the workflow —
-  # an anti-pattern for a sentinel whose whole job is loud signaling.
-  # Re-enable the cron line below in the same PR that adds the PAT.
-  #
-  # schedule:
-  #   - cron: "*/30 * * * *"
+  # Runs every 30 minutes against the RUNNER_INVENTORY_TOKEN PAT so
+  # drift between GitHub's actions/runners listing and
+  # .github/runner-inventory.json surfaces quickly. Cron was parked
+  # until the PAT was in place (scheduled failures would have trained
+  # operators to ignore the workflow — anti-pattern for a sentinel).
+  schedule:
+    - cron: "*/30 * * * *"
   workflow_dispatch:
   push:
     branches: [dev, main]
@@ -49,7 +47,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: runner-inventory-sentinel
@@ -60,8 +57,14 @@ jobs:
     name: Assert expected runner inventory
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write   # opens/comments runner-inventory-drift tracking issue
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Check runner inventory against declaration
         id: check
@@ -70,112 +73,10 @@ jobs:
           # Falls back to GITHUB_TOKEN which will 403 — the script detects
           # that and prints an actionable PAT-setup message.
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import json, subprocess, sys
-
-          INVENTORY = ".github/runner-inventory.json"
-
-          with open(INVENTORY) as f:
-              inventory = json.load(f)
-
-          expected = {r["name"]: r for r in inventory["expected_runners"]}
-          strict = inventory.get("strict_unknown_runners", True)
-
-          result = subprocess.run(
-              ["gh", "api", "/repos/Tr3kkR/Yuzu/actions/runners"],
-              capture_output=True, text=True, check=False
-          )
-          if result.returncode != 0:
-              stderr = result.stderr.strip()
-              if "403" in stderr or "Resource not accessible" in stderr or "Must have admin" in stderr:
-                  print("::error::Runner inventory sentinel needs a PAT.")
-                  print()
-                  print("The default GITHUB_TOKEN cannot list /actions/runners — that endpoint")
-                  print("requires admin access to the repository, which is not grantable via")
-                  print("workflow permissions (no `administration` key at workflow scope).")
-                  print()
-                  print("To enable this sentinel, create a PAT and store it as a repo secret:")
-                  print("  1. github.com → Settings → Developer settings → Personal access tokens")
-                  print("     → Fine-grained tokens → Generate new token")
-                  print("  2. Scope: Repository access = Tr3kkR/Yuzu only")
-                  print("  3. Permissions: 'Administration' = Read-only")
-                  print("  4. Copy the token, then locally:")
-                  print("       gh secret set RUNNER_INVENTORY_TOKEN --body <token>")
-                  print()
-                  print("Until that secret exists, this sentinel will keep failing.")
-                  print("This is intentional: a missing inventory check should be loud, not silent.")
-                  print()
-                  print("Raw error from gh api:")
-                  print(stderr)
-                  sys.exit(1)
-              print("::error::Unexpected error querying /actions/runners")
-              print(stderr)
-              sys.exit(2)
-
-          payload = json.loads(result.stdout)
-          actual = {
-              r["name"]: {
-                  "name": r["name"],
-                  "labels": sorted(l["name"] for l in r["labels"]),
-                  "status": r["status"],
-                  "busy": r["busy"],
-              }
-              for r in payload["runners"]
-          }
-
-          drift = []
-
-          for name, exp in expected.items():
-              act = actual.get(name)
-              if not act:
-                  drift.append(f"MISSING: expected runner '{name}' not registered with GitHub")
-                  continue
-              if act["status"] != "online":
-                  drift.append(f"OFFLINE: runner '{name}' reports status '{act['status']}'")
-              expected_labels = set(exp["labels"])
-              actual_labels = set(act["labels"])
-              missing_labels = expected_labels - actual_labels
-              if missing_labels:
-                  drift.append(
-                      f"MISSING_LABEL: runner '{name}' missing expected labels {sorted(missing_labels)} "
-                      f"(actual labels: {sorted(actual_labels)})"
-                  )
-
-          if strict:
-              for name in actual:
-                  if name not in expected:
-                      drift.append(
-                          f"UNKNOWN: unexpected runner '{name}' is registered "
-                          f"but not declared in {INVENTORY} — either deregister it "
-                          f"or add it to the inventory in a PR"
-                      )
-
-          print("=== Expected (.github/runner-inventory.json) ===")
-          print(json.dumps(list(expected.values()), indent=2))
-          print()
-          print("=== Actual (GitHub /actions/runners) ===")
-          print(json.dumps(list(actual.values()), indent=2))
-          print()
-
-          if drift:
-              print("=== DRIFT DETECTED ===")
-              for d in drift:
-                  print(f"  - {d}")
-              # Surface the drift report as a step output so the issue-creation
-              # step can embed it in the issue body.
-              import os
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("drift_count=" + str(len(drift)) + "\n")
-                  f.write("drift_report<<DRIFT_EOF\n")
-                  for d in drift:
-                      f.write(f"- {d}\n")
-                  f.write("DRIFT_EOF\n")
-              sys.exit(1)
-
-          print("=== RUNNER INVENTORY OK ===")
-          PY
+        # Logic lives in scripts/ci/runner-health-check.py, shared with
+        # ci.yml's preflight job (PR-7 of the CI overhaul plan). --mode
+        # sentinel preserves this workflow's loud-failure-on-drift contract.
+        run: python3 scripts/ci/runner-health-check.py --mode sentinel
 
       - name: Open or update drift issue
         if: failure() && steps.check.outputs.drift_count != ''

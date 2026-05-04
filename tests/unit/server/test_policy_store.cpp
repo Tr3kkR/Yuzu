@@ -6,6 +6,7 @@
  */
 
 #include "policy_store.hpp"
+#include "store_errors.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -173,10 +174,13 @@ TEST_CASE("PolicyStore: create fragment with duplicate ID", "[policy_store][frag
     REQUIRE(r1.has_value());
     CHECK(r1.value() == "frag-full-001");
 
-    // Attempt duplicate
+    // Attempt duplicate — fragment has both duplicate id and duplicate
+    // displayName. The #396 name guard fires first (and is more informative
+    // than the SQLite PK constraint message), so the error carries the
+    // "conflict:" prefix routes use to map to HTTP 409.
     auto r2 = store.create_fragment(kFullFragment);
     REQUIRE(!r2.has_value());
-    CHECK(r2.error().find("failed to create fragment") != std::string::npos);
+    CHECK(is_conflict_error(r2.error()));
 }
 
 TEST_CASE("PolicyStore: create fragment with empty YAML", "[policy_store][fragment]") {
@@ -193,6 +197,12 @@ TEST_CASE("PolicyStore: create fragment with wrong kind", "[policy_store][fragme
     auto result = store.create_fragment("kind: Policy\nname: oops\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    // Issue #621: error must include a worked example so operators sending
+    // partial YAML (or sending `kind` as a request param) get unstuck without
+    // having to find the docs separately. The prefix above stays stable so
+    // existing scripts that grep on it keep working.
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][fragment]") {
@@ -201,6 +211,11 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][frag
     auto result = store.create_fragment("name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!result.has_value());
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
+    CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    // Governance Gate 7 (consistency S2 / QA SHOULD): docs link must be
+    // pinned on this branch too — not just the wrong-kind branch — so the
+    // operator-facing UX is symmetric across both `kind`-failure modes.
+    CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: fragment with check only (no fix, no postCheck)",
@@ -430,6 +445,24 @@ TEST_CASE("PolicyStore: create policy with wrong kind", "[policy_store][policy]"
     auto r = store.create_policy("kind: PolicyFragment\nname: wrong\n");
     REQUIRE(!r.has_value());
     CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
+    // Issue #621: same UX expectation as create_fragment — operators must
+    // see a worked example in the error body, not just the prefix.
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
+}
+
+TEST_CASE("PolicyStore: create policy with missing kind", "[policy_store][policy]") {
+    PolicyStore store(":memory:");
+
+    // Governance Gate 7 (consistency S2 / QA SHOULD): symmetric coverage
+    // with the create_fragment "missing kind" case above. Without this
+    // test the asymmetry would let a future regression that drops the
+    // worked-example body from create_policy alone slip through CI.
+    auto r = store.create_policy("name: no-kind\ndescription: missing kind field\n");
+    REQUIRE(!r.has_value());
+    CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
+    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
+    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
 }
 
 TEST_CASE("PolicyStore: create policy with missing fragment", "[policy_store][policy]") {
@@ -771,4 +804,29 @@ TEST_CASE("PolicyStore: get nonexistent agent status returns nullopt",
           "[policy_store][compliance]") {
     PolicyStore store(":memory:");
     CHECK(store.get_agent_status("pol", "agent") == std::nullopt);
+}
+
+// ── Duplicate-name guard (#396) ──────────────────────────────────────────
+
+TEST_CASE("PolicyStore: duplicate fragment name rejected with conflict prefix",
+          "[policy_store][fragment][duplicate]") {
+    PolicyStore store(":memory:");
+
+    // First create succeeds.
+    auto first = store.create_fragment(kCheckOnlyNoFix);
+    REQUIRE(first.has_value());
+
+    // Same YAML again (same displayName -> same name) must surface as
+    // "conflict:" so the route layer can return HTTP 409 instead of 400.
+    auto second = store.create_fragment(kCheckOnlyNoFix);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(is_conflict_error(second.error()));
+
+    // First fragment is intact — no silent duplicate row.
+    auto fragments = store.query_fragments({});
+    int matches = 0;
+    for (const auto& f : fragments)
+        if (f.name == "Check Only Fragment")
+            ++matches;
+    CHECK(matches == 1);
 }

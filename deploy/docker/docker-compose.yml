@@ -1,7 +1,13 @@
 # Yuzu Development Stack — Docker Compose
 #
-# Standalone server + agent — works out of the box, no gateway needed.
+# Server-only stack — works out of the box, no gateway needed.
 # For gateway deployments, see docker-compose.full-uat.yml.
+#
+# Agents always run natively on each managed endpoint and are NOT
+# included here. To smoke-test agent ↔ server connectivity, run a
+# native agent via `bash scripts/linux-start-UAT.sh` against this
+# stack, or install one of the platform packages (.deb/.rpm/.exe/.pkg)
+# from the GitHub release.
 #
 # Usage:
 #   cd deploy/docker
@@ -25,18 +31,14 @@ services:
       - "50052:50052"   # gRPC (management)
     volumes:
       - server-data:/var/lib/yuzu
-    restart: unless-stopped
-
-  # ── Yuzu Agent ──────────────────────────────────────────────────────
-  agent:
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile.agent
-    command: ["--server", "server:50051", "--no-tls", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]
-    volumes:
-      - agent-data:/var/lib/yuzu-agent
-    depends_on:
-      - server
+    # File-descriptor headroom mirrors the systemd unit
+    # (deploy/systemd/yuzu-server.service). The Docker default is 1024;
+    # 65536 absorbs SSE EventSource fan-in + agent gRPC streams + SQLite
+    # WAL + log handles for fleets up to ~50k agents.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
 
   # ── Prometheus ──────────────────────────────────────────────────────
@@ -64,6 +66,5 @@ services:
 
 volumes:
   server-data:
-  agent-data:
   prometheus-data:
   grafana-data:

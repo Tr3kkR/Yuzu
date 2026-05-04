@@ -191,6 +191,28 @@ std::vector<std::string> load_redaction_patterns(yuzu::tar::TarDatabase& db) {
     }
 }
 
+// Per-source enable/disable (issue #59). Default = enabled.
+bool source_enabled(yuzu::tar::TarDatabase& db, std::string_view source) {
+    return db.get_config(std::format("{}_enabled", source), "true") != "false";
+}
+
+// Process stabilization exclusion patterns (issue #59). Empty = no exclusions.
+std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& db) {
+    auto stored = db.get_config("process_stabilization_exclusions");
+    if (stored.empty())
+        return {};
+    try {
+        auto arr = json::parse(stored);
+        std::vector<std::string> patterns;
+        for (const auto& p : arr) {
+            patterns.push_back(p.get<std::string>());
+        }
+        return patterns;
+    } catch (...) {
+        return {};
+    }
+}
+
 } // namespace
 
 class TarPlugin final : public yuzu::Plugin {
@@ -204,7 +226,7 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"status", "query", "snapshot", "export",
                                       "configure", "collect_fast", "collect_slow",
-                                      "rollup", "sql", nullptr};
+                                      "rollup", "sql", "compatibility", nullptr};
         return acts;
     }
 
@@ -285,6 +307,7 @@ public:
         if (action == "configure")     return do_configure(ctx, params);
         if (action == "rollup")        return do_rollup(ctx);
         if (action == "sql")           return do_sql(ctx, params);
+        if (action == "compatibility") return do_compatibility(ctx);
 
         ctx.write_output(std::format("error|unknown action: {}", action));
         return 1;
@@ -301,11 +324,28 @@ private:
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
+        auto stab_excl = load_stabilization_exclusions(*db_);
         int total_events = 0;
 
         // Process diff (C6: check insert return, abort state save on failure)
-        {
+        // Per-source enable gate (issue #59): if disabled, skip both the
+        // diff and the state save so that re-enabling later starts from a
+        // clean baseline rather than diffing against a frozen snapshot.
+        if (source_enabled(*db_, "process")) {
             auto current = yuzu::agent::enumerate_processes();
+
+            // Stabilization exclusions: drop processes whose name matches any
+            // exclusion pattern. The patterns reuse the same glob semantics
+            // as redaction (case-insensitive substring with optional '*' on
+            // either side stripped). Excluded processes never enter the
+            // diff, so their birth/death events are silently dropped — the
+            // documented forensic-completeness trade-off.
+            if (!stab_excl.empty()) {
+                std::erase_if(current, [&](const auto& p) {
+                    return yuzu::tar::should_redact(p.name, stab_excl);
+                });
+            }
+
             auto prev_json = db_->get_state("process");
             auto previous = json_to_processes(prev_json);
 
@@ -323,7 +363,7 @@ private:
         }
 
         // Network diff
-        {
+        if (source_enabled(*db_, "tcp")) {
             auto current = yuzu::tar::enumerate_connections();
             auto prev_json = db_->get_state("network");
             auto previous = json_to_connections(prev_json);
@@ -358,7 +398,7 @@ private:
         int total_events = 0;
 
         // Service diff (C6: check insert return)
-        {
+        if (source_enabled(*db_, "service")) {
             auto current = yuzu::tar::enumerate_services();
             auto prev_json = db_->get_state("service");
             auto previous = json_to_services(prev_json);
@@ -377,7 +417,7 @@ private:
         }
 
         // User diff
-        {
+        if (source_enabled(*db_, "user")) {
             auto current = yuzu::tar::enumerate_users();
             auto prev_json = db_->get_state("user");
             auto previous = json_to_users(prev_json);
@@ -415,6 +455,76 @@ private:
         ctx.write_output(std::format("newest_timestamp|{}", s.newest_timestamp));
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
         ctx.write_output(std::format("retention_days|{}", s.retention_days));
+
+        // Per-source enable/disable state (issue #59) plus the operational
+        // surface PR-A (#547) needs: paused_at, live_rows, oldest_ts. Default
+        // = enabled, paused_at = 0, so operators that never call `configure`
+        // see the steady-state behavior. live_rows / oldest_ts are queried
+        // from the per-source `*_live` table; an empty table reports 0 / 0.
+        for (const auto& src : yuzu::tar::capture_sources()) {
+            std::string enabled_key = std::format("{}_enabled", src.name);
+            auto enabled_val = db_->get_config(enabled_key, "true");
+            ctx.write_output(std::format("config|{}|{}", enabled_key, enabled_val));
+
+            std::string paused_at_key = std::format("{}_paused_at", src.name);
+            auto paused_at_val = db_->get_config(paused_at_key, "0");
+            ctx.write_output(std::format("config|{}|{}",
+                                          paused_at_key, paused_at_val));
+
+            std::string live_table = std::format("{}_live", src.name);
+            auto count_q = db_->execute_query(
+                "SELECT COUNT(*) FROM " + live_table, /*max_rows=*/1);
+            int64_t live_rows = 0;
+            if (count_q.has_value() && !count_q->rows.empty()) {
+                try { live_rows = std::stoll(count_q->rows[0][0]); } catch (...) {}
+            }
+            ctx.write_output(std::format("config|{}_live_rows|{}",
+                                          src.name, live_rows));
+
+            // `ts` is the column name on every `*_live` table per the schema
+            // registry. NULL on empty table → 0 fallback.
+            auto oldest_q = db_->execute_query(
+                "SELECT IFNULL(MIN(ts), 0) FROM " + live_table, /*max_rows=*/1);
+            int64_t oldest_ts = 0;
+            if (oldest_q.has_value() && !oldest_q->rows.empty()) {
+                try { oldest_ts = std::stoll(oldest_q->rows[0][0]); } catch (...) {}
+            }
+            ctx.write_output(std::format("config|{}_oldest_ts|{}",
+                                          src.name, oldest_ts));
+        }
+        // Currently-configured network capture method (defaults to "polling").
+        auto net_method = db_->get_config("network_capture_method", "polling");
+        ctx.write_output(std::format("config|network_capture_method|{}", net_method));
+        return 0;
+    }
+
+    // ── compatibility action (issue #59) ──────────────────────────────────────
+    //
+    // Emits one row per (source, OS) describing how the source captures data
+    // on that platform and any known constraint. Pipe-delimited so the
+    // existing dashboard renderer can show it as a table without a JSON
+    // codec change.
+    int do_compatibility(yuzu::CommandContext& ctx) {
+        ctx.write_output(
+            "header|source|os|status|capture_method|notes");
+        for (const auto& src : yuzu::tar::capture_sources()) {
+            for (const auto& os : src.os_support) {
+                std::string_view status_str;
+                switch (os.status) {
+                case yuzu::tar::OsSupportStatus::kSupported:
+                    status_str = "supported"; break;
+                case yuzu::tar::OsSupportStatus::kSupportedConstrained:
+                    status_str = "constrained"; break;
+                case yuzu::tar::OsSupportStatus::kPlanned:
+                    status_str = "planned"; break;
+                case yuzu::tar::OsSupportStatus::kUnsupported:
+                    status_str = "unsupported"; break;
+                }
+                ctx.write_output(std::format("row|{}|{}|{}|{}|{}",
+                                              src.name, os.os, status_str,
+                                              os.capture_method, os.notes));
+            }
+        }
         return 0;
     }
 
@@ -659,6 +769,122 @@ private:
                 changed = true;
             } catch (...) {
                 ctx.write_output("error|redaction_patterns must be valid JSON array");
+                return 1;
+            }
+        }
+
+        // ── Per-source enable/disable (issue #59) ─────────────────────────────
+        // Operators can disable any of the four collectors on a host without
+        // editing source. Disabled collectors short-circuit in
+        // collect_fast/slow but still permit `query` against existing rows
+        // (so historical data remains readable while new captures stop).
+        //
+        // PR-A: when a transition enable→disable happens, record the wall-clock
+        // timestamp in `<source>_paused_at` so the server-side retention-paused
+        // dashboard list (#547) can render "paused since" without inferring it
+        // from the audit log. The reverse transition clears the value to "0"
+        // (we do not delete keys — a missing key would be ambiguous with "never
+        // paused"). The timestamp is operator-facing wall-clock seconds; clock
+        // skew is acceptable because the surface is "paused since approximately
+        // X" and the ground truth is the agent's view.
+        for (const auto& src : yuzu::tar::capture_sources()) {
+            std::string key = std::format("{}_enabled", src.name);
+            auto val = params.get(key);
+            if (val.empty()) continue;
+            std::string v{val};
+            if (v != "true" && v != "false") {
+                ctx.write_output(std::format(
+                    "error|{} must be 'true' or 'false'", key));
+                return 1;
+            }
+            yuzu::tar::apply_source_enabled_transition(
+                *db_, src.name, v, now_epoch_seconds());
+            ctx.write_output(std::format("config|{}|{}", key, v));
+            // Echo the resulting paused_at so the operator/dashboard sees the
+            // transition timestamp without an extra status round-trip. We
+            // re-read it post-write rather than re-deriving the transition
+            // here — single source of truth.
+            std::string paused_at_key = std::format("{}_paused_at", src.name);
+            ctx.write_output(std::format("config|{}|{}",
+                                          paused_at_key,
+                                          db_->get_config(paused_at_key, "0")));
+            changed = true;
+        }
+
+        // ── Network capture method surface (issue #59) ───────────────────────
+        // Today only "polling" is wired. ETW (Windows) and Endpoint Security
+        // (macOS) are accepted-and-stored values per the schema registry's
+        // OsSupport metadata so an operator can pre-stage the configuration,
+        // but the collector continues to use polling until the relevant
+        // implementation lands. Validation rejects unknown methods so a typo
+        // does not silently re-default to polling.
+        if (auto m = params.get("network_capture_method"); !m.empty()) {
+            std::string method{m};
+            // "polling" is a sentinel meaning "use the platform default" —
+            // the only mechanism actually wired today. It is intentionally
+            // accepted unconditionally even though no os_support row carries
+            // it as a capture_method (the per-OS rows describe the underlying
+            // platform API: iphlpapi / procfs / proc_pidfdinfo). Without this
+            // special case `tar.status` would report `polling` as the default
+            // but `tar.configure network_capture_method=polling` would be
+            // rejected — the round trip would be broken (governance C-1 /
+            // QA Finding 2).
+            if (method != "polling") {
+                auto accepted = yuzu::tar::accepted_capture_methods("tcp");
+                if (std::find(accepted.begin(), accepted.end(), method) == accepted.end()) {
+                    std::string list = "polling";
+                    for (const auto& m2 : accepted) {
+                        list += ",";
+                        list += m2;
+                    }
+                    ctx.write_output(std::format(
+                        "error|network_capture_method '{}' is not accepted (must be one of: {})",
+                        method, list));
+                    return 1;
+                }
+                // Surface that no kernel-event collector is wired yet so an
+                // operator pre-staging 'etw' / 'endpoint_security' isn't
+                // surprised that the collector keeps polling under the hood.
+                ctx.write_output(std::format(
+                    "warn|network_capture_method '{}' accepted but not yet "
+                    "implemented; collector will continue polling",
+                    method));
+            }
+            db_->set_config("network_capture_method", method);
+            ctx.write_output(std::format("config|network_capture_method|{}", method));
+            changed = true;
+        }
+
+        // ── Process stabilization exclusions (issue #59) ─────────────────────
+        // List of process-name glob patterns whose churn should be excluded
+        // from process events. Useful for noisy short-lived helpers (CI
+        // runners, IDE indexers, telemetry agents) that produce thousands
+        // of birth/death rows per minute and dwarf the actual process
+        // activity an operator wants to see. Trade-off: forensic completeness
+        // is reduced — anything matching these patterns is invisible to TAR.
+        if (auto exc = params.get("process_stabilization_exclusions"); !exc.empty()) {
+            try {
+                auto arr = json::parse(std::string{exc});
+                if (!arr.is_array()) {
+                    ctx.write_output(
+                        "error|process_stabilization_exclusions must be a JSON array");
+                    return 1;
+                }
+                for (const auto& elem : arr) {
+                    if (!elem.is_string() || elem.get<std::string>().empty()) {
+                        ctx.write_output(
+                            "error|process_stabilization_exclusions must contain only "
+                            "non-empty strings");
+                        return 1;
+                    }
+                }
+                db_->set_config("process_stabilization_exclusions", std::string{exc});
+                ctx.write_output(
+                    std::format("config|process_stabilization_exclusions|{}", exc));
+                changed = true;
+            } catch (...) {
+                ctx.write_output(
+                    "error|process_stabilization_exclusions must be valid JSON array");
                 return 1;
             }
         }

@@ -1,6 +1,6 @@
 ---
 name: security-guardian
-description: Security engineer — auth enforcement, crypto, input validation, audit coverage
+description: Use on every change as part of governance gate 2 (mandatory deep-dive); also use on any auth/RBAC/crypto/header/token/secret-handling change, anything under `/mcp/v1/`, anything touching `mcp_server.{hpp,cpp}` / `mcp_jsonrpc.hpp` / `mcp_policy.hpp`, and any new external input parser. Security engineer — reviews for auth enforcement, crypto correctness, input validation, RBAC tier-before-permission ordering, kill switches, and audit coverage. Output is a findings report with severity tags.
 tools: Read, Grep, Glob, Bash
 ---
 

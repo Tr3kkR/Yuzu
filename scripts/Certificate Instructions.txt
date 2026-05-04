@@ -83,7 +83,13 @@ Agent (verify server cert, present its own client cert):
     --cert       Server's PEM certificate (presented to agents)
     --key        Server's private key
     --ca-cert    CA cert to verify agent client certs (enables mTLS)
-    --allow-one-way-tls  Explicitly allow TLS without --ca-cert
+    --insecure-skip-client-verify
+                 Explicitly allow TLS without --ca-cert. Also requires the
+                 environment variable YUZU_ALLOW_INSECURE_TLS=1 as a second
+                 confirmation. Server logs a startup banner and a 5-minute
+                 reminder while running in this mode. (Renamed from
+                 --allow-one-way-tls; old name still accepted with deprecation
+                 warning for one release.)
     --management-cert/--management-key/--management-ca-cert
                  Optional management-listener TLS override
 
@@ -93,12 +99,14 @@ Agent (verify server cert, present its own client cert):
     --client-key   Agent's private key
 
 By default, server startup now requires --ca-cert when TLS is enabled.
-If you intentionally want one-way TLS, pass --allow-one-way-tls.
+If you intentionally want one-way TLS, pass --insecure-skip-client-verify
+AND set YUZU_ALLOW_INSECURE_TLS=1.
 
 When TLS is enabled:
   - Server startup fails if --cert/--key are missing or unreadable.
   - Server startup fails if --ca-cert is provided but unreadable.
-  - Server startup fails if --ca-cert is missing (unless --allow-one-way-tls is set).
+  - Server startup fails if --ca-cert is missing (unless
+    --insecure-skip-client-verify is set AND YUZU_ALLOW_INSECURE_TLS=1).
   - Agent startup fails if only one of --client-cert/--client-key is set.
   - Agent startup fails if provided cert files are unreadable.
 

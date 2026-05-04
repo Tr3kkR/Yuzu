@@ -2,6 +2,10 @@ option('build_agent',    type: 'boolean', value: true,  description: 'Build the 
 option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
 option('build_examples', type: 'boolean', value: true,  description: 'Build example plugins')
 option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
+option('enable_enterprise', type: 'boolean', value: false,
+       description: 'Build commercial enterprise modules from enterprise/. '
+                  + 'Requires a commercial license — see enterprise/LICENSE-ENTERPRISE.md. '
+                  + 'OSS AGPL builds MUST leave this off.')
 # Sanitizers, LTO: use Meson built-ins instead of custom options:
 #   -Db_lto=true                       Link-time optimisation
 #   -Db_sanitize=address,undefined     AddressSanitizer + UBSan

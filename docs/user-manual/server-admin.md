@@ -37,6 +37,15 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--no-https` | off | Disable HTTPS (insecure, for development only). HTTPS is **enabled by default**; provide `--https-cert` and `--https-key`, or pass `--no-https` to disable. Env: `YUZU_NO_HTTPS`. |
+| `--no-tls` | off | Disable **all** gRPC TLS (agent listener AND management listener). Plaintext gRPC, no encryption, no peer authentication. **The administrative surface is ungated when this flag is passed.** Intended for local UAT, customer demos, and development. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder when running in this mode. |
+| `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
+| `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
+| `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
+| `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
+| `--allow-one-way-tls` | off | **[DEPRECATED]** Renamed to `--insecure-skip-client-verify`. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release. |
+| `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
+| `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
+| `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -53,6 +62,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
 
@@ -101,13 +111,16 @@ The server stores its configuration in files located in the **same directory as 
 
 | File | Purpose |
 |---|---|
-| `yuzu-server.cfg` | User credentials. Passwords are stored as PBKDF2 hashes with per-user salts. Never contains plaintext passwords. |
-| `enrollment-tokens.cfg` | Enrollment tokens for Tier 2 agent enrollment. Each token has an ID, creation time, expiry, and remaining use count. |
+| `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt. After first boot, `auth.db` is authoritative and this file is no longer read for live state — keep it as the seed for disaster-recovery (re-creating `auth.db` from scratch). |
+| `auth.db` | SQLite-backed authentication database. Holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256 hashed passwords. Created in `--data-dir` on first boot. Mode `0600` on Linux; restricted ACL on Windows. **This is the live source of truth for authentication state from v0.12.0 onwards.** |
+| `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up all three `.cfg` files regularly. Losing `yuzu-server.cfg` requires re-running first-run setup. Losing `enrollment-tokens.cfg` invalidates all issued tokens. Losing `pending-agents.cfg` loses the pending approval queue (agents will re-register on next heartbeat).
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, and the rest of the `--data-dir` SQLite stores on the same schedule. Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`.
 
-> **File permissions (Unix):** On Unix systems, the server automatically sets file permissions to `0600` (owner-only read/write) on `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` after every write. This protects credential hashes and enrollment tokens from being read by other users on the system. No manual `chmod` is required for these files.
+> **File permissions (Unix):** `auth.db` is created with mode `0600` (owner read/write only); `yuzu-server.cfg`, `enrollment-tokens.cfg`, and `pending-agents.cfg` are also `0600` after every write. No manual `chmod` is required.
+
+> **Windows Defender exclusion:** On Windows production deploys, exclude `auth.db`, `auth.db-wal`, and `auth.db-shm` from real-time scan. See `docs/ops-runbooks/auth-db-recovery.md` for the `Add-MpPreference` commands.
 
 ---
 
@@ -150,6 +163,32 @@ Option (2) is the recommended long-term posture because it aligns with least-pri
 
 Both paths return `HTTP 404 token not found` on a cross-user revoke attempt — identical to the response for a truly-nonexistent token — to prevent the endpoint from being used as an enumeration oracle.
 
+### v0.12.0 — TAR dashboard page + mixed-version agent caveats
+
+The new `/tar` dashboard page (issue #547) surfaces every device × source pair where a TAR collector has been disabled. The page is reachable from the **TAR** entry in the main navigation bar; viewing requires `Infrastructure:Read` and the per-source Re-enable / Scan-fleet actions require `Execution:Execute`.
+
+**Mixed-version rollout caveat.** Agents running a build older than v0.12.0 do not emit the new per-source `paused_at` / `live_rows` / `oldest_ts` lines on `tar.status`. The dashboard renders an em-dash (`—`) for those columns when a pre-v0.12.0 agent appears in a scan result. This is not a server bug — it is an honest "we don't know when this collector was disabled because the agent reporting it pre-dates the field." Operators upgrading the server before the agent fleet should expect the em-dash for any pre-existing paused sources until the agent at the affected device is upgraded. See `docs/user-manual/tar.md` for the full TAR dashboard workflow.
+
+**Per-operator scan state caveat.** Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.
+
+**Audit log additions.** Two new audit actions emit on operator activity: `tar.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `tar.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
+
+### vNEXT — Plugin code signing (#80)
+
+Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).
+
+**New on-disk artifact.** `<cert-dir>/plugin-trust-bundle.pem` (Linux/macOS: `/etc/yuzu/certs/plugin-trust-bundle.pem`; Windows: `C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem`). Server-managed via Settings → Plugin Code Signing. **Back this up alongside `auth.db`.** A backup that captures the SQLite databases but not the cert dir restores `plugin_signing_required=true` (in `runtime_config`) without the trust bundle file — agents fetching the policy will receive a 500 and require-mode agents will reject every plugin until the bundle is restored.
+
+**Cert-dir collision check.** The server now treats this filename as authoritative. If a prior deployment placed an unrelated PEM at this exact path for a different purpose, it will be interpreted as the plugin trust bundle on first read. This is unlikely (the filename was unused before this release) but worth confirming before upgrade. Run `ls <cert-dir>/plugin-trust-bundle.pem` and rename the file if it pre-exists for any other purpose.
+
+**New `runtime_config` key.** `plugin_signing_required` (string `"true"` or `"false"`). Set via the Settings card; reading and writing the key directly via the runtime-config REST surface is supported but not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).
+
+**New audit actions.** `plugin_signing.bundle.uploaded`, `plugin_signing.bundle.cleared`, `plugin_signing.require.changed` — see `audit-log.md` for the result and detail conventions. SIEM rules already filtering on `success`/`failure`/`denied` will pick these up unchanged; no new vocabulary tokens.
+
+**Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
+
+**Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
+
 ---
 
 ## Settings Page
@@ -170,6 +209,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Pending Agents | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. |
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
+| Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. |
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
@@ -179,11 +219,64 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 
 ## TLS Configuration
 
-TLS can be configured at startup via CLI flags or at runtime through the Settings page.
+The Yuzu server has **two independent TLS surfaces**:
 
-### Via CLI Flags
+1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
+2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
+
+The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
+
+### HTTPS via CLI Flags
 
 HTTPS is enabled by default. Pass `--https-cert` and `--https-key` at server startup. Use `--no-https` for development without TLS. See [Server CLI Flags](#server-cli-flags).
+
+### gRPC TLS via CLI Flags
+
+The recommended posture is **mutual TLS (mTLS)** — the server presents a certificate and verifies a client certificate from each connecting agent:
+
+```bash
+./yuzu-server \
+  --cert /etc/yuzu/grpc-server.crt \
+  --key  /etc/yuzu/grpc-server.key \
+  --ca-cert /etc/yuzu/agent-clients-ca.crt
+```
+
+If you have not yet stood up a CA for issuing agent client certificates, you have two fallback options:
+
+**Option 1 — One-way TLS** (server cert is presented but client certs are not verified):
+
+```bash
+export YUZU_ALLOW_INSECURE_TLS=1   # required as a second confirmation
+./yuzu-server \
+  --cert /etc/yuzu/grpc-server.crt \
+  --key  /etc/yuzu/grpc-server.key \
+  --insecure-skip-client-verify
+```
+
+This applies to **both** the agent listener and the management listener. The server emits an ERROR-level startup banner and a 5-minute recurring reminder log line for the duration the listener runs in this mode. An audit event with action `server.tls_degraded` is also written every 5 minutes for SOC 2 evidence.
+
+**Option 2 — `--no-tls`** (no encryption, no peer authentication, plaintext gRPC):
+
+```bash
+./yuzu-server --no-tls
+```
+
+This is the supported posture for **local UAT, customer demos, and development**. The administrative surface is ungated — anyone reachable on port 50052 can issue management RPCs. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder. Do not run `--no-tls` against any network you do not control end-to-end.
+
+### Upgrade note (v0.12.0)
+
+The `--allow-one-way-tls` flag was renamed to `--insecure-skip-client-verify` AND now requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation. **Existing deployments that pass `--allow-one-way-tls` (or the new flag name) will refuse to start after upgrade until the env var is set.** The old flag name remains accepted with a deprecation warning for one release.
+
+For systemd-managed deployments, add the env var via a drop-in:
+
+```bash
+sudo systemctl edit yuzu-server   # creates /etc/systemd/system/yuzu-server.service.d/override.conf
+```
+
+```ini
+[Service]
+Environment="YUZU_ALLOW_INSECURE_TLS=1"
+```
 
 ### Via Settings Page
 
@@ -263,13 +356,61 @@ Yuzu supports two built-in roles for local users:
 
 The password is hashed with PBKDF2 before storage. Plaintext passwords are never written to disk.
 
+> **Breaking change in v0.12.0** — the `role` field is **ignored** on
+> create. New users are always created as `user`. To grant admin, use
+> the **Change Role** button on the user's row, or `POST
+> /api/settings/users/{username}/role` programmatically. This is a
+> deliberate split (security finding C1): collapsing role assignment
+> into the create endpoint allowed a 4xx-on-create + audit-as-success
+> pattern that operators couldn't audit cleanly. Each role transition
+> now produces a single `user.role_change` audit event with `old_role`
+> and `new_role` recorded in the detail field.
+
+### Changing a User's Role
+
+1. Navigate to **Settings > User Management**.
+2. Click **Change Role** next to the target user.
+3. Pick `admin` or `user` and confirm.
+
+The server emits an audit event on every branch:
+
+| Branch | Audit `result` | Detail |
+|---|---|---|
+| Role changed | `success` | `old_role=user,new_role=admin` (or vice versa) |
+| Same role requested | `no_op` | `same_role=admin` (or `user`) |
+| Self-target rejected | `denied` | `self_role_change_blocked` |
+| Invalid username | `denied` | `invalid_username` |
+| Invalid JSON body | `denied` | `invalid_json` |
+| Missing `role` field | `denied` | `missing_role` |
+| Invalid role value | `denied` | `invalid_role` |
+| User not found | `denied` | `user_not_found` |
+| DB write failed | `denied` | `db_failure` |
+
+> **You cannot change your own role.** The endpoint rejects self-target
+> with HTTP 403, audited as `denied:self_role_change_blocked`. The same
+> motivation as the self-delete guard: prevent an operator from locking
+> themselves out via a misclick or scripted demotion.
+
+> **Active sessions are invalidated atomically.** After a successful
+> `user.role_change`, every active session for the target user is
+> destroyed; the user must re-authenticate to pick up the new role.
+
 ### Deleting a User
 
 1. Navigate to **Settings > User Management**.
-2. Click **Delete** next to the target user.
+2. Click **Remove** next to the target user.
 3. Confirm the deletion.
 
-> **Note:** You cannot delete the last admin account. At least one admin must exist at all times.
+> **Note:** You cannot delete your own account. The Users table renders
+> the text "Current user" in place of the **Remove** button for the
+> currently authenticated operator's row, and the server rejects any
+> hand-crafted `DELETE /api/settings/users/<your-username>` request with
+> HTTP 403 and a `Cannot delete your own account` toast. This prevents
+> a misclick — or a scripted revoke loop — from dropping the only
+> credential on the running server and locking every operator out
+> until the process is restarted against its on-disk config. To remove
+> the account you are signed in as, first create a second admin, log
+> out, log in as the second admin, and delete the original.
 
 ---
 
@@ -450,10 +591,11 @@ The server applies retention policies to stored data to manage disk usage. Reten
 |---|---|---|---|
 | Instruction responses | `--response-retention-days` | 90 days | Results from executed instructions. Older responses are purged on a daily schedule. |
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
+| Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 
 Reducing the TTL frees disk space; increasing it preserves history for compliance.
 
-> **Note:** Retention settings are configured at server startup via CLI flags. There is no Settings page UI or runtime API for changing them yet. A runtime configuration API (Phase 7.3) will allow changing TTLs and other limits without restarting the server.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/v1/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/v1/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
 
 ---
 
@@ -543,6 +685,30 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
 ---
+
+## File Logging
+
+Yuzu writes logs to stdout by default. File logging is opt-in via `--log-file`, with a best-effort fallback at the platform default path (`/var/log/yuzu/server.log` on Linux, `C:\ProgramData\Yuzu\logs\server.log` on Windows, `~/Library/Logs/Yuzu/server.log` on macOS).
+
+| Path | Behaviour | Failure mode |
+|---|---|---|
+| `--log-file <path>` (explicit) | Writes to `<path>` in addition to stdout. | If the file/directory cannot be opened, server logs an ERROR and continues without file logging. |
+| Platform default path (implicit) | Writes to the platform default path if it exists and is writable. | If the directory cannot be created or the file cannot be opened, server logs a single INFO line and continues without file logging. The default fallback is best-effort observability, not load-bearing. |
+
+The Docker server image pre-creates `/var/log/yuzu` (mode 0750, owned by the `yuzu` user) so the implicit default path works out of the box. When mounting an external host volume at `/var/log/yuzu`, ensure the host directory is owned by the same UID as the in-container `yuzu` user (verify with `docker exec yuzu-server id yuzu`); a wrong-ownership mount silently degrades to stdout-only logging.
+
+## Health Endpoints
+
+Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and monitoring integrations. All four are unauthenticated and exempt from the API rate limiter.
+
+| Path | Use case | Body | Draining-aware |
+|---|---|---|---|
+| `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200) or `{"status":"draining"}` (503) | **Yes** |
+| `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
+| `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
+
+**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches.
 
 ## Deployment
 

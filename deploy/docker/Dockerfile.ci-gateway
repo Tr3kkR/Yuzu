@@ -11,7 +11,7 @@
 #       runs-on: ubuntu-24.04
 #       container: ghcr.io/tr3kkr/yuzu-ci-gateway:latest
 
-FROM erlang:28
+FROM erlang:28@sha256:59e809003f7690b4bf1a5ed4ab9135a2073ce00a3ae45545835f528f9630ad2b
 
 ARG REBAR3_VERSION=3.24.0
 
@@ -25,9 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Node.js 20 (required by GitHub Actions runner actions) ────────────
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# Pinned tarball + SHA-256 verification instead of NodeSource's
+# `curl | bash` repo-add script. See matching block in Dockerfile.ci-linux.
+ARG NODE_VERSION=20.20.2
+ARG NODE_SHA256_LINUX_X64=df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d
+RUN curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE_SHA256_LINUX_X64}  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+         --exclude='CHANGELOG.md' --exclude='LICENSE' --exclude='README.md' \
+    && rm /tmp/node.tar.xz
 
 # ── rebar3 (pinned version) ──────────────────────────────────────────
 RUN curl -fsSL "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERSION}/rebar3" \
@@ -51,4 +57,4 @@ RUN git config --global --add safe.directory '*'
 # ── Labels ────────────────────────────────────────────────────────────
 LABEL org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu"
 LABEL org.opencontainers.image.description="Yuzu CI gateway build environment (Erlang/OTP 28 + rebar3)"
-LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"

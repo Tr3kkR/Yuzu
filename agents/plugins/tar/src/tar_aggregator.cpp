@@ -115,11 +115,35 @@ int run_aggregation(TarDatabase& db, int64_t now_epoch) {
     return ops;
 }
 
+void apply_source_enabled_transition(TarDatabase& db,
+                                      std::string_view source,
+                                      std::string_view new_value,
+                                      int64_t now_epoch) {
+    auto enabled_key = std::format("{}_enabled", source);
+    std::string prev = db.get_config(enabled_key, "true");
+    db.set_config(enabled_key, std::string{new_value});
+
+    auto paused_at_key = std::format("{}_paused_at", source);
+    if (new_value == "false" && prev != "false") {
+        db.set_config(paused_at_key, std::to_string(now_epoch));
+    } else if (new_value == "true" && prev == "false") {
+        db.set_config(paused_at_key, "0");
+    }
+}
+
 void run_retention(TarDatabase& db, int64_t now_epoch) {
     // M17: Wrap all retention deletes in a single transaction to amortize fsync cost
     db.execute_sql("BEGIN TRANSACTION");
 
     for (const auto& src : capture_sources()) {
+        // #539: Skip retention for disabled sources. The configure docstring and
+        // user-manual promise that disabling a collector "leaves existing rows
+        // queryable." Without this guard, time-based retention drains hourly
+        // within 24h, daily within 31d, monthly within ~365d after disable —
+        // breaking the forensic-preservation use case. See issue #539.
+        auto enabled_key = std::format("{}_enabled", src.name);
+        if (db.get_config(enabled_key, "true") == "false")
+            continue;
         for (const auto& g : src.granularities) {
             auto table_name = std::format("{}_{}", src.name, g.suffix);
             auto sql = retention_sql(table_name, now_epoch);

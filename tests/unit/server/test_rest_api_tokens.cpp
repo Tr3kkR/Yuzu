@@ -9,13 +9,17 @@
  *   - non-admin non-owner attempt (404, denied audit)
  *   - unknown token id (404, no audit)
  *
- * Pattern mirrors `test_mcp_server.cpp`: spin up an httplib::Server on a
- * random port, register the RestApiV1 routes with mock callbacks, and hit
- * the real HTTP surface with httplib::Client.
+ * Pattern: register RestApiV1 routes against an in-process TestRouteSink
+ * and dispatch synthesized httplib::Request objects through the captured
+ * handlers. The previous fixture stood up a real httplib::Server behind a
+ * std::thread acceptor, which crashed deterministically under TSan with
+ * no TSan report (#438) — this fixture has no socket and no acceptor
+ * thread for TSan to fight with.
  */
 
 #include "api_token_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,9 +27,10 @@
 
 #include <atomic>
 #include <chrono>
+#include "../test_helpers.hpp"
+
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -33,13 +38,11 @@ using namespace yuzu::server;
 
 namespace {
 
+// Delegates to the shared salt + atomic counter helper (#482). The prior
+// thread::id-hash ^ steady_clock scheme was the Windows MSVC flake pattern
+// #473 traced back to.
 static fs::path unique_temp_path(const std::string& prefix) {
-    return fs::temp_directory_path() /
-           (prefix + "-" +
-            std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()) ^
-                           static_cast<size_t>(std::chrono::steady_clock::now()
-                                                   .time_since_epoch()
-                                                   .count())));
+    return yuzu::test::unique_temp_path(prefix + "-");
 }
 
 struct AuditRecord {
@@ -50,9 +53,7 @@ struct AuditRecord {
 };
 
 struct RestTokensHarness {
-    httplib::Server svr;
-    std::thread server_thread;
-    int port{0};
+    yuzu::server::test::TestRouteSink sink;
 
     fs::path db_path;
     std::unique_ptr<ApiTokenStore> token_store;
@@ -99,7 +100,7 @@ struct RestTokensHarness {
         // Pass nullptr for every store except the one under test — every
         // REST handler checks for null and returns 503, so unrelated routes
         // just fail cleanly if accidentally hit.
-        api.register_routes(svr, auth_fn, perm_fn, audit_fn,
+        api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/nullptr,
                             token_store.get(),
@@ -111,22 +112,9 @@ struct RestTokensHarness {
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr,
                             /*audit_store=*/nullptr);
-
-        port = svr.bind_to_any_port("127.0.0.1");
-        REQUIRE(port > 0);
-        server_thread = std::thread([this]() { svr.listen_after_bind(); });
-        for (int i = 0; i < 100; ++i) {
-            if (svr.is_running())
-                break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-        REQUIRE(svr.is_running());
     }
 
     ~RestTokensHarness() {
-        svr.stop();
-        if (server_thread.joinable())
-            server_thread.join();
         token_store.reset();
         fs::remove(db_path);
     }
@@ -142,11 +130,11 @@ struct RestTokensHarness {
         return listing.front().token_id;
     }
 
-    httplib::Result delete_token(const std::string& token_id) {
-        httplib::Client cli("127.0.0.1", port);
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(5);
-        return cli.Delete(("/api/v1/tokens/" + token_id).c_str());
+    /// Dispatch a DELETE through the captured route handler in-process.
+    /// Returns std::unique_ptr<httplib::Response> so existing test sites
+    /// using res->status / res->body work unchanged.
+    auto delete_token(const std::string& token_id) {
+        return sink.Delete("/api/v1/tokens/" + token_id);
     }
 };
 

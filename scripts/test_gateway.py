@@ -77,6 +77,21 @@ cmd = ["rebar3", "as", "test", suite]
 if suite == "eunit":
     cmd += ["--dir", "apps/yuzu_gw/test"]
 
+    # eunit_surefire writes its XML report to the literal path declared
+    # in gateway/rebar.config eunit_opts (`{dir, "_build/test/eunit"}`),
+    # which resolves relative to the rebar3 CWD = gateway_dir. That
+    # path is NOT auto-created — `eunit_surefire:write_report/2` calls
+    # `file:open` directly and crashes with `{error,enoent}` if the
+    # directory is missing. On Linux runners with a long-lived gateway
+    # checkout the dir often pre-exists from older non-REBAR_BASE_DIR
+    # runs, hiding the bug. On the Windows runner — and on any fresh
+    # checkout — REBAR_BASE_DIR redirects rebar3's own `_build` to
+    # `_build_eunit`, so `_build/test/eunit` is never created and the
+    # surefire listener crashes after every test passes (exit 1 on the
+    # gateway eunit test even with 0 actual test failures).
+    surefire_dir = Path(gateway_dir) / "_build" / "test" / "eunit"
+    surefire_dir.mkdir(parents=True, exist_ok=True)
+
 # For CT runs, set minimal perf parameters so the heavyweight perf suite
 # finishes quickly.  The perf suite defaults to 10k agents, 50k heartbeats,
 # and a 300-second endurance test — far too long for CI.

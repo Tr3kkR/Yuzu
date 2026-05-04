@@ -31,21 +31,45 @@ kept failing Windows CI. Targeting `dev` eliminates the race.
 
 Yuzu's CI pipeline pins meson because subtle backend rewrites between
 meson minor releases have bitten us on ninja dyndep ordering. The pin
-lives in `requirements-ci.txt` at the repo root, which is the **single
-source of truth** consumed by:
+is stored in two files at the repo root:
+
+- **`requirements-ci.in`** — human-edited source-of-truth (one
+  `package==version` per line).
+- **`requirements-ci.txt`** — hash-pinned lock file auto-generated from
+  `.in` via `pip-compile --generate-hashes`. Required by OpenSSF
+  Scorecard's Pinned-Dependencies check.
+
+These are consumed by:
 
 - `.github/workflows/ci.yml` — all six jobs `pip3/pip/pipx install` from it
-- `.github/workflows/release.yml` — Windows and macOS release builds
+  (with `--require-hashes` so a tampered package breaks the install).
+- `.github/workflows/release.yml` — Windows and macOS release builds.
 
 `scripts/setup.sh` assumes a `meson` binary is already on PATH and does
 not install one — local developers are responsible for matching the
-pinned version themselves (`pip install -r requirements-ci.txt` in a
-venv is the easiest path).
+pinned version themselves (`pip install --require-hashes -r requirements-ci.txt`
+in a venv is the easiest path).
 
-Dependabot opens a PR against `requirements-ci.txt` every week if a newer
-meson is released. CI runs on the PR against the new version; if anything
-breaks, the PR stalls (which is visible on the "Dependency updates" label
-query) instead of silently landing a broken pin.
+### Bumping meson
+
+```bash
+# 1. Edit requirements-ci.in
+$EDITOR requirements-ci.in
+
+# 2. Regenerate the hash-pinned lock file
+pip install pip-tools      # if not already installed
+pip-compile --generate-hashes --strip-extras requirements-ci.in \
+            -o requirements-ci.txt
+
+# 3. Commit both files together
+git add requirements-ci.in requirements-ci.txt
+```
+
+Dependabot opens a PR bumping `requirements-ci.txt` whenever a newer
+meson is released. Accepting a Dependabot bump: pull the branch locally,
+re-run `pip-compile` to refresh the lock file hashes against the bumped
+version in `.in`, amend-commit and push. (Dependabot doesn't know about
+the `.in` file so it only updates the `.txt`; keep them in lockstep.)
 
 ### Known duplication — Dockerfile meson pins
 

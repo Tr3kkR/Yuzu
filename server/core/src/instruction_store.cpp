@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "migration_runner.hpp"
+#include "store_errors.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -27,6 +28,31 @@ int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+/// Issue #587: visualization_spec is stored as a JSON array of chart
+/// objects so the engine sees one shape. This helper takes whatever the
+/// caller supplied (object, array, or anything else) and emits a JSON
+/// array string suitable for the column.
+std::string normalize_to_array_helper(const nlohmann::json& v) {
+    if (v.is_array()) {
+        // Filter to keep only object entries; non-object array entries
+        // (null, scalar, nested array) are dropped silently. The engine
+        // does strict validation on the chart objects themselves.
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& el : v) {
+            if (el.is_object()) out.push_back(el);
+        }
+        return out.dump();
+    }
+    if (v.is_object()) {
+        // Singular spec.visualization YAML form — wrap as a 1-element array.
+        nlohmann::json out = nlohmann::json::array();
+        out.push_back(v);
+        return out.dump();
+    }
+    // Anything else (null, scalar): treat as "no visualization configured".
+    return "[]";
 }
 
 std::string col_text(sqlite3_stmt* stmt, int col) {
@@ -59,6 +85,7 @@ InstructionDefinition row_to_def(sqlite3_stmt* stmt) {
     d.min_agent_version = col_text(stmt, 20);
     d.required_plugins = col_text(stmt, 21);
     d.readable_payload = col_text(stmt, 22);
+    d.visualization_spec = col_text(stmt, 23);
     return d;
 }
 
@@ -67,7 +94,7 @@ const char* kSelectAllCols = "id, name, version, type, plugin, action, descripti
                              "created_by, created_at, updated_at, "
                              "yaml_source, parameter_schema, result_schema, approval_mode, "
                              "concurrency_mode, platforms, min_agent_version, required_plugins, "
-                             "readable_payload";
+                             "readable_payload, visualization_spec";
 
 } // namespace
 
@@ -102,11 +129,20 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
         "ALTER TABLE instruction_definitions ADD COLUMN min_agent_version TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE instruction_definitions ADD COLUMN required_plugins TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE instruction_definitions ADD COLUMN readable_payload TEXT NOT NULL DEFAULT ''",
+        // visualization_spec was deliberately moved out of this list and into
+        // migration v2 below — see governance arch-B1 / F-6. The legacy ALTER
+        // pattern stays only for columns that predate MigrationRunner.
     };
     for (const auto* m : legacy_alters) {
         sqlite3_exec(db_, m, nullptr, nullptr, nullptr); // ignore "duplicate column" errors
     }
 
+    // Issue #253: visualization_spec is added in v2 rather than retroactively
+    // edited into v1's CREATE TABLE so the migration ledger remains an
+    // accurate historical record (governance arch-B1 / F-6). The legacy
+    // ALTER above keeps pre-MigrationRunner deployments alive; v2 ensures
+    // that DBs initialised post-#253 see the column even if the legacy
+    // ALTER ever changes shape.
     static const std::vector<Migration> kMigrations = {
         {1, R"(
             CREATE TABLE IF NOT EXISTS instruction_definitions (
@@ -142,7 +178,53 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
                 created_at INTEGER NOT NULL DEFAULT 0
             );
         )"},
+        // Issue #253: chart visualization spec on InstructionDefinition.
+        // SQLite's `ALTER TABLE ADD COLUMN` is NOT idempotent — it returns
+        // SQLITE_ERROR on a duplicate column, which the migration runner
+        // treats as a fatal failure. Any DB that already has the column
+        // (e.g. a developer who ran the very first iteration of this PR
+        // before the column moved out of `legacy_alters[]`) would wedge
+        // the store. The probe-and-stamp dance below pre-records v2 in
+        // `schema_meta` for those DBs so the migration runner skips the
+        // ALTER entirely (governance arch-B2 / CP-5).
+        {2, "ALTER TABLE instruction_definitions ADD COLUMN visualization_spec "
+            "TEXT NOT NULL DEFAULT '{}';"},
     };
+    // Pre-migration probe: if `instruction_definitions` already has the
+    // visualization_spec column AND `schema_meta` says we're below v2,
+    // stamp v2 directly so the runner skips the duplicate-column ALTER.
+    // The probe is a read-only PRAGMA query — safe to run on any state.
+    {
+        sqlite3_stmt* probe = nullptr;
+        bool col_exists = false;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM pragma_table_info('instruction_definitions') "
+                               "WHERE name='visualization_spec' LIMIT 1",
+                               -1, &probe, nullptr) == SQLITE_OK) {
+            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+            sqlite3_finalize(probe);
+        }
+        int current_v = MigrationRunner::current_version(db_, "instruction_store");
+        if (col_exists && current_v < 2) {
+            // Stamp schema_meta directly. MigrationRunner::set_version is
+            // private, but the table layout is stable.
+            sqlite3_stmt* stamp = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "INSERT OR REPLACE INTO schema_meta "
+                                   "(store, version, upgraded_at) VALUES (?, 2, ?)",
+                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+                sqlite3_bind_text(stamp, 1, "instruction_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp, 2, now);
+                sqlite3_step(stamp);
+                sqlite3_finalize(stamp);
+                spdlog::info("InstructionStore: visualization_spec column already "
+                             "present, stamping schema_meta to v2 (arch-B2)");
+            }
+        }
+    }
     if (!MigrationRunner::run(db_, "instruction_store", kMigrations)) {
         spdlog::error("InstructionStore: schema migration failed, closing database");
         sqlite3_close(db_);
@@ -257,6 +339,33 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();
 
+    // #402: when caller supplies an explicit id, reject duplicates with the
+    // shared kConflictPrefix the routes layer maps to HTTP 409. The id column
+    // is PRIMARY KEY so SQLite would also reject the INSERT, but the
+    // constraint failure surfaces as a generic "insert failed" error string
+    // with no way for the route handler to distinguish a 409 from a 400. An
+    // explicit pre-check under unique_lock keeps the error code accurate.
+    //
+    // sec-LOW2 / sre-1: prepare failure is treated as a hard error rather
+    // than silently bypassing the duplicate check — under DB stress we want
+    // the 409 contract to fail closed, not to silently degrade to "INSERT
+    // anyway and hope SQLite's PK rejects it".
+    if (!def.id.empty()) {
+        sqlite3_stmt* exists_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1",
+                               -1, &exists_stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("InstructionStore: prepare failed in duplicate-id check: {}",
+                          sqlite3_errmsg(db_));
+            return std::unexpected("internal: duplicate-id check failed");
+        }
+        sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
+        sqlite3_finalize(exists_stmt);
+        if (exists)
+            return std::unexpected(std::string(kConflictPrefix) +
+                                   " instruction definition '" + id + "' already exists");
+    }
+
     const char* sql = R"(
         INSERT INTO instruction_definitions
         (id, name, version, type, plugin, action, description, enabled,
@@ -264,8 +373,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
          created_by, created_at, updated_at,
          yaml_source, parameter_schema, result_schema, approval_mode,
          concurrency_mode, platforms, min_agent_version, required_plugins,
-         readable_payload)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         readable_payload, visualization_spec)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -299,6 +408,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.min_agent_version.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.required_plugins.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
+    auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
+    sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
@@ -324,7 +435,7 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
             updated_at=?,
             yaml_source=?, parameter_schema=?, result_schema=?, approval_mode=?,
             concurrency_mode=?, platforms=?, min_agent_version=?, required_plugins=?,
-            readable_payload=?
+            readable_payload=?, visualization_spec=?
         WHERE id=?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -356,6 +467,8 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
     sqlite3_bind_text(stmt, i++, def.min_agent_version.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.required_plugins.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.readable_payload.c_str(), -1, SQLITE_TRANSIENT);
+    auto vs = def.visualization_spec.empty() ? "{}" : def.visualization_spec;
+    sqlite3_bind_text(stmt, i++, vs.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, i++, def.id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
@@ -421,6 +534,7 @@ std::string InstructionStore::export_definition_json(const std::string& id) cons
     j["min_agent_version"] = def->min_agent_version;
     j["required_plugins"] = def->required_plugins;
     j["readable_payload"] = def->readable_payload;
+    j["visualization_spec"] = def->visualization_spec;
     return j.dump(2);
 }
 
@@ -475,6 +589,38 @@ InstructionStore::import_definition_json(const std::string& json_str) {
         def.required_plugins = parsed.value("required_plugins", "");
     if (parsed.contains("readable_payload"))
         def.readable_payload = parsed.value("readable_payload", "");
+    // Issue #587: visualization_spec is stored as a JSON ARRAY of chart
+    // objects so the engine and routes only have to handle one shape.
+    // Accepted on the wire:
+    //   * single chart object         {"type": "...", ...}
+    //   * array of chart objects      [{...}, {...}]
+    //   * pre-serialized JSON string  "{\"type\":\"pie\",...}" or "[...]"
+    //   * legacy spec.visualization key from CLI YAML converters
+    //   * canonical spec.visualizations (plural) array key
+    // All forms normalise to "[{...}, {...}, ...]" before storage. Invalid
+    // / non-object array entries are silently dropped at this point —
+    // strict validation lives in the engine where the error is operator-
+    // facing.
+    auto normalize_to_array = [](const nlohmann::json& v) -> std::string {
+        if (v.is_string()) {
+            auto inner = nlohmann::json::parse(v.get<std::string>(), nullptr, false);
+            if (inner.is_discarded()) return v.get<std::string>(); // pass through
+            return normalize_to_array_helper(inner);
+        }
+        return normalize_to_array_helper(v);
+    };
+    auto pick_spec_field = [&]() -> std::optional<nlohmann::json> {
+        if (parsed.contains("visualization_spec") && !parsed["visualization_spec"].is_null())
+            return parsed["visualization_spec"];
+        if (parsed.contains("visualizations") && !parsed["visualizations"].is_null())
+            return parsed["visualizations"];
+        if (parsed.contains("visualization") && !parsed["visualization"].is_null())
+            return parsed["visualization"];
+        return std::nullopt;
+    };
+    if (auto v = pick_spec_field(); v) {
+        def.visualization_spec = normalize_to_array(*v);
+    }
 
     return create_definition_impl(def);
 }
@@ -517,6 +663,25 @@ std::expected<std::string, std::string> InstructionStore::create_set(const Instr
         return std::unexpected("name is required");
 
     auto id = s.id.empty() ? generate_id() : s.id;
+
+    // Pre-INSERT existence check so duplicate IDs return the shared
+    // kConflictPrefix-prefixed error instead of "insert failed: UNIQUE
+    // constraint failed: ...". Mirrors create_definition_impl above and
+    // is the contract the auto-import loop in server.cpp + the REST 409
+    // handler at /api/v1/instruction-sets both rely on (Gate 4 C-B1).
+    if (!s.id.empty()) {
+        sqlite3_stmt* exists_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1",
+                               -1, &exists_stmt, nullptr) != SQLITE_OK)
+            return std::unexpected("internal: duplicate-id check failed");
+        sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
+        sqlite3_finalize(exists_stmt);
+        if (exists)
+            return std::unexpected(std::string(kConflictPrefix) +
+                                   " instruction set '" + id + "' already exists");
+    }
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_,

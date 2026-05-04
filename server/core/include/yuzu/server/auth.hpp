@@ -9,6 +9,9 @@
 #include <unordered_map>
 #include <vector>
 
+namespace yuzu { class MetricsRegistry; }
+namespace yuzu::server { class AuthDB; }
+
 namespace yuzu::server::auth {
 
 /// Maximum session token length (64 hex chars = 32 bytes random). Reject longer to prevent DoS.
@@ -96,11 +99,33 @@ public:
     /// Remove a user by name.
     bool remove_user(const std::string& username);
 
+    /// Change a user's role. Uses AuthDB if available, otherwise updates in-memory + config.
+    /// Returns false if user not found.
+    bool update_role(const std::string& username, Role new_role);
+
     /// Look up a user's legacy role. Returns nullopt if user not found.
     std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;
+
+    /// Set the AuthDB instance to use for persistence.
+    /// If set, user operations go through the DB instead of config file.
+    /// If not set, falls back to config file I/O (backwards compatible).
+    void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
+
+    /// True iff a configured AuthDB is set AND it reports `is_ready()`.
+    /// Wired into /readyz; operators rely on this to detect a corrupt or
+    /// half-migrated auth.db without having to scrape spdlog. Returns
+    /// true in the legacy config-file-only path (auth_db_ == nullptr is
+    /// fine — the deployment isn't using AuthDB) so the readyz signal
+    /// only fires on an actual AuthDB integrity failure.
+    bool is_auth_db_ok() const noexcept;
+
+    /// Set the metrics registry for emitting login-latency histograms.
+    /// Optional; if null, authenticate() emits no metric (used by tests
+    /// that don't construct the server's MetricsRegistry).
+    void set_metrics_registry(yuzu::MetricsRegistry* m) { metrics_ = m; }
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
@@ -207,6 +232,12 @@ private:
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
     mutable std::unordered_map<std::string, Session> sessions_;
+
+    // Non-owning pointer to AuthDB; if set, persistence goes through DB.
+    yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    // Non-owning pointer to MetricsRegistry; null in tests/CLI tools.
+    yuzu::MetricsRegistry* metrics_ = nullptr;
 
     // Enrollment tokens keyed by token_id
     std::unordered_map<std::string, EnrollmentToken> enrollment_tokens_;

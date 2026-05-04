@@ -140,5 +140,88 @@ class TestProtocVersionCheck(unittest.TestCase):
         self.assertIn('gen_proto.py: using libprotoc 27.3', result.stdout)
 
 
+class TestIncludeFlatten(unittest.TestCase):
+    """Flatten-include regex must only strip yuzu/ prefixes.
+
+    The moment a Yuzu proto imports `google/protobuf/<something>.proto`
+    (e.g. Timestamp), protoc emits `#include "google/protobuf/*.pb.h"` in
+    the generated .pb.cc/.pb.h. Those includes must resolve via the
+    vcpkg protobuf include root, so they cannot be flattened — a broader
+    regex would rewrite them to `#include "<something>.pb.h"` and break
+    the build on every target. Regression guard for this.
+    """
+
+    def setUp(self):
+        # Re-derive the exact flatten logic from gen_proto.py by running it
+        # against a synthetic input — avoids re-implementing the regex here.
+        self.tmpdir = tempfile.mkdtemp(prefix='yuzu_flatten_test_')
+        self.outdir = os.path.join(self.tmpdir, 'out')
+        os.makedirs(self.outdir)
+        self.sample_pb = os.path.join(self.outdir, 'sample.pb.cc')
+        with open(self.sample_pb, 'w') as f:
+            f.write(
+                '// Generated sample\n'
+                '#include "yuzu/common/v1/common.pb.h"\n'
+                '#include "yuzu/agent/v1/agent.pb.h"\n'
+                '#include "yuzu/guardian/v1/guaranteed_state.pb.h"\n'
+                '#include "google/protobuf/timestamp.pb.h"\n'
+                '#include "google/protobuf/descriptor.pb.h"\n'
+            )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _run_flatten(self):
+        """Invoke gen_proto.py's flatten pass by running it end-to-end.
+
+        With no protos in argv[5:], the protoc-compilation loop is skipped
+        but the post-processing flatten loop still runs over whatever
+        *.pb.* files exist under outdir — so the pre-seeded sample.pb.cc
+        gets rewritten.
+        """
+        # Use a mock protoc that returns a valid version (compilation loop
+        # is skipped because argv[5:] is empty).
+        mock = os.path.join(self.tmpdir, 'mock_protoc')
+        if sys.platform == 'win32':
+            mock = os.path.join(self.tmpdir, 'mock_protoc.bat')
+            with open(mock, 'w') as f:
+                f.write('@echo libprotoc 27.3\n@exit /B 0\n')
+        else:
+            with open(mock, 'w') as f:
+                f.write('#!/usr/bin/env python3\n')
+                f.write('import sys\n')
+                f.write('if "--version" in sys.argv:\n')
+                f.write('    print("libprotoc 27.3")\n')
+                f.write('    sys.exit(0)\n')
+                f.write('sys.exit(0)\n')
+            os.chmod(mock, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+
+        result = subprocess.run(
+            [sys.executable, GEN_PROTO, self.outdir, mock,
+             os.devnull, self.tmpdir],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with open(self.sample_pb, 'r') as f:
+            return f.read()
+
+    def test_yuzu_includes_are_flattened(self):
+        out = self._run_flatten()
+        self.assertIn('#include "common.pb.h"', out)
+        self.assertIn('#include "agent.pb.h"', out)
+        self.assertIn('#include "guaranteed_state.pb.h"', out)
+
+    def test_google_protobuf_includes_are_preserved(self):
+        # Regression guard for the ci-B1 bug caught in PR 1 governance:
+        # the prior regex was `(?:[^"/]+/)*` which stripped ALL prefixes
+        # including `google/protobuf/`. That would cause every C++ target
+        # to fail to compile guaranteed_state.pb.cc because
+        # `#include "timestamp.pb.h"` doesn't resolve anywhere.
+        out = self._run_flatten()
+        self.assertIn('#include "google/protobuf/timestamp.pb.h"', out)
+        self.assertIn('#include "google/protobuf/descriptor.pb.h"', out)
+
+
 if __name__ == '__main__':
     unittest.main()

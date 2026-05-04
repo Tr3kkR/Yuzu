@@ -11,8 +11,9 @@
 #   CH-2  — grep -cE on zero-match → arithmetic doesn't break, correct count
 #   CH-3  — coverage --capture-baselines refuses when TEST_RC != 0
 #   CH-4  — gcovr root-wrapper schema → WARN, not silent 0%
-#   CH-6  — perf-gate parser drift (few metrics) → FAIL with clear message
-#   CH-8  — __seed sentinel honored → WARN, not silent PASS
+#   CH-6  — perf-gate parser drift (no metrics) → WARN with clear message
+#   CH-8  — coverage __seed sentinel honored → WARN, not silent PASS
+#          (perf half removed 2026-05-03 with the perf gate's regression logic)
 #   CH-15 — empty/whitespace/traversal --run-id rejected
 #
 # Usage:
@@ -279,30 +280,32 @@ PY
 
 scenario_CH_6() {
     echo ""
-    echo "=== CH-6: perf parser drift fails loudly ==="
+    echo "=== CH-6: perf parser drift surfaces as WARN ==="
     init_db || { bad "CH-6" "db init failed"; return; }
     local run_id="ch6"
     start_run "$run_id"
 
     # Simulate a CT run that passes but uses totally different label names
-    # (parser drift) so the parser extracts ZERO metrics.
+    # (parser drift) so the parser extracts ZERO metrics. With the gate
+    # in measure-and-report mode (2026-05-03), parser drift is a WARN
+    # rather than a FAIL — the gate no longer enforces and the WARN
+    # surfaces the drift signal without blocking the rest of the run.
     YUZU_MOCK_CT_RC=0 \
     YUZU_MOCK_CT_OUTPUT="%%% yuzu_gw_perf_SUITE:
 Registratiun: 5000 ops in 613 ms (8157 op/s)
 Heartbit queue: 20000 ops in 83 ms (240964 op/s)
 All 9 tests passed." \
     bash "$YUZU_ROOT/scripts/test/perf-gate.sh" \
-        --run-id "$run_id" \
-        --baseline "$CHAOS_ROOT/ch6-baseline.json" >/dev/null 2>&1 || true
+        --run-id "$run_id" >/dev/null 2>&1 || true
 
     local status notes
     status=$(db_gate_status "$run_id" "Perf")
     notes=$(db_gate_notes "$run_id" "Perf")
 
-    if [[ "$status" == "FAIL" ]] && [[ "$notes" == *"0 metrics parsed"* || "$notes" == *"metrics parsed"* ]]; then
-        ok "CH-6: parser drift → FAIL, notes: $notes"
+    if [[ "$status" == "WARN" ]] && [[ "$notes" == *"0 metrics parsed"* ]]; then
+        ok "CH-6: parser drift → WARN, notes: $notes"
     else
-        bad "CH-6" "expected FAIL with parser-drift message, got status='$status' notes='$notes'"
+        bad "CH-6" "expected WARN with '0 metrics parsed', got status='$status' notes='$notes'"
     fi
 }
 
@@ -361,39 +364,11 @@ EOF
         bad "CH-8" "expected WARN with 'seed' in notes, got status='$status' notes='$notes'"
     fi
 
-    # Also test the perf gate's __seed path.
-    local run_id2="ch8b"
-    start_run "$run_id2"
-    cat > "$CHAOS_ROOT/ch8-perf-baseline.json" <<'EOF'
-{
-  "__schema": "perf-baseline/v1",
-  "__seed": true,
-  "metrics": {},
-  "tolerance_pct": 10.0,
-  "hardware_fingerprint": "seed"
-}
-EOF
-    YUZU_MOCK_CT_RC=0 \
-    YUZU_MOCK_CT_OUTPUT="%%% yuzu_gw_perf_SUITE:
-Registration: 5000 ops in 613 ms (8157 ops/sec)
-Burst registration: 5000 ops in 340 ms (14706 ops/sec)
-Heartbeat queue: 20000 ops in 83 ms (240964 ops/sec)
-Fanout to 10000 agents: 42 ms (limit 100 ms)
-Cleanup 1000 agents: 150 ms (0.15 ms/agent)" \
-    bash "$YUZU_ROOT/scripts/test/perf-gate.sh" \
-        --run-id "$run_id2" \
-        --baseline "$CHAOS_ROOT/ch8-perf-baseline.json" >/dev/null 2>&1 || true
-
-    status=$(db_gate_status "$run_id2" "Perf")
-    notes=$(db_gate_notes "$run_id2" "Perf")
-
-    # perf-gate on seed baseline → exits 0 PASS (hp-B1 fix) with seed note
-    # so SKILL.md full-mode doesn't abort Phase 7 on first run.
-    if [[ "$status" == "PASS" ]] && [[ "$notes" == *"seed"* ]]; then
-        ok "CH-8: perf seed → PASS with seed note: $notes"
-    else
-        bad "CH-8" "perf seed: expected PASS+seed note, got status='$status' notes='$notes'"
-    fi
+    # Perf half of CH-8 was removed 2026-05-03 along with the perf gate's
+    # baseline-comparison logic. The perf gate no longer reads a baseline
+    # file or honors a __seed sentinel — there's nothing to test on that
+    # axis. CH-6 still exercises the parser-drift WARN path which is the
+    # only remaining "perf gate doesn't silently green-pass" guarantee.
 
     rm -rf /tmp/build-ch8 2>/dev/null || true
 }

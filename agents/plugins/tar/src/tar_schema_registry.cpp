@@ -25,6 +25,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "process",
             .dollar_name = "Process",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "toolhelp32",
+                 "CreateToolhelp32Snapshot — full pid/ppid/name/cmdline; "
+                 "cmdline retrieval requires PROCESS_QUERY_LIMITED_INFORMATION."},
+                {"linux",   OsSupportStatus::kSupported,           "procfs",
+                 "Reads /proc/<pid>/status and /proc/<pid>/cmdline."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "sysctl",
+                 "KERN_PROC_ALL via sysctl. Cmdline requires SIP-respecting "
+                 "KERN_PROCARGS2 — empty for hardened-runtime processes that "
+                 "the agent cannot inspect."},
+            },
             .granularities = {
                 {
                     .suffix = "live",
@@ -84,6 +95,22 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "tcp",
             .dollar_name = "TCP",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "iphlpapi",
+                 "GetExtendedTcpTable / GetExtendedUdpTable — polled at the "
+                 "fast collector interval. ETW Microsoft-Windows-Kernel-Network "
+                 "is planned (capture_method='etw') for sub-second connect/close "
+                 "fidelity; not yet wired."},
+                {"linux",   OsSupportStatus::kSupported,           "procfs",
+                 "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
+                 "below the fast interval may be missed."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "proc_pidfdinfo",
+                 "proc_listallpids + proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via "
+                 "libproc. Inherent TOCTOU between pid enumeration and per-fd "
+                 "query — short-lived sockets that close before the per-fd "
+                 "query may produce empty rows. Endpoint Security framework "
+                 "(kPlanned) is the modern replacement for sub-second fidelity."},
+            },
             .granularities = {
                 {
                     .suffix = "live",
@@ -153,6 +180,18 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "service",
             .dollar_name = "Service",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "scm",
+                 "EnumServicesStatusEx / QueryServiceConfig. Captures "
+                 "display_name, status, startup_type."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "systemctl",
+                 "systemctl list-units. startup_type is reported as 'unknown' "
+                 "(would require a second systemctl call per unit). Hosts "
+                 "without systemd (Alpine sysvinit, OpenRC) are unsupported."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "launchctl",
+                 "launchctl list — no startup_type, status is binary "
+                 "running/stopped only."},
+            },
             .granularities = {
                 {
                     .suffix = "live",
@@ -188,6 +227,21 @@ const std::vector<CaptureSourceDef>& build_sources() {
         {
             .name = "user",
             .dollar_name = "User",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported,           "wts",
+                 "WTSEnumerateSessionsW + WTSQuerySessionInformationW — "
+                 "captures interactive, RDP, console. Requires Terminal "
+                 "Services (always present on supported Windows; absent on "
+                 "Server Core 2008 R2 minimal installs). WTSEnumerateSessionsExW "
+                 "is the recommended successor for new code but is not yet wired."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "utmp",
+                 "Reads /var/run/utmp via getutent. Containers running with "
+                 "no /var/run/utmp produce no events. logon_type is inferred "
+                 "from tty name (pts/* -> remote)."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "utmpx",
+                 "getutxent. logon_type inferred from tty (ttys* -> remote). "
+                 "GUI logins are not always reflected in utmpx."},
+            },
             .granularities = {
                 {
                     .suffix = "live",
@@ -277,6 +331,24 @@ std::string_view ts_column_for_suffix(std::string_view suffix) {
 
 const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();
+}
+
+std::vector<std::string> accepted_capture_methods(std::string_view source_name) {
+    std::vector<std::string> methods;
+    for (const auto& src : build_sources()) {
+        if (src.name != source_name)
+            continue;
+        for (const auto& os : src.os_support) {
+            if (os.status == OsSupportStatus::kUnsupported)
+                continue;
+            std::string m{os.capture_method};
+            if (std::find(methods.begin(), methods.end(), m) == methods.end()) {
+                methods.push_back(std::move(m));
+            }
+        }
+    }
+    std::sort(methods.begin(), methods.end());
+    return methods;
 }
 
 std::string generate_warehouse_ddl() {

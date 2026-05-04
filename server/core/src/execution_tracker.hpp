@@ -11,6 +11,8 @@
 
 namespace yuzu::server {
 
+class ExecutionEventBus;
+
 struct Execution {
     std::string id;
     std::string definition_id;
@@ -26,12 +28,27 @@ struct Execution {
     int64_t completed_at{0};
     std::string parent_id;
     std::string rerun_of;
+    /// Most recent non-empty agent error_detail for this execution. Populated
+    /// only when the caller passes `ExecutionQuery::include_error_detail =
+    /// true` (LIST fragment) or via `get_execution(id)` which always opts in.
+    /// **PII-adjacent: contains agent stderr** — paths, hostnames, env values,
+    /// possibly customer data captured from a broken plugin invocation. Gate
+    /// behind `perm_fn(req, res, "Execution", "Read")` before serializing to
+    /// any caller (mirrors mcp_server.cpp:get_execution_status).
+    std::string last_error_detail;
 };
 
 struct ExecutionQuery {
     std::string definition_id;
     std::string status;
     int limit{100};
+    /// When true, populate `Execution::last_error_detail` via a correlated
+    /// subquery on `agent_exec_status`. Default false because most callers
+    /// (health probes, metrics ticks, server.cpp:1727 with limit=1000) do
+    /// not consume the field, and the per-row subquery cost amortises
+    /// poorly on hot paths (arch-B2). Set true only on the executions
+    /// LIST fragment, which renders a per-row error preview.
+    bool include_error_detail{false};
 };
 
 struct ExecutionSummary {
@@ -100,6 +117,13 @@ public:
 
     void create_tables();
 
+    /// PR 3 — attach a per-execution SSE bus. When set, every mutating call
+    /// (update_agent_status, refresh_counts, mark_cancelled) publishes a
+    /// transition event onto the bus's per-execution channel. The bus is
+    /// owned by the server; the tracker only borrows it. nullptr disables
+    /// publishing — used by harnesses that don't exercise SSE.
+    void set_event_bus(ExecutionEventBus* bus) { event_bus_ = bus; }
+
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
     std::optional<Execution> get_execution(const std::string& id) const;
@@ -111,6 +135,13 @@ public:
     std::expected<std::string, std::string> create_execution(const Execution& exec);
     void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
+
+    /// PR 2: set agents_targeted post-creation. Used by the workflow execute
+    /// handler which now creates the execution row BEFORE dispatch (to thread
+    /// execution_id into cmd_dispatch and close the FAST-agent race UP2-4),
+    /// then updates `agents_targeted` once dispatch confirms how many agents
+    /// the command actually reached.
+    void set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
@@ -125,6 +156,8 @@ public:
 private:
     sqlite3* db_;
     mutable std::recursive_mutex mtx_;
+    /// Borrowed — owned by the server. nullptr = no SSE publishing.
+    ExecutionEventBus* event_bus_{nullptr};
 };
 
 } // namespace yuzu::server

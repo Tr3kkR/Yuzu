@@ -116,9 +116,9 @@ std::string escape_pipes(std::string_view s) {
     return out;
 }
 
-// ── Subprocess helper (Linux / macOS) ────────────────────────────────────────
+// ── Subprocess helper (macOS) ────────────────────────────────────────────────
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__APPLE__)
 std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
@@ -761,7 +761,7 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
                  const std::vector<ConnectionInfo>& conns) {
     for (const auto& port_str : ports) {
         uint16_t target_port = 0;
-        auto [ptr, ec] =
+        [[maybe_unused]] auto [ptr, ec] =
             std::from_chars(port_str.data(), port_str.data() + port_str.size(), target_port);
         if (ec != std::errc{}) {
             ctx.write_output(

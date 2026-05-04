@@ -6,6 +6,7 @@
  */
 
 #include "instruction_store.hpp"
+#include "store_errors.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -471,4 +472,110 @@ TEST_CASE("InstructionStore: timestamps set on create", "[instruction_store][ext
     REQUIRE(fetched.has_value());
     CHECK(fetched->created_at > 0);
     CHECK(fetched->updated_at > 0);
+}
+
+// ── Duplicate-id guard (#402) ──────────────────────────────────────────────
+
+TEST_CASE("InstructionStore: explicit duplicate id rejected with conflict prefix",
+          "[instruction_store][duplicate]") {
+    InstructionStore store(":memory:");
+
+    auto first = make_question("First", "1.0");
+    first.id = "test.os.info";
+    auto first_result = store.create_definition(first);
+    REQUIRE(first_result.has_value());
+    CHECK(*first_result == "test.os.info");
+
+    // Re-using the same explicit id must surface as "conflict:" so the route
+    // layer can map it to HTTP 409 instead of the generic 400.
+    auto second = make_question("Second", "1.0");
+    second.id = "test.os.info";
+    auto second_result = store.create_definition(second);
+    REQUIRE_FALSE(second_result.has_value());
+    CHECK(is_conflict_error(second_result.error()));
+
+    // First definition is unchanged — no silent overwrite.
+    auto fetched = store.get_definition("test.os.info");
+    REQUIRE(fetched.has_value());
+    CHECK(fetched->name == "First");
+}
+
+TEST_CASE("InstructionStore: empty id still gets generated UUID with no conflict",
+          "[instruction_store][duplicate]") {
+    InstructionStore store(":memory:");
+
+    auto a = make_question("Alpha");
+    auto b = make_question("Bravo");
+    // Both with empty def.id — store generates UUIDs, no duplicate-id path.
+    auto ra = store.create_definition(a);
+    auto rb = store.create_definition(b);
+    REQUIRE(ra.has_value());
+    REQUIRE(rb.has_value());
+    CHECK(*ra != *rb);
+}
+
+// Governance Gate 4 C-B1 / arch-B1 / QE-B2 regression — pin the contract
+// the boot-time auto-import loop in server.cpp depends on. Both
+// import_definition_json and create_set MUST return kConflictPrefix-
+// prefixed errors on duplicate id; substring matches like "already exists"
+// are NOT the contract.
+TEST_CASE("InstructionStore: kConflictPrefix has the documented literal value",
+          "[instruction_store][duplicate]") {
+    // Pin the LITERAL VALUE, not just the identifier. Governance Gate 4
+    // UP-11: a future refactor that "fixes" the constant from "conflict:"
+    // to e.g. "already exists:" would move both the producer (store) and
+    // every consumer-side find(kConflictPrefix) test in lock-step, leaving
+    // no test failure — but the auto-import loop in server.cpp also uses
+    // is_conflict_error() and would silently regress if a third consumer
+    // used a substring match. Pinning the literal here is the only way to
+    // detect a constant rename that drops the documented prefix shape.
+    CHECK(std::string_view(kConflictPrefix) == "conflict:");
+}
+
+TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPrefix",
+          "[instruction_store][duplicate][import]") {
+    InstructionStore store(":memory:");
+
+    const std::string envelope = R"({
+        "id":"test.import.dup",
+        "name":"Test Import Dup",
+        "version":"1.0",
+        "type":"question",
+        "plugin":"os_info",
+        "action":"os_name",
+        "yaml_source":"---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: test.import.dup\n  displayName: Test Import Dup\n"
+    })";
+
+    auto first = store.import_definition_json(envelope);
+    REQUIRE(first.has_value());
+
+    auto second = store.import_definition_json(envelope);
+    REQUIRE_FALSE(second.has_value());
+    INFO("actual error: " << second.error());  // Catch2 prints only on failure
+    CHECK(is_conflict_error(second.error()));  // contract for boot-time auto-import
+    CHECK(second.error().find(kConflictPrefix) == 0);
+}
+
+TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
+          "[instruction_store][duplicate][set]") {
+    InstructionStore store(":memory:");
+
+    InstructionSet s;
+    s.id = "test.set.dup";
+    s.name = "Test Set Dup";
+    s.created_by = "test";
+
+    auto first = store.create_set(s);
+    REQUIRE(first.has_value());
+    CHECK(*first == "test.set.dup");
+
+    auto second = store.create_set(s);
+    REQUIRE_FALSE(second.has_value());
+    // Pre-fix this returned "insert failed: UNIQUE constraint failed: ..."
+    // — the boot-time auto-import substring-matched "already exists" and
+    // miscounted every reboot's bundled sets as `errored`. Pin the
+    // kConflictPrefix contract so a future refactor cannot regress it.
+    INFO("actual error: " << second.error());  // Catch2 prints only on failure
+    CHECK(is_conflict_error(second.error()));
+    CHECK(second.error().find(kConflictPrefix) == 0);
 }

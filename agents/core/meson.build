@@ -1,15 +1,17 @@
-# Platform-specific crypto for updater SHA-256 verification
-# Windows: bcrypt.lib linked via #pragma comment(lib) in source files
-if host_machine.system() != 'windows'
-  agent_openssl_dep = dependency('openssl', required: true, include_type: 'system')
-  agent_crypto_deps = [agent_openssl_dep]
-else
-  agent_crypto_deps = []
-endif
+# OpenSSL is required on every platform — used by:
+#   * updater.cpp + plugin_loader.cpp SHA-256 (Linux/macOS path; Windows
+#     SHA-256 still goes through bcrypt for the digest, but
+#   * plugin_loader.cpp CMS signature verification needs OpenSSL
+#     unconditionally (CMS_verify, X509_STORE) so the verifier behaves
+#     identically on all hosts. On Windows libssl/libcrypto are already
+#     linked transitively via gRPC; this declaration just brings in the
+#     include path so #include <openssl/cms.h> resolves.
+agent_openssl_dep = dependency('openssl', required: true, include_type: 'system')
+agent_crypto_deps = [agent_openssl_dep]
 
 yuzu_agent_core_lib = shared_library(
   'yuzu_agent_core',
-  files('src/agent.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/sdk_utilities.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
+  files('src/agent.cpp', 'src/cert_discovery.cpp', 'src/cert_store.cpp', 'src/cloud_identity.cpp', 'src/guardian_engine.cpp', 'src/identity_store.cpp', 'src/kv_store.cpp', 'src/plugin_loader.cpp', 'src/process_enum.cpp', 'src/sdk_utilities.cpp', 'src/temp_file.cpp', 'src/trigger_engine.cpp', 'src/updater.cpp'),
   include_directories: [
     include_directories('include'),
     include_directories('../../sdk/include'),

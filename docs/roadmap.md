@@ -80,7 +80,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.18 | [#218](https://github.com/Tr3kkR/Yuzu/issues/218) | Device Discovery (Unmanaged Endpoints) | Done |
 | | 7.19 | [#235](https://github.com/Tr3kkR/Yuzu/issues/235) | Timeline Activity Record (TAR) | Done |
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
-| **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | Open |
+| **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
 | | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | Open |
 | | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
 | **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
@@ -123,6 +123,17 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 14.4 | [#293](https://github.com/Tr3kkR/Yuzu/issues/293) | vCenter Connector | Open |
 | | 14.5 | [#294](https://github.com/Tr3kkR/Yuzu/issues/294) | Additional Connectors (BigFix, O365, Oracle) | Open |
 | | 14.6 | [#295](https://github.com/Tr3kkR/Yuzu/issues/295) | High Availability (Active-Passive) | Open |
+| **15** | 15.A | [#547](https://github.com/Tr3kkR/Yuzu/issues/547) | TAR dashboard page shell + retention-paused source list | **In progress — PR-A.A shipped** (paused_at + status extension + dashboard page + Scan + Re-enable; purge action + persistence pending) |
+| | 15.B | [#548](https://github.com/Tr3kkR/Yuzu/issues/548) | Result-set store + REST API (composable scope, the differentiator) | Open |
+| | 15.C | [#549](https://github.com/Tr3kkR/Yuzu/issues/549) | Scope-engine `from_result_set:` + dashboard chip + sidebar + breadcrumb | Open |
+| | 15.D | [#550](https://github.com/Tr3kkR/Yuzu/issues/550) | TAR SQL frame: relocate, scope-walking-aware, "save as result set" | Open |
+| | 15.E | [#551](https://github.com/Tr3kkR/Yuzu/issues/551) | YAML DSL `fromResultSet:` + `definition_store` validation + spec amendment | Open |
+| | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | Open |
+| | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | Open |
+| | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer (seed snapshot + reconstruction from `process_live`) | Open (gated on agent service-install hardening) |
+| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | **In progress** (PRs 1-2 shipped) |
+| | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open (gated on 16.A soak) |
+| | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
 
 ## Current Status
 
@@ -136,14 +147,16 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | 5: Policy Engine | 5 | 0 | 5 | 100% |
 | 6: Windows Depth | 6 | 0 | 6 | 100% |
 | 7: Scale & Integration | 20 | 0 | 20 | 100% |
-| 8: Visualization & Response Experience | 0 | 3 | 3 | 0% |
+| 8: Visualization & Response Experience | 1 | 2 | 3 | 33% |
 | 9: Connector Framework & Multi-Source Inventory | 0 | 8 | 8 | 0% |
 | 10: Software Catalog & License Compliance | 0 | 4 | 4 | 0% |
 | 11: Consumer Model & Platform Extensibility | 0 | 4 | 4 | 0% |
 | 12: Remaining Agent Capabilities | 0 | 13 | 13 | 0% |
 | 13: Security Hardening & Operational Polish | 0 | 5 | 5 | 0% |
 | 14: Scale & Enterprise Readiness | 0 | 6 | 6 | 0% |
-| **Total** | **72** | **43** | **115** | **63%** |
+| 15: TAR Dashboard & Scope Walking | 0 | 8 | 8 | 0% |
+| 16: System Guardian — Real-Time GS | 0 | 3 | 3 | 0% |
+| **Total** | **73** | **53** | **126** | **58%** |
 
 **Scaffolded** means DDL/structs/stubs exist but business logic is not wired. See `docs/Instruction-Engine.md` for Phase 2 scaffold details.
 
@@ -935,27 +948,14 @@ Embedded MCP server at `POST /mcp/v1/` using JSON-RPC 2.0 transport. Enables AI 
 
 *Make collected data actionable with charts, templates, and processing pipelines.*
 
-### Issue 8.1: Response Visualization Engine
-**Capabilities:** 20.6 (partial), new | **Scope:** Server | **Status:** Open
+### Issue 8.1: Response Visualization Engine :white_check_mark:
+**Capabilities:** 20.6 (partial), new | **Scope:** Server | **Status:** Done
 
-Add chart rendering to instruction response views with server-side data transformation:
-- Built-in processors: SingleSeries, MultiSeries, DateTimeSeries
-- Chart types: Pie, Bar, Column, Line, Area (rendered via lightweight JS chart library in HTMX pages)
-- Configuration via `spec.visualization` in InstructionDefinition YAML:
-  ```yaml
-  spec:
-    visualization:
-      charts:
-        - type: pie
-          title: "OS Distribution"
-          x: os_name
-          y: count
-          processor: single_series
-  ```
-- REST endpoint: `GET /api/v1/executions/{id}/visualization`
-- Dashboard: embedded chart cards in execution detail view
+Server-side chart rendering for instruction responses. `spec.visualization` (singular) or `spec.visualizations` (canonical plural for multi-chart) on `InstructionDefinition`. Five chart types (`pie`, `bar`, `column`, `line`, `area`) × three processors (`single_series`, `multi_series`, `datetime_series`) with camelCase fields (`labelField`, `valueField`, `seriesField`, `xField`, `yField`, `maxCategories`, `valueLabel`); snake_case forms accepted as deprecated aliases. REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Dashboard auto-renders a chart deck above the results table by reverse-resolving the dispatched `(plugin, action)` to a chart-bearing definition (`InstructionDefinition:Read` required for chart to appear). Renderer is Apache ECharts 5 (vendored at `server/core/vendor/echarts.min.js`, served at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that maps the visualization payload onto ECharts options and reads Yuzu design tokens (`--mds-color-chart-*`) for theming, so re-skinning Yuzu re-skins every chart with no JS rebuild. Engine row cap 10 000 with `rows_capped: true` flag; label cardinality cap 10 000.
 
-**Files:** New `server/core/src/visualization_engine.cpp`, `server/core/src/instruction_ui.cpp`, `server/core/src/rest_api_v1.cpp`
+Six demo charts ship as default examples — `content/definitions/visualization_demo_set.yaml` (`InstructionSet demo.visualization.fleet-posture`) and `content/packs/visualization-demo-pack.yaml` (`ProductPack pack.demo.visualization`) — covering vulnerability severity (the headline pie), Defender real-time protection, disk encryption protection state, firewall state per profile (multi-series column), certificate issuer breakdown (top-N + Other), and OS distribution.
+
+**Files:** `server/core/src/visualization_engine.{hpp,cpp}`, `server/core/src/charts_js_bundle.cpp`, `server/core/src/instruction_store.{hpp,cpp}` (visualization_spec column + MigrationRunner v2), `server/core/src/rest_api_v1.cpp`, `server/core/src/dashboard_routes.{hpp,cpp}`, `docs/yaml-dsl-spec.md` § `spec.visualization`, `docs/user-manual/instructions.md` § Response Visualization, plus `tests/unit/server/test_visualization_engine.cpp` and `tests/unit/server/test_rest_visualization.cpp`.
 
 ### Issue 8.2: Response Templates
 **Capability:** 20.6 | **Scope:** Server | **Status:** Open
@@ -1480,6 +1480,199 @@ Active-passive failover for server resilience:
 
 ---
 
+## Phase 15: TAR Dashboard & Scope Walking
+
+*The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated TAR page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in `docs/scope-walking-design.md` §10.*
+
+### Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List
+**Capability:** new | **Scope:** Server (dashboard + REST) + TAR plugin (status extension) | **Status:** In progress
+
+New `/tar` page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source `<source>_paused_at` timestamp added to `tar.status`, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`, `agents/plugins/tar/src/tar_plugin.cpp`, new `tests/unit/server/test_tar_dashboard_*`. Design: `docs/tar-dashboard.md` §3.
+
+### Issue 15.B: Result-Set Store + REST API
+**Capability:** new (foundational) | **Scope:** Server | **Status:** Open
+
+`result_set_store.cpp` with new `result_sets.db`. Schema per `docs/scope-walking-design.md` §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: `POST /api/v1/result-sets`, `from-inventory-query`, `from-tar-query`, `from-instruction-result`, `GET .../{id}`, `.../{id}/members`, `.../{id}/lineage`, `pin` / `unpin` / `re-eval`, `DELETE`. Audit hooks per §9.
+
+**Files:** new `server/core/src/result_set_store.{cpp,hpp}`, new `server/core/src/result_set_routes.cpp`, `migration_runner.cpp`. Design: `docs/scope-walking-design.md` §3, §6, §9.
+
+### Issue 15.C: Scope Engine `from_result_set:` + Dashboard Chip + Sidebar + Breadcrumb
+**Capability:** 1.6 (extension) | **Scope:** Server | **Status:** Open
+**Depends on:** 15.B
+
+Scope Engine grammar gains `from_result_set:<id-or-alias>` as a third short-circuit kind alongside `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT`. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors `parent_id` walks; scope chip surfaces in TAR / inventory / instruction frames.
+
+**Files:** `server/core/src/scope_engine.{cpp,hpp}`, `server/core/src/dashboard_routes.cpp`, `server/core/src/dashboard_ui.cpp`. Design: `docs/scope-walking-design.md` §4, §8.
+
+### Issue 15.D: TAR SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 15.A, 15.B, 15.C
+
+Relocate the existing `/fragments/tar-sql` route onto the TAR dashboard page. Wire scope-chip resolution to `from_result_set:` (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with `source_kind=tar_query`, members = union of agents that returned ≥1 row by default. Default name is `tar-<5-char-sql-hash>`.
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `server/core/src/agent_service_impl.cpp` (TAR result envelope to carry the producing agent IDs explicitly). Design: `docs/tar-dashboard.md` §4.
+
+### Issue 15.E: YAML DSL `fromResultSet:` + `definition_store` Validation + Spec Amendment
+**Capability:** new | **Scope:** Server (DSL) | **Status:** Open
+**Depends on:** 15.B, 15.C
+
+`scope:` block in `InstructionDefinition`, `InstructionSet`, `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) form. Validation: `fromResultSet + assignment.managementGroups` rejected at YAML load; `fromResultSet` requires `assignment.mode = static`. Resolution at instruction *invocation* time, not load time. Spec section in `docs/yaml-dsl-spec.md`.
+
+**Files:** `server/core/src/definition_store.cpp`, `server/core/src/policy_store.cpp`, `docs/yaml-dsl-spec.md`. Design: `docs/scope-walking-design.md` §7.
+
+### Issue 15.F: Reference Walkthrough — Chrome IR End-to-End Integration Test
+**Capability:** new (regression net) | **Scope:** Tests | **Status:** Open
+**Depends on:** 15.B, 15.C, 15.D, 15.E
+
+`tests/integration/test_chrome_ir_chain.cpp` drives the full §10 walkthrough against a live UAT stack with synthetic agents. Asserts: each step's audit row carries `parent_result_set_id` and `result_result_set_id`; the resulting lineage chain is complete; pinning prevents mid-incident GC; the final un-quarantine + watch step terminates cleanly. The reference test for end-to-end correctness — when this passes, scope walking is real.
+
+**Files:** `tests/integration/test_chrome_ir_chain.cpp`, supporting fixtures in `scripts/uat/synthetic-fleet.sh`. Design: `docs/scope-walking-design.md` §10.
+
+### Issue 15.G: Operational Hardening — Live Re-Eval, GC Sweep, Prometheus + Audit Polish
+**Capability:** new | **Scope:** Server | **Status:** Open
+**Depends on:** 15.B
+
+Live re-eval (`POST /api/v1/result-sets/{id}/re-eval`); background GC sweep every 5 min; per-operator 10K result-set quota + 50 pin cap with `429 RESULT_SET_QUOTA` / `409 PIN_LIMIT`; Prometheus metrics (`yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram, GC counter, quota-rejection counter); audit polish on every state transition.
+
+**Files:** `server/core/src/result_set_store.cpp`, `server/core/src/result_set_routes.cpp`, `server/core/src/server.cpp`. Design: `docs/scope-walking-design.md` §3.3, §9.
+
+### Issue 15.H: TAR Process Tree Viewer
+**Capability:** new (forensic) | **Scope:** TAR plugin + Server (renderer) | **Status:** Open (gated on agent service-install hardening readiness)
+
+`tar.process_tree` agent action walks `/proc` (Linux), `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` (Windows), `proc_listallpids` + `proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)` (macOS). Stores tagged `action='seed'` rows in `process_live` per PID. Server reconstructs the tree by replaying seed + subsequent `started` / `stopped` events from `process_live`. Renderer: collapsible nested `<details>` / `<summary>` for v1, no graph library. Time-slicing via `?as_of=<ts>`. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live `ps`. Cmdline redaction reuses `tar_plugin.cpp` `load_redaction_patterns`.
+
+Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder (`docs/yuzu-guardian-windows-implementation-plan.md` and successors). The viewer ships with honest "observation window" badging; the hardening track does not block this issue.
+
+**Files:** `agents/plugins/tar/src/tar_plugin.cpp` (new `do_process_tree`), new `agents/plugins/tar/src/tar_process_tree_collector.{cpp,hpp}` (cross-platform walks), `server/core/src/dashboard_routes.cpp` (renderer), new `server/core/src/tar_process_tree_reconstruct.{cpp,hpp}`. Design: `docs/tar-dashboard.md` §5.
+
+---
+
+## Phase 16: System Guardian — Real-Time Agent-Side Guaranteed State
+
+*The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. PolicyStore (Phase 5) covers server-side compliance evaluation on a 5-minute poll; this phase covers the **kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable** agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — a 5-minute window is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: `docs/yuzu-guardian-design-v1.1.md` (architecture), `docs/yuzu-guardian-windows-implementation-plan.md` (Windows-first 17-PR delivery ladder).*
+
+### Issue 16.A: System Guardian — Windows-first delivery
+**Capability:** 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | **Scope:** Agent (Windows) + Server | **Status:** In progress (PRs 1-2 shipped)
+**GitHub:** [#555](https://github.com/Tr3kkR/Yuzu/issues/555)
+
+End-to-end Windows enforcement using kernel-backed user-mode APIs:
+- **Event guards (~0 ms latency)** — RegNotifyChangeKeyValue (Registry Guard), NotifyServiceStatusChange (SCM Guard), FwpmFilterSubscribeChanges0 (WFP Guard), OpenTrace + ProcessTrace with session pooling (ETW Guard).
+- **Condition guards (configurable interval)** — Process Guard (hybrid ETW + ToolHelp32), Software Guard (Registry Uninstall + WMI), Compliance Guard (Event Log + WMI), WMI Guard (arbitrary query).
+- **Pre-login activation** — agent service `SERVICE_AUTO_START` + `FailureActions`; `GuardianEngine::start_local()` runs before Register RPC.
+- **Offline capable** — policy cached in `kv_store.db` `__guardian__` namespace; enforcement continues when server is unreachable.
+- **Operator surface** — `/guaranteed-state` dashboard page (rule list + event timeline + kernel-wiring health), HTMX rule editor, approval workflow via existing `ApprovalManager`, MCP read-only tools, HMAC rule signing with `CredWrite`/`CredRead` key storage, quarantine integration via WFP block-all filter at weight 65535.
+
+PRs 1-2 (proto, server store, agent scaffolding, REST + dispatch hook) shipped. PRs 3-15 in `docs/yuzu-guardian-windows-implementation-plan.md`. 14 prerequisite issues already filed (#452-#457, #477-#479, #483, #485, #487, #488, #491).
+
+**Files (anticipated):** `proto/yuzu/guardian/v1/guaranteed_state.proto` (shipped), `server/core/src/guaranteed_state_store.{hpp,cpp}` (shipped), `agents/core/src/guardian_engine.{hpp,cpp}` (shipped), `agents/core/src/guard_*.{hpp,cpp}` (PR 3+), `agents/core/src/state_evaluator.{hpp,cpp}`, `agents/core/src/remediation_engine.{hpp,cpp}`, `agents/core/src/guard_audit.{hpp,cpp}`, `server/core/src/dashboard_guaranteed_state.{hpp,cpp}` (PR 4).
+
+### Issue 16.B: System Guardian — Linux delivery
+**Capability:** 31.4, 31.6 (Linux) | **Scope:** Agent (Linux) | **Status:** Open
+**Depends on:** 16.A soak | **GitHub:** [#556](https://github.com/Tr3kkR/Yuzu/issues/556)
+
+Linux equivalents of Windows event guards: Inotify Guard (`inotify_add_watch`), Netlink Guard (`NETLINK_KOBJECT_UEVENT`), D-Bus Guard (`org.freedesktop.systemd1` signals), Audit Guard (`auditd` consumer for syscall-level assertions), Sysctl Guard (`/proc/sys` watch + write remediation). Linux-specific assertion types (`config-file-key-equals`, `kernel-param-equals`, `selinux-mode-enforcing`). Remediation methods: systemd D-Bus service control, atomic file rewrite, `sysctl -w`, package install/remove via dpkg/rpm.
+
+**Why gated on Windows soak:** the architectural primitives (state evaluator, remediation engine, resilience strategies, audit journal) are platform-agnostic — only the guard implementations are platform-specific. Building Linux before Windows soak risks discovering a primitive-level bug that the Windows track would have caught first.
+
+**Files:** new `agents/core/src/guard_inotify.{cpp,hpp}`, `guard_netlink.{cpp,hpp}`, `guard_dbus.{cpp,hpp}`, `guard_audit_linux.{cpp,hpp}`, `guard_sysctl.{cpp,hpp}` (all Linux-only); `agents/core/meson.build` Linux block adding `libdbus-1`, `libaudit` deps.
+
+### Issue 16.C: System Guardian — macOS delivery
+**Capability:** 31.5, 31.6 (macOS) | **Scope:** Agent (macOS) | **Status:** Open
+**Depends on:** 16.A + 16.B soak, Endpoint Security entitlement | **GitHub:** [#557](https://github.com/Tr3kkR/Yuzu/issues/557)
+
+macOS equivalents using Apple's Endpoint Security (ES) framework — *requires the `com.apple.developer.endpoint-security.client` entitlement*, which Apple grants per-bundle-ID after Developer Program enrolment and notarisation review (typically 4-8 weeks). Without ES the macOS surface is reduced to FSEvents Guard (`fseventsd` consumer) + Launchd Guard (plist polling + `launchctl` poll). macOS-specific assertion types (`plist-key-equals`, `launchd-service-running`, `xprotect-version-current`, `gatekeeper-enabled`). Remediation: plist serialisation + atomic write, `launchctl bootstrap`/`bootout`, `spctl --master-enable`.
+
+**Entitlement gating** is tracked out-of-band in the customer-facing release-readiness doc; the issue ships in two phases — degraded surface first (FSEvents + Launchd, no ES), full surface when entitlement lands.
+
+**Files:** new `agents/core/src/guard_endpoint_security.{cpp,hpp}` (macOS, ES-entitlement-gated), `guard_fsevents.{cpp,hpp}` (macOS), `guard_launchd.{cpp,hpp}` (macOS).
+
+---
+
+## Phase 17: Agentic Surface Hardening (Proposed)
+
+*Implements the four agentic-first invariants from `docs/agentic-first-principle.md` (A1 dashboard parity, A2 discovery, A3 observability, A4 error envelope). Source: `docs/capability-agentic-audit-2026-05.md` §7 P1. Every operation a human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface.*
+
+### Issue 17.1: Introspection Endpoints (`/api/v1/discover/*`)
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+
+`/api/v1/discover/routes` (sourced from `openapi_spec()`), `/discover/plugins` (sourced from registered `PluginInfo`), `/discover/scope-kinds`, `/discover/permissions` (RBAC catalog), `/discover/instructions`. Each mirrored as an MCP tool (`discover_routes`, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements **A2**.
+
+**Files:** new `server/core/src/discovery_routes.{cpp,hpp}`, `mcp_server.cpp` tool registration, `docs/agentic-first-principle.md` §A2.
+
+### Issue 17.2: Dashboard JSON Content Negotiation
+**Capability:** new | **Scope:** Server (dashboard) | **Status:** Proposed
+
+Honor `Accept: application/json` on `/fragments/*` page routes; return structured rows/columns/links/actions parallel to the HTML fragment. First-cut targets the admin surfaces (user mgmt, enrollment-token administration, settings panels). Existing fragments are not retroactively required to comply — backfill is opportunistic, A1 applies to new routes from the date of adoption. Implements **A1**.
+
+**Files:** `server/core/src/dashboard_routes.cpp`, `dashboard_ui.cpp`, fragment route handlers.
+
+### Issue 17.3: Agent-Facing JSON SSE Channel
+**Capability:** new | **Scope:** Server (REST) | **Status:** Proposed
+
+`/api/v1/events?since=&filter=execution_id:X|agent_id:Y` emits structured JSON envelopes (not HTML fragments) on the same `event_bus_` and `ExecutionEventBus` that drive the existing HTMX `/events`. Patterns after `/api/v1/guaranteed-state/events` (`rest_api_v1.cpp:2498`). Decide separately whether to deprecate the HTML-fragment `/events` channel or keep both. Implements **A3**.
+
+**Files:** new `server/core/src/agent_sse_routes.{cpp,hpp}`, reuse `server.cpp:2450-2478` infrastructure.
+
+### Issue 17.4: Service-Account Principal Type
+**Capability:** new | **Scope:** Server (auth) | **Status:** Proposed
+
+`auth_db` migration adds `principal_type IN ('user','service_account')`. Service accounts can be scoped to mgmt-group / plugin / operation subsets. Token rotation pair-overlap workflow exposed via REST. Required for least-privilege agentic worker identity in multi-tenant deployments. Touches A2 (discovery surface for service-account scopes).
+
+**Files:** `server/core/src/auth_db.{cpp,hpp}`, `auth_routes.{cpp,hpp}`, `auth_manager.cpp`, new migration.
+
+### Issue 17.5: Structured Error Envelope Rev
+**Capability:** new | **Scope:** Server (REST + MCP) | **Status:** Proposed
+
+Every failure response includes `correlation_id`, `retry_after_ms` (nullable), `remediation` (URL or hint, nullable). On `kPermissionDenied` name the missing `securable_type:operation`. On `kApprovalRequired` return `approval_id` + `status_url`. Implements **A4**.
+
+**Files:** `mcp_jsonrpc.hpp`, every REST handler emitting an error response, OpenAPI spec.
+
+---
+
+## Phase 18: Compliance & Lifecycle (Proposed)
+
+*Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: `docs/capability-agentic-audit-2026-05.md` §7 P3.*
+
+### Issue 18.1: Vulnerability Lifecycle
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CVE → CVSS → owner → SLA → remediation tracking. Supplements existing `vuln_scan` plugin with a server-side lifecycle store. Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.
+
+### Issue 18.2: Compliance Reporting Templates
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CIS Benchmarks, NIST 800-171, SOC 2 evidence-pack templates that compose PolicyStore rules + audit log entries into auditor-ready PDF/CSV bundles.
+
+### Issue 18.3: Certificate Lifecycle
+**Capability:** new | **Scope:** Server + agent | **Status:** Proposed
+
+Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate inventory (capability §3.8) with lifecycle.
+
+### Issue 18.4: Secrets-Vault Integration
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+HashiCorp Vault, Azure Key Vault, AWS Secrets Manager connectors for connector credentials and enrollment tokens. Replaces SQLite-encrypted-at-rest for shops with a vault.
+
+### Issue 18.5: SBOM Ingest
+**Capability:** new | **Scope:** Server | **Status:** Proposed
+
+CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on `openssl-1.1.1k` lights up every fleet host carrying that component.
+
+### Issue 18.6: Hardware Attestation
+**Capability:** new | **Scope:** Agent + server | **Status:** Proposed
+
+TPM, Secure Boot, UEFI verification. Reports posture state into compliance reporting (18.2).
+
+### Out of scope (documented exclusions)
+
+- **MDM (mobile)** — partner integration only; Yuzu's agent surface is workstation + server, not iOS / Android.
+- **OS deployment / imaging / PXE** — partner integration only; out of scope for endpoint management.
+- **EDR-class telemetry at the agent** — integrate via Phase 9 connectors to existing EDR (CrowdStrike, SentinelOne, MS Defender for Endpoint); do not re-implement at the agent.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |
@@ -1565,13 +1758,15 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope)
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates and 8.3 Response Offloading remain.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)
 5. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12)
 6. **Phase 13** — Security hardening & polish (2FA, branding, MCP write tools)
 7. **Phase 14** — Scale & enterprise readiness (P2P, multi-gateway, HA — large deployment needs)
+8. **Phase 15** — TAR dashboard + scope walking (composable scope from previous query results — the product differentiator). 8-step PR ladder; PR-A (TAR page + retention-paused list) is in flight. Full design in `docs/tar-dashboard.md` and `docs/scope-walking-design.md`. Reference walkthrough: Chrome IR.
+9. **Phase 16** — System Guardian (real-time agent-side guaranteed state). The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Windows-first 17-PR ladder per `docs/yuzu-guardian-windows-implementation-plan.md`; PRs 1-2 shipped, PR 3+ open. Linux + macOS phases gated on Windows soak. Without this phase, "policy engine equivalent" overclaims.
 
 ---
 
@@ -1594,6 +1789,8 @@ Phases 0–7 are complete. For the remaining phases, execution order is based on
 | 12: Agent Capabilities | 13 | 13 |
 | 13: Security & Polish | 5 | 5 |
 | 14: Scale & Enterprise | 6 | 6 |
-| **Total** | **115** | **141** |
+| 15: TAR Dashboard & Scope Walking | 8 | 8 |
+| 16: System Guardian (Real-Time GS) | 3 | 10 |
+| **Total** | **126** | **159** |
 
 Plus 4 future-tier items tracked but not scheduled. The remaining capabilities are covered by existing "Done" implementations.

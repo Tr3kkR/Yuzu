@@ -11,17 +11,19 @@ namespace yuzu::server {
 // ── Allowed keys (safe for runtime modification) ─────────────────────────────
 
 static const std::vector<std::string> kAllowedKeys = {
-    "heartbeat_timeout",      // seconds before marking agent offline
-    "response_retention_days", // days to keep instruction responses
-    "audit_retention_days",    // days to keep audit events
-    "auto_approve_enabled",    // "true" or "false"
-    "log_level",               // trace|debug|info|warn|error
+    "heartbeat_timeout",             // seconds before marking agent offline
+    "response_retention_days",       // days to keep instruction responses
+    "audit_retention_days",          // days to keep audit events
+    "guardian_event_retention_days", // days to keep guaranteed-state events
+    "auto_approve_enabled",          // "true" or "false"
+    "log_level",                     // trace|debug|info|warn|error
     "oidc_issuer",             // OIDC issuer URL
     "oidc_client_id",          // OIDC client ID
     "oidc_client_secret",      // OIDC client secret (encrypted at rest via SQLite)
     "oidc_redirect_uri",       // OIDC redirect URI
     "oidc_admin_group",        // OIDC admin group ID
     "oidc_skip_tls_verify",    // "true" or "false"
+    "plugin_signing_required", // see plugin_signing::kPluginSigningRequiredKey — must match
 };
 
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
@@ -167,7 +169,7 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
         }
     }
 
-    if (key == "auto_approve_enabled") {
+    if (key == "auto_approve_enabled" || key == "plugin_signing_required") {
         if (value != "true" && value != "false")
             return std::unexpected("value must be 'true' or 'false'");
     }

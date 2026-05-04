@@ -7,6 +7,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/version.hpp>
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
 #include "web_utils.hpp"
@@ -16,6 +17,7 @@
 
 #include "agent.grpc.pb.h"
 #include "analytics_event.hpp"
+#include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
@@ -25,15 +27,19 @@
 #include "data_export.hpp"
 #include "deployment_store.hpp"
 #include "discovery_store.hpp"
+#include "execution_event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+// Visualization engine consumers live in dashboard_routes.cpp (#589) and
+// rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
+#include "guaranteed_state_store.hpp"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -112,9 +118,11 @@
 
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -145,14 +153,22 @@ extern const char* const kSettingsHtml;
 // Help and Instruction management pages (separate TUs).
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
+extern const char* const kTarPageHtml;
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
-// Shared design system assets (css_bundle.cpp, icons_svg.cpp).
-extern const char* const kYuzuCss;
+// Shared design system assets (icons_svg.cpp + build-time embed targets).
 extern const char* const kYuzuIconsSvg;
 extern const std::string kHtmxJs;
 extern const std::string kSseJs;
+namespace yuzu::server {
+extern const std::string kYuzuCss;       // server/core/static/yuzu.css (build-time embed)
+extern const std::string kYuzuChartsJs;
+extern const std::string kEChartsJs;     // server/core/vendor/echarts.min.js (Apache-2.0)
+extern const std::string_view kInterVariableWoff2;  // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
+extern const std::vector<std::string> kBundledDefinitions;  // build-time embed of content/definitions/
+extern const std::vector<std::string> kBundledSets;         // build-time embed of content/packs/*sets*
+}  // namespace yuzu::server
 
 namespace yuzu::server {
 
@@ -233,6 +249,32 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // Audit-pipeline observability (governance PR4 OBS-4). Increments when
+        // audit_store->add_event()'s SQLite step does not return DONE — pages
+        // operators that the audit chain itself is degraded.
+        metrics_.describe("yuzu_server_audit_emit_failed_total",
+                          "Audit events that failed to persist (sqlite3_step != DONE)",
+                          "counter");
+        // Login-latency observability (governance PR4 OBS-2). Histogram of
+        // PBKDF2 verify duration, labelled by result so alerts can fire on
+        // success-path regressions independently of brute-force noise on
+        // bad_password / unknown_user.
+        metrics_.describe("yuzu_auth_login_duration_seconds",
+                          "Login PBKDF2 verify latency in seconds, by method and result",
+                          "histogram");
+        // Guardian observability (#452 §6). Sized at zero before ingest
+        // starts so Prometheus alert rules on these metric names can be
+        // authored up front — e.g. events_total > 5e6 as an early-warning
+        // for reaper failure or retention misconfiguration.
+        metrics_.describe("yuzu_server_guardian_rules_total",
+                          "Total Guaranteed-State rules persisted", "gauge");
+        metrics_.describe("yuzu_server_guardian_events_total",
+                          "Total Guaranteed-State events currently persisted", "gauge");
+        metrics_.describe("yuzu_server_guardian_events_written_total",
+                          "Cumulative Guaranteed-State events ever written (pre-reap)", "counter");
+        metrics_.describe("yuzu_server_guardian_events_reaped_total",
+                          "Cumulative Guaranteed-State events deleted by the retention reaper",
+                          "counter");
         // Process health metrics (capability 22.1)
         metrics_.describe("yuzu_server_cpu_usage_percent",
                           "Server process CPU usage percentage", "gauge");
@@ -244,9 +286,36 @@ public:
                           "Number of in-flight command executions", "gauge");
         metrics_.describe("yuzu_server_uptime_seconds",
                           "Server process uptime in seconds", "gauge");
+        // PR 5b — surface ExecutionEventBus internals so SREs can alert on
+        // SSE backpressure (events_dropped non-zero rate), retention-window
+        // sizing (gc_channels_total trend), and live-subscriber load
+        // (subscribers_active gauge). Pairs with the bounded ring buffer
+        // contract documented in CLAUDE.md "Executions-history ladder PR 3".
+        metrics_.describe("yuzu_server_sse_channels_active",
+                          "Per-execution SSE channels currently in the bus map",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_subscribers_active",
+                          "Total live SSE subscribers across all channels",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_events_dropped_total",
+                          "Cumulative SSE events dropped by the ring buffer "
+                          "(slow-subscriber backpressure signal)",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_gc_sweeps_total",
+                          "Cumulative ExecutionEventBus GC sweeps run",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_gc_channels_total",
+                          "Cumulative SSE channels reaped after retention "
+                          "window + zero subscribers",
+                          "counter");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
+
+        // Wire metrics registry into auth manager so authenticate() can
+        // observe login latency. Optional in tests/CLI tools that don't
+        // construct a ServerImpl (auth_mgr_.metrics_ stays nullptr there).
+        auth_mgr_.set_metrics_registry(&metrics_);
 
         // Create gateway upstream service if configured
         if (!cfg_.gateway_upstream_address.empty()) {
@@ -307,24 +376,50 @@ public:
             oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
-        // Setup file logger
+        // Setup file logger.
+        //
+        // The default platform log paths (/var/log/yuzu on Linux,
+        // C:\ProgramData\Yuzu\logs on Windows, ~/Library/Logs/Yuzu on macOS)
+        // may not exist or be writable in containerised or rootless
+        // deployments. Issue #624: when the directory cannot be created we
+        // used to log a WARN + ERROR pair on every boot which made operators
+        // think the server was broken. The file logger is best-effort
+        // observability, not load-bearing — if the path is unwritable we
+        // log a single info line and proceed. Operators who want file
+        // logging can pass --log-file explicitly (handled separately in
+        // main.cpp).
         auto log_path = detail::server_log_path();
         auto parent = log_path.parent_path();
+        bool parent_ready = parent.empty();
         if (!parent.empty()) {
             std::error_code ec;
             std::filesystem::create_directories(parent, ec);
+            parent_ready = !ec;
             if (ec) {
-                spdlog::warn("Could not create log directory {}: {}", parent.string(),
-                             ec.message());
+                // INFO not DEBUG (governance Gate 7): default loglevel is INFO,
+                // so DEBUG is invisible — operators auditing the SOC 2 evidence
+                // chain or troubleshooting "where did my logs go?" need a single
+                // visible breadcrumb. WARN was the original UX bug (false-positive
+                // scary message on every container boot when the directory simply
+                // didn't exist). INFO is the canonical "single startup crumb"
+                // level — appears in default operator output, no alarm semantics.
+                spdlog::info("Default log directory {} not creatable ({}); "
+                             "skipping default file logger. Pass --log-file to override.",
+                             parent.string(), ec.message());
             }
         }
-        try {
-            file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
-            file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
-            file_logger_->flush_on(spdlog::level::info);
-            spdlog::info("Log file: {}", log_path.string());
-        } catch (const spdlog::spdlog_ex& ex) {
-            spdlog::error("Failed to create file logger: {}", ex.what());
+        if (parent_ready) {
+            try {
+                file_logger_ = spdlog::basic_logger_mt("server_file", log_path.string());
+                file_logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [server] %v");
+                file_logger_->flush_on(spdlog::level::info);
+                spdlog::info("Log file: {}", log_path.string());
+            } catch (const spdlog::spdlog_ex& ex) {
+                // INFO not DEBUG — see rationale on the create_directories
+                // branch above.
+                spdlog::info("Default file logger unavailable ({}); "
+                             "pass --log-file to override.", ex.what());
+            }
         }
 
         // Initialize NVD CVE database
@@ -419,14 +514,123 @@ public:
                 // so that consumers are destroyed before the pool closes the DB.
                 instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
                 if (instr_db_pool_->is_open()) {
+                    // PR 3 — per-execution SSE event bus. Constructed
+                    // before the tracker so the tracker can attach
+                    // immediately and we keep the "bus outlives tracker"
+                    // invariant that the member-order comment encodes.
+                    execution_event_bus_ = std::make_unique<ExecutionEventBus>();
                     execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
                     execution_tracker_->create_tables();
+                    execution_tracker_->set_event_bus(execution_event_bus_.get());
 
                     approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
                     approval_manager_->create_tables();
 
                     schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
                     schedule_engine_->create_tables();
+                }
+
+                // Auto-import shipped content from content/definitions/ and
+                // content/packs/. The build-time embed_content.py script
+                // converts each YAML doc to a JSON envelope; we walk the
+                // arrays and upsert. Conflicts on already-existing ids are
+                // expected on second-and-later startups and silently
+                // skipped — content is the source of truth at boot, not
+                // override of in-place operator edits.
+                //
+                // Conflict detection uses is_conflict_error() against the
+                // shared kConflictPrefix (Gate 4 C-B1 / arch-B1). Substring
+                // matching on "already exists" was fragile to localization
+                // and to error-string drift in the store layer.
+                //
+                // Audit emission: each successful import or skip writes one
+                // audit_store entry with principal="system" — closes Gate 6
+                // COMP-1 / sec-M2. Errors include the JSON envelope's `id`
+                // field in both the audit detail and the spdlog warning so
+                // operators can triage without reading 200+ envelopes by
+                // hand (Gate 6 SRE-O2).
+                {
+                    auto audit_bundle = [this](std::string_view target_type,
+                                                const std::string& target_id,
+                                                std::string_view result,
+                                                const std::string& detail) {
+                        // Hardening round 1 INFO — audit_store_ is
+                        // initialized at server.cpp:394, before this
+                        // block at :441; the null branch is unreachable
+                        // today. Guard with an error log so a future
+                        // re-ordering surfaces immediately rather than
+                        // silently dropping boot-content audit events.
+                        if (!audit_store_) {
+                            spdlog::error("bundled_content audit dropped: "
+                                          "audit_store_ not initialized "
+                                          "(target_type={} target_id={})",
+                                          target_type, target_id);
+                            return;
+                        }
+                        AuditEvent ev{};
+                        ev.timestamp      = std::time(nullptr);
+                        ev.principal      = "system";
+                        ev.principal_role = "system";
+                        ev.action         = "content.bundled_import";
+                        ev.target_type    = std::string(target_type);
+                        ev.target_id      = target_id;
+                        ev.detail         = detail;
+                        ev.result         = std::string(result);
+                        audit_store_->log(ev);
+                    };
+                    auto envelope_id = [](const std::string& env) -> std::string {
+                        auto p = nlohmann::json::parse(env, nullptr, false);
+                        return p.is_discarded() ? std::string{}
+                                                : p.value("id", std::string{});
+                    };
+                    int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
+                    for (const auto& env : kBundledDefinitions) {
+                        auto id = envelope_id(env);
+                        auto r = instruction_store_->import_definition_json(env);
+                        if (r) {
+                            ++defs_imported;
+                            audit_bundle("InstructionDefinition", *r,
+                                         "success", "boot-time content embed");
+                        } else if (is_conflict_error(r.error())) {
+                            ++defs_skipped;
+                        } else {
+                            ++defs_errored;
+                            spdlog::warn("bundled definition import failed: id={} error={}",
+                                         id, r.error());
+                            audit_bundle("InstructionDefinition", id,
+                                         "error", r.error());
+                        }
+                    }
+                    int sets_imported = 0, sets_skipped = 0, sets_errored = 0;
+                    for (const auto& env : kBundledSets) {
+                        auto parsed = nlohmann::json::parse(env, nullptr, false);
+                        if (parsed.is_discarded()) { ++sets_errored; continue; }
+                        InstructionSet s;
+                        s.id          = parsed.value("id", "");
+                        s.name        = parsed.value("name", s.id);
+                        s.description = parsed.value("description", "");
+                        s.created_by  = parsed.value("created_by", "system");
+                        if (s.id.empty()) { ++sets_errored; continue; }
+                        auto r = instruction_store_->create_set(s);
+                        if (r) {
+                            ++sets_imported;
+                            audit_bundle("InstructionSet", *r,
+                                         "success", "boot-time content embed");
+                        } else if (is_conflict_error(r.error())) {
+                            ++sets_skipped;
+                        } else {
+                            ++sets_errored;
+                            spdlog::warn("bundled set import failed: id={} error={}",
+                                         s.id, r.error());
+                            audit_bundle("InstructionSet", s.id,
+                                         "error", r.error());
+                        }
+                    }
+                    spdlog::info(
+                        "bundled content: {} definitions imported / {} skipped / {} errored; "
+                        "{} sets imported / {} skipped / {} errored",
+                        defs_imported, defs_skipped, defs_errored,
+                        sets_imported, sets_skipped, sets_errored);
                 }
             }
         }
@@ -474,6 +678,21 @@ public:
             policy_store_ = std::make_unique<PolicyStore>(policy_db);
             if (policy_store_ && policy_store_->is_open()) {
                 spdlog::info("PolicyStore initialized at {}", policy_db.string());
+            }
+        }
+
+        // Guardian (Guaranteed State) rule + event store. REST/dashboard/push
+        // wiring lands in later PRs; this PR stands the store up with its
+        // retention reaper so the schema migration runs, the database file
+        // exists, and bounded growth is the default from day one (#452 §5).
+        {
+            auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
+            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
+                gs_db, cfg_.guardian_event_retention_days);
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
+                guaranteed_state_store_->start_cleanup();
+                spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
+                             gs_db.string(), cfg_.guardian_event_retention_days);
             }
         }
 
@@ -586,9 +805,16 @@ public:
 
             if (!cfg_.mgmt_tls_server_cert.empty() || !cfg_.mgmt_tls_server_key.empty() ||
                 !cfg_.mgmt_tls_ca_cert.empty()) {
-                auto mgmt_tls =
-                    build_tls_credentials(cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key,
-                                          cfg_.mgmt_tls_ca_cert, true, "management listener");
+                // The management listener is governed by the SAME insecure-TLS gate
+                // as the agent listener (issue #79 / C-79-1). An operator who supplies
+                // --management-cert/--management-key without --management-ca-cert must
+                // also pass --insecure-skip-client-verify (which itself requires
+                // YUZU_ALLOW_INSECURE_TLS=1) — otherwise build_tls_credentials refuses.
+                // Previously this was hardcoded `true`, which silently accepted any
+                // unauthenticated peer on the management plane.
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key,
+                    cfg_.mgmt_tls_ca_cert, cfg_.allow_one_way_tls, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
                     return;
@@ -700,6 +926,45 @@ public:
                         .set(static_cast<double>(audit_store_->events_written("denied")));
                     metrics_.gauge("yuzu_server_audit_events_total", {{"result", "other"}})
                         .set(static_cast<double>(audit_store_->events_written("other")));
+                    // OBS-4: surface audit-pipeline persistence failures.
+                    metrics_.gauge("yuzu_server_audit_emit_failed_total")
+                        .set(static_cast<double>(audit_store_->emit_failed_count()));
+                }
+                // PR 5b — ExecutionEventBus observability. Same scrape-as-
+                // gauge pattern used for AuditStore + GuaranteedStateStore
+                // counters above; the bus exposes the counters via lock-
+                // free atomic accessors so reading from this thread is safe.
+                if (execution_event_bus_) {
+                    metrics_.gauge("yuzu_server_sse_channels_active")
+                        .set(static_cast<double>(execution_event_bus_->channel_count()));
+                    metrics_.gauge("yuzu_server_sse_subscribers_active")
+                        .set(static_cast<double>(execution_event_bus_->subscribers_total()));
+                    metrics_.gauge("yuzu_server_sse_events_dropped_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->events_dropped_total()));
+                    metrics_.gauge("yuzu_server_sse_gc_sweeps_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->gc_sweeps_total()));
+                    metrics_.gauge("yuzu_server_sse_gc_channels_total")
+                        .set(static_cast<double>(
+                            execution_event_bus_->gc_channels_total()));
+                }
+                // Guardian scalars + cumulative write/reap counters. Use
+                // gauges for the count-now values (SQL COUNT(*)) and for the
+                // cumulative-but-serialized-as-gauge counters exposed by
+                // the store — matches the existing audit_store pattern so
+                // the /metrics shape stays consistent across subsystems.
+                if (guaranteed_state_store_) {
+                    metrics_.gauge("yuzu_server_guardian_rules_total")
+                        .set(static_cast<double>(guaranteed_state_store_->rule_count()));
+                    metrics_.gauge("yuzu_server_guardian_events_total")
+                        .set(static_cast<double>(guaranteed_state_store_->event_count()));
+                    metrics_.gauge("yuzu_server_guardian_events_written_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->events_written_total()));
+                    metrics_.gauge("yuzu_server_guardian_events_reaped_total")
+                        .set(static_cast<double>(
+                            guaranteed_state_store_->events_reaped_total()));
                 }
                 // Process health sampling (22.1)
                 {
@@ -724,6 +989,51 @@ public:
             }
             spdlog::info("Fleet health recomputation thread stopped");
         });
+
+        // Periodic reminder when TLS is disabled or weakened (issue #79 + C-79
+        // family). Logs at ERROR level every 5 minutes AND writes an audit event
+        // so SOC 2 CC7.2 evidence is collected for the duration the server runs
+        // in a degraded posture (otherwise spdlog-only output would not survive
+        // log rotation or land in audit.db).
+        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
+        const bool no_tls_active = !cfg_.tls_enabled;
+        if (insecure_skip_verify_active || no_tls_active) {
+            insecure_tls_reminder_thread_ = std::thread([this, insecure_skip_verify_active,
+                                                        no_tls_active]() {
+                using namespace std::chrono_literals;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
+                    for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
+                         ++i) {
+                        std::this_thread::sleep_for(5s);
+                    }
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    const char* posture = no_tls_active ? "--no-tls"
+                                                        : "--insecure-skip-client-verify";
+                    const char* detail =
+                        no_tls_active
+                            ? "TLS is fully disabled; both agent and management gRPC "
+                              "listeners accept plaintext from any peer with no encryption "
+                              "and no peer authentication. Restart with TLS certificates "
+                              "to leave this posture."
+                            : "Agent / management listener still running without client "
+                              "certificate verification. Re-enable mTLS by supplying "
+                              "--ca-cert (and --management-ca-cert if applicable).";
+                    spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
+                    if (audit_store_ && audit_store_->is_open()) {
+                        audit_store_->log({.timestamp = std::time(nullptr),
+                                           .principal = "system",
+                                           .principal_role = "system",
+                                           .action = "server.tls_degraded",
+                                           .target_type = "server",
+                                           .target_id = posture,
+                                           .detail = detail,
+                                           .result = "warning"});
+                    }
+                }
+            });
+        }
 
         agent_server_->Wait();
     }
@@ -760,6 +1070,11 @@ public:
             health_recompute_thread_.join();
         }
 
+        // Join the insecure-TLS reminder thread (issue #79)
+        if (insecure_tls_reminder_thread_.joinable()) {
+            insecure_tls_reminder_thread_.join();
+        }
+
         if (schedule_engine_)
             schedule_engine_->stop();
         if (nvd_sync_) {
@@ -771,6 +1086,8 @@ public:
             response_store_->stop_cleanup();
         if (audit_store_)
             audit_store_->stop_cleanup();
+        if (guaranteed_state_store_)
+            guaranteed_state_store_->stop_cleanup();
 
         // Stop cert reloader before web server (it holds a pointer to web_server_)
         if (cert_reloader_) {
@@ -794,6 +1111,10 @@ public:
         // Release Phase 2 components before closing shared DB
         // Release Phase 2 components before closing shared DB (RAII handles close)
         execution_tracker_.reset();
+        // PR 3 — bus outlives the tracker by member-order convention,
+        // but in the explicit reset path we drop the tracker first
+        // (it borrows `event_bus_`), then the bus.
+        execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
@@ -851,11 +1172,13 @@ private:
                 GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
             if (!allow_one_way_tls) {
-                spdlog::error("{} TLS requires --ca-cert (or enable --allow-one-way-tls)",
+                spdlog::error("{} TLS requires --ca-cert (or enable "
+                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
                               listener_name);
                 return nullptr;
             }
-            spdlog::warn("{} TLS running without client certificate verification", listener_name);
+            spdlog::warn("{} TLS running without client certificate verification "
+                         "(--insecure-skip-client-verify)", listener_name);
         }
 
         auto creds = grpc::SslServerCredentials(ssl_opts);
@@ -1252,6 +1575,10 @@ private:
                 try {
                     cfg_.audit_retention_days = std::stoi(e.value);
                 } catch (...) {}
+            } else if (e.key == "guardian_event_retention_days") {
+                try {
+                    cfg_.guardian_event_retention_days = std::stoi(e.value);
+                } catch (...) {}
             }
             // auto_approve_enabled is read dynamically, no startup action needed
             // OIDC settings — runtime-configurable via Settings UI
@@ -1335,8 +1662,14 @@ private:
         web_server_->set_pre_routing_handler(
             [this](const httplib::Request& req,
                    httplib::Response& res) -> httplib::Server::HandlerResponse {
-                // Lightweight probes — always allowed, no auth, no rate limit
-                if (req.path == "/livez" || req.path == "/readyz") {
+                // Lightweight probes — always allowed, no auth, no rate limit.
+                // /health and /api/health are included here (governance Gate 7,
+                // unhappy-path UP-1) so monitoring integrations behind a NAT or
+                // sharing a source-IP bucket with authed REST traffic cannot
+                // 429-starve the health probe. The endpoints themselves are
+                // strictly read-only and documented as unauthenticated.
+                if (req.path == "/livez" || req.path == "/readyz" ||
+                    req.path == "/health" || req.path == "/api/health") {
                     return httplib::Server::HandlerResponse::Unhandled;
                 }
 
@@ -1350,8 +1683,15 @@ private:
                     return httplib::Server::HandlerResponse::Handled;
                 }
 
-                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec
-                if (req.path == "/login" || req.path == "/health" ||
+                // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+                // /health and /api/health are ALSO covered by the early-return
+                // exemption at the top of this lambda (which additionally skips
+                // rate limiting). They are kept in this list as defense-in-depth
+                // — a future contributor narrowing the early-return back to
+                // /livez|/readyz alone would silently start requiring auth on
+                // /health without this lower entry. Governance Gate 7, security
+                // re-review LOW. Do not remove either site without updating both.
+                if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
                     req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
                     req.path == "/api/v1/openapi.json" ||
                     req.path.starts_with("/static/")) {
@@ -1464,74 +1804,101 @@ private:
         });
 
         // -- Health endpoint (7.2) ------------------------------------------------
-        web_server_->Get("/health", [this](const httplib::Request& req, httplib::Response& res) {
+        // Mounted on both /health and /api/health (issue #620). The /api alias
+        // exists so monitoring integrations that prefix every REST call with
+        // /api/ keep working — a side-effect of #401's move from /api/health → /health.
+        auto health_handler = [this](const httplib::Request& req, httplib::Response& res) {
+            // Resolve auth FIRST so we can gate expensive work on it.
+            // Governance Gate 7 round 2 (security MEDIUM): /health and
+            // /api/health are rate-limit-exempt for monitoring stability;
+            // the bounded but non-trivial work below (SQLite scans on
+            // pending-agents and execution_tracker) must only run for
+            // authenticated callers, otherwise an unauth flood becomes a
+            // DoS amplification primitive. Unauth callers get the cheap
+            // probe response — status, uptime, agent count from in-memory
+            // registry, store ok flags from is_open() (constant-time member
+            // checks), and version. Authed callers additionally get
+            // pending-agent count, execution stats, and process sampler.
+            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
+
             auto now = std::chrono::steady_clock::now();
             auto uptime_sec = std::chrono::duration_cast<std::chrono::seconds>(
                                   now - server_start_time_)
                                   .count();
 
-            // Agent counts
+            // Cheap: in-memory agent registry count.
             auto online = registry_.agent_count();
-            auto pending_agents = auth_mgr_.list_pending_agents();
-            int pending_count = 0;
-            for (const auto& a : pending_agents) {
-                if (a.status == auth::PendingStatus::pending)
-                    ++pending_count;
-            }
 
-            // Store health
+            // Store health — is_open() is a constant-time member check, no DB I/O.
             auto response_ok = response_store_ && response_store_->is_open();
             auto audit_ok = audit_store_ && audit_store_->is_open();
             auto instruction_ok = instruction_store_ && instruction_store_->is_open();
             auto policy_ok = policy_store_ && policy_store_->is_open();
-
-            // Execution stats
-            int in_flight = 0;
-            int completed_last_hour = 0;
-            int failed_last_hour = 0;
-            if (execution_tracker_) {
-                auto running = execution_tracker_->query_executions({.status = "running"});
-                in_flight = static_cast<int>(running.size());
-                auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-                auto hour_ago = now_epoch - 3600;
-                auto recent = execution_tracker_->query_executions({.limit = 1000});
-                for (const auto& e : recent) {
-                    if (e.completed_at >= hour_ago) {
-                        if (e.status == "completed")
-                            ++completed_last_hour;
-                        else if (e.status == "failed")
-                            ++failed_last_hour;
-                    }
-                }
-            }
+            // Guardian store is load-bearing for the /api/v1/guaranteed-state/*
+            // surface; prior to inclusion here /healthz reported "healthy" while
+            // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
+            bool guaranteed_state_ok =
+                guaranteed_state_store_ && guaranteed_state_store_->is_open();
 
             // Determine overall status
-            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+            bool all_stores_ok =
+                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
                 {"status", status},
                 {"uptime_seconds", uptime_sec},
-                {"agents",
-                 {{"online", online}, {"pending", pending_count}}},
+                {"agents", {{"online", online}}},  // pending added below for authed callers
                 {"stores",
                  {{"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
-                  {"policies", policy_ok ? "ok" : "error"}}},
-                {"executions",
-                 {{"in_flight", in_flight},
-                  {"completed_last_hour", completed_last_hour},
-                  {"failed_last_hour", failed_last_hour}}},
-                {"version", "0.1.0"}};
+                  {"policies", policy_ok ? "ok" : "error"},
+                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"}}},
+                // #401: was hardcoded "0.1.0" — now derived from the
+                // meson-generated yuzu/version.hpp so the health endpoint
+                // tracks the actual build instead of a stale literal.
+                {"version", std::string(yuzu::kVersionString)}};
 
-            // Process health (22.1) — only include for authenticated requests
-            // to avoid leaking process internals to unauthenticated callers.
-            // Check auth without returning 401 (health probe must stay open).
-            bool is_authenticated = static_cast<bool>(auth_routes_->resolve_session(req));
+            // Authenticated extension — heavier work, only run when the caller
+            // has a session. Adds: agents.pending (SQLite scan), executions.*
+            // (SQLite scan + 1h-window loop), system.* (process_health_sampler).
             if (is_authenticated) {
+                auto pending_agents = auth_mgr_.list_pending_agents();
+                int pending_count = 0;
+                for (const auto& a : pending_agents) {
+                    if (a.status == auth::PendingStatus::pending)
+                        ++pending_count;
+                }
+                health["agents"]["pending"] = pending_count;
+
+                int in_flight = 0;
+                int completed_last_hour = 0;
+                int failed_last_hour = 0;
+                if (execution_tracker_) {
+                    auto running = execution_tracker_->query_executions({.status = "running"});
+                    in_flight = static_cast<int>(running.size());
+                    auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch())
+                                         .count();
+                    auto hour_ago = now_epoch - 3600;
+                    auto recent = execution_tracker_->query_executions({.limit = 1000});
+                    for (const auto& e : recent) {
+                        if (e.completed_at >= hour_ago) {
+                            if (e.status == "completed")
+                                ++completed_last_hour;
+                            else if (e.status == "failed")
+                                ++failed_last_hour;
+                        }
+                    }
+                }
+                health["executions"] = {
+                    {"in_flight", in_flight},
+                    {"completed_last_hour", completed_last_hour},
+                    {"failed_last_hour", failed_last_hour}};
+
+                // Process health (22.1) — leaks process internals so
+                // intentionally authenticated-only.
                 auto ph = process_health_sampler_.sample();
                 health["system"] = {
                     {"cpu_percent", ph.cpu_percent},
@@ -1542,7 +1909,14 @@ private:
             }
 
             res.set_content(health.dump(), "application/json");
-        });
+        };
+        // Both URLs MUST be served by the SAME handler instance — do not split
+        // into two lambda bodies. The unauthenticated `system.*` gating above
+        // is load-bearing and must run identically on both routes; forking the
+        // body invites a future regression where the alias diverges in subtle
+        // ways. Governance Gate 7, architect NICE-2.
+        web_server_->Get("/health", health_handler);
+        web_server_->Get("/api/health", health_handler);
 
         // -- Kubernetes probe endpoints (/livez, /readyz) -------------------------
         web_server_->Get("/livez", [](const httplib::Request&, httplib::Response& res) {
@@ -1579,6 +1953,15 @@ private:
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
+                {"guaranteed_state_store",
+                 guaranteed_state_store_ && guaranteed_state_store_->is_open()},
+                // PR 5b: AuthDB integrity-check coverage. Reports "ok" on
+                // legacy config-file-only deployments (auth_db_ == nullptr
+                // in AuthManager) and false only when an opted-in AuthDB
+                // failed the integrity check or migration. SOC 2 evidence:
+                // an operator can detect a corrupt auth.db without scraping
+                // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
+                {"auth_db", auth_mgr_.is_auth_db_ok()},
             };
 
             std::string failed_list;
@@ -1619,7 +2002,10 @@ private:
                              bool audit_ok = audit_store_ && audit_store_->is_open();
                              bool instruction_ok = instruction_store_ && instruction_store_->is_open();
                              bool policy_ok = policy_store_ && policy_store_->is_open();
-                             bool all_ok = response_ok && audit_ok && instruction_ok && policy_ok;
+                             bool guaranteed_state_ok =
+                                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+                             bool all_ok = response_ok && audit_ok && instruction_ok &&
+                                           policy_ok && guaranteed_state_ok;
 
                              // Execution stats
                              int in_flight = 0;
@@ -1706,6 +2092,8 @@ private:
                              config_obj["heartbeat_timeout"] = cfg_.session_timeout.count();
                              config_obj["response_retention_days"] = cfg_.response_retention_days;
                              config_obj["audit_retention_days"] = cfg_.audit_retention_days;
+                             config_obj["guardian_event_retention_days"] =
+                                 cfg_.guardian_event_retention_days;
                              config_obj["auto_approve_enabled"] = !auto_approve_.list_rules().empty();
                              config_obj["log_level"] = spdlog::level::to_string_view(
                                                            spdlog::default_logger()->level())
@@ -1765,6 +2153,32 @@ private:
                                  return;
                              }
 
+                             // Validate integer-typed keys BEFORE persisting so a
+                             // non-numeric or negative value does not silently land
+                             // in RuntimeConfigStore while leaving cfg_ at the old
+                             // value (the prior `try { stoi } catch (...) {}` path
+                             // was a ghost-write: store persists, cfg ignores,
+                             // operator sees 200 with no effect). UP-R5 from the
+                             // Guardian PR 2 governance re-run.
+                             const bool is_int_key =
+                                 key == "heartbeat_timeout" ||
+                                 key == "response_retention_days" ||
+                                 key == "audit_retention_days" ||
+                                 key == "guardian_event_retention_days";
+                             int parsed_int = 0;
+                             if (is_int_key) {
+                                 auto first = value.data();
+                                 auto last = value.data() + value.size();
+                                 auto [ptr, ec] = std::from_chars(first, last, parsed_int);
+                                 if (ec != std::errc{} || ptr != last || parsed_int < 0) {
+                                     res.status = 400;
+                                     res.set_content(
+                                         R"({"error":{"code":400,"message":"value must be a non-negative integer"},"meta":{"api_version":"v1"}})",
+                                         "application/json");
+                                     return;
+                                 }
+                             }
+
                              // Get username from session
                              auto session = require_auth(req, res);
                              if (!session)
@@ -1779,19 +2193,17 @@ private:
                                  return;
                              }
 
-                             // Apply the change to in-memory config
+                             // Apply the change to in-memory config. Integer keys
+                             // parsed above; direct assignment here means no
+                             // second `try { stoi }` that could swallow errors.
                              if (key == "heartbeat_timeout") {
-                                 try {
-                                     cfg_.session_timeout = std::chrono::seconds(std::stoi(value));
-                                 } catch (...) {}
+                                 cfg_.session_timeout = std::chrono::seconds(parsed_int);
                              } else if (key == "response_retention_days") {
-                                 try {
-                                     cfg_.response_retention_days = std::stoi(value);
-                                 } catch (...) {}
+                                 cfg_.response_retention_days = parsed_int;
                              } else if (key == "audit_retention_days") {
-                                 try {
-                                     cfg_.audit_retention_days = std::stoi(value);
-                                 } catch (...) {}
+                                 cfg_.audit_retention_days = parsed_int;
+                             } else if (key == "guardian_event_retention_days") {
+                                 cfg_.guardian_event_retention_days = parsed_int;
                              }
                              // log_level is applied inside RuntimeConfigStore::set()
 
@@ -2032,10 +2444,16 @@ private:
         });
 
         // -- Static design-system assets ----------------------------------------
+        // CSS is served with no-cache so dashboard skin iteration during
+        // active dev/UAT is picked up on a normal browser reload. The bundle
+        // is ~22 KB; revalidation cost is negligible. Switch back to
+        // max-age + content-hashed URL for prod once the skin stabilises.
         web_server_->Get("/static/yuzu.css",
                          [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=3600");
-                             res.set_content(kYuzuCss, "text/css; charset=utf-8");
+                             res.set_header("Cache-Control",
+                                            "no-cache, no-store, must-revalidate");
+                             res.set_content(yuzu::server::kYuzuCss,
+                                             "text/css; charset=utf-8");
                          });
         web_server_->Get("/static/icons.svg",
                          [](const httplib::Request&, httplib::Response& res) {
@@ -2052,6 +2470,45 @@ private:
                              res.set_header("Cache-Control", "public, max-age=86400");
                              res.set_content(kSseJs, "application/javascript; charset=utf-8");
                          });
+        // Issue #253: response visualization renderer.
+        // /static/echarts.min.js is the vendored Apache ECharts 5 library
+        // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
+        // that maps our chart payload onto ECharts options and reads
+        // Yuzu design-system CSS tokens for theming. Both are cached aggressively
+        // because the bundle is content-addressed by binary version.
+        web_server_->Get(
+            "/static/echarts.min.js",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kEChartsJs,
+                                "application/javascript; charset=utf-8");
+            });
+        // Inter variable webfont (SIL OFL) — the Yuzu design system's
+        // default family. Single woff2 covers all weights via font-
+        // variation-settings on the @font-face declaration in
+        // css_bundle.cpp.
+        web_server_->Get(
+            "/static/fonts/InterVariable.woff2",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=2592000, immutable");
+                // Zero-copy: pass the byte view's data+size directly so we
+                // don't allocate a 345 KB std::string per fetch. (Gate 3
+                // cpp-S1.) httplib's set_content(const char*, size_t, ...)
+                // copies into the response buffer once.
+                res.set_content(yuzu::server::kInterVariableWoff2.data(),
+                                yuzu::server::kInterVariableWoff2.size(),
+                                "font/woff2");
+            });
+
+        web_server_->Get(
+            "/static/yuzu-charts.js",
+            [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kYuzuChartsJs,
+                                "application/javascript; charset=utf-8");
+            });
+
+        // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
         // -- Dashboard (unified UI) -------------------------------------------
         web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
@@ -2812,6 +3269,22 @@ private:
             res.set_content(kHelpHtml, "text/html; charset=utf-8");
         });
 
+        // -- TAR dashboard page (Phase 15.A — issue #547) --------------------
+        // Auth required because the page makes HTMX calls to retention-paused
+        // and (later) SQL fragment endpoints that themselves require auth +
+        // RBAC; loading the page unauthenticated would just produce a blank
+        // shell that immediately redirects on first fragment request. Mirror
+        // the /instructions pattern.
+        web_server_->Get("/tar",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session) {
+                                 res.set_redirect("/login");
+                                 return;
+                             }
+                             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
+                         });
+
         // -- Instruction management page --------------------------------------
         web_server_->Get("/instructions",
                          [this](const httplib::Request& req, httplib::Response& res) {
@@ -2904,6 +3377,11 @@ private:
             try {
                 auto j = nlohmann::json::parse(req.body);
                 InstructionDefinition def;
+                // #402 / iter-H1: honor caller-supplied `id` so the
+                // duplicate-id guard in create_definition_impl actually
+                // fires from this endpoint. Prior code dropped the id on
+                // the floor, leaving #402's protection store-only.
+                def.id = j.value("id", "");
                 def.name = j.value("name", "");
                 def.version = j.value("version", "1.0");
                 def.type = j.value("type", "");
@@ -2935,8 +3413,22 @@ private:
 
                 auto result = instruction_store_->create_definition(def);
                 if (!result) {
-                    res.status = 400;
-                    res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                    // #402: store-level kConflictPrefix maps to HTTP 409. The
+                    // prefix is an internal store↔route contract — strip it
+                    // before placing the message in the operator-facing JSON
+                    // body (governance enterprise-N1). Emit a denied audit
+                    // event so duplicate-id probing leaves a trace
+                    // (governance compliance-1, up-18).
+                    bool is_conflict = is_conflict_error(result.error());
+                    res.status = is_conflict ? 409 : 400;
+                    if (is_conflict) {
+                        audit_log(req, "instruction.create", "denied",
+                                  "instruction", def.id, "duplicate_id");
+                    }
+                    auto body_msg = is_conflict
+                        ? std::string(strip_conflict_prefix(result.error()))
+                        : result.error();
+                    res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                     "application/json");
                     return;
                 }
@@ -3109,8 +3601,22 @@ private:
 
             auto result = instruction_store_->import_definition_json(req.body);
             if (!result) {
-                res.status = 400;
-                res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
+                // iter-H2: /import shares the create_definition_impl path,
+                // so it inherits the kConflictPrefix → 409 mapping that the
+                // POST handler does. Without this mapping the import path
+                // returns 400 with the raw "conflict:" prefix in the body
+                // — defeats the prefix-stripping contract on the very
+                // endpoint that exercises duplicate-id rejection most.
+                bool is_conflict = is_conflict_error(result.error());
+                res.status = is_conflict ? 409 : 400;
+                if (is_conflict) {
+                    audit_log(req, "instruction.import", "denied",
+                              "instruction", "", "duplicate_id");
+                }
+                auto body_msg = is_conflict
+                    ? std::string(strip_conflict_prefix(result.error()))
+                    : result.error();
+                res.set_content(nlohmann::json({{"error", body_msg}}).dump(),
                                 "application/json");
                 return;
             }
@@ -4264,31 +4770,44 @@ private:
                     }
                 }
                 return {"", ""};
-            });
+            },
+            &metrics_,
+            instruction_store_.get());
 
         // WorkflowRoutes — /fragments/executions, /fragments/schedules, /api/workflows/*,
         //                   /api/workflow-executions/*, /api/product-packs/*, /api/scope/estimate
+        //
+        // PR 2.5 (#670): deps-struct refactor. All 15 dependencies now flow
+        // through `WorkflowRoutes::Deps` so PR 3's SSE event-bus addition is
+        // a single new field, not a 17th parameter.
         workflow_routes_ = std::make_unique<WorkflowRoutes>();
-        workflow_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, audit_fn,
-            [this](const std::string& event_type, const httplib::Request& req) {
-                emit_event(event_type, req);
-            },
-            [this](const std::string& expression) -> std::pair<std::size_t, std::size_t> {
-                auto parsed = yuzu::scope::parse(expression);
-                if (!parsed) return {0, registry_.agent_count()};
-                auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                        custom_properties_store_.get());
-                return {matched.size(), registry_.agent_count()};
-            },
-            workflow_engine_.get(), execution_tracker_.get(),
-            schedule_engine_.get(), product_pack_store_.get(),
-            instruction_store_.get(), policy_store_.get(),
-            // CommandDispatchFn — dispatch commands to agents via gRPC
+        WorkflowRoutes::Deps wf_deps;
+        wf_deps.auth_fn = auth_fn;
+        wf_deps.perm_fn = perm_fn;
+        wf_deps.audit_fn = audit_fn;
+        wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
+            emit_event(event_type, req);
+        };
+        wf_deps.scope_fn = [this](const std::string& expression)
+            -> std::pair<std::size_t, std::size_t> {
+            auto parsed = yuzu::scope::parse(expression);
+            if (!parsed) return {0, registry_.agent_count()};
+            auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                    custom_properties_store_.get());
+            return {matched.size(), registry_.agent_count()};
+        };
+        wf_deps.workflow_engine = workflow_engine_.get();
+        wf_deps.execution_tracker = execution_tracker_.get();
+        wf_deps.schedule_engine = schedule_engine_.get();
+        wf_deps.product_pack_store = product_pack_store_.get();
+        wf_deps.instruction_store = instruction_store_.get();
+        wf_deps.policy_store = policy_store_.get();
+        wf_deps.command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids,
                    const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters) -> std::pair<std::string, int> {
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> std::pair<std::string, int> {
                 // Normalize action to lowercase — agent plugins register actions
                 // in lowercase and match case-sensitively.
                 auto norm_action = action;
@@ -4303,6 +4822,15 @@ private:
                 for (const auto& [k, v] : parameters)
                     (*cmd.mutable_parameters())[k] = v;
                 agent_service_.record_send_time(command_id);
+                // PR 2 / UP2-4: register the command_id → execution_id
+                // mapping BEFORE any RPC is sent so a sub-millisecond
+                // loopback agent's response cannot win the race against
+                // mapping registration. Empty execution_id (out-of-band
+                // dispatch with no tracker row) skips registration —
+                // record_execution_id is a no-op for empty values.
+                if (!execution_id.empty()) {
+                    agent_service_.record_execution_id(command_id, execution_id);
+                }
                 int sent = 0;
                 if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
                     auto group_id = scope_expr.substr(6);
@@ -4329,8 +4857,14 @@ private:
                 if (sent > 0)
                     metrics_.counter("yuzu_commands_dispatched_total").increment();
                 return {command_id, sent};
-            },
-            approval_manager_.get());
+            };
+        wf_deps.approval_manager = approval_manager_.get();
+        wf_deps.response_store = response_store_.get();
+        // PR 3 — SSE event bus for live execution updates. Server owns
+        // the bus; ExecutionTracker publishes onto it; SSE handler
+        // subscribes per-connection.
+        wf_deps.execution_event_bus = execution_event_bus_.get();
+        workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
         notification_routes_ = std::make_unique<NotificationRoutes>();
@@ -4392,7 +4926,11 @@ private:
                 }
             },
             inventory_store_.get(),
-            product_pack_store_.get());
+            product_pack_store_.get(),
+            /*sw_deploy_store=*/nullptr,
+            /*device_token_store=*/nullptr,
+            /*license_store=*/nullptr,
+            guaranteed_state_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -4669,7 +5207,27 @@ private:
     // Phase 2: Instruction system
     std::unique_ptr<InstructionStore> instruction_store_;
     std::unique_ptr<InstructionDbPool> instr_db_pool_;  // RAII owner — declared before consumers so it outlives them
+    /// PR 3 — per-execution SSE event bus. Process-local; the tracker
+    /// borrows this pointer and publishes onto it; `WorkflowRoutes`
+    /// registers the SSE handler that subscribes per-connection.
+    /// Declared BEFORE `execution_tracker_` so the bus outlives the
+    /// tracker — members destroy in reverse declaration order, so
+    /// `execution_tracker_` runs `~ExecutionTracker` first (releasing
+    /// its borrowed `event_bus_` pointer) and only then the bus
+    /// destructs.
+    std::unique_ptr<ExecutionEventBus> execution_event_bus_;
     std::unique_ptr<ExecutionTracker> execution_tracker_;
+    // [BUS-BEFORE-TRACKER] — DO NOT reorder these two members or insert
+    // a new member between them. ExecutionTracker borrows a raw
+    // ExecutionEventBus* via set_event_bus(); destructor order is
+    // reverse-of-declaration, so the tracker must destruct FIRST
+    // (releasing the borrow) and the bus must destruct LAST. Reordering
+    // produces a SIGTERM-during-publish UAF that only surfaces under
+    // chaos. Compile-time enforcement was tried (offsetof) but the
+    // class is non-standard-layout — offsetof is conditionally
+    // supported and emits warnings. This comment is the contract
+    // (governance round arch-N1 / UP-A13). Code reviewers — grep
+    // [BUS-BEFORE-TRACKER] before approving any change to this block.
     std::unique_ptr<ApprovalManager> approval_manager_;
     std::unique_ptr<ScheduleEngine> schedule_engine_;
 
@@ -4679,6 +5237,7 @@ private:
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
+    std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;
@@ -4716,6 +5275,10 @@ private:
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
+
+    // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
+    std::thread insecure_tls_reminder_thread_;
+
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> stop_entered_{false};
     std::atomic<bool> draining_{false};

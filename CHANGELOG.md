@@ -7,18 +7,3431 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Targeting **v0.11.0** (minor bump from v0.10.0). The original `0.10.1`
-dev bump in `0c976c7` predated the `feat(test)` commits that landed
-the `/test` skill PR1 + PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new
-operator-facing functionality), the matrix CodeQL workflow expansion
-(8c5b934), and the `563138f` MigrationRunner wiring with its `/readyz`
-response-shape addition (`failed_stores` field on 503). Strict SemVer
-says any new backward-compatible feature ⇒ MINOR bump, so the next
-release is **v0.11.0** rather than the originally-planned v0.10.1
-patch._
+### Added
+
+- **CodeQL SARIF post-processing filter** at `scripts/ci/filter-codeql-sarif.sh`
+  wedged between `analyze` and `upload-sarif` in `codeql.yml`. CodeQL's
+  `paths` / `paths-ignore` config keys do not reliably suppress C/C++
+  alerts whose location is a transitively-included header (the C++
+  extractor follows every `#include`; vendored `vcpkg_installed/` and
+  generated `build-*/` headers end up in the database; structural rules
+  fire on their AST). The filter drops non-security findings in those
+  paths but **preserves security-severity findings everywhere**,
+  including in vendored code — a vendor vulnerability that ships in our
+  binary is real customer exposure regardless of who wrote the bug.
+  Companion gist documents the upstream limitation:
+  https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8 .
+  Without this, every CodeQL run re-creates ~2154 noise alerts on
+  vendored/generated paths.
+- **CodeQL coverage fix — force compile in tracer step** (`CCACHE_RECACHE=true`
+  on `meson compile -C build-linux-codeql`). The tracer cannot observe
+  compile invocations that ccache short-circuits; with persistent ccache
+  on the self-hosted runner this had been silently dropping 98% of TUs
+  from the database since the runner was adopted, masking both standard
+  and custom-rule findings. Cost: cold-compile budget (~15-25 min Linux
+  vs ~3 min cached) — justified, since CodeQL coverage was the entire
+  point.
+- **Custom CodeQL query pack at `.github/codeql/queries/`** — Yuzu-specific
+  queries that the standard `security-and-quality` suite cannot encode
+  because the rules depend on per-project directory scope and the plugin
+  threat model (#371). First pass ships two queries:
+  `cpp/yuzu/plugin-command-exec-non-literal` (POSIX `system`/`popen`/`exec*`
+  in `agents/plugins/<name>/src/*` with a non-literal command argument)
+  and `cpp/yuzu/plugin-windows-process-spawn-non-literal` (the Windows
+  `CreateProcess*`/`ShellExecute*`/`WinExec` equivalent). The pattern
+  matches the four CRITICAL command-injection findings in waves 1-4 — a
+  custom query against the Yuzu CodeQL database would have caught all
+  four before they shipped. Wired into `codeql.yml` via
+  `queries: +security-and-quality,+./.github/codeql/queries`. The
+  remaining catalog from #371 (RBAC, audit-field, plugin-export, header-
+  bundle queries) is deferred to better-fit tooling — see #371's close-
+  out comment for the rationale.
+- **`/api/health` alias** of the existing `/health` endpoint (#620).
+  Both URLs now serve the same JSON body and both bypass authentication so
+  monitoring integrations that prefix every REST call with `/api/` keep
+  working. Both are also exempt from API rate limiting (so a NAT'd or
+  shared-bucket monitoring host can't 429-starve the probe), matching the
+  treatment `/livez` and `/readyz` already get. Restores the path that
+  operators had been pointing monitors at before the #401 fix moved the
+  canonical health endpoint to `/health`.
+
+  **Body shape now varies by auth.** Unauthenticated callers get the cheap
+  probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`,
+  `version`. Authenticated callers additionally get `agents.pending`,
+  `executions.{in_flight, completed_last_hour, failed_last_hour}`, and
+  `system.*` — these were always populated for everyone before, but
+  involve SQLite scans on every request and would be a DoS amplification
+  primitive now that the rate limiter no longer caps probe rate. Monitoring
+  dashboards that displayed `executions.*` from `/health` should switch
+  to the authenticated alternative or query an authenticated REST endpoint.
+- **Docs:** `docs/user-manual/server-admin.md` gains a "File Logging"
+  section covering `--log-file` semantics and the implicit-default
+  fallback, and a "Health Endpoints" section enumerating `/livez`,
+  `/readyz`, `/health`, and `/api/health` with guidance on which to use
+  for which monitoring scenario.
+- **Docs:** `docs/user-manual/rest-api.md` `GET /health` entry now notes
+  the `/api/health` alias and the explicit non-draining-aware contract.
+- **Docs:** `docs/user-manual/upgrading.md` v0.12.0 section gains an
+  "A3 UX ladder (#620, #622, #624)" sub-entry with the operator action
+  required for local compose overrides.
+
+### Removed
+
+- **Qodana code-quality workflow and `qodana.yaml`.** The JetBrains Qodana
+  scanner was wired up but unused; carrying the workflow added third-party-
+  action attack surface and a Token-Permissions Scorecard finding for no
+  benefit. Deleted `.github/workflows/qodana_code_quality.yml` and root
+  `qodana.yaml`; `scripts/check-compose-versions.sh`-style baseline-bump
+  references in `.github/workflows/vcpkg-baseline-update.yml` updated
+  accordingly. CodeQL + Scorecard + zizmor remain the active static-analysis
+  surface.
+
+### Changed
+
+- **Defensive hardening of `pre-release.yml` against template-injection.**
+  Eight `run:` blocks that interpolated `${{ needs.resolve.outputs.version }}`,
+  `${{ needs.resolve.outputs.prev_tag }}`, or related workflow_run-tainted
+  values directly into bash were refactored to bind them via the step's
+  `env:` block and reference the values as `"$VERSION"` / `"$PREV_TAG"` /
+  `"$NEW_VER"` in the script body. CodeQL flagged 4 critical
+  `actions/code-injection/critical` alerts on this file (lines 68, 84,
+  125, 923 in older revisions) — three of those four were already fixed
+  in earlier work; this pass extends the same env-binding pattern to
+  every other run-block interpolation in the file so future CodeQL
+  scans don't re-discover the same shape. Matrix-driven values
+  (`${{ matrix.distro }}` in the .deb / .rpm install steps) are kept
+  as-is because matrix entries are workflow-author-defined and not
+  externally controllable.
+
+- **Static-analysis alert cleanup pass.** Reduced the open code-scanning
+  alert backlog by ~70% in one pass:
+  - 15 vendored security-severity false-positives in `vcpkg_installed/`
+    and `vcpkg/buildtrees/` (abseil/protobuf/httplib/cli11) bulk-dismissed
+    as "won't fix" — outside Yuzu's patch surface; will re-dismiss on each
+    scan until upstream feedback is sent.
+  - 30 stale `zizmor/artipacked` alerts will auto-clear on next zizmor run
+    (every active `actions/checkout@v6.0.2` already carries
+    `persist-credentials: false`; alerts predate that fix).
+  - 8 Scorecard `TokenPermissionsID` alerts dismissed: 5 reflect
+    job-level write scopes the action documentation requires (release,
+    CLA bot, peter-evans/create-pull-request, Qodana before deletion),
+    matching the "top-level read, opt-in per job" policy noted in
+    `release.yml`'s comment block; 3 are stale against pre-permissions-
+    block commits.
+  - 9 cpp/unused-* deletions of truly dead code: unused `run_command*`
+    helpers in `network_actions_plugin.cpp` and `event_logs_plugin.cpp`,
+    `deployment_status_to_string` in `patch_manager.cpp`, the duplicate
+    `json_quoted` and unused `add_cors_headers` in `rest_api_v1.cpp`,
+    plus a few stale local-variable bindings.
+  - 4 platform-conditional helpers wrapped in matching `#if` so CodeQL
+    stops seeing them on the wrong platform: `run_command` in
+    `network_diag_plugin.cpp` (`__APPLE__` only), `run_command_exit` in
+    `services_plugin.cpp` (`__linux__ || __APPLE__`), `run_command` in
+    `ioc_plugin.cpp` (tightened from linux+apple to apple-only),
+    `run_command` in `sccm_plugin.cpp` (`_WIN32` only).
+  - 24 `[[maybe_unused]]` annotations on idiomatic `std::from_chars`
+    structured-binding `[ptr, ec]` / `[_, ec]` sites where only the
+    error code is needed.
+  - 8 cpp/unused-static-function alerts dismissed where CodeQL ignores
+    `[[maybe_unused]]`: settings_routes refactor-staging family pre-
+    extracted from the server.cpp god-object decomposition, plus the
+    `.CRT$XCB` Windows static-init function-pointer pair in `agent.cpp`
+    / `main.cpp` that's reached via linker-section magic CodeQL can't
+    follow.
+
+- **Better error message when `POST /api/policy-fragments` (or `/api/policies`)
+  receives YAML without a `kind:` field** (#621). The previous body
+  `kind must be 'PolicyFragment', got ''` left operators stuck because they
+  often sent JSON like `{"kind":"PolicyFragment", "yaml_source":"..."}`
+  expecting `kind` to be a request parameter. The error now includes a
+  full worked YAML example and a link to `docs/user-manual/policy-engine.md`,
+  while keeping the original `kind must be 'PolicyFragment'` (and `'Policy'`)
+  prefix so existing operator scripts that grep on it continue to work.
+  `docs/user-manual/policy-engine.md` gains a worked `curl` example covering
+  both the JSON-envelope and raw-YAML body forms.
+
+### Fixed
+
+- **MCP token authorization restored to documented tier-first design
+  (#520, #630, branch `fix/520-630-auth-hardening`).** An earlier
+  hardening pass (`5fcb346`..`7c8d4ac`) conflated MCP tokens with
+  service-scoped tokens — required RBAC to be enabled and capped MCP
+  tokens at `ITServiceOwner` permissions regardless of the creator's
+  role. That broke the documented design (`docs/user-manual/mcp.md`
+  §"Authorization Tiers"): the tier (`readonly`/`operator`/`supervised`)
+  is the primary access boundary, applied independently of RBAC, with
+  the creator's actual role as the secondary RBAC layer. The regression
+  made MCP unusable for its intended purpose — agentic fleet management —
+  on every RBAC-disabled deployment.
+
+  Restored behavior:
+  - `auth_routes::require_permission()` and `require_scoped_permission()`
+    now call `mcp::tier_allows()` first, then fall through to the
+    standard RBAC/role check using the creator's actual role.
+  - Tier enforcement now applies on **all** transports (MCP JSON-RPC and
+    REST API) — closes a path-bypass where an MCP token used directly
+    on `/api/v1/...` could skip the tier check that `/mcp/v1/` enforces.
+  - Approval-gated operations (supervised tier on destructive ops) are
+    blocked on every transport with a new `auth.approval_required`
+    audit action until the Phase 2 re-dispatch path is built. This
+    closes a separation-of-duties gap where a supervised MCP token
+    issued by an admin could execute destructive operations via REST
+    without approval.
+  - `require_admin()` MCP block kept — admin/settings routes (user
+    management, TLS, OIDC) are not the MCP use case.
+  - RBAC-enabled and legacy-fallback denial paths now emit
+    `audit_log()` and use the structured JSON envelope, closing prior
+    audit-evidence gaps (CC7.2).
+  - `settings_routes.cpp` tier-string validation replaced with
+    `mcp::is_valid_tier()` to keep the canonical tier set in
+    `mcp_policy.hpp` as the single source of truth.
+
+  Audit detail string format changed for MCP-token denials. Operators
+  with SIEM rules pattern-matching the old strings (`"MCP token
+  blocked: RBAC not enabled"`, `"MCP token blocked: lacks
+  ITServiceOwner permission"`) must update them; see
+  `docs/user-manual/authentication.md` § "Audit Actions". The broken
+  intermediate (`5fcb346`..`7c8d4ac`) never shipped in a release —
+  no customer-facing upgrade notes are required.
+
+- **Docker healthchecks for `docker-compose.uat.yml`** (#622).
+  The server check used `curl` (not installed in the runtime image); the
+  gateway check used `CMD-SHELL` which on Alpine resolves to busybox `sh`
+  with no `/dev/tcp`. Replaced with `bash` + `/dev/tcp` (server, matches
+  `deploy/docker/docker-compose.reference.yml`) and busybox `wget --spider`
+  (gateway, no shell required). The compose stack now reports `healthy`
+  in `docker inspect`. Operators with a local copy of the same broken
+  pattern (e.g. an untracked `docker-compose.local.yml`) should mirror
+  the same change — see `docs/user-manual/upgrading.md`.
+  The bash healthcheck explicitly closes FD 3 after the grep to avoid
+  leaking CLOSE_WAIT sockets under sustained probe cadence.
+- **Server log directory in container deployments** (#624).
+  `Dockerfile.server` now creates `/var/log/yuzu` with mode 0750 and the
+  right ownership during the runtime stage, aligning with the deb postinst
+  and preventing log disclosure to other UIDs in the container. The
+  unconditional file-logger setup in `server.cpp` no longer logs
+  WARN/ERROR on failure — when the default log path is not writable it
+  now drops to a single INFO line and proceeds, since file logging is
+  best-effort observability. INFO (not DEBUG) is the right level so
+  operators auditing the SOC 2 evidence chain or troubleshooting "where
+  did my logs go?" still get a visible breadcrumb at default loglevel.
+  Operators who want explicit on-disk logs can pass `--log-file <path>`;
+  explicit-path failures still log at ERROR.
+
+### Tests
+
+- `tests/unit/test_trigger_engine.cpp`,
+  `tests/unit/server/test_patch_manager.cpp` — `[[maybe_unused]]` on three
+  `auto& [plugin, action, params]` structured bindings (only one binding
+  is asserted on per test) and removal of an unused `bool found_reboot`
+  in the patch_manager Windows-reboot test, in step with the
+  static-analysis alert-cleanup pass.
+
+- `tests/unit/server/test_agent_service_impl.cpp` — new file, 9 cases /
+  47 assertions covering `AgentServiceImpl::record_execution_id` and
+  `AgentServiceImpl::process_gateway_response`. Closes the gap explicitly
+  deferred at `tests/unit/server/test_workflow_routes.cpp:820` ("no
+  AgentServiceImpl in ExecHarness") by constructing a real
+  AgentServiceImpl and driving response receipt end-to-end into a real
+  `ResponseStore`. Pins four contracts from #117's response-streaming
+  call-out: (1) `record_execution_id` registers and clears the
+  command_id → execution_id mapping; (2) `process_gateway_response`
+  stamps execution_id on RUNNING streaming rows, terminal SUCCESS rows,
+  terminal FAILURE rows (with `error_detail`), and degrades to empty
+  execution_id for unmapped command_ids; (3) the HF-1 multi-agent
+  fan-out invariant — the terminal branch does NOT erase the mapping,
+  so 4 agents responding to the same `command_id` (with mixed terminal
+  statuses SUCCESS/FAILURE/TIMEOUT) all stamp the same `execution_id`;
+  (4) the `__timing__|...` sentinel takes the early-return branch in
+  the RUNNING handler and does NOT persist a row. The pre-existing
+  `test_workflow_routes.cpp:814` pin exercised the response-store level
+  only; this new file exercises the `process_gateway_response` upstream
+  path that the comment said had to be deferred to UAT. (#117)
+- `scripts/linux-start-UAT.sh` — added regression assertion that `/health`
+  and `/api/health` return 200 AND identical JSON bodies, guarding
+  against both the #620 regression and a future split of the dual-mount
+  handler lambda.
+- `tests/unit/server/test_policy_store.cpp` — extended the existing
+  wrong-kind / missing-kind cases to assert the new helpful content
+  (`apiVersion: yuzu.io/v1alpha1` substring + docs link), so the
+  improvement is pinned by the test surface rather than relying on a
+  fragile substring match. Adds a missing-`kind:` test for `create_policy`
+  (governance Gate 7 hardening — was asymmetric with `create_fragment`)
+  and pins the docs link on the `create_fragment` missing-kind branch
+  for the same symmetry reason.
+
+## [0.12.0] - 2026-05-03
+
+### Breaking
+
+- **`POST /api/settings/users` `role` field is now ignored.** New users are
+  always created with `role=user` regardless of what the form body sends.
+  Operators that scripted user-create calls with `role=admin` should expect
+  the user to land as `user` and explicitly promote them via the new
+  dedicated endpoint:
+
+  ```
+  POST /api/settings/users/{username}/role
+  Content-Type: application/json
+  { "role": "admin" }
+  ```
+
+  Rationale (security C1, governance Gate 4): collapsing privilege change
+  into the create endpoint allowed a 4xx-on-create + audit-as-success
+  pattern that was hard to reason about. The dedicated role endpoint emits
+  a single `user.role_change` audit event with `old_role` / `new_role` in
+  the detail field, invalidates active sessions for the target user, and
+  has its own RBAC + denied-branch audit chain (see `### Security` below).
 
 ### Added
 
+- **Plugin code signing — CMS detached-signature verification + Settings UI** (#80).
+  Two-layer supply-chain check on every plugin: the existing
+  `--plugin-allowlist` (filename → SHA-256) is now joined by an
+  operator-managed CA trust bundle that the agent uses to verify a
+  sibling `<plugin>.so.sig` (PEM CMS detached) before `dlopen`.
+  Verification runs **before** `dlopen`/`LoadLibrary` so a tampered or
+  untrusted binary never executes code. The trust anchor is
+  deployment-format-agnostic — operators can use a public CA, an
+  internal CA, or (forthcoming) the Yuzu self-managed CA. The Yuzu
+  release pipeline does not yet sign the in-tree `agents/plugins/`;
+  see the *Fleet-suicide caveat* in `docs/user-manual/server-admin.md`
+  for rollout guidance.
+
+  **Agent surface.** Two new CLI flags + env-var equivalents:
+  - `--plugin-trust-bundle <path>` (`YUZU_PLUGIN_TRUST_BUNDLE`) — PEM
+    file with one or more X.509 CA certificates. Enables verification.
+  - `--plugin-require-signature` (`YUZU_PLUGIN_REQUIRE_SIGNATURE`) —
+    when set, plugins without a `.sig` sibling are rejected. When
+    unset (default), unsigned plugins still load (transitional mode
+    for ops rolling out signing). Passing this flag with an empty
+    trust-bundle path causes the agent to refuse to start, preventing
+    the silent fail-open that would otherwise occur.
+
+  Default behaviour for deployments that do not set the new flags is
+  unchanged. The verifier enforces `X509_PURPOSE_CODE_SIGN` — a leaf
+  without `EKU=codeSigning` is rejected even if it chains to a CA in
+  the trust bundle, so a single internal PKI does not implicitly
+  authorise its mTLS / S/MIME / TLS-server siblings to sign plugins.
+
+  **Server surface.** New **Settings → Plugin Code Signing** card with
+  status badge, multipart PEM upload (256 KB cap, OpenSSL-validated on
+  the way in), Require-signed-plugins toggle, and Remove-bundle
+  button. Bundle metadata (cert count, SHA-256, up to 16 subjects) is
+  recomputed from the file at render time so disk + DB cannot drift.
+  PEM persists atomically (temp + rename) at
+  `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in
+  `runtime_config` as `plugin_signing_required`.
+
+  **REST routes.** `GET /fragments/settings/plugin-signing` (admin
+  HTML), `POST /api/settings/plugin-signing/{upload,clear,require}`
+  (admin, HTMX), `GET /api/v1/agent/plugin-policy` (admin only,
+  returns JSON `{enabled, required, trust_bundle_pem, cert_count,
+  sha256}` for out-of-band operator distribution to agents — automatic
+  agent-side fetch is a forthcoming change).
+
+  **Audit + metrics.** Three new actions
+  (`plugin_signing.bundle.uploaded` /
+  `plugin_signing.bundle.cleared` / `plugin_signing.require.changed`)
+  using the standard `success/failure/denied` result vocabulary, with
+  `target_type` of `PluginTrustBundle` (bundle ops) or `RuntimeConfig`
+  (require-flag toggle). Three new label values on
+  `yuzu_agent_plugin_rejected_total{reason}`: `signature_missing`,
+  `signature_invalid`, `signature_untrusted_chain` — distinct from
+  the existing `reserved_name` and `load_failed` buckets so operators
+  can alert per category. Operator workflow + `openssl cms -sign`
+  recipe in `docs/user-manual/agent-plugins.md` § Plugin Code
+  Signing; full REST contract in `docs/user-manual/rest-api.md`
+  § Settings — Plugin Code Signing; upgrade notes in
+  `docs/user-manual/upgrading.md`.
+
+- **Persistent SQLite-backed authentication.** `auth.db` (in `--data-dir`)
+  now holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256
+  hashed passwords. Replaces the prior in-memory + on-config-flush model
+  that lost users on every restart (#618). File is created with mode 0600
+  on Linux; migrations are versioned via the same `MigrationRunner`
+  pattern as the other stores (instruction, response, audit, etc.).
+  Backup procedure: `sqlite3 /var/lib/yuzu/auth.db ".backup ..."` — never
+  `cp` against a live WAL. First-boot seeds from `yuzu-server.cfg`; on
+  restart the DB is authoritative and the config seed is no-op. Recovery
+  procedure for a corrupt `auth.db`: see `docs/ops-runbooks/auth-db-recovery.md`.
+
+- **Dedicated role-change endpoint with full audit chain.**
+  `POST /api/settings/users/{username}/role` (admin-only) accepts
+  `{"role": "admin"|"user"}` and emits `user.role_change` audit on every
+  branch — success, self-target denied, invalid_username, missing_role,
+  invalid_json, invalid_role, user_not_found, db_failure, plus a `no_op`
+  result when the requested role matches the current role. Closes
+  governance PR4 audit-coverage gap. Sessions for the demoted/promoted
+  user are invalidated atomically with the role write so existing tabs
+  re-authenticate against the new role.
+
+- **`/sse/executions/{id}` audit policy clarification.** Every successful
+  subscribe emits `execution.live_subscribe` (target_type=Execution,
+  target_id={id}, result=success). Per-session-per-execution dedup is
+  deferred (#700) — until then, operators on the SOC 2 evidence chain
+  receive a row per reconnect; the forensic-grade audit on first-load
+  remains on `/fragments/executions/{id}/detail`'s
+  `execution.detail.view`.
+
+- **Login-latency observability.** New histogram
+  `yuzu_auth_login_duration_seconds{method="password",result=...}`
+  observes PBKDF2 verify time on every login attempt. Result label is
+  `success`, `bad_password`, or `unknown_user` so SREs can alert on
+  success-path regressions independently of brute-force noise on the
+  failure paths.
+
+- **Audit-pipeline observability.** New counter
+  `yuzu_server_audit_emit_failed_total` increments when
+  `AuditStore::log()`'s `sqlite3_step` returns anything other than
+  `SQLITE_DONE`. SOC 2 CC7.2 gate — alerting on a non-zero rate
+  surfaces audit-chain degradation that was previously silent.
+
+- **`auth.admin_required` audit on every privileged-endpoint 403.**
+  `AuthRoutes::require_admin` emits an audit row with
+  `target_type=endpoint, target_id=req.path, result=denied` on every
+  role-mismatch rejection. Closes the gap where dozens of admin-only
+  routes rejected non-admin callers without surfacing the attempt in
+  `audit_store`. SOC 2 CC7.2.
+
+- **Restart-loop guard on systemd units.**
+  `deploy/systemd/yuzu-server.service` and
+  `deploy/systemd/yuzu-gateway.service` now declare
+  `StartLimitIntervalSec=60` + `StartLimitBurst=3` in `[Unit]` so a
+  recurring crash (e.g. corrupt `auth.db` failing the integrity check)
+  puts the unit cleanly into `failed` instead of spinning indefinitely.
+  See `docs/ops-runbooks/auth-db-recovery.md` for the recovery
+  procedure once a unit lands in `failed`.
+
+- **`LimitNOFILE=65536` on systemd units + `ulimits.nofile` 65536 on
+  Docker compose.** Default 1024 caps the server at ~16k SSE
+  connections and the gateway at ~700 agents under fanout. Aligned
+  systemd + compose so containerised and bare-metal deployments
+  behave identically.
+
+- **`docs/ops-runbooks/auth-db-recovery.md`** — Linux + Windows
+  recovery procedure when `auth.db` integrity check fails at startup,
+  WAL-aware backup procedure, Windows Defender exclusion list for
+  `auth.db*`, filesystem-permission audit (0600 on Linux).
+
+- **Live drawer updates via SSE (PR 3 of executions-history ladder).**
+  `GET /sse/executions/{id}` opens a per-execution Server-Sent Events
+  channel that pushes `agent-transition` (one per agent state change),
+  `execution-progress` (counts snapshot when the recompute crosses the
+  all-agents-responded threshold), and `execution-completed` (terminal
+  status) events. RBAC `Read` on `Execution`; 410 Gone for
+  already-terminal executions so the browser stops reconnecting; 503
+  when the bus is not configured. New `ExecutionEventBus`
+  (`server/core/src/execution_event_bus.{hpp,cpp}`) backs the channel —
+  per-execution ring buffer (1000 events, ~30s window) supports
+  `Last-Event-ID` replay on reconnect; channels GC'd 60s after terminal
+  status and zero subscribers via opportunistic sweep on `publish` so
+  no separate timer thread is required. Server constructs the bus
+  alongside `ExecutionTracker` and calls `set_event_bus` so
+  `update_agent_status` / `refresh_counts` / `mark_cancelled` publish
+  transitions automatically. Drawer JS in `instruction_ui.cpp` opens an
+  `EventSource` only when the row was rendered with status=running or
+  pending (data-execution-status / data-execution-id stamps); the
+  listener applies in-place DOM updates against `#exec-kpi-{id}`,
+  `.agent-cell[data-agent-id]`, `tr[data-agent-id]` (per-agent table
+  row), `.per-agent-status`, and `.per-agent-exit-code`. Closes the
+  reload-to-watch-fan-out UX gap.
+
+- **WorkflowRoutes deps-struct refactor (PR 2.5, #670, hard
+  predecessor for PR 3).** `WorkflowRoutes::register_routes` now takes
+  a single `Deps` aggregate instead of 16 positional arguments. Both
+  the `httplib::Server&` and `HttpRouteSink&` overloads share the same
+  signature; new dependencies (the SSE event-bus pointer was the
+  trigger) are added as fields, not parameters. Mechanical update at
+  the two call sites (`server.cpp`, `test_workflow_routes.cpp`); no
+  behaviour change.
+
+- **Exact correlation between executions and responses (PR 2 of
+  executions-history ladder).**
+  `responses.execution_id` is a new column (migration v2 on
+  `response_store`) populated at write time by an in-memory
+  `command_id → execution_id` mapping that the dispatch path registers
+  with `AgentServiceImpl::record_execution_id` after
+  `ExecutionTracker::create_execution` returns the new id. The mapping
+  is auto-erased on terminal status (DONE / ERROR) so the map size is
+  bounded by the number of in-flight commands. Backed by partial index
+  `idx_resp_execution_ts ON responses(execution_id, timestamp) WHERE
+  execution_id != ''` — the index is slim because legacy / out-of-band
+  rows with the empty-string sentinel are excluded. New helper
+  `ResponseStore::query_by_execution(execution_id, ResponseQuery{...})`
+  returns rows whose `execution_id` matches; rejects empty input
+  (returns no rows) so callers can detect "no PR-2 data" and fall back
+  to the timestamp-window join.
+
+  Closes UP-8 (response cross-contamination) from PR 1's governance
+  Gate 4 risk register: two concurrent executions of the same
+  definition to overlapping agent sets no longer show each other's
+  responses in the inline drawer. The timestamp+agent join was a
+  best-effort heuristic; PR 2 makes correlation exact going forward.
+
+  Pre-PR-2 rows (execution_id='') stay legible via a fallback in the
+  detail handler that runs the legacy `query()` and filters to agents
+  in this execution's set. The fallback is gated on "no PR-2 rows
+  exist for this id" so it cannot dilute correctly-tagged drawers.
+  An admin backfill CLI (`yuzu-server admin backfill-responses`) is
+  **planned in PR 2.1 — not yet shipped in this release**; the command
+  does not exist on disk. Once it lands and confirms 100% coverage, the
+  fallback branch in the detail handler can be removed.
+
+  **Dispatch-path coverage scope.** Only `POST /api/instructions/:id/execute`
+  is wired to register the mapping in PR 2. Workflow-step dispatch
+  (`POST /api/workflows/:id/execute`), MCP `execute_instruction`,
+  scheduled / approval-triggered dispatch, and rerun-via-`create_rerun`
+  produce responses with `execution_id=''` and use the legacy fallback.
+  Closing those surfaces is the scope of PR 2.x follow-ups.
+
+  **Server-restart caveat.** The `command_id → execution_id` mapping
+  is held in memory inside `AgentServiceImpl::cmd_execution_ids_`. If
+  the server restarts mid-execution, the mapping is lost — agent
+  responses arriving post-restart for in-flight commands stamp empty
+  `execution_id` and use the legacy fallback.
+
+  **Performance contract — partial-index predicate** (governance
+  perf-B1). SQLite's planner does NOT use `idx_resp_execution_ts` for
+  a `WHERE execution_id = ?` bind alone; the WHERE clause must
+  syntactically subsume the partial-index predicate `execution_id != ''`.
+  `query_by_execution`'s SQL includes the redundant `AND execution_id != ''`
+  exclusively for planner eligibility — the early-return guard at the
+  top of the method ensures the clause is always trivially true.
+
+  **FAST-agent race close** (governance UP2-4). The dispatch path now
+  creates the execution row BEFORE calling `cmd_dispatch` and threads
+  `execution_id` THROUGH the dispatch closure (new parameter on
+  `CommandDispatchFn`). The closure registers the
+  `command_id → execution_id` mapping with `AgentServiceImpl` BEFORE
+  any RPC is sent — closing the race where a sub-millisecond loopback
+  agent could reply before a post-dispatch register-mapping call
+  landed. Backwards-compatible: callers passing empty `execution_id`
+  (workflow steps + non-tracker dispatch surfaces) skip registration
+  with no behaviour change vs. pre-PR-2.
+
+  **Multi-agent fan-out invariant** (governance HF-1). A single
+  `command_id` is dispatched to N agents and produces N responses;
+  the terminal-status branches in `agent_service_impl.cpp` no longer
+  erase `cmd_execution_ids_` (erasing on the first agent's terminal
+  would leave agents 2..N stamping empty `execution_id`). Map entries
+  persist for the process lifetime; a periodic sweeper is filed as
+  PR 2.x — accepted bounded leak (sec-M1 / perf-S1) for the same
+  reason `cmd_send_times_` and `cmd_first_seen_` carry the same
+  shape today.
+
+  **Phantom-execution-row close** (governance Pattern-C re-review).
+  The reorder of `create_execution` BEFORE `cmd_dispatch` (needed for
+  the UP2-4 race fix above) initially left an orphan row at
+  `status='running'` whenever dispatch failed (sent=0 or thrown).
+  Both failure paths in `/api/instructions/:id/execute` now call
+  `ExecutionTracker::mark_cancelled` to record the failed-dispatch
+  attempt for forensic audit instead of orphaning a phantom in-flight
+  row. Pinned by a regression test.
+
+  Migration uses the same probe-and-stamp idempotency dance as
+  `instruction_store`'s v2 migration (governance arch-B2 / CP-5) so
+  re-opening a DB that already has the column does not wedge on
+  duplicate-column ALTER. Forward-compat: writers always bind the
+  column; readers that don't care leave the field empty in
+  StoredResponse.
+
+  No proto changes, no plugin ABI changes, no agent-side changes —
+  the agent's CommandResponse already carries `command_id` and the
+  server-side mapping handles the rest.
+
+- **Instructions → Executions tab — clickable history + per-execution drawer
+  (PR 1 of executions-history ladder).**
+  The Executions tab is no longer a flat text list. Each row carries a
+  4-segment SVG status sparkbar (succeeded / failed / running / pending —
+  length encodes count, hue encodes status, widths sum to exactly 120 px
+  with rounding residue absorbed by the last non-zero segment), the
+  resolved definition name (with id-prefix fallback), relative time in
+  the cell with ISO-8601 UTC in `title=` for forensic copy/paste, a
+  3 px error-color left stripe on failed rows, and — for failed rows —
+  a UTF-8-safe 80-char truncation of the most recent agent error
+  populated via a gated correlated subquery on `executions` (zero query
+  cost when `agents_failure == 0`). Clicking a row lazy-loads
+  `/fragments/executions/{id}/detail` once via HTMX `hx-trigger="click once"`
+  and expands an inline drawer beneath. The drawer is laid out as four
+  scan-tiers in priority order: a KPI strip (Total / Succeeded / Failed /
+  p50 / p95 duration; "—" when any agent is still running), a
+  CSS-grid agent fan-out as small multiples (12×12 px cells colored by
+  status; bucketed into deciles when `agents_targeted > 1024` so a
+  10 000-agent execution doesn't ship 10 000 DOM nodes), a per-agent
+  table sorted failed-first then by duration descending with an inline
+  server-rendered duration bar scaled to the slowest agent in this run,
+  and a `<details>`-collapsed responses section so opening a drawer
+  doesn't dump 500 rows. Single-drawer-open invariant: clicking row B
+  collapses row A's drawer first; keyboard reach via `tabindex="0"` and
+  Enter/Space. RBAC: detail handler requires `Read` on `Execution`.
+  Information-design discipline: every status conveyed by two channels
+  (color + icon/text/shape) for WCAG + colorblind safety; SVG widgets
+  carry `role="img"` + descriptive `aria-label` with child `<rect>`
+  elements `aria-hidden`; no JS chart library on this surface
+  (server-rendered SVG/CSS only, ECharts reserved for the genuinely
+  interactive Response Visualization Engine in #253). New web
+  helpers in `web_utils.hpp`: `render_status_sparkbar`,
+  `render_duration_bar_html`, `format_iso_utc`, `format_relative_time`,
+  `now_epoch_seconds`, `truncate_utf8` — all pure, header-only,
+  unit-tested. `WorkflowRoutes::register_routes` gains an `HttpRouteSink&`
+  overload (matching `SettingsRoutes` / `RestApiV1`) so future executions
+  PRs (live SSE updates, comparison view, pagination) can be unit-tested
+  in-process without httplib's TSan-hostile acceptor thread (#438).
+
+- **Yuzu design tokens + dark navy palette (dashboard re-skin).**
+  91 `--mds-*` CSS custom properties (color / spacing / type / state /
+  elevation / indicator) layered into `kYuzuCss`; legacy aliases
+  (`--bg`, `--fg`, `--accent`, `--surface`, `--sp-*`, `--text-*`,
+  `--radius-*`, `--font-sans/mono`) re-pointed onto the design tokens
+  so every component re-skins through the same layer. Default values
+  use a deep navy canvas `#0e1a2d`, cyan accent `#00bceb`, and
+  mint / gold / coral indicators. Re-skinning Yuzu is now a token
+  override, not a CSS rewrite. (#XXX)
+
+- **Inter v4.0 variable webfont shipped (SIL OFL 1.1).**
+  Vendored at `server/core/vendor/inter/InterVariable.woff2` (345 KB),
+  served at `/static/fonts/InterVariable.woff2` with
+  `Cache-Control: public, max-age=2592000, immutable`. One file covers
+  weights 100-900 via `font-variation-settings`. `--mds-font-family-default`
+  starts with `'Inter'`. Self-hosted — no CDN dependency, air-gap-safe.
+
+- **Apache ECharts 5 chart renderer (Apache-2.0).** Vendored at
+  `server/core/vendor/echarts.min.js` (1.0 MB), served at
+  `/static/echarts.min.js`. Replaces the previous bespoke SVG
+  renderer in `charts_js_bundle.cpp`. Same `[data-yuzu-chart-url]`
+  auto-render contract and same JSON payload schema — operators do
+  not migrate. Adapter resolves design-system tokens via `getComputedStyle`
+  at render time, so palette switches go live without a JS rebuild.
+  Empty-data payloads now render an explicit `'No data to plot.'`
+  message (matching the prior renderer) rather than a blank canvas.
+
+- **Build-time content auto-import.** All YAML files in
+  `content/definitions/*.yaml` and `content/packs/*.yaml` (217
+  InstructionDefinitions + 10 InstructionSets at this commit) are
+  converted to JSON envelopes at build time by
+  `server/core/scripts/embed_content.py` (PyYAML, build-time
+  dependency pinned in `requirements-ci.txt`) and embedded in the
+  server binary as `kBundledDefinitions` / `kBundledSets`. On every
+  startup the server upserts each entry via `import_definition_json`
+  and `create_set`. **Conflicts on existing IDs are silently skipped
+  — operator-customized definitions are never overwritten.** This
+  is BREAKING for one specific case: definitions an operator
+  previously DELETED will reappear on next restart. To permanently
+  suppress a shipped definition, set `enabled: false` via the
+  dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE.
+  Each successful import / errored import emits an
+  `audit_events.action="content.bundled_import"` row with
+  `principal=system` for SOC 2 traceability. Sidesteps yaml-cpp on
+  Windows MSVC (#625).
+
+- **Inter, ECharts, HTMX, htmx-ext-sse attribution in `NOTICE`.**
+  Closes a long-standing gap for HTMX (0BSD) which was already
+  vendored. ECharts upstream NOTICE vendored at
+  `server/core/vendor/echarts-NOTICE.txt` per Apache 2.0 §4(c).
+
+- **Build-time embed scripts** in `server/core/scripts/`:
+  `embed_js.py` (chunked raw-string-literal generator for arbitrary
+  vendored JS, sized to MSVC's 16,380-byte C2026 limit),
+  `embed_binary.py` (constexpr byte-array generator for binary
+  assets), `embed_content.py` (YAML→JSON envelope converter for
+  shipped instruction content). These replace hand-written chunked
+  literals; future vendor additions should use the scripts.
+
+- **`tests/puppeteer/echarts-smoke.mjs`** — regression test for the
+  ECharts adapter; renders all five chart types against synthetic
+  payloads and verifies design-system tokens resolve correctly.
+
+- **Test pinning for embedded asset symbols** in
+  `tests/unit/server/test_static_js_bundle.cpp`: pinned size +
+  content sentinels for `kEChartsJs`, `kInterVariableWoff2`,
+  `kYuzuCss`, `kYuzuChartsJs`. Plus `kConflictPrefix` contract tests
+  for `import_definition_json` and `create_set` in
+  `tests/unit/server/test_instruction_store.cpp` so a future error-
+  string drift cannot silently miscount the boot-time auto-import.
+
+- **Visualization engine: optional row pre-filter (`whereField` /
+  `whereEquals`).** Lets a chart isolate one logical category of rows
+  from a plugin that emits a mixed `key|value` row layout (firewall,
+  bitlocker, antivirus, os_info, …). Spec authors set `whereField` to a
+  column index and `whereEquals` to the required value; rows whose
+  field at that index doesn't match are skipped before bucketing. The
+  filter is conjunctive with the existing `labelField` / `valueField`
+  extraction. Half-config (one of the pair set, the other absent) is
+  silently disabled rather than half-applied — half-applied filters
+  produce non-deterministic charts depending on row order. Documented
+  in `docs/yaml-dsl-spec.md` § `spec.visualization`. Live use: every
+  one of the six chart-bearing demo definitions added in this release
+  except `vuln_scan.scan` and `os_info.os_name`. Tracking issue #626
+  covers the matching value-substring extractor for plugins whose
+  values themselves carry pipe-delimited sub-fields (firewall's
+  `Domain|enabled`, bitlocker's full volume descriptor) — this PR's
+  filter handles the row-selection half; #626 will close the
+  field-extraction half.
+
+- **Six demo charts ship as default examples for the Phase 8.1 Response
+  Visualization Engine (#253 — closes the issue).** `spec.visualization`
+  blocks added in-place to six existing instruction definitions, covering
+  every processor (`single_series`, `multi_series`) and the most-used
+  chart types (`pie`, `column`):
+  - `security.vuln_scan.summary` — pie of vulnerabilities by severity
+    (`labelField: 0` severity + `valueField: 1` count summed across
+    devices). The headline demo chart.
+  - `security.antivirus.defender_status` — pie of Windows Defender
+    real-time protection state across the fleet.
+  - `security.encryption.state` (BitLocker / LUKS / FileVault) — pie of
+    volume `protection_status`.
+  - `security.firewall.state` — column chart, multi-series, one column
+    per profile (Domain/Private/Public on Windows; firewalld / ufw /
+    iptables / pf elsewhere) and one series per state (ON/OFF).
+  - `security.certificates.list` — pie of certificates by issuer with
+    `maxCategories: 8` (top-N + "Other"). Most informative when run
+    with `expiring_within_days: 90` so the chart focuses on certs
+    needing renewal.
+  - `device.os_info.os_name` — pie of OS distribution across the fleet
+    with `maxCategories: 8`.
+
+  Bundled as `InstructionSet demo.visualization.fleet-posture` in
+  `content/definitions/visualization_demo_set.yaml` and as
+  `ProductPack pack.demo.visualization` in
+  `content/packs/visualization-demo-pack.yaml` (the new `content/packs/`
+  directory is conventional shipping ground for example product packs).
+  Both ship unsigned because they carry only read-only `question`
+  definitions sourced from the in-tree library — production / customer
+  packs should still be signed per `docs/yaml-dsl-spec.md` §8.
+
+  Use the dashboard YAML import view or
+  `POST /api/v1/product-packs` to install the pack against a UAT or
+  demo fleet; running any of the six instructions then auto-renders the
+  declared chart above the standard results table.
+
+### Security
+
+- **C1 closed — privilege-escalation via the user-create role parameter.**
+  `POST /api/settings/users` ignores the `role` field; the only path to
+  promote/demote is `POST /api/settings/users/{username}/role`. Audit
+  events on the new endpoint emit `old_role` and `new_role` so SIEMs
+  can detect anomalous role transitions without inferring intent from
+  the request body.
+
+- **C2 closed — atomic enrollment-token consumption.** Token validation
+  + use_count increment now happens inside a single `BEGIN IMMEDIATE`
+  transaction, eliminating the TOCTOU window where two concurrent
+  enrollments against the same single-use token could both succeed.
+
+- **C3 closed — OIDC admin role assignment.** Admin role is granted
+  ONLY when the OIDC `groups` claim contains the configured admin
+  group id (`--oidc-admin-group`). Email/name match no longer escalates
+  to admin. Operators relying on the legacy email-match shortcut must
+  add their admins to the configured Entra group.
+
+- **`auth.db` is created with mode 0600 on Linux** (owner read/write
+  only). On Windows the equivalent restricted ACL is applied via
+  `CreateFile`. World-readable hashes are not produced.
+
+- **Audit chain coverage on every privileged-mutation denied branch.**
+  `POST /api/settings/users/{username}/role` (8 denied codes), `DELETE
+  /api/settings/users/{name}` (`invalid_username`, `user_not_found`,
+  `self_delete_blocked`), and the centralised `auth.admin_required`
+  rejection in `AuthRoutes::require_admin` now all emit `audit_fn_(...,
+  "denied", ..., reason)`. SOC 2 CC7.2 evidence chain.
+
+### Tests
+
+- **Gateway perf baseline calibration captured at N=300 (#738, ref
+  #530).** Five-hour overnight run on Shulgi (5950X, quiet box,
+  2026-05-02 23:00 UTC → 2026-05-03 04:16 UTC, exit=0, 300/300
+  samples). Raw data at `tests/perf-baseline-provenance-N300.jsonl`,
+  derived stats at `tests/perf-baseline-provenance-N300.json`. The
+  capture confirms what the N=20 trial suggested: 3 of the 4
+  gateway perf metrics (`registration_ops_sec`,
+  `burst_registration_ops_sec`, `session_cleanup_ms_per_agent`) are
+  not Gaussian and σ-bounding them is statistically inappropriate —
+  `registration_ops_sec` is hard-ceiling-bounded with 70% of samples
+  within 5% of the 19,200 ops/sec ceiling; `session_cleanup_ms_per_agent`
+  is dominated by a single race-condition outlier; only
+  `heartbeat_queue_ops_sec` (CV 6.45%, |skew| 0.11, |kurt-3| 0.33,
+  280/300 distinct values) fits the Gaussian assumption. The full
+  finding plus inline ASCII histograms is recorded in
+  `docs/perf-baseline-calibration-2026-05-03.md`. Perf-gate redesign
+  to percentile floors for ceiling-bounded metrics is deferred to a
+  later cycle; in the interim the gate runs as-is and human
+  judgement is the loop.
+- **PR 3 coverage net — `tests/unit/server/test_execution_event_bus.cpp`
+  (new file)** — 10 Catch2 cases / 1039 assertions tagged
+  `[execution_event_bus][pr3]`: subscribe/publish/unsubscribe round-trip
+  on a single channel; per-execution channel partitioning (subscribers
+  on exec A receive zero events for exec B and vice versa, with each
+  channel keeping its own monotonic id space); ring buffer caps at
+  `kBufferCap=1000` with FIFO eviction; `replay_since` is strictly
+  greater-than (Last-Event-ID semantics); terminal flag and GC retention
+  (channels with subscribers are not evicted; channels with retention
+  expired AND no subscribers are); listener invocation is synchronous
+  within `publish` (no event lost across the publish→listener boundary);
+  concurrent publishers never lose events (4 threads × 250 publishes =
+  1000 monotonic ids, no gaps); `subscriber_count` / `channel_count`
+  smoke; `unsubscribe` is idempotent; `snapshot` is a copy not a view.
+- **PR 3 coverage net — `tests/unit/server/test_workflow_routes.cpp`**
+  — 12 new Catch2 cases tagged `[workflow][executions][pr3]`:
+  `/sse/executions/{id}` 404 on unknown id; 410 Gone on already-terminal
+  execution; 403 when `perm_fn` denies `Execution.Read`; 200 + correct
+  Cache-Control / X-Accel-Buffering headers on a happy-path running
+  execution; integration that `update_agent_status` publishes
+  `agent-transition` onto the bus (subscribe directly, watch the
+  events flow); integration that `refresh_counts` crossing the
+  threshold emits both `execution-progress` AND `execution-completed`
+  with progress-before-terminal ordering; `mark_cancelled` emits the
+  terminal `execution-completed`; ring buffer holds events for late
+  connectors; per-execution channel partitioning under the routes
+  layer (no cross-leak between two concurrent executions of the same
+  definition); list view stamps `data-execution-id` and
+  `data-execution-status` for the JS SSE bootstrap; detail KPI strip
+  carries `id="exec-kpi-{id}"` for partial swaps; per-agent status
+  badge has `.per-agent-status` + `.per-agent-exit-code` classes for
+  partial swaps. `ExecHarness` gained an `event_bus` member that is
+  attached to the tracker before any test runs and torn down before
+  the tracker on harness destruction (preserves the
+  bus-outlives-tracker invariant the production code relies on).
+- **PR 3 puppeteer smoke extension —
+  `tests/puppeteer/executions-drawer-smoke.mjs`** — added two new
+  assertions: every `.exec-row` carries both `data-execution-id` and
+  `data-execution-status` attributes (the drawer's SSE bootstrap
+  binding), and the open drawer's KPI strip carries an
+  `id="exec-kpi-{id}"` stamp (the partial-swap binding). Failure of
+  either is a markup contract regression that breaks live updates
+  silently.
+
+- **PR 2 coverage net — `tests/unit/server/test_response_store.cpp`**
+  — 6 new Catch2 cases tagged `[response_store][execution_id]`:
+  default-empty for legacy writers; round-trip when the dispatch path
+  stamps it; `query_by_execution` returns only matching rows
+  (provably no cross-contamination across two same-definition
+  executions); empty-execution_id sentinel rejected by
+  `query_by_execution`; agent_id / since-until / status filters honour
+  on the new query path; migration v2 idempotency (re-open a v2 DB and
+  confirm the ALTER doesn't fire twice + existing tagged rows survive).
+- **PR 2 coverage net — `tests/unit/server/test_workflow_routes.cpp`**
+  — 3 new Catch2 cases tagged `[workflow][executions][detail][pr2]`:
+  the cross-contamination scenario (two concurrent executions of the
+  same definition to the same agent — each detail drawer sees only
+  its own response, proving exact correlation); legacy
+  timestamp-window fallback is reachable when only pre-PR-2
+  (execution_id='') rows exist for the run; the fallback is suppressed
+  when ANY PR-2 row exists for this execution_id, so legacy rows
+  cannot dilute correctly-tagged drawers. New `store_response` helper
+  on `ExecHarness` accepts an optional `execution_id` so future PR 2.x
+  follow-ups can extend the regression net without rewriting fixtures.
+
+- **PR 2 Gate-7 hardening regression net** — 4 new Catch2 cases
+  pinning the contracts closed by the governance hardening rounds.
+  - `cmd_dispatch receives non-empty execution_id when create_execution
+    succeeds` (`[workflow][executions][pr2][hardening]`) — captures
+    the value passed to the cmd_dispatch stub via the new
+    `last_dispatch_execution_id` field on `ExecHarness`. Proves UP2-4
+    close: the FAST-agent race is closed because `record_execution_id`
+    runs INSIDE the dispatch closure before any RPC; by the time
+    cmd_dispatch returns, the mapping is registered.
+  - `query_by_execution includes the partial-index predicate
+    'execution_id != ''' in its SQL (perf-B1)` — exercises mixed
+    PR-2 and legacy rows; would surface a regression where the
+    redundant-but-required predicate is dropped from the SELECT.
+  - `multi-agent fan-out — terminal-branch does NOT erase the mapping
+    (HF-1)` — stores two responses with the same `execution_id` and
+    asserts both appear in `query_by_execution`. Pre-fix erasing on
+    first agent's terminal would drop one row from the drawer.
+  - `failed dispatch does NOT orphan a phantom 'running' execution
+    row (Pattern-C regression close)` — dispatches against a stub
+    returning sent=0; asserts the resulting execution row is in
+    `cancelled` status, not `running`. Pins the `mark_cancelled` call
+    that the create_execution-before-dispatch reorder introduced.
+  Plus the new `last_dispatch_execution_id` field on `ExecHarness`
+  so future PR 2.x tests can exercise dispatch-time mapping behaviour.
+
+- **Gate-7 hardening regression net for executions PR 1** — 5 new
+  Catch2 cases pinning the contracts that closed the governance
+  hardening-round findings.
+  - `executions list: 403 when perm_fn denies (sec-M1)` —
+    `[workflow][executions][list][rbac]`. Dispatches LIST with
+    `perm_grant=false` and asserts 403, proving the new
+    `perm_fn(Execution, Read)` gate fires before any rendering work.
+  - `executions detail: agent_id with single-quote is bound via data-*
+    attrs, not interpolated into JS (UP-1)` —
+    `[workflow][executions][detail][xss]`. Feeds `agent'with'quote`
+    through the renderer; asserts (a) `scrollToAgentRow(` does not
+    appear in the rendered HTML, (b) `data-agent-id="agent&#39;with&#39;quote"`
+    does. Pins the JS-context-XSS fix against any future revert that
+    re-introduces the inline-onclick interpolation pattern.
+  - `ExecutionTracker.query_executions: include_error_detail default
+    false leaves the field empty (arch-B2 hot-path)` —
+    `[workflow][executions][tracker]`. Default-constructed
+    ExecutionQuery does NOT trigger the correlated subquery; protects
+    server.cpp:1727's `query_executions({.limit=1000})` health-tick
+    from regressing back to 1000 partition sorts per call.
+  - `ExecutionTracker.get_execution: always populates last_error_detail`
+    — `[workflow][executions][tracker]`. Single-row reads (rare) opt
+    in unconditionally; pins the contract that detail handler / MCP
+    `get_execution_status` / unit tests get the field populated.
+  - `ExecutionTracker.query_executions: agents_failure>0 with empty
+    error_detail yields empty last_error_detail (qa-S4)` —
+    `[workflow][executions][tracker]`. Pins the silent SQLite
+    `col_text(NULL) == ""` contract — an exit-code-only failure with
+    no agent error message produces an empty preview, not a crash.
+  Two prior cases at `[workflow][executions][tracker]` updated to set
+  `q.include_error_detail = true` explicitly so they exercise the
+  intended path post-arch-B2.
+- **Sparkbar fallback-chain regression test** —
+  `render_status_sparkbar: every fill has a two-arg var() fallback (UP-13)`
+  in `tests/unit/server/test_web_utils.cpp` `[web_utils][sparkbar][fallback]`.
+  Pins all four token-named fills (`--mds-color-bg-success-emphasis`,
+  `--mds-color-theme-indicator-error`, `--mds-color-theme-indicator-stable`,
+  `--mds-color-theme-text-tertiary`) carry the `,var(--green|red|accent|muted)`
+  fallback so a yuzu.css load failure or token rename does not render
+  the bar invisible. Two prior sparkbar tests adjusted to match the
+  new fill-string format (token-name substring check rather than
+  full-`var(...)`-string equality).
+- **Test fixture hardening on `ExecHarness`** in
+  `tests/unit/server/test_workflow_routes.cpp`:
+  - `SqliteHandleGuard` first-member RAII guarantees `sqlite3_close`
+    runs even if a constructor `REQUIRE` throws between the
+    `sqlite3_open` and the `tracker.reset()` in the destructor (qa-B2
+    fixture-leak P0 per `feedback_test_quality.md`).
+  - Execution IDs generated via `static std::atomic<int>` counter
+    instead of `std::hash<std::string>` (qa-B1) — matches CLAUDE.md
+    test-isolation rule against hash-based uniqueness salts.
+- **`tests/unit/server/test_web_utils.cpp`** — extended with 18 new
+  Catch2 cases for the executions-tab rendering primitives.
+  - `format_iso_utc`: dash sentinel for `<= 0`; canonical RFC 3339 form
+    for known UTC moments; fixed-width 20-byte output (`YYYY-MM-DDTHH:MM:SSZ`).
+  - `format_relative_time`: dash sentinel for `<= 0`; bucketing across
+    seconds / minutes / hours / days; future-`then` (clock-skew) clamps
+    to "0s ago".
+  - `now_epoch_seconds`: monotonicity smoke.
+  - `truncate_utf8`: ASCII pass-through under limit, ASCII truncation
+    appends U+2026 ellipsis, walks back across both 2-byte (`café`) and
+    4-byte (FIRE U+1F525) codepoint boundaries — proves the cell can
+    truncate any agent error string without producing invalid UTF-8 that
+    breaks browser `title=` rendering or screen-reader announcement.
+  - `render_status_sparkbar`: hatched empty state when `total == 0`
+    (with `aria-label="no agents matched scope"`); zero-count buckets
+    emit no `<rect>`; aria-label summarises the four counts; widths sum
+    to exactly 120 px including the rounding edge case (1/1/1/0 of 3,
+    2/2/2/1 of 7) — rounding residue is absorbed by the last non-zero
+    segment.
+  - `render_duration_bar_html`: width clamps to 100 % when over
+    max-duration; zero max yields zero width; status class flows through
+    to the `duration-bar--{class}` selector; negative duration clamps to
+    zero in the `aria-label`.
+- **`tests/unit/server/test_workflow_routes.cpp`** — new Catch2 file
+  covering the executions list and detail handlers (19 cases / 159
+  assertions). Uses the `TestRouteSink` pattern (no httplib::Server
+  acceptor, no #438 TSan trap) registered against the new
+  `WorkflowRoutes::register_routes(HttpRouteSink&, ...)` overload.
+  Pins: empty state; definition-name resolution vs id-prefix fallback;
+  `definition_id` query filter; failed-row stripe class
+  (`exec-row--failed`); ISO-8601 UTC time title; sparkbar `aria-label`
+  shape; zero-agent run renders the empty-state sparkbar variant; detail
+  404 on unknown id; detail 403 when `perm_fn` denies; KPI strip carries
+  Total / Succeeded / Failed / p50 / p95; "—" sentinel for p50/p95
+  when any agent is still `running`; per-agent table sorts failed-first;
+  agent grid switches to decile bucketing above 1024 agents; UTF-8
+  truncation does not tear emoji; sidebar shows dispatched_by + ISO
+  timestamps; `last_error_detail` correlated subquery is empty for
+  fully-successful runs and surfaces the most-recent agent error
+  (highest `completed_at`) for failed runs.
+- **`tests/puppeteer/executions-drawer-smoke.mjs`** — new browser-level
+  visual regression net for the executions tab. Logs in, switches to
+  Executions, asserts: at least one `.exec-row` + `.status-sparkbar`
+  rendered; ISO-8601 title on `.exec-time`; sparkbar `aria-label`
+  matches the four-counts pattern; clicking a row lazy-loads the drawer
+  with `.exec-kpi-strip` + `.agent-grid` + `.per-agent-table` all
+  present; KPI strip carries the five labelled tiles
+  (Total / Succeeded / Failed / p50 / p95) and the "—" sentinel does
+  not appear in KPI value position for completed runs; opening row B
+  collapses row A's drawer (single-drawer-open invariant); six Cisco
+  Momentum tokens (`--mds-color-bg-success-emphasis`,
+  `--mds-color-theme-indicator-error`, `--mds-color-theme-indicator-stable`,
+  `--mds-color-theme-text-tertiary`, `--mds-color-state-hover`,
+  `--mds-color-state-selected`) resolve non-empty so silent palette
+  drift is detected. Same shape as `tests/puppeteer/echarts-smoke.mjs`.
+
+### Changed
+
+- **`scripts/test/perf-gate.sh` is no longer a regression-detecting
+  gate.** It runs `yuzu_gw_perf_SUITE`, parses throughput/latency from
+  `ct:pal` output, records each metric into the test-runs DB, and exits
+  PASS. It does not read a baseline file, has no tolerance, and never
+  FAILs on a metric value. The N=300 calibration captured in this same
+  release showed 3 of the 4 gateway perf metrics are ceiling-bounded
+  with long left tails — neither σ nor %-tolerance bands fit them — so
+  perf is moved to measure-and-report until the gate can be rebuilt
+  around percentile primitives. Removed: `tests/perf-baselines.json`
+  file, `--baseline`, `--tolerance-pct`, `--capture-baselines`, and
+  `--report-only` flags (the script now rejects them with a one-line
+  pointer to the calibration doc). Kept: the quiesce check (refuses to
+  run with UAT ports listening), `--allow-busy` debug bypass, hardware
+  fingerprint and loadavg metric capture, parser-drift WARN. SKILL.md,
+  CLAUDE.md, `tests/shell/test_pr2_gates.sh`, and
+  `scripts/test/perf-sample.sh` all updated to match. Coverage gate is
+  unchanged — it still enforces `tests/coverage-baseline.json`. Full
+  rationale and the deferred percentile-redesign live in
+  `docs/perf-baseline-calibration-2026-05-03.md`.
+- **Release supply-chain assets renamed and expanded for OpenSSF Scorecard
+  visibility.** The cosign signature on `SHA256SUMS` is now published as
+  `SHA256SUMS.sigstore` rather than `SHA256SUMS.bundle`, matching the
+  canonical Sigstore Bundle filename and the
+  `\.(minisig|asc|sig|sign|sigstore)$` extension regex Scorecard's
+  Signed-Releases check requires. Each binary archive, installer, and
+  Docker image now also publishes its SLSA build provenance attestation
+  as a sibling `<artifact>.intoto.jsonl` release asset, so Scorecard can
+  see the provenance without reaching the GitHub Attestations API. v0.11.0
+  and v0.11.0-rc2 were backfilled with `SHA256SUMS.sigstore` and per-asset
+  `*.intoto.jsonl` files alongside their original `SHA256SUMS.bundle`;
+  v0.12.0 onwards will ship only the canonical `.sigstore` filename.
+  Customers should update verification scripts to use the `.sigstore`
+  filename — both files are byte-identical Sigstore bundles and `cosign
+  verify-blob --bundle` accepts either path. See
+  `docs/user-manual/release-verification.md` for the migration table.
+
+- **`GET /fragments/executions` now honours the `definition_id` query
+  parameter.** Previously the parameter was accepted but silently ignored.
+  After this release, passing `?definition_id=<id>` filters the list to
+  executions of that definition only. Any operator or automation that
+  embedded the executions fragment URL with `definition_id` expecting
+  the full list must drop the parameter. Behaviour change, not a wire
+  break — the URL shape and response Content-Type are unchanged.
+
+- **Executions surface — Gate-7 hardening round on PR 1.** Information-design
+  PR 1 (the clickable executions history + per-execution drawer) shipped
+  with the visible feature; this round addresses governance findings
+  produced by the `/governance` pipeline:
+  - **`/fragments/executions` LIST handler now gates on `Execution:Read`**
+    (sec-M1). The LIST exposes resolved definition_name and a per-row
+    `last_error_detail` preview — same data class as the DETAIL handler,
+    earns the same RBAC gate. Mirrors MCP `list_executions` and REST
+    `/api/v1/execution-statistics`.
+  - **Detail handler emits an audit event on success** (sec-M2):
+    `audit_fn(req, "execution.detail.view", "success", "Execution",
+    exec_id, "")` — closes the SOC 2 evidence chain for forensic-grade
+    reads. The LIST and other read-only fragment routes continue to skip
+    audit per the documented fragment-route policy (forensic-grade
+    content audits; aggregate / presentation surfaces do not).
+  - **Detail path regex tightened to `[A-Za-z0-9_-]{1,128}`** (sec-L3) —
+    matches the visualization route's bound from #253; prevents
+    unbounded path lengths from reaching `get_execution()`.
+  - **Agent grid uses `data-*` attributes + delegated event listener**
+    (UP-1 / sec-L1): `agent_id` and `exec_id` are no longer interpolated
+    into a JS string literal inside an inline `onclick` attribute. The
+    pre-fix path was: `html_escape` converts `'` to `&#39;` which the
+    HTML parser un-escapes BEFORE the JS lexer sees the attribute value
+    — a malicious or compromised agent registering with `agent_id` like
+    `'); evil(); //` could land arbitrary JS in the operator's session.
+    Mitigated by binding via `addEventListener` against `data-agent-id`
+    / `data-exec-id` so wire-provided bytes never enter a JS-string
+    context. Per-agent table rows also gain matching `data-*` attrs;
+    grid → row scroll lookup uses `getAttribute` not string-concat ID.
+  - **`ExecutionQuery::include_error_detail` opt-in flag** (arch-B2 /
+    perf-B1): the `last_error_detail` correlated subquery on
+    `kSelectAll` is now off by default. The LIST fragment opts in (it
+    renders the field); `get_execution` for single-row reads opts in
+    (rare callers). Hot-path callers (server.cpp:886/963/1721/1727/1871
+    metrics + health ticks at limit=1000) leave the default false and
+    pay zero subquery cost. Eliminates the regression where every 15s
+    metrics tick scanned `agent_exec_status` partitions and sorted by
+    `completed_at` for every row with `agents_failure > 0`.
+  - **KPI percentile sort hoisted out of `fmt_pct` lambda** (perf-B2 /
+    cpp-S3): the durations vector is now sorted once per drawer request
+    rather than twice (once per p50, again per p95).
+  - **Sparkbar SVG fills carry CSS-variable fallbacks** (UP-13): every
+    `var(--mds-color-*)` now declares a second-arg fallback to the
+    pre-token alias (`--green` / `--red` / `--accent` / `--muted`) so a
+    yuzu.css load failure or token rename leaves the bar legible
+    instead of rendering invisible.
+  - **`Execution.last_error_detail` carries a PII-adjacent struct
+    comment** (arch-B1): the field is gated by `Execution:Read` at every
+    serializer; a future contributor adding it to a JSON-blanket-emit
+    REST handler will see the warning at IDE-hover time.
+
+### Removed
+
+- **`/static/debug/<name>.png` route deleted.** A skin-iteration
+  debug helper that served PNG screenshots from
+  `/usr/share/yuzu/screenshots/` (only present in
+  `Dockerfile.server-local`). Unauthenticated by design as a dev
+  helper, but the route existed in every build; closing the data-
+  disclosure surface area before any pilot ship. The `.screenshots/`
+  directory is now gitignored.
+
+### Fixed
+
+- **#743 — workflow canary wall time cut from ~70 min to ~10–15 min.**
+  The `Workflow canary (GHA-hosted ubuntu-24.04)` job had ccache
+  installed and used as the compiler wrapper but never persisted
+  across runs, so every TU compiled cold every run on the 4-vCPU
+  GHA-hosted runner. Added an `actions/cache` step for `~/.cache/ccache`
+  keyed on source hash with cascading restore-keys (mirrors the macOS
+  leg's pattern). Also dropped the `meson test` step from the canary —
+  the canary's purpose is workflow-regression detection, not test
+  regression, and `meson test` runs on every other Linux leg
+  (linux_matrix on push, nightly asan/tsan/coverage). Net: ~17 min
+  saved on compile via warm ccache, ~5–10 min saved by dropping tests.
+
+- **#741 follow-up — sentinel now self-heals on no-drift orphan state.**
+  The original #741 fix wiped both halves of `vcpkg_installed/` on
+  cache-key drift, which closes the path where a NEW commit lands on a
+  corrupt workspace. PR #742's CI then failed with the same abseil
+  `read_lines` symptom because the workspace was already corrupt and the
+  inputs hadn't drifted: the sentinel correctly reported "unchanged",
+  the orphaned `vcpkg/info/abseil_*.list` survived, and `vcpkg install`
+  short-circuited again. Sentinel now runs a defensive invariant on every
+  invocation — if `vcpkg_installed/vcpkg/` exists but
+  `vcpkg_installed/<triplet>/` does not, the registry is orphaned by
+  definition and gets wiped regardless of cache-key state. Test 4 in
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the new behaviour
+  (orphan detection fires on no-drift run; no-op on healthy workspace).
+
+- **#741 — vcpkg sentinel registry-desync wedged Windows CI.** Two
+  related defects converged on today's CodeQL Windows job:
+  (a) `scripts/ci/vcpkg-triplet-sentinel.sh` wiped
+  `vcpkg_installed/<triplet>/` on cache-key drift but left the sibling
+  per-workspace registry (`vcpkg_installed/vcpkg/{info,status,updates}/`)
+  intact, so orphaned `info/<port>_<triplet>.list` entries persuaded the
+  next `vcpkg install` to short-circuit to "already installed" and then
+  fail post-install pkgconfig validation with
+  `read_lines("…/lib/pkgconfig/<pkg>.pc"): no such file or directory`
+  (today's failure hit on `absl_absl_check.pc`); (b) `codeql.yml` had
+  its **own** inline sentinel (`.x64-windows-triplet.sha256`) that
+  hashed only `triplets/x64-windows.cmake` — missing manifest + baseline
+  drift — and shared the same registry-orphan bug. The shared sentinel
+  now wipes both halves of `vcpkg_installed/` together; `codeql.yml` now
+  calls the shared script instead of its own inline logic;
+  `scripts/ci/test-vcpkg-sentinel.sh` pins the four behaviours the
+  sentinel must preserve and runs from the `canary` job in `ci.yml`.
+  `docs/ci-troubleshooting.md` §7 separates this from the pre-existing
+  `vcpkg/packages/` buildtree corruption path.
+
+- **`CertReloader` shutdown latency drops from up to 5s per teardown to
+  near-zero.** The watcher thread used to sleep in 5-second increments and
+  only check the stop flag between increments, so each `stop()` (and each
+  destructor, since `~CertReloader()` calls `stop()`) blocked for up to
+  one full sleep window. With multiple `[cert-reload][lifecycle]` test
+  cases each paying that cost, the `server unit tests` suite was creeping
+  up to its 120-second meson budget — close enough that PR #734's run on
+  a contended `yuzu-wsl2-linux` runner overran by 4.6s and got SIGTERM'd
+  mid-`CertReloader: destructor stops cleanly`. Replaced the polling
+  sleep with a `std::condition_variable::wait_for` whose predicate the
+  `stop()` path notifies, so shutdown is bounded by `notify_all` + thread
+  join (sub-millisecond) rather than the next 5-second poll. Also
+  silences the `[[deprecated]]` warning on `httplib::SSLServer::ssl_context()`
+  by routing through `tls_context()` with a typed cast — same underlying
+  `SSL_CTX*`, no behaviour change.
+
+- **#618 — users lost across server restarts.** Pre-`auth.db` the user
+  list was held in memory, written back to `yuzu-server.cfg` on save,
+  but state created via the dashboard between saves was lost on a
+  crash or hard restart. AuthDB persists every write atomically.
+
+- **#388 — config write failure was silent.** `save_config()` now
+  returns explicit `bool` and is checked on every callsite; auth
+  state and on-disk config diverge no longer.
+
+- **#527 — auth state lifecycle unclear.** Server now has a single
+  authoritative `AuthDB` instance whose lifetime is tied to
+  `ServerImpl`; `AuthManager::set_auth_db()` injection makes the
+  contract explicit at construction.
+
+- **Windows MSVC compile fixes that landed alongside the AuthDB
+  rollout** — explicit `<algorithm>` / `<ctime>` / `<cctype>` /
+  `<cstring>` includes for the strict MSVC STL transitive-include
+  policy, destructor SQLite-handle ordering on the workflow_routes
+  test (so `fs::remove` runs after `sqlite3_close`), and
+  `path.string().c_str()` conversion for `sqlite3_open_v2` (C2664).
+
+- **`InstructionStore::create_set` now uses the `kConflictPrefix`
+  contract on duplicate-id.** Previously returned
+  `"insert failed: UNIQUE constraint failed: ..."` on duplicate, which
+  the boot-time auto-import substring-matched against `"already exists"`
+  and miscounted as `errored`. Every server restart logged
+  `0 sets imported / 0 skipped / 10 errored` plus 10 WARN lines —
+  looking like a persistent fault to any SIEM integration. The store
+  now does a pre-INSERT existence check and returns `kConflictPrefix`-
+  prefixed errors, mirroring `create_definition_impl`. Auto-import
+  classifies via the shared `is_conflict_error()` helper.
+
+- **`/static/yuzu.css` Cache-Control loosened to
+  `no-cache, no-store, must-revalidate`** (was `max-age=3600`) to
+  prevent stale skin during design-token iteration. Operators running
+  a reverse-proxy cache will see slight uplift in origin load on
+  dashboard pageloads. Tracked for dev-mode-flag gating in follow-up
+  — not gated yet.
+
+- **`/static/fonts/InterVariable.woff2` zero-copy.** Route now passes
+  the underlying byte-array `data + size` directly to
+  `httplib::Response::set_content`, skipping a 345 KB `std::string`
+  allocation per fetch.
+
+- **CI: Windows MSVC debug failed at link with LNK2038 abseil
+  RuntimeLibrary mismatch and LNK1181 truncated obj-path errors when
+  it ran after Windows MSVC release on the same self-hosted
+  yuzu-local-windows runner.** Both legs of the matrix shared a single
+  `build-windows/` dir under `clean: false`. When release ran first,
+  `meson setup --reconfigure` for the debug leg did not regenerate
+  ninja's link response files cleanly, so debug-build link.exe
+  invocations pulled release-CRT abseil libs (mismatched
+  `_ITERATOR_DEBUG_LEVEL=0` vs `=2` in `src_main.cpp.obj`) and
+  truncated obj-path entries in the response file (e.g.
+  `'isualization.cpp.obj'` for `unit_server_test_rest_visualization.cpp.obj`).
+  This is the same `--reconfigure` variant-leak edge case the Linux
+  matrix already worked around with per-variant `build-linux-{compiler}-{buildtype}/`
+  dirs (ci.yml:265-274). Fix: split Windows into `build-windows-debug/`
+  and `build-windows-release/` so the two legs can never poison each
+  other's ninja state. Pre-checkout sentinel also wipes the legacy
+  `build-windows/` so a stale pre-split dir cannot linger on the runner.
+
+- **CI: Linux + Windows self-hosted runners rebuilt every vcpkg port from
+  source on every run.** Two compounding causes: (a) `lukka/run-vcpkg`
+  defaults `VCPKG_DEFAULT_BINARY_CACHE` to a per-run UUID temp dir under
+  its own state path, so every job started with a 0% hit rate; (b)
+  `actions/checkout@v6` defaults to `clean: true` (`git clean -ffdx`),
+  which wiped both `vcpkg/` and `vcpkg_installed/` from the workspace.
+  Combined effect: ~25 min from-source on Linux and ~90 min on Windows
+  for grpc + abseil + protobuf, every push, on a runner that had every
+  byte already on disk in a different directory. Symptom signature in
+  the build log: `Restored 0 package(s) from .../<uuid>/vcpkg_cache`.
+
+  Fix: redirect `VCPKG_DEFAULT_BINARY_CACHE` to `${{ runner.tool_cache }}`
+  on every self-hosted job (matrix linux × 4, sanitize-asan, sanitize-tsan,
+  coverage, windows × 2). The tool_cache path lives outside
+  `$GITHUB_WORKSPACE` so checkout's clean leaves it alone. After warm-up,
+  vcpkg restores from zip in ~10 s on Linux / ~30 s on Windows. Caches
+  are scoped by triplet only (`-linux`, `-asan`, `-windows`) — variants
+  using the same triplet share one cache because the package zips are
+  bit-identical regardless of consumer compiler/buildtype. Previous CI
+  rounds had used per-matrix scoping for defensive isolation, which
+  caused 4× from-source on the Linux matrix's first warm-up; we've
+  never had an isolation incident, so the speed wins. Net cumulative
+  first-warm cost dropped from ~5 h to ~2 h 20 min.
+
+- **CI: ASan job lacked sentinel-based triplet drift detection.** The
+  `triplets/x64-linux-asan.cmake` overlay is fingerprinted into vcpkg's
+  ABI hash, but vcpkg's _incremental install_ keys on the manifest only
+  — an edit that touches sanitiser flags or `VCPKG_BUILD_TYPE` would
+  silently leave the existing tree in place, yielding phantom link
+  errors that look like ABI mismatches. Mirrored the Windows
+  `Force fresh vcpkg install when triplet changed` step on the ASan
+  job, sentinel at `vcpkg_installed/.x64-linux-asan-triplet.sha256`.
+  Stock `x64-linux` jobs (matrix linux, TSan, coverage) don't carry an
+  overlay so don't need the sentinel; vcpkg-pinned commit ID covers
+  upstream triplet changes.
+
+- **CI: dead `Export GitHub Actions cache variables` step on the Windows
+  self-hosted job.** `ACTIONS_CACHE_URL` / `ACTIONS_RUNTIME_TOKEN` were
+  exported for an in-process GHA cache backend that nothing on this
+  runner consumes (binary cache is in `runner.tool_cache`, ccache writes
+  to the runner's HOME). Replaced with a comment explaining the history;
+  the macOS leg still uses `actions/cache@v5` directly so its export is
+  also dead but left in place pending a separate scope.
+
+- **Windows MSVC: `dashboard_ui.cpp` C2026 raw-string-literal limit hit
+  by round-2 visualization additions.** The `kDashboardIndexHtml` raw
+  string at the top of `dashboard_ui.cpp` was already at ~16 019 bytes
+  (a notorious sub-section of the 16 380-byte MSVC C2026 limit). Adding
+  the `<div id="chart-deck-host">` placeholder, the
+  `<script src="/static/yuzu-charts.js">` tag, and the
+  `.yuzu-chart-deck` / `.yuzu-chart-card` CSS for the chart deck pushed
+  it over, breaking Windows MSVC release with
+  `error C2026: string too big, trailing characters truncated`. Linux,
+  macOS, and clang accepted the bigger string fine.
+
+  Fix: split the raw string at the `</head>` boundary so chunk 1
+  (head + style) is now ~12 810 bytes and chunk 2 (body onward) is its
+  own 3 209-byte literal. Adjacent string literals concatenate at
+  compile time, so the runtime HTML is byte-identical. Same chunking
+  pattern `static_js_bundle.cpp` already uses for `kHtmxJs` and the
+  governance build-ci agent flagged for `charts_js_bundle.cpp` (#607).
+
+- **Windows MSVC: `yuzu_agent_tests.exe` LNK2019 regression from #572.**
+  PR #572 changed `yuzu_agent_tests` to depend on `yuzu_proto_headers_dep`
+  (no link_with) instead of `yuzu_proto_dep`. On Linux/macOS this works
+  because `proto/meson.build` compiles with `-fvisibility=default`, so
+  proto symbols appear in `libyuzu_agent_core.so`'s dynamic symbol table
+  and the test binary resolves them at runtime. On Windows MSVC there
+  is no equivalent — `shared_library` produces a `.dll` + import lib
+  but does not export every symbol the way ELF visibility does (no
+  `__declspec(dllexport)` on proto symbols means they are not in the
+  import lib). Result: every `.pb.o` symbol referenced in
+  `test_guardian_engine.cpp` (`yuzu::agent::v1::CommandRequest`,
+  `yuzu::guardian::v1::GuaranteedStateRule`, etc.) became unresolved at
+  link time, breaking both Windows MSVC debug and release CI jobs that
+  had previously been green.
+
+  Fix: make the proto-dep choice platform-conditional in
+  `tests/meson.build`. Linux and macOS keep
+  `yuzu_proto_headers_dep` (the ASan-clean #572 path); Windows uses
+  `yuzu_proto_dep` (with link_with) since the duplicate-registration
+  CHECK is non-fatal there and ASan is not part of the Windows MSVC
+  build matrix. Linux verified: `yuzu_agent_tests` 366 cases / 35 775
+  assertions and `yuzu_server_tests` 1252 cases / 14 923 assertions
+  both green after reconfigure + rebuild.
+
+### Changed
+
+- **Visualization: governance round-2 hardening on the multi-chart and
+  dashboard auto-render deltas.** Resolved in-PR: arch-B2 (migration v2
+  duplicate-column was non-idempotent on iterated DBs — added a
+  pre-migration probe that stamps `schema_meta` to v2 when the column
+  already exists, so the migration runner skips the failing ALTER);
+  C-14/sec-F5/UP-36 (raw `&` replaced with `&amp;` in three HTML
+  attribute emit sites for strict HTML5 conformance and consistency
+  with `render_results`); CP-1/sec-F1/ER-NEW-2 (reverse-lookup at
+  `/api/dashboard/execute` now gates on `InstructionDefinition:Read`
+  in addition to `Execution:Execute` — a principal denied
+  `InstructionDefinition:Read` no longer enumerates definition IDs
+  through this side channel; the dispatch itself still succeeds, only
+  the chart auto-render is suppressed); CP-2/C-16 (the `command.dispatch`
+  audit `detail` now appends `definition_id=<id>` when the reverse-lookup
+  resolved one — closes the SIEM correlation gap between dispatch and
+  the subsequent `execution.visualization.fetch` event); sec-F3/C-15
+  (REST endpoint regex-validates `definition_id` against
+  `^[A-Za-z0-9._-]{1,128}$` matching the dashboard fragment, so
+  unbounded values no longer reach SQL bind / audit / log paths);
+  sec-F2 (added failure audit emission for every 4xx path on the REST
+  visualization endpoint with a structured `reason=<r>` token in
+  `detail` so SIEM rules can detect probe / fuzz traffic);
+  doc-SF1 (visualization-demo.sh header comment updated — the
+  browser-console paste workaround is removed in favour of the
+  dashboard auto-render UX); doc-SF2 (`audit-log.md` table now
+  documents `execution.visualization.fetch` with the success / failure
+  detail vocabulary and the SIEM-correlation note);
+  doc-SF3/ER-NEW-4 (`instructions.md` § 13 grew a "Response
+  Visualization (chart deck)" subsection covering the auto-render
+  flow, RBAC, and known limitations).
+
+  Tests: `[visualization]` filter now 28 cases / 186 assertions, all
+  green. Added "REST visualization: malformed definition_id → 400" and
+  asserted failure-path audit emission on the existing missing-
+  definition_id 400 case.
+
+- **Visualization: chart deck auto-renders inline in the dashboard
+  results panel (no manual paste needed).** New `<div id="chart-deck-host">`
+  placeholder above the filter bar in `dashboard_ui.cpp`; `yuzu-charts.js`
+  now ships in the dashboard's `<script>` block alongside `htmx.js` and
+  `sse.js`. `/fragments/results` accepts an optional `definition_id`
+  query parameter and emits an OOB `<div id="chart-deck-host">` swap
+  alongside the tbody, populating the deck with one chart card per
+  configured chart. The dashboard `/api/dashboard/execute` path does a
+  best-effort reverse lookup against `InstructionStore` for a
+  definition matching the dispatched (plugin, action) that has a
+  `spec.visualization` configured; when found, `definition_id` is
+  threaded through (a) the OOB filter-bar `load delay:2s` URL,
+  (b) the OOB chart-deck-host load URL, (c) the filter-bar form's
+  hidden inputs, and (d) the pagination/sort/filter base URLs. Operators
+  who type an instruction whose plugin/action matches a chart-bearing
+  definition now see charts render automatically as soon as responses
+  arrive, with no need for the browser-console paste from
+  `scripts/visualization-demo.sh`. Minimal CSS for the
+  `.yuzu-chart-deck` flex container keeps multiple charts side-by-side
+  with sensible min-width/max-width.
+
+- **Visualization: multi-chart definitions (issue #587, governance arch-S2).**
+  A definition can now declare more than one chart via the canonical
+  plural form `spec.visualizations: [<vis>, ...]`. The singular
+  `spec.visualization: <vis>` is accepted as syntactic sugar for a
+  single-element list and is normalised at ingest by
+  `import_definition_json`. The REST endpoint accepts an optional
+  `?index=N` query parameter (default `0`); the response payload
+  includes `chart_index` and `chart_count` so clients can iterate.
+  Out-of-range `index` returns 404; non-integer `index` returns 400.
+  The dashboard fragment emits one `<div data-yuzu-chart-url="...&index=K">`
+  per configured chart wrapped in a `<div class="yuzu-chart-deck">`
+  container, so each chart is rendered independently and a slow/failed
+  fetch on one doesn't block its siblings. Engine API grew
+  `count(spec_json)` and `transform_at(spec_json, index, ...)`;
+  `has_visualization` and `transform` continue to work for the legacy
+  single-chart case. Storage column `visualization_spec` keeps its
+  TEXT/JSON shape but values are normalised to JSON arrays at ingest.
+
+- **Visualization fragment route relocated to `dashboard_routes.cpp`
+  (issue #589, governance arch-S6).** `GET /fragments/executions/{id}/visualization`
+  was registered in `server.cpp` alongside the static-asset handlers
+  because that's where the stores were already in scope. Every other
+  `/fragments/*` route lives in `dashboard_routes.cpp`; this one now
+  joins them. `DashboardRoutes::register_routes(...)` grew an optional
+  `InstructionStore*` parameter (defaulted to `nullptr` for
+  backward-compatible call sites). Behavior, URL, permission gate
+  (`Response:Read`), and XSS-safe `definition_id` regex validation
+  all unchanged. Demo script and unit tests (`[visualization]`)
+  continue to pass; live UAT confirms the moved route returns
+  HTTP 200 with the expected `data-yuzu-chart-url` placeholder.
+
+### Added
+
+- **Response Visualization Engine — server-side chart rendering for
+  instruction responses (issue #253, Phase 8.1).** New
+  `spec.visualization` block on `InstructionDefinition` declares a
+  chart configuration (5 chart types: pie / bar / column / line /
+  area; 3 processors: single_series / multi_series / datetime_series).
+  The server walks the response set, runs the chosen processor, and
+  returns chart-ready JSON via
+  `GET /api/v1/executions/{id}/visualization` (gated on `Response:Read`
+  for sibling parity with the rest of the response-store read surface;
+  requires `definition_id` query parameter). Dashboard fragment
+  `GET /fragments/executions/{id}/visualization` returns an
+  HTMX-friendly placeholder div the embedded vanilla-SVG renderer
+  (`/static/yuzu-charts.js`, no third-party dependency) populates on
+  settle. `visualization_spec` is stored on the definitions table as
+  a JSON string and tracked by `MigrationRunner` v2 so the schema
+  ledger reflects when the column became canonical. Field names use
+  camelCase (`labelField`, `valueField`, `seriesField`, `xField`,
+  `yField`, `maxCategories`, `valueLabel`); the engine still accepts
+  the snake_case forms as deprecated aliases for backward compat.
+  Row reads cap at 10000 (sibling parity); when the cap is hit the
+  payload includes `rows_capped:true` and a server-side warn log
+  fires so on-call has a signal. Engine label cardinality is also
+  hard-capped at 10000 distinct labels per chart as defense-in-depth.
+  Every render emits an `execution.visualization.fetch` audit event.
+  REST API documented in `docs/user-manual/rest-api.md` and the
+  embedded OpenAPI spec; YAML DSL documented in
+  `docs/yaml-dsl-spec.md` § `spec.visualization` with two worked
+  examples and an entry in the §3.2 complete example.
+
+  Hardening followed an 8-gate `/governance` run on the initial
+  commit; this entry reflects the post-hardening surface. Resolved
+  in-PR: sec-H1 reflected XSS via `definition_id`, sec-H2/C-1 wrong
+  securable, sec-L6/C-4 missing audit, sec-M4/F-9 unbounded label
+  cardinality, bld-B1 macOS `std::from_chars(double)` compile,
+  arch-B1/F-6 migration discipline, dsl-B1 broken services-plugin
+  example, dsl-B2 snake_case→camelCase rename, dsl-B3 missing §3.2
+  example, doc-B1/B2 missing rest-api.md and OpenAPI entries, qe-1/2/3
+  test gaps for 403/audit/503 paths, C-2 row-cap drift 5000→10000,
+  UP-3/ER-P1 silent truncation. Deferred to follow-up issues:
+  sec-M3/F-3 mgmt-group visibility filter (non-trivial — needs
+  `ManagementGroupStore` wired into `RestApiV1::register_routes`),
+  UP-5/SRE-7 concurrent render DoS semaphore, UP-19 duplicate
+  command_id collision, arch-S2 multi-chart-per-definition, arch-S6
+  fragment route relocation to `dashboard_routes.cpp`.
+
+  Test deltas: `tests/unit/server/test_visualization_engine.cpp`
+  (12 engine cases, all camelCase), `tests/unit/server/test_rest_visualization.cpp`
+  (10 wire cases including 403 perm-denied, 503 null-stores, audit
+  emission, snake_case alias, rows_capped meta).
+
+- **CI: ASan job now uses `x64-linux-asan` triplet so vendored deps
+  (protobuf/abseil/grpc) are built with `-fsanitize=address,undefined`
+  — fixes a 4-of-4 ASan FAIL streak.** Every prior ASan run aborted
+  in 0.44s with `AddressSanitizer: use-after-poison` triggered before
+  any Yuzu test code executed: protobuf's `DescriptorPool::Tables`
+  static constructor inserts into an `absl::flat_hash_map` whose
+  unused slots are poisoned by abseil's container-overflow logic, but
+  abseil's `ABSL_HAVE_ADDRESS_SANITIZER` macro only fires when the
+  abseil build itself sees `-fsanitize=address` — vcpkg's stock
+  abseil port doesn't, so the application's ASan instrumentation
+  diverged from the library's, gcc 13's libstdc++ basic_string SSO
+  inline-buffer read on an adjacent slot was flagged as
+  use-after-poison, and the binary aborted.
+  Building the deps with the same sanitiser flags as the application
+  (via the new `triplets/x64-linux-asan.cmake` overlay triplet)
+  makes abseil cooperate with ASan and resolves the static-init
+  abort. Per-sanitiser binary-cache directory keeps the instrumented
+  .zips separate from the regular `x64-linux` cache. First run pays
+  ~25 min from-source for the ASan-instrumented deps; subsequent
+  runs are extract-from-zip (~10s) since the runner's local disk has
+  ample room (issue #569's local-cache architecture made this
+  tractable). TSan deferred — different shadow-memory model, no
+  similar abseil interference today.
+
+- **CI: dropped `actions/cache@v5` on every self-hosted runner —
+  Linux + Windows now use runner-local persistent state only
+  (issue #569).** 14 cache blocks removed across `ci.yml` (8),
+  `release.yml` (5), and `codeql.yml` (1). On a self-hosted
+  runner, ccache's OS-default location (`~/.cache/ccache` on
+  Linux, `~\AppData\Local\ccache` on Windows) lives in the
+  github-runner user's home directory, which persists between
+  jobs by definition; `vcpkg_installed/` similarly persists in
+  `${{ github.workspace }}` since self-hosted workspaces are not
+  recycled. Routing those directories through GHA's 10 GB cache
+  backend was pure overhead — the post-`a5436ed` ccache contents
+  alone (~4 GB per (compiler, mode) entry) couldn't all fit, and
+  LRU eviction was forcing from-scratch rebuilds on every job.
+  Expected impact: per-job CI wall time drops from 50-80 min to
+  8-12 min on self-hosted Linux, and the cumulative push-to-CI
+  cycle from 5-7 hours to 30-60 min. macOS jobs (cloud-hosted,
+  ephemeral) keep their `actions/cache` blocks — those are the
+  only legitimate use of GHA cache in this workflow set.
+
+  The vestigial `compact_compiler` matrix include from the
+  earlier round-3 cache-key unification is also removed — it only
+  fed the cache keys that no longer exist.
+
+- **CI: unified vcpkg + ccache cache-key form to compact `gcc13` /
+  `clang19` (no hyphen) across every Linux job (issues #569, #547
+  /test investigation).** The matrix-driven Linux build jobs were
+  using `vcpkg-x64-linux-${{ matrix.compiler }}-...` which
+  interpolated as `gcc-13` / `clang-19` (with hyphen). The
+  standalone Sanitizer / Coverage / Real-upstream jobs hard-coded
+  `vcpkg-x64-linux-gcc13-...` (no hyphen). Two parallel cache
+  entries for identical content forced the GHA 10 GB cap into LRU
+  eviction during the v0.12.0-rc /test run on dev — net effect
+  was 5-7h CI cycles where 50-80 min was vcpkg-from-source rebuilds
+  and 20-40 min ccache uploads, instead of the expected 8-12 min.
+  Added a `compact_compiler` matrix include that maps
+  `gcc-13 → gcc13` / `clang-19 → clang19`; every Linux cache key
+  now uses that field. The deeper architectural fix (drop
+  `actions/cache@v5` on self-hosted Linux entirely in favour of
+  runner-local persistent dirs) is tracked separately as issue
+  #569; this entry closes only the cache-key-mismatch half.
+- **`.claude/agents/consistency-auditor.md` extended to cover
+  `.github/workflows/*.yml`.** Cache-key parity across sibling
+  jobs, restore-key subsumption, runner-label coherence
+  (self-hosted vs cloud), matrix-include shape parity, action SHA
+  pinning uniformity, and workflow-dispatch input contract are now
+  explicit Key Questions for the agent. Without this, /governance
+  runs miss CI-yaml drift like the gcc-13 / gcc13 cache split that
+  thrashed the GHA cache for weeks before /test surfaced it.
+
+- **TAR dashboard hardening round 4 — Gate 5/6 BLOCKING (issue #547).**
+  Folds the BLOCKING items Gates 5 + 6 (compliance / sre / enterprise-
+  readiness / chaos) caught after the first three hardening rounds:
+  - **compliance F1 (RBAC denied audit gap)** — both new POST handlers
+    (`/fragments/tar/retention-paused/scan` and `.../reenable`) now emit
+    `result=denied` audit rows when `perm_fn_` rejects the request. The
+    audit catalog (`docs/user-manual/audit-log.md`) documented the
+    `denied` rows but the code did not deliver them, contradicting the
+    SOC 2 CC6.1 / CC7.2 control claim. Two `audit_fn_` calls plus the
+    sibling `denied` counter increments close the gap.
+  - **sre OBS-1 (Prometheus metrics)** — the design doc spec'd 5
+    metrics; PR-A in scope is 4: `yuzu_tar_dashboard_view_total`
+    (counter, labels: `frame`, `result`),
+    `yuzu_tar_retention_paused_devices` (gauge, labels: `source`),
+    `yuzu_tar_scan_dispatched_total` (counter, labels: `result` —
+    `success` / `rate_limited` / `no_visible_agents` /
+    `no_connected_agents` / `denied`), and
+    `yuzu_tar_source_reenable_total` (counter, labels: `result` —
+    `success` / `scope_violation` / `agent_not_connected` / `denied` /
+    `invalid_input`). Plumbed `MetricsRegistry*` through
+    `DashboardRoutes::register_routes` (new optional parameter,
+    defaults `nullptr` so tests don't have to construct one).
+    Descriptions registered at startup so the Prometheus serializer
+    emits HELP and TYPE lines correctly. The retention-paused gauge is
+    re-set per source on every render — operators tracking
+    "process retention is paused on N devices over time" now have a
+    queryable signal.
+  - **sre CAP-1 (per-operator scan cooldown)** — `POST .../scan` now
+    enforces a 30-second cooldown using the already-stored
+    `dispatched_at` field. Subsequent dispatches within the window
+    return HTTP 429 with `Retry-After`, an HTML fragment showing the
+    remaining wait, and a `denied` audit row carrying
+    `rate_limited cooldown=Ns`. Without this, a compromised session
+    could spam Scan in a loop and storm the fleet with `tar.status`
+    RPCs at the operator's `Execution:Execute` permission tier.
+  - **enterprise SHOULD-1 (mixed-version upgrade caveat)** —
+    `docs/user-manual/server-admin.md` gains a "v0.12.0 — TAR dashboard
+    page + mixed-version agent caveats" subsection covering the
+    em-dash rendering for pre-PR-A agents, the per-operator scan-state
+    persistence model, and the new audit-action surface. Without this,
+    operators upgrading the server before the agent fleet would see
+    `—` columns and have no documented explanation.
+  - **enterprise SHOULD-2 (TAR nav-link conditional rendering)**
+    deferred to follow-up — requires a JS-time permission lookup that
+    is more architectural than a one-line CSS hide. The current
+    behaviour (click → 401/redirect) is not a security issue.
+
+- **TAR dashboard hardening round 3 — Gate 4 + Gate 3 follow-up
+  (issue #547).** Folds the BLOCKING items Gate 4 caught after the
+  first two hardening rounds, plus the QE BLOCKING test gap on
+  `json_escape`:
+  - **QE F1** — `json_escape` promoted from `static` in
+    `dashboard_routes.cpp` to inline in `web_utils.hpp` so future
+    hx-vals call sites inherit the helper instead of rolling their
+    own. New `test_web_utils.cpp` block (8 cases) pins JSON-escape
+    semantics for empty / plain ASCII / `"` / `\` / named escapes
+    (`\b\f\n\r\t`) / C0 control bytes / 0x20+ pass-through / the
+    full `html_escape(json_escape(value))` pipeline contract that
+    sec-M3 depends on. Without this test, a future refactor that
+    drops a case from json_escape would silently re-open sec-M3.
+  - **consistency-auditor BLOCKING-8** — `docs/capability-map.md`
+    §28.4 still said `/dashboard/tar`. Fixed to `/tar` matching
+    the implementation and the rest of the docs.
+  - **consistency-auditor BLOCKING-9** — `docs/tar-dashboard.md`
+    §3.5 and §6 (permissions matrix) still said
+    `Infrastructure:Update` for Re-enable. Updated to
+    `Execution:Execute` matching the round-1 perm-tier fix and
+    the user-manual / rest-api docs that already said Execute.
+    The Scan-fleet row was also added to the permissions matrix.
+  - **happy-path SHOULD-1** — empty-state message on the
+    retention-paused fragment now distinguishes "scan still in
+    progress" (responses < dispatched) from "scan complete and
+    clean" (every dispatched agent responded with no paused
+    sources). Without this, the operator would see a "click
+    Refresh in a moment" prompt even after every agent had
+    answered, leading to unnecessary re-fetches.
+  - **happy-path NICE-1** — Scan-fleet button no longer fires a
+    success-level toast saying "dispatched to 0 agent(s)" when
+    no agents in scope are connected. The zero-reach case now
+    fires a warning-level toast that matches the empty-state body.
+  - **unhappy-path UP-11** — three TAR fragment endpoints now
+    emit `Cache-Control: no-store, private` and `Vary: Cookie`.
+    Without these, a corporate proxy honouring default `text/html`
+    caching could re-replay one operator's filtered, visibility-
+    scoped scan results to a different operator on the shared URL,
+    defeating the round-1 sec-H2 fix.
+
+- **TAR dashboard hardening round 2 — docs from Gate 2 governance
+  (issue #547).** Folds the four BLOCKING + four SHOULD-FIX docs
+  findings the docs-writer caught:
+  - **doc-B1** — `docs/user-manual/tar.md` gains a new "TAR
+    dashboard page" section after "Checking TAR status," covering
+    the page URL, the retention-paused list workflow, columns,
+    permissions (`Infrastructure:Read` to view, `Execution:Execute`
+    to scan or re-enable — reflects the round-1 perm tier fix), the
+    in-memory per-username scan-state caveat, and the audit-action
+    surface. Also extends the `tar.status` example output block
+    with the four new per-source `enabled` / `paused_at` /
+    `live_rows` / `oldest_ts` lines so operators reading the manual
+    know what to expect.
+  - **doc-B2** — URL drift fixed across `docs/tar-dashboard.md`,
+    `CLAUDE.md`, and `docs/roadmap.md`. The page is at `/tar` (the
+    implementation), not `/dashboard/tar` (the prior design-doc
+    text). The CLAUDE.md routed-concerns trigger pattern updates to
+    `/tar` and `/fragments/tar/...`.
+  - **doc-B3** — `docs/tar-dashboard.md` §3.1 no longer claims
+    background refresh every 60s. Replaced with the actual
+    behaviour (manual Refresh button) and a forward-pointer to
+    Phase 15.G operational hardening.
+  - **doc-B4** — `docs/user-manual/audit-log.md` "Logged actions"
+    table gains entries for `tar.status.scan` and
+    `tar.source.reenable`, including the `result=failure` /
+    `detail=scope_violation|agent_not_connected` distinction the
+    handler emits server-side even when the HTTP response body is
+    identical (404 with body `Agent not reachable.`) for both
+    cases — so SIEM rules can distinguish forged-form attempts
+    from transient connectivity issues.
+  - **doc-S1** — `docs/user-manual/rest-api.md` "Dashboard TAR"
+    section gains entries for `GET /tar`, `GET
+    /fragments/tar/retention-paused`, `POST .../scan`, and `POST
+    .../reenable` with method, path, permission, request schema,
+    response codes, and the audit-action emitted.
+  - **doc-S2** — `docs/tar-dashboard.md` §7 audit-action list
+    corrected: `tar.retention_paused.list` (never implemented) →
+    `tar.status.scan` (the actual emission). Forward-pointer added
+    to `tar.source.purge` etc. as the Phase 15.A.next deliverables.
+  - **doc-S3** — `docs/roadmap.md` Phase 15 issue index row for
+    #547 now reflects PR-A.A delivery — "In progress —
+    PR-A.A shipped (paused_at + status extension + dashboard page +
+    Scan + Re-enable; purge action + persistence pending)" rather
+    than the bare "In progress" of the prior doc commit.
+  - **doc-S4** — `docs/tar-dashboard.md` PR ladder row for PR-A
+    flips from "In flight — current session" to "Shipped PR-A.A"
+    so future readers do not treat the deferred purge action as an
+    accidental omission.
+- **TAR dashboard hardening round 1 — Gate 2 governance findings
+  (issue #547).** The PR-A.A initial commit shipped on
+  `Infrastructure:Read` for the Scan dispatch and a single shared
+  `latest_tar_scan_id_` server slot. Governance Gate 2 caught two
+  HIGH and three MEDIUM findings before merge and this round folds
+  the fixes:
+  - **sec-H1 (perm tier mismatch).** `POST .../scan` and
+    `POST .../reenable` now require `Execution:Execute` (matched to
+    sibling dispatch handlers `run-instruction` / `tar-execute`).
+    Reading the rendered list still requires `Infrastructure:Read`.
+  - **sec-H2 (cross-operator data leak).** Scan state is now
+    per-username (`tar_scans_by_user_` map keyed by session
+    username, bounded LRU at 256 entries). Operator B opening
+    `/tar` no longer sees operator A's scan results, and the
+    rendered table is **filtered by the operator's visible-agent
+    set** (`ManagementGroupStore::get_visible_agents`) so even
+    cached responses from agents outside the operator's RBAC scope
+    are dropped. Defense-in-depth: the dispatch itself is now
+    scoped to visible agents at fan-out time, not to all connected
+    agents.
+  - **sec-M1 (per-device RBAC scope).** The reenable endpoint now
+    verifies `device_id` is in the operator's visible-agent set
+    before dispatching. Out-of-scope IDs are rejected.
+  - **sec-M2 (404 enumeration oracle).** Out-of-scope and
+    not-connected reenable attempts now return identical 404
+    bodies ("Agent not reachable") so the response cannot be used
+    to enumerate device existence. Audit detail records the real
+    reason (`scope_violation` vs `agent_not_connected`)
+    server-side.
+  - **sec-M3 (`hx-vals` JSON injection).** A new local
+    `json_escape()` helper in `dashboard_routes.cpp` escapes JSON
+    metacharacters in `device_id` / `source` before the
+    surrounding `html_escape` runs. Without this, a malicious
+    agent registering with a `device_id` containing `"` could
+    close the JSON string in an HTMX `hx-vals` attribute and
+    inject keys that the operator's browser would submit on Re-
+    enable. Bounded today (only same-fleet agents can mint device
+    IDs) but defense-in-depth.
+  - The scan-provenance header now reports out-of-scope responses
+    that were filtered out, so the operator understands the
+    visibility-bounded view they are seeing.
+
+- **TAR dashboard page + retention-paused source list (PR-A,
+  issue #547).** New `/tar` page off the main dashboard
+  nav, served as `kTarPageHtml` from a dedicated translation unit
+  (`server/core/src/tar_page_ui.cpp`). The page is the operator's
+  destination for *doing TAR* — first frame is the retention-paused
+  source list, with placeholder slots for the scope-walking-aware
+  SQL frame (Phase 15.D / issue #550) and the process tree viewer
+  (Phase 15.H / issue #554) that drop in as those PRs land.
+  Three new HTMX fragment endpoints:
+  - `GET /fragments/tar/retention-paused` queries the response store
+    for the most recent operator-triggered `tar.status` scan, parses
+    each agent's `<source>_enabled=false` rows along with the
+    matching `paused_at` / `live_rows` / `oldest_ts` companions, and
+    renders a sortable table with one row per (agent × paused
+    source) pair. Sorted paused-longest-first so the boxes
+    accumulating non-aging data the longest float to the top. Honest
+    scan-provenance header showing dispatched-to count,
+    responded-so-far count, and the "all-collecting-normally" count.
+  - `POST /fragments/tar/retention-paused/scan` dispatches a fresh
+    `tar.status` to all connected agents, records the resulting
+    command_id in an in-memory `latest_tar_scan_id_` (per-server-
+    instance for now; persistence + multi-server coordination land
+    in Phase 15.G operational hardening). Audit row written:
+    `action=tar.status.scan` with the dispatched-agent count.
+  - `POST /fragments/tar/retention-paused/reenable` takes
+    `device_id` + `source` form params, validates `source` against
+    the canonical four (`process` / `tcp` / `service` / `user`)
+    rejecting forged form submissions with `400 Unknown source`,
+    requires `Infrastructure:Update` per device (re-enable is more
+    consequential than view), then dispatches a single-device
+    `tar.configure` with `<source>_enabled=true`. The row drops
+    optimistically via HTMX `hx-swap=delete`; the next operator-
+    triggered Refresh reconciles against a fresh scan. Audit row:
+    `action=tar.source.reenable` with `device_id` and `source` in
+    the detail. Per-source independence preserved (the #539
+    invariant) — re-enabling one source does not touch the others.
+
+  The page also gains a "TAR" entry in the main dashboard nav,
+  added consistently across `dashboard_ui.cpp`, `help_ui.cpp`,
+  `instruction_ui.cpp`, `settings_ui.cpp`, and `compliance_ui.cpp`
+  so the link is reachable from every existing page.
+
+- **TAR `tar.status` now emits per-source `paused_at`, `live_rows`,
+  `oldest_ts` (PR-A foundation, issue #547).** The `configure` action's
+  per-source enable/disable surface gained a transition timestamp:
+  flipping `<source>_enabled` from `true` → `false` records the
+  wall-clock seconds in `<source>_paused_at`, and the reverse
+  transition clears it to `"0"` (deliberately not unset — a missing
+  key would be ambiguous with "never paused"). Idempotent re-sets do
+  not advance the timestamp, so the dashboard's "paused since" column
+  reflects the actual operator action rather than the most recent
+  configure round-trip. `tar.status` now also emits one `live_rows`
+  and one `oldest_ts` line per source — the rendering data the
+  retention-paused dashboard list (PR-A) needs without a second
+  round-trip. The transition logic is extracted to a free function
+  `yuzu::tar::apply_source_enabled_transition()` in
+  `tar_aggregator.{hpp,cpp}` so the plugin and the regression tests
+  share one source of truth. Backwards-compatible: agents pre-PR-A
+  simply do not emit the new lines, and the dashboard renders `—` for
+  the missing fields.
+
+- **TAR query examples, test coverage, and implementer documentation
+  (issue #60).** Two new pre-built `InstructionDefinition`s shipped
+  in `content/definitions/tar_warehouse.yaml` directly answering the
+  examples called out in the issue body:
+  `crossplatform.tar.daily_process_summary` (live-to-aggregate rollup
+  reading from `$Process_Daily` with `datetime(day_ts, 'unixepoch')`
+  for human-readable dates), and `crossplatform.tar.recent_processes_iso`
+  (the canonical pattern for the SQLite-equivalent of competing
+  platforms' `EPOCHTOJSON(TS)` helper). Both carry per-parameter
+  `description` fields so the dashboard and REST API surface them
+  without docs-side cross-references. (The originally-shipped
+  `crossplatform.tar.process_by_exact_name` was removed during
+  governance — it relied on `${process_name}` interpolation in the
+  hidden default SQL, but the server has no parameter-interpolation
+  pass for `parameters.<key>.default`. Re-add once that surface lands.)
+- **`tar.compatibility` InstructionDefinition + DSL spec registration
+  (governance docs Finding 4 + plugin Finding 5).** The action shipped
+  in the plugin (issue #59) but had no corresponding YAML
+  `InstructionDefinition` in `content/definitions/tar.yaml` and no row
+  in `docs/yaml-dsl-spec.md` §14.15 — meaning operators could not
+  invoke it from the dashboard or via the standard
+  `/api/v1/instructions/execute` flow without hand-crafting a
+  `CommandRequest`. Both gaps are closed; `minAgentVersion: "0.12.0"`
+  is set since the action does not exist on prior agents.
+- **`tar.configure` InstructionDefinition now declares the six new
+  parameters introduced by issue #59** (governance plugin Finding 2):
+  `process_enabled` / `tcp_enabled` / `service_enabled` /
+  `user_enabled` (boolean-as-string with `^(true|false)$` regex
+  validation), `network_capture_method`, and
+  `process_stabilization_exclusions` — all four with descriptions and
+  agent-version notes so the dashboard form widget and the OpenAPI
+  spec render the new surface correctly.
+- **TAR OS compatibility metadata + capture configuration surface
+  (issue #59).** The schema registry's `CaptureSourceDef` now carries a
+  per-OS `os_support` vector (`OsSupportStatus` × `capture_method` ×
+  `notes`) describing how each of the four capture sources (process,
+  tcp, service, user) gathers data on Windows / Linux / macOS, including
+  documented constraints (`KERN_PROCARGS2` invisibility for hardened
+  runtimes, `systemctl`'s `unknown` startup_type, container `/var/run/utmp`
+  absence, `lsof` cost, etc.) and `kPlanned` rows for the ETW and
+  Endpoint Security collectors that have not landed yet
+  (`agents/plugins/tar/src/tar_schema_registry.{hpp,cpp}`). Operators
+  can read the live matrix at runtime via the new `compatibility`
+  action, which emits one `header|...` + N `row|source|os|status|method|notes`
+  lines that the dashboard can render directly.
+- **TAR per-source enable/disable + stabilization exclusions + network
+  capture-method surface (issue #59).** The `configure` action gained
+  four new validated parameters: `process_enabled` /
+  `tcp_enabled` / `service_enabled` / `user_enabled` (default `true`,
+  short-circuit the per-collector block in `collect_fast` /
+  `collect_slow` when `false`); `network_capture_method` (validated
+  against `accepted_capture_methods("tcp")` so unsupported values are
+  rejected at write time, with a `warn|...` line if the value is
+  accepted but not yet wired — currently anything other than
+  `polling`); and `process_stabilization_exclusions` (JSON array of
+  glob patterns; matching processes are dropped before the diff so
+  noisy short-lived helpers don't dwarf real activity, with the
+  forensic-completeness trade-off documented in
+  `docs/user-manual/tar.md`). `do_status` now also surfaces the
+  `<source>_enabled` and `network_capture_method` config rows so
+  operators can see effective state without reading the DB
+  (`agents/plugins/tar/src/tar_plugin.cpp`).
+
+### Breaking
+
+- **`--allow-one-way-tls` requires `YUZU_ALLOW_INSECURE_TLS=1` on
+  upgrade or the server refuses to start (issue #79).** Existing
+  deployments that pass `--allow-one-way-tls` (or the new flag name
+  `--insecure-skip-client-verify`) will fail to start after upgrade
+  unless `YUZU_ALLOW_INSECURE_TLS=1` is also present in the server
+  environment. The deprecated flag name is still accepted for one
+  release with a startup deprecation warning. To restore mTLS, add
+  `--ca-cert <path>` and remove the insecure flag. See the
+  `### Security` entry below and `docs/user-manual/server-admin.md`
+  "Upgrade note (v0.12.0)" for the full migration including a
+  systemd drop-in recipe.
+- **Management gRPC listener now subject to the same
+  `YUZU_ALLOW_INSECURE_TLS=1` gate as the agent listener (governance
+  C-79-1).** Deployments that supply `--management-cert` /
+  `--management-key` without `--management-ca-cert` previously got an
+  unauthenticated management plane silently. They will now fail to
+  start unless `--insecure-skip-client-verify` AND
+  `YUZU_ALLOW_INSECURE_TLS=1` are both set, OR
+  `--management-ca-cert` is supplied. Most deployments do not set
+  the `--management-*` overrides at all (the management listener
+  reuses the agent listener credentials by default) and are
+  unaffected.
+- **`crossplatform.tar.process_by_exact_name` removed from
+  `content/definitions/tar_warehouse.yaml` (governance plugin H-1 /
+  enterprise-readiness Finding 9).** The instruction shipped briefly
+  with `${process_name}` interpolation in its hidden default SQL,
+  but the server has no `${param}` interpolation pass for
+  `parameters.<key>.default` — the literal `${process_name}` would
+  hit SQLite verbatim and match zero rows. Operators who imported
+  the InstructionDefinition during the brief window it was on
+  `dev` should expect the ID `crossplatform.tar.process_by_exact_name`
+  to be missing on upgrade. Re-add once server-side parameter
+  interpolation lands.
+- **`tar_warehouse.yaml` `minAgentVersion` bumped to `"0.10.0"` for
+  every `tar.sql`-based InstructionDefinition (governance H-2).**
+  Previously claimed `"0.7.0"` against agents on which `tar.sql` did
+  not exist. Server-side compatibility checks will now skip these
+  instructions on agents older than v0.10.0 instead of dispatching
+  and getting `unknown action: sql` per device.
+
+### Fixed
+
+- **`yuzu_agent_tests` no longer double-links `yuzu_proto.a`, removing
+  the duplicate protobuf descriptor registration that aborted ASan
+  runs (issue #572).** Both `libyuzu_agent_core.so` and
+  `yuzu_agent_tests` listed `yuzu_proto_dep` (which carries
+  `link_with: yuzu_proto_lib` — a static archive). The linker pulled
+  every `.pb.o` into both the .so and the test exe, so each `.pb.cc`
+  static initializer ran twice at process startup. Non-ASan builds
+  silently tolerated the double registration (the second
+  `DescriptorPool::InternalAddGeneratedFile` saw the same encoded
+  descriptor and returned without retrying); ASan flipped static-init
+  ordering enough to make protobuf's `GOOGLE_CHECK` fire with `File
+  already exists in database: yuzu/common/v1/common.proto`, which
+  this option-2 chain (`afd3904`, `4321a40`, `bc498b3`) finally
+  exposed. The fix has two halves: (a) compile `yuzu_proto` with
+  `-fvisibility=default` (added via per-target `cpp_args` since
+  `add_project_arguments`'s `-fvisibility=hidden` would otherwise
+  win the last-flag-wins fight with `gnu_symbol_visibility`) so the
+  proto symbols actually get exported from any `.so` they're linked
+  into; (b) introduce a `yuzu_proto_headers_dep` (includes + sources
+  + protobuf/grpcpp deps, no `link_with`) and use it in the
+  `yuzu_agent_tests` executable so the test binary resolves proto
+  symbols dynamically against `libyuzu_agent_core.so` instead of
+  relinking the static archive. The ASan path can now exercise the
+  agent test surface end-to-end. (`proto/meson.build`,
+  `tests/meson.build`)
+- **TAR `network_capture_method=polling` (the documented default) is
+  no longer rejected by the configure surface (governance C-1 / QA
+  Finding 2).** Both `do_status` reported `polling` as the default and
+  `do_configure` validated against `accepted_capture_methods("tcp")`
+  — but `polling` was never in that accept-list (the per-OS
+  `os_support` rows describe the underlying platform API:
+  `iphlpapi` / `procfs` / `proc_pidfdinfo`, not the logical
+  `polling` sentinel). The status → configure → status round-trip was
+  broken. `do_configure` now special-cases `polling` and accepts it
+  unconditionally; the rejection error message also lists `polling`
+  alongside the registry-derived methods so the operator sees the
+  full accept-set. (`agents/plugins/tar/src/tar_plugin.cpp`)
+- **TAR macOS TCP `capture_method` metadata corrected
+  (governance C-1 consistency).** `tar_schema_registry.cpp` declared
+  the macOS TCP collector as `capture_method = "lsof"` with notes
+  describing `lsof -nP -iTCP -iUDP`. The actual implementation in
+  `tar_network_collector.cpp` uses `proc_listallpids` +
+  `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` via `libproc` — `lsof`
+  appears nowhere in the collector. The new `tar.compatibility`
+  diagnostic action (issue #59) was therefore shipping factually
+  wrong information to operators on the most operator-facing
+  surface in this batch. Updated the registry, `docs/user-manual/tar.md`
+  OS compatibility matrix, and `docs/tar-implementer.md` to all
+  reflect `proc_pidfdinfo` / libproc with the inherent TOCTOU caveat.
+- **TAR Windows User collector capture-method note corrected
+  (governance H-1 consistency).** `os_support` notes claimed
+  `WTSEnumerateSessionsEx`, but `tar_user_collector.cpp` uses the
+  legacy `WTSEnumerateSessionsW`. Note now reflects the actual symbol
+  and adds a forward-pointer to the recommended successor.
+- **`tar_warehouse.yaml` `minAgentVersion` bumped from `"0.7.0"` to
+  `"0.10.0"` across all 13 entries (governance H-2 consistency).**
+  All entries use `tar.sql`, which first shipped in v0.10.0. The
+  previous claim caused server-side compatibility checks to schedule
+  these instructions against v0.7.x–v0.9.x agents that would then
+  reject them with `unknown action: sql`.
+- **TAR retention no longer deletes data after a source is disabled
+  (issue #539, P1, forensic-completeness regression).** The
+  `configure` action and `docs/user-manual/tar.md` both promise that
+  setting `<source>_enabled=false` "leaves existing rows queryable,"
+  but `run_retention()` in `tar_aggregator.cpp` was iterating
+  `capture_sources()` unconditionally — so the rollup trigger
+  continued draining hourly within 24h, daily within 31d, and monthly
+  within ~365d after disable, breaking the forensic-preservation use
+  case that TAR's headline pitch is built around. The retention loop
+  now consults `<source>_enabled` and skips disabled sources entirely;
+  re-enabling the source resumes time-based retention on the next
+  rollup tick. Per-source independence is preserved: disabling
+  `process_enabled` does not pause retention on `tcp` / `service` /
+  `user`. Surfaced by the /governance run on commit range
+  `b2554ad..HEAD` as unhappy-path H-59-3, chaos-injector CHAOS-2,
+  consistency-auditor M-1, and sre Q2 — all four converged on the
+  same docstring-vs-code drift.
+
+### Documentation
+
+- **`docs/enterprise-parity-plan.md`, `docs/capability-map.md`,
+  `docs/roadmap.md`: System Guardian recognised as the GS delivery
+  vehicle.** Today's parity doc claimed `PolicyStore + CEL + 6
+  trigger types` is equivalent to commercial peers' Guaranteed State —
+  that is a server-side compliance evaluation match, not a real-time
+  enforcement match. Commercial peers' GS uses kernel-event-driven agent-side
+  enforcement (firewall, registry, services revert in milliseconds,
+  not on the next 5-minute poll), and that is the headline parity
+  feature operators evaluate against. The System Guardian work
+  (`docs/yuzu-guardian-design-v1.1.md`, agent-side `GuardianEngine`,
+  Windows-first 17-PR ladder in `docs/yuzu-guardian-windows-implementation-plan.md`)
+  is what closes that gap. PRs 1-2 already shipped (proto, server
+  store, agent scaffolding, `__guard__` dispatch hook); PR 3+ is the
+  rest of the ladder.
+  - **Parity doc**: Part 1 architecture row split into "server-side"
+    and "real-time agent-side enforcement" — only the first is
+    equivalent today; the second is in flight via Guardian. New gap
+    entry G14 calls Guardian out as the CRITICAL parity feature.
+    Priority matrix gains Phase 15 + Phase 16 rows; execution order
+    diagram and total-effort estimate updated. Part 5 capability-map
+    growth target raised from ~215 to ~225 to include the 10 new
+    System Guardian capabilities.
+  - **Capability map**: §16 title clarified to "Policy and Compliance
+    Engine (Server-Side Guaranteed State)" with a header note
+    explaining that real-time agent-side enforcement lives in §31. New
+    §31 "System Guardian — Real-Time Agent-Side Guaranteed State"
+    with 10 capabilities: Guardian Engine + wire protocol (Partial,
+    PRs 1-2 shipped), Windows event guards, condition guards, Linux
+    event guards, macOS event guards, state evaluator + remediation,
+    audit journal + server store (Partial, PR 1 shipped), pre-login
+    activation + offline capability (Done — service install side
+    operational), dashboard + approval workflow, rule signing +
+    quarantine integration. Totals adjusted: 166/225 done, 3 partial.
+  - **Roadmap**: new Phase 16 with three issues (16.A Windows, 16.B
+    Linux, 16.C macOS — gated on Windows soak; 16.C additionally
+    gated on Endpoint Security entitlement) filed as #555-#557.
+    Recommended execution order extends through Phase 16; total issue
+    count updated to 126.
+- **`docs/capability-map.md`: Phase 15 capabilities added (the WHAT).**
+  Section 28 (Response Visualization) gained 28.4 TAR Dashboard Page,
+  28.5 TAR Process Tree Viewer, 28.6 Retention Awareness Surface. New
+  Section 30 (Scope Walking & Result Sets) covers 30.1 Result Set
+  Persistence and Lineage, 30.2 Composable Scope from Previous Query,
+  30.3 YAML DSL `fromResultSet:` Surface, 30.4 Result Set Operational
+  Hardening. Progress totals adjusted: 165 done / 215 total / 1 partial
+  (15.A is in flight, marked `:large_orange_diamond:`); the rest are
+  honestly `:x:` Not Started. The capability map now describes what we
+  will do; the roadmap's Phase 15 PR ladder describes how we will get
+  there. Phase 15 issues filed on GitHub as #547 (15.A) through #554
+  (15.H); the roadmap's "TBD" entries replaced with the issue links.
+- **New `docs/tar-dashboard.md` + `docs/scope-walking-design.md`
+  (Phase 15 design — see `docs/roadmap.md` Phase 15 PR ladder).** Two
+  rigorous design documents covering (a) a dedicated TAR dashboard
+  page with three frames — retention-paused source list, scope-walking-
+  aware ad-hoc SQL, and process tree viewer reconstructed from
+  `process_live` seed + events — and (b) the cross-cutting
+  composable-scope-from-previous-query primitive that is Yuzu's
+  product differentiator. Result-set storage schema (immutable
+  lineage edges, TTL with pin override, source payload JSON for live
+  re-eval), Scope Engine `from_result_set:<id>` short-circuit kind,
+  REST API, YAML DSL `fromResultSet:` surface, dashboard sidebar +
+  breadcrumb, audit chain. Reference walkthrough is the Chrome
+  incident-response scenario — operator iteratively narrows from
+  `__all__` → all-windows → windows-chrome → windows-chrome-bad-hash
+  → windows-chrome-compromised → quarantine + remediate +
+  un-quarantine + heightened-IOC watch, with every step's audit row
+  carrying `parent_result_set_id` and `result_result_set_id` so
+  forensic reconstruction shows the full reasoning chain.
+  `CLAUDE.md` routed-concerns table gains pointers to both docs;
+  `docs/roadmap.md` gains Phase 15 (8 issues, 15.A–15.H) with the
+  PR ladder explicit. PR-A (TAR page shell + retention-paused list)
+  is the first slice and is in progress.
+- **New `docs/tar-implementer.md` (issue #60).** The implementer-facing
+  companion to `docs/user-manual/tar.md`, covering: TAR as a
+  forensics + inventory capability (and what TAR is *not*); the
+  collect_fast / collect_slow / rollup data flow; the on-disk format
+  (plain SQLite WAL today, with explicit honest notes that
+  encryption-at-rest via SQLCipher and page-level compression are
+  deferred); persistence semantics across in-place upgrade, uninstall,
+  reinstall, and `data_dir` change; the post-restart double-capture
+  caveat for TCP and the design rationale for keeping it (forensic
+  completeness over heuristic suppression); device-impact expectations
+  measured on a 5950X (worst-case per-collect timings, default-retention
+  disk usage); and a routine-debugging entry-point table. The doc
+  closes the issue's "supportable without the original upstream page"
+  acceptance criterion. `docs/user-manual/tar.md` gained a top-of-page
+  pointer to it for engineers.
+- **`docs/user-manual/tar.md`** gained an "OS compatibility matrix"
+  section (per-OS capture method + constraints for each source, status
+  legend) and a configuration table extended with the seven new
+  `configure` parameters introduced by issue #59. Includes a worked
+  example combining retention, fast_interval, user_enabled=false, and
+  process_stabilization_exclusions.
+- **`docs/user-manual/server-admin.md` now documents the gRPC TLS
+  flag surface (governance docs Finding 3 / enterprise-readiness
+  blocker).** The "Server CLI Flags" table gained entries for `--no-tls`,
+  `--cert`, `--key`, `--ca-cert`, `--insecure-skip-client-verify`,
+  the deprecated `--allow-one-way-tls`, and the three `--management-*`
+  override flags. The "TLS Configuration" section now distinguishes
+  the two independent TLS surfaces (HTTPS dashboard vs. gRPC agent +
+  management listeners), shows the full mTLS / one-way-TLS / `--no-tls`
+  invocation patterns, and adds an "Upgrade note (v0.12.0)" subsection
+  walking operators through the `YUZU_ALLOW_INSECURE_TLS=1` requirement
+  with a copy-pasteable systemd drop-in. An Ansible role can now be
+  authored from this doc alone.
+
+### Security
+
+- **`--allow-one-way-tls` renamed to `--insecure-skip-client-verify`,
+  now requires `YUZU_ALLOW_INSECURE_TLS=1` (issue #79).** Disabling
+  client certificate verification on the server's agent listener
+  previously required only a single `--allow-one-way-tls` CLI flag and
+  emitted a single `spdlog::warn()` line at startup. A copy-paste
+  mistake or an operator unfamiliar with the flag could silently
+  downgrade an mTLS deployment to one-way TLS — any reachable peer
+  could then register without a client certificate. The flag has been
+  renamed for clarity, the server now refuses to start unless the
+  matching `YUZU_ALLOW_INSECURE_TLS=1` environment variable is also set
+  as a second confirmation, and a multi-line ERROR-level banner is
+  logged at startup. While the listener is running in this degraded
+  mode a background thread re-emits the warning every 5 minutes so the
+  posture remains visible after the startup logs scroll off
+  (`server/core/src/main.cpp`, `server/core/src/server.cpp`). The
+  operator dashboard's TLS row turns red and renames the field to
+  "Insecure Skip Client Verify"
+  (`server/core/src/settings_routes.cpp`). The deprecated
+  `--allow-one-way-tls` flag is still accepted for one release with a
+  startup deprecation warning and will be removed thereafter; existing
+  deployments must add `YUZU_ALLOW_INSECURE_TLS=1` to their environment
+  on upgrade or supply `--ca-cert` to re-enable full mTLS.
+  `SECURITY_REVIEW.md` MEDIUM finding marked resolved against this
+  release.
+- **Management listener now gated by the same `YUZU_ALLOW_INSECURE_TLS=1`
+  check as the agent listener (governance C-79-1 follow-up).** Previously
+  the management gRPC listener (port 50052) called
+  `build_tls_credentials(..., /*allow_one_way_tls=*/true, ...)` with the
+  flag hardcoded — an operator who set `--management-cert` /
+  `--management-key` without `--management-ca-cert` got an
+  unauthenticated management plane with no env-var gate, no banner, and
+  no recurring reminder. The `true` literal has been replaced with
+  `cfg_.allow_one_way_tls`, so the management listener is now subject to
+  the same two-factor confirmation as the agent listener
+  (`server/core/src/server.cpp`). On upgrade, deployments that supply
+  management cert + key without management CA cert must also pass
+  `--insecure-skip-client-verify` and `YUZU_ALLOW_INSECURE_TLS=1`.
+- **`--no-tls` startup banner (governance C-79-2 follow-up).** `--no-tls`
+  remains intentionally ungated — it is the supported posture for local
+  UAT, customer demos, and development until the CA/CSR pipeline is
+  automated. The flag now emits a multi-line ERROR-level startup banner
+  spelling out that both the agent gRPC listener AND the management
+  gRPC listener accept plaintext from any peer with no encryption and
+  no peer authentication, and that the administrative surface is
+  ungated. The 5-minute recurring reminder thread also fires under
+  `--no-tls`, not just `--insecure-skip-client-verify`
+  (`server/core/src/main.cpp`, `server/core/src/server.cpp`).
+- **TLS-degraded posture now writes audit events for SOC 2 CC7.2
+  evidence (governance H-3 / compliance Finding 2).** The 5-minute
+  reminder thread now writes an `AuditEvent` (`action: "server.tls_degraded"`,
+  `principal: "system"`, `result: "warning"`) to `audit_store_` for every
+  recurring tick, in addition to the existing ERROR-level spdlog line.
+  Without this hookup, `journald` / SIEM forwarding was the only durable
+  evidence of degraded-mode duration; `audit.db` queries for "show me
+  every period the server ran without mTLS" returned nothing. The
+  startup gate-failure case (server refuses to start) remains spdlog +
+  systemd-journal only by structural necessity (audit_store is not yet
+  initialized at that point).
+
+### Tests
+
+- **`tests/unit/test_tar_warehouse.cpp`** — new Catch2 suite for issue
+  #60 (15 cases / 284 assertions). Pins: every source/granularity has
+  a `CREATE TABLE` and a timestamp index in `generate_warehouse_ddl()`;
+  `columns_for_table` returns `id` + every declared column for every
+  table; every `$Dollar_Name` is a unique round-trip;
+  process / tcp / service / user rollups cite the correct lower-tier
+  source and upper-tier target; service rolls up only to hourly (no
+  daily/monthly); user rollup has the day-bucket midnight-rollover
+  arithmetic and tracks login_count / logout_count as a count-of-events
+  rather than session-duration; row-count retention uses the H6 OFFSET
+  pattern (not the older O(n*k) NOT IN); time-based retention uses a
+  cutoff predicate; each granularity's retention SQL touches *only*
+  that granularity (independence invariant); and post-restart TCP
+  diff-with-empty-previous yields all-`connected` events (the
+  documented forensic-completeness double-capture caveat).
+- **`tests/unit/test_tar_schema_registry.cpp`** — new Catch2 suite for
+  issue #59 (6 cases / 44 assertions). Pins: every source declares
+  windows + linux + macos rows; every non-`kUnsupported` row has a
+  non-empty `capture_method` + `notes`; `accepted_capture_methods` is
+  deduped + sorted + non-empty; unknown source returns empty; all
+  `kPlanned` methods stay in the accept-list (so operators can
+  pre-stage); `kUnsupported`-only methods are excluded.
+- **`tests/unit/server/test_insecure_tls_gate.cpp`** — new Catch2 suite
+  pinning the #79 env-var gate. Constants `kInsecureTlsEnvVar` /
+  `kInsecureTlsEnvAuthorizedValue` are pinned to their documented
+  values, and `insecure_tls_env_authorized()` is exercised against
+  nullptr, the empty string, `"0"`, `"true"` (any case), `"yes"`,
+  `"on"`, `"enabled"`, whitespace-padded `"1"`, `"10"`, `"1abc"`, and
+  the only authorizing value `"1"`. The exact-match policy is the
+  point — any future "be permissive" change to the gate would have to
+  delete a test case and survive review.
+- **`tests/unit/test_tar_aggregator.cpp`** — extended with 4 PR-A
+  cases (issue #547) pinning the
+  `apply_source_enabled_transition()` helper and the
+  `<source>_paused_at` semantics: enabled→disabled writes the
+  passed timestamp; disabled→enabled clears to `"0"`; idempotent
+  re-set leaves the timestamp untouched (so repeated configure
+  round-trips don't pretend the pause is fresher than it is); per-
+  source isolation (disabling `process` does not touch `tcp` /
+  `service` / `user` paused_at). The four cases sit alongside the
+  existing #539 retention-guard suite — same fixture pattern, same
+  `yuzu::test::TempDbFile` shared helper.
+- **`tests/unit/test_tar_aggregator.cpp`** — original 4-case Catch2
+  suite pinning the issue #539 retention guard. Reproduces the chaos-injector
+  CHAOS-2 scenario (48 hourly rows seeded across a 48h window centred
+  on the test's `now`, disable the source, run retention) and asserts
+  every row survives. Counter-tests pin that enabled sources still age
+  out, that re-enabling a disabled source resumes retention, and that
+  disabling one source does not pause retention on the others — so a
+  future refactor cannot turn the per-source guard into a global
+  switch without deleting a named test case. Adds
+  `agents/plugins/tar/src/tar_aggregator.cpp` to the TAR test
+  executable's source list (the existing tests are schema-registry-only
+  and did not exercise the rollup engine). Tests use
+  `yuzu::test::TempDbFile` per the shared-helper convention in
+  `tests/unit/test_helpers.hpp`.
+- **`tests/unit/test_tar_schema_registry.cpp`** — orphaned `lsof`
+  assertion fixed. The test on line 73 still expected the macOS TCP
+  capture-method accept-list to contain `"lsof"`, but commit
+  `5a41db5` corrected the registry to `"proc_pidfdinfo"` (matching
+  the actual collector `proc_listallpids` + `proc_pidfdinfo` via
+  libproc). The test was missed in that commit's update wave; this
+  closes the loop and includes a forward-pointer to the SHA in the
+  comment so a future code archaeologist can find the rationale.
+
+## [0.11.0] - 2026-04-25
+
+### Fixed
+
+- **Settings → Users: short-password submission now shows the real rejection
+  instead of failing silently.** `POST /api/settings/users` in
+  `server/core/src/settings_routes.cpp` was fire-and-forgetting the bool
+  return from `AuthManager::upsert_user`, which silently rejects passwords
+  shorter than 12 characters (G2-SEC-A1-003). When an operator typed a
+  short password, the handler still logged `"User added/updated"`, wrote
+  a **success** entry to `audit_store`, and emitted the `"User created"`
+  green toast via HX-Trigger — while nothing was persisted. UAT reported
+  this as "setting a password less than 12 characters silently fails."
+  The handler now checks the return, audits
+  `user.upsert / denied / weak_password`, returns HTTP 400, and emits
+  `{"showToast":{"message":"Password must be at least 12 characters",
+  "level":"error"}}` so the dashboard shows a red toast and the user is
+  not created. The rendered add-user fragment also carries HTML5
+  `minlength="12"` plus an inline `(min 12 chars)` helper label so the
+  browser surfaces the rule natively before the submit round-trip —
+  defence-in-UX, not a security control; the server-side check remains
+  canonical. Three new test cases in
+  `tests/unit/server/test_settings_routes_users.cpp` pin the denial
+  (short password, 11-char boundary, fragment-carries-minlength).
+
+### Changed
+
+- **Governance Gate 7 hardening round — `/governance 4b35786..HEAD`.**
+  Closes the findings from the full governance re-run on `dev` after
+  Guardian PR 2 merged. No new functionality; tightens four correctness
+  and accuracy gaps against the existing entries on this branch.
+  - **`ci.yml` `Upload meson-logs` trigger broadened from `failure()` to
+    `failure() || cancelled()`** (ci-C1 / Gate 5 CH-3 / Gate 6 OB-1).
+    The motivating scenario for #501 — rapid-dev-push concurrency cancel
+    on the Windows leg — makes `failure()` evaluate false, silently
+    dropping the forensic artifact on the exact runs that need it most.
+    `if-no-files-found: warn` already covers cancels that fire before
+    meson writes `testlog.txt`, so there is no false-positive risk.
+  - **`guardian_engine.hpp` `get_status()` doc comment corrected**
+    (hp-F1). The header had claimed rules report `status="compliant"`
+    in PR 2; the implementation at `guardian_engine.cpp:223-225,249`
+    pessimistically reports `status="errored"` for every rule because
+    no evaluator is running yet. Pre-existing drift from the Guardian
+    PR 2 baseline caught by the Gate 4 happy-path review. Matching
+    comment in `guardian_engine.cpp` also tightened. Speculative
+    "Dashboards surface … as 'Guardian installed but inert'" phrasing
+    removed — no such dashboard presentation exists yet; it is a PR 3
+    concern.
+  - **CHANGELOG scope correction for the #482 follow-up list**
+    (doc-GS1 / Gate 4 CA-1). The original TempDbFile migration entry
+    named `test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+    `test_rest_api_t2.cpp`, and `test_kv_store.cpp` as the remaining
+    sibling test files still managing their own RAII. Those four were
+    already remediated in prior commits; the Gate 4 consistency audit
+    caught the misattribution. The accurate 6-file list is now carried
+    in the TempDbFile entry below (`test_tar_store.cpp`,
+    `test_api_token_store.cpp`, `test_management_group_store.cpp`,
+    `test_settings_routes_users.cpp`, `test_guaranteed_state_store.cpp`,
+    `test_plugin_loader.cpp`).
+  - **#501 entry rewritten for factual accuracy** (doc-GS2 / Gate 7
+    re-review BLOCK-1). The original entry described the fix as
+    "switching from `Map::operator[]` to `Map::insert`"; that framing
+    contradicts `.claude/agents/build-ci.md`, which documents both APIs
+    as equally ineffective (both go through `raw_hash_set`'s bucket-
+    index path). The merged fix is the `YUZU_EXPORT
+    guardian_dispatch_push_bytes_for_test` DLL-side helper; the entry
+    now reflects that, and cross-platform's verification that the
+    sibling `server.cpp` pattern is safe (server_core is a
+    `static_library`) is carried into the entry rather than left as an
+    open follow-up.
+  - **Test substring assertions space-anchored** (test-T1 / Gate 3
+    qe-S3). `tests/unit/test_guardian_engine.cpp:208-214` now matches
+    `"applied=1 "` (trailing space) and `" generation=42 "` (both
+    sides) so that a future test growing to 10-rule batches cannot
+    silently pass a stale `"applied=1"` check against `"applied=10"`
+    output.
+
+- **CI observability: upload `meson-logs/` as artifact on Windows test
+  failure (#501).** meson + ninja truncate test stdout to the last 100
+  lines in the GitHub Actions UI, which hides all but one assertion
+  expansion when a test fails with multiple asserts.
+  `meson-logs/testlog.txt` contains the full Catch2 output for every
+  failed test. Issue #501 tracks a Windows-only `yuzu_agent_tests`
+  failure that can't be diagnosed from the truncated log —
+  two failing test cases and seven assertions are known, but only one
+  expansion currently escapes the truncation. Artifact retention 14
+  days, keyed on `build-type + run-attempt` so re-runs don't overwrite
+  each other. Added to the Windows MSVC leg only; Linux and macOS
+  will get the same treatment in a follow-up once this one has proven
+  useful.
+
+- **Windows runner hardening: broaden Defender exclusions + migrate
+  project scripting to PowerShell 7+ (`pwsh.exe`) (#501, #516, #517).**
+  Two coupled changes shipped together.
+
+  First, **`scripts/windows-runner-defender-exclusions.ps1`** gains
+  `C:\WINDOWS\SystemTemp\yuzu_*` as a wildcard path — the prior
+  exact-path entries (`yuzu_test_guardian`, `yuzu_test_kv`) did NOT
+  match the actual runtime directory names the test suite creates
+  (`yuzu_test_guardian_SHULGI$`, `yuzu_test_kv_SHULGI$`,
+  `yuzu_test_reserved_plugin_<random>`, `yuzu_trigger_test`). Three
+  test binaries (`yuzu_agent_tests.exe`, `yuzu_server_tests.exe`,
+  `yuzu_tar_tests.exe`) and two release binaries (`yuzu-agent.exe`,
+  `yuzu-server.exe`) are added to `ExclusionProcess` — Defender has
+  been observed retaining handles on freshly-written `.obj` / `.pdb`
+  siblings after these processes exit, contributing to the EBUSY
+  loop we hit on #501's rerun of 2026-04-24.
+
+  Second, **stock Windows PowerShell 5.1 (`powershell.exe`) is no
+  longer supported for Yuzu-authored scripting**; the project standard
+  is PowerShell 7+ (`pwsh.exe`). Reason: the repo saves `.ps1` files
+  as UTF-8 without BOM (POSIX / git convention), and PS 5.1 reads
+  such files as the system ANSI codepage (Windows-1252 on English
+  installs), which mangles non-ASCII characters — a right-double-quote
+  byte at 0x94 closes a string literal early and downstream tokens
+  become "command not found" errors. PS 7+ defaults to UTF-8. The
+  `yuzu-local-windows` runner already has `pwsh.exe` 7.6.1
+  pre-installed; 7 workflow steps across `release.yml` and
+  `pre-release.yml` were already on `shell: pwsh`. Concrete changes:
+  - Preflight guard at the top of
+    `scripts/windows-runner-defender-exclusions.ps1`:
+    `PSVersionTable.PSVersion.Major -lt 7` → `Write-Error` + `exit 1`
+    with an actionable message (after the `[CmdletBinding()]`/`param`
+    block, per PS's required ordering).
+  - `docs/yuzu-guardian-design-v1.1.md:781` example guard command
+    changed from `powershell.exe -NonInteractive …` to
+    `pwsh.exe -NonInteractive …`.
+  - `docs/windows-build.md` gains a new **PowerShell: pwsh.exe only**
+    section documenting the standard and the preflight pattern.
+
+  Three latent bugs in the exclusion-applicator script fixed along
+  the way: (a) `<path>` in a double-quoted `Write-Host` string
+  tripped PS's redirection parser; now single-quoted. (b) Hostname
+  allowlist default `^yuzu-local-windows` never matched
+  `$env:COMPUTERNAME` (which is `SHULGI` — the physical machine name,
+  not the GitHub Actions runner role label); default now `^SHULGI$`.
+  (c) Unicode box-drawing characters in `Write-Host` banners now
+  work correctly (they would have required UTF-8 BOM under PS 5.1;
+  the PS 7+ preflight makes that irrelevant).
+
+- **Tests: route Guardian dispatch test `CommandRequest` population through
+  a DLL-side helper — unblocks Windows MSVC debug CI (#501).** Two test
+  cases in `tests/unit/test_guardian_engine.cpp` were tripping a static-
+  linkage limitation that falls out of the Windows option D
+  `cxx.find_library()` wiring documented in CLAUDE.md / #375. Root cause:
+  `absl::hash_internal::MixingHashState::Seed()` returns the ADDRESS of
+  `kSeed`. `absl_hash.lib` is linked statically into both the test EXE
+  and `yuzu_agent_core.dll`, so each image holds its own `kSeed` at a
+  different virtual address. Protobuf `Map<K,V>` mixes that address into
+  every bucket-index calculation, so an `insert()` performed in the test
+  EXE and a `find()` performed inside the DLL compute different buckets
+  for the same key. The test dispatch silently fell into the
+  "missing 'push' parameter" branch, yielding exit_code=1 instead of 0/2.
+  Deterministic and reproducible on `build-windows-ci`; issue #501 has
+  the testlog.
+
+  The fix adds a `YUZU_EXPORT guardian_dispatch_push_bytes_for_test`
+  helper in `agents/core/src/guardian_engine.cpp` that constructs the
+  `CommandRequest` and populates its `parameters` map INSIDE the DLL,
+  then dispatches. Both the insert and the find now execute against the
+  DLL's copy of `kSeed`. An earlier attempt in the PR swapped
+  `Map::operator[]` for `Map::insert({k,v})` on the test side —
+  **that workaround is ineffective** and was reverted: both APIs go
+  through the same `raw_hash_set` bucket-index path and both are tripped
+  by the cross-image seed split. `.claude/agents/build-ci.md` gains a
+  new "#501 Windows DLL-boundary absl hash seed mismatch" section that
+  documents the failure mode, the DLL-helper fix, the audit pattern for
+  future tests that populate a proto `map<K,V>` in EXE code and pass it
+  to DLL-side code, and the six other approaches that do not work.
+
+  Production agents are unaffected because the gRPC Subscribe stream
+  parses `CommandRequest` bytes inside `yuzu_agent_core.dll`, so
+  population and lookup share a seed. `server/core/src/server.cpp:{2395,
+  4316,4434,4577}` uses the same `(*cmd.mutable_parameters())[k] = v;`
+  pattern — **verified safe** by the Gate 3 cross-platform review:
+  `yuzu_server_core` is a `static_library`, not a DLL, so there is no
+  cross-image boundary for the bucket index to diverge across.
+
+- **`.claude/agents/` cleanup — token efficiency + routing effectiveness.**
+  Audit-driven sweep of the subagent frontmatter and a few body-text
+  fixes that bring the descriptions in line with how the parent agent
+  actually picks subagents.
+  - **Bug fix:** `workflow-orchestrator.md` declared `TodoWrite` in its
+    `tools:` list. The harness has long since migrated to the
+    `Task*` family (`TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`,
+    `TaskOutput`, `TaskStop`); `TodoWrite` resolves to nothing and the
+    orchestrator's progress-tracking calls silently no-op'd. Replaced
+    with `TaskCreate, TaskUpdate, TaskList`.
+  - **Merged `erlang-dev` into `gateway-erlang`.** The two agents had
+    overlapping scope ("generic Erlang" vs "Yuzu Erlang gateway") with
+    no clean disjoint routing rule, and the gateway is the only Erlang
+    component in the codebase, making `erlang-dev` functionally
+    redundant. `gateway-erlang` now carries the full body of both:
+    OTP supervision trees, rebar3 + EUnit + CT + dialyzer toolchain,
+    `prometheus_httpd` pitfalls, gpb↔protoc compat, plus the language-
+    expert content (process lifecycle rules, EXIT-signal semantics,
+    EUnit isolation recipe, mock-process-leak diagnosis from #336,
+    Erlang idioms, anti-patterns table). References updated in
+    `CONTRIBUTING.md`, `.claude/agents/workflow-orchestrator.md`
+    (gate-3 agent list + domain-trigger map), and
+    `.claude/skills/governance/SKILL.md`.
+  - **Tightened body wording in `docs-writer` and `quality-engineer`**
+    so it matches their read-only `tools:` lists. Both are governance
+    *reviewers*: their output is a structured findings report
+    (required doc updates / missing test coverage / fixture leaks)
+    that the producing agent then applies. Previous wording
+    ("produce documentation diff", "Maintain `docs/test-coverage.md`",
+    "Expand EUnit coverage") implied authoring authority they don't
+    have.
+  - **Rewrote `description:` for the five highest-traffic agents** in
+    "use when…" routing-instruction style instead of role-label style:
+    `cpp-expert`, `security-guardian`, `docs-writer`, `cross-platform`,
+    `build-ci`. The descriptions now name the file patterns / change
+    classes that should trigger each agent, so the parent's routing
+    decision is mechanical rather than interpretive.
+
+- **Tests: migrate `GuardianFixture` in `test_guardian_engine.cpp` to
+  `yuzu::test::TempDbFile` RAII (#482).** Replaces the fixture's
+  hand-rolled destructor (`kv_path` member + three manual `fs::remove`
+  calls on `.db` / `-wal` / `-shm`) with the shared
+  `TempDbFile`-as-first-member pattern documented in CLAUDE.md. Also
+  migrates the sibling `[guardian][engine][persistence]` test case
+  (line 277) which was managing cleanup the same way. Added a new
+  path-accepting `TempDbFile(std::filesystem::path)` constructor to
+  `tests/unit/test_helpers.hpp` so fixtures that need a per-UID
+  subdirectory (agents/tests/unit/test_guardian_engine.cpp keeps files
+  under `yuzu_test_guardian_<uid>/` so shared dev boxes don't collide
+  between users) can adopt a precomputed path while still getting the
+  destructor-fires-on-partial-construction guarantee. The
+  `unique_kv_path()` helper is retained — it composes `unique_temp_path`
+  with the per-UID dir prefix and remains the single uniqueness source
+  for this test file. Progresses #482; six sibling test files still
+  carry the flake-#473 salt pattern (`std::hash<std::thread::id>` +
+  `steady_clock::now()`, or a fresh `random_device` per construction)
+  instead of the shared `yuzu::test::TempDbFile` helper:
+  `tests/unit/test_tar_store.cpp`,
+  `tests/unit/server/test_api_token_store.cpp`,
+  `tests/unit/server/test_management_group_store.cpp`,
+  `tests/unit/server/test_settings_routes_users.cpp`,
+  `tests/unit/server/test_guaranteed_state_store.cpp` (has its own
+  local duplicate `struct TempDbFile` — switch to the shared helper),
+  and `tests/unit/test_plugin_loader.cpp`. Left for follow-up so this
+  PR stays bisectable.
+
+- **BREAKING (licensing): Yuzu is now distributed under AGPL-3.0-or-later
+  (community edition) with a separate commercial license for the new
+  `enterprise/` subtree.** Previously the repository was Apache-2.0. The
+  motivation is §13 of the AGPL: any operator running a modified Yuzu as a
+  network service must offer the modified source to users of that service.
+  This protects the commons and the viability of a commercial enterprise
+  edition, which a permissive licence would not.
+
+  Releases tagged v0.11.0-rc2 and earlier **remain licensed under
+  Apache-2.0** for everyone who received them — Apache grants are perpetual
+  and we are not retroactively re-licensing past code. The first release
+  cut after this entry lands is the first AGPL-era release.
+
+  Mechanical changes in this commit:
+  - `LICENSE` replaced with the verbatim AGPL-3.0 text from
+    `https://www.gnu.org/licenses/agpl-3.0.txt`.
+  - New top-level `NOTICE` file records the copyright holder, relicensing
+    history, dual-licensing boundary, SDK linking exception, and starter
+    third-party attribution roll-up.
+  - `meson.build` `license:` field → `AGPL-3.0-or-later`.
+  - `vcpkg.json` `license` field → `AGPL-3.0-or-later`.
+  - `gateway/apps/yuzu_gw/src/yuzu_gw.app.src` `licenses` → `["AGPL-3.0-or-later"]`
+    (fixes a legacy `"Proprietary"` drift).
+  - `deploy/docker/Dockerfile.ci-gateway`,
+    `deploy/docker/Dockerfile.ci-linux`, and
+    `.github/workflows/release.yml` OCI image-label `org.opencontainers.image.licenses`
+    set to `AGPL-3.0-or-later` (the release-workflow entry previously
+    incorrectly said `MIT`).
+  - `README.md` License section rewritten to document the AGPL core, the
+    enterprise SKU, and the SDK linking exception.
+
+- **New `enterprise/` subtree — opt-in commercial module surface.** Added
+  as empty scaffolding behind the new Meson option
+  `-Denable_enterprise=true` (default `false`). Does not compile into OSS
+  builds. Includes `enterprise/README.md`, a placeholder
+  `enterprise/LICENSE-ENTERPRISE.md` (TODO: legal review before shipping
+  paid builds), and `enterprise/meson.build`. First real premium feature
+  (SAML/SSO) will land in a follow-up PR. See
+  `docs/enterprise-edition.md`.
+
+- **Contributor License Agreement (CLA) introduced.** New `CLA.md` (based
+  on the Harmony 1.0 template, pending counsel review) assigns copyright
+  to the project steward with a broad re-license grant covering both AGPL
+  and commercial use. `CONTRIBUTING.md` updated to reference it; a
+  disabled-by-default CLA-bot stub at `.github/workflows/cla.yml` is
+  included — ops must provision `CLA_REPO_ACCESS_TOKEN` to activate.
+  Accepting external contributions before activation would lock those
+  contributions to AGPL-only.
+
+- **Plugin SDK linking exception documented.** New `sdk/LICENSE-SDK.md`
+  carves out dynamically-loaded plugins that consume only the stable
+  `plugin.h` C ABI, analogous to the GCC Runtime Library / Classpath
+  Exception. Proprietary plugins remain permitted. Wording must be
+  legal-reviewed before the first AGPL-era release ships.
+
+
+  + exclude vendored and generated paths from CodeQL scanning.** Two
+  security-tooling follow-ups surfaced by the first real CodeQL scan
+  after the Scorecard lift landed.
+  - **Code injection fix.** CodeQL critical rule
+    `actions/code-injection/critical` flagged line 49 of
+    `.github/workflows/pre-release.yml`, where
+    `${{ github.event.workflow_run.head_branch }}` was interpolated
+    directly into the bash `run:` block of the "Determine version" step.
+    `workflow_run` is an externally-influenced event trigger, and branch
+    or tag names can carry shell metacharacters. Rebound both
+    `head_branch` and the `workflow_dispatch` `inputs.tag` value to step-
+    level `env:` entries (`EVENT_BRANCH`, `INPUT_TAG`) and reference them
+    as shell variables — the canonical Actions security pattern.
+  - **CodeQL scope.** Added `.github/codeql/codeql-config.yml` with a
+    `paths-ignore` list (`vcpkg_installed/**`, `build-*/**`,
+    `builddir*/**`, `_build/**`) and wired it into the `codeql-action/init`
+    step via `config-file:`. Previously the scan indexed every header
+    under `vcpkg_installed/x64-linux/include/` — protobuf, abseil,
+    httplib — producing one "critical" (protobuf `map.h`) + six "high"
+    (abseil `raw_hash_set.h`, protobuf tctable, httplib `non-https-url`)
+    findings that are upstream-vendor bugs we cannot fix in-tree and
+    would be erased by the next vcpkg cache rebuild. Excluding them
+    collapses the noise and leaves first-party findings visible.
+
+- **Isolate `yuzu_gw_real_upstream_SUITE` from CI's gateway CT discovery.**
+  The suite needs a live `yuzu-server` reachable on `127.0.0.1:50055`
+  AND `YUZU_GW_TEST_TOKEN` set (or `scripts/linux-start-UAT.sh` to have
+  just run); CI provisions neither. Previously the suite was registered
+  alongside the regular CT tree and ran as part of `meson test --suite
+  gateway`, where it failed deterministically on the Windows MSVC runner
+  (TCP probe to `:50055` succeeded against an unrelated listener bound by
+  WSL2 port-forwarding from the same physical box, so the suite proceeded
+  to the gRPC `ProxyRegister` call and exploded). Linux hid the failure
+  because the self-hosted runner has no `rebar3` on PATH and the entire
+  gateway CT step is skipped at meson configure time.
+  - **Move:** `gateway/apps/yuzu_gw/test/yuzu_gw_real_upstream_SUITE.erl`
+    → `gateway/apps/yuzu_gw/integration_test/yuzu_gw_real_upstream_SUITE.erl`.
+    `git mv` so file history follows.
+  - **rebar3 wiring:** add `{extra_src_dirs, [{"integration_test",
+    [{recursive, false}]}]}` under the `test` profile in
+    `gateway/rebar.config` so the moved suite still compiles in the test
+    profile but is reachable only via explicit `--dir
+    apps/yuzu_gw/integration_test`.
+  - **CI invocation:** `scripts/test_gateway.py ct` (called by the meson
+    `gateway ct` test target) keeps using `--dir apps/yuzu_gw/test` and
+    no longer discovers the suite — verified locally: 6 suites / 52
+    tests, all pass, no `yuzu_gw_real_upstream_SUITE` entry.
+  - **`/test` invocation:** `.claude/skills/test/SKILL.md` Phase 5 now
+    runs a second `gate_run "CT real-upstream"` step that targets `--dir
+    apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE`,
+    relying on Phase 4's `linux-start-UAT.sh` to have stood up the
+    server and provisioned the enrollment token. Doc-comment in the
+    SKILL warns about the prerequisites and the per-case
+    `{test_case_failed, "No enrollment token: …"}` failure mode if
+    either is missing.
+
+- **CI dedup: drop `feature/**` and `fix/**` from the `push:` triggers in
+  `ci.yml` and `docs-lint.yml`.** Pushes to feature/fix branches with an
+  open PR previously fired both the `push` and `pull_request` events on
+  the same SHA, doubling runner consumption for every commit pushed to a
+  PR branch. Mainline branches (`main`, `dev`) remain on the `push:`
+  list so merge runs still fire exactly once. Pre-PR work (no PR open
+  yet) no longer runs CI automatically — open the PR earlier or use the
+  existing `workflow_dispatch` trigger to fire it manually.
+
+- **Digest-pin Dockerfile `FROM` lines, replace `curl | sh` installers,
+  and hash-pin `requirements-ci.txt` (PR #3 of Scorecard lift).**
+  Completes Scorecard's `Pinned-Dependencies` check — the remaining
+  two-thirds after PR #2 addressed the GitHub Actions third. Changes:
+  - **Dockerfile `FROM` digest pins.** Eight `deploy/docker/Dockerfile.*`
+    base images were previously referenced by tag only
+    (`ubuntu:24.04`, `erlang:28`, `alpine:3.23`). Pinned each to its
+    current multi-arch index digest. `Dockerfile.runner-linux` — which
+    seeds the self-hosted runner image on Shulgi — is now pinned to an
+    exact digest of `ghcr.io/actions/actions-runner:latest`; Dependabot's
+    `/deploy/docker` docker scope will continue to propose bumps as new
+    runner releases ship.
+  - **`curl | bash` NodeSource installs replaced with verified tarball
+    download.** `Dockerfile.ci-linux` and `Dockerfile.ci-gateway` both
+    installed Node.js 20 via `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -`,
+    which Scorecard flags as unverified code execution. Replaced with a
+    direct `.tar.xz` download from `nodejs.org` + `sha256sum -c`
+    verification. `NODE_VERSION` and `NODE_SHA256_LINUX_X64` are `ARG`
+    pairs so bumps are atomic.
+  - **Trivy installer replaced with `aquasecurity/trivy-action`.**
+    `pre-release.yml` was installing Trivy via `curl -sfL … install.sh | sh`;
+    swapped for the SHA-pinned `aquasecurity/trivy-action@57a97c7e…`
+    (v0.35.0). **Scope clarification:** while making this swap, removed
+    the Trivy SBOM generation step entirely — `release.yml` already emits
+    authoritative Syft-based SBOMs via `anchore/sbom-action` for every
+    platform archive and container image, so Trivy's SBOMs were a
+    redundant second source that disagreed on component enumeration.
+    Trivy now does vulnerability scanning only (its strength); Syft owns
+    SBOM generation across the entire release pipeline.
+  - **Hash-pinned `requirements-ci.txt` via `pip-compile --generate-hashes`.**
+    Added `requirements-ci.in` as the human-edited source; `pip-compile`
+    regenerates `requirements-ci.txt` with `--hash=sha256:…` continuation
+    lines. Every `pip install -r requirements-ci.txt` call in `ci.yml`
+    and `release.yml` now uses `--require-hashes`; a tampered package
+    would fail the install rather than silently execute. macOS pipx grep
+    path updated (`awk '/^meson==/ {print $1}'`) to handle the trailing
+    `\` that `pip-compile` adds to hashed requirement lines. Bump cadence
+    documented at `docs/dependency-updates.md`.
+  - **Docker Compose image digests.** `docker-compose.local.yml` and the
+    root `docker-compose.uat.yml` referenced `prom/prometheus:latest`,
+    `grafana/grafana:latest`, and `clickhouse/clickhouse-server:latest`.
+    Aligned all three with the digest-pinned variants already used under
+    `deploy/docker/docker-compose*.yml` (Prometheus v3.2.1, Grafana
+    11.5.2, ClickHouse 24.12). Two `clickhouse-server:24.12` tag-only
+    refs under `deploy/docker/` also gained digests.
+
+- **SHA-pin every GitHub Actions reference for OpenSSF Scorecard
+  Pinned-Dependencies check (PR #2 of Scorecard lift).** Scorecard's
+  `Pinned-Dependencies` check scored 0 because every `uses:` line in
+  `.github/workflows/*.yml` resolved by tag (`@v6`, `@v3`, `@v0`) rather
+  than by immutable commit SHA — a compromised upstream could silently
+  repoint the tag at a malicious commit. Rewrote all 144 `uses:` refs
+  across 12 workflow files to the form
+  `owner/repo@<40-char-sha> # vX.Y.Z`; the trailing version comment is
+  mandatory so Dependabot can still detect newer releases and propose
+  coordinated SHA+comment bumps. Floating-major refs (`anchore/sbom-action@v0`,
+  `ilammy/msvc-dev-cmd@v1`, `erlef/setup-beam@v1`, `bufbuild/buf-setup-action@v1`,
+  plus two cases where the `v3` major tag lagged the latest point release —
+  `actions/attest-build-provenance` and `sigstore/cosign-installer`) are
+  pinned to the latest exact X.Y.Z SHA rather than the floating major's
+  current SHA, so the pin doesn't drift back when the major tag is
+  eventually updated. `github/codeql-action/init` and `/analyze` are pinned
+  to the same parent-repo SHA per CodeQL's documented invariant.
+  Self-hosted runners (`yuzu-wsl2-linux`, `yuzu-local-windows`) are
+  unaffected — action pins control which code runs on the runner, not the
+  runner image itself. PR #3 will pin the remaining two thirds of
+  `Pinned-Dependencies` (Dockerfile FROMs + `curl | sh` installers +
+  pip hash-pinning).
+- **Group Dependabot GitHub Actions PRs.** After SHA-pinning, Dependabot
+  opens one PR per action per bump — roughly 3× the pre-pin weekly
+  volume. Added a `groups:` block under the `github-actions` ecosystem
+  in `.github/dependabot.yml` to bundle related cohorts:
+  `actions-core` (`actions/*`), `docker-actions` (`docker/*`), and
+  `github-codeql` (`github/codeql-action/*`). Ungrouped actions still
+  ship as individual PRs.
+
+- **Tighten GitHub Actions token permissions for OpenSSF Scorecard
+  Token-Permissions check.** Scorecard's Token-Permissions check scored 0
+  because `qodana_code_quality.yml` had no top-level `permissions:` block
+  (one missing block zeroes the entire check) and several workflows
+  declared writes at workflow scope that only specific jobs actually
+  needed. Changes:
+  - `qodana_code_quality.yml`: new top-level `permissions: contents: read`;
+    dropped unused job-level `contents: write` + `pull-requests: write`
+    (pr-mode is false, so the action never opens PRs); kept `checks: write`
+    at job scope.
+  - `release.yml`: demoted top-level `contents: write` + `packages: write`
+    to job scope. `id-token: write` and `attestations: write` stay at
+    workflow scope because every build job calls
+    `actions/attest-build-provenance`. The `release` job gets explicit
+    `contents: write` + `id-token: write`; `docker-publish` already had
+    its own explicit block.
+  - `vcpkg-baseline-update.yml`: top-level `permissions: contents: read`;
+    moved `contents: write` + `pull-requests: write` into the
+    `propose-bump` job.
+  - `ci.yml`: removed unused top-level `packages: write` (the workflow
+    doesn't push to any registry); top-level is now `contents: read` only.
+
+- **Wire `SCORECARD_READ_TOKEN` PAT into `scorecard.yml`.** Scorecard's
+  `Branch-Protection` check caps at ~3/10 without a PAT because the
+  public GitHub API can't read Repository Rulesets. The action now
+  receives `repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}`
+  so the ruleset-aware code path runs once the secret is populated. The
+  `|| github.token` fallback keeps fork runs and first-time-setup scans
+  succeeding. PAT creation + rotation procedure documented at
+  `docs/security/scorecard-token.md` — classic PAT with `public_repo` +
+  `read:org` scopes ONLY; 90-day expiration with a 365-day rotation
+  cadence.
+
+### Added
+
+- **Guardian PR 2 — REST control plane + agent-side `GuardianEngine`
+  skeleton.** Stands up the operator-facing surface and the agent
+  scaffolding the rest of the Windows-first rollout grafts onto. No real
+  guards are running yet; PR 3 lands the Registry Guard + state evaluator
+  + remediation that turns the wire path into actual enforcement.
+  - **Server REST endpoints under `/api/v1/guaranteed-state/*`.** Full CRUD
+    on rules (`GET / POST / GET :id / PUT :id / DELETE :id`) plus `POST
+    /push` (returns `202 Accepted` — fan-out is PR 3), `GET /events`
+    (paginated query mirroring `audit_store` semantics; `limit` capped at
+    1000 at the REST boundary), `GET /status`, `GET /status/:agent_id`,
+    and `GET /alerts`. Conflict detection routes through `kConflictPrefix`
+    → HTTP 409 (matching #396/#399/#402). Created/updated rules carry the
+    session principal in `created_by` / `updated_by`. Every mutating route
+    fires an audit event under target type `GuaranteedState`.
+  - **New RBAC operation `Push` + securable type `GuaranteedState`.**
+    Distributes a rule set to scoped agents — separated from `Write` so
+    operators can be granted "deploy existing rules" without "author new
+    rules." Default seeds: `Operator` gets `Read + Push`,
+    `PlatformEngineer` gets full CRUD + `Push`, `Administrator` and
+    `ITServiceOwner` get the cross-type defaults, `Viewer` gets `Read`.
+    The cross-type `Push` grants on non-Guardian securables are harmless
+    because only the Guardian REST handlers consult `Push`.
+  - **Agent-side `GuardianEngine` class** (`agents/core/src/guardian_engine.{hpp,cpp}`).
+    Two-phase startup per design §4: `start_local()` runs pre-network so
+    the engine is enforcing before the Register RPC opens; `sync_with_server()`
+    runs post-Register and is the future drain point for buffered events.
+    Persists rules into `KvStore` under reserved namespace `__guardian__`
+    as JSON (binary-safe across the SQLite text APIs `KvStore` wraps).
+    `dispatch()` answers `__guard__` plugin commands `push_rules` and
+    `get_status`; reserved-name dispatch is intercepted in `agent.cpp`
+    *before* the plugin match loop so a third-party plugin cannot shadow
+    Guardian (defence-in-depth alongside the load-time reservation that
+    landed in #453). PR 2 reports every rule as `errored` because no
+    guards are running yet — honest about "Guardian installed but inert"
+    until PR 3.
+  - **`TestRouteSink` parses query strings.** The test sink now splits
+    request paths on `?` and feeds the tail to `httplib::detail::`
+    `parse_query_text`, populating `req.params`. This unblocks unit-level
+    coverage of every existing handler that branches on `req.has_param`
+    / `req.get_param_value` (the `events` query parameters were the
+    forcing function). Out-of-scope for the PR but a free win for any
+    follow-up REST test.
+
+- **Guardian: agent rejects plugins declaring a reserved internal-dispatch
+  name (#453).** The agent plugin loader now refuses to load any plugin whose
+  `YuzuPluginDescriptor::name` matches the reserved set `__guard__`,
+  `__system__`, `__update__`. Rejected plugins are logged at `error` and
+  counted in `yuzu_agent_plugin_rejected_total{reason="reserved_name"}` so
+  operators can alert on reserved-name attempts distinct from generic load
+  failures. Prevents a compromised plugin author (or a misconfigured
+  third-party plugin) from shadowing the `__guard__` dispatch intercept that
+  Guardian PR 3 will add at `agents/core/src/agent.cpp`. Reserved-name
+  namespace documented in `docs/cpp-conventions.md`.
+
+- **Guardian PR 2 prerequisites (#452).** Pre-REST-endpoint hardening of the
+  `GuaranteedStateStore` so PR 2's ingest path can land on a production-ready
+  foundation:
+  - **`std::expected<T, std::string>` mutators with `kConflictPrefix`.**
+    `create_rule`, `update_rule`, `delete_rule`, and `insert_event` now
+    return `std::expected<void, std::string>` and surface duplicate-UNIQUE
+    / PRIMARY KEY collisions as `kConflictPrefix`-prefixed errors so REST
+    handlers can map them to HTTP 409 (matching #396/#399/#402). Not-found
+    paths return a distinct non-conflict error so routes can split 404 from
+    409 cleanly.
+  - **`created_by` / `updated_by` audit columns on `guaranteed_state_rules`.**
+    Added to the v1 migration (before schema freeze). REST handlers in PR 2
+    populate both from the session principal; SOC 2 audit-chain
+    reconstruction can now answer "who authorised this rule version" from
+    the store alone, with the full `audit_events` join procedure documented
+    in `docs/yuzu-guardian-design-v1.1.md` §9.3.
+  - **Retention reaper on `guaranteed_state_events`.** 30-day default
+    (new `guardian_event_retention_days` config, overridable via runtime
+    config). Events carry `ttl_expires_at` populated at insert; a
+    background thread mirroring `AuditStore::run_cleanup` runs a periodic
+    `DELETE`. Partial index `idx_gse_ttl WHERE ttl_expires_at > 0` keeps
+    the reap query fast at fleet-scale ingest. `retention_days = 0`
+    disables expiry for forensic freezes.
+  - **Batch `insert_events(std::vector<…>)` API.** Wraps a `BEGIN…COMMIT`
+    envelope; one fsync per batch instead of one per row (10–50× faster at
+    agent batch sizes). Transactional — any failing row rolls back the
+    whole batch so REST handlers never have to reason about partial state.
+  - **Prometheus observability.** Four new server gauges — `yuzu_server_`
+    `guardian_rules_total`, `guardian_events_total`,
+    `guardian_events_written_total`, `guardian_events_reaped_total`. Wired
+    into the existing health-recompute thread alongside `audit_store`'s
+    gauges; sized at zero before ingest starts so alert rules
+    (e.g. `yuzu_server_guardian_events_total > 5e6`) can be authored up
+    front.
+  - **Data inventory entry.** `guaranteed_state_events` recorded in the
+    workstream-E data inventory (`docs/enterprise-readiness-soc2-first-customer.md` §3.5)
+    with the 30-day retention policy, reaper mechanism, and sizing
+    guidance for customers with longer forensic SLAs.
+
+- **Guardian "Guaranteed State" engine — wire contract + server store
+  skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
+  SQLite file `guaranteed-state.db` is created in the server data directory
+  at startup and a `guaranteed_state_store` entry appears in the `/readyz`
+  probe response. No REST endpoints, no dispatch, no agent wiring, and no
+  dashboard surface in this release — PR 1 ships only the proto (new package
+  `yuzu.guardian.v1` at `proto/yuzu/guardian/v1/guaranteed_state.proto`),
+  the server SQLite store, and 17 unit test cases. Operators upgrading will
+  see the new `.db` file alongside the existing stores (same permissions,
+  same backup story: copy the full `--data-dir`) and the new `/readyz` JSON
+  key. Full architecture: `docs/yuzu-guardian-design-v1.1.md`. Windows-first
+  delivery plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+
+- **Supply-chain attestation bundle: CycloneDX + SPDX SBOMs, SLSA
+  provenance, and cosign image signatures on every release (#362,
+  #408).** The release workflow now emits, per tag, a full verifiable
+  supply-chain artefact set:
+  - **CycloneDX + SPDX SBOMs per platform archive** via
+    [Syft](https://github.com/anchore/syft) (`anchore/sbom-action@v0`):
+    `yuzu-{linux-x64,gateway-linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json`.
+    Syft picks up vcpkg C++ dependencies (reading vcpkg's generated
+    `vcpkg.spdx.json` under `vcpkg_installed/<triplet>/share/`), Erlang
+    deps from `gateway/rebar.lock`, and metadata on the built
+    ELF/PE/Mach-O binaries.
+  - **CycloneDX + SPDX SBOMs per Docker image**
+    (`yuzu-{server,gateway}-image.{cdx,spdx}.json`) generated by Syft
+    scanning the pushed image by digest, so the SBOM is bound to the
+    exact image layers customers will pull.
+  - **SLSA v1.0 build provenance attestations** for every binary archive,
+    installer, and Docker image via `actions/attest-build-provenance@v3`.
+    Stored in GitHub's native attestation registry and verified
+    customer-side with `gh attestation verify <file> --repo Tr3kkR/Yuzu`
+    (images: `oci://ghcr.io/.../<image>@sha256:<digest>`).
+  - **cosign keyless Docker image signing** for both
+    `ghcr.io/tr3kkr/yuzu-server` and `ghcr.io/tr3kkr/yuzu-gateway`,
+    bound to the release workflow's OIDC identity (no static keys to
+    rotate). Existing cosign blob signature on `SHA256SUMS` is retained.
+  - **New release-gate script** at
+    `scripts/check-release-artifacts.sh` runs before `gh release create`
+    and fails the release if any expected archive, installer, or SBOM
+    is missing — preventing partially-attested releases from ever
+    reaching customers.
+  - **New operator doc** at
+    [`docs/user-manual/release-verification.md`](docs/user-manual/release-verification.md)
+    covers `sha256sum -c`, `cosign verify-blob`, `cosign verify` (images),
+    `gh attestation verify` (binaries + images), and CycloneDX / SPDX
+    inspection with `jq` and the CycloneDX CLI. Includes an end-to-end
+    verification script and a compliance-mapping table (SOC 2 CC6.8 /
+    CC7.1, NIST SSDF PW.5 / PS.3, EO 14028, EU CRA Annex V).
+  - Top-level workflow permissions extended with `attestations: write`
+    (required by `actions/attest-build-provenance`); `docker-publish`
+    job gains `id-token: write` + `attestations: write`. `SHA256SUMS`
+    now covers the SBOM files so customers can verify them alongside
+    the archives. Release notes heredoc advertises the new verification
+    workflow and links to the operator doc.
+  - Effective at the next tag after merge. No CHANGELOG gate on
+    historical releases — retro-generating provenance for shipped tags
+    is out of scope.
+- **OpenSSF Scorecard + Zizmor workflows (#407).** Added
+  `.github/workflows/scorecard.yml` (weekly + push to main +
+  `branch_protection_rule`; publishes to scorecard.dev + SARIF to the
+  GitHub Security tab) and `.github/workflows/zizmor.yml` (static
+  analyzer for `.github/workflows/*.yml`, runs on workflow-touching PRs
+  + weekly). README now advertises the Scorecard and Zizmor badges; the
+  OpenSSF Best Practices Badge slot is wired up pending manual
+  application at bestpractices.dev. Triaging Scorecard findings into
+  follow-up issues is the remaining work on #407.
+- **README `Install`, `Contributing`, `Reporting Issues` sections
+  (#407).** Addresses the OpenSSF Best Practices `[interact]` criterion
+  — README now points prebuilt-binary users at GitHub Releases +
+  `ghcr.io/tr3kkr/yuzu-{server,gateway,agent}` + `deploy/docker/docker-compose.yml`
+  instead of only documenting the from-source build. Adds explicit
+  links to `CONTRIBUTING.md`, `CLAUDE.md`, the bug-report and
+  feature-request issue templates, `SECURITY.md` (private vulnerability
+  reporting), and GitHub Discussions.
+
+### Fixed
+
+- **Guardian PR 2 hardening round 5 — doc-RR1..doc-RR4 (documentation only).**
+  Closes the BLOCKING and SHOULD doc findings from the second governance
+  re-run on `21c0ba4..HEAD` (rounds 3 + 4). Pure documentation — no code
+  changes, no behaviour changes. The re-run confirmed that rounds 3 + 4
+  introduced no new code regressions; all remaining findings were either
+  doc precision gaps or pre-existing patterns newly visible after the
+  `/push` sanitisation fix (filed as follow-up issues).
+  - **`docs/user-manual/audit-log.md` `guaranteed_state.push` entry now
+    documents the scope-sanitisation semantic** (doc-RR1). The SIEM-
+    parser-facing description previously read `scope="<expr>"` as if the
+    value were verbatim operator input; after round 3's UP-R3 fix the
+    value is backslash-escaped for `"` and `\` and stripped of C0 control
+    bytes before embedding. The entry now names the normalisation
+    explicitly with a concrete example (`env="prod"` → `scope="env=\"prod\""`)
+    so SIEM rule authors don't build parsers against the wrong shape.
+    The `fan_out_deferred_pr3=true` marker and the non-object-body 400
+    rejection are also called out in the same row.
+  - **`guaranteed_state.rule.update` entry now lists 400 invalid-body as
+    an explicit denied-audit case** (doc-RR2). Round 4's UP-R1 fix emits
+    `result=denied` when the PUT body is unparseable JSON; the audit-log
+    page did not reflect this in its per-action row or in the result
+    vocabulary prose. Both now name the specific 400 branch alongside the
+    existing 404/409 cases. The result-vocabulary paragraph gains a SIEM
+    filter hint: "filter on `result == "denied"` scoped to the actions
+    you care about — every mutating branch produces a row."
+  - **`docs/user-manual/upgrading.md` v0.12.0 section gains a negative-
+    retention behaviour change note** (doc-RR3). Pre-round-4 the `PUT
+    /api/v1/config/<retention-key>` handler silently accepted negative
+    values and the store treated `<= 0` as "never reap"; post-round-4 the
+    handler rejects with 400 and operators must use `0` explicitly to
+    preserve the disable-retention semantic. Also documents that non-
+    numeric values (which were previously silent no-ops) now return 400 —
+    surfacing configuration errors that had been hidden.
+  - **Upgrading.md's RBAC remediation SQL is now a 4-step guarded
+    procedure instead of a single destructive one-liner** (doc-RR4). The
+    single `DELETE` block was replaced with: (1) back up `rbac.db`
+    first, (2) run a `SELECT` preview and review the rows, (3) `DELETE`
+    scoped to `principal_id IN ('Administrator', 'ITServiceOwner')` so a
+    custom role with a legitimate non-Guardian Push grant is left alone,
+    (4) re-run the preview to confirm cleanup. Same remediation, defence-
+    in-depth wrapping. `principal_id` scoping matches what the bug
+    actually produced — seeded roles only.
+
+- **Guardian PR 2 hardening round 4 — UP-R1, UP-R5, and SHOULD-tier docs.**
+  Small, code-local MEDIUM/SHOULD items from the governance re-run that did
+  not require architectural decisions. Systemic items (retention runtime-PUT
+  propagation across 3 stores, PUT TOCTOU optimistic concurrency, RBAC
+  upgrade migration, audit action namespace flatten, `.get<T>()` sweep
+  across 12 non-Guardian handlers, `TempDbFile` RAII adoption) are filed as
+  tracking issues #483, #484, #485, #486, #487, #488 and excluded from this
+  round to keep the commit focused.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` 400 invalid-body branch now
+    emits a `denied` audit** (UP-R1). Previously the handler rejected
+    malformed JSON with `400 {"error":"invalid JSON"}` but produced no
+    audit record, while the sibling `/push` 400 branch did — asymmetric
+    audit coverage across two branches shipped in the same hardening round.
+    Added a regression test (`[rest][guaranteed_state][crud]`) that POSTs a
+    non-object body and asserts the denied audit fires with the correct
+    action, target, and detail fields.
+  - **`PUT /api/v1/config/<key>` now validates integer-typed values before
+    persisting** (UP-R5). The prior implementation called
+    `runtime_config_store_->set(key, value, ...)` first, then wrapped
+    `std::stoi(value)` in `try { ... } catch (...) {}`. Any non-numeric or
+    negative value persisted to the store while silently failing to update
+    `cfg_` — an operator PUTting `{"value":"abc"}` received `200 {"applied":
+    true}` with no behaviour change, and on the next restart the invalid
+    string loaded back into `RuntimeConfigStore`. Replaced with
+    `std::from_chars`-based validation that runs **before** the `set` call
+    and rejects with `400 {"error":{"code":400,"message":"value must be a
+    non-negative integer"}}` on any parse failure. Applies to
+    `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
+    and `guardian_event_retention_days`. The `try { stoi } catch (...) {}`
+    blocks in the startup-config parser remain for now because that path
+    has no 400 to return — this fix targets the runtime API only.
+  - **`docs/user-manual/server-admin.md` Retention Settings table documents
+    `--guardian-event-retention-days`** (doc-S2). Third row added alongside
+    the existing `--response-retention-days` and `--audit-retention-days`
+    entries. Supporting prose updated to describe the env-var alternatives
+    (`YUZU_*_RETENTION_DAYS`) and the runtime `PUT /api/v1/config` path,
+    with an explicit "takes effect on restart" caveat cross-referencing
+    issue #483.
+  - **`CHANGELOG.md` round-1 BL-4 entry annotated with the H-4 correction**
+    (doc-S3). The 19×6=114 formula describing Administrator's seed count
+    was accurate at BL-4 commit time but implicitly superseded by round 2's
+    H-4 fix (which removed `Push` from the cross-type seed, reducing
+    Administrator to 96 and ITServiceOwner to 81). Inline note added so a
+    reader walking the CHANGELOG forward sees the correction before the
+    implausible math statement.
+  - **`CLAUDE.md` Guardian section expanded with the invariants that keep
+    surfacing in governance** (N1 + N3). Three resident notes: (a) `Push`
+    seed is Guardian-only — `ops[]` is the catalogue, `crud_ops[]` is the
+    cross-type seed, do not cross-seed `Push`; (b) reserved plugin name
+    `__guard__` has load-time rejection AND dispatch-time intercept, both
+    halves must stay; (c) Guardian wire payloads carrying raw proto bytes
+    must not be placed in `map<string, string>` fields the Erlang gateway
+    re-encodes via `gpb:e_type_string` — UTF-8 validation crashes. New
+    "Test conventions — shared helpers" section points at
+    `tests/unit/test_helpers.hpp` and names the `std::hash<thread::id>` +
+    `steady_clock` anti-pattern as the flake #473 vector.
+  - **`docs/user-manual/upgrading.md` gains a v0.12.0 Guardian PR 2 section**
+    (N2). Documents two operator-visible upgrade notes: the stale `*:Push`
+    RBAC grants on deployments that ran pre-hardening code (with manual
+    remediation SQL pending the #485 auto-migration), and the
+    "retention PUT takes effect on restart" limitation shared across the
+    three retention stores (cross-ref #483).
+
+- **Guardian PR 2 hardening round 3 — UP-R3, doc-B1, doc-B2, UP-R9.** Closes
+  the BLOCKING findings from the governance re-run on `a90a21e..HEAD`
+  (rounds 1 + 2). Pattern C confirmed: the first two hardening rounds
+  themselves introduced one new security regression and two doc regressions
+  that this round addresses.
+  - **`/push` audit detail now sanitises the scope value before embedding**
+    (UP-R3 — new regression introduced by BL-6's audit format change). The
+    BL-6 vocabulary fix formatted detail as `rules=N full_sync=B scope="<scope>"
+    fan_out_deferred_pr3=true`, embedding operator-controlled scope between
+    raw quotes. An operator with `GuaranteedState:Push` could therefore POST
+    `{"scope":"x\" result=\"denied\" fake=\""}` and forge audit-record
+    fragments that parse downstream as successful-looking denials — audit log
+    integrity is a SOC 2 Workstream F control, so this is a real injection
+    vector. Added an inline `sanitize_audit_string` lambda that
+    backslash-escapes `"` and `\` and drops all C0 control bytes (CR/LF/NUL/
+    TAB and the rest of 0x00–0x1F + DEL). audit_store writes the string as
+    an opaque column so the sanitisation is defensive at the SIEM layer —
+    but that's the layer compliance evidence is reconstructed from. Test
+    `test_rest_guaranteed_state.cpp` gains a `[security]`-tagged regression
+    guard that POSTs an adversarial scope and asserts no control bytes, no
+    unescaped top-level injection tokens, and the structural frame of the
+    detail remains intact.
+  - **RBAC matrix tables in `docs/user-manual/guaranteed-state.md` and
+    `docs/user-manual/rest-api.md` now show all 6 operation columns**
+    (doc-B1 — new regression introduced by my BL-4 doc authoring). The
+    tables as first written showed 4 columns (Read/Write/Delete/Push) and
+    silently omitted Execute + Approve. Administrator and ITServiceOwner
+    actually receive Execute and Approve on `GuaranteedState` via the
+    `crud_ops[]` cross-type seed loop in `rbac_store.cpp`; the tables now
+    reflect that. PlatformEngineer's row is narrower (Read/Write/Delete/Push
+    — no Execute, no Approve) because its grants are explicit and targeted,
+    not cross-type. Added a clarifying paragraph beneath each table noting
+    the cross-seed origin of the Execute/Approve grants — this sets
+    expectations for future readers that those ops exist in the DB but have
+    no active Guardian handler today.
+  - **`docs/user-manual/guaranteed-state.md` PR-2 status banner now matches
+    the actual audit vocabulary** (doc-B2 — new regression introduced by
+    BL-6 + my BL-8 doc authoring). The banner still said "audited as
+    `accepted`" while the rest of the same file (and the code) use
+    `result=success` with `fan_out_deferred_pr3=true` in the detail field.
+    Updated the banner to match. Internal doc contradiction closed.
+  - **`openapi_spec()` 503 description strings aligned with the runtime body
+    strings** (UP-R9 / sec-L3 — H-7's scope miss). H-7 changed nine runtime
+    `error_json("service unavailable", 503)` calls but left three OpenAPI
+    path-entry `"503": {"description": "..."}` strings at the old "guaranteed-
+    state store unavailable" wording. Client libraries generated from the
+    spec saw a description that never matched the actual response body.
+    Consolidated.
+
+- **Guardian PR 2 hardening round 2 — H-3, H-4, H-7, H-8.** Second hardening
+  round after the BL-1..BL-9 commit on the same governance run. Closes the
+  HIGH findings that were small enough to fold into a single commit; the
+  remaining HIGHs (H-1 read-side audit gap, H-2 plugin-loader RCE, H-5 gateway
+  UTF-8 crash, H-6 apply_rules atomicity) are tracked as issues #477 / #478 /
+  #479 and will land separately.
+  - **PUT `/api/v1/guaranteed-state/rules/:id` stops type-mismatched bodies
+    from surfacing as HTTP 500** (H-3). The handler was using
+    `body["k"].get<T>()` which raises `nlohmann::json::type_error` on a
+    type-mismatched field (e.g. `{"enabled": "yes"}`); without a server-wide
+    `set_exception_handler`, httplib's default path returns 500 with an empty
+    body. Swapped to `body.value("k", existing)` matching the sibling POST
+    handler — type-mismatched fields silently fall back to the current value
+    rather than converting a client-side request-shape mistake into a server-
+    error alertable event.
+  - **`Push` operation seeding restricted to `GuaranteedState`** (H-4). The
+    previous cross-type seed granted `Administrator` and `ITServiceOwner`
+    the `Push` op on every securable type — harmless today because only the
+    Guardian REST handlers consult `Push`, but a latent privilege grant that
+    any future handler reading `perm_fn(..., "Push")` on a non-Guardian
+    securable would silently accept. `ops[]` is now split into `ops[]` (all
+    six, seeded into the operations catalogue) and `crud_ops[]` (the five
+    used for cross-type role seeding). Push is granted explicitly on
+    `GuaranteedState` for `Administrator` and `ITServiceOwner`, matching
+    the already-targeted grants for `Operator` and `PlatformEngineer`.
+    Test assertions updated: Administrator 114 → 96 permissions,
+    ITServiceOwner 96 → 81 permissions, plus new invariant checks that
+    verify `Push` exists exactly once per role and only on `GuaranteedState`.
+    `rbac.md` counts updated to match.
+  - **503 error body vocabulary consolidated** (H-7). Nine Guardian 503
+    sites previously returned `"guaranteed-state store unavailable"`; every
+    other 503 site in `rest_api_v1.cpp` uses `"service unavailable"`.
+    Log-based alerting that greps the sibling string will now match Guardian
+    store outages too.
+  - **New `tests/unit/test_helpers.hpp` replaces the stale `thread::id`-hash
+    + `steady_clock` uniqueness pattern across 5 test files** (H-8, closes
+    #482). The pattern that commit a90a21e replaced in
+    `test_guardian_engine.cpp` for Windows MSVC flake #473 is now extinct
+    in `test_rest_guaranteed_state.cpp`, `test_rest_api_tokens.cpp`,
+    `test_rest_api_t2.cpp`, and `test_kv_store.cpp`. Shared header provides
+    `unique_temp_path(prefix)` with a process-local `mt19937_64`-seeded
+    salt + atomic monotonic counter, and `TempDbFile` RAII wrapper cleaning
+    up `.db` / `-wal` / `-shm` companions. Header-only inline impl so each
+    test binary owns its own salt and counter; no shared-state hazard.
+
+- **Guardian PR 2 hardening round — governance Gate 7 BL-1..BL-9.** Consolidates
+  the blocking findings from the `/governance b13ff17~1..HEAD` run on
+  `feat/guardian-pr2`. No new functionality; closes the gaps between Guardian
+  PR 2's implementation and the operator, SIEM, and SOC 2 contracts it shipped
+  against.
+  - **`/healthz` + dashboard health fragment now include
+    `guaranteed_state_store` in the `all_stores_ok` conjunction** (BL-1). Prior
+    to this fix, `/healthz` reported `"healthy"` while `/api/v1/guaranteed-state/*`
+    returned `503` — the readiness-probe regression pattern (HC-1) that prior
+    governance runs have caught on every new load-bearing store addition.
+    Matches the `/readyz` per-store check which was already correct.
+  - **`guardian_event_retention_days` is now actually overridable** (BL-2). The
+    field was declared in `ServerConfig` with a default of 30 but had no CLI
+    flag and no runtime-config parser branch, so the CHANGELOG's
+    "overridable via runtime config" and the SOC 2 data-inventory doc's
+    "configurable" claims were false. Adds the `--guardian-event-retention-days`
+    CLI flag (+ `YUZU_GUARDIAN_EVENT_RETENTION_DAYS` env var), the `GET /api/config`
+    response key, the runtime `PUT /api/config/guardian_event_retention_days`
+    branch, the `RuntimeConfigStore::allowed_keys` entry, and the startup-config
+    parser branch — all matching the `audit_retention_days` pattern.
+  - **All 10 `/api/v1/guaranteed-state/*` routes now appear in the OpenAPI
+    spec served at `/api/v1/openapi.json` and in
+    `docs/user-manual/rest-api.md`** (BL-3). Adds `GuaranteedStateRule`,
+    `GuaranteedStateStatus`, and `GuaranteedStateEvent` schema components plus
+    per-path entries with security, request/response bodies, and status codes.
+    Rest-api.md gains a full "Guaranteed State" section with the RBAC matrix,
+    every endpoint's permission, request/response shape, and error paths.
+  - **`docs/user-manual/rbac.md` updated for `GuaranteedState` and `Push`**
+    (BL-4). Adds the securable type and operation, recomputes role permission
+    counts (Administrator 19×6=114, ITServiceOwner 16×6=96, Viewer 18×1=18) to
+    match code, and documents `Push` as the deploy-authority-without-author
+    operation consumed only by the Guardian REST handlers. **Note:** the 19×6
+    arithmetic is correct for the state at BL-4 commit time; the subsequent
+    H-4 fix in hardening round 2 (entry directly above) restricted `Push`
+    from the cross-type seed loop, reducing Administrator to 96 and
+    ITServiceOwner to 81. The final values that ship are Administrator 96,
+    ITServiceOwner 81, Viewer 18.
+  - **`docs/user-manual/audit-log.md` adds the four Guardian audit actions**
+    (BL-5). `guaranteed_state.rule.create / update / delete / push`. The push
+    entry explicitly warns SIEM rule authors that `fan_out_deferred_pr3=true`
+    in the detail field means "server accepted the push but agent delivery is
+    deferred" — misreading this as delivered would be premature until the PR 3
+    fan-out lands.
+  - **`/push` audit vocabulary aligned with sibling handlers** (BL-6 /
+    consistency-auditor F3). Previously emitted `result="accepted"` with
+    `target_id=<scope>` — a novel result string and a target_id that broke
+    SIEM joins (every other audit site uses a concrete entity id in target_id).
+    Now emits `result="success"` with `target_id=""` (pushes are fleet-level,
+    not per-entity) and `detail=rules=N full_sync=B scope="E" fan_out_deferred_pr3=true`.
+    Also rejects non-object JSON bodies with `400` + denied audit (previously
+    silently coerced to empty object), and replaces the engineer-facing
+    `note: "fan-out lands in Guardian PR 3"` in the response body with the
+    stable operational phrase `"push accepted; agent delivery is asynchronous"`.
+  - **`/status` and `/status/:agent_id` field names match the agent-side proto**
+    (BL-7 / consistency-auditor F1). REST previously returned `compliant`,
+    `drifted`, `errored`; the proto `GuaranteedStateStatus` uses
+    `compliant_rules`, `drifted_rules`, `errored_rules`. Renamed REST keys
+    to the `_rules` suffix before any downstream dashboard locks in the drift.
+    Per-agent status response gains `total_rules` for symmetry.
+  - **New operator-facing page `docs/user-manual/guaranteed-state.md`** (BL-8).
+    Covers the PR-2 limitation ("control plane + agent skeleton; no enforcement
+    until PR 3"), the YAML rule schema, the create/push/query workflow with
+    `curl` examples, the RBAC matrix, retention configuration, and the
+    `/healthz` / `/readyz` observability surface. Linked from the user-manual
+    README table of contents.
+  - **Windows Defender exclusion script now refuses to run on non-runner
+    hosts** (BL-9). `scripts/windows-runner-defender-exclusions.ps1` previously
+    would silently weaken Defender coverage on a dev workstation if run by
+    mistake (it excludes `%USERPROFILE%\AppData\Local\ccache` and
+    `C:\WINDOWS\SystemTemp\yuzu_test_*` — paths that exist on dev boxes). Adds
+    a hostname allowlist (default `^yuzu-local-windows`, overridable via
+    `-AllowedHostPattern` when provisioning a new runner) that errors out
+    before any `Add-MpPreference` call runs.
+
+- **`/api/health` reports the actual server version instead of the
+  hardcoded "0.1.0" (#401).** The endpoint now derives the version
+  string from the meson-generated `yuzu/version.hpp` constant
+  `kVersionString`, so health probes track the running build (currently
+  `0.11.0`) rather than a stale literal that survived the v0.10.x cycle.
+- **`docker-compose.uat.yml` now passes `--data-dir /var/lib/yuzu` to
+  the server (#389).** Without the flag, all SQLite stores fell back to
+  the working directory (`/etc/yuzu`) instead of the persistent volume
+  mount — agent registrations, audit log, and tokens were lost on
+  container restart. The other compose files (`docker-compose.local.yml`,
+  `deploy/docker/docker-compose.full-uat.yml`) already passed the flag;
+  the UAT file was the outlier.
+- **`POST /api/settings/users` returns 409 on duplicate username (#399).**
+  Previously the endpoint silently overwrote an existing account via
+  `AuthManager::upsert_user` — a privilege-escalation primitive in the
+  hands of any authenticated admin attacker. The endpoint now rejects
+  duplicates with HTTP 409, an `HX-Trigger` toast (`"Username already
+  exists"`), and a denied audit event
+  (`user.upsert / denied / duplicate_username`). Self-password-change
+  (same username, same role) is still allowed.
+- **`POST /api/instructions` returns 409 on duplicate explicit `id`
+  (#402).** Previously returned a generic 400 (`"insert failed"`); the
+  store now pre-checks under the existing write lock and surfaces a
+  structured 409 (`{"error":"instruction definition '<id>' already
+  exists"}`) plus a denied audit event
+  (`instruction.create / denied / duplicate_id`). Empty `id` paths still
+  generate a UUID with no duplicate-check overhead.
+- **`POST /api/policy-fragments` returns 409 on duplicate fragment name
+  (#396).** Previously silently inserted a duplicate row; the store now
+  rejects with HTTP 409 (`{"error":"policy fragment named '<name>'
+  already exists"}`) plus a denied audit event
+  (`policy_fragment.create / denied / duplicate_name`).
+
+### Tests
+
+- Added `tests/unit/server/test_store_errors.cpp` exercising the shared
+  `kConflictPrefix` constant and `is_conflict_error` /
+  `strip_conflict_prefix` helpers introduced for the route↔store conflict
+  contract (governance Gate 3 arch-B1).
+- Added duplicate-detection cases to `test_settings_routes_users.cpp`,
+  `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
+  pre-existing "duplicate ID" policy-store test was tightened to assert
+  the new `kConflictPrefix` semantics.
+- Added `tests/unit/fixtures/reserved_name_plugin.cpp` — a test plugin
+  declaring the reserved `__guard__` name — plus three new test cases in
+  `tests/unit/test_plugin_loader.cpp` (`is_reserved_plugin_name`
+  predicate, `kReservedPluginNames` namespace pin, and a behavioural
+  scan-rejection test that copies the fixture into a temp directory and
+  asserts `PluginLoader::scan` refuses to load it). The fixture is built
+  as a `shared_library` in `tests/meson.build` and wired as a `depends:`
+  of the agent test runner so it's on disk before the test runs.
+- Expanded `tests/unit/server/test_guaranteed_state_store.cpp` for
+  the #452 surface: new cases for `kConflictPrefix`-formatted duplicate
+  errors on both `name` and `rule_id`, conflict on rename-into-existing
+  name, batch `insert_events` happy path + transactional rollback on
+  mid-batch collision, `created_by` / `updated_by` round-trip, and TTL
+  reaper delete mechanics (including `retention_days=0` sentinel).
+- Added `tests/unit/test_guardian_engine.cpp` (13 cases, 79 assertions)
+  for the agent-side `GuardianEngine` ingest contract: `apply_rules`
+  persists rules + bumps generation, `full_sync` wipes the prior set,
+  delta merge keeps prior rules and updates overlap, empty `rule_id` is
+  skipped, `dispatch` round-trips `push_rules` through proto
+  `SerializeAsString`, `dispatch get_status` returns a serialised
+  `GuaranteedStateStatus`, missing `push` parameter / garbage proto map
+  to distinct exit codes, rule cache + `policy_generation` survive an
+  in-process engine reconstruct against the same `KvStore`, null-`KvStore`
+  construction degrades gracefully, and post-`stop()` `apply_rules`
+  fails. Bumps the agent test suite's `agent_test_exe` deps with
+  `yuzu_proto_dep` (the test constructs proto messages directly).
+- Added `tests/unit/server/test_rest_guaranteed_state.cpp` (11 cases,
+  88 assertions) for the `/api/v1/guaranteed-state/*` REST surface:
+  `201` on create with `rule_id` echoed, `400` on missing required
+  fields, `409` mapping from `kConflictPrefix` for duplicate name, full
+  list/get/update/delete round-trip with version bump, `404` on unknown
+  ids with denied-audit, `202` on `/push` with rule count + scope in the
+  audit detail, `events` filter + `limit` pagination, `400` on invalid
+  `limit`, `status` rollup, and `alerts` placeholder. Built against the
+  in-process `TestRouteSink` (no live `httplib::Server`, no #438 TSan
+  trap).
+- Updated `tests/unit/server/test_rbac_store.cpp`: bumped securable-type
+  count to 19, operations count to 6, `Administrator` perms to 114 (19
+  × 6), `Viewer` to 18, and `ITServiceOwner` to 96 (16 × 6) — all
+  knock-ons from adding the `GuaranteedState` securable type and the
+  `Push` operation seeded for PR 2.
+
+- **Coverage and perf baselines locked off seed; enforcement live in
+  `/test --full`.** `tests/coverage-baseline.json` and
+  `tests/perf-baselines.json` shipped with PR2 of the `/test` skill as
+  permissive `__seed: true` placeholders that emitted WARN regardless
+  of measured numbers. Both are now captured against commit
+  `40acd33` on the 5950X dev box: branch coverage **26.8%** / line
+  coverage **51.8%** with **0.5 pp slack** on the coverage gate; **4
+  perf metrics** (`registration_ops_sec=19084`,
+  `burst_registration_ops_sec=18248`, `heartbeat_queue_ops_sec=2.86M`,
+  `session_cleanup_ms_per_agent=0.05`) with **10% tolerance** and
+  hardware fingerprint locked. Cross-hardware perf runs auto-downgrade
+  to WARN (so a 5950X baseline doesn't false-fail on the MBP and vice
+  versa); coverage stays compiler-deterministic so no fingerprint is
+  recorded there. The `__seed: true` sentinel is still honored as a
+  defensive WARN if anyone re-introduces it. Regenerate with
+  `bash scripts/test/{coverage,perf}-gate.sh --run-id manual --capture-baselines`
+  on a clean test run; both gates refuse capture when the underlying
+  meson test or rebar3 ct exited non-zero (UP-18 guard).
+- **`yuzu_gw_upstream_tests:flush_sends_batch` rewritten to use
+  `flush_sync/0` instead of `! flush; timer:sleep(N)`.** The original
+  drain pattern was racy under coverage-instrumented BEAM — the cast
+  pipeline could outrun the 20ms settle window and the assertion saw
+  fewer than the expected 2 heartbeats. `flush_sync/0` is a
+  `gen_server:call`, so it serialises after pending casts and waits
+  for `do_flush` to complete before returning, making the test
+  deterministic regardless of host load. Sibling tests
+  (`buffer_retained_on_failure`, `buffer_cap_on_failure`) keep
+  `! flush` deliberately — they exercise the timer-flush path's
+  failure-cap semantics that differ from `flush_sync`. Verified:
+  148/148 pass on `rm -rf _build/test`; 3/3 sequential meson coverage
+  runs pass on the originally-flaky path.
+- **Test-runs DB auto-vivifies missing `test_runs` rows on operator-invoked
+  writes (#528).** `scripts/test/test_db.py` `cmd_gate` / `cmd_timing` /
+  `cmd_metric` previously failed `sqlite3.IntegrityError: FOREIGN KEY
+  constraint failed` when the `--run-id` had no parent `test_runs`
+  row — the path triggered by
+  `coverage-gate.sh --run-id manual --capture-baselines` and any direct
+  operator invocation outside the `/test` pipeline. New
+  `_ensure_run_exists(conn, run_id)` helper auto-creates a stub row
+  with `mode='manual'` / `overall_status='MANUAL'` (commit_sha + branch
+  resolved via `git rev-parse`, schema-init runs first if the DB is
+  brand-new). Race-safe via `INSERT OR IGNORE`; emits a stderr signal
+  on actual creation so a `/test` pipeline whose `run-start` silently
+  failed produces a visible signal rather than a green-looking run with
+  `mode='manual'` rows. On repeat manual capture, the existing stub's
+  `started_at` / `commit_sha` / `branch` are refreshed so trend queries
+  attribute new metrics to the current commit.
+- **`--latest` / `--last` / `--flaky` / `--prune` query helpers default-
+  exclude `mode='manual'` rows.** Operator captures via
+  `--capture-baselines` no longer displace real `/test --full` runs in
+  the kept window or pollute trend / flaky stats. Pass `--include-manual`
+  to opt back in.
+- **`scripts/linux-start-UAT.sh` server bind timeout 10s → 30s.**
+  `yuzu-server` cold-start walks ~20 `MigrationRunner` migrations and
+  routinely takes 12+ seconds before binding `:8080`; the prior 10s
+  budget produced a flaky Phase 4 in `/test --full` on WSL2 dev boxes.
+  Same bump applied to `scripts/integration-test.sh:441-443` (15s →
+  30s) and `scripts/win-start-UAT.sh:325` (10s → 30s) for cross-platform
+  parity. `wait_for_port` in all three scripts now emits
+  `bound to :PORT in Ns` on success, so future cold-start growth (e.g.
+  Guardian PRs adding `MigrationRunner` stores) shows up as a leading
+  indicator before the next timeout breach.
+- **`tests/puppeteer/dashboard-help-test.mjs` runs headless.** The test
+  was launching Chrome with `headless: false` and required an X server,
+  which the WSL2 dev box and CI runners don't provide. `headless: true`
+  removes the dependency; verified end-to-end against a fresh UAT stack
+  with `help=162 rows / command=1 row`, exit 0.
+
+### Tests — release tooling
+
+- **`/release` skill: Phase 0.5 reconciliation gate catches dev/main
+  divergence at preflight.** Every prior release hit the same trap —
+  `dev` accumulates merged work, the prior release's prep commits land
+  on `main` without coming back to `dev`, and by the next release both
+  branches are diverged in both directions. `scripts/release-preflight.sh`
+  now hard-FAILs check #8 (`origin/dev and origin/main reconciled`)
+  with the exact ahead/behind counts; the skill's new Phase 0.5
+  documents the cherry-pick + fast-forward reconcile recipe. Verified
+  by `/release v0.12.0-rc0 → /release v0.11.0 final` cycle that found
+  88 dev-ahead / 2 main-ahead and reconciled to 0/0 before tagging.
+- **`scripts/release-preflight.sh` check #7 regex matches SHA-pinned
+  `actions/cache@<40-hex>` references in addition to tag-pinned
+  `@v[0-9]+`.** Dependabot + Scorecard migrated all 7 cache steps in
+  `release.yml` to SHA pinning, so the prior regex matched zero and
+  the count comparison printed `0/7` on a clean release. The regex is
+  now `(@<40-hex-sha>|@v[0-9]+)` so both forms count.
+
+### Changed — deployment
+
+- **`docker-compose.yml` and `docker-compose.reference.yml` no longer
+  include a `yuzu-agent` service; agents run natively on each managed
+  endpoint.** Per-platform installers ship as release assets:
+  `yuzu-agent_X.Y.Z_amd64.deb` / `yuzu-agent-X.Y.Z-1.x86_64.rpm` for
+  Linux, `YuzuAgentSetup-X.Y.Z.exe` (Authenticode-signed) for Windows,
+  `YuzuAgent-X.Y.Z-macos-arm64.pkg` (notarised + stapled) for macOS.
+  The reference compose now documents these install paths and points
+  at `bash scripts/linux-start-UAT.sh` for dev smoke-testing of the
+  server↔agent roundtrip. Power users wanting a containerised agent
+  can still build from `deploy/docker/Dockerfile.agent`; we don't
+  publish a `yuzu-agent` GHCR image. `pre-release.yml` Trivy matrix
+  was scanning a `yuzu-agent` image that never existed — that step is
+  removed; only `yuzu-server` and `yuzu-gateway` are scanned.
+- **`docker-compose.sanitizer-uat.yml` agent service preserved.**
+  This is internal sanitiser test infrastructure that deliberately
+  runs the agent under ASan/TSan via `Dockerfile.agent-asan` /
+  `Dockerfile.agent-tsan`; not user-facing.
+
+
+## [0.11.0-rc2] - 2026-04-20
+
+### Added
+
+- **Guardian "Guaranteed State" engine — wire contract + server store
+  skeleton (PR 1 of the Windows-first rollout).** Landed dormant: a new
+  SQLite file `guaranteed-state.db` is created in the server data directory
+  at startup and a `guaranteed_state_store` entry appears in the `/readyz`
+  probe response. No REST endpoints, no dispatch, no agent wiring, and no
+  dashboard surface in this release — PR 1 ships only the proto (new package
+  `yuzu.guardian.v1` at `proto/yuzu/guardian/v1/guaranteed_state.proto`),
+  the server SQLite store, and 17 unit test cases. Operators upgrading will
+  see the new `.db` file alongside the existing stores (same permissions,
+  same backup story: copy the full `--data-dir`) and the new `/readyz` JSON
+  key. Full architecture: `docs/yuzu-guardian-design-v1.1.md`. Windows-first
+  delivery plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+
+- **Supply-chain attestation bundle: CycloneDX + SPDX SBOMs, SLSA
+  provenance, and cosign image signatures on every release (#362,
+  #408).** The release workflow now emits, per tag, a full verifiable
+  supply-chain artefact set:
+  - **CycloneDX + SPDX SBOMs per platform archive** via
+    [Syft](https://github.com/anchore/syft) (`anchore/sbom-action@v0`):
+    `yuzu-{linux-x64,gateway-linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json`.
+    Syft picks up vcpkg C++ dependencies (reading vcpkg's generated
+    `vcpkg.spdx.json` under `vcpkg_installed/<triplet>/share/`), Erlang
+    deps from `gateway/rebar.lock`, and metadata on the built
+    ELF/PE/Mach-O binaries.
+  - **CycloneDX + SPDX SBOMs per Docker image**
+    (`yuzu-{server,gateway}-image.{cdx,spdx}.json`) generated by Syft
+    scanning the pushed image by digest, so the SBOM is bound to the
+    exact image layers customers will pull.
+  - **SLSA v1.0 build provenance attestations** for every binary archive,
+    installer, and Docker image via `actions/attest-build-provenance@v3`.
+    Stored in GitHub's native attestation registry and verified
+    customer-side with `gh attestation verify <file> --repo Tr3kkR/Yuzu`
+    (images: `oci://ghcr.io/.../<image>@sha256:<digest>`).
+  - **cosign keyless Docker image signing** for both
+    `ghcr.io/tr3kkr/yuzu-server` and `ghcr.io/tr3kkr/yuzu-gateway`,
+    bound to the release workflow's OIDC identity (no static keys to
+    rotate). Existing cosign blob signature on `SHA256SUMS` is retained.
+  - **New release-gate script** at
+    `scripts/check-release-artifacts.sh` runs before `gh release create`
+    and fails the release if any expected archive, installer, or SBOM
+    is missing — preventing partially-attested releases from ever
+    reaching customers.
+  - **New operator doc** at
+    [`docs/user-manual/release-verification.md`](docs/user-manual/release-verification.md)
+    covers `sha256sum -c`, `cosign verify-blob`, `cosign verify` (images),
+    `gh attestation verify` (binaries + images), and CycloneDX / SPDX
+    inspection with `jq` and the CycloneDX CLI. Includes an end-to-end
+    verification script and a compliance-mapping table (SOC 2 CC6.8 /
+    CC7.1, NIST SSDF PW.5 / PS.3, EO 14028, EU CRA Annex V).
+  - Top-level workflow permissions extended with `attestations: write`
+    (required by `actions/attest-build-provenance`); `docker-publish`
+    job gains `id-token: write` + `attestations: write`. `SHA256SUMS`
+    now covers the SBOM files so customers can verify them alongside
+    the archives. Release notes heredoc advertises the new verification
+    workflow and links to the operator doc.
+  - Effective at the next tag after merge. No CHANGELOG gate on
+    historical releases — retro-generating provenance for shipped tags
+    is out of scope.
+- **OpenSSF Scorecard + Zizmor workflows (#407).** Added
+  `.github/workflows/scorecard.yml` (weekly + push to main +
+  `branch_protection_rule`; publishes to scorecard.dev + SARIF to the
+  GitHub Security tab) and `.github/workflows/zizmor.yml` (static
+  analyzer for `.github/workflows/*.yml`, runs on workflow-touching PRs
+  + weekly). README now advertises the Scorecard and Zizmor badges; the
+  OpenSSF Best Practices Badge slot is wired up pending manual
+  application at bestpractices.dev. Triaging Scorecard findings into
+  follow-up issues is the remaining work on #407.
+- **README `Install`, `Contributing`, `Reporting Issues` sections
+  (#407).** Addresses the OpenSSF Best Practices `[interact]` criterion
+  — README now points prebuilt-binary users at GitHub Releases +
+  `ghcr.io/tr3kkr/yuzu-{server,gateway,agent}` + `deploy/docker/docker-compose.yml`
+  instead of only documenting the from-source build. Adds explicit
+  links to `CONTRIBUTING.md`, `CLAUDE.md`, the bug-report and
+  feature-request issue templates, `SECURITY.md` (private vulnerability
+  reporting), and GitHub Discussions.
+
+### Fixed
+
+- **`/api/health` reports the actual server version instead of the
+  hardcoded "0.1.0" (#401).** The endpoint now derives the version
+  string from the meson-generated `yuzu/version.hpp` constant
+  `kVersionString`, so health probes track the running build (currently
+  `0.11.0`) rather than a stale literal that survived the v0.10.x cycle.
+- **`docker-compose.uat.yml` now passes `--data-dir /var/lib/yuzu` to
+  the server (#389).** Without the flag, all SQLite stores fell back to
+  the working directory (`/etc/yuzu`) instead of the persistent volume
+  mount — agent registrations, audit log, and tokens were lost on
+  container restart. The other compose files (`docker-compose.local.yml`,
+  `deploy/docker/docker-compose.full-uat.yml`) already passed the flag;
+  the UAT file was the outlier.
+- **`POST /api/settings/users` returns 409 on duplicate username (#399).**
+  Previously the endpoint silently overwrote an existing account via
+  `AuthManager::upsert_user` — a privilege-escalation primitive in the
+  hands of any authenticated admin attacker. The endpoint now rejects
+  duplicates with HTTP 409, an `HX-Trigger` toast (`"Username already
+  exists"`), and a denied audit event
+  (`user.upsert / denied / duplicate_username`). Self-password-change
+  (same username, same role) is still allowed.
+- **`POST /api/instructions` returns 409 on duplicate explicit `id`
+  (#402).** Previously returned a generic 400 (`"insert failed"`); the
+  store now pre-checks under the existing write lock and surfaces a
+  structured 409 (`{"error":"instruction definition '<id>' already
+  exists"}`) plus a denied audit event
+  (`instruction.create / denied / duplicate_id`). Empty `id` paths still
+  generate a UUID with no duplicate-check overhead.
+- **`POST /api/policy-fragments` returns 409 on duplicate fragment name
+  (#396).** Previously silently inserted a duplicate row; the store now
+  rejects with HTTP 409 (`{"error":"policy fragment named '<name>'
+  already exists"}`) plus a denied audit event
+  (`policy_fragment.create / denied / duplicate_name`).
+
+### Tests
+
+- Added `tests/unit/server/test_store_errors.cpp` exercising the shared
+  `kConflictPrefix` constant and `is_conflict_error` /
+  `strip_conflict_prefix` helpers introduced for the route↔store conflict
+  contract (governance Gate 3 arch-B1).
+- Added duplicate-detection cases to `test_settings_routes_users.cpp`,
+  `test_instruction_store.cpp`, and `test_policy_store.cpp`. The
+  pre-existing "duplicate ID" policy-store test was tightened to assert
+  the new `kConflictPrefix` semantics.
+
+## [0.11.0-rc1] - 2026-04-18
+
+_Minor bump from v0.10.0. The original `0.10.1` dev bump in `0c976c7`
+predated the `feat(test)` commits that landed the `/test` skill PR1 +
+PR2 (cb4cd7f, b6f1256 — ~5,000 lines of new operator-facing
+functionality), the matrix CodeQL workflow expansion (8c5b934), and
+the `563138f` MigrationRunner wiring with its `/readyz` response-shape
+addition (`failed_stores` field on 503). Strict SemVer says any new
+backward-compatible feature ⇒ MINOR bump, so this was first cut as
+**v0.11.0-rc1** (2026-04-18); rc2 followed on 2026-04-20 to smoke-test
+the new SBOM + SLSA + cosign supply-chain pipeline; the **v0.11.0**
+final tag landed on 2026-04-25 — see the `[0.11.0]` section above for
+the full set of changes between rc2 and final._
+
+### Added
+
+- **`/release` skill at `.claude/skills/release/SKILL.md`** — bash-first
+  release orchestrator that runs preflight (`scripts/release-preflight.sh`
+  + `scripts/check-compose-versions.sh`), pushes the tag, monitors the
+  release workflow until terminal state, troubleshoots known failure
+  modes (the v0.10.0 download-artifact bug, compose version mismatch,
+  Windows signtool absence, macOS notarytool timeout, Windows MSVC
+  LNK2038 vcpkg cache poisoning, EUnit meck false-positive), verifies
+  the GitHub Releases page has every expected asset including the
+  Compose Wizard zip and GHCR images, and produces a release report.
+  Supports `--watch`, `--verify`, and `--resume` modes for
+  re-entrant operation when a release stalls partway. Mirrors the
+  `/test` skill's bash-first orchestration pattern (no agent fan-out;
+  the LLM interprets failures and decides next-step). Use:
+  `/release vX.Y.Z` — full pipeline; `/release --watch vX.Y.Z` —
+  monitor an in-flight release; `/release --verify vX.Y.Z` —
+  post-hoc verification.
+- **Compose Wizard bundled as a release asset
+  (`.github/workflows/release.yml` `Package Compose Wizard` step).**
+  The browser-based docker-compose.yml + .env generator at
+  `tools/compose-wizard/` (PR #405 by @fjarvis) is now packaged into
+  `yuzu-compose-wizard-X.Y.Z.zip` during the release workflow's
+  `release` job and uploaded alongside the other assets. Auto-included
+  in `SHA256SUMS` and the cosign-signed `SHA256SUMS.bundle`. Release
+  notes get a "Compose Wizard" section pointing customers at the
+  download with `unzip + open index.html` instructions. Conditional
+  on `tools/compose-wizard/` existing in the tag's commit tree —
+  emits a workflow warning and skips the bundle if absent (release
+  proceeds without it). Tag must be cut from a commit that has both
+  this workflow change AND the wizard files merged in.
 - **Runner inventory sentinel workflow
   (`.github/workflows/runner-inventory-sentinel.yml`,
   `.github/runner-inventory.json`).** Declarative expected-state file
@@ -558,50 +3971,108 @@ patch._
   includes `docker-compose.reference.yml` with the "requires operator
   hardening" caveat.
 
+### Breaking
+
+- **`DELETE /api/settings/users/:name` now returns 403 + HTMX toast
+  when the URL target matches the caller's own session username
+  (was: 200 + deletion).** Operator scripts that previously called
+  this endpoint to delete the credential they were authenticated
+  with — for example, a decommission flow that removes its own
+  service account as a final step — will receive `403 Forbidden`
+  starting in v0.11.0. The full self-deletion lockout vector
+  including UI suppression is documented in the Fixed entry below
+  (#397). To remove the account a script is signed in as, create a
+  second admin account first, switch authentication to that account,
+  then issue the DELETE.
+- **`POST /api/settings/users` now returns 403 + HTMX toast when an
+  admin attempts to change their own role (typically a self-demote
+  from `admin` to `user`).** The same lockout class as the DELETE
+  case above; closed in the Gate 4 governance hardening round
+  (ca-B1). Self-password-change (same username, same role, different
+  password) is **explicitly allowed** and continues to return 200 —
+  the guard is role-scoped, not a blanket self-upsert ban. Operator
+  scripts that change their own role need to be split: have a
+  second admin perform the role change, or perform the role change
+  before swapping accounts.
+- **Two new audit actions written to `audit_store`:**
+  `user.delete` and `user.upsert`, each with `result` ∈
+  {`success`, `denied`}. Downstream consumers (Splunk HEC,
+  ClickHouse projections) that match on the existing
+  `<noun>.<verb>` action convention pick this up automatically. SOC
+  2 CC7.2 evidence chain (governance Gate 6 CO-1).
+
 ### Fixed
 
-- **MCP token authorization restored to documented tier-first design
-  (#520, #630, branch `fix/520-630-auth-hardening`).** An earlier
-  hardening pass (`5fcb346`..`7c8d4ac`) conflated MCP tokens with
-  service-scoped tokens — required RBAC to be enabled and capped MCP
-  tokens at `ITServiceOwner` permissions regardless of the creator's
-  role. That broke the documented design (`docs/user-manual/mcp.md`
-  §"Authorization Tiers"): the tier (`readonly`/`operator`/`supervised`)
-  is the primary access boundary, applied independently of RBAC, with
-  the creator's actual role as the secondary RBAC layer. The regression
-  made MCP unusable for its intended purpose — agentic fleet management —
-  on every RBAC-disabled deployment.
-
-  Restored behavior:
-  - `auth_routes::require_permission()` and `require_scoped_permission()`
-    now call `mcp::tier_allows()` first, then fall through to the
-    standard RBAC/role check using the creator's actual role.
-  - Tier enforcement now applies on **all** transports (MCP JSON-RPC and
-    REST API) — closes a path-bypass where an MCP token used directly
-    on `/api/v1/...` could skip the tier check that `/mcp/v1/` enforces.
-  - Approval-gated operations (supervised tier on destructive ops) are
-    blocked on every transport with a new `auth.approval_required`
-    audit action until the Phase 2 re-dispatch path is built. This
-    closes a separation-of-duties gap where a supervised MCP token
-    issued by an admin could execute destructive operations via REST
-    without approval.
-  - `require_admin()` MCP block kept — admin/settings routes (user
-    management, TLS, OIDC) are not the MCP use case.
-  - RBAC-enabled and legacy-fallback denial paths now emit
-    `audit_log()` and use the structured JSON envelope, closing prior
-    audit-evidence gaps (CC7.2).
-  - `settings_routes.cpp` tier-string validation replaced with
-    `mcp::is_valid_tier()` to keep the canonical tier set in
-    `mcp_policy.hpp` as the single source of truth.
-
-  Audit detail string format changed for MCP-token denials. Operators
-  with SIEM rules pattern-matching the old strings (`"MCP token
-  blocked: RBAC not enabled"`, `"MCP token blocked: lacks
-  ITServiceOwner permission"`) must update them; see
-  `docs/user-manual/authentication.md` § "Audit Actions". The broken
-  intermediate (`5fcb346`..`7c8d4ac`) never shipped in a release —
-  no customer-facing upgrade notes are required.
-
+- **Settings → Users hardening round on top of the #397/#403 fix —
+  ca-B1 sibling lockout, CO-1 audit chain, UP-1 empty-username
+  fail-closed, UP-9 GET/POST defensive auth (governance Gate 4-6).**
+  The original two-sided fix below closed the DELETE self-target
+  case but left several adjacent hardening items open that the full
+  governance pipeline surfaced:
+  - **ca-B1 — POST self-demotion guard.** `POST /api/settings/users`
+    is the second equivalent route to the same lockout class: an
+    admin POSTing their own username with a lower role demotes
+    themselves out of admin and is locked out of every admin-gated
+    page on the next request. Now rejected with HTTP 403 + "Cannot
+    change your own role" toast when
+    `(username == session->username && role != session->role)`.
+    Self-password-change (same role) is explicitly allowed.
+  - **CO-1 — SOC 2 CC7.2 audit chain.** The 403 self-reject branches
+    and the success delete/upsert paths now emit `audit_fn_` events
+    (`user.delete` / `user.upsert` with `result` ∈ {`denied`,
+    `success`}). `spdlog::warn` alone is not the audit chain — SIEM
+    ingestion paths and SOC 2 evidence collection both read
+    `audit_store`, not log files. Pre-existing gap on the success
+    path also closed.
+  - **UP-1 — empty session username fail-closed.** All three
+    handlers now return HTTP 500 + `spdlog::error` when
+    `session->username.empty()`. Defense-in-depth against an
+    upstream OIDC mis-config returning empty `preferred_username`;
+    previously the empty-string sentinel could match an empty-
+    username row via `"" == ""` or render every row as non-self.
+  - **UP-9 — GET/POST defensive 401.** GET `/fragments/settings/users`
+    and POST `/api/settings/users` now mirror the DELETE handler's
+    defensive 401 branch when `admin_fn_` passes but `auth_fn_`
+    returns nullopt. Previously they fell through with empty
+    `self_name`, re-rendering Remove buttons on every row including
+    the operator's own — the #403 bug pattern resurrected inside
+    the response body.
+  - **arch-S1 — `render_users_fragment` no longer has a default
+    argument.** Every call site must pass `current_username`
+    explicitly so a future caller forgetting it is a compile error
+    rather than a silent UI regression.
+  - **CLAUDE.md** under Authentication & Authorization captures the
+    self-target principal-destruction guard as a hard invariant for
+    future handlers (doc-S2).
+- **Self-deletion lockout in Settings → Users closed on both UI and
+  handler sides (#397 critical, #403 UI — both filed from the Apr 2026
+  UAT pass).** The Settings → Users page rendered a "Remove" button
+  next to every account including the currently authenticated
+  operator's own row, and `DELETE /api/settings/users/:name` did not
+  check the target against the caller's session. Confirming the
+  generic hx-confirm dialog dropped the sole admin credential on a
+  running server, leaving every API call returning 401 until the
+  process was restarted against its on-disk config — a permanent
+  lockout on single-seat deployments where the only recovery was a
+  container restart. Fix lands both halves because a hand-crafted
+  HTTP DELETE bypasses the dashboard entirely:
+  - `server/core/src/settings_routes.cpp` —
+    `render_users_fragment(const std::string& current_username)` now
+    takes the caller's session username and renders an italicised
+    "Current user" badge (not a button, no hx-delete) for the matching
+    row. Every call site (`GET /fragments/settings/users`,
+    `POST /api/settings/users` success and error paths,
+    `DELETE /api/settings/users/:name`) resolves the session via
+    `auth_fn_` and threads the name through so the UI stays consistent
+    after user CRUD.
+  - The `DELETE` handler resolves `session = auth_fn_(req, res)` after
+    the `admin_fn_` gate passes, compares `session->username` to the
+    URL-captured target, and rejects with HTTP 403 +
+    `HX-Trigger: {"showToast":{"message":"Cannot delete your own
+    account","level":"error"}}` if they match. The rejected attempt is
+    logged at warn level (`User '<x>' attempted to delete their own
+    account via /api/settings/users — rejected`) so operators chasing
+    a lockout incident can see it in the server log.
 - **Windows MSVC LNK2038 closed end-to-end via "option D" — static
   triplet override + hand-rolled `cxx.find_library()` wiring for
   grpc/protobuf/abseil/zlib/openssl (#375, PR #373 merged as
@@ -830,6 +4301,46 @@ patch._
 
 ### Tests
 
+- **`tests/unit/server/test_settings_routes_users.cpp` (new, 9
+  cases).** First test file for the Settings routes layer. Stands up a
+  real `httplib::Server` on a random port with `SettingsRoutes`
+  registered against a two-account `AuthManager` (`admin` +
+  `bob`), mocks the `auth_fn`/`admin_fn`/`perm_fn`/`audit_fn`
+  callbacks (audit_fn captures every call into a vector for evidence-
+  chain assertions), and exercises the full HTTP surface. Coverage:
+  - **#397 handler guard:** admin-self-DELETE returns 403 with the
+    full HX-Trigger payload (not just substring) and leaves the
+    account intact; the rejected attempt emits a `user.delete` /
+    `denied` audit event (CO-1 evidence chain).
+  - **Non-self DELETE:** admin-DELETE of another user returns 200,
+    the account is removed, and emits a `user.delete` / `success`
+    audit event.
+  - **Non-admin DELETE:** rejected by the `admin_fn_` gate before
+    the self-delete guard is reached, no audit event recorded.
+  - **Unauthenticated DELETE:** rejected by `admin_fn_` with 403,
+    target account intact, no audit event recorded.
+  - **ca-B1 self-demotion guard (POST):** admin POSTing
+    `username=admin&role=user` is rejected with 403 +
+    "Cannot change your own role" toast; role remains admin;
+    `user.upsert` / `denied` audit event captured.
+  - **POST self-password-change:** same username, same role only
+    password change — explicitly allowed, returns 200,
+    `user.upsert` / `success` audit emitted.
+  - **POST success path renders self-row guard:** new user appears
+    in the response fragment with hx-delete; operator's own row
+    still has Current user badge — regression cover for the
+    self_name threading through the success branch.
+  - **#403 UI guard:** `GET /fragments/settings/users` emits no
+    `hx-delete="/api/settings/users/admin"` attribute for the self
+    row, still emits it for every other row, and renders the
+    "Current user" badge in its place.
+  - **UI guard with multiple users:** every non-self row keeps its
+    Remove button when the user list grows.
+  Harness uses an RAII `TmpDirGuard` member that cleans up the temp
+  directory even if a `REQUIRE` inside the constructor body throws
+  (qe-B1 — partially-constructed objects don't run their own
+  destructor but fully-constructed members do). Pattern available for
+  future Settings-routes regression coverage.
 - **`tests/unit/server/test_migration_runner.cpp`** — four new cases
   tagged `[migration][adoption]` exercise the adoption and hardening
   paths: (a) running v1 on a database that already has tables populated

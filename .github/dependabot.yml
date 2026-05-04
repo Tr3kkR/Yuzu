@@ -13,6 +13,21 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    # After SHA-pinning every `uses:` ref (Scorecard PR #2), Dependabot
+    # opens one PR per action per bump. Group them so related actions
+    # ship together and weekly PR volume stays manageable.
+    groups:
+      actions-core:
+        patterns:
+          - "actions/*"
+      docker-actions:
+        patterns:
+          - "docker/*"
+      github-codeql:
+        patterns:
+          - "github/codeql-action/*"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/deploy/docker"
@@ -22,6 +37,8 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    cooldown:
+      default-days: 7
 
   # Python tooling consumed by CI (meson, and whatever else lands in
   # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
@@ -34,3 +51,5 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    cooldown:
+      default-days: 7

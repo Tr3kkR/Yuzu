@@ -63,7 +63,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  security-events: write
   contents: read
 
 env:
@@ -75,6 +74,9 @@ env:
 jobs:
   analyze:
     name: "Analyze (${{ matrix.os }})"
+    permissions:
+      contents: read
+      security-events: write   # github/codeql-action/upload-sarif
     # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
     # build_tests=false): 14m49s with 155/156 compiles being real misses
     # on a 32-thread runner. Current config (+security-and-quality +
@@ -129,10 +131,11 @@ jobs:
         shell: ${{ matrix.shell }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       # ─── MSVC environment (Windows only) ──────────────────────────
       # CLAUDE.md forbids direct use of vcvars64.bat because it returns
@@ -143,7 +146,7 @@ jobs:
       # setup_msvc_env.sh which is for interactive MSYS2 bash sessions).
       - name: Setup MSVC (windows)
         if: matrix.os == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Assert toolchain available
         run: |
@@ -182,79 +185,50 @@ jobs:
           # database. Wipe the build dir each run.
           rm -rf ${{ matrix.build_dir }}
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: ${{ matrix.ccache_path }}
-          # NOTE: the obvious pattern hashFiles('**/*.cpp', '**/*.hpp',
-          # '**/*.h') exceeds GitHub's 120s hashFiles timeout on the
-          # self-hosted Windows runner because the persistent workspace
-          # accumulates vcpkg_installed/ across runs (thousands of
-          # vendored headers from gRPC, protobuf, abseil, etc.) and the
-          # NTFS recursive walk is too slow. ci.yml gets away with the
-          # broad pattern because GitHub-hosted runners have a fresh
-          # workspace per run.
-          #
-          # We hash only the build-system config files (meson.build,
-          # meson_options.txt, vcpkg.json, vcpkg-configuration.json,
-          # meson native/cross files) — these are small, fast, and the
-          # only inputs that should rotate the ccache slot. ccache
-          # handles source-level invalidation internally via content
-          # hashing, so the GHA cache key only needs to differ when the
-          # build configuration meaningfully changes.
-          key: ${{ matrix.ccache_key_prefix }}-${{ hashFiles('meson.build', 'meson_options.txt', 'vcpkg.json', 'vcpkg-configuration.json', 'meson/native/*.ini', 'meson/cross/*.ini') }}
-          restore-keys: |
-            ${{ matrix.ccache_key_prefix }}-
-
+      # ccache (matrix.ccache_path: ~/.cache/ccache on Linux,
+      # ~\AppData\Local\ccache on Windows) persists in the runner
+      # user's home dir between jobs on both self-hosted runners.
+      # vcpkg_installed/ persists in the workspace. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Force fresh vcpkg install when triplet changed (windows only)
-        if: matrix.os == 'windows'
-        run: |
-          # The self-hosted Windows runner has a persistent
-          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
-          # incremental install keys off the manifest only — it does NOT
-          # detect overlay-triplet content edits. So a triplet change
-          # like removing `VCPKG_BUILD_TYPE release` (which gates whether
-          # vcpkg builds the debug variant of every package) silently
-          # leaves the existing release-only tree in place, and the
-          # debug build then fails to link with LNK2038
-          # `RuntimeLibrary` / `_ITERATOR_DEBUG_LEVEL` mismatches against
-          # absl_*.lib.
-          #
-          # We reconcile by wiping the install root whenever the recorded
-          # triplet hash drifts from the current `triplets/x64-windows.cmake`
-          # SHA. The sentinel is a 1-line file under vcpkg_installed itself
-          # so it lives and dies with the tree it describes.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
-          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
-          have=$(cat "$sentinel" 2>/dev/null || echo "")
-          if [[ "$want" != "$have" ]]; then
-            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
-            rm -rf "$installed_dir"
-            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
-            echo "$want" > "$sentinel"
-          else
-            echo "x64-windows triplet sha256 unchanged ($want) — keeping persistent vcpkg_installed/x64-windows"
-          fi
+      - name: vcpkg sentinel
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        # Replaces the prior inline Windows-only sentinel that hashed only
+        # `triplets/x64-windows.cmake`, missed manifest + baseline drift,
+        # and left `vcpkg_installed/vcpkg/` orphaned after wiping the
+        # triplet tree (#741). The shared script invalidates both halves
+        # of vcpkg_installed/ together and uses the same key as ci.yml so
+        # the binary cache is shared cleanly across workflows.
+        # `/usr/bin/bash` (absolute path) — matches the Windows callers
+        # in ci.yml:464 and release.yml:439. A bare `bash` does a PATH
+        # lookup; on the Windows self-hosted runner `C:\WINDOWS\system32`
+        # sits ahead of `C:\msys64\usr\bin`, so bare `bash` resolves to
+        # WSL's `C:\Windows\System32\bash.EXE`, which refuses to run
+        # under the runner's LocalSystem service account
+        # (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED). `/usr/bin/bash` works on
+        # both Linux (real path) and MSYS2 (maps to
+        # C:/msys64/usr/bin/bash.exe).
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh ${{ matrix.triplet }}
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace. Without this
+          # lukka/run-vcpkg defaults to a per-run UUID temp dir under its
+          # own state path → 0% hit rate every run → every port rebuilt
+          # from source (~25 min on this runner for grpc + abseil +
+          # protobuf). The path matches ci.yml's
+          # `yuzu-vcpkg-binary-cache-${matrix.os}` so the binary cache is
+          # shared across workflows — the abseil zip is the same artifact
+          # whichever workflow built it. runner.tool_cache survives
+          # actions/checkout's default clean. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-${{ matrix.os }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -264,6 +238,7 @@ jobs:
           # without the backslash, collapsing the path. $GITHUB_WORKSPACE
           # is read by bash at runtime so escape rules don't apply, and
           # MSYS2 handles path translation when calling native binaries.
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE"
@@ -287,10 +262,24 @@ jobs:
           fi
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
           languages: ${{ matrix.languages }}
-          queries: +security-and-quality
+          # The leading `+` means "augment the default suite" (applies
+          # to the whole comma-separated list, not to individual items —
+          # a stray `+` on the second entry triggers
+          # "Specifier for external repository is invalid").
+          # security-and-quality — generic CWE coverage (memory leaks,
+          #   UAF, null deref, taint to system/popen, etc.).
+          # ./.github/codeql/queries — Yuzu-specific queries that the
+          #   generic suite cannot encode (per-project directory scope,
+          #   plugin ABI conventions, threat model). See qlpack.yml in
+          #   that directory and the close-out comment on issue #371
+          #   for the design rationale and deferred catalog.
+          queries: +security-and-quality,./.github/codeql/queries
+          # Scope the scan to first-party code; see the config file for
+          # the list of vendored/generated paths that are excluded.
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Configure (Meson debug) — linux
         if: matrix.os == 'linux'
@@ -351,6 +340,21 @@ jobs:
         # CodeQL's tracer wraps this step's compile invocations to build
         # its database. Full graph traversal required — no --no-rebuild,
         # no partial target selection.
+        #
+        # CCACHE_RECACHE=true is load-bearing for CodeQL coverage. The
+        # tracer attaches to compiler processes; if ccache returns a
+        # cached object file without invoking the compiler, the tracer
+        # never sees that translation unit and CodeQL's database omits
+        # it entirely. With persistent ccache on the self-hosted runner
+        # this silently dropped 98% of TUs from the database (e.g. only
+        # 1 of 47 plugin .cpp files was reaching analysis), making most
+        # custom and standard queries report 0 alerts on plugin code.
+        # `RECACHE` forces the compiler to actually run while still
+        # updating the cache, so non-CodeQL CI builds keep their cache
+        # warm. `CCACHE_DISABLE=true` would also work but would skip
+        # the cache update and degrade subsequent CI builds.
+        env:
+          CCACHE_RECACHE: "true"
         run: meson compile -C ${{ matrix.build_dir }}
 
       - name: ccache stats
@@ -358,6 +362,50 @@ jobs:
         run: ccache -s
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        # `upload: never` — we need to filter the SARIF before upload
+        # because CodeQL's `paths` / `paths-ignore` config keys do not
+        # reliably suppress findings whose location is a transitively-
+        # included header in compiled C/C++. The `output` directory
+        # holds the raw SARIF for post-processing.
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
         with:
+          category: "${{ matrix.category }}"
+          output: codeql-sarif
+          upload: never
+
+      - name: Filter SARIF (drop non-security findings in vendored/generated paths + Catch2 TEST_CASE FP in tests/)
+        # Strips results in vcpkg_installed/, build-*/, vcpkg/, and
+        # generated proto code unless the rule has a security-severity.
+        # Also strips cpp/unused-static-function in tests/ (Catch2
+        # TEST_CASE registration false-positive). Security-severity
+        # findings in vendored code are KEPT — even though we cannot
+        # patch upstream, a vendor vulnerability that ships in our
+        # binary is a real exposure to customers and we need to stay
+        # aware of it (track via dedicated vendor-security process).
+        #
+        # Why this is necessary: CodeQL's paths/paths-ignore config does
+        # not reliably suppress C/C++ findings in transitively-included
+        # vendored headers. Full writeup:
+        #   https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8
+        #
+        # Implemented in Python rather than jq because jq is not on
+        # PATH in the MSYS2 environment used by the Windows self-hosted
+        # runner; python is already required by "Assert toolchain
+        # available" so the dependency is free. Probe both names because
+        # the canonical executable differs by platform: Linux runners
+        # have `python3`, Windows MSYS2 runners have `python`.
+        run: |
+          PYTHON=$(command -v python3 || command -v python)
+          if [[ -z "$PYTHON" ]]; then
+            echo "::error::no python interpreter on PATH (tried python3, python)"
+            exit 1
+          fi
+          for f in codeql-sarif/*.sarif; do
+            "$PYTHON" scripts/ci/filter-codeql-sarif.py "$f"
+          done
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        with:
+          sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

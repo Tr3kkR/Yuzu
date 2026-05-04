@@ -85,15 +85,16 @@ heartbeats_batched() ->
     ?assertEqual(0, length(BatchCalls)).
 
 flush_sends_batch() ->
-    %% Drain any stale heartbeats from prior tests by flushing twice
-    %% with enough time for the gen_server to process.
+    %% Drain any stale heartbeats from prior tests deterministically.
+    %% flush_sync is a gen_server:call, so it serializes after any
+    %% pending casts and waits for do_flush to complete before returning.
+    %% Why: the original `! flush; timer:sleep(100)` pattern was racy
+    %% under coverage-instrumented BEAM — the cast queue could outpace
+    %% the 20ms settle window and the assertion would see <2 heartbeats.
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged_count => 0}, #{}}
     end),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    ok = yuzu_gw_heartbeat_buffer:flush_sync(),
     %% Now reset and set up the real assertion mock.
     meck:reset(grpcbox_client),
     meck:expect(grpcbox_client, unary, fun(_, Path, Req, _, _) ->
@@ -104,13 +105,11 @@ flush_sends_batch() ->
                 {ok, #{acknowledged_count => length(HBs)}, #{}}
         end
     end),
-    %% Queue exactly 2 heartbeats.
+    %% Queue exactly 2 heartbeats. flush_sync's gen_server:call serializes
+    %% after both casts in the mailbox, so no sleep is needed.
     yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"f1">>}),
     yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"f2">>}),
-    timer:sleep(20),
-    %% Trigger flush manually.
-    whereis(yuzu_gw_heartbeat_buffer) ! flush,
-    timer:sleep(100),
+    ok = yuzu_gw_heartbeat_buffer:flush_sync(),
     %% Check that BatchHeartbeat was called with exactly 2 heartbeats.
     Calls = meck:history(grpcbox_client),
     BatchCalls = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,

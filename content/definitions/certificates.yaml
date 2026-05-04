@@ -72,6 +72,17 @@ spec:
       groupBy: [store, issuer]
       operations: [count]
 
+  visualization:
+    # Best demoed with `expiring_within_days: 90` to focus the chart on
+    # certs that need renewal attention. With the default expiry filter
+    # of 0 the same chart shows top issuers across the entire estate.
+    type: pie
+    processor: single_series
+    title: Certificates by issuer
+    labelField: 1       # issuer — typically a CA distinguished name
+    maxCategories: 8    # collapse the long tail into "Other"
+    valueLabel: Certificates
+
   readablePayload: "List certificates (store=${store}, expiring within ${expiring_within_days} days)"
 
   gather:

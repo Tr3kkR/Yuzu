@@ -249,6 +249,40 @@ sum by (plugin) (rate(yuzu_agent_plugin_executions_total{status="failure"}[5m]))
 / sum by (plugin) (rate(yuzu_agent_plugin_executions_total[5m])) * 100
 ```
 
+### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
+
+Counter incremented every time the agent rejects a plugin at scan time
+**before** the plugin's code runs. The `reason` label is bounded to a
+fixed set of stable string prefixes — alert rules SHOULD pin against
+the literal label values, not substring matches.
+
+| Reason label | Meaning | Operator action |
+|---|---|---|
+| `reserved_name` | Plugin declared a reserved name (`__guard__`, `__system__`, `__update__`). Possible plugin-author error or a malicious shadowing attempt (#453). | Investigate the plugin source / drop. |
+| `load_failed` | `dlopen` / `LoadLibrary` failed, missing `yuzu_plugin_descriptor` export, or ABI version mismatch. | Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI. |
+| `signature_missing` | `--plugin-trust-bundle` is set, `--plugin-require-signature` is set, and a plugin has no `<plugin>.so.sig` sibling. | Sign the plugin, deploy the `.sig` alongside, or relax the require flag. |
+| `signature_invalid` | `.sig` file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing). | Re-sign the plugin or investigate tampering. |
+| `signature_untrusted_chain` | The signing cert does not chain to a CA in the operator's trust bundle, OR the leaf cert lacks `EKU=codeSigning`, OR the cert chain has expired. | Verify the bundle includes the right CA root; re-issue a leaf with `extendedKeyUsage=codeSigning`; rotate expired CAs. |
+
+```promql
+# WARN: any plugin rejected for an invalid signature in the last 5 min
+# (most often: tampered file in the plugin dir).
+increase(yuzu_agent_plugin_rejected_total{reason="signature_invalid"}[5m]) > 0
+
+# CRITICAL: chain validation failure means a plugin was signed against
+# a CA the operator's trust bundle doesn't anchor — supply-chain signal,
+# or an expired/revoked operator CA.
+increase(yuzu_agent_plugin_rejected_total{reason="signature_untrusted_chain"}[5m]) > 0
+
+# Volume tracker: missing-sig rejections during a signing rollout
+# (transitional → enforced). Expect this to be non-zero only during
+# rollout, then drop to 0 once every plugin has a .sig sibling.
+sum by (instance) (increase(yuzu_agent_plugin_rejected_total{reason="signature_missing"}[1h]))
+
+# Reserved-name attempts (#453) — should be 0 in normal operation.
+increase(yuzu_agent_plugin_rejected_total{reason="reserved_name"}[5m]) > 0
+```
+
 ### Instruction throughput
 
 ```promql

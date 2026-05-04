@@ -4,9 +4,12 @@
 
 #include "settings_routes.hpp"
 
+#include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
+#include <yuzu/server/auth_db.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -371,11 +374,14 @@ std::string SettingsRoutes::render_tls_fragment() {
            "</div>"
            "</form>";
 
-    // One-way TLS
-    std::string owt_color = cfg_->allow_one_way_tls ? "#f0883e" : "#8b949e";
-    std::string owt_text = cfg_->allow_one_way_tls ? "Enabled (no client cert required)" : "Disabled (mTLS enforced)";
+    // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
+    // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
+    std::string owt_color = cfg_->allow_one_way_tls ? "#f85149" : "#8b949e";
+    std::string owt_text = cfg_->allow_one_way_tls
+        ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
+        : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
-            "  <label>One-Way TLS</label>"
+            "  <label>Insecure Skip Client Verify</label>"
             "  <span style=\"font-size:0.8rem;color:" + owt_color + "\">" + owt_text + "</span>"
             "</div>";
 
@@ -406,7 +412,7 @@ std::string SettingsRoutes::render_tls_fragment() {
     return html;
 }
 
-std::string SettingsRoutes::render_users_fragment() {
+std::string SettingsRoutes::render_users_fragment(const std::string& current_username) {
     auto users = auth_mgr_->list_users();
     std::string html = "<table class=\"user-table\">"
                        "  <thead><tr><th>Username</th><th>Role</th><th></th></tr></thead>"
@@ -418,21 +424,41 @@ std::string SettingsRoutes::render_users_fragment() {
         for (const auto& u : users) {
             auto role_str = auth::role_to_string(u.role);
             auto cls = (u.role == auth::Role::admin) ? "role-admin" : "role-user";
+            const bool is_self =
+                !current_username.empty() && u.username == current_username;
             html += "<tr><td>" + html_escape(u.username) +
                     "</td>"
                     "<td><span class=\"role-badge " +
                     std::string(cls) + "\">" + html_escape(role_str) +
                     "</span></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
-                    "hx-delete=\"/api/settings/users/" +
-                    html_escape(u.username) +
-                    "\" "
-                    "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove user &quot;" +
-                    html_escape(u.username) +
-                    "&quot;?\""
-                    ">Remove</button></td></tr>";
+                    "<td>";
+            if (is_self) {
+                // Self-deletion lockout guard (#397/#403): the Remove button
+                // is suppressed for the currently authenticated operator's
+                // own row so that deleting the sole admin — and thereby
+                // locking every user out of the running server — is not a
+                // two-click operation in the dashboard. The DELETE handler
+                // also rejects self-targeted requests; both halves are load-
+                // bearing because the UI guard alone does not stop a hand-
+                // crafted HTTP DELETE.
+                html += "<span class=\"current-user-badge\" "
+                        "style=\"color:#484f58;font-size:0.7rem;"
+                        "font-style:italic\" "
+                        "title=\"You cannot remove your own account\">"
+                        "Current user</span>";
+            } else {
+                html += "<button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/settings/users/" +
+                        html_escape(u.username) +
+                        "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Remove user &quot;" +
+                        html_escape(u.username) +
+                        "&quot;?\""
+                        ">Remove</button>";
+            }
+            html += "</td></tr>";
         }
     }
 
@@ -445,8 +471,10 @@ std::string SettingsRoutes::render_users_fragment() {
             "    <input type=\"text\" name=\"username\" placeholder=\"username\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
-            "    <label>Password</label>"
-            "    <input type=\"password\" name=\"password\" placeholder=\"password\" required>"
+            "    <label>Password <span style=\"color:#8b949e;font-weight:normal;"
+            "font-size:0.7rem\">(min 12 chars)</span></label>"
+            "    <input type=\"password\" name=\"password\" placeholder=\"password\" "
+            "           minlength=\"12\" required>"
             "  </div>"
             "  <div class=\"mini-field\">"
             "    <label>Role</label>"
@@ -1700,9 +1728,225 @@ std::string SettingsRoutes::render_directory_fragment() {
     return html;
 }
 
+// ── Plugin code-signing settings ────────────────────────────────────────────
+//
+// Storage model (intentionally minimal — see SKILL.md auth-and-authz §10
+// for the full design):
+//   * The PEM trust bundle lives at <cert-dir>/plugin-trust-bundle.pem.
+//   * Presence of that file = "signing enabled". No separate enabled flag
+//     so disk + DB cannot drift out of sync — clearing the file disables
+//     signing atomically.
+//   * The require flag lives in runtime_config under the
+//     plugin_signing::kPluginSigningRequiredKey key.
+//   * Bundle metadata (cert count, SHA-256) is recomputed from the file
+//     each render rather than denormalised — keeps the source of truth
+//     single (the file), at cost of a few-ms re-parse per /settings load.
+
+namespace {
+
+using ::yuzu::server::plugin_signing::TrustBundleStats;
+using ::yuzu::server::plugin_signing::trust_bundle_path;
+using ::yuzu::server::plugin_signing::validate_trust_bundle_pem;
+
+// Read+validate the on-disk bundle (may be missing). Returns nullopt if the
+// file is absent. Returns an error string if present but unreadable / parse
+// failure (so the UI can surface "bundle on disk is corrupt" rather than
+// silently downgrading to "no bundle").
+std::optional<std::expected<TrustBundleStats, std::string>>
+read_on_disk_bundle() {
+    std::error_code ec;
+    auto path = trust_bundle_path();
+    if (!std::filesystem::exists(path, ec)) {
+        return std::nullopt;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return std::expected<TrustBundleStats, std::string>(
+            std::unexpect, "cannot open " + path.string());
+    }
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    return validate_trust_bundle_pem(content);
+}
+
+} // namespace
+
+std::string SettingsRoutes::render_plugin_signing_fragment() {
+    std::string html;
+
+    auto bundle = read_on_disk_bundle();
+    const bool enabled = bundle && bundle->has_value();
+    const bool required =
+        runtime_config_store_ &&
+        runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+    // Status badge
+    std::string badge_color, badge_text;
+    if (enabled && required) {
+        badge_color = "#238636"; // green
+        badge_text = "Enforced (required)";
+    } else if (enabled) {
+        badge_color = "#9e6a03"; // amber
+        badge_text = "Trust bundle loaded (transitional)";
+    } else {
+        badge_color = "#484f58"; // muted
+        badge_text = "Disabled";
+    }
+    html += "<div style=\"margin-bottom:1rem\">"
+            "  <span style=\"font-size:0.75rem;background:" + badge_color +
+            ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
+            badge_text + "</span></div>";
+
+    // Current state
+    if (enabled && bundle->has_value()) {
+        const auto& stats = bundle->value();
+        html += "<div class=\"form-row\"><label>Trust anchors</label>"
+                "<span style=\"font-size:0.8rem\">" +
+                std::to_string(stats.cert_count) + " certificate(s)</span></div>";
+        html += "<div class=\"form-row\"><label>Bundle SHA-256</label>"
+                "<code style=\"font-size:0.7rem;word-break:break-all\">" +
+                stats.sha256_hex + "</code></div>";
+        if (!stats.subjects.empty()) {
+            html += "<div class=\"form-row\" style=\"align-items:flex-start\">"
+                    "<label>Subjects</label>"
+                    "<div style=\"font-size:0.75rem;flex:1;min-width:0\">";
+            for (const auto& s : stats.subjects) {
+                html += "<div style=\"font-family:monospace;color:var(--mds-color-theme-text-secondary);"
+                        "overflow-wrap:anywhere\">" + html_escape(s) + "</div>";
+            }
+            html += "</div></div>";
+        }
+    } else if (bundle && !bundle->has_value()) {
+        html += "<div class=\"feedback feedback-error\">Bundle on disk is unreadable: " +
+                html_escape(bundle->error()) + "</div>";
+    } else {
+        html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "No trust bundle uploaded. Plugin signature verification is off "
+                "for every agent connected to this server.</p>";
+    }
+
+    // Fleet-suicide warning: Yuzu-shipped plugins are not currently
+    // signed. An operator who enables Require=on without first signing
+    // the in-tree plugins will reject every Yuzu-shipped plugin
+    // fleet-wide on next agent restart. Make the risk explicit before
+    // they touch the toggle (governance hardening round 1, ER-1).
+    html += "<div class=\"feedback feedback-warning\" "
+            "style=\"font-size:0.75rem;background:#664d03;color:#fff;"
+            "padding:0.5rem 0.75rem;border-radius:4px;margin-top:0.5rem\">"
+            "<strong>Heads up.</strong> Yuzu-shipped plugins do not yet "
+            "include CMS signatures. Enabling <em>Require signed plugins</em> "
+            "will cause agents to reject every Yuzu-bundled plugin at next "
+            "scan. Use the transitional mode (bundle uploaded, Require off) "
+            "until you have signed every plugin your fleet uses, including "
+            "the ones shipped under <code>agents/plugins/</code>."
+            "</div>";
+
+    // Upload form (multipart so curl/UI both work)
+    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+            "margin:1rem 0\">";
+    html += "<form hx-post=\"/api/settings/plugin-signing/upload\" "
+            "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+            "hx-encoding=\"multipart/form-data\">";
+    html += "<div class=\"form-row\" style=\"align-items:center\">"
+            "<label style=\"min-width:140px\">PEM trust bundle</label>"
+            "<input type=\"file\" name=\"file\" accept=\".pem,.crt,application/x-pem-file\" "
+            "required style=\"flex:1;min-width:0\"></div>";
+    html += "<div class=\"form-row\"><label></label>"
+            "<button type=\"submit\" class=\"btn btn-primary\">"
+            "Upload &amp; verify</button></div>";
+    html += "</form>";
+
+    // Toggle: require signature (only meaningful when bundle is loaded)
+    if (enabled) {
+        html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+                "style=\"margin-top:0.75rem\">";
+        html += "<div class=\"form-row\">"
+                "<label style=\"min-width:140px\">Require signed plugins</label>"
+                "<label style=\"display:flex;align-items:center;gap:0.5rem;flex:1\">"
+                "<input type=\"checkbox\" name=\"required\" value=\"true\"" +
+                std::string(required ? " checked" : "") +
+                "><span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Reject unsigned plugins instead of allowing them through (transitional vs enforced).</span>"
+                "</label></div>";
+        html += "<div class=\"form-row\"><label></label>"
+                "<button type=\"submit\" class=\"btn btn-secondary\">Save</button></div>";
+        html += "</form>";
+
+        // Clear button — separate form so it can have a confirm.
+        // Confirm copy is deliberate about what is and isn't possible
+        // today: there is no automatic agent-side bundle refresh, so a
+        // running agent that already loaded plugins continues to use
+        // its in-process verification state. The bundle on the server
+        // is removed; new agent starts (or future auto-refresh) will
+        // see no bundle. Operators rotating away from a compromised CA
+        // need to also restart agents (governance hardening round 1,
+        // UP-5).
+        html += "<form hx-post=\"/api/settings/plugin-signing/clear\" "
+                "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" "
+                "hx-confirm=\"Remove the plugin trust bundle and reset the require flag? "
+                "This stops new agent starts from verifying signatures, but already-running "
+                "agents keep their in-process state until they restart. "
+                "If you are rotating away from a compromised CA, restart your agents.\" "
+                "style=\"margin-top:0.75rem\">";
+        html += "<div class=\"form-row\"><label></label>"
+                "<button type=\"submit\" class=\"btn btn-danger\">Remove trust bundle</button>"
+                "</div></form>";
+    }
+
+    // Operator help
+    html += "<hr style=\"border:none;border-top:1px solid var(--mds-color-theme-border-secondary);"
+            "margin:1rem 0\">";
+    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary);"
+            "margin-bottom:0.4rem\"><strong>Agent distribution.</strong> The bundle "
+            "is served at <code>GET /api/v1/agent/plugin-policy</code> "
+            "(<em>admin-only</em> — operators distribute to agents via the "
+            "standard config-management flow). Agents are pointed at a local "
+            "file via <code>--plugin-trust-bundle</code>; automatic agent-side "
+            "fetch is a forthcoming change, at which point this endpoint will "
+            "gain a dedicated agent identity.</p>";
+    html += "<p style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+            "<strong>Signing recipe:</strong> "
+            "<code>openssl cms -sign -binary -nodetach=false -signer signer.pem "
+            "-inkey signer.key -in plugin.so -outform pem -out plugin.so.sig</code>. "
+            "See <a href=\"/docs#plugin-code-signing\">user manual</a> for the full workflow.</p>";
+
+    return html;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
+// Production overload — wraps httplib::Server in an HttplibRouteSink and
+// delegates to the sink-based implementation below. Tests bypass this and
+// call the sink overload directly with their own TestRouteSink (#438).
 void SettingsRoutes::register_routes(httplib::Server& svr,
+                                      AuthFn auth_fn,
+                                      AdminFn admin_fn,
+                                      PermFn perm_fn,
+                                      AuditFn audit_fn,
+                                      Config& cfg,
+                                      auth::AuthManager& auth_mgr,
+                                      auth::AutoApproveEngine& auto_approve,
+                                      ApiTokenStore* api_token_store,
+                                      ManagementGroupStore* mgmt_group_store,
+                                      TagStore* tag_store,
+                                      UpdateRegistry* update_registry,
+                                      RuntimeConfigStore* runtime_config_store,
+                                      AuditStore* audit_store,
+                                      bool gateway_enabled,
+                                      GatewaySessionCountFn gateway_session_count_fn,
+                                      AgentsJsonFn agents_json_fn,
+                                      std::shared_mutex& oidc_mu,
+                                      std::unique_ptr<oidc::OidcProvider>& oidc_provider) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
+                    std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
+                    mgmt_group_store, tag_store, update_registry, runtime_config_store,
+                    audit_store, gateway_enabled, std::move(gateway_session_count_fn),
+                    std::move(agents_json_fn), oidc_mu, oidc_provider);
+}
+
+void SettingsRoutes::register_routes(HttpRouteSink& sink,
                                       AuthFn auth_fn,
                                       AdminFn admin_fn,
                                       PermFn perm_fn,
@@ -1742,7 +1986,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     oidc_provider_ = &oidc_provider;
 
     // -- Settings page (admin only) -------------------------------------------
-    svr.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res)) {
             res.set_redirect("/");
             return;
@@ -1752,42 +1996,69 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings HTMX fragment endpoints -------------------------------------
 
-    svr.Get("/fragments/settings/tls",
+    sink.Get("/fragments/settings/tls",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/users",
+    sink.Get("/fragments/settings/users",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
-                res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+                auto session = auth_fn_(req, res);
+                if (!session) {
+                    // Match the DELETE handler's defensive branch: if
+                    // admin_fn_ passes but auth_fn_ returns nullopt the
+                    // two callbacks have disagreed (concurrent logout,
+                    // stale cookie, OIDC session expiry between calls).
+                    // Refuse to render with empty self_name — that path
+                    // would emit Remove buttons on every row including
+                    // the operator's own, resurrecting #403 inside the
+                    // dashboard fragment.
+                    res.status = 401;
+                    return;
+                }
+                if (session->username.empty()) {
+                    // Defense-in-depth against an upstream auth bug
+                    // (e.g. OIDC mis-config returning empty
+                    // preferred_username). Empty session->username would
+                    // make the is_self comparison in render_users_fragment
+                    // never match any row, and would also let a hand-
+                    // crafted DELETE against an empty-username row
+                    // succeed via "" == "" — see governance Gate 4 UP-1.
+                    spdlog::error("/fragments/settings/users: session has empty username; "
+                                  "refusing to render (likely upstream auth misconfiguration)");
+                    res.status = 500;
+                    return;
+                }
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/tokens",
+    sink.Get("/fragments/settings/tokens",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/pending",
+    sink.Get("/fragments/settings/pending",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/auto-approve",
+    sink.Get("/fragments/settings/auto-approve",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/api-tokens",
+    sink.Get("/fragments/settings/api-tokens",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ApiToken", "Read"))
                     return;
@@ -1802,77 +2073,358 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                                 "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/management-groups",
+    sink.Get("/fragments/settings/management-groups",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "ManagementGroup", "Read"))
                     return;
                 res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/tag-compliance",
+    sink.Get("/fragments/settings/tag-compliance",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "Tag", "Read"))
                     return;
                 res.set_content(render_tag_compliance_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/updates",
+    sink.Get("/fragments/settings/updates",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/gateway",
+    sink.Get("/fragments/settings/gateway",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_gateway_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/server-config",
+    sink.Get("/fragments/settings/server-config",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_server_config_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/https",
+    sink.Get("/fragments/settings/https",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_https_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/analytics",
+    sink.Get("/fragments/settings/analytics",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/data-retention",
+    sink.Get("/fragments/settings/data-retention",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_data_retention_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/mcp",
+    sink.Get("/fragments/settings/mcp",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_mcp_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/nvd",
+    sink.Get("/fragments/settings/plugin-signing",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!admin_fn_(req, res))
+                    return;
+                res.set_content(render_plugin_signing_fragment(),
+                                "text/html; charset=utf-8");
+            });
+
+    // -- Plugin Code Signing: upload PEM trust bundle (admin) -----------------
+    sink.Post("/api/settings/plugin-signing/upload",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+
+                  std::string content;
+                  if (SETTINGS_REQ_HAS_FILE(req, "file")) {
+                      content = SETTINGS_REQ_GET_FILE(req, "file").content;
+                  }
+                  if (content.empty()) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Upload a PEM file.</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  if (content.size() > 256 * 1024) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">PEM bundle too large (max 256 KB).</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+
+                  auto stats = validate_trust_bundle_pem(content);
+                  if (!stats) {
+                      res.status = 400;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Rejected: " +
+                              html_escape(stats.error()) + "</span>",
+                          "text/html; charset=utf-8");
+                      // result="failure" — PEM validation rejected the operator's input.
+                      // Vocabulary: success/failure/denied per audit_store.hpp:28.
+                      // ("rejected" was a novel token that silently undercounts
+                      // the Prometheus events_other_ bucket — fixed in
+                      // governance hardening round 1, arch-B1 / CONS-B2 / CC7.2.)
+                      audit_fn_(req, "plugin_signing.bundle.uploaded", "failure",
+                                "PluginTrustBundle", "trust-bundle", stats.error());
+                      return;
+                  }
+
+                  auto cert_dir = auth::default_cert_dir();
+                  std::error_code ec;
+                  std::filesystem::create_directories(cert_dir, ec);
+                  if (ec) {
+                      res.status = 500;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Cannot create cert directory.</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  // Atomic write: stage in a sibling temp file, then rename
+                  // over the destination. Same-directory rename is
+                  // POSIX-atomic and Windows-replace-atomic via MoveFileExW.
+                  // Prevents the torn-read window where a concurrent
+                  // /api/v1/agent/plugin-policy fetch reads a 0-byte or
+                  // partial PEM mid-write (sec-MED-1 / UP-1 / UP-2 / UP-16
+                  // / hp-S1).
+                  auto out_path = trust_bundle_path();
+                  auto tmp_path = out_path;
+                  tmp_path += ".tmp";
+                  {
+                      std::ofstream f(tmp_path,
+                                      std::ios::binary | std::ios::trunc);
+                      if (!f.is_open()) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget", "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Cannot write trust bundle file.</span>",
+                              "text/html; charset=utf-8");
+                          return;
+                      }
+                      f.write(content.data(),
+                              static_cast<std::streamsize>(content.size()));
+                      f.flush();
+                      // Surface short-write / disk-full / EIO before we
+                      // attempt the atomic rename. Without this, a partial
+                      // tmp file would be renamed into place and the
+                      // operator would see "uploaded" while agents see
+                      // a corrupt bundle (hp-S1 / UP-16).
+                      if (!f.good()) {
+                          std::error_code rmec;
+                          std::filesystem::remove(tmp_path, rmec);
+                          res.status = 500;
+                          res.set_header("HX-Retarget", "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Trust bundle write failed (disk full?).</span>",
+                              "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
+                  std::error_code rnec;
+                  std::filesystem::rename(tmp_path, out_path, rnec);
+                  if (rnec) {
+                      std::error_code rmec;
+                      std::filesystem::remove(tmp_path, rmec);
+                      res.status = 500;
+                      res.set_header("HX-Retarget", "#plugin-signing-section");
+                      res.set_content(
+                          "<span class=\"feedback-error\">Atomic rename of trust bundle failed: " +
+                              html_escape(rnec.message()) + "</span>",
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  // Trust bundles are public-readable (only contains
+                  // X.509 certs, no private keys).
+
+                  spdlog::info("Plugin trust bundle uploaded: {} ({} certs, sha256 {})",
+                               out_path.string(), stats->cert_count, stats->sha256_hex);
+                  audit_fn_(req, "plugin_signing.bundle.uploaded", "success",
+                            "PluginTrustBundle", "trust-bundle",
+                            std::to_string(stats->cert_count) + " cert(s), sha256=" +
+                                stats->sha256_hex);
+
+                  res.set_header("HX-Trigger",
+                      R"({"showToast":{"message":"Trust bundle uploaded","level":"success"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: clear trust bundle (admin) ----------------------
+    sink.Post("/api/settings/plugin-signing/clear",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+
+                  // Two-phase commit: clear the DB flag FIRST, then remove
+                  // the file. If the flag write fails we surface a 500 and
+                  // never touch the file — agents continue to verify
+                  // against the existing bundle and the operator sees an
+                  // explicit error rather than a silent "file gone but
+                  // require still on" state (UP-4).
+                  if (runtime_config_store_) {
+                      auto rc = runtime_config_store_->set(
+                          plugin_signing::kPluginSigningRequiredKey, "false", "system");
+                      if (!rc) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget",
+                                         "#plugin-signing-section");
+                          res.set_content(
+                              "<span class=\"feedback-error\">Cannot clear "
+                              "require flag: " + html_escape(rc.error()) +
+                                  ". Trust bundle was not removed.</span>",
+                              "text/html; charset=utf-8");
+                          audit_fn_(req, "plugin_signing.bundle.cleared",
+                                    "failure", "PluginTrustBundle",
+                                    "trust-bundle",
+                                    "require-flag write failed: " + rc.error());
+                          return;
+                      }
+                  }
+                  auto path = trust_bundle_path();
+                  std::error_code ec;
+                  bool removed = std::filesystem::remove(path, ec);
+
+                  spdlog::info(
+                      "Plugin trust bundle cleared (file {}, require flag reset)",
+                      removed ? "removed" : "absent");
+                  audit_fn_(req, "plugin_signing.bundle.cleared", "success",
+                            "PluginTrustBundle", "trust-bundle",
+                            removed ? "file removed" : "no file present");
+
+                  res.set_header("HX-Trigger",
+                      R"({"showToast":{"message":"Trust bundle cleared","level":"info"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: toggle require flag (admin) ---------------------
+    sink.Post("/api/settings/plugin-signing/require",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  if (!admin_fn_(req, res))
+                      return;
+                  // HTML checkbox semantics: present-and-"true" = required;
+                  // absent = not required. Reuse the form parser the rest
+                  // of settings uses.
+                  const std::string val =
+                      extract_form_value(req.body, "required");
+                  const std::string new_val =
+                      (val == "true" || val == "on") ? "true" : "false";
+                  if (runtime_config_store_) {
+                      auto rc = runtime_config_store_->set(
+                          plugin_signing::kPluginSigningRequiredKey, new_val, "ui");
+                      if (!rc) {
+                          res.status = 500;
+                          res.set_header("HX-Retarget",
+                                         "#plugin-signing-section");
+                          res.set_content("<span class=\"feedback-error\">" +
+                                              html_escape(rc.error()) +
+                                              "</span>",
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
+                  }
+                  audit_fn_(req, "plugin_signing.require.changed", "success",
+                            "RuntimeConfig", plugin_signing::kPluginSigningRequiredKey, new_val);
+                  res.set_header(
+                      "HX-Trigger",
+                      R"({"showToast":{"message":"Require flag updated","level":"success"}})");
+                  res.set_content(render_plugin_signing_fragment(),
+                                  "text/html; charset=utf-8");
+              });
+
+    // -- Plugin Code Signing: distribution endpoint --------------------------
+    //
+    // Returns the current trust bundle and require flag as JSON for
+    // out-of-band distribution to agents (operators curl this into
+    // /etc/yuzu/plugin-trust-bundle.pem on each agent host, then pass
+    // --plugin-trust-bundle to the agent). Future automatic agent-side
+    // fetch will use the same shape.
+    //
+    // Authorization: admin only. The bundle PEM holds X.509 certificates
+    // (no private keys) so the security blast radius of disclosure is
+    // small, but a non-admin token holder learning when the trust anchor
+    // rotates (sha256 changes) is useful reconnaissance for a
+    // supply-chain attacker. CC6.1 least-privilege requires we restrict
+    // even read access to security-critical config to admin principals
+    // (governance hardening round 1: sec-LOW-4 / UP-13 / CC6.1).
+    sink.Get("/api/v1/agent/plugin-policy",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!admin_fn_(req, res)) return;
+
+                 auto disk = read_on_disk_bundle();
+                 const bool required =
+                     runtime_config_store_ &&
+                     runtime_config_store_->get_value(
+                         plugin_signing::kPluginSigningRequiredKey) == "true";
+
+                 // Bundle absent → 200 success-shape with enabled=false.
+                 // Status code 404 was misleading: "no bundle uploaded" is
+                 // a normal operational state, not a fetch failure
+                 // (CONS-B1 part 2).
+                 if (!disk) {
+                     nlohmann::json out;
+                     out["enabled"] = false;
+                     out["required"] = required;
+                     out["trust_bundle_pem"] = "";
+                     res.set_content(out.dump(), "application/json");
+                     return;
+                 }
+                 if (!disk->has_value()) {
+                     // Structured envelope (A4 / CONS-B1) — same shape as
+                     // every other /api/v1/* error site (auth_routes,
+                     // rest_api_v1, etc.).
+                     res.status = 500;
+                     nlohmann::json err = {
+                         {"error",
+                          {{"code", 500},
+                           {"message", "Trust bundle on disk is unreadable"}}},
+                         {"meta", {{"api_version", "v1"}}}};
+                     res.set_content(err.dump(), "application/json");
+                     return;
+                 }
+
+                 // Re-read the file so the response carries the actual
+                 // bytes, not a regenerated copy.
+                 std::ifstream f(trust_bundle_path(), std::ios::binary);
+                 std::string pem((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+                 nlohmann::json out;
+                 out["enabled"] = true;
+                 out["required"] = required;
+                 out["trust_bundle_pem"] = pem;
+                 out["cert_count"] = disk->value().cert_count;
+                 out["sha256"] = disk->value().sha256_hex;
+                 res.set_content(out.dump(), "application/json");
+             });
+
+    sink.Get("/fragments/settings/nvd",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
                 res.set_content(render_nvd_fragment(), "text/html; charset=utf-8");
             });
 
-    svr.Get("/fragments/settings/directory",
+    sink.Get("/fragments/settings/directory",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!admin_fn_(req, res))
                     return;
@@ -1880,7 +2432,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Settings API: TLS toggle (HTMX POST) ---------------------------------
-    svr.Post("/api/settings/tls",
+    sink.Post("/api/settings/tls",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -1895,7 +2447,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
              });
 
     // -- Settings API: Certificate upload (admin only, multipart) --------------
-    svr.Post("/api/settings/cert-upload", [this](const httplib::Request& req,
+    sink.Post("/api/settings/cert-upload", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -1981,7 +2533,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: Paste PEM content (admin only, HTMX) --------------------
-    svr.Post("/api/settings/cert-paste", [this](const httplib::Request& req,
+    sink.Post("/api/settings/cert-paste", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2082,7 +2634,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: OIDC configuration (admin only, HTMX) -------------------
-    svr.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/oidc", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
 
@@ -2176,7 +2728,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: OIDC test connection (admin only, HTMX) -----------------
-    svr.Post("/api/settings/oidc/test", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/oidc/test", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
 
@@ -2272,16 +2824,35 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------
-    svr.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/settings/users", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            // Match DELETE defensive branch — see GET handler comment.
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            spdlog::error("POST /api/settings/users: session has empty username; "
+                          "refusing to upsert (likely upstream auth misconfiguration)");
+            res.status = 500;
+            return;
+        }
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
-        auto role_str = extract_form_value(req.body, "role");
+
+        // C1 FIX: Role parameter is IGNORED on user creation.
+        // New users are ALWAYS created as 'user' role. To change a user's
+        // role, use the dedicated POST /api/settings/users/:username/role
+        // endpoint (enhanced audit logging, session invalidation).
+        // This prevents privilege escalation where a compromised admin
+        // silently creates additional admin accounts.
+        auth::Role role = auth::Role::user;
 
         if (username.empty() || password.empty()) {
             res.status = 400;
-            res.set_content(render_users_fragment() +
+            res.set_content(render_users_fragment(session->username) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
                                 "document.getElementById('user-feedback').textContent='"
@@ -2290,35 +2861,304 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             return;
         }
 
-        auto role = auth::string_to_role(role_str);
-        auth_mgr_->upsert_user(username, password, role);
-        if (!auth_mgr_->save_config()) {
-            spdlog::error("Failed to save config after user upsert");
+        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':')
+        if (!is_valid_username(username)) {
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username: must be 1-64 chars, alphanumeric + ._- only","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
         }
-        spdlog::info("User '{}' added/updated (role={})", username, role_str);
+
+        // #399: reject duplicate username on the create path.
+        if (auth_mgr_->get_user_role(username).has_value()) {
+            spdlog::warn("POST /api/settings/users: username '{}' already exists — rejected", username);
+            audit_fn_(req, "user.create", "denied", "User", username, "duplicate_username");
+            res.status = 409;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Username already exists","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // C1 FIX: Self-password-change is allowed, but role is always 'user' on creation.
+        // Role changes must go through POST /api/settings/users/:username/role.
+        // The self-demotion guard is no longer needed on this path since
+        // new users are always created as 'user' role.
+        if (!auth_mgr_->upsert_user(username, password, role)) {
+            spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
+                         "(weak_password — minimum 12 characters)",
+                         username);
+            audit_fn_(req, "user.create", "denied", "User", username, "weak_password");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Password must be at least 12 characters","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        if (!auth_mgr_->save_config()) {
+            spdlog::error("Failed to save config after user create");
+        }
+        std::string role_str = auth::role_to_string(role);
+        spdlog::info("User '{}' created (role={})", username, role_str);
+        // SOC 2 CC7.2: privileged user lifecycle operations must appear
+        // in audit_store, not just spdlog (governance Gate 6 CO-1).
+        audit_fn_(req, "user.create", "success", "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
             R"({"showToast":{"message":"User created","level":"success"}})");
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
+    sink.Delete(R"(/api/settings/users/(.+))", [this](const httplib::Request& req,
                                                        httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            // admin_fn_ already authenticated the caller; this branch is
+            // defensive — if the two callbacks disagree there is a deeper
+            // bug and we refuse to proceed rather than delete on a stale
+            // or unresolvable session.
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            // Defense-in-depth: an empty session->username would let
+            // a hand-crafted DELETE against an empty-username row
+            // succeed via the "" == "" comparison below. The root
+            // cause of empty session->username is upstream (typically
+            // OIDC mis-config returning empty preferred_username), but
+            // the handler fails closed regardless. Governance Gate 4 UP-1.
+            spdlog::error("DELETE /api/settings/users: session has empty username; "
+                          "refusing to delete (likely upstream auth misconfiguration)");
+            res.status = 500;
+            return;
+        }
         auto username = req.matches[1].str();
+        // Username allowlist before any state mutation. Without this a
+        // hand-crafted DELETE against `..%2Ffoo` or characters that
+        // bypass URL canonicalisation reaches remove_user() with bytes
+        // that should never have entered the user-store path.
+        if (!is_valid_username(username)) {
+            audit_fn_(req, "user.delete", "denied", "User", username, "invalid_username");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username format","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Self-deletion lockout guard (#397). Deleting the currently
+        // authenticated operator — typically the sole admin on a single-
+        // seat deployment — leaves the running server with zero usable
+        // credentials until it is restarted against its on-disk config.
+        // The UI suppresses the Remove button for the self row (#403),
+        // but the handler must reject independently because a hand-
+        // crafted HTTP DELETE bypasses the dashboard entirely.
+        if (username == session->username) {
+            spdlog::warn("User '{}' attempted to delete their own account via "
+                         "/api/settings/users — rejected",
+                         session->username);
+            // SOC 2 CC7.2: rejected privileged operations must appear
+            // in audit_store, not just spdlog (governance Gate 6 CO-1).
+            // SIEM ingestion paths read audit events; spdlog rotation
+            // alone is not the evidence chain.
+            audit_fn_(req, "user.delete", "denied", "User", username, "self_delete_blocked");
+            res.status = 403;
+            // Toast wording must stay in sync with docs/user-manual/server-admin.md
+            // and the CHANGELOG Fixed entry — operators search both.
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot delete your own account","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
+            audit_fn_(req, "user.delete", "success", "User", username, "");
             res.set_header("HX-Trigger",
                 R"({"showToast":{"message":"User deleted","level":"success"}})");
+        } else {
+            // remove_user() returns false when the username is not in the
+            // user store. A no-op DELETE is still a privileged-mutation
+            // attempt and must surface in the audit chain.
+            audit_fn_(req, "user.delete", "denied", "User", username, "user_not_found");
+            res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"User not found","level":"error"}})");
         }
-        res.set_content(render_users_fragment(), "text/html; charset=utf-8");
+        res.set_content(render_users_fragment(session->username),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- Settings API: Role change (admin only, C1 fix) -------------------------
+    // Dedicated endpoint for changing user roles. Separated from user creation
+    // to enforce enhanced audit logging and session invalidation.
+    sink.Post(R"(/api/settings/users/(.+)/role)", [this](const httplib::Request& req,
+                                                           httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.status = 401;
+            return;
+        }
+        if (session->username.empty()) {
+            spdlog::error("POST /api/settings/users/:username/role: session has empty username");
+            res.status = 500;
+            return;
+        }
+        auto target_username = req.matches[1].str();
+
+        // H1 FIX: Validate username in path parameter
+        if (!is_valid_username(target_username)) {
+            // SOC 2 CC7.2: every denied branch on a privileged-mutation
+            // endpoint emits an audit event so the SIEM evidence chain is
+            // complete (governance PR4 audit-coverage).
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_username");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid username format","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Self-demotion guard — can't change your own role
+        if (target_username == session->username) {
+            spdlog::warn("User '{}' attempted to change their own role via "
+                         "/api/settings/users/:username/role — rejected",
+                         session->username);
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "self_role_change_blocked");
+            res.status = 403;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Cannot change your own role","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Parse requested role from JSON body
+        std::string requested_role;
+        try {
+            auto json = nlohmann::json::parse(req.body);
+            if (!json.contains("role") || !json["role"].is_string()) {
+                audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                          "missing_role");
+                res.status = 400;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Missing or invalid 'role' field","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            requested_role = json["role"].get<std::string>();
+        } catch (const std::exception& e) {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_json");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid JSON body","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Allowlist check — only 'admin' or 'user' allowed
+        auth::Role new_role;
+        if (requested_role == "admin") {
+            new_role = auth::Role::admin;
+        } else if (requested_role == "user") {
+            new_role = auth::Role::user;
+        } else {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "invalid_role");
+            res.status = 400;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Invalid role: must be 'admin' or 'user'","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Get current role for audit logging
+        auto current_entry_opt = auth_mgr_->get_user_role(target_username);
+        if (!current_entry_opt) {
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "user_not_found");
+            res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"User not found","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auth::Role old_role = *current_entry_opt;
+
+        // No-op if role unchanged
+        if (old_role == new_role) {
+            // No state change, but audit the operator's intent — distinguishes
+            // "tried to set already-current role" from "no request was made"
+            // for compliance review.
+            audit_fn_(req, "user.role_change", "no_op", "User", target_username,
+                      "same_role=" + auth::role_to_string(new_role));
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Role unchanged","level":"info"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Perform role change (AuthManager.update_role() handles DB + session invalidation)
+        if (!auth_mgr_->update_role(target_username, new_role)) {
+            spdlog::error("Failed to update role for '{}'", target_username);
+            audit_fn_(req, "user.role_change", "denied", "User", target_username,
+                      "db_failure");
+            res.status = 500;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Failed to update role","level":"error"}})");
+            res.set_content(render_users_fragment(session->username),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // Enhanced audit logging (C1 requirement)
+        std::string old_role_str = auth::role_to_string(old_role);
+        std::string new_role_str = auth::role_to_string(new_role);
+        spdlog::info("User role changed: {} {} -> {} by {}",
+                    target_username, old_role_str, new_role_str, session->username);
+        audit_fn_(req, "user.role_change", "success", "User", target_username,
+                  "old_role=" + old_role_str + ",new_role=" + new_role_str);
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"Role updated","level":"success"}})");
+        res.set_content(render_users_fragment(session->username),
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: Enrollment tokens (admin only, HTMX) --------------------
-    svr.Post("/api/settings/enrollment-tokens", [this](const httplib::Request& req,
+    sink.Post("/api/settings/enrollment-tokens", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2349,7 +3189,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_tokens_fragment(raw_token), "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/enrollment-tokens/(.+))",
+    sink.Delete(R"(/api/settings/enrollment-tokens/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2361,7 +3201,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                });
 
     // -- Batch enrollment token generation (JSON API for scripting) -------------
-    svr.Post("/api/settings/enrollment-tokens/batch", [this](const httplib::Request& req,
+    sink.Post("/api/settings/enrollment-tokens/batch", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2402,7 +3242,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     });
 
     // -- Settings API: API tokens (admin only, HTMX) ---------------------------
-    svr.Post("/api/settings/api-tokens", [this](const httplib::Request& req,
+    sink.Post("/api/settings/api-tokens", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Write"))
             return;
@@ -2474,7 +3314,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                         "text/html; charset=utf-8");
     });
 
-    svr.Delete(R"(/api/settings/api-tokens/(.+))",
+    sink.Delete(R"(/api/settings/api-tokens/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!perm_fn_(req, res, "ApiToken", "Delete"))
                        return;
@@ -2553,7 +3393,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
     // -- Settings API: Pending agents (admin only, HTMX) -----------------------
 
     // Bulk approve/deny — registered BEFORE the (.+) catch-all patterns
-    svr.Post("/api/settings/pending-agents/bulk-approve",
+    sink.Post("/api/settings/pending-agents/bulk-approve",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2571,7 +3411,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post("/api/settings/pending-agents/bulk-deny",
+    sink.Post("/api/settings/pending-agents/bulk-deny",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2589,7 +3429,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post(R"(/api/settings/pending-agents/(.+)/approve)",
+    sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2600,7 +3440,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Post(R"(/api/settings/pending-agents/(.+)/deny)",
+    sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2611,7 +3451,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(R"(/api/settings/pending-agents/(.+))",
+    sink.Delete(R"(/api/settings/pending-agents/(.+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2622,7 +3462,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Auto-approve rules (HTMX) ------------------------------
 
-    svr.Post("/api/settings/auto-approve", [this](const httplib::Request& req,
+    sink.Post("/api/settings/auto-approve", [this](const httplib::Request& req,
                                                     httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2645,7 +3485,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Post("/api/settings/auto-approve/mode", [this](const httplib::Request& req,
+    sink.Post("/api/settings/auto-approve/mode", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2656,7 +3496,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
+    sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2668,7 +3508,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(R"(/api/settings/auto-approve/(\d+))",
+    sink.Delete(R"(/api/settings/auto-approve/(\d+))",
                [this](const httplib::Request& req, httplib::Response& res) {
                    if (!admin_fn_(req, res))
                        return;
@@ -2680,7 +3520,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Management Groups (HTMX) --------------------------------
 
-    svr.Post("/api/settings/management-groups",
+    sink.Post("/api/settings/management-groups",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "ManagementGroup", "Write"))
                      return;
@@ -2720,7 +3560,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
                  res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
              });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/settings/management-groups/([a-f0-9]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "ManagementGroup", "Delete"))
@@ -2747,7 +3587,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         });
 
     // -- Settings API: MCP toggle (HTMX POST) ---------------------------------
-    svr.Post("/api/settings/mcp",
+    sink.Post("/api/settings/mcp",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
@@ -2768,7 +3608,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
 
     // -- Settings API: Update package management (admin only) -------------------
 
-    svr.Post("/api/settings/updates/upload", [this](const httplib::Request& req,
+    sink.Post("/api/settings/updates/upload", [this](const httplib::Request& req,
                                                      httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
@@ -2859,7 +3699,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!admin_fn_(req, res))
@@ -2888,7 +3728,7 @@ void SettingsRoutes::register_routes(httplib::Server& svr,
             res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
         });
 
-    svr.Post(
+    sink.Post(
         R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!admin_fn_(req, res))

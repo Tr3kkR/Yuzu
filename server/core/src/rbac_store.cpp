@@ -143,7 +143,8 @@ void RbacStore::seed_defaults() {
                            "DeviceToken",
                            "SoftwareDeployment",
                            "License",
-                           "FileRetrieval"};
+                           "FileRetrieval",
+                           "GuaranteedState"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -154,8 +155,16 @@ void RbacStore::seed_defaults() {
         sqlite3_finalize(s);
     }
 
-    // Operations
-    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
+    // Operations. "Push" is Guardian-specific — distributes a rule set to
+    // scoped agents (design doc §9.2). It is a first-class operation in
+    // the catalogue (every role can be granted Push explicitly) but the
+    // Administrator and ITServiceOwner cross-type seed loops below use
+    // `crud_ops` (no Push) so future handlers that accidentally check
+    // `perm_fn(..., "Push")` on a non-Guardian securable do not silently
+    // succeed against a seeded allow. Only the Guardian REST handlers
+    // consult Push; grant it explicitly per role and per type.
+    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push"};
+    const char* crud_ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
     for (auto* o : ops) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO operations (id, is_system) VALUES (?, 1);",
@@ -195,9 +204,13 @@ void RbacStore::seed_defaults() {
         sqlite3_finalize(s);
     }
 
-    // Administrator: allow everything
+    // Administrator: CRUD on everything + Push on GuaranteedState only.
+    // Seeding Push cross-type would be a latent privilege grant that any
+    // future handler reading `perm_fn(..., "Push")` on a non-Guardian
+    // securable would silently accept, so Push lives as a targeted grant
+    // outside the main loop.
     for (auto* t : types) {
-        for (auto* o : ops) {
+        for (auto* o : crud_ops) {
             sqlite3_stmt* s = nullptr;
             sqlite3_prepare_v2(
                 db_,
@@ -209,6 +222,10 @@ void RbacStore::seed_defaults() {
             sqlite3_finalize(s);
         }
     }
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'GuaranteedState', 'Push', 'allow');",
+        nullptr, nullptr, nullptr);
 
     // PlatformEngineer: full CRUD on definitions, sets, and read on related types
     const char* pe_full_types[] = {"InstructionDefinition", "InstructionSet"};
@@ -337,6 +354,35 @@ void RbacStore::seed_defaults() {
         "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'FileRetrieval', 'Write', 'allow');",
         nullptr, nullptr, nullptr);
 
+    // Operator: read + push on GuaranteedState — they can distribute an
+    // existing rule set but cannot author or delete rules. Authoring is
+    // privileged and lives with PlatformEngineer / Administrator.
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'GuaranteedState', 'Read', 'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'GuaranteedState', 'Push', 'allow');",
+        nullptr, nullptr, nullptr);
+
+    // PlatformEngineer: full CRUD + Push on GuaranteedState. Mirrors the
+    // pattern they have for InstructionDefinition — they author the rules
+    // and need to push the set to fleet for testing.
+    {
+        const char* gs_ops[] = {"Read", "Write", "Delete", "Push"};
+        for (auto* o : gs_ops) {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(db_,
+                               "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', "
+                               "'GuaranteedState', ?, 'allow');",
+                               -1, &s, nullptr);
+            sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+
     // ApiTokenManager: read + write + delete on ApiToken
     const char* atm_ops[] = {"Read", "Write", "Delete"};
     for (auto* o : atm_ops) {
@@ -367,9 +413,12 @@ void RbacStore::seed_defaults() {
                                 "DeviceToken",
                                 "SoftwareDeployment",
                                 "License",
-                                "FileRetrieval"};
+                                "FileRetrieval",
+                                "GuaranteedState"};
+    // Same Push-restriction rationale as Administrator above: CRUD cross-type,
+    // Push only on GuaranteedState where it is actually consulted.
     for (auto* t : itso_types) {
-        for (auto* o : ops) {
+        for (auto* o : crud_ops) {
             sqlite3_stmt* s = nullptr;
             sqlite3_prepare_v2(
                 db_,
@@ -381,6 +430,10 @@ void RbacStore::seed_defaults() {
             sqlite3_finalize(s);
         }
     }
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('ITServiceOwner', 'GuaranteedState', 'Push', 'allow');",
+        nullptr, nullptr, nullptr);
 
     // Viewer: read on all except Infrastructure
     const char* viewer_types[] = {"UserManagement",
@@ -399,7 +452,8 @@ void RbacStore::seed_defaults() {
                                   "DeviceToken",
                                   "SoftwareDeployment",
                                   "License",
-                                  "FileRetrieval"};
+                                  "FileRetrieval",
+                                  "GuaranteedState"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

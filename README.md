@@ -1,5 +1,10 @@
 # Yuzu
 
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Tr3kkR/Yuzu/badge)](https://scorecard.dev/viewer/?uri=github.com/Tr3kkR/Yuzu)
+<!-- OpenSSF Best Practices Badge: application in progress (issue #407). Once approved, replace <ID> with the project id from bestpractices.dev. -->
+<!-- [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
+[![Zizmor](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main)](https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml)
+
 **Enterprise endpoint management platform.** Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.
 
 Yuzu gives operations and security teams a single control plane to query, command, patch, and enforce policy on every managed endpoint in real time. Agents are lightweight, plugin-extensible, and report structured telemetry that is natively compatible with Prometheus, Grafana, ClickHouse, and Splunk.
@@ -136,6 +141,25 @@ Yuzu/
 └── .github/workflows/        CI: Linux, Windows, macOS, ARM64 cross-compile
 ```
 
+## Install
+
+Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
+
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.10.0; v0.11.0-rc1 is the most recent pre-release.
+- **Container images** (published to GHCR on every tag):
+  - `ghcr.io/tr3kkr/yuzu-server:<version>`
+  - `ghcr.io/tr3kkr/yuzu-agent:<version>`
+  - `ghcr.io/tr3kkr/yuzu-gateway:<version>`
+- **Docker Compose** quickstart: [`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) stands up the full server + gateway + agent stack. Reference wiring for UAT is [`deploy/docker/docker-compose.reference.yml`](deploy/docker/docker-compose.reference.yml).
+
+```bash
+# Pull and run the latest stable release via compose
+curl -fsSL https://raw.githubusercontent.com/Tr3kkR/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
+YUZU_VERSION=0.10.0 docker compose up -d
+```
+
+Open `http://localhost:8080` and sign in with the credentials set during first-run provisioning.
+
 ## Building
 
 ### Prerequisites
@@ -212,8 +236,29 @@ Open `http://localhost:8080` for the web dashboard.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.
 
-See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (184 capabilities across 24 domains, 150 done — 82%).
+See [`docs/capability-map.md`](docs/capability-map.md) for the live capability inventory and progress.
+
+## Contributing
+
+Pull requests welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it covers the build, branch naming (`feature/*`, `fix/*`), the governance-gated PR workflow, C++23 coding standards, observability conventions, and the plugin SDK. Architectural and release context lives in [CLAUDE.md](CLAUDE.md).
+
+Good first issues are labelled [`good first issue`](https://github.com/Tr3kkR/Yuzu/labels/good%20first%20issue); broader backlogs are grouped by area (`enterprise-readiness`, `security`, `docs`, `compliance`).
+
+## Reporting Issues
+
+- **Bugs** — open a [bug report](https://github.com/Tr3kkR/Yuzu/issues/new?template=bug_report.md). Include version (`yuzu-server --version`), OS, and reproduction steps.
+- **Feature requests** — open a [feature request](https://github.com/Tr3kkR/Yuzu/issues/new?template=feature_request.md). Tie it to a use case so scope stays concrete.
+- **Security vulnerabilities** — do **not** file a public issue. Follow [SECURITY.md](SECURITY.md) and submit via [GitHub's private vulnerability reporting](https://github.com/Tr3kkR/Yuzu/security/advisories/new). Acknowledgement within 48 hours.
+- **Questions & discussion** — [GitHub Discussions](https://github.com/Tr3kkR/Yuzu/discussions) for usage questions; use issues for anything actionable.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Yuzu is dual-licensed:
+
+- **Community Edition** — [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later). If you modify Yuzu and operate it as a network service, §13 requires you to offer the modified source to all users of that service. See [NOTICE](NOTICE) for attribution.
+- **Enterprise Edition** — a commercial license covering premium features under [`enterprise/`](enterprise/). See [`enterprise/LICENSE-ENTERPRISE.md`](enterprise/LICENSE-ENTERPRISE.md) for terms and contact details.
+- **Plugin authors** — the stable C ABI in [`sdk/`](sdk/) is covered by a linking exception documented in [`sdk/LICENSE-SDK.md`](sdk/LICENSE-SDK.md); proprietary plugins that consume only the ABI remain permitted.
+
+Contributions require a signed [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Releases tagged before the AGPL transition (≤ v0.11.x) remain available under their original Apache-2.0 grant to everyone who received them. Only releases cut after the transition are governed by AGPL.

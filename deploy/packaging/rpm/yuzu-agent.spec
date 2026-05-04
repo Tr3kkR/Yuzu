@@ -2,7 +2,7 @@ Name:           yuzu-agent
 Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Yuzu endpoint management agent
-License:        Apache-2.0
+License:        AGPL-3.0-or-later
 URL:            https://github.com/Tr3kkR/Yuzu
 
 %description

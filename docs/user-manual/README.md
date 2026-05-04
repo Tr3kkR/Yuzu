@@ -22,12 +22,14 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Agent Plugins](agent-plugins.md) | Plugin architecture, available plugins, and plugin development |
 | [Cookbook](cookbook.md) | Practical examples for every plugin -- YAML, Python, CEL, Dashboard UI, and instruction chaining |
 | [Policy Engine](policy-engine.md) | Desired-state rules, triggers, compliance checks, and auto-remediation |
+| [Guaranteed State (Guardian)](guaranteed-state.md) | Real-time policy enforcement with agent-side guards, events, and remediation (control plane + agent skeleton shipped in v0.12; Windows enforcement lands in Guardian PR 3) |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
 | [Server Administration](server-administration.md) | Configuration, TLS, user management, first-run setup, and backup |
 | [REST API Reference](rest-api-reference.md) | Complete REST API v1 endpoint reference with request/response examples |
 | [Gateway](gateway.md) | Erlang/OTP gateway node for multi-site deployments and scale-out |
 | [TAR (Timeline Activity Record)](tar.md) | Continuous system state change tracking -- processes, network, services, users |
 | [Upgrading](upgrading.md) | Version upgrades, rollback, and migration |
+| [Release Verification](release-verification.md) | SHA256SUMS, cosign signatures, SLSA provenance, and CycloneDX / SPDX SBOMs |
 | [MCP (AI Integration)](mcp.md) | Model Context Protocol server -- AI-driven fleet querying, tools, tokens, and approval workflows |
 | [Security Hardening](security-hardening.md) | mTLS setup, firewall rules, secret management, quarantine, IOC checking, certificate inventory, and production hardening |
 

@@ -423,6 +423,15 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
                 sr.status = static_cast<int>(resp.status());
                 sr.output = resp.output();
                 sr.plugin = plugin;
+                // PR 2: stamp execution_id from the dispatch-time mapping so
+                // the executions detail drawer can correlate exactly.
+                {
+                    std::lock_guard lock(cmd_times_mu_);
+                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
+                        eit != cmd_execution_ids_.end()) {
+                        sr.execution_id = eit->second;
+                    }
+                }
                 response_store_->store(sr);
             }
 
@@ -451,6 +460,19 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
                 sr.plugin = plugin_name;
                 if (resp.has_error()) {
                     sr.error_detail = resp.error().message();
+                }
+                // PR 2: stamp execution_id from the dispatch-time mapping.
+                // Do NOT erase on terminal status — a single command_id can
+                // produce N terminal responses (one per agent in fan-out);
+                // erasing on the first agent's terminal would cause agents
+                // 2..N to stamp empty execution_id (HF-1). Map entries
+                // persist until a future sweeper (PR 2.x) lands.
+                {
+                    std::lock_guard lock(cmd_times_mu_);
+                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
+                        eit != cmd_execution_ids_.end()) {
+                        sr.execution_id = eit->second;
+                    }
                 }
                 response_store_->store(sr);
             }
@@ -556,6 +578,18 @@ void AgentServiceImpl::record_send_time(const std::string& command_id) {
     output_row_count_.store(0, std::memory_order_relaxed);
 }
 
+// -- record_execution_id (PR 2) -----------------------------------------------
+
+void AgentServiceImpl::record_execution_id(const std::string& command_id,
+                                            const std::string& execution_id) {
+    std::lock_guard lock(cmd_times_mu_);
+    if (execution_id.empty()) {
+        cmd_execution_ids_.erase(command_id);
+    } else {
+        cmd_execution_ids_[command_id] = execution_id;
+    }
+}
+
 // -- process_gateway_response -------------------------------------------------
 
 void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
@@ -599,6 +633,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.status = static_cast<int>(resp.status());
             sr.output = resp.output();
             sr.plugin = plugin;
+            // PR 2: streaming response — keep the mapping until completion.
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                if (auto eit = cmd_execution_ids_.find(resp.command_id());
+                    eit != cmd_execution_ids_.end()) {
+                    sr.execution_id = eit->second;
+                }
+            }
             response_store_->store(sr);
         }
 
@@ -625,6 +667,17 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.plugin = gw_plugin;
             if (resp.has_error()) {
                 sr.error_detail = resp.error().message();
+            }
+            // PR 2: stamp execution_id from the dispatch-time mapping.
+            // Do NOT erase on terminal status (HF-1) — multi-agent
+            // fan-out produces N terminal responses; entries persist
+            // until a future sweeper (PR 2.x) lands.
+            {
+                std::lock_guard lock(cmd_times_mu_);
+                if (auto eit = cmd_execution_ids_.find(resp.command_id());
+                    eit != cmd_execution_ids_.end()) {
+                    sr.execution_id = eit->second;
+                }
             }
             response_store_->store(sr);
         }

@@ -1,0 +1,67 @@
+Yuzu — enterprise endpoint management platform
+Copyright (C) 2024-2026 Nathan Dornbrook
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3 or
+(at your option) any later version, as published by the Free Software
+Foundation.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+License for more details — see the LICENSE file in this repository, or
+<https://www.gnu.org/licenses/agpl-3.0.html>.
+
+────────────────────────────────────────────────────────────────────────
+
+Relicensing history
+-------------------
+Prior to the release immediately following this NOTICE's introduction,
+Yuzu was distributed under the Apache License 2.0. Those prior releases
+remain licensed under Apache-2.0 in perpetuity for the recipients who
+obtained them. Starting from the first release tagged after this NOTICE
+lands in the repository, the project is licensed under AGPL-3.0-or-later.
+
+Dual licensing
+--------------
+The `enterprise/` subtree of this repository is NOT covered by the AGPL
+and is distributed under a separate commercial license — see
+`enterprise/LICENSE-ENTERPRISE.md`. Contributions accepted into Yuzu
+require a signed Contributor License Agreement (see `CLA.md`) that
+permits dual licensing.
+
+Plugin SDK
+----------
+The stable plugin C ABI under `sdk/` carries a linking exception to the
+AGPL so that proprietary plugins may be distributed separately without
+triggering copyleft. See `sdk/LICENSE-SDK.md` for the exact wording.
+
+Third-party attributions
+------------------------
+This distribution incorporates or links the following third-party
+libraries. Their individual licenses, copyrights and notices apply to
+those components and are retained within the distributed artefacts. This
+section is maintained manually; see `vcpkg.json` and
+`gateway/rebar.config` for the authoritative dependency lists.
+
+  gRPC .................................. Apache-2.0
+  Protocol Buffers ...................... BSD-3-Clause
+  Abseil ................................ Apache-2.0
+  spdlog ................................ MIT
+  nlohmann/json ......................... MIT
+  CLI11 ................................. BSD-3-Clause
+  cpp-httplib ........................... MIT
+  SQLite ................................ Public Domain
+  OpenSSL ............................... Apache-2.0 / OpenSSL
+  Catch2 (test only) .................... BSL-1.0
+  grpcbox / gpb ......................... Apache-2.0
+  telemetry / recon / gproc ............. Apache-2.0
+  prometheus / prometheus_httpd ......... MIT
+  HTMX (vendored) ....................... 0BSD
+  htmx-ext-sse (vendored) ............... 0BSD
+  Apache ECharts (vendored) ............. Apache-2.0
+  Inter typeface (vendored) ............. SIL OFL 1.1
+
+Before cutting the first AGPL-era release, run an SBOM / attribution
+aggregator (e.g. scancode-toolkit or OSS Review Toolkit) over the
+produced binaries and append any missing upstream notices here.

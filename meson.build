@@ -1,8 +1,8 @@
 project(
   'yuzu',
   'cpp',
-  version: '0.11.0',
-  license: 'Apache-2.0',
+  version: '0.12.0',
+  license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
     'cpp_std=c++23',
@@ -114,7 +114,20 @@ if host_os == 'windows'
   # so the include dir has to be a relative-to-source-root string.
   # Headers are the same across debug and release variants, so this
   # points at the shared include/ regardless of buildtype.
+  #
+  # Two forms exist on purpose:
+  #   * _vcpkg_include_win_rel — string path, used in run_command() / find_program()
+  #     contexts that take a string (none today, but kept stable for diagnostics).
+  #   * _vcpkg_inc_win         — IncludeDirs object captured once at the project
+  #     root, safe to reuse across subdirs.
+  #
+  # include_directories() resolves a relative string path against the CURRENT
+  # meson.build's source directory. Calling include_directories('vcpkg_installed/...')
+  # from tests/meson.build would look for tests/vcpkg_installed/... and fail.
+  # Capturing the IncludeDirs object here once anchors it to the project root;
+  # subdirs can then reuse the same object via the project-global variable.
   _vcpkg_include_win_rel = 'vcpkg_installed/x64-windows/include'
+  _vcpkg_inc_win = include_directories(_vcpkg_include_win_rel, is_system: true)
   if get_option('buildtype') == 'debug'
     _vcpkg_lib_win = _vcpkg_root_win / 'debug' / 'lib'
     _pbd = 'd'   # vcpkg convention: libprotobufd.lib / libprotobuf-lited.lib / libprotocd.lib / libupbd.lib
@@ -172,6 +185,16 @@ if host_os == 'windows'
   _libssl    = _cxx.find_library('libssl',    dirs: [_vcpkg_lib_win], required: true)
   _libcrypto = _cxx.find_library('libcrypto', dirs: [_vcpkg_lib_win], required: true)
 
+  # CLI11 — same build-type-conditional reasoning as protobuf/grpc above.
+  # Meson's cmake dep would pick `lib/CLI11.lib` (release) for both debug
+  # and release consumers, producing LNK2038 mismatches between debug
+  # user code (/MDd, _ITERATOR_DEBUG_LEVEL=2) and release CLI11.lib's
+  # Precompile.cpp.obj (/MD, =0). Hand-wire to the buildtype-specific
+  # _vcpkg_lib_win directory so debug picks debug/lib/CLI11.lib.
+  # CLI11's vcpkg port keeps the same name in both lib/ and debug/lib/
+  # (no `d` suffix), so no _pbd handling needed here.
+  _libcli11 = _cxx.find_library('CLI11', dirs: [_vcpkg_lib_win], required: true)
+
   # zlib — grpc.lib(message_compress.cc.obj) has unresolved references to
   # __imp_deflate / __imp_inflate / __imp_deflateInit2_ / __imp_inflateInit2_
   # etc. gRPC's message compression code path uses zlib for gzip-compressed
@@ -193,14 +216,14 @@ if host_os == 'windows'
   # method: 'cmake')` calls that Linux/macOS use — those paths are
   # unreachable on Windows.
   protobuf_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    include_directories: _vcpkg_inc_win,
     dependencies: [
       _libprotobuf, _libprotobuf_lite, _libprotoc, _libupb,
       _libutf8_range, _libutf8_validity,
     ] + _absl_deps,
   )
   grpcpp_dep = declare_dependency(
-    include_directories: include_directories(_vcpkg_include_win_rel, is_system: true),
+    include_directories: _vcpkg_inc_win,
     dependencies: [
       _libgrpcpp, _libgrpc, _libgpr, _libaddress_sorting,
       _libre2, _libcares,
@@ -210,6 +233,10 @@ if host_os == 'windows'
       # that only pull in grpcpp_dep still see protobuf's symbols.
       _libprotobuf, _libprotobuf_lite, _libupb, _libutf8_range, _libutf8_validity,
     ] + _absl_deps,
+  )
+  cli11_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: [_libcli11],
   )
 else
   # Linux/macOS: meson's cmake dep method works correctly because gcc/clang
@@ -228,12 +255,12 @@ else
     protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
       include_type: 'system')
   endif
+  cli11_dep = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
+    required: true, include_type: 'system')
 endif
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
 nlohmann_dep    = dependency('nlohmann_json', required: true, include_type: 'system')
-cli11_dep       = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
-  required: true, include_type: 'system')
 httplib_dep     = dependency('httplib', required: false, include_type: 'system')
 if not httplib_dep.found()
   httplib_dep   = dependency('cpp-httplib', required: true, include_type: 'system')
@@ -309,6 +336,15 @@ endif
 # ── Server ────────────────────────────────────────────────────────────────────
 if build_server
   subdir('server/core')
+endif
+
+# ── Enterprise (commercial license; see enterprise/LICENSE-ENTERPRISE.md) ────
+# This subtree is NOT covered by the AGPL license that governs the rest of
+# the repository. It only builds when explicitly enabled via
+# -Denable_enterprise=true, and doing so requires a commercial license.
+if get_option('enable_enterprise')
+  message('Building WITH enterprise modules — commercial license required (see enterprise/LICENSE-ENTERPRISE.md).')
+  subdir('enterprise')
 endif
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -413,10 +449,11 @@ endif
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 summary({
-  'Agent':    build_agent,
-  'Server':   build_server,
-  'Examples': build_examples,
-  'Tests':    build_tests,
+  'Agent':      build_agent,
+  'Server':     build_server,
+  'Examples':   build_examples,
+  'Tests':      build_tests,
+  'Enterprise': get_option('enable_enterprise'),
 }, section: 'Components')
 
 summary({

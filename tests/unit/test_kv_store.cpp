@@ -6,15 +6,35 @@
 
 #include <yuzu/agent/kv_store.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace yuzu::agent;
+
+// Per-uid suffix so multi-user hosts (e.g. WSL2 with both an interactive
+// user and the github-runner CI account) don't collide on /tmp ownership.
+// Without this, whichever uid wins the race owns /tmp/yuzu_test_kv 0700
+// and locks the other uid out until someone runs `sudo rm`.
+static std::string yuzu_test_uid_suffix() {
+#ifdef _WIN32
+    if (const char* u = std::getenv("USERNAME")) return std::string("_") + u;
+    return "_unknown";
+#else
+    return "_" + std::to_string(static_cast<unsigned long>(::geteuid()));
+#endif
+}
 
 // Helper: create a KvStore in a unique temp file, return it + the path for cleanup.
 struct TestKvStore {
@@ -33,10 +53,12 @@ struct TestKvStore {
 };
 
 static TestKvStore make_test_store() {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_kv" /
-               ("kv_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
-                "_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-                ".db");
+    // Previously used `std::hash<std::thread::id>{} ^ steady_clock::now()` for
+    // uniqueness — the pattern that flaked on Windows MSVC debug + Defender
+    // (#473). Delegate to the shared salt+counter helper so KV tests don't
+    // regress even though they haven't flaked in CI yet (#482).
+    const auto dir = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix());
+    const auto tmp = dir / (yuzu::test::unique_temp_path("kv_").filename().string() + ".db");
     auto result = KvStore::open(tmp);
     REQUIRE(result.has_value());
     return TestKvStore{std::move(*result), tmp};
@@ -354,7 +376,7 @@ TEST_CASE("KvStore: multiple sets then clear returns correct count", "[kv_store]
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp = fs::temp_directory_path() / "yuzu_test_kv" / "move_ctor.db";
+    auto tmp = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_ctor.db";
     auto result = KvStore::open(tmp);
     REQUIRE(result.has_value());
 
@@ -375,8 +397,8 @@ TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle
 }
 
 TEST_CASE("KvStore: move assignment transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp1 = fs::temp_directory_path() / "yuzu_test_kv" / "move_a1.db";
-    auto tmp2 = fs::temp_directory_path() / "yuzu_test_kv" / "move_a2.db";
+    auto tmp1 = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a1.db";
+    auto tmp2 = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a2.db";
 
     auto r1 = KvStore::open(tmp1);
     auto r2 = KvStore::open(tmp2);

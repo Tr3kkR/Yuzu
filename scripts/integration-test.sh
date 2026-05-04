@@ -23,6 +23,20 @@ USE_TLS=false
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure `erl` / `escript` / `rebar3` are on PATH before the gateway build
+# step runs. The helper is a no-op if Erlang is already available; otherwise
+# it probes kerl / asdf / Homebrew / MSYS2 and activates the first match.
+# The "28" arg pins the major version tracked by release.yml — keep in
+# sync with erlef/setup-beam otp-version in .github/workflows/release.yml.
+# shellcheck source=ensure-erlang.sh
+source "$SCRIPT_DIR/ensure-erlang.sh" 28
+if ! command -v erl > /dev/null 2>&1; then
+    echo "FAIL: erl not on PATH after ensure-erlang.sh (needed for rebar3/escript)" >&2
+    echo "      Install via kerl (kerl install 28.4.2), asdf, Homebrew, or the" >&2
+    echo "      MSYS2 Erlang installer, then rerun." >&2
+    exit 1
+fi
+
 # Per-OS canonical build dir (see CLAUDE.md "Per-OS build directory convention").
 if [[ -n "${YUZU_BUILDDIR:-}" ]]; then
     BUILDDIR="$YUZU_BUILDDIR"
@@ -64,6 +78,91 @@ while [[ $# -gt 0 ]]; do
         *)         echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
+
+# ── Phase 4 reuse mode ────────────────────────────────────────────────
+# When /test runs, Phase 4 (`scripts/linux-start-UAT.sh`) already stood up a
+# full server+gateway+agent stack on the canonical default ports (8080 web,
+# 50051 gateway agent, 50055 server upstream, 50063 gateway mgmt, 9568
+# gateway metrics, 8081 gateway health). Spawning a parallel stack would
+# collide on at least 9568 / 50055 / 50063 and yield {listen,eaddrinuse}
+# crashes. Detect Phase 4's presence and reuse its stack rather than fight
+# it.
+#
+# Control:
+#   YUZU_REUSE_STACK=1   force reuse (fail fast if Phase 4 not detected)
+#   YUZU_REUSE_STACK=0   force own-stack (never reuse, current default
+#                        behaviour for standalone runs)
+#   unset                auto-detect via /readyz probe on 8080
+#
+# Reuse only applies when AGENT_COUNT == 1 (Phase 4's stack has one
+# agent). --agents N > 1 implies load-test intent and falls back to
+# spinning a private stack with non-conflicting ports.
+REUSE_STACK=false
+REUSE_REASON=""
+
+detect_phase4_stack() {
+    # Probe for Yuzu's fingerprint on the canonical Phase 4 ports:
+    #   - server /readyz on :8080 returns `{"status":"ready"}`
+    #   - gateway /healthz on :8081 returns `{"status":"ok","node":"..."}`
+    # Both endpoints are HTTP 200 under healthy operation. We check the
+    # JSON payload for the Yuzu-distinctive status tokens so we don't
+    # mis-fire against some other process that happens to bind either
+    # port and return 200.
+    local server_body gateway_body
+    server_body=$(curl -sf --max-time 1 "http://127.0.0.1:8080/readyz" 2>/dev/null) || return 1
+    echo "$server_body" | grep -qE '"status":"(ready|draining)"' || return 1
+    gateway_body=$(curl -sf --max-time 1 "http://127.0.0.1:8081/healthz" 2>/dev/null) || return 1
+    echo "$gateway_body" | grep -q '"node":"yuzu_gw' || return 1
+    return 0
+}
+
+case "${YUZU_REUSE_STACK:-auto}" in
+    1|true|yes)
+        if [[ "$AGENT_COUNT" -gt 1 ]]; then
+            echo "integration-test: YUZU_REUSE_STACK=1 set but --agents=$AGENT_COUNT > 1; reuse only" >&2
+            echo "  supports AGENT_COUNT=1 (Phase 4's stack has one agent). Aborting." >&2
+            exit 1
+        fi
+        if ! detect_phase4_stack; then
+            echo "integration-test: YUZU_REUSE_STACK=1 set but no Phase 4 stack detected on" >&2
+            echo "  127.0.0.1:8080 (/readyz) + :8081 (/healthz). Start the stack first with" >&2
+            echo "  'bash scripts/linux-start-UAT.sh' or unset YUZU_REUSE_STACK." >&2
+            exit 1
+        fi
+        REUSE_STACK=true
+        REUSE_REASON="explicit YUZU_REUSE_STACK=1"
+        ;;
+    0|false|no)
+        REUSE_STACK=false
+        REUSE_REASON="explicit YUZU_REUSE_STACK=0"
+        ;;
+    auto|*)
+        if [[ "$AGENT_COUNT" -eq 1 ]] && detect_phase4_stack; then
+            REUSE_STACK=true
+            REUSE_REASON="auto-detected Phase 4 stack on default ports"
+        else
+            REUSE_STACK=false
+            if [[ "$AGENT_COUNT" -gt 1 ]]; then
+                REUSE_REASON="AGENT_COUNT=$AGENT_COUNT > 1 (load test — private stack)"
+            else
+                REUSE_REASON="no Phase 4 stack detected on :8080/:8081"
+            fi
+        fi
+        ;;
+esac
+
+if $REUSE_STACK; then
+    # Override every port to match linux-start-UAT.sh's actual defaults.
+    # Any explicit PORT env vars the caller passed are respected; we only
+    # set values that are at their script-level default.
+    SERVER_AGENT_PORT="${SERVER_AGENT_PORT_OVERRIDE:-50054}"
+    SERVER_MGMT_PORT="${SERVER_MGMT_PORT_OVERRIDE:-50052}"
+    SERVER_GW_PORT="${SERVER_GW_PORT_OVERRIDE:-50055}"
+    SERVER_WEB_PORT="${SERVER_WEB_PORT_OVERRIDE:-8080}"
+    GW_AGENT_PORT="${GW_AGENT_PORT_OVERRIDE:-50051}"
+    GW_MGMT_PORT="${GW_MGMT_PORT_OVERRIDE:-50063}"
+    GW_METRICS_PORT="${GW_METRICS_PORT_OVERRIDE:-9568}"
+fi
 
 # ── Preflight checks ─────────────────────────────────────────────────
 check_binary() {
@@ -131,6 +230,9 @@ wait_for_port() {
             return 1
         fi
     done
+    # SRE-2 — surface cold-start duration. elapsed counts 0.5s ticks.
+    local seconds=$((elapsed / 2))
+    echo "  ✓ $name on :$port in ${seconds}s"
     return 0
 }
 
@@ -151,26 +253,30 @@ wait_for_http() {
 # ── Cleanup on exit ──────────────────────────────────────────────────
 cleanup() {
     log "Tearing down..."
-    # Stop agents
-    for pid in "${AGENT_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    # Stop gateway
-    if [[ -n "$GATEWAY_PID" ]]; then
-        kill "$GATEWAY_PID" 2>/dev/null || true
+    if $REUSE_STACK; then
+        log "  Reuse mode — leaving Phase 4 server/gateway/agent processes running."
+    else
+        # Stop agents
+        for pid in "${AGENT_PIDS[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+        # Stop gateway
+        if [[ -n "$GATEWAY_PID" ]]; then
+            kill "$GATEWAY_PID" 2>/dev/null || true
+        fi
+        # Stop server
+        if [[ -n "$SERVER_PID" ]]; then
+            kill "$SERVER_PID" 2>/dev/null || true
+        fi
+        # Wait for all to exit
+        sleep 1
+        # Force-kill stragglers
+        for pid in "${AGENT_PIDS[@]}"; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        [[ -n "$GATEWAY_PID" ]] && kill -9 "$GATEWAY_PID" 2>/dev/null || true
+        [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
     fi
-    # Stop server
-    if [[ -n "$SERVER_PID" ]]; then
-        kill "$SERVER_PID" 2>/dev/null || true
-    fi
-    # Wait for all to exit
-    sleep 1
-    # Force-kill stragglers
-    for pid in "${AGENT_PIDS[@]}"; do
-        kill -9 "$pid" 2>/dev/null || true
-    done
-    [[ -n "$GATEWAY_PID" ]] && kill -9 "$GATEWAY_PID" 2>/dev/null || true
-    [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
     # Clean temp dir (preserve when YUZU_KEEP_WORK_DIR is set, for debugging)
     if [[ -n "$WORK_DIR" && -d "$WORK_DIR" && -z "${YUZU_KEEP_WORK_DIR:-}" ]]; then
         rm -rf "$WORK_DIR"
@@ -184,6 +290,51 @@ trap cleanup EXIT
 # ── Create temp work directory ────────────────────────────────────────
 WORK_DIR=$(mktemp -d /tmp/yuzu-integration.XXXXXX)
 log "Work directory: $WORK_DIR"
+
+if $REUSE_STACK; then
+    log "═══════════════════════════════════════════════════════════════"
+    log "Phase 4 REUSE mode: $REUSE_REASON"
+    log "  Reusing existing stack on canonical ports:"
+    log "    server web=$SERVER_WEB_PORT agent=$SERVER_AGENT_PORT mgmt=$SERVER_MGMT_PORT gw=$SERVER_GW_PORT"
+    log "    gateway agent=$GW_AGENT_PORT mgmt=$GW_MGMT_PORT metrics=$GW_METRICS_PORT"
+    log "  Skipping own-stack bring-up (server/gateway/agent already running)."
+    log "═══════════════════════════════════════════════════════════════"
+
+    # Discover Phase 4's process PIDs so the downstream stability tests
+    # (`kill -0 $SERVER_PID` / `$GATEWAY_PID` / agent PIDs) can probe them
+    # the same way they probe a script-spawned stack. These PIDs are
+    # discovered, not owned — the EXIT trap's `kill` calls are skipped
+    # in reuse mode via the REUSE_STACK guard so we never terminate
+    # processes we didn't start.
+    #
+    # Agent filter: match only Phase 4's agent by its `/tmp/yuzu-uat/`
+    # data-dir. A broader `yuzu-agent.*--server` pattern would also match
+    # strays from prior own-stack integration-test runs that failed to
+    # clean up, and would inflate the agent count in the stability
+    # assertions.
+    SERVER_PID=$(pgrep -f 'yuzu-server.*--listen' | head -1 || true)
+    # Gateway can run as either the prod release (`yuzu_gw/bin/yuzu_gw`
+    # wrapper → erts) or a dev-mode `rebar3 run` (beam.smp). The Erlang
+    # `-name yuzu_gw1@127.0.0.1` flag is the stable fingerprint across
+    # both; it's present on the cmdline either way.
+    GATEWAY_PID=$(pgrep -f '\-name yuzu_gw1@127.0.0.1' | head -1 || true)
+    AGENT_PIDS=($(pgrep -f 'yuzu-agent.*--data-dir /tmp/yuzu-uat' || true))
+    if [[ -z "$SERVER_PID" ]]; then
+        echo "FAIL: Phase 4 reuse — could not find yuzu-server pid via pgrep" >&2
+        exit 1
+    fi
+    if [[ -z "$GATEWAY_PID" ]]; then
+        echo "FAIL: Phase 4 reuse — could not find gateway beam.smp pid via pgrep" >&2
+        exit 1
+    fi
+    if [[ ${#AGENT_PIDS[@]} -eq 0 ]]; then
+        echo "FAIL: Phase 4 reuse — could not find any yuzu-agent pid via pgrep" >&2
+        exit 1
+    fi
+    log "  Discovered Phase 4 PIDs: server=$SERVER_PID gateway=$GATEWAY_PID agents=${AGENT_PIDS[*]}"
+else
+    log "Own-stack mode: $REUSE_REASON"
+fi
 
 # ── TLS certificate generation (if --tls) ────────────────────────────
 if $USE_TLS; then
@@ -221,77 +372,96 @@ else
     TLS_AGENT_FLAGS="--no-tls"
 fi
 
-# ── Generate server config via first-run setup ────────────────────────
-SERVER_DATA_DIR="$WORK_DIR/server-data"
-mkdir -p "$SERVER_DATA_DIR"
-SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
-log "Running first-run setup to generate server config..."
-printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
-    "$BUILDDIR/server/core/yuzu-server" \
-        --config "$SERVER_CFG" \
-        --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
-        --management "127.0.0.1:$SERVER_MGMT_PORT" \
-        --web-port "$SERVER_WEB_PORT" \
-        > "$WORK_DIR/setup.log" 2>&1 &
-SETUP_PID=$!
-# Wait for config to be written, then kill the server
-for i in $(seq 1 20); do
-    if [[ -s "$SERVER_CFG" ]]; then break; fi
-    sleep 0.5
-done
-sleep 1
-kill -9 "$SETUP_PID" 2>/dev/null || true
-wait "$SETUP_PID" 2>/dev/null || true
-if [[ ! -s "$SERVER_CFG" ]]; then
-    echo "FAIL: Could not generate server config"
-    cat "$WORK_DIR/setup.log"
-    exit 1
-fi
-log "  Server config created at $SERVER_CFG"
+# ── Generate server config via first-run setup (own-stack only) ───────
+if ! $REUSE_STACK; then
+    SERVER_DATA_DIR="$WORK_DIR/server-data"
+    mkdir -p "$SERVER_DATA_DIR"
+    SERVER_CFG="$SERVER_DATA_DIR/yuzu-server.cfg"
+    log "Running first-run setup to generate server config..."
+    printf 'admin\nadminpassword1\nadminpassword1\nuser\nuserpassword1\nuserpassword1\n' | \
+        "$BUILDDIR/server/core/yuzu-server" \
+            --config "$SERVER_CFG" \
+            --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
+            --management "127.0.0.1:$SERVER_MGMT_PORT" \
+            --web-port "$SERVER_WEB_PORT" \
+            > "$WORK_DIR/setup.log" 2>&1 &
+    SETUP_PID=$!
+    # Wait for config to be written, then kill the server
+    for i in $(seq 1 20); do
+        if [[ -s "$SERVER_CFG" ]]; then break; fi
+        sleep 0.5
+    done
+    sleep 1
+    kill -9 "$SETUP_PID" 2>/dev/null || true
+    wait "$SETUP_PID" 2>/dev/null || true
+    if [[ ! -s "$SERVER_CFG" ]]; then
+        echo "FAIL: Could not generate server config"
+        cat "$WORK_DIR/setup.log"
+        exit 1
+    fi
+    log "  Server config created at $SERVER_CFG"
 
-# Generate an enrollment token so test agents are auto-approved (Tier 2)
-ENROLL_TOKEN=$(
-    "$BUILDDIR/server/core/yuzu-server" \
-        --config "$SERVER_CFG" \
-        --generate-tokens 1 \
-        --token-label "integration-test" \
-        --token-max-uses "$AGENT_COUNT" \
-        --no-tls \
-        2>/dev/null \
-    | grep -o '"[0-9a-f]\{64\}"' | tr -d '"'
-)
-if [[ -z "$ENROLL_TOKEN" ]]; then
-    echo "FAIL: Could not generate enrollment token"
-    exit 1
+    # Generate an enrollment token so test agents are auto-approved (Tier 2)
+    ENROLL_TOKEN=$(
+        "$BUILDDIR/server/core/yuzu-server" \
+            --config "$SERVER_CFG" \
+            --generate-tokens 1 \
+            --token-label "integration-test" \
+            --token-max-uses "$AGENT_COUNT" \
+            --no-tls \
+            2>/dev/null \
+        | grep -o '"[0-9a-f]\{64\}"' | tr -d '"'
+    )
+    if [[ -z "$ENROLL_TOKEN" ]]; then
+        echo "FAIL: Could not generate enrollment token"
+        exit 1
+    fi
+    log "  Enrollment token generated (${ENROLL_TOKEN:0:8}...)"
 fi
-log "  Enrollment token generated (${ENROLL_TOKEN:0:8}...)"
 
 # ══════════════════════════════════════════════════════════════════════
 # PHASE 1: Start the C++ Server
 # ══════════════════════════════════════════════════════════════════════
-log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
+if ! $REUSE_STACK; then
+    log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
 
-"$BUILDDIR/server/core/yuzu-server" \
-    --config "$SERVER_CFG" \
-    --listen "127.0.0.1:$SERVER_AGENT_PORT" \
-    --management "127.0.0.1:$SERVER_MGMT_PORT" \
-    --web-port "$SERVER_WEB_PORT" \
-    --no-https \
-    --gateway-mode \
-    --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
-    $TLS_SERVER_FLAGS \
-    > "$WORK_DIR/server.log" 2>&1 &
-SERVER_PID=$!
-log "  Server PID: $SERVER_PID"
+    "$BUILDDIR/server/core/yuzu-server" \
+        --config "$SERVER_CFG" \
+        --listen "127.0.0.1:$SERVER_AGENT_PORT" \
+        --management "127.0.0.1:$SERVER_MGMT_PORT" \
+        --web-port "$SERVER_WEB_PORT" \
+        --no-https \
+        --gateway-mode \
+        --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
+        $TLS_SERVER_FLAGS \
+        > "$WORK_DIR/server.log" 2>&1 &
+    SERVER_PID=$!
+    log "  Server PID: $SERVER_PID"
 
-wait_for_port "$SERVER_WEB_PORT" "C++ server web UI" 15 || exit 1
-wait_for_port "$SERVER_AGENT_PORT" "C++ server agent gRPC" 15 || exit 1
-wait_for_port "$SERVER_GW_PORT" "C++ server gateway gRPC" 15 || exit 1
-log "  Server is ready."
+    # 30s budget — yuzu-server cold-starts walk ~20 MigrationRunners and
+    # routinely take 12+ seconds; the prior 15s headroom was too tight on
+    # WSL2 dev boxes (parity with linux-start-UAT.sh:197).
+    wait_for_port "$SERVER_WEB_PORT" "C++ server web UI" 30 || exit 1
+    wait_for_port "$SERVER_AGENT_PORT" "C++ server agent gRPC" 30 || exit 1
+    wait_for_port "$SERVER_GW_PORT" "C++ server gateway gRPC" 30 || exit 1
+    log "  Server is ready."
+else
+    log "Phase 4 reuse: verifying existing C++ server ports are responsive..."
+    wait_for_port "$SERVER_WEB_PORT" "C++ server web UI (Phase 4)" 5 || {
+        echo "FAIL: Phase 4 server not responding on :$SERVER_WEB_PORT" >&2
+        exit 1
+    }
+    wait_for_port "$SERVER_GW_PORT" "C++ server gateway gRPC (Phase 4)" 5 || {
+        echo "FAIL: Phase 4 server not responding on :$SERVER_GW_PORT" >&2
+        exit 1
+    }
+    log "  Phase 4 server confirmed on :$SERVER_WEB_PORT / :$SERVER_GW_PORT."
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # PHASE 2: Start the Erlang Gateway
 # ══════════════════════════════════════════════════════════════════════
+if ! $REUSE_STACK; then
 log "Starting Erlang gateway (agent=$GW_AGENT_PORT, mgmt=$GW_MGMT_PORT, upstream=$SERVER_AGENT_PORT)..."
 
 # Write a test sys.config pointing upstream at the server
@@ -400,47 +570,99 @@ if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
     exit 1
 fi
 log "  Gateway is running."
+else
+    log "Phase 4 reuse: verifying existing gateway ports are responsive..."
+    wait_for_port "$GW_AGENT_PORT" "Gateway agent-facing (Phase 4)" 5 || {
+        echo "FAIL: Phase 4 gateway not responding on :$GW_AGENT_PORT" >&2
+        exit 1
+    }
+    wait_for_port "$GW_MGMT_PORT" "Gateway mgmt (Phase 4)" 5 || {
+        echo "FAIL: Phase 4 gateway not responding on :$GW_MGMT_PORT" >&2
+        exit 1
+    }
+    log "  Phase 4 gateway confirmed on :$GW_AGENT_PORT / :$GW_MGMT_PORT / :$GW_METRICS_PORT."
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # PHASE 3: Start Agent(s) — connecting THROUGH the gateway
 # ══════════════════════════════════════════════════════════════════════
-log "Starting $AGENT_COUNT agent(s) (connecting to gateway at 127.0.0.1:$GW_AGENT_PORT)..."
+if ! $REUSE_STACK; then
+    log "Starting $AGENT_COUNT agent(s) (connecting to gateway at 127.0.0.1:$GW_AGENT_PORT)..."
 
-for i in $(seq 1 "$AGENT_COUNT"); do
-    AGENT_DATA_DIR="$WORK_DIR/agent-$i"
-    mkdir -p "$AGENT_DATA_DIR"
+    for i in $(seq 1 "$AGENT_COUNT"); do
+        AGENT_DATA_DIR="$WORK_DIR/agent-$i"
+        mkdir -p "$AGENT_DATA_DIR"
 
-    "$BUILDDIR/agents/core/yuzu-agent" \
-        --server "127.0.0.1:$GW_AGENT_PORT" \
-        --agent-id "integration-agent-$i" \
-        --data-dir "$AGENT_DATA_DIR" \
-        --heartbeat 5 \
-        --enrollment-token "$ENROLL_TOKEN" \
-        $TLS_AGENT_FLAGS \
-        > "$WORK_DIR/agent-$i.log" 2>&1 &
-    AGENT_PIDS+=($!)
-done
+        "$BUILDDIR/agents/core/yuzu-agent" \
+            --server "127.0.0.1:$GW_AGENT_PORT" \
+            --agent-id "integration-agent-$i" \
+            --data-dir "$AGENT_DATA_DIR" \
+            --heartbeat 5 \
+            --enrollment-token "$ENROLL_TOKEN" \
+            $TLS_AGENT_FLAGS \
+            > "$WORK_DIR/agent-$i.log" 2>&1 &
+        AGENT_PIDS+=($!)
+    done
 
-# Wait for agents to register (poll for up to 15s)
-log "  Waiting for agents to register..."
-for i in $(seq 1 15); do
-    if grep -qi "register\|session" "$WORK_DIR/agent-1.log" 2>/dev/null; then
-        break
+    # Wait for agents to register (poll for up to 15s)
+    log "  Waiting for agents to register..."
+    for i in $(seq 1 15); do
+        if grep -qi "register\|session" "$WORK_DIR/agent-1.log" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    ALIVE_AGENTS=0
+    for pid in "${AGENT_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            ALIVE_AGENTS=$((ALIVE_AGENTS + 1))
+        fi
+    done
+    log "  $ALIVE_AGENTS/$AGENT_COUNT agents running."
+else
+    # Phase 4 already has at least one agent registered. Verify via the
+    # server's /metrics endpoint (no auth) — `yuzu_fleet_agents_healthy`
+    # gauge shows how many agents are currently heartbeating. Name was
+    # confirmed 2026-04-19 against a live v0.11.0 server; keep in sync
+    # with server/core/src/metrics.cpp if it drifts.
+    log "Phase 4 reuse: verifying registered agent count via /metrics..."
+    AGENT_COUNT_FROM_METRICS=0
+    for i in $(seq 1 10); do
+        METRICS=$(curl -sf --max-time 2 "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
+        HEALTHY=$(echo "$METRICS" | awk '/^yuzu_fleet_agents_healthy[[:space:]]/ { print $2; exit }')
+        if [[ -n "$HEALTHY" ]] && [[ "${HEALTHY%.*}" -ge 1 ]]; then
+            AGENT_COUNT_FROM_METRICS=${HEALTHY%.*}
+            break
+        fi
+        sleep 1
+    done
+    if [[ "$AGENT_COUNT_FROM_METRICS" -ge 1 ]]; then
+        log "  Phase 4 agent confirmed: yuzu_fleet_agents_healthy = $AGENT_COUNT_FROM_METRICS"
+        ALIVE_AGENTS=$AGENT_COUNT_FROM_METRICS
+    else
+        echo "FAIL: Phase 4 reuse — yuzu_fleet_agents_healthy < 1 on /metrics after 10s" >&2
+        exit 1
     fi
-    sleep 1
-done
-
-ALIVE_AGENTS=0
-for pid in "${AGENT_PIDS[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-        ALIVE_AGENTS=$((ALIVE_AGENTS + 1))
-    fi
-done
-log "  $ALIVE_AGENTS/$AGENT_COUNT agents running."
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # PHASE 4: Test Scenarios
 # ══════════════════════════════════════════════════════════════════════
+
+# Source logs from Phase 4's /tmp/yuzu-uat in reuse mode; from our own
+# $WORK_DIR otherwise. Defined once here so every downstream test uses
+# the same path.
+if $REUSE_STACK; then
+    AGENT_LOG_PATH="/tmp/yuzu-uat/agent.log"
+    GATEWAY_LOG_PATH="/tmp/yuzu-uat/gateway.log"
+    SERVER_LOG_PATH="/tmp/yuzu-uat/server.log"
+else
+    AGENT_LOG_PATH="$WORK_DIR/agent-1.log"
+    GATEWAY_LOG_PATH="$WORK_DIR/gateway.log"
+    SERVER_LOG_PATH="$WORK_DIR/server.log"
+fi
+
 log ""
 log "═══════════════════════════════════════════"
 log "  RUNNING INTEGRATION TESTS"
@@ -485,19 +707,18 @@ else
     fail "Gateway process died"
 fi
 
-# ── Test 5: Agent logs show successful registration ───────────────────
 log "Test: Agent registration in logs"
-AGENT1_LOG=$(cat "$WORK_DIR/agent-1.log" 2>/dev/null || echo "")
+AGENT1_LOG=$(cat "$AGENT_LOG_PATH" 2>/dev/null || echo "")
 if echo "$AGENT1_LOG" | grep -qi "register\|session\|connect\|heartbeat"; then
-    pass "Agent-1 log shows connection activity"
+    pass "Agent log shows connection activity ($AGENT_LOG_PATH)"
     TESTS=$((TESTS + 1))
 else
-    fail "Agent-1 log shows no connection activity"
+    fail "Agent log shows no connection activity ($AGENT_LOG_PATH)"
 fi
 
 # ── Test 6: Gateway logs show agent connections ───────────────────────
 log "Test: Gateway sees agent connections"
-GW_LOG=$(cat "$WORK_DIR/gateway.log" 2>/dev/null || echo "")
+GW_LOG=$(cat "$GATEWAY_LOG_PATH" 2>/dev/null || echo "")
 if echo "$GW_LOG" | grep -qi "agent\|connect\|register\|started"; then
     pass "Gateway log shows activity"
     TESTS=$((TESTS + 1))
@@ -513,7 +734,7 @@ fi
 
 # ── Test 7: Server logs show gateway-mode activity ────────────────────
 log "Test: Server gateway-mode operation"
-SERVER_LOG=$(cat "$WORK_DIR/server.log" 2>/dev/null || echo "")
+SERVER_LOG=$(cat "$SERVER_LOG_PATH" 2>/dev/null || echo "")
 if echo "$SERVER_LOG" | grep -qi "gateway\|register\|agent\|listen"; then
     pass "Server log shows gateway-mode activity"
     TESTS=$((TESTS + 1))
@@ -707,7 +928,7 @@ fi
 log "Test: Gateway stability throughout test"
 TESTS=$((TESTS + 1))
 if kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    GW_LOG_FINAL=$(cat "$WORK_DIR/gateway.log" 2>/dev/null || echo "")
+    GW_LOG_FINAL=$(cat "$GATEWAY_LOG_PATH" 2>/dev/null || echo "")
     if echo "$GW_LOG_FINAL" | grep -qE 'CRASH REPORT|=ERROR REPORT|Supervisor: .* terminating|\[error\].*SIGTERM'; then
         fail "Gateway log shows critical errors"
     else
@@ -721,7 +942,7 @@ fi
 log "Test: Server stability throughout test"
 TESTS=$((TESTS + 1))
 if kill -0 "$SERVER_PID" 2>/dev/null; then
-    SERVER_LOG_FINAL=$(cat "$WORK_DIR/server.log" 2>/dev/null || echo "")
+    SERVER_LOG_FINAL=$(cat "$SERVER_LOG_PATH" 2>/dev/null || echo "")
     if echo "$SERVER_LOG_FINAL" | grep -qi "fatal\|SIGSEGV\|abort"; then
         fail "Server log shows fatal errors"
     else
@@ -894,29 +1115,29 @@ if [[ $FAILURES -gt 0 ]]; then
     echo "  FAILURE DETAILS"
     echo "═══════════════════════════════════════════════════════════════════"
     echo ""
-    echo "--- server.log (last 30 lines) ---"
-    tail -30 "$WORK_DIR/server.log" 2>/dev/null || true
+    echo "--- server.log (last 30 lines, $SERVER_LOG_PATH) ---"
+    tail -30 "$SERVER_LOG_PATH" 2>/dev/null || true
     echo ""
-    echo "--- gateway.log (last 30 lines) ---"
-    tail -30 "$WORK_DIR/gateway.log" 2>/dev/null || true
+    echo "--- gateway.log (last 30 lines, $GATEWAY_LOG_PATH) ---"
+    tail -30 "$GATEWAY_LOG_PATH" 2>/dev/null || true
     echo ""
-    echo "--- agent-1.log (last 30 lines) ---"
-    tail -30 "$WORK_DIR/agent-1.log" 2>/dev/null || true
+    echo "--- agent.log (last 30 lines, $AGENT_LOG_PATH) ---"
+    tail -30 "$AGENT_LOG_PATH" 2>/dev/null || true
     echo ""
 
     # Check for specific error patterns
     echo "--- Error Pattern Analysis ---"
-    if grep -qi "error\|fail\|crash" "$WORK_DIR/server.log" 2>/dev/null; then
+    if grep -qi "error\|fail\|crash" "$SERVER_LOG_PATH" 2>/dev/null; then
         echo "Server errors:"
-        grep -i "error\|fail\|crash" "$WORK_DIR/server.log" | tail -10
+        grep -i "error\|fail\|crash" "$SERVER_LOG_PATH" | tail -10
     fi
-    if grep -qi "error\|crash\|badarg" "$WORK_DIR/gateway.log" 2>/dev/null; then
+    if grep -qi "error\|crash\|badarg" "$GATEWAY_LOG_PATH" 2>/dev/null; then
         echo "Gateway errors:"
-        grep -i "error\|crash\|badarg" "$WORK_DIR/gateway.log" | tail -10
+        grep -i "error\|crash\|badarg" "$GATEWAY_LOG_PATH" | tail -10
     fi
-    if grep -qi "error\|fail" "$WORK_DIR/agent-1.log" 2>/dev/null; then
-        echo "Agent-1 errors:"
-        grep -i "error\|fail" "$WORK_DIR/agent-1.log" | tail -10
+    if grep -qi "error\|fail" "$AGENT_LOG_PATH" 2>/dev/null; then
+        echo "Agent errors:"
+        grep -i "error\|fail" "$AGENT_LOG_PATH" | tail -10
     fi
     echo ""
 

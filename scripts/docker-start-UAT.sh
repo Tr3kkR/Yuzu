@@ -45,6 +45,13 @@ COMPOSE_FILE="$YUZU_ROOT/deploy/docker/docker-compose.full-uat.yml"
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
+# Server web port. Override via SERVER_PORT=NNNN if the compose stack
+# is configured to publish on a different host port (e.g. when running
+# alongside a native server on :8080). All curl calls below interpolate
+# this variable so the health-check, login, dashboard, and metrics
+# probes track whatever the compose file actually publishes.
+SERVER_PORT="${SERVER_PORT:-8080}"
+
 # ── Docker CLI ───────────────────────────────────────────────────────────
 
 if ! command -v docker > /dev/null 2>&1; then
@@ -196,7 +203,7 @@ show_status() {
     fi
     echo ""
     echo "Endpoints:"
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:${SERVER_PORT}"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123"
@@ -233,16 +240,27 @@ start_all() {
     # ── Preflight ─────────────────────────────────────────────────────
     local errors=0
 
-    # Agent binary (native)
-    local agent_bin=""
-    if [ -f "$BUILDDIR/agents/core/yuzu-agent.exe" ]; then
-        agent_bin="$BUILDDIR/agents/core/yuzu-agent.exe"
-    elif [ -f "$BUILDDIR/agents/core/yuzu-agent" ]; then
-        agent_bin="$BUILDDIR/agents/core/yuzu-agent"
-    else
-        fail "yuzu-agent not found — run: meson compile -C builddir"
+    # Two agents: WSL Linux (build-linux/) + native Windows (.uat/windows-agent/
+    # extracted from a release zip, OR build-windows/ if locally built).
+    # If only one is present, run that one.
+    local linux_agent_bin=""
+    local windows_agent_bin=""
+
+    if [ -f "$YUZU_ROOT/build-linux/agents/core/yuzu-agent" ]; then
+        linux_agent_bin="$YUZU_ROOT/build-linux/agents/core/yuzu-agent"
+    fi
+    if [ -f "$YUZU_ROOT/build-windows/agents/core/yuzu-agent.exe" ]; then
+        windows_agent_bin="$YUZU_ROOT/build-windows/agents/core/yuzu-agent.exe"
+    elif [ -f "$YUZU_ROOT/.uat/windows-agent/yuzu-agent.exe" ]; then
+        windows_agent_bin="$YUZU_ROOT/.uat/windows-agent/yuzu-agent.exe"
+    fi
+
+    if [ -z "$linux_agent_bin" ] && [ -z "$windows_agent_bin" ]; then
+        fail "no yuzu-agent found — build via meson or extract a release zip into .uat/windows-agent/"
         errors=$((errors + 1))
     fi
+    [ -n "$linux_agent_bin" ]   && info "WSL Linux agent:  $linux_agent_bin"
+    [ -n "$windows_agent_bin" ] && info "Windows agent:    $windows_agent_bin"
 
     # Docker images
     if ! docker image inspect yuzu-server:latest > /dev/null 2>&1; then
@@ -267,8 +285,12 @@ start_all() {
     # ── Clean state ───────────────────────────────────────────────────
     kill_agent
     kill_docker
-    rm -rf "$UAT_DIR"
-    mkdir -p "$UAT_DIR/agent-data" "$UAT_DIR/dashboards"
+    # Preserve .uat/windows-agent/ (the extracted Windows release binaries —
+    # we don't want to re-extract on every start). Wipe everything else.
+    if [ -d "$UAT_DIR" ]; then
+        find "$UAT_DIR" -mindepth 1 -maxdepth 1 ! -name 'windows-agent' -exec rm -rf {} +
+    fi
+    mkdir -p "$UAT_DIR/agent-linux-data" "$UAT_DIR/agent-windows-data" "$UAT_DIR/dashboards"
 
     # ── Generate credentials ──────────────────────────────────────────
     generate_config
@@ -287,11 +309,11 @@ start_all() {
         docker compose -f "$COMPOSE_FILE" up -d 2>&1 | tail -10
 
     # Wait for services
-    if ! wait_for_http "http://localhost:8080/login" "Server" 45; then
+    if ! wait_for_http "http://localhost:${SERVER_PORT}/login" "Server" 45; then
         fail "Server did not start — check: docker logs yuzu-uat-server"
         exit 1
     fi
-    ok "Server up (dashboard http://localhost:8080)"
+    ok "Server up (dashboard http://localhost:${SERVER_PORT})"
 
     if ! wait_for_http "http://localhost:8081/readyz" "Gateway" 30; then
         fail "Gateway did not start — check: docker logs yuzu-uat-gateway"
@@ -321,12 +343,12 @@ start_all() {
     info "Creating enrollment token..."
     local enroll_token=""
     for _attempt in 1 2 3; do
-        curl -s -L -c "$UAT_DIR/cookies.txt" http://localhost:8080/login \
+        curl -s -L -c "$UAT_DIR/cookies.txt" http://localhost:${SERVER_PORT}/login \
             -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" -o /dev/null 2>/dev/null || true
 
         local token_html
         token_html=$(curl -s -L -b "$UAT_DIR/cookies.txt" \
-            -X POST http://localhost:8080/api/settings/enrollment-tokens \
+            -X POST http://localhost:${SERVER_PORT}/api/settings/enrollment-tokens \
             -d "label=uat-auto&max_uses=1000&ttl=86400" 2>/dev/null) || true
         enroll_token=$(echo "$token_html" | python3 -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null) || true
 
@@ -343,49 +365,89 @@ start_all() {
     echo "$enroll_token" > "$UAT_DIR/enrollment-token"
     ok "Enrollment token created"
 
-    # ── 2. Native agent (connects to gateway on host-exposed port) ────
+    # ── 2. Native agents (connect to gateway on host-exposed port) ────
     echo ""
-    echo "[2/2] Starting yuzu-agent (native, -> gateway :50051)..."
+    echo "[2/2] Starting yuzu-agent processes -> gateway :50051..."
 
-    # When running a Windows .exe from WSL2, paths must be Windows-style.
-    # The .exe cannot resolve /mnt/c/... paths — use wslpath to convert.
-    local agent_data_dir="$UAT_DIR/agent-data"
-    local agent_plugin_dir="$BUILDDIR/agents/plugins"
-    if [[ "$agent_bin" == *.exe ]] && command -v wslpath > /dev/null 2>&1; then
-        agent_data_dir=$(wslpath -w "$agent_data_dir")
-        agent_plugin_dir=$(wslpath -w "$agent_plugin_dir")
-    fi
+    # start_agent <binary> <data-dir> <plugin-dir> <log-file> <label>
+    # Spawns ONE agent and waits for "Registered with server" in the log.
+    # Returns the session_id via the global LAST_SESSION_ID.
+    LAST_SESSION_ID=""
+    start_agent() {
+        local bin=$1 data=$2 plugins=$3 log=$4 label=$5
 
-    "$agent_bin" \
-        --server localhost:50051 \
-        --no-tls \
-        --data-dir "$agent_data_dir" \
-        --plugin-dir "$agent_plugin_dir" \
-        --log-level info \
-        --enrollment-token "$enroll_token" \
-        > "$UAT_DIR/agent.log" 2>&1 &
-    disown
-
-    # Wait for registration
-    local waited=0
-    while ! grep -q "Registered with server" "$UAT_DIR/agent.log" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-        if [ "$waited" -ge 20 ]; then
-            fail "Agent did not register within 20s — check $UAT_DIR/agent.log"
-            exit 1
+        # Windows .exe launched from WSL2 sees Windows-style paths only.
+        if [[ "$bin" == *.exe ]] && command -v wslpath > /dev/null 2>&1; then
+            data=$(wslpath -w "$data")
+            plugins=$(wslpath -w "$plugins")
         fi
-    done
-    local session_id
-    session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | \
-        python3 -c "import sys,re; lines=sys.stdin.read(); m=re.findall(r'session=[^ ,)]+', lines); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
-    ok "Agent up ($session_id)"
 
-    if echo "$session_id" | grep -q "gw-session"; then
-        ok "Agent confirmed via gateway (gw-session prefix)"
-    else
-        warn "Agent session: $session_id (may not be routed through gateway)"
+        info "Starting $label agent: $bin"
+        "$bin" \
+            --server localhost:50051 \
+            --no-tls \
+            --data-dir "$data" \
+            --plugin-dir "$plugins" \
+            --log-level info \
+            --enrollment-token "$enroll_token" \
+            > "$log" 2>&1 &
+        disown
+
+        local waited=0
+        while ! grep -q "Registered with server" "$log" 2>/dev/null; do
+            sleep 1
+            waited=$((waited + 1))
+            if [ "$waited" -ge 25 ]; then
+                fail "$label agent did not register within 25s — check $log"
+                return 1
+            fi
+        done
+        LAST_SESSION_ID=$(grep "Registered with server" "$log" | \
+            python3 -c "import sys,re; m=re.findall(r'session=[^ ,)]+', sys.stdin.read()); print(m[-1] if m else 'unknown')" 2>/dev/null || echo "unknown")
+        ok "$label agent up ($LAST_SESSION_ID, ${waited}s)"
+
+        if echo "$LAST_SESSION_ID" | grep -q "gw-session"; then
+            ok "$label agent confirmed via gateway"
+        else
+            warn "$label agent session: $LAST_SESSION_ID (may not be routed through gateway)"
+        fi
+    }
+
+    local started_agents=0
+    if [ -n "$linux_agent_bin" ]; then
+        if start_agent \
+            "$linux_agent_bin" \
+            "$UAT_DIR/agent-linux-data" \
+            "$YUZU_ROOT/build-linux/agents/plugins" \
+            "$UAT_DIR/agent-linux.log" \
+            "WSL-Linux"; then
+            started_agents=$((started_agents + 1))
+        fi
     fi
+    if [ -n "$windows_agent_bin" ]; then
+        # Windows agent's plugin dir lives next to the .exe in the release
+        # zip layout (.uat/windows-agent/plugins/) or at build-windows/agents/
+        # plugins/ for a local build. Pick whichever matches the chosen bin.
+        local win_plugin_dir
+        if [[ "$windows_agent_bin" == */build-windows/* ]]; then
+            win_plugin_dir="$YUZU_ROOT/build-windows/agents/plugins"
+        else
+            win_plugin_dir="$YUZU_ROOT/.uat/windows-agent/plugins"
+        fi
+        if start_agent \
+            "$windows_agent_bin" \
+            "$UAT_DIR/agent-windows-data" \
+            "$win_plugin_dir" \
+            "$UAT_DIR/agent-windows.log" \
+            "Windows"; then
+            started_agents=$((started_agents + 1))
+        fi
+    fi
+    if [ "$started_agents" -eq 0 ]; then
+        fail "No agents started — aborting"
+        exit 1
+    fi
+    ok "$started_agents agent(s) registered"
 
     # ── Connectivity Tests ────────────────────────────────────────────
     echo ""
@@ -396,7 +458,7 @@ start_all() {
     # Test 1: Dashboard
     tests_total=$((tests_total + 1))
     local dash_code
-    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:8080/ 2>/dev/null)
+    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:${SERVER_PORT}/ 2>/dev/null)
     if [ "$dash_code" = "200" ]; then
         ok "Dashboard reachable (HTTP $dash_code)"
         tests_passed=$((tests_passed + 1))
@@ -415,28 +477,28 @@ start_all() {
         fail "Gateway health: $gw_health"
     fi
 
-    # Test 3: Server metrics — agent registered
+    # Test 3: Server metrics — agents registered (expect $started_agents)
     tests_total=$((tests_total + 1))
     local reg_count
-    reg_count=$(curl -s http://localhost:8080/metrics 2>/dev/null | \
+    reg_count=$(curl -s http://localhost:${SERVER_PORT}/metrics 2>/dev/null | \
         python3 -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
-    if [ "$reg_count" -ge 1 ]; then
-        ok "Server sees $reg_count registered agent(s)"
+    if [ "$reg_count" -ge "$started_agents" ]; then
+        ok "Server sees $reg_count registered agent(s) (expected $started_agents)"
         tests_passed=$((tests_passed + 1))
     else
-        fail "Server shows 0 registered agents"
+        fail "Server shows $reg_count registered agents (expected $started_agents)"
     fi
 
-    # Test 4: Gateway metrics — agent connected
+    # Test 4: Gateway metrics — agents connected (expect $started_agents)
     tests_total=$((tests_total + 1))
     local gw_agents
     gw_agents=$(curl -s http://localhost:9568/metrics 2>/dev/null | \
         python3 -c "import sys,re; m=re.search(r'yuzu_gw_agents_connected_total\{[^}]*\} (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
-    if [ "$gw_agents" -ge 1 ]; then
-        ok "Gateway shows $gw_agents connected agent(s)"
+    if [ "$gw_agents" -ge "$started_agents" ]; then
+        ok "Gateway shows $gw_agents connected agent(s) (expected $started_agents)"
         tests_passed=$((tests_passed + 1))
     else
-        fail "Gateway shows 0 connected agents"
+        fail "Gateway shows $gw_agents connected agents (expected $started_agents)"
     fi
 
     # Test 5: Prometheus scraping
@@ -487,7 +549,7 @@ except: print(0)
     tests_total=$((tests_total + 1))
     local help_html
     help_html=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        http://localhost:8080/api/help/html 2>/dev/null)
+        http://localhost:${SERVER_PORT}/api/help/html 2>/dev/null)
     local plugin_count
     plugin_count=$(echo "$help_html" | grep -o 'result-row' | wc -l)
     if [ "$plugin_count" -gt 0 ]; then
@@ -502,7 +564,7 @@ except: print(0)
     info "Sending 'os_info os_name' (full round-trip via gateway)..."
     local cmd_resp
     cmd_resp=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        -X POST http://localhost:8080/api/command \
+        -X POST http://localhost:${SERVER_PORT}/api/command \
         -H "Content-Type: application/json" \
         -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null)
     local cmd_id
@@ -517,7 +579,7 @@ except: print(0)
             sleep 1
             poll_count=$((poll_count + 1))
             os_result=$(curl -s -b "$UAT_DIR/cookies.txt" \
-                "http://localhost:8080/api/responses/$cmd_id" 2>/dev/null | \
+                "http://localhost:${SERVER_PORT}/api/responses/$cmd_id" 2>/dev/null | \
                 python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -573,7 +635,7 @@ for r in d.get('responses',[]):
     echo "       Docker UAT Stack Ready                 "
     echo "=============================================="
     echo ""
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:${SERVER_PORT}"
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
@@ -582,13 +644,14 @@ for r in d.get('responses',[]):
     echo "  GW Health:   http://localhost:8081/readyz"
     echo "  GW Metrics:  http://localhost:9568/metrics"
     echo ""
-    echo "  Agent (native) -> GW(:50051) -> Server(:50055)  [data]"
-    echo "  Server -> GW(:50063) -> Agent                   [commands]"
+    echo "  Agents ($started_agents) -> GW(:50051) -> Server(:50055)   [data]"
+    echo "  Server -> GW(:50063) -> Agents                  [commands]"
     echo "  Server -> ClickHouse (Docker network)           [analytics]"
     echo "  Prometheus -> Server + GW (Docker network)      [metrics]"
-    echo "  Grafana -> Prometheus + ClickHouse               [dashboards]"
+    echo "  Grafana -> Prometheus + ClickHouse              [dashboards]"
     echo ""
-    echo "  Agent log: $UAT_DIR/agent.log"
+    [ -n "$linux_agent_bin" ]   && echo "  WSL Linux agent log: $UAT_DIR/agent-linux.log"
+    [ -n "$windows_agent_bin" ] && echo "  Windows agent log:   $UAT_DIR/agent-windows.log"
     echo "  Server:    docker logs -f yuzu-uat-server"
     echo "  Gateway:   docker logs -f yuzu-uat-gateway"
     echo "  Stop:      bash scripts/docker-start-UAT.sh stop"

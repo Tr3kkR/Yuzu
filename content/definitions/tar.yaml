@@ -331,6 +331,67 @@ spec:
           process command line matching a pattern has its cmdline replaced
           with "[REDACTED by TAR]". Default patterns: ["*password*",
           "*secret*", "*token*", "*api_key*", "*credential*"].
+      process_enabled:
+        type: string
+        displayName: Process Collector Enabled
+        description: >
+          Enable or disable the process collector on this agent. "true"
+          (default) keeps the collector active; "false" short-circuits the
+          process branch of every collect_fast cycle. Existing rows remain
+          queryable until they age out by retention. Requires agent
+          v0.12.0+; older agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      tcp_enabled:
+        type: string
+        displayName: TCP Collector Enabled
+        description: >
+          Enable or disable the TCP/network collector on this agent. See
+          process_enabled for semantics. Requires agent v0.12.0+; older
+          agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      service_enabled:
+        type: string
+        displayName: Service Collector Enabled
+        description: >
+          Enable or disable the service collector on this agent. See
+          process_enabled for semantics. Requires agent v0.12.0+; older
+          agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      user_enabled:
+        type: string
+        displayName: User-Session Collector Enabled
+        description: >
+          Enable or disable the user-session collector on this agent. See
+          process_enabled for semantics. Requires agent v0.12.0+; older
+          agents silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      network_capture_method:
+        type: string
+        displayName: Network Capture Method
+        description: >
+          TCP capture mechanism. "polling" (default) drives the collector
+          via the platform polling API (iphlpapi on Windows,
+          /proc/net/tcp* on Linux, libproc on macOS) at fast_interval
+          cadence. Other values (iphlpapi, procfs, lsof, etw,
+          endpoint_security) can be pre-staged for forthcoming
+          kernel-event collectors but are accepted-but-not-yet-implemented;
+          the agent emits a warn line. Requires agent v0.12.0+.
+      process_stabilization_exclusions:
+        type: string
+        displayName: Process Stabilization Exclusions
+        description: >
+          JSON array of case-insensitive substring patterns matched against
+          the process name. Any process whose name contains a pattern is
+          dropped before the diff so noisy short-lived helpers do not
+          dwarf real activity. Trade-off: forensic completeness — anything
+          matching is invisible to TAR. Leading and trailing `*` are
+          stripped (so `*-helper*` is the same as `-helper`). NOT real
+          glob — `?` and `[abc]` are treated as literals. Requires agent
+          v0.12.0+. Example: '["chrome-helper","ms-edge-helper"]'.
 
   result:
     columns:
@@ -456,6 +517,68 @@ spec:
 
   compatibility:
     minAgentVersion: 0.1.0
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.compatibility
+  displayName: TAR OS Compatibility Matrix
+  version: 1.0.0
+  description: >
+    Returns the live OS-support matrix for every TAR capture source.
+    Output is one header line followed by N row lines, pipe-delimited:
+
+      header|source|os|status|capture_method|notes
+      row|process|windows|supported|toolhelp32|...
+      row|process|linux|supported|procfs|...
+
+    Status values: supported | constrained | planned | unsupported.
+
+    Use this to verify on a target host which capture sources are wired
+    and which are kPlanned (so operators can pre-stage
+    network_capture_method before the implementation lands). Read-only,
+    static metadata — does not touch the database or the filesystem,
+    safe to call at any frequency.
+  tags: [tar, compatibility, diagnostics, capabilities]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: compatibility
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: output
+        type: clob
+        description: "header|... or row|source|os|status|capture_method|notes lines"
+
+  readablePayload: "Show TAR OS compatibility matrix"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.12.0"
     requiredPlugins: [tar]
 
 status:

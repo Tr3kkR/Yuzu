@@ -30,7 +30,9 @@ struct Config {
     bool verbose_logging{false};           // Verbose logging flag
 
     // Plugin security
-    std::filesystem::path plugin_allowlist;  // --plugin-allowlist (sha256sum-format file)
+    std::filesystem::path plugin_allowlist;     // --plugin-allowlist (sha256sum-format file)
+    std::filesystem::path plugin_trust_bundle;  // --plugin-trust-bundle (PEM CA bundle for code-sig)
+    bool plugin_require_signature{false};       // --plugin-require-signature
 
     // OTA updates
     bool auto_update{true};                               // --no-auto-update disables

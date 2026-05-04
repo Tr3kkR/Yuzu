@@ -95,7 +95,51 @@ void ResponseStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_facets_agent
                 ON response_facets(instruction_id, agent_id);
         )"},
+        // v2 (PR 2 of executions-history ladder): exact correlation between
+        // a response and the execution that produced it. Pre-v2 rows carry
+        // execution_id='' as the legacy sentinel; the detail handler in
+        // workflow_routes falls back to the timestamp-window join on those.
+        // SQLite's ALTER TABLE ADD COLUMN is not idempotent; the probe
+        // below pre-stamps schema_meta to v2 if the column already exists
+        // (e.g. a developer ran an iterated build), matching the precedent
+        // at instruction_store.cpp:197-216 (governance arch-B2 / CP-5).
+        {2, R"(
+            ALTER TABLE responses ADD COLUMN execution_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_resp_execution_ts
+                ON responses(execution_id, timestamp) WHERE execution_id != '';
+        )"},
     };
+    // Pre-migration probe (mirrors instruction_store.cpp:197-216): if the
+    // execution_id column already exists and schema_meta is below v2, stamp
+    // v2 directly so the runner skips the duplicate ALTER. The probe is a
+    // read-only PRAGMA — safe on any DB state.
+    {
+        sqlite3_stmt* probe = nullptr;
+        bool col_exists = false;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM pragma_table_info('responses') "
+                               "WHERE name='execution_id' LIMIT 1",
+                               -1, &probe, nullptr) == SQLITE_OK) {
+            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+            sqlite3_finalize(probe);
+        }
+        int current_v = MigrationRunner::current_version(db_, "response_store");
+        if (col_exists && current_v < 2) {
+            sqlite3_stmt* stamp = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "INSERT OR REPLACE INTO schema_meta "
+                                   "(store, version, upgraded_at) VALUES (?, 2, ?)",
+                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp, 2, now);
+                sqlite3_step(stamp);
+                sqlite3_finalize(stamp);
+            }
+        }
+    }
     if (!MigrationRunner::run(db_, "response_store", kMigrations)) {
         spdlog::error("ResponseStore: schema migration failed, closing database");
         sqlite3_close(db_);
@@ -108,8 +152,8 @@ void ResponseStore::prepare_insert_stmt() {
         return;
     const char* sql = R"(
         INSERT INTO responses (instruction_id, agent_id, timestamp, status, output,
-                               error_detail, ttl_expires_at, plugin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                               error_detail, ttl_expires_at, plugin, execution_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     if (sqlite3_prepare_v2(db_, sql, -1, &insert_stmt_, nullptr) != SQLITE_OK) {
         spdlog::error("ResponseStore: failed to prepare insert statement: {}", sqlite3_errmsg(db_));
@@ -153,6 +197,11 @@ void ResponseStore::store(const StoredResponse& resp) {
     sqlite3_bind_text(insert_stmt_, 6, resp.error_detail.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(insert_stmt_, 7, ttl);
     sqlite3_bind_text(insert_stmt_, 8, resp.plugin.c_str(), -1, SQLITE_TRANSIENT);
+    // PR 2: execution_id column. Empty when the dispatch path didn't
+    // register a command_id→execution_id mapping (out-of-band callers,
+    // legacy code paths). The detail handler uses the timestamp-window
+    // fallback for empty values.
+    sqlite3_bind_text(insert_stmt_, 9, resp.execution_id.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(insert_stmt_) != SQLITE_DONE) {
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -163,7 +212,6 @@ void ResponseStore::store(const StoredResponse& resp) {
 
     // Extract facets from the output using the plugin schema
     if (facet_insert_stmt_ && !resp.plugin.empty() && !resp.output.empty()) {
-        auto& cols = columns_for_plugin(resp.plugin);
         auto lines = split_output_lines(resp.output);
 
         // Accumulate (col_idx, value) → line_count.
@@ -207,7 +255,8 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
         return results;
 
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
-                      "error_detail, ttl_expires_at, COALESCE(plugin,'') FROM responses"
+                      "error_detail, ttl_expires_at, COALESCE(plugin,''), "
+                      "COALESCE(execution_id,'') FROM responses"
                       " WHERE instruction_id = ?";
     std::vector<std::string> bind_texts;
     // int64_binds: (param_index, value) pairs for integer parameters
@@ -274,6 +323,119 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
         auto pl = sqlite3_column_text(stmt, 8);
         if (pl)
             r.plugin = reinterpret_cast<const char*>(pl);
+        auto ex = sqlite3_column_text(stmt, 9);
+        if (ex)
+            r.execution_id = reinterpret_cast<const char*>(ex);
+        results.push_back(std::move(r));
+    }
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+// PR 2: exact-correlation lookup via the new execution_id column. Falls
+// back to no-op (empty result) on the legacy sentinel `''` so callers can
+// detect "no PR 2 data for this id" and use `query()` for the legacy
+// timestamp-window join. Same filter surface as `query()` minus the
+// outer instruction_id (replaced with execution_id) — agent / status /
+// since / until / limit / offset still work.
+std::vector<StoredResponse>
+ResponseStore::query_by_execution(const std::string& execution_id,
+                                   const ResponseQuery& q) const {
+    std::shared_lock lock(mtx_);
+    std::vector<StoredResponse> results;
+    if (!db_)
+        return results;
+    if (execution_id.empty()) {
+        // arch-B1: empty execution_id is the legacy sentinel and indicates
+        // a caller bug (Execution.id was uninitialized) rather than a
+        // legitimate empty-result query. Log at debug rather than warn so
+        // a misbehaving caller doesn't flood production logs; the bug
+        // surfaces in operator-debug runs where verbose logging is on.
+        spdlog::debug("ResponseStore::query_by_execution called with empty "
+                      "execution_id — legacy sentinel; returning no rows. "
+                      "Caller should guard upstream and use query() for "
+                      "legacy-correlation needs.");
+        return results;
+    }
+
+    // perf-B1 fix: include the partial-index predicate `execution_id != ''`
+    // EXPLICITLY in the WHERE clause so SQLite's planner uses
+    // `idx_resp_execution_ts`. Without this redundant clause the planner
+    // refuses to match a partial index against a `WHERE execution_id = ?`
+    // bind alone — it requires the WHERE clause to syntactically subsume
+    // the partial-index predicate. The early-return at the top of this
+    // method guarantees `execution_id` is non-empty, so the extra clause
+    // is always trivially true; it exists solely for the planner.
+    std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
+                      "error_detail, ttl_expires_at, COALESCE(plugin,''), "
+                      "COALESCE(execution_id,'') FROM responses"
+                      " WHERE execution_id != '' AND execution_id = ?";
+    std::vector<std::string> bind_texts;
+    std::vector<std::pair<int, int64_t>> int_binds;
+    int bind_idx = 1;
+    bind_texts.push_back(execution_id);
+    bind_idx++;
+
+    if (!q.agent_id.empty()) {
+        sql += " AND agent_id = ?";
+        bind_texts.push_back(q.agent_id);
+        bind_idx++;
+    }
+    if (q.status >= 0) {
+        sql += " AND status = ?";
+        int_binds.emplace_back(bind_idx++, static_cast<int64_t>(q.status));
+    }
+    if (q.since > 0) {
+        sql += " AND timestamp >= ?";
+        int_binds.emplace_back(bind_idx++, q.since);
+    }
+    if (q.until > 0) {
+        sql += " AND timestamp <= ?";
+        int_binds.emplace_back(bind_idx++, q.until);
+    }
+    sql += " ORDER BY timestamp DESC LIMIT ?";
+    int limit_idx = bind_idx++;
+    int offset_idx = 0;
+    if (q.offset > 0) {
+        sql += " OFFSET ?";
+        offset_idx = bind_idx++;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+        return results;
+
+    for (int i = 0; i < static_cast<int>(bind_texts.size()); ++i) {
+        sqlite3_bind_text(stmt, i + 1, bind_texts[i].c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& [idx, val] : int_binds) {
+        sqlite3_bind_int64(stmt, idx, val);
+    }
+    sqlite3_bind_int64(stmt, limit_idx, q.limit);
+    if (offset_idx > 0) {
+        sqlite3_bind_int64(stmt, offset_idx, q.offset);
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        StoredResponse r;
+        r.id = sqlite3_column_int64(stmt, 0);
+        r.instruction_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.agent_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        r.timestamp = sqlite3_column_int64(stmt, 3);
+        r.status = sqlite3_column_int(stmt, 4);
+        auto out = sqlite3_column_text(stmt, 5);
+        if (out)
+            r.output = reinterpret_cast<const char*>(out);
+        auto err = sqlite3_column_text(stmt, 6);
+        if (err)
+            r.error_detail = reinterpret_cast<const char*>(err);
+        r.ttl_expires_at = sqlite3_column_int64(stmt, 7);
+        auto pl = sqlite3_column_text(stmt, 8);
+        if (pl)
+            r.plugin = reinterpret_cast<const char*>(pl);
+        auto ex = sqlite3_column_text(stmt, 9);
+        if (ex)
+            r.execution_id = reinterpret_cast<const char*>(ex);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -568,7 +730,8 @@ std::vector<StoredResponse> ResponseStore::query_by_ids(
         in_list += std::to_string(response_ids[i]);
     }
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output,"
-                      " error_detail, ttl_expires_at, COALESCE(plugin,'') FROM responses"
+                      " error_detail, ttl_expires_at, COALESCE(plugin,''),"
+                      " COALESCE(execution_id,'') FROM responses"
                       " WHERE id IN (" + in_list + ") ORDER BY id";
 
     sqlite3_stmt* stmt = nullptr;
@@ -589,6 +752,8 @@ std::vector<StoredResponse> ResponseStore::query_by_ids(
         r.ttl_expires_at = sqlite3_column_int64(stmt, 7);
         auto pl = sqlite3_column_text(stmt, 8);
         if (pl) r.plugin = reinterpret_cast<const char*>(pl);
+        auto ex = sqlite3_column_text(stmt, 9);
+        if (ex) r.execution_id = reinterpret_cast<const char*>(ex);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);

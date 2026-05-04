@@ -12,17 +12,23 @@ on:
     - cron: '0 10 1 * *'
   workflow_dispatch:
 
+# Scorecard Token-Permissions hardening: least-privilege read at workflow
+# scope; the single job below exercises writes when it opens the PR.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   propose-bump:
     name: Propose vcpkg baseline bump
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write         # peter-evans/create-pull-request: commit + branch push
+      pull-requests: write    # peter-evans/create-pull-request: open/update PR
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Resolve latest vcpkg master SHA
         id: latest
@@ -67,7 +73,6 @@ jobs:
           files=(
             vcpkg.json
             vcpkg-configuration.json
-            qodana.yaml
             CLAUDE.md
             .github/workflows/ci.yml
             .github/workflows/release.yml
@@ -91,7 +96,7 @@ jobs:
 
       - name: Create pull request
         if: steps.check.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
           branch: "deps/vcpkg-baseline-${{ steps.latest.outputs.sha }}"
@@ -108,7 +113,6 @@ jobs:
             Updates every tracked reference of the baseline SHA:
             - `vcpkg.json` `builtin-baseline`
             - `vcpkg-configuration.json` default registry `baseline`
-            - `qodana.yaml` vcpkg fetch step
             - `CLAUDE.md` vcpkg documentation line
             - `.github/workflows/ci.yml` `VCPKG_COMMIT`
             - `.github/workflows/release.yml` `VCPKG_COMMIT`

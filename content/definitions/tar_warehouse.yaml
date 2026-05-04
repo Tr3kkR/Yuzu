@@ -53,7 +53,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -103,7 +103,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -153,7 +153,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -203,7 +203,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -253,7 +253,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -303,7 +303,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -355,7 +355,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -405,7 +405,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -455,7 +455,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -506,7 +506,125 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+## Issue #60 — daily aggregation example reading from $Process_Daily.
+## Demonstrates the live-to-aggregate rollup tier shape (start_count /
+## stop_count are SUM-aggregated by day_ts + name + user). The
+## `datetime(day_ts, 'unixepoch')` conversion is the SQLite-native
+## equivalent of competing platforms' `EPOCHTOJSON(TS)` helper.
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.daily_process_summary
+  displayName: "TAR: Daily process summary"
+  version: 1.0.0
+  description: >
+    Per-day process activity for the last 30 days, aggregated from
+    $Process_Daily. Each row is (date, process_name, user, start_count,
+    stop_count). Useful for trend questions ("did $process_name run more
+    often last week than the week before?") that would be O(N) over
+    $Process_Live.
+  tags: [tar, warehouse, processes, daily, examples]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT datetime(day_ts, 'unixepoch') AS day, name, user, start_count, stop_count FROM $Process_Daily WHERE day_ts > strftime('%s', 'now', '-30 days') ORDER BY day_ts DESC, start_count DESC LIMIT 1000"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+## Issue #60 — ISO timestamp conversion example.
+## Operators reading raw ts INTEGER columns get epoch seconds, which are
+## hard to skim. SQLite's `datetime(ts, 'unixepoch')` returns a sortable
+## ISO-8601 string ("2026-04-25 19:31:42"). This query is shipped as a
+## copy-paste reference and as a standing example query.
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.recent_processes_iso
+  displayName: "TAR: Recent processes (ISO timestamps)"
+  version: 1.0.0
+  description: >
+    Same as `tar.recent_processes` but emits human-readable ISO-8601
+    timestamps via `datetime(ts, 'unixepoch')` instead of epoch seconds.
+    Use this when piping query output to a human reader; use
+    `tar.recent_processes` when piping to another tool that expects
+    epoch seconds.
+  tags: [tar, warehouse, processes, examples, iso]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: sql
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      sql:
+        type: string
+        default: "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500"
+        hidden: true
+    required: [sql]
+
+  result:
+    columns:
+      - { name: output, type: clob }
+
+  gather:
+    ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:
@@ -558,7 +676,7 @@ spec:
     authorRoles: [content-author]
 
   compatibility:
-    minAgentVersion: "0.7.0"
+    minAgentVersion: "0.10.0"
     requiredPlugins: [tar]
 
 status:

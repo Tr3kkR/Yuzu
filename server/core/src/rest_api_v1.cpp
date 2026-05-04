@@ -1,5 +1,8 @@
 #include "rest_api_v1.hpp"
+#include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "store_errors.hpp"
+#include "visualization_engine.hpp"
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -9,9 +12,14 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <regex>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::server {
 namespace {
@@ -103,16 +111,6 @@ public:
     [[nodiscard]] int64_t size() const { return n_; }
 };
 
-/// Quote a string as a JSON value: "escaped content"
-std::string json_quoted(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size() + 2);
-    out += '"';
-    json_escape(out, sv);
-    out += '"';
-    return out;
-}
-
 // ── Envelope helpers ────────────────────────────────────────────────────
 
 std::string ok_json(std::string_view data_json) {
@@ -141,16 +139,6 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .str();
 }
 
-// ── CORS helpers ────────────────────────────────────────────────────────
-
-void add_cors_headers(httplib::Response& res, const httplib::Request& /* req */) {
-    // Do NOT reflect arbitrary Origin — that defeats CORS.
-    // API is same-origin by design; external integrations use API tokens.
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Yuzu-Token");
-    res.set_header("Access-Control-Max-Age", "86400");
-}
-
 // ── OpenAPI 3.0 spec ────────────────────────────────────────────────────
 // Returned as a static raw string — zero template instantiation at compile
 // time.  Previously this was a 365-line nested nlohmann::json initializer
@@ -164,7 +152,7 @@ const std::string& openapi_spec() {
     "version": "1.0.0",
     "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header.",
     "contact": {"name": "Yuzu Project"},
-    "license": {"name": "Apache-2.0"}
+    "license": {"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"}
   },
   "servers": [{"url": "/api/v1", "description": "API v1 base path"}],
   "components": {
@@ -260,6 +248,52 @@ const std::string& openapi_spec() {
           "installed_at": {"type": "integer"},
           "verified": {"type": "boolean", "description": "Whether the pack signature was verified"}
         }
+      },
+      "GuaranteedStateRule": {
+        "type": "object",
+        "properties": {
+          "rule_id": {"type": "string", "description": "Stable operator-chosen id ([A-Za-z0-9._-]+)"},
+          "name": {"type": "string"},
+          "yaml_source": {"type": "string", "description": "Authoritative rule body (kind: GuaranteedStateRule)"},
+          "version": {"type": "integer"},
+          "enabled": {"type": "boolean"},
+          "enforcement_mode": {"type": "string", "enum": ["enforce", "audit"]},
+          "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+          "os_target": {"type": "string", "description": "Empty (any) or one of windows|linux|macos"},
+          "scope_expr": {"type": "string", "description": "Scope DSL expression selecting target agents"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"},
+          "created_by": {"type": "string"},
+          "updated_by": {"type": "string"}
+        }
+      },
+      "GuaranteedStateStatus": {
+        "type": "object",
+        "properties": {
+          "total_rules": {"type": "integer"},
+          "compliant_rules": {"type": "integer"},
+          "drifted_rules": {"type": "integer"},
+          "errored_rules": {"type": "integer"}
+        }
+      },
+      "GuaranteedStateEvent": {
+        "type": "object",
+        "properties": {
+          "event_id": {"type": "string"},
+          "rule_id": {"type": "string"},
+          "agent_id": {"type": "string"},
+          "event_type": {"type": "string"},
+          "severity": {"type": "string"},
+          "guard_type": {"type": "string"},
+          "guard_category": {"type": "string", "enum": ["event", "condition"]},
+          "detected_value": {"type": "string"},
+          "expected_value": {"type": "string"},
+          "remediation_action": {"type": "string"},
+          "remediation_success": {"type": "boolean"},
+          "detection_latency_us": {"type": "integer"},
+          "remediation_latency_us": {"type": "integer"},
+          "timestamp": {"type": "string", "format": "date-time"}
+        }
       }
     }
   },
@@ -287,7 +321,11 @@ const std::string& openapi_spec() {
       "get": {"summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments"}}},
       "post": {"summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned"}}},
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
-    },
+    })json"
+    // Split here so each raw-string literal stays under MSVC's 16,380-byte
+    // C2026 cap. Adjacent string literals are concatenated at compile time,
+    // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
+    R"json(,
     "/tokens": {
       "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}}},
       "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}}}
@@ -341,6 +379,37 @@ const std::string& openapi_spec() {
     },
     "/openapi.json": {
       "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
+    },
+    "/executions/{id}/visualization": {
+      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Requires Response:Read. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
+    })json"
+    // Split here so each raw-string literal stays under MSVC's 16,380-byte
+    // C2026 cap. Adjacent string literals are concatenated at compile time,
+    // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
+    R"json(,
+    "/guaranteed-state/rules": {
+      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+    },
+    "/guaranteed-state/rules/{rule_id}": {
+      "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
+      "put": {"summary": "Update a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Version is incremented on every successful update.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"200": {"description": "Rule updated"}, "400": {"description": "Invalid JSON"}, "404": {"description": "Rule not found"}, "409": {"description": "Conflicting name"}}},
+      "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "404": {"description": "Rule not found"}}}
+    },
+    "/guaranteed-state/push": {
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
+    },
+    "/guaranteed-state/events": {
+      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
+    },
+    "/guaranteed-state/status": {
+      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
+    },
+    "/guaranteed-state/status/{agent_id}": {
+      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
+    },
+    "/guaranteed-state/alerts": {
+      "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     }
   }
 })json";
@@ -351,6 +420,9 @@ const std::string& openapi_spec() {
 
 // ── Route registration ───────────────────────────────────────────────────────
 
+// Production overload — wraps httplib::Server in an HttplibRouteSink and
+// delegates to the sink-based implementation below. Tests bypass this and
+// call the sink overload directly with their own TestRouteSink (#438).
 void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 AuditFn audit_fn, RbacStore* rbac_store,
                                 ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
@@ -364,25 +436,50 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 ProductPackStore* product_pack_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 DeviceTokenStore* device_token_store,
-                                LicenseStore* license_store) {
+                                LicenseStore* license_store,
+                                GuaranteedStateStore* guaranteed_state_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    rbac_store, mgmt_store, token_store, quarantine_store, response_store,
+                    instruction_store, execution_tracker, schedule_engine, approval_manager,
+                    tag_store, audit_store, std::move(service_group_fn), std::move(tag_push_fn),
+                    inventory_store, product_pack_store, sw_deploy_store, device_token_store,
+                    license_store, guaranteed_state_store);
+}
+
+void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                AuditFn audit_fn, RbacStore* rbac_store,
+                                ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
+                                QuarantineStore* quarantine_store, ResponseStore* response_store,
+                                InstructionStore* instruction_store,
+                                ExecutionTracker* execution_tracker,
+                                ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
+                                TagStore* tag_store, AuditStore* audit_store,
+                                ServiceGroupFn service_group_fn, TagPushFn tag_push_fn,
+                                InventoryStore* inventory_store,
+                                ProductPackStore* product_pack_store,
+                                SoftwareDeploymentStore* sw_deploy_store,
+                                DeviceTokenStore* device_token_store,
+                                LicenseStore* license_store,
+                                GuaranteedStateStore* guaranteed_state_store) {
 
     spdlog::info("REST API v1: registering routes");
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
-    svr.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
+    sink.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.status = 204;
     });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
-    svr.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
+    sink.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(openapi_spec(), "application/json");
     });
 
     // ── /api/v1/me ───────────────────────────────────────────────────────
 
-    svr.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -410,7 +507,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
-    svr.Get("/api/v1/management-groups",
+    sink.Get("/api/v1/management-groups",
             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -438,7 +535,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
@@ -477,7 +574,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
 
-    svr.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
+    sink.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -517,7 +614,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             });
 
     // Update group (rename, re-parent, change description/membership)
-    svr.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
+    sink.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
             [auth_fn, perm_fn, audit_fn, mgmt_store](const httplib::Request& req,
                                                       httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
@@ -590,7 +687,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(JObj().add("updated", true).str()), "application/json");
             });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+))",
         [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Delete"))
@@ -613,7 +710,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         });
 
     // Members
-    svr.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
+    sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
              [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Write"))
                      return;
@@ -638,7 +735,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                  res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
              });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
         [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
@@ -659,7 +756,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
-    svr.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+    sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
@@ -682,7 +779,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(arr.str()), "application/json");
             });
 
-    svr.Post(
+    sink.Post(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
         [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
                                                               httplib::Response& res) {
@@ -758,7 +855,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
             res.set_content(ok_json(JObj().add("assigned", true).str()), "application/json");
         });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
         [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
                                                               httplib::Response& res) {
@@ -809,7 +906,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── API Tokens (/api/v1/tokens) ──────────────────────────────────────
 
-    svr.Get("/api/v1/tokens",
+    sink.Get("/api/v1/tokens",
             [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "ApiToken", "Read"))
                     return;
@@ -842,7 +939,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
+    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
                                 tag_store](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
@@ -911,7 +1008,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    svr.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
+    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
                                              const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -967,7 +1064,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
-    svr.Get("/api/v1/quarantine",
+    sink.Get("/api/v1/quarantine",
             [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Security", "Read"))
                     return;
@@ -992,7 +1089,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
+    sink.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
                                        const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "Security", "Execute"))
             return;
@@ -1021,7 +1118,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
         res.set_content(ok_json(JObj().add("quarantined", true).str()), "application/json");
     });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/quarantine/(.+))",
         [perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Security", "Execute"))
@@ -1045,7 +1142,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
-    svr.Get("/api/v1/rbac/roles",
+    sink.Get("/api/v1/rbac/roles",
             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "UserManagement", "Read"))
                     return;
@@ -1068,7 +1165,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
+    sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "UserManagement", "Read"))
                     return;
@@ -1090,7 +1187,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(arr.str()), "application/json");
             });
 
-    svr.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
+    sink.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
                                                          httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
@@ -1110,7 +1207,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tag Categories (/api/v1/tag-categories) ────────────────────────
 
-    svr.Get("/api/v1/tag-categories",
+    sink.Get("/api/v1/tag-categories",
             [perm_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1131,7 +1228,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tag Compliance (/api/v1/tag-compliance) ──────────────────────────
 
-    svr.Get("/api/v1/tag-compliance",
+    sink.Get("/api/v1/tag-compliance",
             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1154,7 +1251,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Tags (/api/v1/tags) ──────────────────────────────────────────────
 
-    svr.Get("/api/v1/tags",
+    sink.Get("/api/v1/tags",
             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Read"))
                     return;
@@ -1177,7 +1274,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(obj.str()), "application/json");
             });
 
-    svr.Put("/api/v1/tags",
+    sink.Put("/api/v1/tags",
             [perm_fn, audit_fn, tag_store, service_group_fn,
              tag_push_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Tag", "Write"))
@@ -1226,7 +1323,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(JObj().add("set", true).str()), "application/json");
             });
 
-    svr.Delete(
+    sink.Delete(
         R"(/api/v1/tags/([^/]+)/([^/]+))",
         [perm_fn, audit_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Tag", "Delete"))
@@ -1251,7 +1348,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Instructions (/api/v1/definitions) ───────────────────────────────
 
-    svr.Get("/api/v1/definitions",
+    sink.Get("/api/v1/definitions",
             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
                     return;
@@ -1280,7 +1377,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Audit (/api/v1/audit) ────────────────────────────────────────────
 
-    svr.Get("/api/v1/audit",
+    sink.Get("/api/v1/audit",
             [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "AuditLog", "Read"))
                     return;
@@ -1321,7 +1418,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
 
-    svr.Get("/api/v1/inventory/tables",
+    sink.Get("/api/v1/inventory/tables",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
@@ -1343,7 +1440,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
+    sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
             [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
@@ -1377,7 +1474,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(data.str()), "application/json");
             });
 
-    svr.Post("/api/v1/inventory/query",
+    sink.Post("/api/v1/inventory/query",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return;
@@ -1424,7 +1521,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
 
-    svr.Get("/api/v1/execution-statistics",
+    sink.Get("/api/v1/execution-statistics",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 auto summary = execution_tracker->get_fleet_summary();
@@ -1438,7 +1535,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                 res.set_content(ok_json(data), "application/json");
             });
 
-    svr.Get("/api/v1/execution-statistics/agents",
+    sink.Get("/api/v1/execution-statistics/agents",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 ExecutionStatsQuery q;
@@ -1462,7 +1559,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
-    svr.Get("/api/v1/execution-statistics/definitions",
+    sink.Get("/api/v1/execution-statistics/definitions",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Execution", "Read")) return;
                 ExecutionStatsQuery q;
@@ -1484,10 +1581,161 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 "application/json");
             });
 
+    // ── Response Visualization (issue #253, capability 20.6) ─────────────
+    //
+    // Renders an instruction's response set as chart-ready JSON using the
+    // `spec.visualization` block stored on the InstructionDefinition. The
+    // {id} path parameter is the response_store key (a.k.a. command_id /
+    // instruction_id) returned at dispatch time. `definition_id` is required
+    // because Yuzu's response model keys responses by command_id, not by
+    // executions.id — the only durable link from a response set back to a
+    // definition is the one the dispatcher recorded in the audit trail.
+    //
+    // Securable: Response:Read — sibling parity with /fragments/results,
+    // /api/responses/{id}/aggregate, and /api/responses/{id}/export which
+    // all read response_store on the same gate. Governance gate C-1.
+    sink.Get(R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
+            [auth_fn, perm_fn, audit_fn, response_store, instruction_store]
+            (const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Response", "Read")) return;
+                auto session = auth_fn(req, res);
+                if (!session) return;
+                if (!response_store || !instruction_store ||
+                    !response_store->is_open() ||
+                    !instruction_store->is_open()) {
+                    res.status = 503;
+                    res.set_content(error_json("service unavailable", 503),
+                                    "application/json");
+                    return;
+                }
+
+                auto execution_id = req.matches[1].str();
+                if (!req.has_param("definition_id")) {
+                    res.status = 400;
+                    res.set_content(error_json("definition_id query parameter is required"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, "reason=missing_definition_id");
+                    return;
+                }
+                auto definition_id = req.get_param_value("definition_id");
+
+                // Closes governance sec-F3 / C-15: regex-bound definition_id
+                // on the REST endpoint to match the dashboard fragment.
+                // Without this, an unbounded value flows through audit_fn,
+                // spdlog, and SQL bind parameters.
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                if (!std::regex_match(definition_id, kIdRegex)) {
+                    res.status = 400;
+                    res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, "reason=malformed_definition_id");
+                    return;
+                }
+
+                // Issue #587: optional `?index=N` selects which chart to
+                // render when a definition declares multiple. Default 0.
+                int chart_index = 0;
+                if (req.has_param("index")) {
+                    try {
+                        chart_index = std::stoi(req.get_param_value("index"));
+                    } catch (...) {
+                        res.status = 400;
+                        res.set_content(error_json("index must be a non-negative integer"),
+                                        "application/json");
+                        return;
+                    }
+                    if (chart_index < 0) {
+                        res.status = 400;
+                        res.set_content(error_json("index must be a non-negative integer"),
+                                        "application/json");
+                        return;
+                    }
+                }
+
+                auto def = instruction_store->get_definition(definition_id);
+                if (!def) {
+                    res.status = 404;
+                    res.set_content(error_json("instruction definition not found"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id,
+                             definition_id + " reason=definition_not_found");
+                    return;
+                }
+                int chart_count = VisualizationEngine::count(def->visualization_spec);
+                if (chart_count == 0) {
+                    res.status = 404;
+                    res.set_content(error_json("no visualization configured for this definition"),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, definition_id + " reason=no_visualization");
+                    return;
+                }
+                if (chart_index >= chart_count) {
+                    res.status = 404;
+                    res.set_content(
+                        error_json("visualization index out of range (have " +
+                                   std::to_string(chart_count) + " chart(s))"),
+                        "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id,
+                             definition_id + " reason=index_oor index=" +
+                                 std::to_string(chart_index));
+                    return;
+                }
+
+                ResponseQuery q;
+                // Sibling parity: dashboard_routes.cpp's /fragments/results
+                // and the response aggregate/export paths use 10000. Closes
+                // governance C-2 row-cap drift.
+                static constexpr int kRowCap = 10000;
+                q.limit = kRowCap;
+                auto responses = response_store->query(execution_id, q);
+                bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
+                if (rows_capped) {
+                    spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
+                                 kRowCap, execution_id, definition_id);
+                }
+
+                VisualizationEngine engine;
+                auto result = engine.transform_at(def->visualization_spec, chart_index,
+                                                   def->plugin, responses);
+                if (!result.ok) {
+                    res.status = 500;
+                    auto parsed = nlohmann::json::parse(result.json, nullptr, false);
+                    auto msg = parsed.is_discarded() ? std::string("invalid spec")
+                                                     : parsed.value("error", "invalid spec");
+                    res.set_content(error_json(msg), "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, definition_id + " err=" + msg);
+                    return;
+                }
+                // Stamp truncation status + chart index/total onto the
+                // payload so the dashboard can show a "1/2" indicator and
+                // a "showing first 10000 rows" banner. Closes UP-3 / ER-P1.
+                std::string final_json = result.json;
+                if (!final_json.empty() && final_json.back() == '}') {
+                    final_json.pop_back();
+                    final_json += ",\"chart_index\":" + std::to_string(chart_index);
+                    final_json += ",\"chart_count\":" + std::to_string(chart_count);
+                    if (rows_capped) {
+                        final_json += ",\"rows_capped\":true,\"rows_cap\":";
+                        final_json += std::to_string(kRowCap);
+                    }
+                    final_json += "}";
+                }
+                res.set_content(ok_json(final_json), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "success", "execution",
+                         execution_id,
+                         definition_id + " index=" + std::to_string(chart_index));
+            });
+
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────
 
     if (inventory_store) {
-        svr.Post("/api/v1/inventory/evaluate",
+        sink.Post("/api/v1/inventory/evaluate",
                  [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                      if (!perm_fn(req, res, "Inventory", "Read")) return;
                      auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1539,7 +1787,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 
     if (device_token_store) {
-        svr.Get("/api/v1/device-tokens",
+        sink.Get("/api/v1/device-tokens",
                 [auth_fn, perm_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "DeviceToken", "Read")) return;
                     auto session = auth_fn(req, res);
@@ -1562,7 +1810,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/device-tokens",
+        sink.Post("/api/v1/device-tokens",
                  [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1590,7 +1838,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
                  });
 
-        svr.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
+        sink.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
                    [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
                        auto session = auth_fn(req, res);
                        if (!session) return;
@@ -1609,7 +1857,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── Software Deployment (capability 7.6) ──────────────────────────────
 
     if (sw_deploy_store) {
-        svr.Get("/api/v1/software-packages",
+        sink.Get("/api/v1/software-packages",
                 [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
                     auto pkgs = sw_deploy_store->list_packages();
@@ -1625,7 +1873,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/software-packages",
+        sink.Post("/api/v1/software-packages",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1667,7 +1915,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Get("/api/v1/software-deployments",
+        sink.Get("/api/v1/software-deployments",
                 [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
                     auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
@@ -1687,7 +1935,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                     "application/json");
                 });
 
-        svr.Post("/api/v1/software-deployments",
+        sink.Post("/api/v1/software-deployments",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1713,7 +1961,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1728,7 +1976,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      }
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1743,7 +1991,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      }
                  });
 
-        svr.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
+        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1762,7 +2010,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     // ── License Management (capability 22.3) ──────────────────────────────
 
     if (license_store) {
-        svr.Get("/api/v1/license",
+        sink.Get("/api/v1/license",
                 [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "License", "Read")) return;
                     auto lic = license_store->get_active_license();
@@ -1784,7 +2032,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     res.set_content(ok_json(data), "application/json");
                 });
 
-        svr.Post("/api/v1/license",
+        sink.Post("/api/v1/license",
                  [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                      auto session = auth_fn(req, res);
                      if (!session) return;
@@ -1814,7 +2062,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                  });
 
-        svr.Delete(R"(/api/v1/license/([a-f0-9]+))",
+        sink.Delete(R"(/api/v1/license/([a-f0-9]+))",
                    [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                        auto session = auth_fn(req, res);
                        if (!session) return;
@@ -1829,7 +2077,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                        }
                    });
 
-        svr.Get("/api/v1/license/alerts",
+        sink.Get("/api/v1/license/alerts",
                 [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
                     if (!perm_fn(req, res, "License", "Read")) return;
                     bool unack = req.has_param("unacknowledged");
@@ -1850,7 +2098,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Topology (capability 22.2) ─ REST endpoint ────────────────────────
 
-    svr.Get("/api/v1/topology",
+    sink.Get("/api/v1/topology",
             [perm_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read")) return;
                 // Topology data is assembled from in-memory agent registry in server.cpp
@@ -1863,7 +2111,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── Statistics (capability 22.6) ─ REST endpoint ──────────────────────
 
-    svr.Get("/api/v1/statistics",
+    sink.Get("/api/v1/statistics",
             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read")) return;
                 auto fleet = execution_tracker->get_fleet_summary();
@@ -1881,7 +2129,7 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
     // Receives files uploaded by the content_dist plugin's upload_file action.
-    svr.Post("/api/v1/file-retrieval",
+    sink.Post("/api/v1/file-retrieval",
             [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "FileRetrieval", "Write")) return;
 
@@ -1913,6 +2161,425 @@ void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     .str();
                 res.set_content(ok_json(data), "application/json");
             });
+
+    // ── Guardian / Guaranteed State (/api/v1/guaranteed-state) ────────────
+    // PR 2 of the Guardian Windows-first rollout. Endpoints follow design
+    // doc §9.2. RBAC securable type is "GuaranteedState" with operations
+    // Read/Write/Delete/Push (Push is a new op seeded by rbac_store).
+    //
+    // Re-parsing YAML for the denormalised columns is intentionally NOT
+    // done here — yaml-cpp is not a server-side dep. Callers pass severity
+    // / os_target / scope_expr alongside yaml_source in the JSON body
+    // (matches how `instruction_store` ingests YAML from the dashboard).
+
+    auto iso_now = []() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#if defined(_WIN32)
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        return std::string(buf);
+    };
+
+    auto rule_to_jobj = [](const GuaranteedStateRuleRow& r) {
+        JObj o;
+        o.add("rule_id", r.rule_id)
+            .add("name", r.name)
+            .add("yaml_source", r.yaml_source)
+            .add("version", static_cast<int64_t>(r.version))
+            .add("enabled", r.enabled)
+            .add("enforcement_mode", r.enforcement_mode)
+            .add("severity", r.severity)
+            .add("os_target", r.os_target)
+            .add("scope_expr", r.scope_expr)
+            .add("created_at", r.created_at)
+            .add("updated_at", r.updated_at)
+            .add("created_by", r.created_by)
+            .add("updated_by", r.updated_by);
+        return o;
+    };
+
+    sink.Get("/api/v1/guaranteed-state/rules",
+        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto rows = guaranteed_state_store->list_rules();
+            JArr arr;
+            for (const auto& r : rows) arr.add(rule_to_jobj(r));
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                            "application/json");
+        });
+
+    sink.Post("/api/v1/guaranteed-state/rules",
+        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            GuaranteedStateRuleRow row;
+            row.rule_id          = body.value("rule_id", "");
+            row.name             = body.value("name", "");
+            row.yaml_source      = body.value("yaml_source", "");
+            row.version          = body.value("version", int64_t{1});
+            row.enabled          = body.value("enabled", true);
+            row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
+            row.severity         = body.value("severity", std::string{"medium"});
+            row.os_target        = body.value("os_target", std::string{""});
+            row.scope_expr       = body.value("scope_expr", std::string{""});
+            if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+                res.status = 400;
+                res.set_content(error_json("rule_id, name, and yaml_source are required"),
+                                "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (session) {
+                row.created_by = session->username;
+                row.updated_by = session->username;
+            }
+            row.created_at = iso_now();
+            row.updated_at = row.created_at;
+
+            auto result = guaranteed_state_store->create_rule(row);
+            if (!result) {
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                    "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(error_json(result.error()), "application/json");
+                }
+                audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
+                         row.rule_id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.create", "success", "GuaranteedState",
+                     row.rule_id, row.name);
+            res.status = 201;
+            res.set_content(ok_json(JObj().add("rule_id", row.rule_id).str()),
+                            "application/json");
+        });
+
+    sink.Get(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                         httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto row = guaranteed_state_store->get_rule(id);
+            if (!row) {
+                res.status = 404;
+                res.set_content(error_json("rule not found"), "application/json");
+                return;
+            }
+            res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
+        });
+
+    sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
+            const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto existing = guaranteed_state_store->get_rule(id);
+            if (!existing) {
+                res.status = 404;
+                res.set_content(error_json("rule not found"), "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                // Mirror the /push handler's invalid-body audit (BL-6): a
+                // mutating REST path that rejects a malformed body should
+                // leave a denied audit trail so SIEM sees the probe/fuzz
+                // attempt. Asymmetric audit coverage across sibling branches
+                // was flagged as UP-R1 in the Guardian PR 2 governance re-run.
+                audit_fn(req, "guaranteed_state.rule.update", "denied",
+                         "GuaranteedState", id, "invalid JSON body");
+                return;
+            }
+            auto updated = *existing;
+            // Use body.value<T>(k, default) rather than body["k"].get<T>()
+            // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
+            // falls back to the existing value rather than throwing
+            // nlohmann::json::type_error. nlohmann throws from get<T>() on
+            // mismatch; without a server-wide set_exception_handler on
+            // web_server_ (none installed), httplib's default path returns
+            // HTTP 500 with an empty body. That converts a client-error
+            // request-shape mistake into a server-error alertable event.
+            // Mirrors the POST handler's body.value(...) pattern.
+            updated.name             = body.value("name", updated.name);
+            updated.yaml_source      = body.value("yaml_source", updated.yaml_source);
+            updated.enabled          = body.value("enabled", updated.enabled);
+            updated.enforcement_mode = body.value("enforcement_mode", updated.enforcement_mode);
+            updated.severity         = body.value("severity", updated.severity);
+            updated.os_target        = body.value("os_target", updated.os_target);
+            updated.scope_expr       = body.value("scope_expr", updated.scope_expr);
+            updated.version = existing->version + 1;
+            updated.updated_at = iso_now();
+            auto session = auth_fn(req, res);
+            if (session) updated.updated_by = session->username;
+
+            auto result = guaranteed_state_store->update_rule(updated);
+            if (!result) {
+                if (is_conflict_error(result.error())) {
+                    res.status = 409;
+                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                    "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(error_json(result.error()), "application/json");
+                }
+                audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState",
+                         id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.update", "success", "GuaranteedState",
+                     id, updated.name);
+            res.set_content(ok_json(JObj().add("updated", true)
+                                          .add("version", static_cast<int64_t>(updated.version)).str()),
+                            "application/json");
+        });
+
+    sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
+        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Delete")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            auto result = guaranteed_state_store->delete_rule(id);
+            if (!result) {
+                res.status = 404;
+                res.set_content(error_json(result.error()), "application/json");
+                audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
+                         id, result.error());
+                return;
+            }
+            audit_fn(req, "guaranteed_state.rule.delete", "success", "GuaranteedState",
+                     id, "");
+            res.set_content(ok_json(JObj().add("deleted", true).str()),
+                            "application/json");
+        });
+
+    // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
+    // expansion). PR 2 acks the request and audits the operator action so
+    // dashboards and audit-trail tooling can be exercised end-to-end now.
+    sink.Post("/api/v1/guaranteed-state/push",
+        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Push")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "invalid JSON body");
+                return;
+            }
+            if (body.is_null()) body = nlohmann::json::object();
+            std::string scope = body.value("scope", std::string{""});
+            bool full_sync = body.value("full_sync", false);
+            const auto rule_count = guaranteed_state_store->rule_count();
+            // Sanitize scope before embedding in the audit detail: operators
+            // with GuaranteedState:Push can otherwise post a scope containing
+            // raw quotes, CR/LF, NULs, or pipes, which appear verbatim in the
+            // detail string and corrupt SIEM parsers that tokenise on quoted
+            // strings or split on newlines (log-injection, SOC 2 audit-trail
+            // integrity). Dropping control bytes and backslash-escaping `"`
+            // and `\` preserves every printable scope DSL expression while
+            // neutering the injection vector. audit_store stores the string
+            // as an opaque column, so the sanitization is defensive at the
+            // SIEM layer only — but that is the layer SOC 2 Workstream F
+            // evidence is reconstructed from.
+            auto sanitize_audit_string = [](const std::string& s) {
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s) {
+                    if (c == '"' || c == '\\') {
+                        out += '\\';
+                        out += c;
+                    } else if (static_cast<unsigned char>(c) < 0x20 ||
+                               static_cast<unsigned char>(c) == 0x7F) {
+                        // Drop control bytes (CR/LF/NUL/TAB and all C0/DEL).
+                        // Keeping them as escapes would still let an attacker
+                        // embed "\\n\\n" to visually split a SIEM view; better
+                        // to erase. Non-ASCII UTF-8 (>= 0x80) is preserved.
+                    } else {
+                        out += c;
+                    }
+                }
+                return out;
+            };
+            // target_id is reserved for a concrete entity id across every other
+            // audit emission in this file (rule_id, agent_id, group_id, token_id).
+            // The push scope expression is a fleet-level selector, not an entity
+            // id, so emit it in `detail` and leave target_id empty to preserve
+            // the SIEM join semantics. Result vocabulary stays "success" (202 is
+            // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+            audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
+                     "rules=" + std::to_string(rule_count) +
+                     " full_sync=" + (full_sync ? "true" : "false") +
+                     " scope=\"" + sanitize_audit_string(scope) + "\"" +
+                     " fan_out_deferred_pr3=true");
+            res.status = 202;
+            res.set_content(ok_json(JObj()
+                                        .add("queued", true)
+                                        .add("rules", static_cast<int64_t>(rule_count))
+                                        .add("scope", scope)
+                                        .add("note", "push accepted; agent delivery is asynchronous").str()),
+                            "application/json");
+        });
+
+    // GET /events — query events with optional filters. Mirrors
+    // `audit_store` query semantics. Caps `limit` at 1000 at the REST
+    // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
+    sink.Get("/api/v1/guaranteed-state/events",
+        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!guaranteed_state_store) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503),
+                                "application/json");
+                return;
+            }
+            GuaranteedStateEventQuery q;
+            q.rule_id  = req.has_param("rule_id")  ? req.get_param_value("rule_id")  : "";
+            q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+            q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+            if (req.has_param("limit")) {
+                int v = 0;
+                auto s = req.get_param_value("limit");
+                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                if (ec != std::errc{} || v < 0) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid limit"), "application/json");
+                    return;
+                }
+                q.limit = std::min(v, 1000);
+            }
+            if (req.has_param("offset")) {
+                int v = 0;
+                auto s = req.get_param_value("offset");
+                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+                if (ec != std::errc{} || v < 0) {
+                    res.status = 400;
+                    res.set_content(error_json("invalid offset"), "application/json");
+                    return;
+                }
+                q.offset = v;
+            }
+            auto rows = guaranteed_state_store->query_events(q);
+            JArr arr;
+            for (const auto& e : rows) {
+                arr.add(JObj()
+                            .add("event_id", e.event_id)
+                            .add("rule_id", e.rule_id)
+                            .add("agent_id", e.agent_id)
+                            .add("event_type", e.event_type)
+                            .add("severity", e.severity)
+                            .add("guard_type", e.guard_type)
+                            .add("guard_category", e.guard_category)
+                            .add("detected_value", e.detected_value)
+                            .add("expected_value", e.expected_value)
+                            .add("remediation_action", e.remediation_action)
+                            .add("remediation_success", e.remediation_success)
+                            .add("detection_latency_us",
+                                 static_cast<int64_t>(e.detection_latency_us))
+                            .add("remediation_latency_us",
+                                 static_cast<int64_t>(e.remediation_latency_us))
+                            .add("timestamp", e.timestamp));
+            }
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()),
+                                      static_cast<int64_t>(q.offset)),
+                            "application/json");
+        });
+
+    // GET /status, /status/:agent_id, /alerts — placeholders that respond
+    // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
+    // (status) and PR 11 (alerts). Returning empty structures now keeps
+    // dashboard fragments and audit tooling exercisable against the API.
+    // Field names match the agent-side proto `GuaranteedStateStatus`
+    // (compliant_rules / drifted_rules / errored_rules) so REST and proto
+    // schemas do not diverge when PR 4 wires real aggregation.
+    sink.Get("/api/v1/guaranteed-state/status",
+        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
+            res.set_content(ok_json(JObj()
+                                        .add("total_rules", static_cast<int64_t>(rules))
+                                        .add("compliant_rules", 0)
+                                        .add("drifted_rules", 0)
+                                        .add("errored_rules", 0)
+                                        .add("note", "fleet aggregation lands in Guardian PR 4")
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get(R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
+        [perm_fn](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            auto agent_id = req.matches[1].str();
+            res.set_content(ok_json(JObj()
+                                        .add("agent_id", agent_id)
+                                        .add("total_rules", 0)
+                                        .add("compliant_rules", 0)
+                                        .add("drifted_rules", 0)
+                                        .add("errored_rules", 0)
+                                        .add("note", "per-agent status lands in Guardian PR 4")
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get("/api/v1/guaranteed-state/alerts",
+        [perm_fn](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            res.set_content(list_json("[]", 0), "application/json");
+        });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }

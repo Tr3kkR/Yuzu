@@ -136,6 +136,8 @@ wait_for_port() {
             return 1
         fi
     done
+    # SRE-2 — surface cold-start duration so future drift is visible.
+    echo "  ✓ $name bound to :$port in ${elapsed}s"
     return 0
 }
 
@@ -322,7 +324,7 @@ start_all() {
         > "$UAT_DIR/server.log" 2>&1 &
     disown
 
-    if ! wait_for_port 8080 "yuzu-server" 10; then
+    if ! wait_for_port 8080 "yuzu-server" 30; then
         fail "Server failed to start — check $UAT_DIR/server.log"
         exit 1
     fi

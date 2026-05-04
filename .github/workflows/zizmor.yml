@@ -1,0 +1,89 @@
+name: Zizmor GitHub Actions static analysis
+
+# Zizmor (https://docs.zizmor.sh) is a static analyzer for GitHub Actions
+# workflow YAML. It catches template-injection (`${{ github.event.* }}`
+# interpolated into shell), over-privileged GITHUB_TOKEN grants, mutable
+# action tag references that bypass SHA-pinning, artifact-exfil patterns,
+# dangerous triggers (`pull_request_target` without ref discipline), etc.
+#
+# Triggered on workflow-touching PRs + pushes to main + weekly + manual.
+# Findings are uploaded as SARIF to the GitHub Security tab (category
+# `zizmor`) so they live alongside CodeQL and Scorecard findings.
+#
+# References:
+#   - https://github.com/zizmorcore/zizmor
+#   - https://github.com/zizmorcore/zizmor-action
+#   - LLVM reference: https://github.com/llvm/llvm-project/blob/main/.github/workflows/zizmor.yml
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/workflows/zizmor.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - '.github/workflows/zizmor.yml'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Zizmor workflow audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Deterministic guard against the deprecated `save-always: true`
+      # input on `actions/cache`. The cache maintainers documented it as
+      # "does not work as intended" and recommend a split
+      # `actions/cache/restore` + `actions/cache/save` (gated on
+      # `if: always() && cache-hit != 'true'`) instead. This step fails
+      # the workflow if `save-always` reappears in any workflow YAML so
+      # the non-use becomes structural rather than convention.
+      # Reference: https://github.com/actions/cache/tree/main/save#always-save-cache
+      - name: Guard — no save-always on actions/cache
+        run: |
+          set -eu
+          # Match only the actual YAML key (line begins, after optional
+          # whitespace, with `save-always:`). Comments containing the
+          # phrase — including this one — are excluded by the leading
+          # whitespace + literal `s` anchor. `|| true` keeps set -e happy
+          # on the no-match case.
+          hits=$(grep -rIn --include='*.yml' --include='*.yaml' \
+            -E '^[[:space:]]*save-always:' \
+            .github/workflows .github/actions 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "::error::save-always: is deprecated and forbidden — see https://github.com/actions/cache/tree/main/save#always-save-cache"
+            echo "$hits"
+            exit 1
+          fi
+          echo "save-always check: clean"
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+        with:
+          # Audit everything under .github/workflows/ and reusable
+          # composite actions. The action uploads SARIF itself.
+          inputs: ./.github

@@ -245,15 +245,55 @@ the `Policy:Read` or `Policy:Write` RBAC permission.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/policy-fragments` | List all fragments. Query params: `name`, `limit`. |
-| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Body: `{"yaml_source": "..."}`. |
+| `POST` | `/api/policy-fragments` | Create a fragment from YAML. Body must be a complete YAML document or a JSON envelope `{"yaml_source": "<full YAML>"}` — see worked example below. |
 | `DELETE` | `/api/policy-fragments/{id}` | Delete a fragment by ID. |
+
+#### Worked example — `POST /api/policy-fragments`
+
+The `kind` is a **YAML field** inside the body, not an HTTP query
+parameter or top-level JSON key. The server checks `kind: PolicyFragment`
+on the parsed YAML; sending `?kind=PolicyFragment` in the URL or
+`{"kind":"PolicyFragment"}` outside `yaml_source` is silently ignored. If
+the YAML is missing the `kind:` line you'll get an HTTP 400 with the full
+expected schema in the error body.
+
+**JSON envelope (recommended for programmatic callers):**
+
+```bash
+curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Content-Type: application/json" \
+  -b cookie -d '{
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nmetadata:\n  name: ssh-disabled\nspec:\n  check:\n    plugin: services\n    action: status\n    parameters: { name: sshd }\n    compliance: \"result.state != \\\"running\\\"\"\n"
+  }'
+```
+
+**Raw YAML body (alternative — content-type other than `application/json`):**
+
+```bash
+curl -X POST http://localhost:8080/api/policy-fragments \
+  -H "Content-Type: application/yaml" \
+  -b cookie --data-binary @- <<'EOF'
+apiVersion: yuzu.io/v1alpha1
+kind: PolicyFragment
+metadata:
+  name: ssh-disabled
+spec:
+  check:
+    plugin: services
+    action: status
+    parameters: { name: sshd }
+    compliance: 'result.state != "running"'
+EOF
+```
+
+Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 
 ### Policies
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. |
-| `POST` | `/api/policies` | Create a policy from YAML. Body: `{"yaml_source": "..."}`. |
+| `POST` | `/api/policies` | Create a policy from YAML. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
 | `GET` | `/api/policies/{id}` | Get policy detail including compliance summary. |
 | `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. |
 | `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. |

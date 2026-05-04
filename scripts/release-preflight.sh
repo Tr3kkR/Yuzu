@@ -61,13 +61,29 @@ else
     fail "Dockerfile.server CMD missing --data-dir"
 fi
 
-# ── 7. All cache steps in release.yml have save-always ────────────────────
-CACHE_COUNT=$(grep -c 'actions/cache@v4' .github/workflows/release.yml)
-SAVE_ALWAYS_COUNT=$(grep -c 'save-always: true' .github/workflows/release.yml)
-if [ "$CACHE_COUNT" -eq "$SAVE_ALWAYS_COUNT" ]; then
-    pass "All $CACHE_COUNT cache steps have save-always: true"
+# ── 7. release.yml uses cache/restore only, never cache (save) ────────────
+# Release builds consume cache, never produce — each tag is a unique
+# commit so the file-hash key never matches anything a future release
+# could benefit from. Paying the cache writeback cost on every release
+# blew the Linux 45-min job budget during v0.11.0 retags (Post Cache
+# ccache spent 28.5 min uploading data nobody would re-read). Enforce
+# that only `actions/cache/restore@` references appear in release.yml
+# — bare `actions/cache@` would re-introduce the save phase and the
+# timeout regression. The previous check enforced `save-always: true`,
+# but the action authors deprecated that input as "does not work as
+# intended", so the invariant flipped: now we enforce its absence.
+BARE_CACHE_COUNT=$(grep -cE 'actions/cache@([0-9a-f]{40}|v[0-9]+)' .github/workflows/release.yml || true)
+RESTORE_CACHE_COUNT=$(grep -cE 'actions/cache/restore@([0-9a-f]{40}|v[0-9]+)' .github/workflows/release.yml || true)
+# Match YAML input only (whitespace-then-key), not comments mentioning the
+# string. Without the `^\s*` anchor the regex caught the inline comment
+# block in release.yml that explains why save-always was removed.
+SAVE_ALWAYS_COUNT=$(grep -cE '^\s*save-always:' .github/workflows/release.yml || true)
+if [ "$BARE_CACHE_COUNT" -gt 0 ]; then
+    fail "$BARE_CACHE_COUNT bare actions/cache@ references in release.yml — must be actions/cache/restore@ (release builds consume cache, never produce)"
+elif [ "$SAVE_ALWAYS_COUNT" -gt 0 ]; then
+    fail "$SAVE_ALWAYS_COUNT save-always: references in release.yml — input is deprecated and the cache surgery removed the save phase"
 else
-    fail "$SAVE_ALWAYS_COUNT/$CACHE_COUNT cache steps have save-always: true"
+    pass "All $RESTORE_CACHE_COUNT cache steps in release.yml are restore-only (no save phase, no save-always)"
 fi
 
 # ── 8. docker-compose.full-uat.yml has --data-dir ─────────────────────────
@@ -77,7 +93,28 @@ else
     fail "docker-compose.full-uat.yml missing --data-dir"
 fi
 
-# ── 9. Full build validation (optional) ──────────────────────────────────
+# ── 9. dev / main reconciliation ──────────────────────────────────────────
+# Releases tag from main. If main is missing commits that are on dev, the
+# tag will not include them — and worse, if main has commits not on dev
+# (typical leftover release-prep commits from prior releases), continued
+# work on dev keeps diverging silently. This check is hard FAIL per the
+# /release skill's "this catches us every time" lesson — surface the
+# divergence at preflight rather than at tag-time-or-later.
+if git ls-remote --exit-code --heads origin main >/dev/null 2>&1 \
+   && git ls-remote --exit-code --heads origin dev >/dev/null 2>&1; then
+    git fetch --quiet origin main dev 2>/dev/null || true
+    DEV_AHEAD=$(git rev-list --count origin/main..origin/dev 2>/dev/null || echo 0)
+    MAIN_AHEAD=$(git rev-list --count origin/dev..origin/main 2>/dev/null || echo 0)
+    if [ "$DEV_AHEAD" = "0" ] && [ "$MAIN_AHEAD" = "0" ]; then
+        pass "origin/dev and origin/main reconciled (no divergence)"
+    else
+        fail "origin/dev and origin/main diverged: dev is $DEV_AHEAD ahead, main is $MAIN_AHEAD ahead — reconcile before tagging (see /release skill 'Phase 0.5 — Branch reconciliation')"
+    fi
+else
+    pass "skipping dev/main reconciliation check (one or both branches missing on origin)"
+fi
+
+# ── 10. Full build validation (optional) ─────────────────────────────────
 if [ "$FULL" = "--full" ]; then
     echo ""
     echo "  --- Full build validation ---"

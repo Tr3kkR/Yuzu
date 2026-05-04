@@ -21,25 +21,30 @@ th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--border);
 th{color:var(--muted);font-weight:600}
 .empty-state{color:var(--muted);text-align:center;padding:2rem}
 .status-badge{display:inline-block;padding:.1rem .5rem;border-radius:1rem;font-size:.7rem;font-weight:600}
-.status-pending{background:var(--yellow);color:#0d1117}
-.status-running{background:#1f6feb;color:#fff}
-.status-completed{background:var(--green);color:#fff}
-.status-cancelled{background:var(--subtle);color:#fff}
-.status-failed{background:var(--red);color:#fff}
-.status-approved{background:var(--green);color:#fff}
-.status-rejected{background:var(--red);color:#fff}
+.status-pending{background:var(--yellow);color: var(--mds-color-theme-background-canvas)}
+.status-running{background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent)}
+.status-completed{background:var(--green);color:var(--mds-color-text-on-accent)}
+/* PR 3 hardening (ca-PR3-7): per-agent renderer + SSE swap canonicalised
+   on DOM vocabulary status-{succeeded,failed,running,pending}. .status-succeeded
+   is the canonical agent/exec success class going forward; .status-completed
+   stays for backwards-compat on existing fragments. */
+.status-succeeded{background:var(--green);color:var(--mds-color-text-on-accent)}
+.status-cancelled{background:var(--subtle);color:var(--mds-color-text-on-accent)}
+.status-failed{background:var(--red);color:var(--mds-color-text-on-accent)}
+.status-approved{background:var(--green);color:var(--mds-color-text-on-accent)}
+.status-rejected{background:var(--red);color:var(--mds-color-text-on-accent)}
 /* Instruction-page button overrides (smaller, denser) */
 .btn{height:auto;padding:.3rem .8rem;font-size:.75rem;margin-right:.3rem}
-.btn-primary{background:var(--green);color:#fff}
+.btn-primary{background:var(--green);color:var(--mds-color-text-on-accent)}
 .btn-secondary{background:var(--surface);color:var(--fg);border:1px solid var(--border)}
-.btn-danger{background:var(--red);color:#fff}
+.btn-danger{background:var(--red);color:var(--mds-color-text-on-accent)}
 .btn-sm{padding:.2rem .5rem;font-size:.7rem}
 .progress-bar{width:80px;height:8px;background:var(--border);border-radius:4px;display:inline-block;vertical-align:middle}
 .progress-fill{height:100%;background:var(--green);border-radius:4px}
 code{background:var(--surface);padding:.1rem .3rem;border-radius:4px;font-size:.75rem}
 .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem}
 .role-badge{display:inline-block;padding:.1rem .4rem;border-radius:4px;font-size:.65rem;
-  font-weight:600;background:#1f6feb;color:#fff;margin-left:.5rem;vertical-align:middle}
+  font-weight:600;background:var(--mds-color-theme-accent-primary-active);color:var(--mds-color-text-on-accent);margin-left:.5rem;vertical-align:middle}
 /* Editor panel */
 .editor-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem;margin-bottom:1rem;display:none}
 .editor-panel.active{display:block}
@@ -56,18 +61,18 @@ input,select,textarea{background:var(--bg);border:1px solid var(--border);border
 textarea{font-family:var(--font-mono);min-height:300px;resize:vertical;tab-size:2}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 /* Syntax token colors — GitHub-dark-inspired */
-.yk{color:#79c0ff}                     /* YAML key */
-.yv{color:#a5d6ff}                     /* YAML string value */
-.yc{color:#8b949e;font-style:italic}   /* comment */
-.ya{color:#d2a8ff}                     /* apiVersion / kind (schema keywords) */
-.yt-q{color:#7ee787}                   /* type: question — green (safe, read-only) */
-.yt-a{color:#ffa657;font-weight:700}   /* type: action — orange bold (privileged, modifying) */
-.yap{color:#ff7b72;font-weight:700}    /* approval: always — red bold (requires sign-off) */
-.yap-auto{color:#7ee787}              /* approval: auto — green (no gate) */
-.ycc{color:#d29922}                    /* concurrency mode — amber */
-.yn{color:#79c0ff}                     /* numeric values */
-.yb{color:#ff7b72}                     /* boolean values */
-.yd{color:#8b949e}                     /* dashes (list markers) */
+.yk{color: var(--mds-color-indicator-info-bright)}                     /* YAML key */
+.yv{color:var(--mds-color-indicator-info-bright)} /* YAML string value */
+.yc{color: var(--mds-color-theme-text-tertiary);font-style:italic}   /* comment */
+.ya{color: var(--mds-color-indicator-special)}                     /* apiVersion / kind (schema keywords) */
+.yt-q{color: var(--mds-color-indicator-success-bright)}                   /* type: question — green (safe, read-only) */
+.yt-a{color: var(--mds-color-indicator-attention);font-weight:700}   /* type: action — orange bold (privileged, modifying) */
+.yap{color: var(--mds-color-indicator-error-bright);font-weight:700}    /* approval: always — red bold (requires sign-off) */
+.yap-auto{color: var(--mds-color-indicator-success-bright)}              /* approval: auto — green (no gate) */
+.ycc{color: var(--mds-color-theme-indicator-warning)}                    /* concurrency mode — amber */
+.yn{color: var(--mds-color-indicator-info-bright)}                     /* numeric values */
+.yb{color: var(--mds-color-indicator-error-bright)}                     /* boolean values */
+.yd{color: var(--mds-color-theme-text-tertiary)}                     /* dashes (list markers) */
 /* Legend */
 .yaml-legend{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.5rem;font-size:.7rem}
 .yaml-legend span{display:flex;align-items:center;gap:.3rem}
@@ -75,7 +80,64 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 .form-actions{margin-top:1rem;display:flex;gap:.5rem}
 /* alert overrides (shared .alert base from yuzu.css, page-specific padding) */
 .alert{padding:.5rem 1rem;font-size:.8rem;margin-bottom:.8rem}
-.legacy-badge{font-size:.65rem;background:#6e7681;color:#fff;padding:.05rem .4rem;border-radius:3px}
+.legacy-badge{font-size:.65rem;background:var(--mds-color-theme-outline-secondary);color:var(--mds-color-text-on-accent);padding:.05rem .4rem;border-radius:3px}
+/* Executions tab — clickable rows + per-execution detail drawer.
+   Information-design conventions:
+     - Status as hue + icon + row stripe (two channels for colorblind safety).
+     - Sparkbar widths = counts (length channel); hue = status (hue channel).
+     - KPI strip carries the headline; tables carry the long tail.
+     - Agent grid is small-multiples; one cell per agent, color by status. */
+.exec-table{width:100%}
+.exec-row{cursor:pointer}
+.exec-row:hover{background:var(--mds-color-state-hover)}
+.exec-row.expanded{background:var(--mds-color-state-selected)}
+.exec-row--failed>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-error)}
+.exec-row--running>td:first-child{box-shadow:inset 3px 0 0 var(--mds-color-theme-indicator-stable)}
+.exec-row:focus{outline:2px solid var(--accent);outline-offset:-2px}
+.exec-def-name{font-weight:600}
+.exec-agent-count{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.exec-error-preview{font-family:var(--font-mono);font-size:.7rem;color:var(--mds-color-theme-indicator-error);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exec-time{font-size:.7rem;color:var(--muted);white-space:nowrap}
+.status-sparkbar{display:block}
+.exec-detail{display:none}
+.exec-detail.open{display:table-row}
+.exec-detail>td{padding:1rem!important;background:var(--mds-color-theme-bg-secondary,var(--bg))}
+.exec-detail-grid{display:grid;gap:1rem;grid-template-columns:1fr minmax(220px,320px)}
+@media (max-width:900px){.exec-detail-grid{grid-template-columns:1fr}}
+.exec-detail-grid h4{margin:0 0 .3rem 0;font-size:.7rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em}
+.exec-kpi-strip{display:flex;flex-wrap:wrap;gap:1.5rem;grid-column:1/-1;padding-bottom:.5rem;border-bottom:1px solid var(--border)}
+.exec-kpi{min-width:7rem}
+.exec-kpi-value{font-size:1.5rem;font-weight:600;line-height:1.1}
+.exec-kpi-value--ok{color:var(--green)}
+.exec-kpi-value--err{color:var(--red)}
+.exec-kpi-label{font-size:.65rem;color:var(--mds-color-theme-text-tertiary);text-transform:uppercase;letter-spacing:.05em;margin-top:.2rem}
+.agent-grid-wrap{grid-column:1/-1}
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,12px);gap:2px;max-height:200px;overflow-y:auto}
+.agent-cell{width:12px;height:12px;border-radius:2px;cursor:pointer}
+.agent-cell--bucket{width:auto;height:18px;display:flex;align-items:center;justify-content:center;font-size:.65rem;color:var(--mds-color-text-on-accent);padding:0 .3rem;border-radius:3px}
+.agent-cell--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
+.agent-cell--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
+.agent-cell--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
+.agent-cell--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
+.per-agent-table-wrap{grid-column:1}
+.per-agent-table{font-size:.75rem}
+.per-agent-table td{vertical-align:middle}
+.duration-bar{height:6px;border-radius:3px;display:inline-block;vertical-align:middle;min-width:1px}
+.duration-bar--succeeded{background:var(--mds-color-bg-success-emphasis,var(--green))}
+.duration-bar--failed{background:var(--mds-color-theme-indicator-error,var(--red))}
+.duration-bar--running{background:var(--mds-color-theme-indicator-stable,var(--accent))}
+.duration-bar--pending{background:var(--mds-color-theme-text-tertiary,var(--muted));opacity:.4}
+.duration-text{font-size:.65rem;color:var(--muted);margin-left:.3rem}
+.per-agent-row-highlight{background:var(--mds-color-state-selected)!important;transition:background .3s}
+.per-agent-responses-wrap{grid-column:1}
+.per-agent-responses summary{cursor:pointer;font-size:.75rem;color:var(--muted);padding:.3rem 0}
+.per-agent-responses-table{font-size:.7rem}
+.resp-output pre{margin:.3rem 0;padding:.3rem;background:var(--bg);border-radius:3px;max-height:200px;overflow:auto;white-space:pre-wrap}
+.exec-detail-sidebar{grid-column:2;font-size:.75rem}
+@media (max-width:900px){.exec-detail-sidebar{grid-column:1}}
+.exec-detail-sidebar>div{margin-bottom:.5rem}
+.exec-detail-meta-id{font-family:var(--font-mono);font-size:.65rem;color:var(--muted)}
+.exec-detail-scope,.exec-detail-params{display:block;font-size:.7rem;background:var(--bg);padding:.3rem;border-radius:3px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head><body>
 
@@ -86,6 +148,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
   <a href="/" class="nav-link">Dashboard</a>
   <a href="/instructions" class="nav-link active">Instructions</a>
   <a href="/compliance" class="nav-link">Compliance</a>
+  <a href="/tar" class="nav-link">TAR</a>
   <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
   <span class="nav-spacer"></span>
   <span class="nav-user" id="nav-user"></span>
@@ -476,6 +539,201 @@ document.addEventListener('keydown', function(e) {
     window.location.href = '/?palette=1';
   }
 });
+
+/* ── Executions drawer toggle ─────────────────────────────────────────────
+   Modeled on dashboard_ui.cpp's toggleDetail. Single-drawer-open invariant:
+   clicking a row collapses any other open drawer first so the operator
+   never has two expanded forensic views competing for attention. The HTMX
+   attributes on the row handle the lazy fetch (click once); this function
+   only manages visibility state. */
+/* PR 3 — open EventSources keyed on execution_id. close() the source
+   when the drawer collapses, when the SSE handler emits
+   `execution-completed`, or when the browser navigates away. We hold
+   the Map at module scope rather than on the row so re-rendered drawer
+   markup (HTMX swap) doesn't strand the connection. */
+var execEventSources = (window.execEventSources = window.execEventSources || new Map());
+
+function execCssEsc(s) {
+  if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(s));
+  /* Conservative fallback — escape the chars that can break attribute
+     selectors. The id charset is bounded server-side to 1-128 of
+     [A-Za-z0-9_-] so nothing here should actually need escaping, but
+     we don't trust the assumption on the client. */
+  return String(s).replace(/(["\\])/g, '\\$1');
+}
+
+function execStopLiveUpdates(execId) {
+  var es = execEventSources.get(execId);
+  if (!es) return;
+  try { es.close(); } catch (e) {}
+  execEventSources.delete(execId);
+}
+
+function execApplyAgentTransition(drawerEl, execId, payload) {
+  if (!drawerEl || !payload || !payload.agent_id) return;
+  var status = String(payload.status || '');
+  var safeAgent = execCssEsc(payload.agent_id);
+  var safeExec = execCssEsc(execId);
+  /* Map the wire status to the CSS modifier the renderer used. Server
+     emits raw status (success/failure/timeout/rejected/running/pending). */
+  var domStatus = 'pending';
+  if (status === 'success') domStatus = 'succeeded';
+  else if (status === 'failure' || status === 'timeout' || status === 'rejected') domStatus = 'failed';
+  else if (status === 'running') domStatus = 'running';
+
+  /* Swap the agent-cell modifier so the colour reflects the new status. */
+  var cells = drawerEl.querySelectorAll(
+    '.agent-cell[data-agent-id="' + safeAgent + '"][data-exec-id="' + safeExec + '"]');
+  for (var i = 0; i < cells.length; i++) {
+    var c = cells[i];
+    c.className = c.className.replace(/\bagent-cell--(succeeded|failed|running|pending|success|failure|timeout|rejected)\b/g, '').trim();
+    c.classList.add('agent-cell');
+    c.classList.add('agent-cell--' + domStatus);
+  }
+  /* Update the per-agent table row's status badge + exit code. */
+  var rows = drawerEl.querySelectorAll(
+    'tr[data-agent-id="' + safeAgent + '"][data-exec-id="' + safeExec + '"]');
+  for (var j = 0; j < rows.length; j++) {
+    var badge = rows[j].querySelector('.per-agent-status');
+    if (badge) {
+      badge.textContent = status;
+      // Canonical class vocabulary (ca-PR3-7) — matches the server
+      // renderer in workflow_routes.cpp. Both produce
+      // `.status-{succeeded,failed,running,pending}` so initial
+      // render and SSE live update yield identical class strings.
+      // CSS rules `.status-succeeded` / `.status-failed` /
+      // `.status-running` / `.status-pending` cover the set.
+      badge.className = 'status-badge per-agent-status status-' + domStatus;
+    }
+    var exitTd = rows[j].querySelector('.per-agent-exit-code');
+    if (exitTd && typeof payload.exit_code === 'number') {
+      exitTd.textContent = String(payload.exit_code);
+    }
+  }
+}
+
+function execApplyProgress(drawerEl, execId, payload) {
+  if (!drawerEl || !payload) return;
+  var strip = drawerEl.querySelector('#exec-kpi-' + execCssEsc(execId));
+  if (!strip) return;
+  var values = strip.querySelectorAll('.exec-kpi-value');
+  /* Strip layout: Total / Succeeded / Failed / p50 / p95.
+     Update the first three from counts; p50 / p95 stay on "—" until the
+     next full detail-fragment fetch so we don't re-implement the
+     percentile renderer client-side. */
+  if (values.length >= 3) {
+    if (typeof payload.agents_targeted === 'number')
+      values[0].textContent = String(payload.agents_targeted);
+    if (typeof payload.agents_success === 'number')
+      values[1].textContent = String(payload.agents_success);
+    if (typeof payload.agents_failure === 'number')
+      values[2].textContent = String(payload.agents_failure);
+  }
+}
+
+function execStartLiveUpdates(drawerEl, execId) {
+  if (!execId || execEventSources.has(execId)) return;
+  /* `EventSource` is reused across reconnects via Last-Event-ID; the
+     server ring buffer replays anything we missed. The handler returns
+     410 Gone when the execution is already terminal — the browser
+     surfaces that as `error` and `readyState=CLOSED`. */
+  var url = '/sse/executions/' + encodeURIComponent(execId);
+  var es;
+  try { es = new EventSource(url); } catch (e) { return; }
+  execEventSources.set(execId, es);
+  es.addEventListener('agent-transition', function(ev) {
+    try { execApplyAgentTransition(drawerEl, execId, JSON.parse(ev.data)); }
+    catch (err) {}
+  });
+  es.addEventListener('execution-progress', function(ev) {
+    try { execApplyProgress(drawerEl, execId, JSON.parse(ev.data)); } catch (err) {}
+  });
+  es.addEventListener('execution-completed', function() {
+    execStopLiveUpdates(execId);
+  });
+  es.addEventListener('heartbeat', function() {});
+  es.onerror = function() {
+    /* CONNECTING (0) is the auto-reconnect path — let it work. CLOSED (2)
+       means the server hung up permanently (410 Gone or auth lapsed);
+       drop the source. */
+    if (es.readyState === 2 /* CLOSED */) execStopLiveUpdates(execId);
+  };
+}
+
+function toggleExecDetail(row) {
+  if (!row) return;
+  /* Collapse any other open drawer first. */
+  document.querySelectorAll('.exec-row.expanded').forEach(function(other) {
+    if (other === row) return;
+    other.classList.remove('expanded');
+    var sib = other.nextElementSibling;
+    if (sib && sib.classList.contains('exec-detail')) sib.classList.remove('open');
+    var otherId = other.getAttribute('data-execution-id') || '';
+    if (otherId) execStopLiveUpdates(otherId);
+  });
+  row.classList.toggle('expanded');
+  var det = row.nextElementSibling;
+  var isOpen = false;
+  if (det && det.classList.contains('exec-detail')) {
+    det.classList.toggle('open');
+    isOpen = det.classList.contains('open');
+  }
+  /* Bootstrap / tear down the SSE connection in step with the visual
+     state. We start it only if the row was rendered with status=running
+     or status=pending; the server re-validates and responds 410 if the
+     row turned terminal between LIST render and click. */
+  var execId = row.getAttribute('data-execution-id') || '';
+  var execStatus = row.getAttribute('data-execution-status') || '';
+  if (!execId) return;
+  if (isOpen && (execStatus === 'running' || execStatus === 'pending')) {
+    /* Defer the EventSource open one tick so the htmx swap that fills
+       the drawer body has populated `.exec-detail-content`. The
+       listener queries the DOM under `det` so a too-early connection
+       would fan out into nothing. */
+    setTimeout(function() { execStartLiveUpdates(det, execId); }, 0);
+  } else {
+    execStopLiveUpdates(execId);
+  }
+}
+
+/* Tear down all sources on browser navigation away — fail-safe path.
+   Without this the EventSource stays connected through bfcache and the
+   server holds the per-connection sink_state until httplib's keep-alive
+   timeout (~5s) expires. */
+window.addEventListener('beforeunload', function() {
+  execEventSources.forEach(function(es) { try { es.close(); } catch (e) {} });
+  execEventSources.clear();
+});
+
+/* Delegated listener for agent grid cells.
+   Reads exec_id and agent_id from data-* attributes — never interpolates
+   user-controlled bytes into a JS string literal (UP-1 / sec-L1 fix).
+   Event delegated to document so newly-loaded drawers inherit the binding
+   without re-wiring on every fragment swap. */
+document.addEventListener('click', function(event) {
+  var cell = event.target.closest && event.target.closest('.agent-cell[data-agent-id]');
+  if (!cell) return;
+  event.stopPropagation();
+  var execId = cell.getAttribute('data-exec-id') || '';
+  var agentId = cell.getAttribute('data-agent-id') || '';
+  if (!execId || !agentId) return;
+  /* Build the row id via DOM traversal rather than string concat to avoid
+     any id-collision pitfalls where agent_id contains "row-". */
+  var drawer = cell.closest('.exec-detail-content');
+  if (!drawer) return;
+  var rows = drawer.querySelectorAll('tr[data-agent-id]');
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute('data-agent-id') === agentId &&
+        rows[i].getAttribute('data-exec-id') === execId) {
+      rows[i].scrollIntoView({behavior: 'smooth', block: 'center'});
+      rows[i].classList.add('per-agent-row-highlight');
+      (function(r) {
+        setTimeout(function() { r.classList.remove('per-agent-row-highlight'); }, 1500);
+      })(rows[i]);
+      return;
+    }
+  }
+});
 </script>
 </body></html>
 )HTM";
@@ -565,12 +823,12 @@ extern const char* const kInstructionEditorHtml = R"HTM(
             <div class="form-group full">
                 <label>YAML Source (apiVersion: yuzu.io/v1alpha1)</label>
                 <div class="yaml-legend">
-                    <span><span class="swatch" style="background:#7ee787"></span> question (read-only)</span>
-                    <span><span class="swatch" style="background:#ffa657"></span> action (privileged)</span>
-                    <span><span class="swatch" style="background:#ff7b72"></span> approval required</span>
-                    <span><span class="swatch" style="background:#d29922"></span> concurrency</span>
-                    <span><span class="swatch" style="background:#79c0ff"></span> keys</span>
-                    <span><span class="swatch" style="background:#d2a8ff"></span> schema</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-success-bright)"></span> question (read-only)</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-attention)"></span> action (privileged)</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-error-bright)"></span> approval required</span>
+                    <span><span class="swatch" style="background: var(--mds-color-theme-indicator-warning)"></span> concurrency</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-info-bright)"></span> keys</span>
+                    <span><span class="swatch" style="background: var(--mds-color-indicator-special)"></span> schema</span>
                 </div>
                 <div class="yaml-split">
                     <textarea id="yaml-editor" name="yaml_source"

@@ -111,7 +111,7 @@ The `run()` method uses `goto shutdown_plugins` for error handling. While functi
 - **Session binding across RPCs.** The server records peer identity at `Register()` time and re-validates at `Subscribe()` time (`server.cpp:375-386`). This prevents a malicious agent from hijacking another agent's session by stealing the session ID — the TLS identity must also match.
 - **Pending registration TTL.** Session tokens expire after 60 seconds (`server.cpp:560`), limiting the window for session fixation attacks.
 - **Separate credentials for management listener.** The server supports independent TLS configuration for the management gRPC port (`server.cpp:644-659`), allowing different trust boundaries for agent-facing vs. operator-facing traffic.
-- **Secure defaults.** TLS is enabled by default (`Config::tls_enabled{true}`). Disabling it requires explicit `--no-tls`. Omitting `--ca-cert` without `--allow-one-way-tls` causes a hard failure.
+- **Secure defaults.** TLS is enabled by default (`Config::tls_enabled{true}`). Disabling it requires explicit `--no-tls`. Omitting `--ca-cert` without `--insecure-skip-client-verify` (formerly `--allow-one-way-tls`) causes a hard failure, and the insecure flag itself requires `YUZU_ALLOW_INSECURE_TLS=1` as a second confirmation (issue #79).
 - **Certificate instructions are clear.** `scripts/Certificate Instructions.txt` provides a complete walk-through with correct OpenSSL commands and SAN configuration.
 
 ### Issues
@@ -160,9 +160,9 @@ std::mt19937_64 gen(rd());
 
 Certificates are loaded once at startup. Rotating certificates requires a full process restart. For enterprise deployments with short-lived certificates (e.g., Vault PKI, SPIFFE), this is a significant operational burden.
 
-#### MEDIUM: `--allow-one-way-tls` weakens security silently
+#### MEDIUM: `--allow-one-way-tls` weakens security silently — **resolved (#79, v0.12.0)**
 
-This flag disables client certificate verification with only a `spdlog::warn()`. In a production deployment, accidentally setting this flag would silently downgrade from mTLS to one-way TLS. Consider requiring an additional confirmation or environment variable.
+This flag previously disabled client certificate verification with only a `spdlog::warn()`. As of #79 the flag was renamed to `--insecure-skip-client-verify` and now requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation. The server logs an ERROR-level startup banner and a recurring 5-minute reminder while the listener runs in this mode, and the operator dashboard's TLS row turns red and renames the field to "Insecure Skip Client Verify". The deprecated flag name is still accepted for one release with a startup deprecation warning, then will be removed.
 
 ---
 

@@ -1,6 +1,90 @@
-catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+if host_os == 'windows'
+  # Same #375-class IMPORTED_LOCATION_RELEASE problem as protobuf/grpc/cli11
+  # in the top-level meson.build: meson's cmake dep translator picks
+  # the release-CRT Catch2 lib for both debug and release consumers,
+  # so a debug test binary linking with /MDd against release Catch2
+  # trips dozens of LNK2038 _ITERATOR_DEBUG_LEVEL mismatches.
+  #
+  # Catch2's vcpkg layout (verified against vcpkg_installed/x64-linux/
+  # — same convention on Windows with .lib instead of .a):
+  #
+  #   lib/Catch2.lib                              <- base lib
+  #   lib/manual-link/Catch2Main.lib              <- defines main()
+  #   debug/lib/Catch2d.lib                       <- debug, `d` suffix
+  #   debug/lib/manual-link/Catch2Maind.lib
+  #
+  # Three quirks:
+  #   1. Two libs in two directories. Catch2 is in plain lib/; only
+  #      Catch2Main lives in lib/manual-link/. (vcpkg convention:
+  #      libs that define main() — that the consumer must explicitly
+  #      opt into linking — go in manual-link/.)
+  #   2. The lib file is named Catch2Main, NOT Catch2WithMain. The
+  #      cmake TARGET is Catch2::Catch2WithMain but the underlying
+  #      filename omits the "With".
+  #   3. Same `d` suffix convention as protobuf for the debug variant.
+  #      _pbd is established in the top-level Windows block ('' for
+  #      release, 'd' for debug).
+  _cxx_tests = meson.get_compiler('cpp')
+  _libcatch2     = _cxx_tests.find_library('Catch2'     + _pbd, dirs: [_vcpkg_lib_win],                 required: true)
+  _libcatch2main = _cxx_tests.find_library('Catch2Main' + _pbd, dirs: [_vcpkg_lib_win / 'manual-link'], required: true)
+  catch2_dep = declare_dependency(
+    # Reuse the project-root-anchored IncludeDirs object from the top-level
+    # meson.build. Recreating it here with include_directories() would resolve
+    # the relative path against tests/ and fail with "vcpkg_installed/...
+    # does not exist".
+    include_directories: _vcpkg_inc_win,
+    # Order matters: Catch2Main defines main() and references symbols
+    # from Catch2. List Main first so the linker pulls it in, then
+    # Catch2 satisfies the leftover refs.
+    dependencies: [_libcatch2main, _libcatch2],
+  )
+else
+  catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
+endif
+
+# ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
+# Built only when tests are enabled; test_plugin_loader.cpp scans against this
+# shared library to verify the reserved-name rejection path.
+reserved_name_fixture_plugin = shared_library(
+  'reserved_name_fixture_plugin',
+  files('unit/fixtures/reserved_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
 
 # ── Agent unit tests ──────────────────────────────────────────────────────────
+#
+# Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
+#
+#   * Linux + macOS: yuzu_proto_headers_dep (no link_with). The proto
+#     symbols are baked into libyuzu_agent_core.so as `.dynsym` entries
+#     because proto/meson.build compiles with -fvisibility=default. The
+#     test binary resolves them dynamically at runtime → single
+#     descriptor registration → ASan-clean.
+#
+#   * Windows MSVC: yuzu_proto_dep (with link_with). MSVC shared_library
+#     does NOT export symbols by default — there's no equivalent of
+#     -fvisibility=default that lets every symbol cross the DLL boundary
+#     without __declspec(dllexport). So libyuzu_agent_core.dll's import
+#     lib does not surface proto symbols and the test binary must link
+#     yuzu_proto.lib directly. Same proto archive, double-registered —
+#     but ASan isn't part of the Windows MSVC build matrix, so the
+#     duplicate-descriptor CHECK that drove #572 doesn't fire here.
+#
+# Without this split, Windows MSVC fails LNK2019 on every .pb.o symbol
+# in test_guardian_engine.cpp (the canary that surfaces the broken link).
+if host_machine.system() == 'windows'
+  agent_test_proto_dep = yuzu_proto_dep
+else
+  agent_test_proto_dep = yuzu_proto_headers_dep
+endif
+
+# test_plugin_loader.cpp uses OpenSSL CMS APIs to mint test fixtures
+# (CA + signing cert + detached PEM signature) so the verifier tests do not
+# depend on `openssl(1)` at runtime or pre-baked .pem files that drift.
+agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'system')
+
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
@@ -16,14 +100,24 @@ agent_test_exe = executable(
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
     'unit/test_trigger_engine.cpp',
+    'unit/test_guardian_engine.cpp',
     'unit/test_new_plugins.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, catch2_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  # Ensure the fixture plugin is built before the test runs so the lookup
+  # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
+  link_depends: reserved_name_fixture_plugin,
 )
-test('agent unit tests', agent_test_exe, suite: 'agent', timeout: 120)
+test(
+  'agent unit tests',
+  agent_test_exe,
+  suite: 'agent',
+  timeout: 240,
+  depends: reserved_name_fixture_plugin,
+)
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
@@ -33,16 +127,20 @@ tar_test_exe = executable(
   files(
     'unit/test_tar_diff.cpp',
     'unit/test_tar_store.cpp',
+    'unit/test_tar_schema_registry.cpp',
+    'unit/test_tar_warehouse.cpp',
+    'unit/test_tar_aggregator.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
+    '../agents/plugins/tar/src/tar_aggregator.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
   ],
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe, suite: 'tar')
+test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
@@ -60,10 +158,13 @@ if build_server
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_workflow_routes.cpp',
+      'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
       'unit/server/test_execution_tracker.cpp',
+      'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_rbac_store.cpp',
@@ -76,6 +177,7 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_policy_store.cpp',
+      'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
@@ -94,15 +196,37 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_guaranteed_state.cpp',
       'unit/server/test_security_headers.cpp',
+      'unit/server/test_insecure_tls_gate.cpp',
+      'unit/server/test_settings_routes_users.cpp',
+      'unit/server/test_plugin_signing_helpers.cpp',
+      'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_visualization_engine.cpp',
+      'unit/server/test_rest_visualization.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
     ],
-    dependencies: [yuzu_server_core_dep, catch2_dep],
+    # httplib.h is header-only and its Client/Server class layout depends on
+    # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with
+    # https_cpp_args, so any test TU that includes <httplib.h> (directly or
+    # via test_route_sink.hpp / workflow_routes.hpp) MUST match or MSVC emits
+    # C4743 (vtable size mismatch) and the linked binary crashes with
+    # STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on first httplib::Server /
+    # ::Client construction. LISTEN_BACKLOG kept aligned for completeness.
+    cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'],
+    # Server unit tests #include <openssl/...> directly (e.g.
+    # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
+    # propagate the OpenSSL include path, so declare it explicitly here
+    # rather than relying on the transitive declare_dependency carry —
+    # makes the dependency visible to Meson's graph and survives a
+    # future static-merge refactor of yuzu_server_core (governance
+    # hardening round 1, qe-B2).
+    dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 120)
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

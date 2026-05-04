@@ -402,6 +402,75 @@ simplify either half without reading the agent doc first.
 
 ---
 
+## 7. Windows vcpkg `Install vcpkg packages` fails with missing `.pc` file
+
+**Symptom:** Windows CI run repeatedly fails at the `Install vcpkg packages`
+step with:
+
+```
+read_lines("...vcpkg_installed/x64-windows/lib/pkgconfig/<pkg>.pc"): no such file or directory
+```
+
+**Root cause — two distinct paths produce this same symptom:**
+
+1. **`<workspace>/vcpkg_installed/vcpkg/info/<port>_<triplet>.list`
+   desync** (#741, fixed 2026-05-03). The sentinel previously wiped
+   `vcpkg_installed/<triplet>/` on key drift but left the sibling
+   workspace registry intact. The orphaned `info/*.list` files convince
+   the next `vcpkg install` that ports are "already installed" and it
+   skips restoration; post-install pkgconfig validation then fails
+   against the missing `.pc`. The sentinel now wipes both halves of
+   `vcpkg_installed/` together — see `scripts/ci/vcpkg-triplet-sentinel.sh`
+   and `scripts/ci/test-vcpkg-sentinel.sh` — so this path should not
+   recur on runners that picked up the patched script. If you see the
+   symptom on an unpatched runner, manual recovery is
+   `rm -rf <workspace>/vcpkg_installed/`.
+
+2. **`<workspace>/vcpkg/packages/<port>_<triplet>/` partial build**
+   (separate failure mode, predates #741). A build killed mid-port leaves
+   a partial `vcpkg/packages/abseil_x64-windows/` (no `.pc` files yet)
+   in the vcpkg tool root. vcpkg's manifest install trusts that dir's
+   hash and short-circuits to "already installed" regardless of what's
+   in `vcpkg_installed/<triplet>/` or the binary cache. The cache-key
+   sentinel does **NOT** reach `vcpkg/packages/`; manual recovery is
+   the script in the **Fix** block below.
+
+Full set of candidate corruption paths under `clean: false`:
+
+- `<workspace>/vcpkg/packages/` — pre-stage zips (path 2)
+- `<workspace>/vcpkg/buildtrees/` — port build state
+- `<workspace>/vcpkg/installed/` — vcpkg classic-mode install (rare in manifest mode)
+- `<workspace>/vcpkg_installed/<triplet>/` — project install root (sentinel-managed)
+- `<workspace>/vcpkg_installed/vcpkg/` — per-workspace registry (sentinel-managed since #741)
+- `<workspace>/vcpkg_installed/.<triplet>-cachekey.sha256` — the sentinel hash file
+- `${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows` — runner-local binary cache
+- `C:\Users\<user>\AppData\Local\vcpkg\archives\` — interactive-user default cache (vcpkg consults this even when `VCPKG_DEFAULT_BINARY_CACHE` is set)
+- `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
+
+**Fix:** `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over
+SSH on the runner as the `natha` interactive user with output redirected
+to a `.out` file:
+
+```powershell
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+```
+
+Outputs structured `KEY: value` inventory before + nuke + after. Preserves
+`vcpkg/` (the tool itself) and `vcpkg/downloads/` (source tarballs — slow
+to refetch). Wipes everything else.
+
+**Verification:** Re-run the failing job; `Install vcpkg packages` should
+proceed past the missing `.pc` symptom and rebuild from source on first
+warm.
+
+**Reference incident:** 2026-04-28 incident freed 33.9 GB.
+
+**After running:** REMOVE any TEMP one-shot recovery step from `ci.yml`
+if one was added during the incident — leaving it in forces from-source
+rebuild on every run and defeats the cache.
+
+---
+
 ## When to add a new entry
 
 Add an entry here if:

@@ -4,11 +4,11 @@
 #include <cstdio>
 #include <io.h>
 #pragma section(".CRT$XCB", read)
-static void __cdecl diag_before_static_init() {
+[[maybe_unused]] static void __cdecl diag_before_static_init() {
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) static void(__cdecl* p_diag_init)() = diag_before_static_init;
+__declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
 #include <yuzu/agent/agent.hpp>
@@ -124,6 +124,14 @@ int main(int argc, char* argv[]) {
     app.add_option("--plugin-allowlist", cfg.plugin_allowlist,
                    "Path to sha256sum-format allowlist file for plugin verification")
         ->envname("YUZU_PLUGIN_ALLOWLIST");
+    app.add_option("--plugin-trust-bundle", cfg.plugin_trust_bundle,
+                   "PEM CA bundle for plugin code-signing verification (operator-supplied "
+                   "or pointing at the Yuzu self-managed CA root)")
+        ->envname("YUZU_PLUGIN_TRUST_BUNDLE");
+    app.add_flag("--plugin-require-signature", cfg.plugin_require_signature,
+                 "Reject plugins that have no .sig sibling file (default: allow unsigned "
+                 "if --plugin-trust-bundle is set, for transitional rollouts)")
+        ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
     app.add_flag("--no-auto-update", "Disable OTA auto-updates")->each([&cfg](const std::string&) {
         cfg.auto_update = false;
     });

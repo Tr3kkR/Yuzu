@@ -3,15 +3,26 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual fallback when GitHub's push/tag webhook dispatch for this repo
+  # silently drops events (encountered 2026-04-18 during v0.11.0-rc1 cut:
+  # push events stopped firing workflows for ~hours while workflow_dispatch
+  # remained functional). Dispatch from the tag ref via the Actions UI or
+  # `gh workflow run release.yml --ref vX.Y.Z` — GITHUB_REF_NAME resolves to
+  # the tag name exactly as it does for push, so the existing version-
+  # extraction in every step continues to work unchanged.
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write  # Required for cosign keyless signing
+  # Top-level baseline = least-privilege read. Every elevated scope
+  # (id-token, attestations, packages, contents:write) is opted into
+  # per-job — Scorecard Token-Permissions zeroes the score on any
+  # workflow-level write to a sensitive scope, even one shared across
+  # multiple jobs.
+  contents: read
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -25,13 +36,23 @@ jobs:
   build-linux:
     name: "Build Linux x64"
     runs-on: [self-hosted, Linux]
-    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
+    # 90 = backstop for the slow GHA cache backend / 9P filesystem
+    # observed during v0.11.0 retags. Cache surgery (restore-only)
+    # should make this irrelevant in practice; keeping the wider
+    # budget so the next dependabot bump or runner hiccup doesn't
+    # immediately cliff back into Post-step timeouts.
+    timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Verify build dependencies
         run: |
@@ -46,26 +67,19 @@ jobs:
           fi
 
       - name: Clean stale build directory (preserve vcpkg_installed)
-        run: rm -rf builddir
+        run: rm -rf build-linux
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: ~/.cache/ccache
-          key: ccache-release-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-release-linux-
-
+      # ccache (~/.cache/ccache) persists on the self-hosted Linux
+      # runner between jobs. The original cache/restore@v5 was already
+      # restore-only because release tags never re-use a file-hash; the
+      # local persistence delivers the same restore semantics without
+      # any GHA round-trip. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      - name: vcpkg sentinel (x64-linux-static)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-static
 
       - name: Install vcpkg packages (static linkage)
         run: |
@@ -80,14 +94,14 @@ jobs:
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static/lib/pkgconfig
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-static
         run: |
-          meson setup builddir \
+          meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-static \
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-linux
 
       - name: ccache stats
         if: always()
@@ -95,8 +109,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/server/core/yuzu-server --help || true
-          ./builddir/agents/core/yuzu-agent --help || true
+          ./build-linux/server/core/yuzu-server --help || true
+          ./build-linux/agents/core/yuzu-agent --help || true
 
       - name: Package archive
         run: |
@@ -106,14 +120,14 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
-          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
+          cp build-linux/server/core/yuzu-server "${STAGING}/bin/"
+          cp build-linux/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core shared library
-          find builddir -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
+          find build-linux -name 'libyuzu_agent_core.so*' -exec cp {} "${STAGING}/bin/" \;
 
           # Plugin shared libraries
-          find builddir/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
+          find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
 
           # Content definitions
           cp content/definitions/*.yaml "${STAGING}/content/definitions/"
@@ -125,7 +139,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DEB_VERSION="${VERSION/-/\~}"
           bash deploy/packaging/debian/build-deb.sh \
-            --bin-dir builddir --version "$DEB_VERSION" --output .
+            --bin-dir build-linux --version "$DEB_VERSION" --output .
 
       - name: Build .rpm packages
         run: |
@@ -136,10 +150,47 @@ jobs:
           PRE_FLAG=""
           [ -n "$PRERELEASE" ] && PRE_FLAG="--prerelease $PRERELEASE"
           bash deploy/packaging/rpm/build-rpm.sh \
-            --bin-dir builddir --version "$RPM_VERSION" $PRE_FLAG --output .
+            --bin-dir build-linux --version "$RPM_VERSION" $PRE_FLAG --output .
+
+      # ── SBOM (CycloneDX + SPDX) ─────────────────────────────────────
+      # Syft scans the workspace and emits one SBOM covering:
+      #   - vcpkg C++ dependencies (via vcpkg.spdx.json files under
+      #     vcpkg_installed/x64-linux-static/share/<pkg>/)
+      #   - Built ELF binaries under build-linux/ (server, agent, plugins)
+      # Output two formats because customer questionnaires ask for one
+      # or the other inconsistently and both are trivial to emit.
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-linux-x64.cdx.json
+          artifact-name: yuzu-linux-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-linux-x64.spdx.json
+          artifact-name: yuzu-linux-x64.spdx.json
+          upload-artifact: false
+
+      # ── SLSA build provenance ───────────────────────────────────────
+      # Records that these specific artifacts came from this specific
+      # workflow run. Stored in GitHub's attestation registry; verified
+      # customer-side with `gh attestation verify <file>`.
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            yuzu-linux-x64.tar.gz
+            *.deb
+            *.rpm
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-x64
@@ -147,7 +198,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-deb
@@ -155,11 +206,21 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-linux-rpm
           path: "*.rpm"
+          retention-days: 3
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-linux-x64-sbom
+          path: |
+            yuzu-linux-x64.cdx.json
+            yuzu-linux-x64.spdx.json
           retention-days: 3
 
   # ── Linux ARM64 release build — SUSPENDED ────────────────────────────
@@ -176,36 +237,30 @@ jobs:
     name: "Build Gateway (Erlang)"
     needs: [build-linux]
     runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 30
     env:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install Erlang/OTP and rebar3
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
         with:
           otp-version: '28'
           rebar3-version: '3.24'
 
-      - name: Cache rebar3 dependencies
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: gateway/_build/default/lib
-          key: rebar3-deps-${{ hashFiles('gateway/rebar.lock') }}
-          restore-keys: |
-            rebar3-deps-
-
-      - name: Cache Dialyzer PLT
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: gateway/_build/default/*_plt*
-          key: dialyzer-plt-otp27-${{ hashFiles('gateway/rebar.lock') }}
-          restore-keys: |
-            dialyzer-plt-otp27-
+      # rebar3 _build/default/lib and Dialyzer PLT both persist in
+      # the workspace on the self-hosted Linux runner — the original
+      # cache/restore@v5 calls were already restore-only and the local
+      # persistence is functionally equivalent without GHA round-trip.
+      # Issue #569.
 
       - name: Compile gateway
         working-directory: gateway
@@ -263,8 +318,38 @@ jobs:
             --rel-dir gateway/_build/prod/rel/yuzu_gw \
             --version "$RPM_VERSION" $PRE_FLAG --output .
 
+      # ── Gateway SBOM (CycloneDX + SPDX) ─────────────────────────────
+      # Syft reads gateway/rebar.lock for Erlang/OTP dependencies and
+      # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
+      # runtime bundled into the release.
+      - name: Generate gateway SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: gateway
+          format: cyclonedx-json
+          output-file: yuzu-gateway-linux-x64.cdx.json
+          artifact-name: yuzu-gateway-linux-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate gateway SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: gateway
+          format: spdx-json
+          output-file: yuzu-gateway-linux-x64.spdx.json
+          artifact-name: yuzu-gateway-linux-x64.spdx.json
+          upload-artifact: false
+
+      - name: Attest gateway provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            yuzu-gateway-linux-x64.tar.gz
+            *.deb
+            *.rpm
+
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64
@@ -272,7 +357,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-deb
@@ -280,11 +365,21 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-gateway-rpm
           path: "*.rpm"
+          retention-days: 3
+
+      - name: Upload gateway SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-gateway-linux-x64-sbom
+          path: |
+            yuzu-gateway-linux-x64.cdx.json
+            yuzu-gateway-linux-x64.spdx.json
           retention-days: 3
 
   # ── Windows x64 release build ────────────────────────────────────────
@@ -293,56 +388,55 @@ jobs:
   build-windows:
     name: "Build Windows x64"
     runs-on: [self-hosted, Windows]
-    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
+    # 90 = backstop. Same rationale as Build Linux x64. Defender
+    # exclusions on the runner should keep tar/zstd extraction off
+    # the Defender scan path, but if exclusions ever drift the wider
+    # budget at least lets the build complete instead of timing out.
+    timeout-minutes: 90
     env:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Install Meson and ccache
         run: |
-          pip install -r requirements-ci.txt
+          pip install --require-hashes -r requirements-ci.txt
           choco install ccache --yes --no-progress
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: ~\AppData\Local\ccache
-          key: ccache-release-windows-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-release-windows-
-
+      # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
+      # persist on the self-hosted Windows runner between jobs. The
+      # original cache/restore@v5 calls were already restore-only —
+      # local persistence delivers the same restore semantics without
+      # any GHA round-trip. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          save-always: true
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-windows-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-windows-
-
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: vcpkg sentinel (x64-windows)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        # Both the outer shell AND the inner bash invocation must bypass
+        # $PATH lookup for `bash`, otherwise the runner's $PATH order
+        # (C:\Windows\system32 before C:\msys64\usr\bin) resolves `bash`
+        # to WSL bash, which exits with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+        # under LOCAL SYSTEM. Explicit MSYS2 paths fix it.
+        shell: 'C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
       - name: Install vcpkg packages
         run: |
@@ -355,14 +449,14 @@ jobs:
           CC: ccache cl
           CXX: ccache cl
         run: |
-          meson setup builddir `
+          meson setup build-windows `
             --buildtype=release `
             -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-windows
 
       - name: ccache stats
         if: always()
@@ -370,8 +464,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          & ./builddir/server/core/yuzu-server.exe --help
-          & ./builddir/agents/core/yuzu-agent.exe --help
+          & ./build-windows/server/core/yuzu-server.exe --help
+          & ./build-windows/agents/core/yuzu-agent.exe --help
         continue-on-error: true
 
       - name: Sign binaries (Authenticode)
@@ -399,10 +493,10 @@ jobs:
 
           # Collect all EXE and DLL files to sign
           $filesToSign = @()
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-server.exe" -Recurse
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu-agent.exe" -Recurse
-          $filesToSign += Get-ChildItem builddir -Filter "yuzu_agent_core.dll" -Recurse
-          $filesToSign += Get-ChildItem builddir/agents/plugins -Filter "*.dll" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu-server.exe" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu-agent.exe" -Recurse
+          $filesToSign += Get-ChildItem build-windows -Filter "yuzu_agent_core.dll" -Recurse
+          $filesToSign += Get-ChildItem build-windows/agents/plugins -Filter "*.dll" -Recurse
 
           foreach ($file in $filesToSign) {
             Write-Host "Signing: $($file.FullName)"
@@ -430,19 +524,19 @@ jobs:
       - name: Package archive
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
           $staging = "yuzu-${version}-windows-x64"
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
 
           # Binaries
-          Copy-Item "builddir/server/core/yuzu-server.exe" "${staging}/bin/"
-          Copy-Item "builddir/agents/core/yuzu-agent.exe" "${staging}/bin/"
+          Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"
+          Copy-Item "build-windows/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
           # Agent core DLL
-          Get-ChildItem -Path builddir -Filter "yuzu_agent_core.dll" -Recurse | Copy-Item -Destination "${staging}/bin/"
+          Get-ChildItem -Path build-windows -Filter "yuzu_agent_core.dll" -Recurse | Copy-Item -Destination "${staging}/bin/"
 
           # Plugin DLLs
-          Get-ChildItem -Path builddir/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
+          Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
           # Runtime DLLs from vcpkg that plugins/binaries need
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
@@ -458,7 +552,7 @@ jobs:
       - name: Build Windows installers (InnoSetup)
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           # Install InnoSetup 6
           choco install innosetup -y --no-progress
@@ -472,7 +566,7 @@ jobs:
           Write-Host "=== Building Agent Installer ==="
           & $iscc `
             "/DAppVersion=${version}" `
-            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "/DBuildDir=${{ github.workspace }}\build-windows" `
             "deploy\packaging\windows\yuzu-agent.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Agent installer failed"; exit 1 }
 
@@ -484,7 +578,7 @@ jobs:
           Write-Host "=== Building Server Installer ==="
           & $iscc `
             "/DAppVersion=${version}" `
-            "/DBuildDir=${{ github.workspace }}\builddir" `
+            "/DBuildDir=${{ github.workspace }}\build-windows" `
             "/DContentDir=${{ github.workspace }}\content" `
             "deploy\packaging\windows\yuzu-server.iss"
           if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
@@ -500,7 +594,7 @@ jobs:
           WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         shell: pwsh
         run: |
-          $version = "${{ github.ref_name }}".TrimStart("v").Replace("-", "_")
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
 
           $certPath = "${{ runner.temp }}\signing-cert.pfx"
           [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT))
@@ -527,8 +621,38 @@ jobs:
 
           Remove-Item $certPath -Force
 
+      # ── Windows SBOM (CycloneDX + SPDX) ─────────────────────────────
+      # Scans vcpkg_installed/x64-windows (C++ deps) + build-windows (PE
+      # binaries). Syft supports PowerShell/Windows runners via the
+      # composite action, which downloads a Windows syft binary.
+      - name: Generate Windows SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-windows-x64.cdx.json
+          artifact-name: yuzu-windows-x64.cdx.json
+          upload-artifact: false
+
+      - name: Generate Windows SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-windows-x64.spdx.json
+          artifact-name: yuzu-windows-x64.spdx.json
+          upload-artifact: false
+
+      - name: Attest Windows provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            yuzu-windows-x64.zip
+            YuzuAgentSetup-*.exe
+            YuzuServerSetup-*.exe
+
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-windows-x64
@@ -536,7 +660,7 @@ jobs:
           retention-days: 3
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-windows-installer
@@ -545,29 +669,54 @@ jobs:
             YuzuServerSetup-*.exe
           retention-days: 3
 
+      - name: Upload Windows SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-windows-x64-sbom
+          path: |
+            yuzu-windows-x64.cdx.json
+            yuzu-windows-x64.spdx.json
+          retention-days: 3
+
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
     runs-on: macos-14
+    permissions:
+      contents: read
+      id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
+      attestations: write   # actions/attest-build-provenance
     timeout-minutes: 90
     env:
       HAS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT != '' }}
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install "$(grep '^meson==' requirements-ci.txt)"
+          # awk strips the trailing ` \` that pip-compile adds when the
+          # requirement is continued by `--hash=...` lines.
+          pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/Library/Caches/ccache
           key: ccache-release-macos-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -577,23 +726,37 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+        # Restore-only: release builds consume cache, never produce.
+        # Each release tag is a unique commit, so the file-hash cache
+        # key never matches anything a future release would benefit
+        # from. Paying writeback cost on every release is what timed
+        # out the v0.11.0 first attempt — Linux Post Cache ccache
+        # spent 28.5 min uploading data nobody would re-read, blowing
+        # the 45-min job budget. cache/restore@v5 also drops the
+        # `save-always: true` input that the maintainers say never
+        # worked as intended (cf. v5.0.5 deprecation warning).
+        #
+        # Cache key follows the universal contract from the CI overhaul
+        # plan: vcpkg.json + vcpkg-configuration.json + every overlay
+        # triplet + the pinned VCPKG_COMMIT baseline. Same shape as the
+        # ci.yml macOS cache key.
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
+            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -609,7 +772,7 @@ jobs:
           CC: ccache cc
           CXX: ccache c++
         run: |
-          meson setup builddir \
+          meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
@@ -617,7 +780,7 @@ jobs:
             -Db_lto=true
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-macos
 
       - name: ccache stats
         if: always()
@@ -625,8 +788,8 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./builddir/server/core/yuzu-server --help || true
-          ./builddir/agents/core/yuzu-agent --help || true
+          ./build-macos/server/core/yuzu-server --help || true
+          ./build-macos/agents/core/yuzu-agent --help || true
 
       - name: Sign binaries (codesign)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -661,7 +824,7 @@ jobs:
 
           # Sign all binaries and dylibs with hardened runtime
           IDENTITY="${MACOS_SIGNING_IDENTITY}"
-          for binary in builddir/yuzu-server builddir/yuzu-agent; do
+          for binary in build-macos/yuzu-server build-macos/yuzu-agent; do
             echo "Signing: ${binary}"
             codesign --force --options runtime \
               --sign "${IDENTITY}" \
@@ -671,7 +834,7 @@ jobs:
           done
 
           # Sign dylibs
-          find builddir -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
+          find build-macos -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do
             echo "Signing: ${dylib}"
             codesign --force --options runtime \
               --sign "${IDENTITY}" \
@@ -693,11 +856,11 @@ jobs:
           # Create a ZIP of the signed binaries for notarization submission
           NOTARIZE_ZIP="${RUNNER_TEMP}/yuzu-notarize.zip"
           zip -j "${NOTARIZE_ZIP}" \
-            builddir/yuzu-server \
-            builddir/yuzu-agent
+            build-macos/yuzu-server \
+            build-macos/yuzu-agent
 
           # Add dylibs to the notarization payload
-          find builddir -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
+          find build-macos -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
 
           # Submit for notarization and wait for result
           echo "Submitting for Apple notarization..."
@@ -727,14 +890,14 @@ jobs:
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
 
           # Binaries
-          cp builddir/server/core/yuzu-server "${STAGING}/bin/"
-          cp builddir/agents/core/yuzu-agent "${STAGING}/bin/"
+          cp build-macos/server/core/yuzu-server "${STAGING}/bin/"
+          cp build-macos/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core dylib
-          find builddir -name 'libyuzu_agent_core.dylib*' -exec cp {} "${STAGING}/bin/" \;
+          find build-macos -name 'libyuzu_agent_core.dylib*' -exec cp {} "${STAGING}/bin/" \;
 
           # Plugin dylibs
-          find builddir/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
+          find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
 
           # Content definitions
           cp content/definitions/*.yaml "${STAGING}/content/definitions/"
@@ -746,7 +909,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           bash deploy/packaging/macos/build-pkg.sh \
-            --bin-dir builddir --version "$VERSION" --output .
+            --bin-dir build-macos --version "$VERSION" --output .
 
       - name: Sign installer (.pkg)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -787,8 +950,35 @@ jobs:
           xcrun stapler staple "${PKG}"
           echo "Notarized and stapled: ${PKG}"
 
+      # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
+      # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
+      - name: Generate macOS SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: yuzu-macos-arm64.cdx.json
+          artifact-name: yuzu-macos-arm64.cdx.json
+          upload-artifact: false
+
+      - name: Generate macOS SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: yuzu-macos-arm64.spdx.json
+          artifact-name: yuzu-macos-arm64.spdx.json
+          upload-artifact: false
+
+      - name: Attest macOS provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            yuzu-macos-arm64.tar.gz
+            YuzuAgent-*.pkg
+
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-macos-arm64
@@ -796,11 +986,21 @@ jobs:
           retention-days: 3
 
       - name: Upload .pkg artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         with:
           name: yuzu-macos-pkg
           path: "YuzuAgent-*.pkg"
+          retention-days: 3
+
+      - name: Upload macOS SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-macos-arm64-sbom
+          path: |
+            yuzu-macos-arm64.cdx.json
+            yuzu-macos-arm64.spdx.json
           retention-days: 3
 
   # ── Docker images — server + gateway published to GHCR ──────────────
@@ -815,6 +1015,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
     strategy:
       fail-fast: false
       matrix:
@@ -825,20 +1027,21 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Lowercase repository owner
         id: owner
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -846,7 +1049,7 @@ jobs:
 
       - name: Compute image tags and labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
           # Tag convention mirrors scripts/docker-release.sh:
@@ -862,10 +1065,11 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -877,7 +1081,74 @@ jobs:
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}
           cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }},mode=max
+          # Disable buildx's own provenance/sbom attestation — we emit
+          # GitHub-native attestations + cosign signatures below so
+          # customers have a single verification path via `gh
+          # attestation verify` and `cosign verify`.
           provenance: false
+          sbom: false
+
+      # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
+      # Syft scans the pushed image by digest (pulls manifest +
+      # layers from GHCR) so the SBOM reflects exactly what customers
+      # will pull. Output goes to artifacts/ for the release job to
+      # attach alongside the per-platform archive SBOMs.
+      - name: Generate image SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: yuzu-${{ matrix.image }}-image.cdx.json
+          artifact-name: yuzu-${{ matrix.image }}-image.cdx.json
+          upload-artifact: false
+
+      - name: Generate image SBOM (SPDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: yuzu-${{ matrix.image }}-image.spdx.json
+          artifact-name: yuzu-${{ matrix.image }}-image.spdx.json
+          upload-artifact: false
+
+      - name: Upload image SBOM artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        continue-on-error: true
+        with:
+          name: yuzu-${{ matrix.image }}-image-sbom
+          path: |
+            yuzu-${{ matrix.image }}-image.cdx.json
+            yuzu-${{ matrix.image }}-image.spdx.json
+          retention-days: 3
+
+      # ── SLSA build provenance (by image digest) ─────────────────────
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
+        run: |
+          # cosign v3.0+ rejects explicit --oidc-issuer when a signing
+          # config is in use (the GHA-default path). The OIDC issuer is
+          # auto-detected from the workflow's id-token, so the flag is
+          # both redundant and a hard error in v3. The cosign-installer
+          # bump from 3.10.1 → 4.1.1 (#495) installs cosign v3.0.5 by
+          # default; v0.11.0-rc0 hit "cannot specify service URLs and
+          # use signing config" and aborted before publishing the
+          # release page.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
       - name: Image summary
         run: |
@@ -887,6 +1158,10 @@ jobs:
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
+            echo ""
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Create GitHub Release ────────────────────────────────────────────
@@ -895,17 +1170,27 @@ jobs:
     needs: [build-linux, build-gateway, build-windows, build-macos, docker-publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write   # gh release create
+      id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Validate docker-compose image versions
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/check-compose-versions.sh "$VERSION"
+          # Compose ${YUZU_VERSION:-X.Y.Z} defaults track the stable base
+          # version, not rc/beta/alpha suffixes — same convention used by
+          # the Extract changelog step below. v0.11.0-rc1 cut (2026-04-18)
+          # hit this after all 6 build jobs had already completed.
+          BASE_VERSION="${VERSION%%-*}"
+          bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           # Skip docker buildx attestation/provenance artifacts (auto-named
@@ -916,23 +1201,118 @@ jobs:
           # it could publish; v0.10.0 had to be assembled manually.
           pattern: 'yuzu-*'
 
+      - name: Package Compose Wizard
+        # The Compose Wizard (tools/compose-wizard/) is a browser-based
+        # docker-compose.yml + .env generator contributed in PR #405 by
+        # @fjarvis. Zero dependencies — extract zip, open index.html, walk
+        # the wizard. Bundled here as a release asset so customers can grab
+        # it from the Releases page.
+        #
+        # Conditional on the directory existing — the wizard was merged
+        # into main directly in PR #405, so any tag cut from a branch that
+        # hasn't reconciled with main may not have it. Skip with a warning
+        # rather than fail the release.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -d tools/compose-wizard ]; then
+            STAGING="yuzu-compose-wizard-${VERSION}"
+            cp -r tools/compose-wizard "$STAGING"
+            zip -r "artifacts/yuzu-compose-wizard-${VERSION}.zip" "$STAGING"
+            SIZE=$(du -h "artifacts/yuzu-compose-wizard-${VERSION}.zip" | cut -f1)
+            echo "Packaged compose wizard: yuzu-compose-wizard-${VERSION}.zip ($SIZE)"
+          else
+            echo "::warning::tools/compose-wizard not present in this checkout — skipping wizard bundle. See PR #405."
+          fi
+
+      - name: Flatten artifacts + SBOMs
+        run: |
+          cd artifacts
+          # Collect archives, installers, AND SBOMs from per-platform
+          # upload-artifact subdirs into artifacts/ for uniform handling
+          # by the gate script, SHA256SUMS generator, and gh release
+          # create. File names are globally unique across jobs (the
+          # per-platform suffix is baked into each asset name), so no
+          # collisions are expected; fail loud if they happen.
+          find . -mindepth 2 -type f \( \
+            -name '*.tar.gz' -o \
+            -name '*.zip'    -o \
+            -name '*.exe'    -o \
+            -name '*.deb'    -o \
+            -name '*.rpm'    -o \
+            -name '*.pkg'    -o \
+            -name '*.cdx.json' -o \
+            -name '*.spdx.json' \
+          \) -exec mv {} . \;
+
+      - name: Verify release artifact completeness
+        run: |
+          # Gate: every expected archive must have a sibling CycloneDX +
+          # SPDX SBOM, and both image SBOMs must be present. Missing any
+          # of the above fails the release before we publish anything
+          # customers will have to unwind. Tracked as #362 / #408.
+          bash scripts/check-release-artifacts.sh artifacts
+
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg' \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg > SHA256SUMS
+          # *.zip glob covers both yuzu-windows-x64.zip and yuzu-compose-wizard-*.zip.
+          # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
+          # verify the SBOM they download matches the SBOM we shipped.
+          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Sign SHA256SUMS (keyless)
         run: |
           cd artifacts
-          cosign sign-blob --yes \
-            --oidc-issuer https://token.actions.githubusercontent.com \
-            SHA256SUMS --bundle SHA256SUMS.bundle
+          # cosign v3.0+ rejects explicit --oidc-issuer when a signing
+          # config is in use (auto-detected from the workflow's id-token).
+          # See "Sign image (keyless)" earlier in this file for the same
+          # fix. v0.11.0-rc0 was the first release to hit this after the
+          # cosign-installer 3 → 4 dependabot bump (#495).
+          #
+          # Output extension is .sigstore (canonical Sigstore Bundle format
+          # name) rather than the historical .bundle so the OpenSSF
+          # Scorecard Signed-Releases check recognises the asset — its
+          # extension regex is `\.(minisig|asc|sig|sign|sigstore)$`. v0.11.0
+          # and v0.11.0-rc2 also carry a backfilled .sigstore copy alongside
+          # their original .bundle for the same reason; this rename makes
+          # every future release Scorecard-visible by default.
+          cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.sigstore
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+
+      - name: Bundle SLSA attestations as .intoto.jsonl release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd artifacts
+          # Each build job calls actions/attest-build-provenance, which
+          # uploads the SLSA bundle to GitHub's Attestations API keyed by
+          # the artifact's sha256 digest. That registry is invisible to
+          # OpenSSF Scorecard's Signed-Releases check, which only walks
+          # release *assets* and matches `*.intoto.jsonl` for provenance.
+          # Re-attach each bundle as <artifact>.intoto.jsonl so Scorecard
+          # sees the attestation. `gh attestation verify` continues to work
+          # against the API; offline verification can also now use
+          # `gh attestation verify --bundle <file>.intoto.jsonl <file>`.
+          while IFS=' ' read -r digest name; do
+            name="${name#\*}"
+            case "$name" in
+              ''|*.cdx.json|*.spdx.json|yuzu-compose-wizard-*) continue ;;
+            esac
+            # gh api --jq does not apply on 4xx responses, so capture the
+            # raw body and require a non-null bundle to materialise.
+            body=$(gh api "repos/${{ github.repository }}/attestations/sha256:$digest" 2>/dev/null || true)
+            bundle=$(printf '%s' "$body" | jq -c '.attestations[0].bundle // empty' 2>/dev/null || true)
+            if [ -z "$bundle" ]; then
+              echo "::warning::no attestation for $name (digest sha256:$digest) — skipping"
+              continue
+            fi
+            printf '%s\n' "$bundle" > "${name}.intoto.jsonl"
+            echo "wrote ${name}.intoto.jsonl ($(wc -c < "${name}.intoto.jsonl") bytes)"
+          done < SHA256SUMS
 
       - name: Determine if prerelease
         id: prerelease
@@ -967,7 +1347,7 @@ jobs:
       - name: Generate release notes
         run: |
           OWNER="${{ github.repository_owner }}"
-          TAG="${{ github.ref_name }}"
+          TAG="${GITHUB_REF_NAME}"
 
           # Start with changelog content if available
           if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
@@ -1022,6 +1402,22 @@ jobs:
           | \`yuzu-windows-x64.zip\` | Windows (server + agent) | x86_64 |
           | \`yuzu-macos-arm64.tar.gz\` | macOS (server + agent) | ARM64 (Apple Silicon) |
 
+          ## Compose Wizard
+
+          \`yuzu-compose-wizard-*.zip\` — browser-based step-by-step
+          generator for a customised \`docker-compose.yml\` + \`.env\`.
+          Zero dependencies — extract the zip and open \`index.html\` in
+          a browser. Contributed by
+          [@fjarvis](https://github.com/fjarvis) in
+          [#405](https://github.com/${{ github.repository }}/pull/405).
+
+          \`\`\`bash
+          unzip yuzu-compose-wizard-*.zip
+          cd yuzu-compose-wizard-*
+          # Open index.html in your browser, or:
+          python3 -m http.server 8000
+          \`\`\`
+
           ## Docker images
 
           \`\`\`bash
@@ -1040,11 +1436,23 @@ jobs:
           ### Verify signature (cosign)
 
           \`\`\`bash
-          cosign verify-blob --bundle SHA256SUMS.bundle \\
+          cosign verify-blob --bundle SHA256SUMS.sigstore \\
             --certificate-identity-regexp '.*' \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
           \`\`\`
+
+          ## Supply chain: SBOM, SLSA provenance, signed images
+
+          Every release ships CycloneDX + SPDX SBOMs per platform
+          (\`yuzu-*-{linux-x64,windows-x64,macos-arm64}.{cdx,spdx}.json\`,
+          \`yuzu-{server,gateway}-image.{cdx,spdx}.json\`), GitHub-native
+          SLSA build provenance attestations for every binary archive
+          and Docker image, and cosign keyless signatures on both the
+          Docker images and the \`SHA256SUMS\` manifest. See
+          [\`docs/user-manual/release-verification.md\`](docs/user-manual/release-verification.md)
+          for the full verification workflow (\`gh attestation verify\`,
+          \`cosign verify\`, CycloneDX / SPDX validation).
 
           See the [user manual](docs/user-manual/) for full setup instructions.
           NOTES_EOF
@@ -1060,8 +1468,16 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
 
-          gh release create "${{ github.ref_name }}" \
-            --title "Yuzu ${{ github.ref_name }}" \
+          # Compose Wizard zip is conditional — Package Compose Wizard step
+          # skips with a warning if tools/compose-wizard isn't in the tag's
+          # commit tree. Only include if the file actually exists.
+          WIZARD_ASSET=()
+          if ls artifacts/yuzu-compose-wizard-*.zip >/dev/null 2>&1; then
+            WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
+          fi
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "Yuzu ${GITHUB_REF_NAME}" \
             --notes-file release-notes.md \
             ${PRERELEASE_FLAG} \
             artifacts/yuzu-linux-x64.tar.gz \
@@ -1073,5 +1489,9 @@ jobs:
             artifacts/yuzu-macos-arm64.tar.gz \
             artifacts/*.deb \
             artifacts/*.rpm \
+            artifacts/*.cdx.json \
+            artifacts/*.spdx.json \
+            artifacts/*.intoto.jsonl \
             artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.bundle
+            artifacts/SHA256SUMS.sigstore \
+            "${WIZARD_ASSET[@]}"

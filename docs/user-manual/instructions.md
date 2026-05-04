@@ -1233,7 +1233,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | Tab | Description |
 |---|---|
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
-| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, view running and completed executions with per-agent status drill-down, rerun, and cancel actions. |
+| **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, relative time with the full ISO-8601 UTC timestamp on hover, and — on failed rows — an 80-character preview of the most recent agent error. Click any row to expand an inline drawer showing a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a collapsed responses section. The drawer is keyboard-reachable via Tab and Enter/Space. Pass `?definition_id=<id>` in the page URL to pre-filter the list to one definition. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. Badge shows pending count. |
 
@@ -1263,6 +1263,50 @@ registry get_value hive=HKLM key=SOFTWARE\Microsoft\Windows value=ProductName
 - Parameters are passed to the plugin as a `map<string, string>`
 
 This differs from YAML-parameterised instructions where parameters are defined in the `parameter_schema` of an `InstructionDefinition`. Inline parameters are ad-hoc and bypass schema validation — they are sent directly to the plugin action. YAML-defined parameters provide type constraints, descriptions, default values, and validation.
+
+### Response Visualization (chart deck)
+
+When the dispatched (plugin, action) reverse-resolves to an enabled `InstructionDefinition` that declares `spec.visualization` or `spec.visualizations`, a chart deck auto-renders above the results table — no operator action required. The dashboard:
+
+1. Resolves `(plugin, action)` to the first enabled definition with a configured visualization. The reverse-lookup is gated on `InstructionDefinition:Read` in addition to `Execution:Execute`; an operator without `InstructionDefinition:Read` sees the dispatch succeed but no chart appears.
+2. Emits an OOB `<div id="chart-deck-host">` with a 2-second deferred load trigger so responses have time to arrive.
+3. Fetches `/fragments/results?...&definition_id=<id>` which returns one chart-card placeholder per configured chart in a `<div class="yuzu-chart-deck">` container.
+4. The Yuzu chart adapter (`/static/yuzu-charts.js`) — built on Apache ECharts 5 (`/static/echarts.min.js`) and themed from Yuzu design tokens — populates each placeholder from `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>`.
+
+**Limitations operators should expect:**
+
+- **First-match arbitrariness.** When multiple enabled definitions share `(plugin, action)` and more than one declares a visualization, the alphabetically-first definition wins. Authors should ensure at most one chart-bearing definition per `(plugin, action)` — or dispatch via the Instructions tab (which carries `definition_id` explicitly).
+- **F5 mid-dispatch.** Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.
+- **Row cap.** Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes `rows_capped: true`; the dashboard renders the chart from the truncated set and the `command.dispatch` audit detail records the truncation.
+- **No definition? No chart.** Free-form `(plugin, action)` dispatches that don't correspond to any enabled definition with `spec.visualization` produce only the standard tabular results — the dashboard does not render an empty chart card.
+- **Dashboard YAML editor strips `spec.visualization`.** The dashboard's CodeMirror editor (`POST /api/instructions/yaml`) saves the YAML source verbatim into `yaml_source` but its lightweight line-scanner does not extract `spec.visualization` into the indexed `visualization_spec` column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via `POST /api/v1/definitions/import` (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through `POST /api/v1/definitions/import` rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).
+
+See `docs/yaml-dsl-spec.md` § `spec.visualization` for the chart configuration schema and `docs/user-manual/rest-api.md` § Execution Visualization for the underlying REST API.
+
+**Worked examples (default-shipped).** Six chart-bearing definitions ship in the in-tree content library as the default demo set:
+
+| Definition | Chart |
+|---|---|
+| `security.vuln_scan.summary` | pie — vulnerabilities by severity |
+| `security.antivirus.defender_status` | pie — Defender real-time protection |
+| `security.encryption.state` | pie — volume protection (BitLocker / LUKS / FileVault) |
+| `security.firewall.state` | column (multi-series) — firewall state per profile |
+| `security.certificates.list` | pie — certificates by issuer (top-N + Other) |
+| `device.os_info.os_name` | pie — OS distribution across the fleet |
+
+They are bundled as `InstructionSet demo.visualization.fleet-posture` (`content/definitions/visualization_demo_set.yaml`) and as `ProductPack pack.demo.visualization` (`content/packs/visualization-demo-pack.yaml`) and are **auto-imported on server startup** — no manual import step is required on a fresh install. The 217 InstructionDefinitions and 10 InstructionSets under `content/` are converted to JSON envelopes at build time by `server/core/scripts/embed_content.py` (PyYAML), embedded in the server binary as `kBundledDefinitions` / `kBundledSets`, and upserted on every startup via `import_definition_json` / `create_set`. Conflicts on already-existing IDs are silently skipped — operator-customised definitions are never overwritten by the auto-import. Each successful or errored import emits an `audit_events.action="content.bundled_import"` row with `principal=system` for SOC 2 traceability.
+
+On upgrade from a release prior to the build-time content embed, definitions an operator previously DELETED will reappear after restart. To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than deleting the row.
+
+To force-install on an existing deployment via the operator UI (e.g. for a custom InstructionSet not in the in-tree library), still use the dashboard YAML import view or:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     --data-binary @content/packs/visualization-demo-pack.yaml \
+     https://yuzu.example/api/v1/product-packs
+```
+
+Then dispatch any of the six from the dashboard "Send" panel — the chart deck auto-renders above the results table.
 
 ---
 

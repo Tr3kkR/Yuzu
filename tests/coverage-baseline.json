@@ -1,10 +1,9 @@
 {
-  "__doc": "Seed baseline shipped with PR2 of the /test skill. Run 'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' on the target dev box to lock a real baseline, then commit the updated file alongside the change that earned it. The seed accepts any non-zero coverage (branch_percent=0, slack_pp=100) so PR2 doesn't trip on first run; real enforcement kicks in after first capture.",
+  "__doc": "Locked branch coverage baseline enforced by scripts/test/coverage-gate.sh. Regenerate with 'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' then commit this file alongside the change that earned the new baseline. Hardware fingerprint deliberately omitted \u2014 line-level coverage is compiler-deterministic, unlike perf timings.",
   "__schema": "coverage-baseline/v1",
-  "__seed": true,
-  "branch_percent": 0.0,
-  "captured_at": 1776200000,
-  "captured_commit": "seed",
-  "line_percent": 0.0,
-  "slack_pp": 100.0
+  "branch_percent": 26.8,
+  "captured_at": 1777101720,
+  "captured_commit": "40acd33255ef83ea262697308486bdd756d881e3",
+  "line_percent": 51.8,
+  "slack_pp": 0.5
 }

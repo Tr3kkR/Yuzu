@@ -6,32 +6,32 @@ This document describes how Yuzu's components interact, the data flows between t
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              Yuzu Server                                 │
+│                              Yuzu Server                                │
 │                                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │
-│  │  gRPC       │  │  HTTP/REST   │  │  Auth        │  │  Metrics    │ │
-│  │  Services   │  │  API + HTMX  │  │  Manager     │  │  /metrics   │ │
-│  │             │  │  Dashboard   │  │  (RBAC)      │  │             │ │
-│  └──────┬──────┘  └──────┬───────┘  └──────┬───────┘  └─────────────┘ │
-│                   ┌──────────────┐                                      │
-│                   │  MCP Server  │  (JSON-RPC 2.0, AI tool use)        │
-│                   │  /mcp/v1/    │                                      │
-│                   └──────────────┘                                      │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐   │
+│  │  gRPC       │  │  HTTP/REST   │  │  Auth        │  │  Metrics    │   │
+│  │  Services   │  │  API + HTMX  │  │  Manager     │  │  /metrics   │   │
+│  │             │  │  Dashboard   │  │  (RBAC)      │  │             │   │
+│  └──────┬──────┘  └──────┬───────┘  └───────┬──────┘  └─────────────┘   │
+│         │         ┌──────────────┐          │                           │
+│         │         │  MCP Server  │  (JSON-RPC 2.0, AI tool use)         │
+│         │         │  /mcp/v1/    │          │                           │
+│         │         └──────────────┘          │                           │
 │         │                │                  │                           │
-│  ┌──────▼──────────────────▼──────────────────▼───────────────────────┐ │
+│  ┌──────▼────────────────▼──────────────────▼─────────────────────────┐ │
 │  │                     Server Core                                    │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐ │ │
-│  │  │ Agent        │  │ Instruction│  │ Response   │  │ Audit     │ │ │
-│  │  │ Registry     │  │ Engine     │  │ Store      │  │ Log       │ │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘ │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐ │ │
-│  │  │ Scope        │  │ Policy     │  │ Scheduler  │  │ Event     │ │ │
-│  │  │ Engine       │  │ Engine     │  │            │  │ Bus       │ │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘ │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐               │ │
-│  │  │ Management   │  │ NVD Sync   │  │ Content    │               │ │
-│  │  │ Groups       │  │            │  │ Repository │               │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘               │ │
+│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐   │ │
+│  │  │ Agent        │  │ Instruction│  │ Response   │  │ Audit     │   │ │
+│  │  │ Registry     │  │ Engine     │  │ Store      │  │ Log       │   │ │
+│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘   │ │
+│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐   │ │
+│  │  │ Scope        │  │ Policy     │  │ Scheduler  │  │ Event     │   │ │
+│  │  │ Engine       │  │ Engine     │  │            │  │ Bus       │   │ │
+│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘   │ │
+│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐                  │ │
+│  │  │ Management   │  │ NVD Sync   │  │ Content    │                  │ │
+│  │  │ Groups       │  │            │  │ Repository │                  │ │
+│  │  └──────────────┘  └────────────┘  └────────────┘                  │ │
 │  └────────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
          │                                              │
@@ -52,48 +52,48 @@ This document describes how Yuzu's components interact, the data flows between t
 ```
 Agent                           Server
   │                               │
-  │──── Register(AgentInfo) ────►│  Contains: agent_id, hostname, OS, arch,
-  │     + enrollment_token       │  plugins list, enrollment_token
+  │──── Register(AgentInfo) ────► │  Contains: agent_id, hostname, OS, arch,
+  │     + enrollment_token        │  plugins list, enrollment_token
   │                               │
   │                               ├── Validate enrollment token (Tier 2)
   │                               ├── OR check auto-approve rules
   │                               ├── OR add to pending queue (Tier 1)
   │                               │
-  │◄── RegisterResponse ─────────│  Contains: session_id, enrollment_status
+  │◄── RegisterResponse ───────── │  Contains: session_id, enrollment_status
   │     (enrolled/pending/denied) │  (enrolled → proceed, pending → retry later)
   │                               │
-  │──── Subscribe() ─────────────│  Bidirectional stream opens
+  │──── Subscribe() ───────────── │  Bidirectional stream opens
   │     (bidi stream)             │  Server stores stream pointer in registry
 ```
 
-**Why bidirectional streaming?** Polling-based command delivery (the legacy `Heartbeat` + `ExecuteCommand` pattern) introduces latency proportional to the heartbeat interval. The `Subscribe` RPC keeps a persistent stream open so the server can push commands immediately. This is critical for security response (quarantine a device NOW) and interactive querying.
+**Why bidirectional streaming?** Polling-based command delivery (the legacy `Heartbeat` + `ExecuteCommand` pattern) introduces latency proportional to the heartbeat interval. The `Subscribe` RPC keeps a persistent stream open so the server can push commands immediately. This is critical for security response (quarantine a device NOW) and interactive querying. The difference from latency in commands manifests most in iterative situations such as LLM instrumented surfaces such as the MCP that Yuzu exposes; LLMs are naive and ‘walk up’ discovery of the correct course of action, iterated over failure. We want to make those failures as fast as possible - and successes as fast as possible as well - in order to allow agentic workloads to be performant.
 
 **Why three enrollment tiers?** Different organizations have different security postures. Startup labs want zero-friction onboarding (Tier 2 tokens). Enterprises need approval workflows (Tier 1 manual). High-security environments need hardware attestation (Tier 3 platform trust).
 
 ### 2. Command Dispatch and Response Collection
 
 ```
-Dashboard/API           Server                    Agent
-     │                    │                         │
-     │── SendCommand ───►│                         │
-     │   (plugin, action, │                         │
-     │    params, scope)  │                         │
+Dashboard/API           Server                     Agent
+     │                    │                          │
+     │── SendCommand ───► │                          │
+     │   (plugin, action, │                          │
+     │    params, scope)  │                          │
      │                    ├── Scope engine evaluates │
      │                    │   which agents match     │
-     │                    │                         │
-     │                    │── CommandRequest ──────►│
+     │                    │                          │
+     │                    │── CommandRequest ───────►│
      │                    │   (via Subscribe stream) │
-     │                    │                         ├── Find plugin by name
-     │                    │                         ├── Spawn execution thread
-     │                    │                         ├── Call plugin execute()
-     │                    │                         │
-     │                    │◄── CommandResponse ─────│  Streamed: status, output chunks
+     │                    │                          ├── Find plugin by name
+     │                    │                          ├── Spawn execution thread
+     │                    │                          ├── Call plugin execute()
+     │                    │                          │
+     │                    │◄── CommandResponse ──────│  Streamed: status, output chunks
      │                    │    (streaming)           │
      │                    ├── Store in Response Store│
      │                    ├── Aggregate if defined   │
-     │                    │                         │
-     │◄── SSE event ─────│                         │
-     │   (real-time UI)   │                         │
+     │                    │                          │
+     │◄── SSE event ──────│                          │
+     │   (real-time UI)   │                          │
 ```
 
 **Why stream responses?** Plugins may produce output incrementally (e.g., scanning a filesystem). Streaming delivers results to the dashboard as they arrive rather than waiting for completion. This is also why the Response Store must handle appending partial results.
@@ -104,26 +104,26 @@ Dashboard/API           Server                    Agent
 
 ```
 Admin                    Server
-  │                        │
-  │── Create Definition ──►│  Named, versioned template:
-  │   (name, version,      │  - plugin + action + param schema
+  │                         │
+  │── Create Definition ───►│  Named, versioned template:
+  │   (name, version,       │  - plugin + action + param schema
   │    param schema,        │  - response schema (typed columns)
   │    response schema,     │  - aggregation rules
   │    aggregation,         │  - TTL ranges
   │    instruction set)     │  - instruction type (question/action)
-  │                        │
-  │── Run Instruction ────►│  Instantiate definition with:
+  │                         │
+  │── Run Instruction ─────►│  Instantiate definition with:
   │   (definition name,     │  - parameter values
   │    scope expression,    │  - scope expression (who to target)
   │    parameter values)    │  - approved (or enters approval queue)
-  │                        │
-  │                        ├── Check approval workflow
-  │                        ├── Evaluate scope → target agents
-  │                        ├── Dispatch to agents
-  │                        ├── Collect responses
-  │                        ├── Aggregate server-side
-  │                        │
-  │◄── Results ────────────│  Raw + aggregated, filterable, paginated
+  │                         │
+  │                         ├── Check approval workflow
+  │                         ├── Evaluate scope → target agents
+  │                         ├── Dispatch to agents
+  │                         ├── Collect responses
+  │                         ├── Aggregate server-side
+  │                         │
+  │◄── Results ─────────────│  Raw + aggregated, filterable, paginated
 ```
 
 **Why instruction definitions?** Ad-hoc commands are powerful but dangerous at scale. Definitions provide:
@@ -141,7 +141,7 @@ Admin                    Server
 Admin                    Server                    Agent
   │                        │                         │
   │── Create Fragment ────►│  Check/Fix code block   │
-  │── Create Rule ────────►│  Fragment + triggers     │
+  │── Create Rule ────────►│  Fragment + triggers    │
   │── Assign to Group ────►│  Policy → mgmt group    │
   │── Deploy ─────────────►│  Compile, hash, push    │
   │                        │                         │
@@ -174,7 +174,7 @@ Admin                    Server                    Agent
 User/API Client          Server
      │                     │
      │── Login ───────────►│  Session cookie (browser)
-     │   or Bearer token    │  or API token (automation)
+     │   or Bearer token   │  or API token (automation)
      │                     │
      │── Any Request ─────►│
      │                     ├── Authenticate (session or token)

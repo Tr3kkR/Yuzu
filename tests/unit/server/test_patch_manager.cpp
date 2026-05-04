@@ -199,7 +199,6 @@ TEST_CASE("PatchManager: execute_deployment reboot orchestration", "[patch_manag
 
     // Should have dispatched: scan, install (script_exec), verify, notify, reboot (script_exec)
     bool found_notify = false;
-    bool found_reboot = false;
     int script_exec_count = 0;
     for (const auto& [instr, agent] : log) {
         if (instr == "device.interaction.notify")

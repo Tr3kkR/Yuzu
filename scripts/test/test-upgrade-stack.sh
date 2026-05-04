@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # test-upgrade-stack.sh — Phase 2 of the /test pipeline.
 #
-# Stand up the previous-released yuzu-server image (default 0.10.0 from
-# ghcr.io), populate fixtures, swap to the local HEAD image (built in
+# Stand up the previous-released yuzu-server image (default: GitHub's
+# current "Latest release" tag, resolved at runtime via `gh api`; override
+# with --old-version, or set YUZU_RELEASE_REPO to point at a fork), populate
+# fixtures, swap to the local HEAD image (built in
 # Phase 1, tagged yuzu-server:test-${RUN_ID}), verify migrations ran and
 # fixtures survived, and run the synthetic UAT test set against the
 # upgraded stack. Records sub-step timings into the test-runs DB.
@@ -40,7 +42,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
 RUN_ID=""
-OLD_VERSION="0.10.0"
+OLD_VERSION=""
 NEW_VERSION=""
 NEW_IMAGE_LOADED=1
 TEST_DIR=""
@@ -56,7 +58,11 @@ Required:
   --run-id ID
 
 Optional:
-  --old-version V        (default: 0.10.0)
+  --old-version V        (default: GitHub's "Latest release" tag via
+                          \`gh api repos/:owner/:repo/releases/latest\`,
+                          with the leading \`v\` stripped; falls back to
+                          0.10.0 if the gh CLI is unavailable or the
+                          repo has no non-prerelease releases)
   --new-version V        (default: 0.10.1-test-\${RUN_ID})
   --new-image-loaded 0|1 (default: 1 — assumes Phase 1 built it)
   --test-dir DIR         (default: /tmp/yuzu-test-\${RUN_ID})
@@ -85,6 +91,25 @@ if [[ -z "$RUN_ID" ]]; then
     echo "missing --run-id" >&2
     usage >&2
     exit 2
+fi
+
+# Resolve --old-version default from GitHub's "Latest release" (which excludes
+# prereleases) if the operator didn't pin one. This lets /test track whatever
+# the last published stable tag is rather than an ever-staler hardcoded pin.
+# Fallback to 0.10.0 if gh is unavailable or the API call fails, so the
+# pipeline still runs on a fresh clone without gh configured.
+if [[ -z "$OLD_VERSION" ]]; then
+    if command -v gh >/dev/null 2>&1; then
+        resolved=$(gh api "repos/${YUZU_RELEASE_REPO:-Tr3kkR/Yuzu}/releases/latest" \
+                      --jq '.tag_name' 2>/dev/null | sed 's/^v//') || resolved=""
+    fi
+    if [[ -n "${resolved:-}" ]]; then
+        OLD_VERSION="$resolved"
+        echo "test-upgrade-stack: resolved --old-version=$OLD_VERSION (latest release)"
+    else
+        OLD_VERSION="0.10.0"
+        echo "test-upgrade-stack: gh unavailable or no releases — falling back to --old-version=$OLD_VERSION" >&2
+    fi
 fi
 
 NEW_VERSION="${NEW_VERSION:-0.10.1-test-${RUN_ID}}"

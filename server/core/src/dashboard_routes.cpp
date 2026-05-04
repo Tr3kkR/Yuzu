@@ -1,15 +1,24 @@
 #include "dashboard_routes.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <format>
+#include <regex>
 #include <sstream>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 
 #include "agent_registry.hpp" // provides detail::AgentRegistry
 #include "event_bus.hpp"
+#include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "response_store.hpp"
+#include "visualization_engine.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
@@ -19,6 +28,45 @@ namespace yuzu::server {
 // -- Helper: clamp an integer to [lo, hi] -------------------------------------
 static int clamp(int val, int lo, int hi) {
     return std::max(lo, std::min(val, hi));
+}
+
+// -- Helper: format epoch seconds as a coarse "Xd Yh ago" age -----------------
+//
+// Used by the TAR retention-paused list. Intentionally coarse: operators care
+// about "this has been paused for days/hours" not seconds. Returns "—" for 0
+// (sentinel for "never paused").
+static std::string format_age(int64_t epoch_then, int64_t now_epoch) {
+    if (epoch_then <= 0) return "—";
+    int64_t delta = now_epoch - epoch_then;
+    if (delta < 0) delta = 0;
+    if (delta < 60) return std::format("{}s ago", delta);
+    if (delta < 3600) return std::format("{}m ago", delta / 60);
+    if (delta < 86400) return std::format("{}h {}m ago", delta / 3600, (delta % 3600) / 60);
+    int64_t days = delta / 86400;
+    int64_t hours = (delta % 86400) / 3600;
+    if (days < 30) return std::format("{}d {}h ago", days, hours);
+    return std::format("{}d ago", days);
+}
+
+// -- Helper: format epoch seconds as ISO-ish "YYYY-MM-DD HH:MM UTC" -----------
+static std::string format_utc(int64_t epoch_secs) {
+    if (epoch_secs <= 0) return "—";
+    std::time_t t = static_cast<std::time_t>(epoch_secs);
+    std::tm tm_val{};
+#ifdef _WIN32
+    gmtime_s(&tm_val, &t);
+#else
+    gmtime_r(&t, &tm_val);
+#endif
+    return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC",
+                        tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+                        tm_val.tm_hour, tm_val.tm_min);
+}
+
+// -- Helper: epoch-seconds "now" for human-facing age math ---------------------
+static int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // -- Helper: safe int from query param ----------------------------------------
@@ -107,7 +155,9 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
-                                       ResolveFn resolve_fn) {
+                                       ResolveFn resolve_fn,
+                                       yuzu::MetricsRegistry* metrics,
+                                       InstructionStore* instruction_store) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -119,6 +169,32 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
     agents_json_fn_ = std::move(agents_json_fn);
     dispatch_fn_ = std::move(dispatch_fn);
     resolve_fn_ = std::move(resolve_fn);
+    metrics_ = metrics;
+    instruction_store_ = instruction_store;
+
+    // Phase 15.A — issue #547 metric registrations. The design doc
+    // (docs/tar-dashboard.md §7) defines the catalog; PR-A implements the
+    // two that are operational today (the rest land with their owning PRs).
+    if (metrics_) {
+        metrics_->describe(
+            "yuzu_tar_dashboard_view_total",
+            "Operator views of the TAR dashboard fragments by frame and result.",
+            "counter");
+        metrics_->describe(
+            "yuzu_tar_retention_paused_devices",
+            "Number of devices currently reporting a paused TAR source, by source name.",
+            "gauge");
+        metrics_->describe(
+            "yuzu_tar_scan_dispatched_total",
+            "Operator-triggered tar.status scans dispatched by result (success / "
+            "rate_limited / no_visible_agents / no_connected_agents / denied).",
+            "counter");
+        metrics_->describe(
+            "yuzu_tar_source_reenable_total",
+            "Operator-triggered TAR source re-enable attempts by result "
+            "(success / scope_violation / agent_not_connected / denied / invalid_input).",
+            "counter");
+    }
 
     // -- GET /fragments/results -----------------------------------------------
     svr.Get("/fragments/results",
@@ -147,8 +223,24 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 auto filters = parse_filters(req, plugin);
                 auto text_query = req.get_param_value("q");
 
+                // Issue #587: when the dispatcher knew the definition_id
+                // (e.g. an instruction text resolved to a definition with
+                // spec.visualization), it propagates here so the chart
+                // deck is re-rendered as an OOB swap alongside the tbody.
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                std::string definition_id;
+                if (req.has_param("definition_id")) {
+                    auto raw = req.get_param_value("definition_id");
+                    if (std::regex_match(raw, kIdRegex))
+                        definition_id = raw;
+                    // Silently drop malformed values rather than 400 — this
+                    // is an OOB enrichment, not a primary contract; the
+                    // results table still renders.
+                }
+
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
-                                           page, per_page, filters, text_query);
+                                           page, per_page, filters, text_query,
+                                           definition_id);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -166,7 +258,86 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                     return;
                 }
 
-                auto html = render_filter_bar(command_id, plugin);
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                std::string definition_id;
+                if (req.has_param("definition_id")) {
+                    auto raw = req.get_param_value("definition_id");
+                    if (std::regex_match(raw, kIdRegex))
+                        definition_id = raw;
+                }
+
+                auto html = render_filter_bar(command_id, plugin, definition_id);
+                res.set_content(html, "text/html; charset=utf-8");
+            });
+
+    // -- GET /fragments/executions/{id}/visualization (issue #253) ------------
+    //
+    // HTMX placeholder for instruction-response chart cards. Lives here
+    // (next to /fragments/results) rather than in server.cpp so the
+    // dashboard fragment surface is in one file. Closes arch-S6 / #589.
+    //
+    // Returns either:
+    //   * a `<div class="yuzu-chart-deck">` containing one
+    //     `<div data-yuzu-chart-url="...&index=K">` per configured chart
+    //     (issue #587 — definitions may declare multiple charts) that the
+    //     yuzu-charts.js auto-render hook (htmx:afterSettle) populates,
+    //   * an empty body when the definition is missing or has no
+    //     visualization configured (so the dashboard suppresses the
+    //     deck entirely rather than showing a "no data" placeholder).
+    //
+    // Securable: Response:Read — sibling parity with /fragments/results
+    // and the /api/v1/executions/{id}/visualization REST endpoint.
+    svr.Get(R"(/fragments/executions/([A-Za-z0-9._-]+)/visualization)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn_(req, res, "Response", "Read")) return;
+                auto execution_id = req.matches[1].str();
+                std::string definition_id;
+                if (req.has_param("definition_id"))
+                    definition_id = req.get_param_value("definition_id");
+                // Validate definition_id with the same character set the
+                // path-bound execution_id uses. Closes sec-H1: without
+                // this check a value containing `"` or `>` would break
+                // out of the `data-yuzu-chart-url` attribute below
+                // (reflected XSS).
+                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+                if (execution_id.empty() || definition_id.empty() ||
+                    !std::regex_match(definition_id, kIdRegex)) {
+                    res.status = 400;
+                    res.set_content(
+                        R"(<div class="yuzu-chart-empty">Missing or malformed execution id or definition_id.</div>)",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                // Pre-flight count: skip the entire deck when no chart is
+                // configured. count() handles both legacy single-object
+                // and canonical array shapes.
+                int chart_count = 0;
+                if (instruction_store_ && instruction_store_->is_open()) {
+                    auto def = instruction_store_->get_definition(definition_id);
+                    if (def)
+                        chart_count = VisualizationEngine::count(def->visualization_spec);
+                }
+                if (chart_count <= 0) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+
+                // Both ids regex-bounded by this point — safe to embed
+                // verbatim into the attribute value. One placeholder per
+                // chart; yuzu-charts.js fetches each independently so a
+                // slow/failed render of one chart doesn't block siblings.
+                // Use `&amp;` (not raw `&`) inside HTML attribute values for
+                // strict HTML5 conformance and consistency with render_results
+                // base_url emission. Closes governance C-14 / sec-F5 / UP-36.
+                std::string html = R"(<div class="yuzu-chart-deck">)";
+                for (int i = 0; i < chart_count; ++i) {
+                    html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
+                    html += "/api/v1/executions/" + execution_id
+                          + "/visualization?definition_id=" + definition_id
+                          + "&amp;index=" + std::to_string(i);
+                    html += R"("></div>)";
+                }
+                html += "</div>";
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -342,6 +513,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      html += "<nav id=\"result-pagination\" hx-swap-oob=\"innerHTML\"></nav>";
                      html += "<div id=\"result-summary\" hx-swap-oob=\"innerHTML\"></div>";
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
+                     // Clear any chart deck from a prior query — help is
+                     // a no-chart command so any lingering deck would
+                     // overlay the help table. The hx-on::before-request
+                     // JS hook on #instr-form clears it client-side too;
+                     // this OOB swap is defence-in-depth so a future
+                     // refactor of the form-handler attribute can't
+                     // silently leave stale charts on the page.
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
                      res.set_content(html, "text/html; charset=utf-8");
                      return;
                  }
@@ -349,13 +528,50 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                  // Resolve instruction text → plugin/action
                  auto [plugin, action] = resolve_fn_(lower_cmd);
                  if (plugin.empty()) {
+                     // Defensive: clear any chart deck from a prior
+                     // query so the unknown-command banner isn't
+                     // overlaid on a stale chart.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " style=\"font-size:0.75rem;color:var(--mds-color-theme-indicator-error)\">"
                          "Unknown command: &quot;" + html_escape(instruction) +
-                         "&quot;. Type &quot;help&quot; to list all commands.</span>",
+                         "&quot;. Type &quot;help&quot; to list all commands.</span>"
+                         "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                          "text/html; charset=utf-8");
                      return;
+                 }
+
+                 // Issue #587: reverse-lookup an InstructionDefinition that
+                 // matches (plugin, action) AND has a spec.visualization.
+                 // When found, propagate the definition_id through the
+                 // result-render flow so the chart deck renders inline.
+                 //
+                 // Closes governance CP-1 / sec-F1 / ER-NEW-2: gate the
+                 // reverse-lookup on `InstructionDefinition:Read` so a
+                 // principal with `Execution:Execute` but denied
+                 // `InstructionDefinition:Read` cannot enumerate definition
+                 // IDs via this side channel. The dispatch itself is
+                 // already authorised — we only suppress the chart-deck
+                 // enrichment, not the command. perm_fn_'s deny path
+                 // writes 403 to its res argument, so we hand it a
+                 // throwaway Response and discard the side effect.
+                 std::string def_id;
+                 httplib::Response def_perm_res;
+                 bool can_read_defs = perm_fn_(req, def_perm_res,
+                                               "InstructionDefinition", "Read");
+                 if (can_read_defs && instruction_store_ &&
+                     instruction_store_->is_open()) {
+                     InstructionQuery q;
+                     q.plugin_filter = plugin;
+                     q.enabled_only = true;
+                     q.limit = 50;
+                     for (const auto& d : instruction_store_->query_definitions(q)) {
+                         if (d.action != action) continue;
+                         if (!VisualizationEngine::has_visualization(d.visualization_spec))
+                             continue;
+                         def_id = d.id;
+                         break;
+                     }
                  }
 
                  // Resolve scope → agent_ids or scope expression
@@ -414,11 +630,36 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
 
                  // OOB: filter bar — initially empty, self-refreshes after
                  // results arrive (facets are stored when agent responds,
-                 // which is after this HTTP response returns)
+                 // which is after this HTTP response returns).
+                 // Issue #587: include definition_id when known so the
+                 // re-fetched filter bar emits it as a hidden input and
+                 // every subsequent /fragments/results call carries it,
+                 // which keeps the chart deck rendered as filters change.
                  html += "<div id=\"filter-bar\" hx-swap-oob=\"true\""
                          " hx-get=\"/fragments/results/filter-bar?command_id=" +
-                         html_escape(command_id) + "&plugin=" + html_escape(plugin) +
-                         "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
+                         html_escape(command_id) + "&amp;plugin=" + html_escape(plugin);
+                 if (!def_id.empty())
+                     html += "&amp;definition_id=" + html_escape(def_id);
+                 html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
+
+                 // OOB: chart deck — empty initially, self-refreshes once
+                 // responses are in. Same delay window as the filter bar.
+                 // Without this, the deck only appears after the operator
+                 // touches a filter; users expect the chart to render as
+                 // soon as the data arrives. `hx-swap-oob="true"` replaces
+                 // the whole element (outerHTML) so the new hx-get /
+                 // hx-trigger attributes attach; `innerHTML` would lose
+                 // them.
+                 if (!def_id.empty()) {
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
+                             " hx-get=\"/fragments/results?command_id=" +
+                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
+                             "&amp;definition_id=" + html_escape(def_id) +
+                             "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
+                 } else {
+                     // Clear any deck left over from a prior command.
+                     html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\"></div>";
+                 }
 
                  // OOB: clear pagination and summary
                  html += "<nav id=\"result-pagination\" hx-swap-oob=\"true\"></nav>";
@@ -431,8 +672,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
 
-                 audit_fn_(req, "command.dispatch", "success", "command", command_id,
-                          plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)");
+                 // Closes governance CP-2 / C-16: append definition_id when
+                 // the reverse-lookup resolved one, so SIEM correlation
+                 // between command.dispatch and execution.visualization.fetch
+                 // (2s later) is traceable by definition.
+                 std::string detail =
+                     plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
+                 if (!def_id.empty())
+                     detail += " definition_id=" + def_id;
+                 audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
              });
@@ -551,6 +799,360 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
+    // -- TAR retention-paused source list (Phase 15.A — issue #547) -----------
+    //
+    // GET renders the table for the calling operator from THEIR most-recent
+    // tar.status scan (per-username state); POST dispatches a fresh scan
+    // **scoped to the operator's visible agents** and records the new
+    // command_id under the username key. Both routes filter rendered
+    // responses by the operator's visible agent set so an operator without
+    // visibility on a device cannot see its TAR config even via cached
+    // scan results.
+    //
+    // Permission tiers (after Gate 2 hardening):
+    //   GET  scan list      → Infrastructure:Read   (read-only render)
+    //   POST scan dispatch  → Execution:Execute     (dispatches commands)
+    //   POST reenable       → Execution:Execute     (mutates agent state)
+    //
+    // The two routes are deliberately separate (rather than one auto-fetch
+    // route) so an operator viewing the page does not silently re-scan the
+    // fleet on every page load — the dispatch is an explicit operator action,
+    // surfaced in the audit trail.
+
+    svr.Get("/fragments/tar/retention-paused",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn_(req, res, "Infrastructure", "Read")) {
+                    if (metrics_) {
+                        metrics_->counter("yuzu_tar_dashboard_view_total",
+                                          {{"frame", "retention"},
+                                           {"result", "denied"}}).increment();
+                    }
+                    return;
+                }
+                auto session = auth_fn_(req, res);
+                if (!session) return;
+                // Per-operator scoped data — must not be cached by any
+                // shared upstream proxy. UP-11 from Gate 4 unhappy-path:
+                // a corporate proxy honoring default text/html caching
+                // would re-replay one operator's filtered, visibility-
+                // scoped table to a different operator on a shared
+                // session-less URL.
+                res.set_header("Cache-Control", "no-store, private");
+                res.set_header("Vary", "Cookie");
+                res.set_content(render_tar_retention_paused(session->username),
+                                "text/html; charset=utf-8");
+                if (metrics_) {
+                    metrics_->counter("yuzu_tar_dashboard_view_total",
+                                      {{"frame", "retention"},
+                                       {"result", "success"}}).increment();
+                }
+            });
+
+    svr.Post("/fragments/tar/retention-paused/scan",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 // Dispatching a command to the fleet is an Execute action,
+                 // not a Read. Sibling dispatch handlers (`run-instruction`,
+                 // `tar-execute`) all gate on Execution:Execute — match.
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     // Compliance F1: emit a denied audit row so SIEM rules
+                     // alerting on RBAC-rejection probing have a data source.
+                     // Without this, the audit catalog overclaims coverage.
+                     audit_fn_(req, "tar.status.scan", "denied", "command",
+                              "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "denied"}}).increment();
+                     }
+                     return;
+                 }
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<div class=\"empty-state\">Dispatch "
+                                     "unavailable.</div>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 // sre CAP-1: per-operator 30-second scan cooldown to defend
+                 // against an operator (or compromised session) clicking Scan
+                 // in a tight loop and storming the fleet with tar.status
+                 // RPCs. Uses the already-stored dispatched_at field; no new
+                 // state needed.
+                 constexpr int64_t kScanCooldownSec = 30;
+                 {
+                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
+                     auto it = tar_scans_by_user_.find(session->username);
+                     if (it != tar_scans_by_user_.end()) {
+                         auto since = now_epoch() - it->second.dispatched_at;
+                         if (since < kScanCooldownSec) {
+                             res.status = 429;
+                             res.set_header("Retry-After",
+                                 std::to_string(kScanCooldownSec - since));
+                             res.set_content(std::format(
+                                 "<div class=\"empty-state\">Please wait "
+                                 "<strong>{}</strong> second{} before "
+                                 "scanning again.</div>",
+                                 kScanCooldownSec - since,
+                                 (kScanCooldownSec - since) == 1 ? "" : "s"),
+                                 "text/html; charset=utf-8");
+                             audit_fn_(req, "tar.status.scan", "denied",
+                                      "command", "",
+                                      std::format("rate_limited cooldown={}s",
+                                                   kScanCooldownSec - since));
+                             if (metrics_) {
+                                 metrics_->counter(
+                                     "yuzu_tar_scan_dispatched_total",
+                                     {{"result", "rate_limited"}}).increment();
+                             }
+                             return;
+                         }
+                     }
+                 }
+
+                 // Scope dispatch to the operator's visible agents only —
+                 // never fan out to devices the operator cannot see.
+                 // Empty visible set = nobody to scan; return early.
+                 std::vector<std::string> agent_ids;
+                 if (mgmt_group_store_) {
+                     agent_ids = mgmt_group_store_->get_visible_agents(
+                         session->username);
+                 }
+                 if (agent_ids.empty()) {
+                     res.set_content(
+                         "<div class=\"empty-state\">You have no agents "
+                         "in scope to scan. Check your management-group "
+                         "role assignments.</div>",
+                         "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "no_visible_agents"}}).increment();
+                     }
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 auto [command_id, sent] = dispatch_fn_(
+                     "tar", "status", agent_ids, /*scope_expr=*/"", params);
+
+                 {
+                     std::lock_guard<std::mutex> lk(tar_scan_mu_);
+                     // Bounded LRU: drop the oldest entry by dispatched_at if
+                     // we'd exceed the cap. Keeps memory bounded across
+                     // operator turnover without per-request fairness games.
+                     if (tar_scans_by_user_.size() >= kTarScanStateCap &&
+                         !tar_scans_by_user_.contains(session->username)) {
+                         auto oldest = tar_scans_by_user_.begin();
+                         for (auto it = tar_scans_by_user_.begin();
+                              it != tar_scans_by_user_.end(); ++it) {
+                             if (it->second.dispatched_at <
+                                 oldest->second.dispatched_at) {
+                                 oldest = it;
+                             }
+                         }
+                         tar_scans_by_user_.erase(oldest);
+                     }
+                     auto& st = tar_scans_by_user_[session->username];
+                     st.command_id = command_id;
+                     st.dispatched_count = sent;
+                     st.dispatched_at = now_epoch();
+                 }
+
+                 audit_fn_(req, "tar.status.scan", "success", "command",
+                          command_id,
+                          std::format("dispatched to {} agent(s) in scope",
+                                       sent));
+
+                 std::string body;
+                 if (sent == 0) {
+                     body = "<div class=\"empty-state\">None of the agents "
+                            "in your scope are currently connected. Bring "
+                            "an agent online and click "
+                            "<strong>Scan fleet</strong> again.</div>";
+                     // Suppress the success-level toast on zero-reach — Gate 4
+                     // happy-NICE-1 flagged "dispatched to 0 agent(s)" as
+                     // misleading. Use a warning toast that matches the body.
+                     res.set_header("HX-Trigger",
+                         "{\"showToast\":{\"message\":\"No connected agents "
+                         "in scope to scan\",\"level\":\"warning\"}}");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "no_connected_agents"}}).increment();
+                     }
+                 } else {
+                     body = std::format(
+                         "<div class=\"empty-state\">Scanning <strong>{}"
+                         "</strong> agent{} (command <code>{}</code>) — "
+                         "click <strong>Refresh</strong> in a moment to see "
+                         "the results.</div>",
+                         sent, sent == 1 ? "" : "s",
+                         html_escape(std::string{command_id}));
+                     res.set_header("HX-Trigger", std::format(
+                         "{{\"showToast\":{{\"message\":\"TAR scan dispatched "
+                         "to {} agent(s)\",\"level\":\"success\"}}}}", sent));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_scan_dispatched_total",
+                                           {{"result", "success"}}).increment();
+                     }
+                 }
+                 // Cache-Control: no-store applies to all fragment responses
+                 // — fragment data is per-operator (post-hardening-round-1)
+                 // and a shared upstream proxy that caches text/html could
+                 // re-replay one operator's filtered scan result to a
+                 // different operator (UP-11). Vary on Cookie so any
+                 // proxy-cache that does honor CC still keys per-session.
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
+                 res.set_content(body, "text/html; charset=utf-8");
+             });
+
+    // POST /fragments/tar/retention-paused/reenable
+    //   form params: device_id, source
+    //
+    // Dispatches `tar.configure` with `<source>_enabled=true` to the single
+    // named device. Per-source independence (the #539 invariant) means this
+    // does not touch the other three sources on the device.
+    //
+    // Permission: Execution:Execute (dispatches a configure command — same
+    // tier as run-instruction and tar-sql siblings; Gate 2 governance flagged
+    // the original Infrastructure:Update as a tier mismatch).
+    //
+    // RBAC scope: device_id MUST be in the operator's visible agents set;
+    // out-of-scope device_ids are rejected with the same 404 body as
+    // not-connected so non-operators cannot use this endpoint as an
+    // existence-enumeration oracle.
+    svr.Post("/fragments/tar/retention-paused/reenable",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "Execution", "Execute")) {
+                     // Compliance F1: denied audit on RBAC rejection.
+                     audit_fn_(req, "tar.source.reenable", "denied",
+                              "command", "", "rbac_denied");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "denied"}}).increment();
+                     }
+                     return;
+                 }
+                 auto session = auth_fn_(req, res);
+                 if (!session) return;
+                 if (!dispatch_fn_) {
+                     res.status = 503;
+                     res.set_content("<span class=\"tar-row-error\">Dispatch "
+                                     "unavailable.</span>",
+                                     "text/html; charset=utf-8");
+                     return;
+                 }
+
+                 auto device_id = req.has_param("device_id")
+                     ? req.get_param_value("device_id")
+                     : extract_form_value(req.body, "device_id");
+                 auto source = req.has_param("source")
+                     ? req.get_param_value("source")
+                     : extract_form_value(req.body, "source");
+
+                 if (device_id.empty() || source.empty()) {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "device_id and source are required."
+                                     "</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "invalid_input"}}).increment();
+                     }
+                     return;
+                 }
+                 // Validate source against the canonical four. Anything else
+                 // would be a forged form submission; reject rather than
+                 // dispatch a configure command with an arbitrary key.
+                 if (source != "process" && source != "tcp" &&
+                     source != "service" && source != "user") {
+                     res.status = 400;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Unknown source — must be one of "
+                                     "process, tcp, service, user.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "invalid_input"}}).increment();
+                     }
+                     return;
+                 }
+
+                 // Per-device RBAC visibility check. Out-of-scope device_ids
+                 // collapse to the same 404 path as not-connected devices so
+                 // the response cannot be used to enumerate device existence.
+                 // Audit detail records the real reason on the server side.
+                 bool visible = false;
+                 if (mgmt_group_store_) {
+                     auto visible_ids = mgmt_group_store_->get_visible_agents(
+                         session->username);
+                     for (const auto& vid : visible_ids) {
+                         if (vid == device_id) { visible = true; break; }
+                     }
+                 }
+
+                 if (!visible) {
+                     audit_fn_(req, "tar.source.reenable", "failure",
+                              "command", "",
+                              std::format("scope_violation source={}",
+                                           source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "scope_violation"}}).increment();
+                     }
+                     return;
+                 }
+
+                 std::unordered_map<std::string, std::string> params;
+                 params[std::format("{}_enabled", source)] = "true";
+                 auto [command_id, sent] = dispatch_fn_(
+                     "tar", "configure", {device_id}, /*scope_expr=*/"",
+                     params);
+
+                 if (sent == 0) {
+                     audit_fn_(req, "tar.source.reenable", "failure",
+                              "command", "",
+                              std::format("agent_not_connected source={}",
+                                           source));
+                     res.status = 404;
+                     res.set_content("<span class=\"tar-row-error\">"
+                                     "Agent not reachable.</span>",
+                                     "text/html; charset=utf-8");
+                     if (metrics_) {
+                         metrics_->counter("yuzu_tar_source_reenable_total",
+                                           {{"result", "agent_not_connected"}}).increment();
+                     }
+                     return;
+                 }
+
+                 audit_fn_(req, "tar.source.reenable", "success",
+                          "command", command_id,
+                          std::format("device={} source={}",
+                                       device_id, source));
+                 if (metrics_) {
+                     metrics_->counter("yuzu_tar_source_reenable_total",
+                                       {{"result", "success"}}).increment();
+                 }
+
+                 res.set_header("HX-Trigger", std::format(
+                     "{{\"showToast\":{{\"message\":\"Re-enabling {} on "
+                     "{}\",\"level\":\"success\"}}}}",
+                     source, html_escape(std::string{device_id})));
+                 // No-store on every fragment response (UP-11 mitigation).
+                 res.set_header("Cache-Control", "no-store, private");
+                 res.set_header("Vary", "Cookie");
+                 // Empty response body — combined with hx-swap=delete on
+                 // the row, this drops the row optimistically. The next
+                 // Refresh will reconcile against a fresh tar.status.
+                 res.set_content("", "text/html; charset=utf-8");
+             });
+
     spdlog::info("DashboardRoutes: registered fragment endpoints");
 }
 
@@ -594,7 +1196,8 @@ std::string DashboardRoutes::render_results(
     const std::string& sort_col, const std::string& sort_dir,
     int page, int per_page,
     const std::vector<FacetFilter>& filters,
-    const std::string& text_query) {
+    const std::string& text_query,
+    const std::string& definition_id) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -699,6 +1302,8 @@ std::string DashboardRoutes::render_results(
                           "&amp;dir=" + html_escape(new_dir) +
                           "&amp;page=" + std::to_string(new_page) +
                           "&amp;per_page=" + std::to_string(per_page);
+        if (!definition_id.empty())
+            url += "&amp;definition_id=" + html_escape(definition_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -838,6 +1443,34 @@ std::string DashboardRoutes::render_results(
     }
     html += "</div>";
 
+    // Issue #587 — OOB chart deck. When the dispatched command came from an
+    // InstructionDefinition that has a `spec.visualization`, populate
+    // #chart-deck-host with one chart-card div per configured chart.
+    // yuzu-charts.js (loaded in dashboard.html) re-runs auto-render on
+    // htmx:afterSettle and fetches each chart's REST URL independently.
+    // When no definition_id is supplied or the definition has no charts,
+    // we still emit an empty <div> so any prior chart deck from a previous
+    // command is cleared.
+    int chart_count = 0;
+    if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
+        auto def = instruction_store_->get_definition(definition_id);
+        if (def)
+            chart_count = VisualizationEngine::count(def->visualization_spec);
+    }
+    html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
+    if (chart_count > 0) {
+        html += R"(<div class="yuzu-chart-deck">)";
+        for (int i = 0; i < chart_count; ++i) {
+            html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
+            html += "/api/v1/executions/" + html_escape(command_id) +
+                    "/visualization?definition_id=" + html_escape(definition_id) +
+                    "&amp;index=" + std::to_string(i);
+            html += R"("></div>)";
+        }
+        html += "</div>";
+    }
+    html += "</div>";
+
     return html;
 }
 
@@ -846,7 +1479,8 @@ std::string DashboardRoutes::render_results(
 // ---------------------------------------------------------------------------
 
 std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
-                                                const std::string& plugin) {
+                                                const std::string& plugin,
+                                                const std::string& definition_id) {
     auto& cols = columns_for_plugin(plugin);
 
     std::string html;
@@ -855,6 +1489,10 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
             html_escape(command_id) + "\">"
             "<input type=\"hidden\" name=\"plugin\" value=\"" +
             html_escape(plugin) + "\">";
+    if (!definition_id.empty()) {
+        html += "<input type=\"hidden\" name=\"definition_id\" value=\"" +
+                html_escape(definition_id) + "\">";
+    }
 
     // Per-column filter controls (skip Agent at index 0)
     for (size_t i = 1; i < cols.size(); ++i) {
@@ -1034,6 +1672,288 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
                     html_escape(agents_arr.dump()) +
                     "\" style=\"display:none\"></div>";
         }
+    }
+
+    return html;
+}
+
+// ---------------------------------------------------------------------------
+// render_tar_retention_paused — Phase 15.A retention-paused source list
+// ---------------------------------------------------------------------------
+//
+// Reads THIS OPERATOR'S most-recent tar.status scan (per-username state),
+// queries the response store for that command_id, **filters responses to
+// the operator's visible agents**, parses each agent's
+// `config|<source>_enabled|false` lines plus the matching paused_at /
+// live_rows / oldest_ts companions, and returns an HTML table fragment.
+//
+// Per-username state + visibility filter together close the Gate 2
+// governance HIGH finding (cross-operator data leak via shared scan slot).
+//
+// Empty states (no scan run yet, scan returned zero rows) render as
+// informational placeholders rather than table-with-zero-rows so the
+// operator gets actionable guidance.
+
+std::string DashboardRoutes::render_tar_retention_paused(
+    const std::string& username) const {
+    std::string scan_id;
+    int scan_count = 0;
+    int64_t scan_at = 0;
+    {
+        std::lock_guard<std::mutex> lk(tar_scan_mu_);
+        auto it = tar_scans_by_user_.find(username);
+        if (it != tar_scans_by_user_.end()) {
+            scan_id = it->second.command_id;
+            scan_count = it->second.dispatched_count;
+            scan_at = it->second.dispatched_at;
+        }
+    }
+
+    if (scan_id.empty()) {
+        return "<div class=\"empty-state\">No scan data yet — click "
+               "<strong>Scan fleet</strong> above to query the agents "
+               "in your scope for TAR retention state.</div>";
+    }
+    if (!response_store_) {
+        return "<div class=\"empty-state\">Response store unavailable.</div>";
+    }
+
+    // Build the operator's visible-agent allow-set so we can filter the
+    // raw response stream against it. Defense-in-depth: even if the scan
+    // dispatch already scoped to visible agents, a separate operator who
+    // shares the command_id (no longer possible after per-user state but
+    // kept for layered safety) still cannot see out-of-scope data.
+    std::unordered_set<std::string> visible_set;
+    if (mgmt_group_store_) {
+        auto visible_ids = mgmt_group_store_->get_visible_agents(username);
+        visible_set.reserve(visible_ids.size());
+        for (auto& v : visible_ids) visible_set.insert(std::move(v));
+    }
+
+    // Pull every response stored for the scan command_id.
+    ResponseQuery q;
+    q.limit = 10000;
+    auto responses = response_store_->query(scan_id, q);
+
+    // Each response is from one agent. Parse each line for
+    //   config|<source>_enabled|<value>
+    //   config|<source>_paused_at|<ts>
+    //   config|<source>_live_rows|<count>
+    //   config|<source>_oldest_ts|<ts>
+    // and emit one table row for every (agent, source) pair where
+    // `<source>_enabled` == "false". Sources with `enabled=true` are
+    // dropped — the operator wants the *paused* set, not the whole fleet.
+    struct PausedRow {
+        std::string agent_id;
+        std::string agent_display;
+        std::string source;
+        int64_t paused_at{0};
+        int64_t live_rows{-1};   // -1 = unknown (older agent)
+        int64_t oldest_ts{0};
+    };
+    std::vector<PausedRow> rows;
+    int agents_responded = 0;
+    int agents_with_no_paused_sources = 0;
+    int agents_filtered_out_of_scope = 0;
+
+    for (const auto& resp : responses) {
+        // Visibility gate: drop responses from agents the operator cannot
+        // see. If mgmt_group_store_ is unavailable, fail closed (drop all
+        // — operator sees an empty list rather than unscoped data).
+        if (!visible_set.contains(resp.agent_id)) {
+            ++agents_filtered_out_of_scope;
+            continue;
+        }
+        ++agents_responded;
+        std::unordered_map<std::string, std::string> kv;
+        auto lines = split_output_lines(resp.output);
+        for (const auto& line : lines) {
+            if (!line.starts_with("config|")) continue;
+            // line shape: config|<key>|<value>
+            auto first_pipe = line.find('|', 7);
+            if (first_pipe == std::string::npos) continue;
+            std::string key = line.substr(7, first_pipe - 7);
+            std::string val = line.substr(first_pipe + 1);
+            kv[std::move(key)] = std::move(val);
+        }
+
+        bool any_paused_for_this_agent = false;
+        // Iterate the four canonical sources. Hardcoding here is fine — these
+        // are stable across the project; new sources land via TAR registry
+        // changes, and the dashboard list is robust to unknown sources by
+        // simply not rendering them (they will surface in PR-A.6 follow-up).
+        for (const char* source : {"process", "tcp", "service", "user"}) {
+            std::string enabled_key = std::string{source} + "_enabled";
+            auto it = kv.find(enabled_key);
+            if (it == kv.end() || it->second != "false") continue;
+
+            PausedRow row;
+            row.agent_id = resp.agent_id;
+            row.agent_display = registry_ ? registry_->display_name(resp.agent_id)
+                                          : resp.agent_id;
+            row.source = source;
+            if (auto p = kv.find(std::string{source} + "_paused_at");
+                p != kv.end()) {
+                try { row.paused_at = std::stoll(p->second); } catch (...) {}
+            }
+            if (auto lr = kv.find(std::string{source} + "_live_rows");
+                lr != kv.end()) {
+                try { row.live_rows = std::stoll(lr->second); } catch (...) {}
+            }
+            if (auto ot = kv.find(std::string{source} + "_oldest_ts");
+                ot != kv.end()) {
+                try { row.oldest_ts = std::stoll(ot->second); } catch (...) {}
+            }
+            rows.push_back(std::move(row));
+            any_paused_for_this_agent = true;
+        }
+        if (!any_paused_for_this_agent) ++agents_with_no_paused_sources;
+    }
+
+    int64_t now = now_epoch();
+
+    // sre OBS-1: surface retention-paused fleet posture as a gauge per
+    // source so SREs can alert on "process retention is paused on N
+    // devices" trends. We compute per-source counts here from the
+    // already-iterated row set, clearing the gauge family first so an
+    // operator's narrowed-by-visibility view doesn't leave stale values
+    // when their group composition shrinks.
+    if (metrics_) {
+        std::unordered_map<std::string, int64_t> per_source_counts{
+            {"process", 0}, {"tcp", 0}, {"service", 0}, {"user", 0}};
+        for (const auto& r : rows) {
+            ++per_source_counts[r.source];
+        }
+        for (const auto& [src, count] : per_source_counts) {
+            metrics_->gauge("yuzu_tar_retention_paused_devices",
+                            {{"source", src}})
+                .set(static_cast<double>(count));
+        }
+    }
+
+    // Header showing scan provenance and an honest "responded N of M" count.
+    // Includes the in-scope filter so the operator understands the
+    // visibility-bounded view.
+    std::string html;
+    html.reserve(2048);
+    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
+    html += std::format(
+        "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
+        "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
+        "responded &middot; <strong>{}</strong> have all sources collecting "
+        "normally",
+        html_escape(scan_id),
+        scan_count, scan_count == 1 ? "" : "s",
+        format_age(scan_at, now),
+        agents_responded,
+        agents_with_no_paused_sources);
+    if (agents_filtered_out_of_scope > 0) {
+        html += std::format(" &middot; <strong>{}</strong> response{} from "
+                            "out-of-scope agents dropped",
+                            agents_filtered_out_of_scope,
+                            agents_filtered_out_of_scope == 1 ? "" : "s");
+    }
+    html += "</div>";
+
+    if (rows.empty()) {
+        // Distinguish "scan still in progress" from "scan complete and clean."
+        // Without this branch the empty-state always nudges Refresh, which is
+        // factually wrong once every agent has answered (Gate 4 happy-path
+        // SHOULD-1).
+        if (agents_responded < scan_count) {
+            html += "<div class=\"empty-state\">"
+                    "<strong>No paused sources detected yet.</strong> The "
+                    "scan is still in progress — click "
+                    "<strong>Refresh</strong> in a moment for more responses."
+                    "</div>";
+        } else {
+            html += "<div class=\"empty-state\">"
+                    "<strong>No paused sources detected</strong> &mdash; all "
+                    "agents in your scope responded and every collector is "
+                    "running normally."
+                    "</div>";
+        }
+        return html;
+    }
+
+    // Sort: paused-longest-first, then by agent display name. Operators want
+    // to see the boxes that have been accumulating non-aging data the
+    // longest at the top of the list.
+    std::sort(rows.begin(), rows.end(),
+              [](const PausedRow& a, const PausedRow& b) {
+                  if (a.paused_at != b.paused_at) {
+                      // Smaller paused_at = older = first. Treat 0 as "infinity"
+                      // so unknowns sink to the bottom.
+                      auto cmp_a = a.paused_at == 0 ? INT64_MAX : a.paused_at;
+                      auto cmp_b = b.paused_at == 0 ? INT64_MAX : b.paused_at;
+                      return cmp_a < cmp_b;
+                  }
+                  return a.agent_display < b.agent_display;
+              });
+
+    html += "<table>";
+    html += "<thead><tr>"
+            "<th>Device</th>"
+            "<th>Source</th>"
+            "<th>Paused since</th>"
+            "<th>Paused for</th>"
+            "<th style=\"text-align:right\">Live rows</th>"
+            "<th>Oldest data</th>"
+            "<th></th>"
+            "</tr></thead><tbody>";
+
+    for (const auto& r : rows) {
+        html += "<tr>";
+        html += "<td>" + html_escape(r.agent_display) + "</td>";
+        html += "<td><span class=\"source-pill\">" +
+                html_escape(r.source) + "</span></td>";
+        html += "<td>" + format_utc(r.paused_at) + "</td>";
+        html += "<td>" + format_age(r.paused_at, now) + "</td>";
+        html += "<td style=\"text-align:right\">";
+        if (r.live_rows < 0) {
+            html += "<span style=\"color:#8b949e\">—</span>";
+        } else {
+            html += std::format("{}", r.live_rows);
+        }
+        html += "</td>";
+        html += "<td>" + format_age(r.oldest_ts, now) + "</td>";
+        // Re-enable button: HTMX POST with the device_id + source as form
+        // values, swap=delete on the closest tr so the row drops
+        // optimistically on success. The next operator-triggered Refresh
+        // will reconcile against a fresh tar.status if the agent failed
+        // to apply the configure for any reason.
+        //
+        // hx-vals carries JSON inside an HTML attribute. JSON-escape FIRST
+        // (so `"` becomes `\"`) then HTML-escape the result (the browser
+        // un-HTML-escapes attribute values *before* HTMX's JSON parser
+        // sees them). Skipping the JSON-escape pass here was the Gate 2
+        // sec-M3 finding — a malicious agent registering with a `device_id`
+        // containing `"` could close the JSON string and inject keys.
+        html += std::format(
+            "<td style=\"text-align:right\">"
+            "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
+            "font-size:0.75rem\" "
+            "hx-post=\"/fragments/tar/retention-paused/reenable\" "
+            "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
+            "hx-target=\"closest tr\" hx-swap=\"delete\" "
+            "hx-confirm=\"Re-enable {} collector on {}?\">"
+            "Re-enable"
+            "</button>"
+            "</td>",
+            html_escape(json_escape(r.agent_id)),
+            html_escape(json_escape(r.source)),
+            html_escape(r.source), html_escape(r.agent_display));
+        html += "</tr>";
+    }
+    html += "</tbody></table>";
+
+    if (agents_responded < scan_count) {
+        html += std::format(
+            "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+            "{} of {} agent{} still pending — click "
+            "<strong>Refresh</strong> to pick up additional responses.</div>",
+            scan_count - agents_responded, scan_count,
+            scan_count == 1 ? "" : "s");
     }
 
     return html;

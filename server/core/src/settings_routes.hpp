@@ -49,7 +49,32 @@ public:
     using GatewaySessionCountFn = std::function<std::size_t()>;
 
     /// Register all settings-related routes on the given server.
+    /// Production callers use this overload; internally it constructs an
+    /// HttplibRouteSink and delegates to the sink-based overload below.
     void register_routes(httplib::Server& svr,
+                         AuthFn auth_fn,
+                         AdminFn admin_fn,
+                         PermFn perm_fn,
+                         AuditFn audit_fn,
+                         Config& cfg,
+                         auth::AuthManager& auth_mgr,
+                         auth::AutoApproveEngine& auto_approve,
+                         ApiTokenStore* api_token_store,
+                         ManagementGroupStore* mgmt_group_store,
+                         TagStore* tag_store,
+                         UpdateRegistry* update_registry,
+                         RuntimeConfigStore* runtime_config_store,
+                         AuditStore* audit_store,
+                         bool gateway_enabled,
+                         GatewaySessionCountFn gateway_session_count_fn,
+                         AgentsJsonFn agents_json_fn,
+                         std::shared_mutex& oidc_mu,
+                         std::unique_ptr<oidc::OidcProvider>& oidc_provider);
+
+    /// Sink-based overload — used by tests to register routes against an
+    /// in-process TestRouteSink and dispatch synthesized requests directly,
+    /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
+    void register_routes(class HttpRouteSink& sink,
                          AuthFn auth_fn,
                          AdminFn admin_fn,
                          PermFn perm_fn,
@@ -74,7 +99,19 @@ private:
 
     std::string render_server_config_fragment();
     std::string render_tls_fragment();
-    std::string render_users_fragment();
+    /// Render the Users settings fragment.
+    ///
+    /// @param current_username  Username of the currently authenticated
+    ///                          operator. The row matching this name is
+    ///                          rendered without a "Remove" button to
+    ///                          prevent self-deletion lockout (#397/#403).
+    ///                          No default is provided — every caller must
+    ///                          pass an explicit value (typically
+    ///                          `session->username`) so a future call site
+    ///                          omitting the argument is a compile error,
+    ///                          not a silent UI regression that re-renders
+    ///                          the pre-fix Remove button on the self row.
+    std::string render_users_fragment(const std::string& current_username);
     std::string render_tokens_fragment(const std::string& new_raw_token = {});
     /// Render the API tokens settings fragment.
     ///
@@ -98,6 +135,14 @@ private:
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
     std::string render_directory_fragment();
+    /// Plugin code-signing settings — operator-managed trust bundle and
+    /// require-signature toggle. The PEM bundle lives in
+    /// auth::default_cert_dir() / "plugin-trust-bundle.pem"; the require
+    /// flag persists in `runtime_config` under key
+    /// "plugin_signing_required". Bundle metadata (cert count, SHA-256)
+    /// is recomputed at render time directly from the PEM file rather
+    /// than denormalised, to avoid drift between disk + DB.
+    std::string render_plugin_signing_fragment();
 
     // -- Dependency pointers (stored by register_routes) -----------------------
 

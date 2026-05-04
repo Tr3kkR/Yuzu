@@ -1,0 +1,71 @@
+## Visualization Demo Product Pack
+##
+## Default-shipped example pack that exercises the Phase 8.1 Response
+## Visualization Engine (#253) end-to-end. The pack bundles the
+## `demo.visualization.fleet-posture` InstructionSet (which references six
+## chart-bearing InstructionDefinitions) so an operator can install one
+## thing and immediately demo every chart type the engine supports.
+##
+## Distribution: this pack is shipped unsigned because it carries only
+## read-only `question` definitions sourced from the in-tree content
+## library — no third-party trust chain required. Production / customer
+## packs should be signed per `docs/yaml-dsl-spec.md` §8 and the
+## ProductPackStore signature workflow.
+##
+## To install at runtime:
+##   curl -X POST -H "Authorization: Bearer $TOKEN" \
+##        --data-binary @content/packs/visualization-demo-pack.yaml \
+##        https://yuzu.example/api/v1/product-packs
+##
+## Alternatively, import the bundled InstructionSet and definitions
+## directly via the dashboard's YAML import view.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: ProductPack
+metadata:
+  id: pack.demo.visualization
+  displayName: Visualization Demo Pack
+  version: 1.0.0
+  description: >
+    Default examples pack demonstrating the Response Visualization Engine
+    (#253). Bundles six chart-bearing instruction definitions covering
+    vulnerability severity, antivirus posture, disk encryption, firewall
+    state, certificate issuers, and OS distribution. Install this pack
+    against any UAT or demo fleet and run any of the six instructions
+    from the dashboard "Send" panel — a chart card auto-renders above
+    the results table.
+spec:
+  publisher:
+    name: Yuzu Core
+    contact: platform@example.invalid
+  compatibility:
+    minServerVersion: 0.11.0
+    minAgentVersion: 0.11.0
+    requiredApiVersions:
+      - yuzu.io/v1alpha1
+  contents:
+    instructionSets:
+      - demo.visualization.fleet-posture
+    instructionDefinitions:
+      - security.vuln_scan.scan
+      - security.antivirus.defender_status
+      - security.encryption.state
+      - security.firewall.state
+      - security.certificates.list
+      - device.os_info.os_name
+  dependencies:
+    plugins:
+      - vuln_scan
+      - antivirus
+      - bitlocker
+      - firewall
+      - certificates
+      - os_info
+    packs: []
+  distribution:
+    format: tar.zst
+    importMode: direct
+    allowPartialImport: false
+status:
+  phase: active

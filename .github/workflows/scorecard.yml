@@ -1,0 +1,79 @@
+name: Scorecard supply-chain security
+
+# OpenSSF Scorecard (https://scorecard.dev). Runs 18 automated checks against
+# the repo — branch protection, pinned deps, signed releases, token perms,
+# fuzzing, dangerous workflows, etc. — and publishes the aggregate score
+# plus SARIF into the GitHub Security tab.
+#
+# Triggered by:
+#   - schedule: weekly (Mondays 05:00 UTC, low-activity window)
+#   - push to main: keep scorecard fresh after every reconcile
+#   - branch_protection_rule: re-evaluate the Branch-Protection check when
+#     branch-protection settings change
+#   - workflow_dispatch: manual re-run
+#
+# This workflow itself must pass the Token-Permissions and Pinned-Dependencies
+# scorecard checks it runs, hence `permissions: read-all` at workflow level +
+# scoped write permissions only on the analysis job. Action pins currently
+# follow the repo convention of @vN (dependabot bumps weekly) — the
+# Pinned-Dependencies finding for other workflows will be triaged as a
+# follow-up per issue #407.
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '0 5 * * 1'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+          # PAT scoped to public_repo + read:org. Without it, Scorecard
+          # cannot read Repository Rulesets via the GitHub API and the
+          # Branch-Protection check caps at ~3. Secret rotation cadence
+          # documented in docs/security/scorecard-token.md.
+          # Gracefully optional — when the secret is not yet populated
+          # (e.g. fork runs), the action falls back to the default token
+          # and the Branch-Protection score stays at its public-API limit.
+          repo_token: ${{ secrets.SCORECARD_READ_TOKEN || github.token }}
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 14
+
+      - name: Upload SARIF to code-scanning
+        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        with:
+          sarif_file: results.sarif
+          category: scorecard

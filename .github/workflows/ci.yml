@@ -1,8 +1,24 @@
 name: CI
 
 on:
+  # push fires only on mainline branches (merges into dev/main) so feature/
+  # fix branches with an open PR run CI exactly once via pull_request rather
+  # than the previous duplicate (push + pull_request). For pre-PR feature
+  # work, open the PR earlier or use workflow_dispatch.
+  #
+  # tags-ignore is belt-and-suspenders: with `branches:` set, GitHub
+  # already filters tag pushes — but explicitly excluding `v*` documents
+  # the intent that release tags MUST NOT trip CI (the Release workflow
+  # at release.yml owns the build matrix for tags). NOTE: this does NOT
+  # eliminate the duplicate CI race we hit during v0.11.0 — that came
+  # from branch pushes (the CHANGELOG promote commit landing on dev,
+  # then fast-forwarded to main) firing two CI runs that contended for
+  # the self-hosted runners against the release tag's workflow. A real
+  # cross-workflow concurrency fix is needed for that; tracked as a
+  # follow-up issue.
   push:
-    branches: [main, dev, "feature/**", "fix/**"]
+    branches: [main, dev]
+    tags-ignore: ['v*']
     paths-ignore:
       - 'docs/**'
       - '*.md'
@@ -21,13 +37,21 @@ on:
       - '.github/workflows/runner-inventory-sentinel.yml'
   workflow_dispatch:
 
+# Scorecard Token-Permissions hardening: ci.yml builds and tests only —
+# no registry pushes, no release creation. contents:read is all that's
+# needed. (Image pushes live in ci-runner-image.yml, which keeps its
+# packages:write.)
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PRs cancel-in-progress (rapid iteration — every push obsoletes the last).
+  # Pushes to dev / main do NOT cancel — they queue. Mid-flight pushes were
+  # killing 10+ min of compile work on rapid landings, and the
+  # squash-merge-mid-CI race plausibly explained the irreproducible
+  # post-squash Windows test failure (#501). PR-4 of the CI overhaul plan.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # meson pin lives in requirements-ci.txt (pip ecosystem tracked by
@@ -35,16 +59,57 @@ env:
   # .github/workflows/vcpkg-baseline-update.yml workflow.
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   VCPKG_BINARY_SOURCES: "default"
-  CCACHE_MAXSIZE: "500M"
+  # Bumped 500M → 30G after measuring 94-97% direct-hit rate on the
+  # self-hosted runners (yuzu-wsl2-linux + yuzu-local-windows). Yuzu has
+  # ~700 TUs × multiple build_type/compiler matrix legs; 500M was
+  # thrashing the cache between configs. The hosted macOS leg uploads
+  # via actions/cache and gets capped at GitHub's 10 GB per-repo cache
+  # limit, so this is effectively a "self-hosted gets the full cache"
+  # bump — no risk of bloating the GitHub Actions cache budget.
+  CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
+  CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
+  # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
+  # Runs on a GHA-hosted runner (always available) and queries
+  # /actions/runners. Each downstream job that targets a self-hosted
+  # runner gates on the corresponding *_healthy output with explicit
+  # `== 'true'` (fail-closed: an unhealthy or unknown runner skips the
+  # job in <30s rather than queuing 30 min into a stalled runner).
+  #
+  # Output names are slugified runner names from .github/runner-inventory.json:
+  #   yuzu-wsl2-linux  → yuzu_wsl2_linux_healthy
+  #   yuzu-local-windows → yuzu_local_windows_healthy
+  #
+  # If RUNNER_INVENTORY_TOKEN is missing, the script writes
+  # all runners as `false` and exits 0 (fail-closed): downstream jobs
+  # skip with an obvious "preflight detected unhealthy runner" reason
+  # rather than disappearing into a queue.
+  preflight:
+    name: "Preflight (runner health)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
+      yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
+      all_healthy: ${{ steps.health.outputs.all_healthy }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Probe runner health
+        id: health
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci/runner-health-check.py --mode preflight
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@v6
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -59,14 +124,17 @@ jobs:
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
     name: "Proto backward-compat"
+    needs: [preflight]
+    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
-      - uses: bufbuild/buf-setup-action@v1
+          persist-credentials: false
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
       - name: Lint protos
@@ -77,6 +145,10 @@ jobs:
   # ── Linux (GCC + Clang, self-hosted yuzu-wsl2-linux) ──────────────────
   linux:
     name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    needs: [preflight]
+    # PR-7 of CI overhaul plan: skip if the self-hosted Linux runner is
+    # unhealthy or unknown. Fail-closed `== 'true'` (NOT `!= 'false'`).
+    if: needs.preflight.outputs.yuzu_wsl2_linux_healthy == 'true'
     # Self-hosted: Shulgi 5950X WSL2 Ubuntu. Persistent ccache + vcpkg
     # state between runs on the same workspace amortizes the install
     # cost. Trade-off: the single runner process serializes this 4-way
@@ -97,9 +169,41 @@ jobs:
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-19' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      # PR-5 of the CI overhaul plan: clean:false preserves build-linux/
+      # across jobs so meson + ninja can be incremental across pushes.
+      # The branch-switch sentinel below is the safety net — if the
+      # previous job on this runner was on a different branch, the
+      # build dir's source paths and meson config are stale and must
+      # be wiped (NEVER touch vcpkg/, vcpkg_installed/, or the
+      # runner.tool_cache binary caches — those have their own
+      # sentinel, see scripts/ci/vcpkg-triplet-sentinel.sh).
+      - name: Wipe build-linux*/ on branch switch (pre-checkout)
+        # Per-variant dirs (build-linux-gcc-13-debug, ...) — wipe all of
+        # them on branch switch, not just the matrix-specific one, so
+        # any stale variant-dir from a different branch is also cleared.
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-linux*/"
+              rm -rf "$GITHUB_WORKSPACE"/build-linux-*
+              # Also wipe legacy non-variant dir if it lingers from before
+              # the per-variant migration.
+              rm -rf "$GITHUB_WORKSPACE/build-linux"
+            fi
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          # clean:false — persist build-linux-{compiler}-{buildtype}/ +
+          # vcpkg_installed/ between runs. Branch switches are handled
+          # by the pre-checkout wipe step above; cache freshness is
+          # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
+          # runner-reset.sh.
+          clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -107,44 +211,67 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build pkg-config curl zip unzip tar python3-pip ccache \
             ${{ matrix.compiler == 'gcc-13' && 'gcc-13 g++-13' || 'clang-19' }}
-          pip3 install --user --break-system-packages -r requirements-ci.txt
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      # OTP + rebar3 for the gateway test legs. Without these, meson's
+      # `find_program('rebar3', required: false)` returns not-found,
+      # `gateway eunit` and `gateway ct` are silently skipped, and the
+      # Linux matrix can't catch gateway regressions until they hit the
+      # Windows leg (where rebar3 is pre-baked via choco). Pin matches
+      # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
+      # both halves together — see CLAUDE.md "Toolchain activation".
+      # ImageOS is required because erlef/setup-beam can't auto-detect
+      # the runner OS on self-hosted; set at step scope so the rest of
+      # the job doesn't see it.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
         with:
-          path: ~/.cache/ccache
-          key: ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-
-            ccache-linux-${{ matrix.compiler }}-
+          otp-version: '28'
+          rebar3-version: '3.24'
 
+      # ccache cache lives at ~/.cache/ccache on the self-hosted Linux
+      # runner, which persists in the github-runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying
+      # the GHA upload cost would just reupload data that's already on
+      # disk. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-${{ matrix.compiler }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-${{ matrix.compiler }}-
+      # vcpkg_installed/ persists across runs under clean:false (PR-5).
+      # The vcpkg sentinel below detects manifest / triplet / baseline
+      # drift and wipes vcpkg_installed/<triplet>/ on mismatch. The
+      # runner.tool_cache binary cache lives outside the workspace so
+      # checkout cannot touch it regardless. Issue #569.
+      # job rebuilds every port from source — symptom signature in the
+      # build log is `Restored 0 package(s) from .../<uuid>/vcpkg_cache`.
+      # Mirrors the sanitize-asan pattern at the VCPKG_DEFAULT_BINARY_CACHE
+      # line further down. Issue #569.
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
+      - name: vcpkg sentinel (x64-linux)
+        # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+
       - name: Install vcpkg packages
+        env:
+          # Single shared cache across all matrix variants. The x64-linux
+          # triplet produces bit-identical package zips regardless of the
+          # consuming compiler (gcc-13 vs clang-19) or buildtype (vcpkg
+          # builds with its own toolchain, not the consumer's). Sharing
+          # one cache means the first matrix variant pays the from-source
+          # cost (~25 min) and the other three restore in seconds, vs.
+          # 4× from-source under per-matrix scoping. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
@@ -155,7 +282,22 @@ jobs:
           CXX: ccache ${{ matrix.compiler == 'gcc-13' && 'g++-13' || 'clang++-19' }}
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
-          meson setup builddir \
+          # Under clean:false (PR-5) build-linux/ may already be configured
+          # from a previous matrix variant or push. meson setup errors on
+          # Per-variant build dir under PR-5 clean:false. Sharing one
+          # build-linux/ across all 4 matrix legs (gcc-13/clang-19 ×
+          # debug/release) trips a meson --reconfigure edge case where
+          # the linker driver from a previous variant leaks into the
+          # current one — observed in run #25070779695 where Linux
+          # gcc-13 release ended up linking yuzu-agent with `clang++-19
+          # -flto` instead of `g++-13 -flto`, producing CLI11 undefined
+          # references. Per-variant dirs eliminate the reconfigure
+          # entirely; ccache absorbs the per-TU work across matrix runs
+          # so the disk cost is the only added cost (~1-2 GB × 4).
+          BUILDDIR=build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          reconfig=""
+          [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
+          meson setup $reconfig "$BUILDDIR" \
             --native-file meson/native/${{ matrix.compiler == 'gcc-13' && 'linux-gcc13.ini' || 'linux-clang19.ini' }} \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
@@ -163,10 +305,25 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-13' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
+
+      # Mirror the windows job's upload step so a Linux test failure is
+      # diagnosable. meson `--print-errorlogs` truncates per-test output to
+      # the last 100 lines, which is enough for a Catch2 failure but loses
+      # the failing test name when an Erlang eunit run reports
+      # `Failed: 1. Passed: 144.` with no surviving `*failed*` marker.
+      # Without this artifact we cannot identify which gateway test failed.
+      - name: Upload meson-logs on test failure or cancel
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-logs-linux-${{ matrix.compiler }}-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: ccache stats
         if: always()
@@ -175,6 +332,10 @@ jobs:
   # ── Windows (MSVC, self-hosted yuzu-local-windows) ─────────────────────
   windows:
     name: "Windows MSVC ${{ matrix.build_type }}"
+    needs: [preflight]
+    # PR-7 of CI overhaul plan: skip if the self-hosted Windows runner
+    # is unhealthy or unknown. Fail-closed `== 'true'`.
+    if: needs.preflight.outputs.yuzu_local_windows_healthy == 'true'
     # Self-hosted: 32-core / 48 GB host. gRPC alone takes ~90 min on the
     # GitHub-hosted 4-vCPU windows-2022 runners; self-hosted with cl /MP
     # finishes in a fraction of that and avoids the GitHub Actions minute
@@ -200,12 +361,52 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      # PR-5 of the CI overhaul plan: clean:false on the persistent
+      # yuzu-local-windows runner. Branch-switch sentinel runs in the
+      # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
+      # env vars and bash test syntax both work).
+      #
+      # Per-variant build dirs (build-windows-debug, build-windows-release)
+      # mirror the Linux pattern at lines 265-274. Sharing one build-windows/
+      # across debug+release on the same self-hosted runner triggers the same
+      # meson --reconfigure variant-leak edge case observed on Linux: when
+      # the release build runs first and debug runs second, ninja's link
+      # response files retain release-buildtype state (release-CRT abseil
+      # libs, stale obj-path entries) and produce LNK2038 RuntimeLibrary
+      # mismatches plus LNK1181 truncated-input-path errors. Per-variant
+      # dirs eliminate the reconfigure entirely; ccache absorbs the per-TU
+      # work across matrix runs so the disk cost is the only added cost.
+      # Also wipe the legacy non-variant dir if it lingers from before
+      # this change.
+      - name: Wipe build-windows/ on branch switch (pre-checkout)
+        run: |
+          incoming="${GITHUB_REF#refs/heads/}"
+          if [[ -d "$GITHUB_WORKSPACE/.git" ]]; then
+            current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+            if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
+              echo "branch switch: $current -> $incoming — wiping build-windows*/"
+              rm -rf "$GITHUB_WORKSPACE/build-windows" \
+                     "$GITHUB_WORKSPACE/build-windows-debug" \
+                     "$GITHUB_WORKSPACE/build-windows-release"
+            fi
+          fi
+          # Always remove the legacy single-variant dir so a stale state
+          # from before per-variant dirs landed cannot poison either leg.
+          if [[ -d "$GITHUB_WORKSPACE/build-windows" ]]; then
+            echo "removing legacy build-windows/ (per-variant dirs are now build-windows-{debug,release})"
+            rm -rf "$GITHUB_WORKSPACE/build-windows"
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          # clean:false — persist build-windows-{debug,release}/ +
+          # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
+          clean: false
+          persist-credentials: false
 
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Assert toolchain available
         run: |
@@ -236,51 +437,51 @@ jobs:
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export was previously
+      # done here for the in-process GHA cache backend that lukka/run-vcpkg
+      # used to support. We don't consume those vars anywhere on this
+      # self-hosted runner (binary cache lives in runner.tool_cache, ccache
+      # writes to the runner's HOME), so the export was dead wiring. Issue #569.
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: Force fresh vcpkg install when triplet changed
-        run: |
-          # The persistent runner workspace accumulates a
-          # vcpkg_installed/x64-windows tree from prior runs. vcpkg's
-          # incremental install keys off the manifest only — it does NOT
-          # detect overlay-triplet content edits. A triplet change
-          # (e.g. removing `VCPKG_BUILD_TYPE release` to enable debug
-          # variants — the LNK2038 fix on dev) silently leaves the
-          # existing release-only tree in place, and the debug build
-          # then fails to link with _ITERATOR_DEBUG_LEVEL mismatches
-          # against absl_*.lib. Reconcile by wiping the install root
-          # whenever the recorded triplet hash drifts. Same approach as
-          # codeql.yml's mirror step.
-          installed_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows"
-          sentinel="$GITHUB_WORKSPACE/vcpkg_installed/.x64-windows-triplet.sha256"
-          want=$(sha256sum triplets/x64-windows.cmake | awk '{print $1}')
-          have=$(cat "$sentinel" 2>/dev/null || echo "")
-          if [[ "$want" != "$have" ]]; then
-            echo "x64-windows triplet sha256 drift: have=$have want=$want — wiping vcpkg_installed/x64-windows"
-            rm -rf "$installed_dir"
-            mkdir -p "$GITHUB_WORKSPACE/vcpkg_installed"
-            echo "$want" > "$sentinel"
-          else
-            echo "x64-windows triplet sha256 unchanged — keeping persistent vcpkg_installed/x64-windows"
-          fi
+      - name: vcpkg sentinel (x64-windows)
+        # Universal cache-key contract — wipe vcpkg_installed/x64-windows
+        # only when (vcpkg.json | vcpkg-configuration.json | triplet | baseline)
+        # has actually changed. See scripts/ci/vcpkg-triplet-sentinel.sh.
+        #
+        # Explicit `/usr/bin/bash` (NOT `bash`) because $PATH on this
+        # runner has C:\Windows\system32 ahead of C:\msys64\usr\bin, so
+        # `bash` resolves to C:\Windows\System32\bash.exe (WSL bash)
+        # which silently exits with WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED
+        # when the runner is a LOCAL SYSTEM service. /usr/bin/bash
+        # resolves through MSYS2's mount table (no $PATH lookup) →
+        # MSYS2 bash. Same gotcha CLAUDE.md documents for `shell: bash`.
+        run: /usr/bin/bash scripts/ci/vcpkg-triplet-sentinel.sh x64-windows
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace. Without this
+          # lukka/run-vcpkg defaults to a per-run UUID temp dir under its
+          # own state path → 0% hit rate every run → every port rebuilt
+          # from source (~90 min for grpc + abseil + protobuf on this
+          # runner). runner.tool_cache survives actions/checkout's
+          # default `clean: true`. Mirrors the Linux pattern. Issue #569.
+          # Single shared cache across debug+release. The x64-windows
+          # triplet builds both variants in one port build (the
+          # VCPKG_BUILD_TYPE override was removed in the LNK2038 fix), so
+          # the zip filename is the same regardless of consumer build_type.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
           # the workspace path contains backslashes and bash's escape
           # processing strips them when interpolated as source text.
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
             --x-manifest-root="$GITHUB_WORKSPACE"
@@ -291,7 +492,13 @@ jobs:
           CXX: ccache cl
           CMAKE_PREFIX_PATH: ${{ github.workspace }}/vcpkg_installed/x64-windows
         run: |
-          meson setup build-windows-ci \
+          # Per-variant build dir under PR-5 clean:false — see the
+          # pre-checkout wipe step above for the rationale. Branch on
+          # existence to satisfy meson's "use --reconfigure" requirement.
+          BUILDDIR=build-windows-${{ matrix.build_type }}
+          reconfig=""
+          [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
+          meson setup $reconfig "$BUILDDIR" \
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
@@ -299,7 +506,7 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-windows-ci
+        run: meson compile -C build-windows-${{ matrix.build_type }}
 
       - name: Test
         run: |
@@ -309,7 +516,27 @@ jobs:
             bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
           fi
           export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          meson test -C build-windows-ci --print-errorlogs
+          meson test -C build-windows-${{ matrix.build_type }} --print-errorlogs
+
+      # meson+ninja truncate test stdout to the last 100 lines in the Actions
+      # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
+      # every failed test — without this artifact, a multi-assertion failure
+      # only exposes ONE expansion in the workflow log. Issue #501.
+      #
+      # `failure() || cancelled()` covers the rapid-dev-push concurrency-cancel
+      # scenario that motivated #501: `cancel-in-progress: true` on the `dev`
+      # concurrency group interrupts the Windows test mid-run, which makes
+      # `if: failure()` evaluate false and drops the artifact — the exact case
+      # that most needs the forensic log. `if-no-files-found: warn` handles
+      # cancels that fire before meson writes testlog.txt.
+      - name: Upload meson-logs on test failure or cancel
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: build-windows-${{ matrix.build_type }}/meson-logs/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: ccache stats
         if: always()
@@ -328,19 +555,31 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
           brew install cmake ninja ccache pipx
-          pipx install "$(grep '^meson==' requirements-ci.txt)"
+          # awk strips the trailing ` \` that pip-compile adds when the
+          # requirement is continued by `--hash=...` lines.
+          pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      # Split restore + always-save: `save-always: true` is deprecated and
+      # documented as "does not work as intended" by the actions/cache
+      # maintainers (https://github.com/actions/cache/tree/main/save#always-save-cache).
+      # Pattern: restore on the way in, then a paired `actions/cache/save`
+      # at the job tail gated on `if: always() && cache-hit != 'true'`. The
+      # `always()` lets the save run even if the build step failed (which
+      # is the only behaviour `save-always` was meant to deliver); the
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already exists, matching the default `actions/cache` semantics.
+      - name: Restore ccache
+        id: cache-ccache-macos
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ~/Library/Caches/ccache
           key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
           restore-keys: |
@@ -351,23 +590,31 @@ jobs:
         run: ccache -z
 
       - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+      - name: Restore vcpkg installed packages
+        # Universal cache-key contract: vcpkg.json + vcpkg-configuration.json
+        # + every overlay triplet + the pinned VCPKG_COMMIT baseline.
+        # Without the triplet/baseline components a port edit or baseline
+        # bump silently restores stale binaries (D3 in the CI overhaul plan).
+        # Save side is the paired `actions/cache/save` step at the job tail
+        # — see comment on `Restore ccache` above for the save-always
+        # deprecation rationale.
+        id: cache-vcpkg-macos
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          save-always: true
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
+            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
             vcpkg-arm64-osx-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
@@ -384,7 +631,7 @@ jobs:
           CXX: ccache c++
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
         run: |
-          meson setup builddir \
+          meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
@@ -392,30 +639,115 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-macos
 
       - name: Test
-        run: meson test -C builddir --print-errorlogs
+        run: meson test -C build-macos --print-errorlogs
+
+      # Same rationale as the linux + windows upload steps: keep test
+      # failures diagnosable when meson's `--print-errorlogs` truncation
+      # drops the test name (notably: gateway eunit summaries).
+      - name: Upload meson-logs on test failure or cancel
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-logs-macos-${{ matrix.build_type }}-${{ github.run_attempt }}
+          path: build-macos/meson-logs/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-  # ── Sanitizers (ASan + UBSan) — main/dev push only ────────────────────
-  sanitize-asan:
-    name: "Sanitizers (ASan+UBSan)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-    env:
-      ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
-      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+      # Paired saves for the two restore-only steps above. `if: always()`
+      # is the documented replacement for `save-always: true` and lets
+      # the cache populate even when Build/Test failed. The
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already matched on restore (no new content to save).
+      - name: Save ccache
+        if: always() && steps.cache-ccache-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/ccache
+          key: ${{ steps.cache-ccache-macos.outputs.cache-primary-key }}
 
+      - name: Save vcpkg installed packages
+        if: always() && steps.cache-vcpkg-macos.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ github.workspace }}/vcpkg_installed
+          key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
+
+  # ── CI canary (PR-8 of overhaul plan) ─────────────────────────────────
+  # Detects whether a PR (or a push to main) touches CI infrastructure
+  # (workflows / actions / CI helper scripts). If it does, the canary leg
+  # runs the linux build on GHA-hosted ubuntu-24.04 — a fresh-disk runner
+  # with no warm caches and no self-hosted assumptions — so workflow
+  # regressions are caught against a vanilla environment BEFORE the
+  # change lands on main and becomes the next CI run for everyone.
+  #
+  # Cache-warming rationale for the push-to-main trigger: GHA cache scope
+  # is branch-isolated. PR runs save to `refs/pull/<N>/merge`, which
+  # sibling PRs cannot read, so without a push-to-main run the canary's
+  # vcpkg + ccache caches never land on `refs/heads/main` and every PR
+  # cold-starts (~25 min from-source vcpkg). Running on push to main
+  # populates the default-branch cache scope, which every subsequent PR
+  # inherits as its restore fallback (~10 s warm restore). Limited to
+  # main only — dev pushes are pre-merge churn, the warm canonical state
+  # we want operators to inherit is what landed on main.
+  detect-ci-changes:
+    name: "Detect CI infrastructure changes"
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: detect
+        run: |
+          # PRs diff against the base ref; pushes diff against the SHA
+          # before the push (`github.event.before`). For push-to-main
+          # that's the previous main tip, which is exactly the boundary
+          # we want — anything in this push that touched CI infra needs
+          # to (re)warm the canary cache scope.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+          fi
+          # Defensive: a brand-new branch push has before = 40 zeros.
+          # main is protected and never created from scratch in normal
+          # flow, but if it happens fall back to HEAD~1 so we don't
+          # diff against the empty tree (which would mark every file
+          # changed and run the canary unconditionally).
+          if [[ "$base_sha" =~ ^0{40}$ ]]; then
+            base_sha="HEAD~1"
+          fi
+          if git diff --name-only "$base_sha"..HEAD \
+              | grep -qE '^\.github/(workflows|actions)/|^scripts/ci/'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "CI infrastructure changes detected — canary will run."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No CI infrastructure changes — canary skipped."
+          fi
+
+  canary:
+    name: "Workflow canary (GHA-hosted ubuntu-24.04)"
+    needs: [detect-ci-changes]
+    if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -423,40 +755,54 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-asan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-asan-
-
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+      - name: Restore vcpkg installed packages (canary)
+        # Universal cache key — invalidates only when manifest, triplet,
+        # or vcpkg baseline changes. First canary run on a stable manifest
+        # is ~25 min from-source; subsequent runs restore in ~10 s.
+        # Save side is the paired `actions/cache/save` step at the job tail
+        # — see comment on the macOS `Restore ccache` step (line ~564) for
+        # the save-always deprecation rationale and the documented split
+        # restore + always-save pattern.
+        id: cache-vcpkg-canary
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/*.cmake') }}
           restore-keys: |
-            vcpkg-x64-linux-gcc13-
+            vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
+            vcpkg-canary-x64-linux-
+
+      - name: Restore ccache (canary)
+        # ccache is `apt-get install`-ed and used as the compiler wrapper
+        # below, but the GHA-hosted runner is fresh-disk per job — without
+        # this cache step every TU compiles cold every run. Mirrors the
+        # macOS pattern. Source-hash key triggers a fresh save on any
+        # source change but cascading restore-keys keep most of the cache
+        # warm. Closes the canary's biggest unforced-loss perf hole (#743).
+        id: cache-ccache-canary
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-canary-x64-linux-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+          restore-keys: |
+            ccache-canary-x64-linux-
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Sentinel unit tests
+        # Pin the sentinel's drift / no-op / first-run / missing-manifest
+        # behaviour before running it for real. Closes #741.
+        run: bash scripts/ci/test-vcpkg-sentinel.sh
+
+      - name: vcpkg sentinel (x64-linux)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
 
       - name: Install vcpkg packages
         run: |
@@ -464,218 +810,42 @@ jobs:
             --triplet x64-linux \
             --x-manifest-root=${{ github.workspace }}
 
-      - name: Configure (Meson + ASan/UBSan)
+      - name: Configure (Meson, gcc-13 debug)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
-          meson setup builddir \
+          meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true \
-            -Db_sanitize=address,undefined
+            -Dbuild_tests=true
 
       - name: Build
-        run: meson compile -C builddir
+        run: meson compile -C build-linux
 
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
+      # Test step intentionally absent — the canary's purpose is
+      # workflow-regression detection on a fresh-disk runner, not test
+      # regression. `meson test` runs on every other linux leg
+      # (linux_matrix, nightly asan/tsan/coverage). Skipping it here saves
+      # ~10 min per canary run without reducing coverage. #743.
 
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
-  # ── Sanitizers (TSan) — main/dev push only ─────────────────────────────
-  sanitize-tsan:
-    name: "Sanitizers (TSan)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-    env:
-      TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ccache-linux-tsan-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-tsan-
-
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
+      # Paired saves for the two restore-only steps above. `if: always()`
+      # is the documented replacement for `save-always: true` and lets
+      # the cache populate even when Build failed. The
+      # `cache-hit != 'true'` gate skips the upload when the primary key
+      # already matched on restore (no new content to save).
+      - name: Save vcpkg installed packages (canary)
+        if: always() && steps.cache-vcpkg-canary.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
+          key: ${{ steps.cache-vcpkg-canary.outputs.cache-primary-key }}
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Install vcpkg packages
-        run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
-            --x-manifest-root=${{ github.workspace }}
-
-      - name: Configure (Meson + TSan)
-        env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-        run: |
-          meson setup builddir \
-            --native-file meson/native/linux-gcc13.ini \
-            --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true \
-            -Db_sanitize=thread
-
-      - name: Build
-        run: meson compile -C builddir
-
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
-
-  # ── Coverage — main/dev push only, after Linux passes ─────────────────
-  coverage:
-    name: "Coverage (GCC 13)"
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    needs: [linux]
-    runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake ninja-build gcc-13 g++-13 \
-            pkg-config curl zip unzip tar python3-pip ccache
-          pip3 install --user --break-system-packages -r requirements-ci.txt gcovr
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Save ccache (canary)
+        if: always() && steps.cache-ccache-canary.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/.cache/ccache
-          key: ccache-linux-coverage-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-linux-coverage-
-
-      - name: Reset ccache stats
-        run: ccache -z
-
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Cache vcpkg installed packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-x64-linux-gcc13-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-          restore-keys: |
-            vcpkg-x64-linux-gcc13-
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
-          vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
-
-      - name: Install vcpkg packages
-        run: |
-          ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
-            --x-manifest-root=${{ github.workspace }}
-
-      - name: Configure (Meson + coverage)
-        env:
-          CC: ccache gcc-13
-          CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
-        run: |
-          meson setup builddir \
-            --native-file meson/native/linux-gcc13.ini \
-            --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true \
-            -Db_coverage=true
-
-      - name: Build
-        run: meson compile -C builddir
-
-      - name: Test
-        run: meson test -C builddir --print-errorlogs
-
-      - name: Generate coverage reports
-        run: |
-          gcovr --root . \
-            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
-            --exclude '.*\.pb\.(h|cc)$' \
-            --branches \
-            --xml -o builddir/coverage.xml
-          gcovr --root . \
-            --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
-            --exclude '.*\.pb\.(h|cc)$' \
-            --branches \
-            --html --html-details -o builddir/coverage-html/index.html
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
-        with:
-          files: builddir/coverage.xml
-          fail_ci_if_error: false
-
-      - name: Upload HTML coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: builddir/coverage-html/
-
-      - name: ccache stats
-        if: always()
-        run: ccache -s
+          key: ${{ steps.cache-ccache-canary.outputs.cache-primary-key }}

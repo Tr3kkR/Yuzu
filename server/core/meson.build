@@ -49,14 +49,83 @@ if not re2_dep.found()
   re2_dep = cxx.find_library('re2')
 endif
 
+# Build-time embed of vendored ECharts into a generated .cpp containing
+# chunked raw string literals (sliced to fit MSVC's 16,380-byte limit on
+# raw string literals — error C2026). Symbol: kEChartsJs.
+echarts_embed = custom_target(
+  'echarts_js_bundle',
+  input: 'vendor/echarts.min.js',
+  output: 'echarts_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'EChartsJs',
+  ],
+)
+
+# Build-time embed of the Yuzu Design System CSS bundle. The source
+# kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
+# after the design-token expansion. Chunking into ~14 KB
+# fragments concatenated at static-init time keeps every chunk under
+# the limit. Symbol: kYuzuCss (std::string).
+yuzu_css_embed = custom_target(
+  'yuzu_css_bundle',
+  input: 'static/yuzu.css',
+  output: 'yuzu_css_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuCss',
+  ],
+)
+
+# Build-time embed of vendored Inter variable webfont as a constexpr
+# byte array (woff2 binary; cannot use raw string literals). Symbol:
+# kInterVariableWoff2 — std::string_view of the bytes.
+inter_embed = custom_target(
+  'inter_woff2_bundle',
+  input: 'vendor/inter/InterVariable.woff2',
+  output: 'inter_woff2_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'InterVariableWoff2',
+  ],
+)
+
+# Build-time YAML→JSON conversion for shipped Yuzu content. The
+# server iterates kBundledDefinitions / kBundledSets on startup and
+# upserts them into the instruction store, so charts are populated
+# without operator intervention. Sidesteps yaml-cpp on Windows MSVC
+# (#625) by doing the parse at build time with PyYAML.
+content_embed = custom_target(
+  'bundled_content',
+  output: 'bundled_content.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_content.py'),
+    meson.project_source_root() / 'content',
+    '@OUTPUT@',
+  ],
+  build_always_stale: true,  # always re-scan content/ for edits
+)
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
+  [echarts_embed, yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
     'src/gateway_service_impl.cpp',
     'src/auth.cpp',
+    'src/auth_db.cpp',
     'src/auth_routes.cpp',
     'src/auto_approve.cpp',
     'src/dashboard_ui.cpp',
@@ -65,6 +134,7 @@ yuzu_server_core_lib = static_library(
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
     'src/settings_routes.cpp',
+    'src/plugin_signing_helpers.cpp',
     'src/nvd_db.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
@@ -79,10 +149,12 @@ yuzu_server_core_lib = static_library(
     'src/instruction_db_pool.cpp',
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
+    'src/execution_event_bus.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
+    'src/tar_page_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
     'src/error_codes.cpp',
@@ -93,6 +165,7 @@ yuzu_server_core_lib = static_library(
     'src/api_token_store.cpp',
     'src/quarantine_store.cpp',
     'src/policy_store.cpp',
+    'src/guaranteed_state_store.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
@@ -121,14 +194,19 @@ yuzu_server_core_lib = static_library(
     'src/license_store.cpp',
     'src/topology_ui.cpp',
     'src/statistics_ui.cpp',
-    'src/css_bundle.cpp',
+    # css_bundle.cpp removed in favour of build-time chunked embed (Gate 4
+    # cpp-B1: kYuzuCss exceeds MSVC's 16,380-byte raw-string-literal limit).
+    # Source CSS lives at server/core/static/yuzu.css; embed_js.py emits
+    # yuzu_css_bundle.cpp with the chunked literal pattern.
     'src/static_js_bundle.cpp',
+    'src/charts_js_bundle.cpp',
+    'src/visualization_engine.cpp',
     'src/icons_svg.cpp',
     'src/migration_runner.cpp',
     'src/rate_limiter.cpp',
     'src/cert_reloader.cpp',
     'src/security_headers.cpp',
-  ),
+  )],
   include_directories: ['include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,

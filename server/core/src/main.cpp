@@ -1,8 +1,10 @@
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
+#include "insecure_tls_gate.hpp"
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
@@ -31,6 +33,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <string_view>
 
 static std::atomic<yuzu::server::Server*> g_server{nullptr};
 
@@ -107,8 +110,18 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_KEY");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
-    app.add_flag("--allow-one-way-tls", "Allow TLS without --ca-cert (disables mTLS)")
+    bool deprecated_allow_one_way_tls_flag = false;
+    app.add_flag("--insecure-skip-client-verify",
+                 "Allow TLS without --ca-cert (disables mTLS client verification). "
+                 "Requires YUZU_ALLOW_INSECURE_TLS=1.")
         ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+    app.add_flag("--allow-one-way-tls",
+                 "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
+                 "still accepted for backward compatibility.")
+        ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
+            cfg.allow_one_way_tls = true;
+            deprecated_allow_one_way_tls_flag = true;
+        });
     app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
                    "PEM management server certificate override");
     app.add_option("--management-key", cfg.mgmt_tls_server_key,
@@ -250,6 +263,10 @@ int main(int argc, char* argv[]) {
                    "Audit log retention period in days (default: 365)")
         ->default_val(365)
         ->envname("YUZU_AUDIT_RETENTION_DAYS");
+    app.add_option("--guardian-event-retention-days", cfg.guardian_event_retention_days,
+                   "Guardian (guaranteed-state) event retention period in days (default: 30)")
+        ->default_val(30)
+        ->envname("YUZU_GUARDIAN_EVENT_RETENTION_DAYS");
 
     // Analytics options
     app.add_flag("--no-analytics", "Disable analytics event collection")
@@ -388,6 +405,49 @@ int main(int argc, char* argv[]) {
 
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
 
+    // ── Insecure-TLS gate (issue #79) ────────────────────────────────────────
+    // Disabling client certificate verification requires BOTH a CLI flag AND
+    // an explicit environment variable, so that no single misconfiguration
+    // (typo, copy-pasted command, leaked CLI history) can silently downgrade
+    // the agent listener from mTLS to one-way TLS.
+    if (deprecated_allow_one_way_tls_flag) {
+        spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
+                     "instead (this flag will be removed in a future release).");
+    }
+    if (cfg.allow_one_way_tls && cfg.tls_enabled) {
+        if (!yuzu::server::security::insecure_tls_env_authorized()) {
+            spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
+                          "in the environment as a second confirmation. Refusing to start.");
+            return EXIT_FAILURE;
+        }
+        spdlog::error("***********************************************************************");
+        spdlog::error("*** CLIENT CERTIFICATE VERIFICATION DISABLED (one-way TLS)          ***");
+        spdlog::error("*** Any network peer can connect to the agent listener AND the      ***");
+        spdlog::error("*** management listener without an mTLS client certificate. This is ***");
+        spdlog::error("*** acceptable ONLY for short-term development or migration         ***");
+        spdlog::error("*** scenarios. Re-enable mTLS by supplying --ca-cert (and           ***");
+        spdlog::error("*** --management-ca-cert if a management override is configured)    ***");
+        spdlog::error("*** and removing --insecure-skip-client-verify.                     ***");
+        spdlog::error("***********************************************************************");
+    }
+
+    // ── --no-tls warning banner ──────────────────────────────────────────────
+    // --no-tls is the supported posture for UAT and customer demos until the
+    // CA/CSR pipeline is automated. It is intentionally NOT gated behind an
+    // env var (an operator passing --no-tls is opting in to plaintext loudly
+    // and explicitly), but we make the degradation impossible to miss in logs.
+    if (!cfg.tls_enabled) {
+        spdlog::error("***********************************************************************");
+        spdlog::error("*** --no-tls IS UNSAFE                                              ***");
+        spdlog::error("*** TLS is fully disabled. The agent gRPC listener AND the          ***");
+        spdlog::error("*** management gRPC listener accept plaintext connections from any  ***");
+        spdlog::error("*** network peer with no encryption and no peer authentication.     ***");
+        spdlog::error("*** The administrative surface is ungated. Anyone reachable on the  ***");
+        spdlog::error("*** management port can issue admin RPCs.                           ***");
+        spdlog::error("*** Use --no-tls ONLY for local UAT, customer demos, and dev work.  ***");
+        spdlog::error("***********************************************************************");
+    }
+
     // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
     if (sqlite3_threadsafe() == 0) {
         spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
@@ -420,6 +480,17 @@ int main(int argc, char* argv[]) {
     }
 
     cfg.auth_config_path = cfg_path;
+
+    // AuthDB lifetime — declared at function scope (NOT inside the
+    // --data-dir block) so the unique_ptr outlives Server::create() and
+    // server->run(). Storing &auth_db in AuthManager from inside the
+    // else block (the previous shape) destroyed the AuthDB at the close
+    // of the block, leaving AuthManager holding a dangling pointer for
+    // the rest of main() — every authenticate() / upsert_user /
+    // update_role / list_users call hit use-after-free in production
+    // deployments with --data-dir set (governance round arch-B1
+    // CRITICAL). Stays nullptr when no --data-dir is configured.
+    std::unique_ptr<yuzu::server::AuthDB> auth_db;
 
     // If --data-dir was specified, ensure it exists and resolve to canonical path
     if (!cfg.data_dir.empty()) {
@@ -457,7 +528,59 @@ int main(int argc, char* argv[]) {
         // The initial load_config() loaded them from cfg_path_ parent (the old
         // location) because set_data_dir() hadn't been called yet.
         auth_mgr.reload_state();
+
+        // -- Auth DB: Initialize SQLite-backed auth persistence -----------------
+        // When --data-dir is specified, create and initialize the auth DB.
+        // This provides persistent user/session/token storage that survives
+        // container restarts (fixes GitHub issues #618, #388, #527, #391, #526).
+        //
+        // arch-B1 fix: assign through the function-scope unique_ptr declared
+        // above. Do NOT redeclare a local AuthDB inside this block — the
+        // pointer must outlive Server::create() and server->run() below.
+        spdlog::info("Initializing auth DB in data directory: {}", cfg.data_dir.string());
+        auth_db = std::make_unique<yuzu::server::AuthDB>(cfg.data_dir);
+        auto db_result = auth_db->initialize();
+        if (!db_result) {
+            spdlog::error("Failed to initialize auth DB: {}",
+                         static_cast<int>(db_result.error()));
+            return EXIT_FAILURE;
+        }
+        spdlog::info("Auth DB initialized successfully");
+
+        // First-boot seeding: if auth DB has no users, seed admin from config file.
+        // This ensures backwards compatibility — existing config-based users
+        // are automatically migrated to the DB on first start.
+        auto users_result = auth_db->list_users();
+        if (users_result && users_result->empty()) {
+            spdlog::info("Auth DB is empty — seeding admin user from config file");
+            // The admin user was already loaded into auth_mgr via load_config(),
+            // so we can read it back and persist to the DB.
+            for (const auto& user : auth_mgr.list_users()) {
+                auto seed_result = auth_db->upsert_user(
+                    user.username,
+                    user.hash_hex,
+                    user.salt_hex,
+                    user.role
+                );
+                if (seed_result) {
+                    spdlog::info("Seeded user '{}' (role={}) into auth DB",
+                               user.username, auth::role_to_string(user.role));
+                } else {
+                    spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
+                }
+            }
+        }
+
         spdlog::info("Data directory: {}", cfg.data_dir.string());
+
+        // Wire AuthDB into AuthManager AFTER seeding is complete.
+        // This ensures auth_mgr.list_users() reads from in-memory (config file)
+        // during seeding, then delegates to AuthDB for all subsequent operations.
+        // The raw pointer is safe: auth_db (the unique_ptr) lives in the outer
+        // function scope and is destroyed only after server->run() returns
+        // and AuthManager has gone out of scope.
+        auth_mgr.set_auth_db(auth_db.get());
+        spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
     // -- Batch token generation mode (exits without starting server) ----------

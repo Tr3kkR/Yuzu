@@ -45,6 +45,24 @@ spec:
       groupBy: [state]
       operations: [count]
 
+  visualization:
+    # firewall is a key|value-schema plugin — `result_parsing.hpp` clamps
+    # each row to two fields. The `state` action emits rows whose value
+    # is itself pipe-delimited (`Domain|enabled`, `Private|enabled`, …)
+    # but the engine sees it as one opaque string. Filtering to the
+    # `profile` rows and labelling by the value string gives a fleet
+    # pie of "which (profile, state) tuples do we have, by device
+    # count". Splitting the value into its own (profile, state) axes
+    # for a true multi-series column chart needs the value-substring
+    # engine extension tracked under issue #626.
+    type: pie
+    processor: single_series
+    title: Firewall profile state across the fleet
+    whereField: 0
+    whereEquals: profile
+    labelField: 1
+    valueLabel: Devices
+
   readablePayload: "Query firewall state"
 
   gather:

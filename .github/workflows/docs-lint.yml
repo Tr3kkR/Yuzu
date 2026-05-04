@@ -4,8 +4,10 @@ name: Docs Lint
 # markdown-only changes (which ci.yml deliberately skips via paths-ignore).
 # Keep this workflow fast and dependency-light — no build, no vcpkg, no caches.
 on:
+  # push fires only on mainline branches; feature/fix branches with an open
+  # PR run docs lint exactly once via pull_request. Mirrors ci.yml.
   push:
-    branches: [main, dev, "feature/**", "fix/**"]
+    branches: [main, dev]
     paths:
       - 'CHANGELOG.md'
       - 'docs/**'
@@ -33,7 +35,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py

@@ -109,8 +109,20 @@ void AuditStore::log(const AuditEvent& event) {
     sqlite3_bind_text(stmt, 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 12, ttl);
 
-    sqlite3_step(stmt);
+    int step_rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+
+    // SOC 2 CC7.2: a privileged-mutation handler that emits an audit event
+    // and silently fails to persist it produces a forensically-empty row.
+    // Surface the failure count so operators can alert on a non-zero rate.
+    // We still bucket the per-result counter below so the success/failure
+    // ratio remains observable separately from the emit-failed signal.
+    if (step_rc != SQLITE_DONE) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("AuditStore: sqlite3_step rc={} ({}); event lost",
+                      step_rc, sqlite3_errmsg(db_));
+        return;
+    }
 
     // Bucket the write into a Prometheus-friendly counter so the audit subsystem
     // is observable from the /metrics scrape. Result vocabulary is open-ended at

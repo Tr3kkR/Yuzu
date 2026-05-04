@@ -180,11 +180,11 @@ configs:
 services:
   # ── Yuzu Server ──────────────────────────────────────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.10.0}
+    image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.12.0}
     container_name: yuzu-server
     restart: unless-stopped
     ports:
-      - "8080:8080"     # Web dashboard + REST API
+      - "8092:8080"     # Web dashboard + REST API
       - "50051:50051"   # Agent gRPC (direct-connect agents)
       - "50052:50052"   # Management gRPC
       - "50055:50055"   # Gateway upstream
@@ -202,6 +202,8 @@ services:
       - "8080"
       - "--config"
       - "/etc/yuzu/yuzu-server.cfg"
+      - "--data-dir"
+      - "/var/lib/yuzu"
       - "--gateway-upstream"
       - "0.0.0.0:50055"
       - "--gateway-mode"
@@ -223,8 +225,19 @@ services:
         target: /etc/yuzu/yuzu-server.cfg
     volumes:
       - server-data:/var/lib/yuzu
+    # Healthcheck uses bash's /dev/tcp pseudo-device (issue #622).
+    # `curl` is not installed in the server runtime image, and `CMD-SHELL`
+    # invokes `/bin/sh` which on Ubuntu 24.04 is `dash` and does not
+    # implement /dev/tcp — so we must invoke `bash` explicitly.
+    # Trailing `exec 3>&-` explicitly closes FD 3 to avoid leaking
+    # CLOSE_WAIT sockets under sustained healthcheck cadence (governance
+    # Gate 7, unhappy-path UP-18 / sre SHOULD).
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/livez"]
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /livez HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3 ; rc=$$? ; exec 3>&- ; exit $$rc"
       interval: 10s
       timeout: 5s
       retries: 5
@@ -234,7 +247,7 @@ services:
 
   # ── Yuzu Gateway (Erlang/OTP) ────────────────────────────────────────
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.10.0}
+    image: ghcr.io/tr3kkr/yuzu-gateway:${YUZU_VERSION:-0.12.0}
     container_name: yuzu-gateway
     restart: unless-stopped
     ports:
@@ -247,15 +260,18 @@ services:
     configs:
       - source: gateway-sys-config
         target: /opt/yuzu_gw/releases/0.2.0/sys.config
+    # Gateway runtime is alpine:3.23 — busybox `wget` is available;
+    # `bash` is not. `--spider` exits non-zero on HTTP failure.
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8081"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   # ── Prometheus ───────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    # Matches deploy/docker/docker-compose.uat.yml; bump both together.
+    image: prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62
     container_name: yuzu-prometheus
     restart: unless-stopped
     ports:
@@ -271,7 +287,8 @@ services:
 
   # ── Grafana ──────────────────────────────────────────────────────────
   grafana:
-    image: grafana/grafana:latest
+    # Matches deploy/docker/docker-compose.uat.yml; bump both together.
+    image: grafana/grafana:11.5.2@sha256:8b37a2f028f164ce7b9889e1765b9d6ee23fec80f871d156fbf436d6198d32b7
     container_name: yuzu-grafana
     restart: unless-stopped
     ports:
@@ -298,7 +315,7 @@ services:
 
   # ── ClickHouse ───────────────────────────────────────────────────────
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.12@sha256:a65ca89ddbe8e04a05036dd7d7110a203256293b407b9359130ed5e4333f45ff
     container_name: yuzu-clickhouse
     restart: unless-stopped
     ports:

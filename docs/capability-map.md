@@ -30,9 +30,9 @@ Each capability is rated on two axes:
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
 Future       [====================------------]  31/50 done  (62%)
-New (Ph 8-14)[----------------------------]     0/24 done   (0%)
+New (Ph 8-16)[=---------------------------]     1/41 done   (2%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   165/208 done (79%)
+Overall      [======================---------]   166/225 done (74%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -64,9 +64,13 @@ Overall      [======================---------]   165/208 done (79%)
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
 | 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 3 | 0 | 0 | 3 |
+| 28. Response Visualization | 6 | 0 | 1 | 5 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
-| **TOTAL** | **208** | **165** | **0** | **43** |
+| 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
+| 31. System Guardian | 10 | 1 | 2 | 7 |
+| **TOTAL** | **225** | **166** | **3** | **56** |
+
+> **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
 ---
 
@@ -130,9 +134,7 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 ### 2.2 Multi-Agent Broadcast :white_check_mark: `T1`
 
-`SendCommandRequest.agent_ids` supports broadcast (empty = all agents).
-
-> **Gap:** No scope/filter-based targeting (e.g., "all Windows agents").
+`SendCommandRequest.agent_ids` supports broadcast (empty = all agents). Scope/filter targeting is also supported: `AgentRegistry::evaluate_scope` (`server/core/src/agent_registry.cpp:820-861`) instantiates an `AttributeResolver` lambda that resolves `ostype`, `hostname`, `arch`, `agent_version`, `tag:X` (in-memory `scopable_tags` plus persistent `TagStore` fallback), and `props.X` (custom properties), composed via the scope DSL's `AND` / `OR` / `NOT`. See `docs/asset-tagging-guide.md` and `docs/scope-walking-design.md` for operator-level usage.
 
 ### 2.3 Streaming Command Output :white_check_mark: `T1`
 
@@ -663,9 +665,9 @@ Not implemented. Agent-side cache with delta sync.
 
 ---
 
-## 16. Policy and Compliance Engine (Guaranteed State)
+## 16. Policy and Compliance Engine (Server-Side Guaranteed State)
 
-*Define desired-state policies, evaluate compliance, and auto-remediate.*
+*Define desired-state policies, evaluate compliance on a poll-based schedule, and auto-remediate. This domain covers the **server-side** half of guaranteed state — definition, fleet-wide compliance evaluation, history, drill-down. Real-time **agent-side** enforcement (kernel-event-driven, millisecond-level, pre-login, offline-capable) lives in §31 (System Guardian) and is the operational primitive that makes "this setting must never be in a non-compliant state" actually true on disk. A complete guaranteed-state implementation requires both halves — §16 alone has a 5-minute poll cycle that is unacceptable for security-sensitive settings (firewall, registry, EDR process running, SSH config).*
 
 ### 16.1 Policy Rules Definition :white_check_mark: `T2`
 
@@ -1063,9 +1065,9 @@ Not implemented. Per-product compliance summary with drill-down to device-level 
 
 *Chart rendering, data processing, and template management for instruction responses.*
 
-### 28.1 Response Visualization Engine :x: `T2`
+### 28.1 Response Visualization Engine :white_check_mark: `T2`
 
-Not implemented. Server-side data transformation with built-in processors (SingleSeries, MultiSeries, DateTimeSeries). Chart types: Pie, Bar, Column, Line, Area. Configured via `spec.visualization` in InstructionDefinition YAML.
+Implemented. Server-side data transformation with built-in processors (`single_series`, `multi_series`, `datetime_series`) and an optional row pre-filter (`whereField` / `whereEquals`). Chart types: pie, bar, column, line, area. Configured via `spec.visualization` (singular) or `spec.visualizations` (plural for multi-chart). REST: `GET /api/v1/executions/{id}/visualization?definition_id=<id>&index=<N>` gated on `Response:Read`. Renderer is Apache ECharts 5 (vendored at `/static/echarts.min.js`) wrapped by a thin adapter at `/static/yuzu-charts.js` that reads `--mds-color-chart-*` Yuzu design tokens at render time. Six chart-bearing demo definitions (vuln_scan, antivirus, bitlocker, firewall, certificates, os_info) ship as `InstructionSet demo.visualization.fleet-posture`, auto-imported on server startup.
 
 ### 28.2 Response Templates :x: `T2`
 
@@ -1074,6 +1076,18 @@ Not implemented. Named response view configurations (column selection, sort orde
 ### 28.3 Response Offloading :x: `T2`
 
 Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.
+
+### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
+
+In progress (Phase 15.A and 15.D). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the process tree viewer. The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+
+### 28.5 TAR Process Tree Viewer :x: `T2`
+
+Not implemented (Phase 15.H). Reconstructs the per-device process tree from `process_live` — a seed snapshot taken at agent install / first start (walks `/proc` on Linux, `CreateToolhelp32Snapshot` + `Process32FirstW`/`NextW` on Windows, `proc_listallpids` + `proc_pidinfo` on macOS) plus subsequent `started` / `stopped` events from the regular `collect_fast` cycle. Renders as a collapsible tree with honest "as observed since `<seed_ts>`" framing — orphans whose parents died before the seed appear reparented to PID 1, exactly as in a live `ps`. Time-slicing via `?as_of=<ts>`. Cmdline redaction reuses the existing TAR redaction patterns. Data quality depends on agent uptime and tamper-resistance — that hardening pillar is the parallel Guardian PR ladder and does not block the viewer. Design: `docs/tar-dashboard.md` §5.
+
+### 28.6 Retention Awareness Surface :large_orange_diamond: `T2`
+
+In progress (Phase 15.A). Operator-facing aggregate view of every device × source pair where `<source>_enabled=false` — the operational consequence of issue #539's per-source retention pause. Surfaces "paused since" timestamp, live-row count, oldest timestamp; supports one-click re-enable (per-source, the #539 invariant) and a typed-confirmation purge for the "we have what we need, drop the rows but keep the collector paused" case. Without this surface, operators who disabled a collector for forensic preservation have no way to know which boxes are accumulating non-aging data. Design: `docs/tar-dashboard.md` §3.
 
 ---
 
@@ -1096,6 +1110,87 @@ Not implemented. `Yuzu.Management` PowerShell module wrapping REST API v1 with c
 ### 29.4 Python SDK :x: `T3`
 
 Not implemented. `yuzu-sdk` Python package wrapping REST API v1 with async support and typed models.
+
+---
+
+## 30. Scope Walking & Result Sets
+
+*The Yuzu product differentiator. Operator working memory is finite; the IT estate is a finite-state automaton with mutating state-table size and mutating per-row state. Real-time discovery via iterative scope narrowing — every query produces a device set that becomes the input scope for the next query or action — is the only realistic interaction model at fleet scale. Reference walkthrough: the Chrome incident-response scenario in `docs/scope-walking-design.md` §10.*
+
+### 30.1 Result Set Persistence and Lineage :x: `T2`
+
+Not implemented (Phase 15.B). A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (`rs_<ulid>`), optional human-readable per-operator alias, immutable lineage edges that record the chain of `(parent_result_set, narrowing_query)` back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in `result_sets.db` with `ON DELETE CASCADE` member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: `/api/v1/result-sets/...` covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: `docs/scope-walking-design.md` §3, §6, §9.
+
+### 30.2 Composable Scope from Previous Query :x: `T2`
+
+Not implemented (Phase 15.C). The Scope Engine grammar gains a third short-circuit kind, `from_result_set:<id-or-alias>`, alongside the existing `__all__` and `group:<name>`. Composes with attribute predicates via `AND`/`OR`/`NOT` so a result set can be the candidate set and the predicate is a real-time refinement against current device attributes. Stale members (offline > 24h, decommissioned, removed from management group) are silently dropped at resolve time with a dashboard-surfaced warning rather than failing the query — operators iterating an IR chain need progress, not a stop, and the audit row records the dropped IDs for forensic completeness. Dashboard surfacing: persistent left-rail sidebar of the operator's active result sets, chain breadcrumb above every query frame mirroring the lineage, scope chip in every query/instruction/policy frame for one-click rebinding. Design: `docs/scope-walking-design.md` §4, §8.
+
+### 30.3 YAML DSL `fromResultSet:` Surface :x: `T2`
+
+Not implemented (Phase 15.E). The `scope:` block in `InstructionDefinition`, `InstructionSet`, and `Policy` gains `fromResultSet:` as a mutually-exclusive (or composable-with-`selector:`) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: `fromResultSet + assignment.managementGroups` rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); `fromResultSet` requires `assignment.mode = static` (the whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it). Resolution at instruction *invocation* time, not YAML load time, so a definition carrying `fromResultSet:` is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row. Design: `docs/scope-walking-design.md` §7.
+
+### 30.4 Result Set Operational Hardening :x: `T2`
+
+Not implemented (Phase 15.G). Live re-evaluation produces a *new* result set ID rooted at the original's parent (sibling, not child) — operators can refresh a stale set against current estate state without breaking lineage. Background GC sweep every 5 minutes removes unpinned sets past TTL, cascading to member rows. Per-operator quotas enforced with `429 RESULT_SET_QUOTA` and `409 PIN_LIMIT`. Prometheus metrics — `yuzu_result_sets_total`, `yuzu_result_sets_alive`, `yuzu_result_set_resolve_seconds` histogram by cardinality bucket, GC counter, quota-rejection counter — surface health and runaway-script detection. Audit polish on every state transition. Design: `docs/scope-walking-design.md` §3.3, §9.
+
+---
+
+## 31. System Guardian — Real-Time Agent-Side Guaranteed State
+
+*The agent-side primitive that makes guaranteed state **operationally true** rather than approximately true. PolicyStore (§16) evaluates desired-state rules on a poll-based schedule — typical 5-minute cadence. For security-sensitive settings ("this firewall port must never be open," "this registry value must never change," "this EDR process must always run") a 5-minute window is unacceptable. System Guardian uses **kernel-backed user-mode notification APIs** to detect drift within microseconds of it occurring, remediate it, and journal the event — even when the server is unreachable, even before any user has logged in. This is the headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Agent runs in user space as SYSTEM (Windows) / root (Linux) / privileged daemon (macOS); no kernel drivers required. Design: `docs/yuzu-guardian-design-v1.1.md`. Windows-first delivery: `docs/yuzu-guardian-windows-implementation-plan.md`.*
+
+### 31.1 Guardian Engine and Wire Protocol :large_orange_diamond: `T2`
+
+In progress (PRs 1-2 shipped). Agent-side `GuardianEngine` (`agents/core/src/guardian_engine.{hpp,cpp}`) with two-phase startup — `start_local()` pre-network so enforcement is active before the Register RPC, then `sync_with_server()` post-Register. KV namespace `__guardian__` for cached policy. Reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop (load-time rejection in `plugin_loader.cpp` for defence in depth). Wire contract: `proto/yuzu/guardian/v1/guaranteed_state.proto` with `GuaranteedStateRule`, `GuaranteedStatePush`, `GuaranteedStateEvent`, `GuaranteedStateStatus`, `GuaranteedStateRuleStatus`. Server store `guaranteed-state.db` with immutable event log. Actions: `push_rules`, `get_status`. Every rule reports `errored` until guard implementations land in PR 3+.
+
+### 31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :x: `T2`
+
+Not implemented (PRs 3, 5, 6, 7, 10). Real-time enforcement via four Windows kernel-backed user-mode APIs:
+- **Registry Guard** — `RegNotifyChangeKeyValue` + `WaitForMultipleObjects` (~0 ms latency); the canonical "registry value must equal X" enforcer.
+- **SCM Guard** — `NotifyServiceStatusChange` (~0 ms latency); enforces "service must remain running/stopped/disabled."
+- **WFP Guard** — `FwpmFilterSubscribeChanges0` (~0 ms latency); defence-in-depth filter monitor for firewall posture.
+- **ETW Guard** — `OpenTrace` / `ProcessTrace` (~1-5 ms latency); the multiplexed event provider with shared-session pooling per `docs/yuzu-guardian-design-v1.1.md` §8.3 (mandatory because Windows caps system-wide ETW sessions at 64, shared with Defender / EDR).
+
+Each guard implements `self_test()` on start to prove kernel wiring (sentinel write → expected callback within 500 ms → pass / `errored` mark). Resilience strategies (`Fixed`, `Backoff`, `Escalation`) and `RaceDetector` (sliding-window drifts/second) surface at PR 4.
+
+### 31.3 Condition Guards — Periodic Evaluation (All Platforms) :x: `T2`
+
+Not implemented (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines `Microsoft-Windows-Kernel-Process` ETW (events 1/2 for start/stop, near-real-time) with periodic `CreateToolhelp32Snapshot` poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.
+
+### 31.4 Event Guards — Linux :x: `T3`
+
+Not implemented (PR 16). Linux equivalents of the Windows event-guard primitives:
+- **Inotify Guard** — `inotify_add_watch` for file/directory state assertions (config files, certificate files, sshd config).
+- **Netlink Guard** — `NETLINK_KOBJECT_UEVENT` for process-tree and device-event monitoring.
+- **D-Bus Guard** — `org.freedesktop.systemd1` signal subscriptions for service state ("sshd.service must remain running").
+- **Audit Guard** — Linux audit subsystem (`auditd`) consumer for syscall-level assertions.
+- **Sysctl Guard** — periodic check + `/proc/sys/...` write remediation; monitors kernel parameters that drift would indicate compromise.
+
+Phase 16 Linux delivery is gated on Windows track soaking in production.
+
+### 31.5 Event Guards — macOS :x: `T3`
+
+Not implemented (PR 17). macOS equivalents using Apple's Endpoint Security (ES) framework — *requires the ES entitlement*, which is a notarised-build / DDM-distributed entitlement that Apple grants per-bundle-ID. Without ES, the macOS guard surface is reduced to `fseventsd`, `launchd` plist polling, and `kqueue` file-watch. Phase 16 macOS delivery is gated on (a) Windows + Linux soak and (b) ES entitlement availability.
+
+### 31.6 State Evaluator and Remediation Engine :x: `T2`
+
+Not implemented (PRs 3, 5+). Assertion registry (`registry-value-equals`, `registry-value-absent`, `service-running`, `service-stopped`, `firewall-port-blocked`, `process-running`, `file-hash-equals`, `kernel-param-equals`, `plist-key-equals`, etc.) returns `compliant | drift | exempt` for a `StateSnapshot`. Remediation methods are **system calls only — no shell-out** (per design §14): `RegSetValueExW` / `RegDeleteValueW` (Win), `INetFwPolicy2` COM (Win firewall), service control via SCM (Win) / systemd D-Bus (Linux) / launchctl (macOS), `/proc/sys` writes (Linux), `defaults write` equivalent via plist serialisation (macOS). Re-entrancy guard per rule with 5 ms suppression window prevents the remediation from triggering its own watch callback.
+
+### 31.7 Audit Journal and Server Store :large_orange_diamond: `T2`
+
+Server store shipped (PR 1 — `server/core/src/guaranteed_state_store.{hpp,cpp}`, `guaranteed-state.db`, immutable event log, no FK cascade on rule delete so historical events persist for forensic review). Agent-side journal (`agents/core/src/guard_audit.{hpp,cpp}`) lands with PR 3: MPSC queue + dedicated writer thread, SQLite journal table inside `kv_store.db` keyed by monotonic `event_seq`, drained by `GuardianEngine::sync_with_server` into `CommandResponse { plugin: "__guard__", action: "event" }`. Every detection and remediation journaled locally first, synced to server when online.
+
+### 31.8 Pre-Login Activation and Offline Capability :white_check_mark: `T2`
+
+Pre-login activation works by construction today: the agent runs as a Windows service with `SERVICE_AUTO_START` + `FailureActions` configured at install time (`agents/core/src/main.cpp:136-200`); systemd unit on Linux with `Type=notify` + `Restart=always`; launchd `KeepAlive=true` + `RunAtLoad=true` on macOS. `GuardianEngine::start_local()` runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in `kv_store.db` under `__guardian__` namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked `:white_check_mark:` because the service-install side is operational; the *enforcement* half is gated on PR 3+ landing real guards.
+
+### 31.9 Dashboard and Approval Workflow :x: `T2`
+
+Not implemented (PRs 4, 11, 14). Dashboard page at `/guaranteed-state` listing rules (with kernel-wiring health indicator — `guard_healthy` + `last_notification` timestamp surface "deaf because subscription silently went nowhere" vs. "compliant because nothing's happening"), event timeline, summary cards, fragments per `docs/yuzu-guardian-design-v1.1.md` §10. Approval workflow reuses the existing `ApprovalManager` with `definition_id = "guaranteed_state_rule_*"` — no manager code changes (already generic). HTMX rule editor (CRUD + YAML validation + conflict detection) at PR 14.
+
+### 31.10 Rule Signing and Quarantine Integration :x: `T2`
+
+Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in `CredWrite`/`CredRead` (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. Quarantine integration: WFP block-all filter at weight 65535 (Windows) or `iptables` / `nftables` rule (Linux) drops all traffic except Yuzu's own; instruction handlers `quarantine.add_exception | remove_exception | lift`; server-side DNS resolution; resilience reset on lift so a remediation storm doesn't carry over.
 
 ---
 

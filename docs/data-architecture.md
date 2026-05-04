@@ -1,0 +1,38 @@
+# Data Architecture for Analytics Integration
+
+The `architect` and `sre` agents load this document when designing schemas for new features. CLAUDE.md keeps a one-line pointer.
+
+When building new features, design data schemas with downstream analytics in mind. The four data classes below are the integration surface; all other persistence is internal.
+
+## Response data
+
+- Every instruction definition declares a typed schema (column name + type).
+- Permitted types: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`.
+- Typed schemas make it trivial to materialize ClickHouse tables or Splunk sourcetypes from a `ProductPack`.
+- Large text fields use `clob` with configurable truncation — never embed unbounded blobs in `string` columns.
+
+## Audit events
+
+- Envelope: `{timestamp, principal, action, target_type, target_id, result, detail}` — see `docs/observability-conventions.md` for the full schema.
+- Forwardable to Splunk HEC or generic webhook sinks.
+- Indexed by `timestamp` and `principal` for efficient queries.
+- Denied operations MUST emit an audit event (SOC 2 CC7.2 evidence chain).
+
+## Metrics
+
+- Prometheus exposition format on `/metrics`.
+- Labels: `agent_id`, `plugin`, `method`, `status`, `os`, `arch`.
+- Grafana dashboard templates: `docs/grafana/`.
+- ClickHouse ingest path: `prometheus_remote_write`, or scrape `/metrics` directly.
+
+## Inventory data
+
+- Per-plugin structured blobs stored server-side.
+- Queryable via REST API with filter expressions.
+- **Schema is self-describing** — the plugin reports its own schema at registration. Downstream tooling consumes the schema to materialize tables, not by hard-coding column lists.
+
+## Cross-references
+
+- `docs/observability-conventions.md` — metric/label/audit envelope rules
+- `docs/clickhouse-setup.md` — ClickHouse ingest pipeline
+- `docs/analytics-events.md` — event taxonomy and downstream contracts

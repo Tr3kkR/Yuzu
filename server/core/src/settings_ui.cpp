@@ -39,7 +39,7 @@ extern const char* const kSettingsHtml =
     }
     .form-row:last-child { margin-bottom: 0; }
     .form-row label {
-      flex: 0 0 140px; font-size: 0.8rem; color: #8b949e;
+      flex: 0 0 140px; font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary);
       font-weight: 600;
     }
     .form-row input[type="text"],
@@ -64,7 +64,7 @@ extern const char* const kSettingsHtml =
     .toggle .slider {
       position: absolute; cursor: pointer;
       top: 0; left: 0; right: 0; bottom: 0;
-      background: #484f58; border-radius: 22px;
+      background: var(--mds-color-theme-outline-secondary); border-radius: 22px;
       transition: 0.2s;
     }
     .toggle .slider::before {
@@ -84,7 +84,7 @@ extern const char* const kSettingsHtml =
       display: flex; align-items: center; gap: 0.75rem;
     }
     .file-name {
-      font-size: 0.75rem; color: #8b949e; font-family: var(--mono);
+      font-size: 0.75rem; color: var(--mds-color-theme-text-tertiary); font-family: var(--mono);
     }
 
     /* ── User table ────────────────────────────────────────── */
@@ -93,20 +93,20 @@ extern const char* const kSettingsHtml =
     }
     .user-table th {
       text-align: left; padding: 0.4rem 0.6rem;
-      border-bottom: 2px solid var(--border); color: #8b949e;
+      border-bottom: 2px solid var(--border); color: var(--mds-color-theme-text-tertiary);
       font-size: 0.7rem; text-transform: uppercase;
       letter-spacing: 0.05em; font-weight: 600;
     }
     .user-table td {
       padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border);
     }
-    .user-table tr:hover { background: rgba(88,166,255,0.06); }
+    .user-table tr:hover { background: var(--mds-color-state-hover); }
     .role-badge {
       font-size: 0.7rem; padding: 0.1rem 0.5rem;
       border-radius: 1rem; font-weight: 600;
     }
-    .role-admin { background: var(--accent); color: #fff; }
-    .role-user  { background: #484f58; color: #fff; }
+    .role-admin { background: var(--accent); color: var(--mds-color-text-on-accent); }
+    .role-user  { background: var(--mds-color-theme-outline-secondary); color: var(--mds-color-text-on-accent); }
 
     /* ── Disabled/coming-soon overlay ──────────────────────── */
     .coming-soon {
@@ -137,7 +137,7 @@ extern const char* const kSettingsHtml =
       display: flex; flex-direction: column; gap: 0.2rem;
     }
     .add-user-form .mini-field label {
-      font-size: 0.65rem; color: #8b949e; font-weight: 600;
+      font-size: 0.65rem; color: var(--mds-color-theme-text-tertiary); font-weight: 600;
     }
     .add-user-form input, .add-user-form select {
       padding: 0.35rem 0.5rem;
@@ -149,7 +149,7 @@ extern const char* const kSettingsHtml =
     /* ── Token reveal ──────────────────────────────────────── */
     .token-reveal {
       margin-top: 1rem; padding: 0.75rem;
-      background: #0d1117; border: 1px solid var(--green);
+      background: var(--mds-color-theme-background-canvas); border: 1px solid var(--green);
       border-radius: 0.3rem;
     }
     .token-reveal-header {
@@ -163,7 +163,7 @@ extern const char* const kSettingsHtml =
 
     /* ── HTMX loading indicator ────────────────────────────── */
     .htmx-indicator {
-      display: none; color: #8b949e; font-size: 0.75rem;
+      display: none; color: var(--mds-color-theme-text-tertiary); font-size: 0.75rem;
     }
     .htmx-request .htmx-indicator,
     .htmx-request.htmx-indicator { display: inline; }
@@ -178,6 +178,7 @@ extern const char* const kSettingsHtml =
     <a href="/" class="nav-link">Dashboard</a>
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
+    <a href="/tar" class="nav-link">TAR</a>
     <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>
@@ -198,7 +199,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Server Configuration</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Network listeners, session limits, and rate limiting.
           These values are set at server startup via CLI flags or environment variables.
         </p>
@@ -206,7 +207,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/server-config"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -220,7 +221,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/tls"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -229,14 +230,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">HTTPS Dashboard</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           TLS termination for the web dashboard and REST API.
         </p>
         <div id="https-section"
              hx-get="/fragments/settings/https"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -249,7 +250,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/users"
              hx-trigger="load, refreshUsers from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -258,7 +259,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Enrollment Tokens</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Generate pre-shared tokens to auto-enroll agents.
           The raw token is shown <strong>once</strong> — copy it before closing.
         </p>
@@ -266,7 +267,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/tokens"
              hx-trigger="load, refreshTokens from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -275,7 +276,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">API Tokens</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Generate tokens for programmatic REST API access.
           Pass via <code>Authorization: Bearer &lt;token&gt;</code> or
           <code>X-Yuzu-Token</code> header.
@@ -285,7 +286,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/api-tokens"
              hx-trigger="load, refreshApiTokens from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -294,7 +295,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Auto-Approve Policies</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Define rules to automatically approve agents on registration.
           Matching agents skip the pending queue entirely.
         </p>
@@ -302,7 +303,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/auto-approve"
              hx-trigger="load, refreshAutoApprove from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -313,7 +314,7 @@ extern const char* const kSettingsHtml =
          sse-connect="/events">
       <div class="section-header">Pending Agent Approvals</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Agents that registered without an enrollment token are shown here.
           Approve or deny them to control fleet membership.
         </p>
@@ -321,7 +322,25 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/pending"
              hx-trigger="load, sse:pending-agent, refreshPending from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Plugin Code Signing ─────────────────────────────── -->
+    <div class="section">
+      <div class="section-header">Plugin Code Signing</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Operator-managed trust bundle for agent plugin code signing.
+          Upload a PEM bundle of CA certificates that should anchor plugin signatures;
+          enable "Require signed plugins" to reject unsigned plugins on every agent.
+        </p>
+        <div id="plugin-signing-section"
+             hx-get="/fragments/settings/plugin-signing"
+             hx-trigger="load, refreshPluginSigning from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -330,14 +349,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Agent Updates (OTA)</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Upload agent binaries and manage fleet-wide update rollout.
         </p>
         <div id="updates-section"
              hx-get="/fragments/settings/updates"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -348,7 +367,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Gateway</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           The Erlang/OTP gateway node sits between agents and this server,
           providing connection multiplexing, heartbeat batching, and circuit breaker protection.
         </p>
@@ -356,7 +375,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/gateway"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -365,14 +384,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Analytics &amp; Telemetry</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Event collection, ClickHouse integration, and JSONL export.
         </p>
         <div id="analytics-section"
              hx-get="/fragments/settings/analytics"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -381,14 +400,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Data Retention</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Retention policies for response data and audit logs.
         </p>
         <div id="data-retention-section"
              hx-get="/fragments/settings/data-retention"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -397,14 +416,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">MCP (AI Integration)</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Model Context Protocol endpoint for AI-driven fleet management. MCP allows AI models to query agents, check compliance, and manage your fleet through a secure JSON-RPC interface.
         </p>
         <div id="mcp-section"
              hx-get="/fragments/settings/mcp"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -413,14 +432,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Vulnerability Management</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           NVD CVE feed synchronization for vulnerability scanning.
         </p>
         <div id="nvd-section"
              hx-get="/fragments/settings/nvd"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -429,14 +448,14 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Management Groups</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Organize devices into a hierarchy for access scoping and targeted operations.
         </p>
         <div id="mgmt-groups-section"
              hx-get="/fragments/settings/management-groups"
              hx-trigger="load, refreshMgmtGroups from:body"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -445,7 +464,7 @@ extern const char* const kSettingsHtml =
     <div class="section">
       <div class="section-header">Tag Compliance</div>
       <div class="section-body">
-        <p style="font-size:0.75rem;color:#8b949e;margin-bottom:0.75rem">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
           Devices should have all 4 structured tag categories assigned.
           Devices missing tags are flagged but continue to function normally.
         </p>
@@ -453,7 +472,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/tag-compliance"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>
@@ -466,7 +485,7 @@ extern const char* const kSettingsHtml =
              hx-get="/fragments/settings/directory"
              hx-trigger="load"
              hx-swap="innerHTML">
-          <span style="color:#484f58">Loading...</span>
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
         </div>
       </div>
     </div>

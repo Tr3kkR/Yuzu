@@ -11,7 +11,12 @@
 #     -e RUNNER_URL=https://github.com/Tr3kkR/Yuzu \
 #     --name yuzu-local-linux yuzu-runner-linux
 
-FROM ghcr.io/actions/actions-runner:latest
+# Pinned by digest for Scorecard Pinned-Dependencies (PR #3 of Scorecard
+# lift). Dependabot tracks ghcr.io/actions/actions-runner via the docker
+# ecosystem — new releases will open a PR with the new digest rather than
+# silently repointing the `:latest` tag at a new SHA. Refresh cadence also
+# documented in docs/security/scorecard-token.md.
+FROM ghcr.io/actions/actions-runner:latest@sha256:b6614fce332517f74d0a76e7c762fb08e4f2ff13dcf333183397c8a5725b6e8e
 
 USER root
 

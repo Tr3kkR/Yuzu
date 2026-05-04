@@ -83,7 +83,7 @@ bool parse_cidr(std::string_view cidr, uint32_t& base_ip, int& prefix_len) {
 
     // Parse prefix length
     prefix_len = 0;
-    auto [ptr, ec] = std::from_chars(prefix_str.data(),
+    [[maybe_unused]] auto [ptr, ec] = std::from_chars(prefix_str.data(),
                                       prefix_str.data() + prefix_str.size(),
                                       prefix_len);
     if (ec != std::errc{} || prefix_len < 8 || prefix_len > 30)
@@ -97,7 +97,7 @@ bool parse_cidr(std::string_view cidr, uint32_t& base_ip, int& prefix_len) {
     for (size_t i = 0; i <= ip.size() && octet_idx < 4; ++i) {
         if (i == ip.size() || ip[i] == '.') {
             int val = 0;
-            auto [p, e] = std::from_chars(ip.data() + start, ip.data() + i, val);
+            [[maybe_unused]] auto [p, e] = std::from_chars(ip.data() + start, ip.data() + i, val);
             if (e != std::errc{} || val < 0 || val > 255) return false;
             octets[octet_idx++] = static_cast<uint8_t>(val);
             start = i + 1;

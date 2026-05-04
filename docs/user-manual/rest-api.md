@@ -68,6 +68,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Topology](#topology)
   - [Fleet Statistics](#fleet-statistics)
   - [File Retrieval](#file-retrieval)
+  - [Guaranteed State](#guaranteed-state)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
   - [Agents](#agents)
@@ -1117,6 +1118,13 @@ Query audit events.
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
+| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 characters). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`}. Denied detail values: `self_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `db_failure` (500). `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role — recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
+| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
+| `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |
@@ -1183,6 +1191,12 @@ Create a new policy fragment from YAML.
   "status": "created"
 }
 ```
+
+**Response (400):** YAML missing required fields, oversized payload, invalid CEL compliance expression. Body is `{"error": "<reason>"}`.
+
+**Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
+
+**Response (503):** Policy store not yet initialized.
 
 ---
 
@@ -2010,6 +2024,74 @@ Get per-definition execution statistics.
 
 ---
 
+### Execution Visualization
+
+Render an execution's response set as chart-ready JSON, using the `spec.visualization` block configured on the associated `InstructionDefinition` (issue #253). The endpoint is the data source for the dashboard's chart cards and is also suitable for external consumers (Grafana scripted-panel datasources, custom dashboards) that can read JSON over HTTP.
+
+#### `GET /api/v1/executions/{id}/visualization`
+
+**Permission:** `Response:Read`
+
+**Path parameters:**
+
+| Param | Description |
+|---|---|
+| `id` | The response-store key (the `command_id` returned at dispatch time). |
+
+**Query parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `definition_id` | string | Yes | ID of the `InstructionDefinition` that holds the `spec.visualization` (or `spec.visualizations`) block. Required because Yuzu keys responses by `command_id`, not by `executions.id` — the caller supplies the link. Must match `[A-Za-z0-9._-]+`. |
+| `index` | integer | No | Chart index when the definition declares multiple visualizations. Default `0`. Returns 404 if out of range. |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "chart_type": "pie",
+    "title": "Service States",
+    "labels": ["running", "stopped", "paused"],
+    "series": [{ "name": "Count", "data": [42, 7, 1] }],
+    "meta": {
+      "responses_total": 50,
+      "responses_succeeded": 50,
+      "responses_failed": 0
+    },
+    "chart_index": 0,
+    "chart_count": 1
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`chart_index` and `chart_count` (issue #587) let clients iterate when the definition declares multiple charts. For `datetime_series` charts, `labels` is replaced by `x` (epoch-seconds array) and `"x_axis": "datetime"` is added.
+
+When the underlying response set exceeds the per-request row cap (10000), the response payload includes `"rows_capped": true` and `"rows_cap": 10000` so the client can surface a "showing first N rows" banner.
+
+**Errors:**
+
+| Status | Cause |
+|---|---|
+| `400` | `definition_id` query parameter not provided, or `index` is not a non-negative integer. |
+| `404` | Definition not found, has no `spec.visualization` configured, or the requested `index` is out of range. |
+| `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
+| `503` | Response store or instruction store unavailable. |
+
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id>`.
+
+**Example:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/executions/cmd-os_info-abc123/visualization?definition_id=crossplatform.service.inspect"
+```
+
+See `docs/yaml-dsl-spec.md` § `spec.visualization` for the full configuration schema.
+
+---
+
 ### Device Tokens
 
 Device tokens are scoped authentication tokens that restrict execution to a specific device and instruction definition. Used for unattended agent operations.
@@ -2389,6 +2471,127 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
 
 ---
 
+### Guaranteed State
+
+Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide, YAML rule schema, and the PR-2 limitation that all rules report `errored` until the agent-side guards land in Guardian PR 3.
+
+**RBAC matrix:**
+
+| Role | Read | Write | Execute | Delete | Approve | Push |
+|---|---|---|---|---|---|---|
+| Administrator | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| ITServiceOwner | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| PlatformEngineer | ✓ | ✓ | | ✓ | | ✓ |
+| Operator | ✓ | | | | | ✓ |
+| Viewer | ✓ | | | | | |
+
+Administrator and ITServiceOwner inherit Execute and Approve on `GuaranteedState` from the cross-type CRUD seed loop — those operations have no active Guardian handler today but the grants exist in the DB. PlatformEngineer's grants are explicit (Read/Write/Delete/Push only). `Push` is a Guardian-specific operation (distribute an existing rule set to scoped agents) that separates deploy authority from authoring authority.
+
+#### `GET /api/v1/guaranteed-state/rules`
+
+List all Guaranteed State rules.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `data[]` of `GuaranteedStateRule` objects (see OpenAPI schema).
+- **5xx:** `503` if the store is unavailable.
+
+#### `POST /api/v1/guaranteed-state/rules`
+
+Create a rule.
+
+- **Permission:** `GuaranteedState:Write`
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
+| `name` | string | Yes | Human-readable name (unique per server). |
+| `yaml_source` | string | Yes | Full rule YAML (`kind: GuaranteedStateRule`). |
+| `version` | integer | No | Starting version (default `1`). |
+| `enabled` | boolean | No | Default `true`. |
+| `enforcement_mode` | string | No | `enforce` (default) or `audit`. |
+| `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |
+| `os_target` | string | No | Empty (any) or `windows` / `linux` / `macos`. |
+| `scope_expr` | string | No | Scope DSL expression selecting target agents. |
+
+- **Response:** `201` with `data.rule_id`.
+- **4xx:** `400` missing required fields or invalid JSON; `409` on duplicate `rule_id` or duplicate `name`.
+- **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+
+#### `GET /api/v1/guaranteed-state/rules/{rule_id}`
+
+Fetch a single rule.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `data` is a `GuaranteedStateRule` object.
+- **4xx:** `404` if the rule does not exist.
+
+#### `PUT /api/v1/guaranteed-state/rules/{rule_id}`
+
+Update a rule. Version is incremented on every successful update regardless of whether any field changed.
+
+- **Permission:** `GuaranteedState:Write`
+- **Request body:** Any subset of the create-body fields (absent fields retain their current values).
+- **Response:** `200` with `data.updated = true` and `data.version`.
+- **4xx:** `400` invalid JSON; `404` rule not found; `409` on name conflict.
+- **Audit:** `guaranteed_state.rule.update`.
+
+#### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
+
+Delete a rule.
+
+- **Permission:** `GuaranteedState:Delete`
+- **4xx:** `404` if the rule does not exist.
+- **Audit:** `guaranteed_state.rule.delete`.
+
+#### `POST /api/v1/guaranteed-state/push`
+
+Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. In the PR-2 ship of Guardian the fan-out to agents is **not** wired; the endpoint accepts and audits the request so dashboards and SIEM pipelines can be exercised end-to-end. Fan-out lands in Guardian PR 3.
+
+- **Permission:** `GuaranteedState:Push`
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `scope` | string | No | Scope DSL selector. Empty = all agents. |
+| `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
+
+- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.scope`.
+- **4xx:** `400` if the JSON body is present but not an object.
+- **Audit:** `guaranteed_state.push` (`success`, detail includes `fan_out_deferred_pr3=true` while PR 2 is in effect).
+
+#### `GET /api/v1/guaranteed-state/events`
+
+Query Guaranteed State events (rule violations, remediations, agent sync events).
+
+- **Permission:** `GuaranteedState:Read`
+- **Query parameters:** `rule_id`, `agent_id`, `severity`, `limit` (default 100, capped at 1000), `offset` (default 0).
+- **Response:** `data[]` of event objects.
+- **4xx:** `400` on non-integer or negative `limit` / `offset`.
+
+#### `GET /api/v1/guaranteed-state/status`
+
+Fleet-wide status rollup. PR 2 returns placeholder zeros; fleet aggregation lands in Guardian PR 4.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
+
+#### `GET /api/v1/guaranteed-state/status/{agent_id}`
+
+Per-agent status. PR 2 placeholder; per-agent aggregation lands in Guardian PR 4.
+
+- **Permission:** `GuaranteedState:Read`
+- **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+
+#### `GET /api/v1/guaranteed-state/alerts`
+
+Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** empty list in PR 2.
+
+---
+
 ### Patch Management
 
 **`GET /api/patches`** — Query missing/installed patches.
@@ -2475,6 +2678,201 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
 
 ---
 
+### Settings — Plugin Code Signing
+
+These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v1/agent/plugin-policy` returns JSON. See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes.
+
+**`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment showing status badge (Disabled / Trust bundle loaded / Enforced), bundle metadata (cert count, SHA-256, up to 16 subjects), upload form, require-flag toggle, and Remove button.
+
+**`POST /api/settings/plugin-signing/upload`** — Upload a PEM trust bundle.
+
+- **Permission:** Admin only
+- **Request body (multipart/form-data):** `file` (.pem/.crt; max 256 KB)
+- **Validation:** the server validates the PEM with OpenSSL on the way in — at least one parsable X.509 certificate must be present, BEGIN/END markers required.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Bundle is written atomically to `<cert-dir>/plugin-trust-bundle.pem` (temp + rename).
+- **Response (400):** Validation failure. Body: `<span class="feedback-error">Rejected: …</span>`. Audit row emitted with `result=failure`, `target_type=PluginTrustBundle`, detail = the validation error.
+- **Response (500):** I/O failure (cannot create cert dir, write tmp file, or rename to destination). Body: `<span class="feedback-error">…</span>`.
+
+**`POST /api/settings/plugin-signing/clear`** — Remove the trust bundle and reset the require flag.
+
+- **Permission:** Admin only
+- **Request body:** None (HTMX hx-confirm)
+- **Effect:** Two-phase commit — writes `plugin_signing_required=false` to `runtime_config` first, then removes `<cert-dir>/plugin-trust-bundle.pem`. If the DB write fails the file is **not** removed (prevents disk/DB desync) and a 500 is returned.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=info`. Audit `plugin_signing.bundle.cleared` / `success`.
+- **Response (500):** DB write failure. Audit `plugin_signing.bundle.cleared` / `failure` with the store error in `detail`. Bundle file untouched.
+
+**`POST /api/settings/plugin-signing/require`** — Toggle the require-signature flag.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):** `required` = `true`/`on` (checkbox checked) or absent (checkbox unchecked, treated as false).
+- **Effect:** Writes `plugin_signing_required=<true|false>` to `runtime_config`.
+- **Response (200):** Re-rendered fragment, `HX-Trigger: showToast level=success`. Audit `plugin_signing.require.changed` / `success`, `target_type=RuntimeConfig`, `target_id=plugin_signing_required`, `detail=<new_val>`.
+- **Response (500):** DB write failure with the store error.
+
+**`GET /api/v1/agent/plugin-policy`** — Distribution endpoint for operator agent-config flows. Returns the current trust bundle PEM and require flag as JSON.
+
+- **Permission:** Admin only. The bundle holds X.509 certificates only (no private keys), but the SHA-256 fingerprint and the trust-anchor identity are operationally sensitive — non-admin token holders are not authorized to see when the trust anchor rotates. Future automatic agent-side fetch will introduce a dedicated agent identity for this endpoint.
+- **Stability:** pilot-stable. The path `/api/v1/agent/...` and the JSON response shape may change before the GA `/v1/` contract is finalized; the field set is unlikely to shrink (forward-compatible additions only).
+- **Response (200, bundle uploaded):**
+
+  ```json
+  {
+    "enabled": true,
+    "required": false,
+    "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIB…\n-----END CERTIFICATE-----\n",
+    "cert_count": 2,
+    "sha256": "abc123…"
+  }
+  ```
+
+- **Response (200, no bundle uploaded):**
+
+  ```json
+  {"enabled": false, "required": false, "trust_bundle_pem": ""}
+  ```
+
+  (Status is 200, not 404 — "no bundle uploaded" is a normal operational state, not a fetch failure.)
+
+- **Response (500, bundle on disk is unreadable):** standard `/api/v1/*` error envelope.
+
+  ```json
+  {"error": {"code": 500, "message": "Trust bundle on disk is unreadable"},
+   "meta": {"api_version": "v1"}}
+  ```
+
+- **Operator usage:** curl this into a local file on each agent host, then point the agent at that file with `--plugin-trust-bundle`:
+
+  ```bash
+  curl -fsSL -H "Authorization: Bearer $YUZU_ADMIN_TOKEN" \
+    https://server.example.com:8443/api/v1/agent/plugin-policy \
+    | jq -r .trust_bundle_pem > /etc/yuzu/plugin-trust-bundle.pem
+  ```
+
+---
+
+### Settings — User Management
+
+These endpoints drive the **Settings → Users** tab. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than the standard JSON envelope. All three require an admin session and the dashboard swaps the response body into `#user-section`.
+
+The handler enforces a **self-target guard** on destructive operations: the currently authenticated operator cannot delete or demote their own account, even via a hand-crafted HTTP request that bypasses the dashboard. See `docs/user-manual/server-admin.md` → "Deleting a User" for the operator-side recovery procedure.
+
+**`GET /fragments/settings/users`**
+
+Render the user table fragment.
+
+- **Permission:** Admin only
+- **Response (200):** HTML fragment of the user table. The row matching the caller's session username renders an italic `Current user` badge in place of the Remove button. All other rows include an `hx-delete` attribute targeting the DELETE endpoint below.
+- **Response (401):** Returned defensively when the admin gate passes but the session cannot be re-resolved (e.g., concurrent logout). The dashboard should redirect to login.
+- **Response (500):** Returned when the resolved session has an empty username — defense-in-depth against an upstream auth misconfiguration (e.g., OIDC returning empty `preferred_username`). Server log records the cause.
+
+**`POST /api/settings/users`**
+
+Create a new local account.
+
+> **Breaking change in v0.12.0:** The `role` field is now **ignored**. New users
+> are always created as `user`. To assign or change a role use the dedicated
+> `POST /api/settings/users/{username}/role` endpoint documented below — this
+> closes security finding C1 (privilege escalation via the role parameter on
+> create). Operators that scripted user-create with `role=admin` should expect
+> the user to land as `user` and explicitly promote via the role endpoint.
+
+- **Permission:** Admin only
+- **Request body (form-encoded):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only. |
+| `password` | string | Yes | New password. Minimum 12 characters. |
+| `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
+
+- **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
+- **Response (400):** Returned when `username` is invalid, `password` is empty, or password is shorter than 12 characters. Audit `user.create / denied / weak_password` (or `invalid_username`).
+- **Response (409):** Returned when `username` already exists. Body is the re-rendered user table fragment with the duplicate-username toast. Audit `user.create / denied / duplicate_username`.
+- **Response (401):** Defensive — admin gate passed but session not re-resolvable.
+- **Response (500):** Defensive — session resolved with empty username.
+
+**`POST /api/settings/users/:username/role`**
+
+Change the role of an existing user. Dedicated endpoint introduced in
+v0.12.0 to give role transitions their own audit chain (governance C1).
+
+- **Permission:** Admin only
+- **Request body (JSON):**
+
+```json
+{ "role": "admin" }
+```
+
+The `role` field must be exactly `admin` or `user`.
+
+- **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
+- **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
+- **Response (400) invalid request:**
+  - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
+  - `invalid_json` — body is not valid JSON.
+  - `missing_role` — body has no `role` field, or `role` is not a string.
+  - `invalid_role` — `role` value is not `admin` or `user`.
+
+  Each branch emits `user.role_change / denied / <reason>`.
+
+- **Response (403):** Self-target rejected. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Cannot change your own role","level":"error"}}`. Audit `user.role_change / denied / self_role_change_blocked`. To demote yourself, create a second admin, log out, log in as the second admin, and use this endpoint to demote the first.
+
+- **Response (404):** `:username` does not match any persisted user. Audit `user.role_change / denied / user_not_found`.
+
+- **Response (500):** AuthDB write failed. Audit `user.role_change / denied / db_failure`.
+
+**Example — promote `bob` to admin:**
+
+```bash
+curl -X POST https://yuzu-server:8080/api/settings/users/bob/role \
+  -H "Content-Type: application/json" \
+  -H "X-Yuzu-Token: yzt_..." \
+  -d '{"role":"admin"}'
+```
+
+**`DELETE /api/settings/users/:name`**
+
+Delete the named account.
+
+- **Permission:** Admin only
+- **Response (200):** Account deleted. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"User deleted","level":"success"}}`. Audit event recorded as `user.delete / success`.
+- **Response (400):** `:name` fails the username allowlist (e.g. contains `$`, `:`, or other disallowed bytes). Audit `user.delete / denied / invalid_username`.
+- **Response (404):** `:name` does not match any persisted user. Audit `user.delete / denied / user_not_found`. Returned with a `User not found` toast in the re-rendered fragment.
+- **Response (403):** Returned when `:name` matches the caller's own session username — the **self-deletion guard**. Body is the re-rendered user table fragment. Header includes:
+
+  ```
+  HX-Trigger: {"showToast":{"message":"Cannot delete your own account","level":"error"}}
+  ```
+
+  Audit event recorded as `user.delete / denied / self_delete_blocked`. The rejected attempt is logged at warn level on the server. To delete the account you are signed in as, create a second admin, sign out, sign in as the second admin, then delete the original.
+
+- **Response (401):** Defensive — admin gate passed but session not re-resolvable.
+- **Response (500):** Defensive — session resolved with empty username.
+
+| HTTP status | Condition |
+|---|---|
+| 200 | Account deleted successfully |
+| 400 | Username failed the allowlist regex |
+| 404 | No persisted user matched `:name` |
+| 403 | Target equals the caller's own username (self-delete guard) |
+| 403 | Caller is not an admin (rejected by admin gate before handler) |
+| 401 | Defensive — admin gate / session callbacks disagree |
+| 500 | Defensive — session has empty username |
+
+**Example — attempt self-delete (will be rejected):**
+```bash
+curl -X DELETE https://yuzu-server:8080/api/settings/users/admin \
+  -H "X-Yuzu-Token: yzt_..." \
+  -v
+# HTTP/1.1 403 Forbidden
+# HX-Trigger: {"showToast":{"message":"Cannot delete your own account","level":"error"}}
+```
+
+---
+
 ## Legacy API Endpoints
 
 The following endpoints are under `/api/` (without the `v1` prefix). They predate the versioned API and remain available for backward compatibility. These endpoints return JSON but do not use the standard v1 envelope.
@@ -2542,7 +2940,24 @@ Get a single instruction definition by ID.
 
 #### `POST /api/instructions`
 
-Create a new instruction definition from JSON.
+Create a new instruction definition from JSON. The `id` field is optional —
+when omitted the server generates a UUID; when supplied it is validated for
+uniqueness against existing definitions.
+
+**Permission:** `InstructionDefinition:Write`
+
+**Response (200):** `{"id": "<id>"}` for the newly-created definition.
+
+**Response (400):** Validation error (missing required field, invalid
+`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+
+**Response (409):** Returned when an explicit `id` is supplied that already
+exists in the store. Body is
+`{"error": "instruction definition '<id>' already exists"}`.
+Audit event recorded as `instruction.create / denied / duplicate_id`. To
+update the existing definition use `PUT /api/instructions/{id}`.
+
+**Response (503):** Instruction store not yet initialized.
 
 #### `PUT /api/instructions/{id}`
 
@@ -2828,6 +3243,74 @@ event: command_response
 data: {"agent_id":"agent-01","command_id":"cmd-abc","status":"COMPLETED"}
 ```
 
+#### `GET /sse/executions/{id}`
+
+Per-execution Server-Sent Events stream introduced in v0.12.0. Backs the
+inline drawer's live updates on the **Instructions → Executions** tab.
+
+- **Permission:** `Execution:Read` (RBAC) or admin role
+- **`{id}`:** the execution id returned by `POST /api/instructions/:id/execute` or visible in the executions list (regex: `[A-Za-z0-9_-]{1,128}`).
+- **Content-Type:** `text/event-stream`
+- **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
+
+**Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
+
+**Event types:**
+
+| Event | Emitted on | Payload (JSON in `data:`) |
+|---|---|---|
+| `agent-transition` | One per agent state change (`update_agent_status` write) | `AgentExecStatus` snapshot — `agent_id`, `status`, `exit_code`, `duration_ms`, `error` |
+| `execution-progress` | Every `refresh_counts` recompute | counts snapshot — `total`, `succeeded`, `failed`, `running`, `pending` |
+| `execution-completed` | Crossing the all-agents-responded threshold OR `mark_cancelled` | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`. Client should close the EventSource after this event. |
+
+**Status-code map:**
+
+| HTTP status | Condition |
+|---|---|
+| 200 | Stream attached; events follow |
+| 401 | No session / token |
+| 403 | RBAC `Execution:Read` denied |
+| 404 | `{id}` does not exist in the execution tracker |
+| 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
+| 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
+
+**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
+
+**Example (curl):**
+
+```bash
+curl -N -H "Cookie: yuzu_session=abc123" \
+  https://yuzu.example.com/sse/executions/exec-abc123
+```
+
+**Example output (running execution, two agents, one in progress):**
+
+```
+event: agent-transition
+id: 1
+data: {"agent_id":"a-1","status":"running","exit_code":null,"duration_ms":null}
+
+event: agent-transition
+id: 2
+data: {"agent_id":"a-1","status":"success","exit_code":0,"duration_ms":4218}
+
+event: execution-progress
+id: 3
+data: {"total":2,"succeeded":1,"failed":0,"running":1,"pending":0}
+
+event: agent-transition
+id: 4
+data: {"agent_id":"a-2","status":"success","exit_code":0,"duration_ms":5102}
+
+event: execution-progress
+id: 5
+data: {"total":2,"succeeded":2,"failed":0,"running":0,"pending":0}
+
+event: execution-completed
+id: 6
+data: {"status":"succeeded"}
+```
+
 ---
 
 ### Dashboard TAR
@@ -2861,6 +3344,54 @@ curl -X POST https://yuzu.example.com/api/dashboard/tar-execute \
 **Safety controls:**
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
 - Agent-side: validates `$`-prefixed table name whitelist, enforces single-statement limit, and rejects queries exceeding 4KB.
+
+#### `GET /tar`
+
+Render the TAR dashboard page. Requires an authenticated session (302 redirect to `/login` otherwise). The page hosts the retention-paused source list and placeholder slots for the SQL frame and process tree viewer.
+
+**Permission:** Session-only (the page itself; embedded fragment endpoints carry their own permission gates — see below).
+
+#### `GET /fragments/tar/retention-paused`
+
+Render an HTML table fragment of the calling operator's most-recent TAR retention scan, scoped to the operator's visible-agent set. Empty-state placeholders distinguish "no scan yet" from "scan returned no paused sources."
+
+**Permission:** `Infrastructure:Read`.
+
+**Request:** no parameters.
+
+**Response:** HTML fragment.
+
+#### `POST /fragments/tar/retention-paused/scan`
+
+Dispatch a `tar.status` command to the operator's visible-agent set and record the new command_id in the per-username scan slot. The next `GET /fragments/tar/retention-paused` picks up the responses.
+
+**Permission:** `Execution:Execute`. Reading the resulting list still requires only `Infrastructure:Read`, but dispatching a command to the fleet is an Execute action.
+
+**Request:** no parameters. Scope is implicitly the operator's visible-agent set; the operator cannot widen scope through this endpoint.
+
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder if the operator has zero visible agents in scope.
+
+**Audit:** Emits `tar.status.scan` with detail `dispatched to <N> agent(s) in scope`.
+
+#### `POST /fragments/tar/retention-paused/reenable`
+
+Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-source independence is preserved — re-enabling `process` does not affect `tcp` / `service` / `user`.
+
+**Permission:** `Execution:Execute`. Per-device RBAC visibility is verified before dispatch; out-of-scope `device_id` values collapse to the same 404 response as not-connected agents (no enumeration oracle).
+
+**Request body (form-encoded):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `device_id` | string | Yes | The agent ID. Must be in the operator's visible-agent set; otherwise rejected with 404 (same body as not-connected). |
+| `source` | string | Yes | One of `process`, `tcp`, `service`, `user`. Other values rejected with 400 to prevent forged form submissions. |
+
+**Response:**
+- 200 OK with empty body and an `HX-Trigger` toast on success.
+- 400 with explanatory body for missing/invalid params.
+- 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
+
+**Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
 ---
 
@@ -3015,11 +3546,17 @@ OIDC callback endpoint. The identity provider redirects here after authenticatio
 
 ## Health
 
-#### `GET /health`
+#### `GET /health` (alias: `GET /api/health`)
+
+> **Note:** `/api/health` is an identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Both paths are unauthenticated, exempt from rate limiting, and return the same JSON body. The canonical path is `/health`; use `/api/health` only when your tooling enforces the `/api/` prefix unconditionally. (Restored in v0.12.0 — see issue #620.)
+>
+> **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
+>
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`. Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 
-**Permission:** None (unauthenticated).
+**Permission:** None (unauthenticated). Authenticated callers receive an extended response (see body-shape note above).
 
 **Response:**
 

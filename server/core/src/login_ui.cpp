@@ -23,14 +23,14 @@ extern const char* const kLoginHtml =
       font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem;
     }
     .login-card .subtitle {
-      font-size: 0.8rem; color: #8b949e; margin-bottom: 1.5rem;
+      font-size: 0.8rem; color: var(--mds-color-theme-text-tertiary); margin-bottom: 1.5rem;
     }
     .field {
       margin-bottom: 1rem; text-align: left;
     }
     .field label {
       display: block; font-size: 0.8rem; font-weight: 600;
-      color: #8b949e; margin-bottom: 0.3rem;
+      color: var(--mds-color-theme-text-tertiary); margin-bottom: 0.3rem;
     }
     .field input {
       width: 100%; padding: 0.5rem 0.75rem;
@@ -41,11 +41,11 @@ extern const char* const kLoginHtml =
     }
     .field input:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(88,166,255,0.2);
+      box-shadow: 0 0 0 2px var(--mds-color-state-selected);
     }
     .btn-login {
       width: 100%; padding: 0.6rem; font-size: 0.9rem; font-weight: 600;
-      background: var(--accent); color: #fff; border: none;
+      background: var(--accent); color: var(--mds-color-text-on-accent); border: none;
       border-radius: 0.375rem; cursor: pointer; transition: opacity 0.15s;
       margin-top: 0.5rem;
     }
@@ -61,7 +61,7 @@ extern const char* const kLoginHtml =
     }
     .btn-sso {
       width: 100%; padding: 0.5rem; font-size: 0.85rem; font-weight: 500;
-      background: var(--surface); color: #484f58;
+      background: var(--surface); color: var(--mds-color-theme-outline-secondary);
       border: 1px solid var(--border); border-radius: 0.375rem;
       cursor: not-allowed; opacity: 0.5;
       transition: opacity 0.15s, border-color 0.15s;
@@ -70,9 +70,9 @@ extern const char* const kLoginHtml =
       color: var(--fg); cursor: pointer; opacity: 1;
       border-color: var(--accent);
     }
-    .btn-sso.enabled:hover { background: #1c2128; }
+    .btn-sso.enabled:hover { background: var(--mds-color-theme-background-solid-secondary); }
     .sso-label {
-      font-size: 0.7rem; color: #484f58; margin-top: 0.4rem;
+      font-size: 0.7rem; color: var(--mds-color-theme-outline-secondary); margin-top: 0.4rem;
     }
   </style>
 </head>
