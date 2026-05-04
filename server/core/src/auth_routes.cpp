@@ -6,6 +6,8 @@
 
 #include <shared_mutex>
 
+#include "mcp_policy.hpp"
+
 // Login page HTML (defined in login_ui.cpp)
 extern const char* const kLoginHtml;
 
@@ -90,7 +92,9 @@ auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
     synth.token_scope_service = api_token.scope_service;
     synth.mcp_tier = api_token.mcp_tier;
 
-    // Resolve the creator's actual legacy role (not unconditional admin)
+    // Resolve the creator's actual legacy role fresh (not unconditional admin).
+    // get_user_role() queries the current role on every call, so a creator who's
+    // been demoted since the token was issued will produce a user-role session.
     auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
     synth.role = legacy_role.value_or(auth::Role::user);
 
@@ -100,6 +104,9 @@ auth::Session AuthRoutes::synthesize_token_session(const ApiToken& api_token) {
 std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request& req) {
     // 1. Try session cookie (existing browser auth)
     auto token = extract_session_cookie(req);
+    // Guard against oversized cookie values before passing to validate_session (#630).
+    if (token.size() > auth::kMaxSessionTokenLength)
+        return std::nullopt;
     auto session = auth_mgr_.validate_session(token);
     if (session)
         return session;
@@ -108,16 +115,20 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
     auto auth_header = req.get_header_value("Authorization");
     if (auth_header.size() > 7 && auth_header.substr(0, 7) == "Bearer ") {
         auto raw = auth_header.substr(7);
-        if (api_token_store_) {
-            auto api_token = api_token_store_->validate_token(raw);
-            if (api_token)
-                return synthesize_token_session(*api_token);
+        // Reject overly-long API tokens early to prevent DoS via expensive hash
+        // operations in ApiTokenStore::validate_token() (#630).
+        if (raw.size() <= auth::kMaxApiTokenLength) {
+            if (api_token_store_) {
+                auto api_token = api_token_store_->validate_token(raw);
+                if (api_token)
+                    return synthesize_token_session(*api_token);
+            }
         }
     }
 
     // 3. Try X-Yuzu-Token header (alternative API token header)
     auto custom_header = req.get_header_value("X-Yuzu-Token");
-    if (!custom_header.empty() && api_token_store_) {
+    if (!custom_header.empty() && custom_header.size() <= auth::kMaxApiTokenLength && api_token_store_) {
         auto api_token = api_token_store_->validate_token(custom_header);
         if (api_token)
             return synthesize_token_session(*api_token);
@@ -142,6 +153,31 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     auto session = require_auth(req, res);
     if (!session)
         return false;
+
+    // Service-scoped tokens are limited to ITServiceOwner permissions for one named
+    // service; they must never reach admin routes regardless of the creator's role.
+    // MCP tokens are for fleet management (queries, instruction execution) and must
+    // not be used to administer the server itself (settings, users, TLS, OIDC).
+    // See docs/mcp-server.md and docs/auth-architecture.md (#520).
+    if (!session->token_scope_service.empty()) {
+        audit_log(req, "auth.admin_required", "denied", "", "",
+                  "service-scoped token blocked from admin route");
+        res.status = 403;
+        res.set_content(
+            R"({"error":{"code":403,"message":"service-scoped tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
+            "application/json");
+        return false;
+    }
+    if (!session->mcp_tier.empty()) {
+        audit_log(req, "auth.admin_required", "denied", "", "",
+                  "MCP token blocked from admin route");
+        res.status = 403;
+        res.set_content(
+            R"({"error":{"code":403,"message":"MCP tokens cannot perform admin operations"},"meta":{"api_version":"v1"}})",
+            "application/json");
+        return false;
+    }
+
     if (session->role != auth::Role::admin) {
         // SOC 2 CC7.2: every privileged-endpoint denial must surface in
         // the audit chain, not just the request log. Emitting here closes
@@ -164,10 +200,53 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     if (!session)
         return false;
 
+    // MCP-tier tokens: enforce the tier policy (readonly/operator/supervised) then
+    // fall through to the standard RBAC/role check using the creator's actual role.
+    // The tier is the primary MCP access control boundary; RBAC is a secondary layer.
+    // Tier enforcement applies on all transports (MCP JSON-RPC and REST API) so
+    // a token cannot bypass the tier by switching endpoints.
+    if (!session->mcp_tier.empty()) {
+        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "MCP token tier '" + session->mcp_tier + "' does not allow " +
+                          securable_type + ":" + operation);
+            res.status = 403;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "MCP token tier does not allow " +
+                                                           securable_type + ":" + operation}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return false;
+        }
+        // Approval-gated operations (supervised tier on destructive ops) cannot
+        // proceed because the approval workflow re-dispatch path is Phase 2 work.
+        // mcp_server.cpp returns kApprovalRequired for the same reason; mirror
+        // that behavior here so the REST transport cannot bypass it (#520).
+        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+            audit_log(req, "auth.approval_required", "denied", "", "",
+                      "MCP token tier '" + session->mcp_tier +
+                          "' requires approval for " + securable_type + ":" + operation +
+                          " (Phase 2 not implemented)");
+            res.status = 403;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "operation requires approval; "
+                                                       "approval-gated MCP execution is not yet implemented"}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return false;
+        }
+    }
+
     // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
     // Scoped tokens cannot be used when RBAC is disabled.
     if (!session->token_scope_service.empty()) {
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
             res.set_content(
                 R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
@@ -175,12 +254,12 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             return false;
         }
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"detail", "service-scoped token does not grant " +
-                                               securable_type + ":" + operation}})
-                    .dump(),
+                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
                 "application/json");
             return false;
         }
@@ -189,10 +268,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
 
     if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
         if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"required_permission", securable_type + ":" + operation}})
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "permission denied: " +
+                                                           securable_type + ":" + operation}}},
+                                {"meta", {{"api_version", "v1"}}}})
                     .dump(),
                 "application/json");
             return false;
@@ -202,6 +285,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
 
     // Legacy fallback: write/delete/execute/approve require admin
     if (operation != "Read" && session->role != auth::Role::admin) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "non-admin role denied " + securable_type + ":" + operation +
+                      (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
         res.set_content(
             R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",
@@ -219,10 +305,48 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     if (!session)
         return false;
 
+    // MCP-tier tokens: enforce the tier policy then fall through to the standard
+    // RBAC/role check using the creator's actual role. Approval-gated operations
+    // (supervised tier on destructive ops) are blocked here because Phase 2
+    // re-dispatch is not built — same contract as mcp_server.cpp (#520).
+    if (!session->mcp_tier.empty()) {
+        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "MCP token tier '" + session->mcp_tier + "' does not allow " +
+                          securable_type + ":" + operation);
+            res.status = 403;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "MCP token tier does not allow " +
+                                                           securable_type + ":" + operation}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return false;
+        }
+        if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
+            audit_log(req, "auth.approval_required", "denied", "", "",
+                      "MCP token tier '" + session->mcp_tier +
+                          "' requires approval for " + securable_type + ":" + operation +
+                          " (Phase 2 not implemented)");
+            res.status = 403;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "operation requires approval; "
+                                                       "approval-gated MCP execution is not yet implemented"}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return false;
+        }
+    }
+
     // Service-scoped tokens: verify the target agent belongs to the token's service,
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
         if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
             res.set_content(
                 R"({"error":{"code":403,"message":"service-scoped tokens require RBAC to be enabled"},"meta":{"api_version":"v1"}})",
@@ -231,18 +355,19 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         }
         // Check that the ITServiceOwner role grants this permission type
         if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"detail", "service-scoped token does not grant " +
-                                               securable_type + ":" + operation}})
-                    .dump(),
+                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
                 "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
         if (!tag_store_) {
-            // Cannot verify scope without TagStore — deny rather than silently grant (UH-6)
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: tag store unavailable");
             res.status = 503;
             res.set_content(R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
                             "application/json");
@@ -251,12 +376,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         if (!agent_id.empty()) {
             auto agent_service = tag_store_->get_tag(agent_id, "service");
             if (agent_service != session->token_scope_service) {
+                audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                          "agent service '" + agent_service + "' does not match token scope '" + session->token_scope_service + "'");
                 res.status = 403;
                 res.set_content(
-                    nlohmann::json(
-                        {{"error", "forbidden"},
-                         {"detail", "agent is not in service '" +
-                                        session->token_scope_service + "'"}})
+                    nlohmann::json({{"error", "forbidden"},
+                                    {"detail", "agent is not in service '" + session->token_scope_service + "'"}})
                         .dump(),
                     "application/json");
                 return false;
@@ -268,10 +393,14 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
         if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
                                                   agent_id, mgmt_group_store_)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
             res.set_content(
-                nlohmann::json({{"error", "forbidden"},
-                                {"required_permission", securable_type + ":" + operation}})
+                nlohmann::json({{"error", {{"code", 403},
+                                           {"message", "permission denied: " +
+                                                           securable_type + ":" + operation}}},
+                                {"meta", {{"api_version", "v1"}}}})
                     .dump(),
                 "application/json");
             return false;
@@ -281,6 +410,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // Legacy fallback: write/delete/execute/approve require admin
     if (operation != "Read" && session->role != auth::Role::admin) {
+        audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                  "non-admin role denied " + securable_type + ":" + operation +
+                      (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
         res.status = 403;
         res.set_content(
             R"({"error":{"code":403,"message":"admin role required"},"meta":{"api_version":"v1"}})",

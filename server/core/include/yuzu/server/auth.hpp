@@ -14,6 +14,12 @@ namespace yuzu::server { class AuthDB; }
 
 namespace yuzu::server::auth {
 
+/// Maximum session token length (64 hex chars = 32 bytes random). Reject longer to prevent DoS.
+inline constexpr std::size_t kMaxSessionTokenLength = 64;
+
+/// Maximum API token length (raw token before hashing). Raw tokens can be up to 256 chars.
+inline constexpr std::size_t kMaxApiTokenLength = 256;
+
 enum class Role { user, admin };
 
 struct UserEntry {

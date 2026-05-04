@@ -252,6 +252,38 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/tokens
 
 Timestamps are Unix epoch seconds. The plaintext token value is never returned after creation.
 
+
+### Token Length Limits
+
+For DoS protection, Yuzu enforces maximum token lengths:
+
+| Token type | Max length | Behavior on exceed |
+|---|---|---|
+| Session tokens (`yuzu_session` cookie) | 64 hex chars | 401 Unauthorized |
+| API tokens (Bearer or X-Yuzu-Token) | 256 chars | 401 Unauthorized |
+
+Tokens exceeding these limits are rejected before any cryptographic operations, preventing resource exhaustion attacks.
+
+### Service-Scoped Tokens
+
+Service-scoped tokens are API tokens with an additional `scope_service` field that restricts the token holder to operations within a specific service boundary. These tokens cannot access admin routes and require RBAC to be enabled.
+
+```bash
+curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "finance-svc-token",
+    "scope_service": "finance",
+    "expires_at": 1750185000
+  }'
+```
+
+Service-scoped tokens:
+- Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
+- Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
+- Must have `ITServiceOwner` role permission for the target operation
+- Are scoped to agents tagged with the matching `service` tag
+
 ### Revoking a Token
 
 Requires `ApiToken:Delete` RBAC permission. This performs a soft revoke (the token record remains but is marked revoked).
@@ -288,7 +320,9 @@ MCP (Model Context Protocol) tokens are API tokens with an additional `mcp_tier`
 | `operator` | Read-only tools + tag writes + auto-approved instruction executions |
 | `supervised` | All operations, but destructive actions require admin approval via the approval workflow |
 
-Tier enforcement happens *before* RBAC checks. Even if RBAC would permit an operation, the MCP tier can restrict it.
+Tier enforcement happens *before* RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.
+
+The `supervised` tier marks destructive operations as approval-gated. Until the Phase 2 approval re-dispatch path lands, supervised-tier writes are blocked on every transport (MCP JSON-RPC and REST API) with `auth.approval_required` audit; only Reads and trivially-allowed operations succeed.
 
 ### Creating an MCP Token
 
@@ -306,6 +340,16 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 
 ```json
 {
+
+### MCP Token Restrictions
+
+MCP tokens have the following restrictions:
+
+- Cannot access admin-only routes (user management, settings) — 403 Forbidden regardless of creator's role
+- The tier restricts which operations are permitted (`readonly` → read only; `operator` → read + tag writes + execute; `supervised` → all ops with approval workflow)
+- If RBAC is enabled, the creator's actual RBAC role applies after the tier check
+- If RBAC is disabled, the creator's legacy role (user/admin) applies after the tier check
+
   "data": {
     "token": "yuzu_Ab3xK9m2...",
     "name": "claude-desktop-readonly"
@@ -346,6 +390,50 @@ curl -s -X POST http://localhost:8080/mcp/v1/ \
 ### Audit
 
 Every MCP tool invocation is logged as an audit event with `action: "mcp.<tool_name>"` and includes the `mcp_tool` field on the `AuditEvent` record.
+
+
+### Audit Log Actions
+
+The following audit actions are emitted for authentication and authorization events:
+
+| Action | Result | Description |
+|---|---|---|
+| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
+| `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
+| `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
+| `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from approval-gated operation (Phase 2 re-dispatch not yet implemented) |
+| `auth.login` | `success` | Successful local password login |
+| `auth.login_failed` | `failure` | Failed login attempt |
+| `auth.logout` | `success` | User-initiated logout |
+| `auth.oidc_login` | `success` | Successful OIDC SSO login |
+| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt |
+
+All `denied` results include a `detail` field explaining the reason. Examples per action:
+- `auth.admin_required` → `"MCP token blocked from admin route"`, `"service-scoped token blocked from admin route"`, `"non-admin user blocked from admin route"`
+- `auth.permission_required` → `"MCP token tier 'readonly' does not allow Execution:Execute"`, `"RBAC denied Execution:Execute"`
+- `auth.scoped_permission_required` → `"agent service 'X' does not match token scope 'Y'"`, `"MCP token tier 'readonly' does not allow Tag:Write"`
+- `auth.approval_required` → `"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"`
+
+### JSON Error Envelope
+
+All authentication and authorization errors use the standard JSON envelope:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "service-scoped token does not grant Agent:Execute (ITServiceOwner permission required)"
+  },
+  "meta": {
+    "api_version": "v1"
+  }
+}
+```
+
+HTTP status codes:
+- `401 Unauthorized` — No valid authentication provided (missing/invalid token)
+- `403 Forbidden` — Authentication valid but operation not permitted (scope/tier/role restriction)
+- `503 Service Unavailable` — Required backend (e.g., TagStore) unavailable for scope verification
 
 ## API Reference Summary
 
