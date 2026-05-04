@@ -26,6 +26,8 @@ updates:
       github-codeql:
         patterns:
           - "github/codeql-action/*"
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: "docker"
     directory: "/deploy/docker"
@@ -35,6 +37,8 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    cooldown:
+      default-days: 7
 
   # Python tooling consumed by CI (meson, and whatever else lands in
   # requirements-ci.txt). vcpkg and rebar3 are covered by dedicated
@@ -47,3 +51,5 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    cooldown:
+      default-days: 7
