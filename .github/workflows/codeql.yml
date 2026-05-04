@@ -390,11 +390,18 @@ jobs:
         #
         # Implemented in Python rather than jq because jq is not on
         # PATH in the MSYS2 environment used by the Windows self-hosted
-        # runner; python3 is already required by "Assert toolchain
-        # available" so the dependency is free.
+        # runner; python is already required by "Assert toolchain
+        # available" so the dependency is free. Probe both names because
+        # the canonical executable differs by platform: Linux runners
+        # have `python3`, Windows MSYS2 runners have `python`.
         run: |
+          PYTHON=$(command -v python3 || command -v python)
+          if [[ -z "$PYTHON" ]]; then
+            echo "::error::no python interpreter on PATH (tried python3, python)"
+            exit 1
+          fi
           for f in codeql-sarif/*.sarif; do
-            python3 scripts/ci/filter-codeql-sarif.py "$f"
+            "$PYTHON" scripts/ci/filter-codeql-sarif.py "$f"
           done
 
       - name: Upload SARIF
