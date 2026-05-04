@@ -205,6 +205,8 @@ if build_server
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
+      'unit/server/test_response_templates_engine.cpp',
+      'unit/server/test_rest_response_templates.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
