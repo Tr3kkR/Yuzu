@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CodeQL SARIF post-processing filter** at `scripts/ci/filter-codeql-sarif.sh`
+  wedged between `analyze` and `upload-sarif` in `codeql.yml`. CodeQL's
+  `paths` / `paths-ignore` config keys do not reliably suppress C/C++
+  alerts whose location is a transitively-included header (the C++
+  extractor follows every `#include`; vendored `vcpkg_installed/` and
+  generated `build-*/` headers end up in the database; structural rules
+  fire on their AST). The filter drops non-security findings in those
+  paths but **preserves security-severity findings everywhere**,
+  including in vendored code — a vendor vulnerability that ships in our
+  binary is real customer exposure regardless of who wrote the bug.
+  Companion gist documents the upstream limitation:
+  https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8 .
+  Without this, every CodeQL run re-creates ~2154 noise alerts on
+  vendored/generated paths.
+- **CodeQL coverage fix — force compile in tracer step** (`CCACHE_RECACHE=true`
+  on `meson compile -C build-linux-codeql`). The tracer cannot observe
+  compile invocations that ccache short-circuits; with persistent ccache
+  on the self-hosted runner this had been silently dropping 98% of TUs
+  from the database since the runner was adopted, masking both standard
+  and custom-rule findings. Cost: cold-compile budget (~15-25 min Linux
+  vs ~3 min cached) — justified, since CodeQL coverage was the entire
+  point.
 - **Custom CodeQL query pack at `.github/codeql/queries/`** — Yuzu-specific
   queries that the standard `security-and-quality` suite cannot encode
   because the rules depend on per-project directory scope and the plugin
