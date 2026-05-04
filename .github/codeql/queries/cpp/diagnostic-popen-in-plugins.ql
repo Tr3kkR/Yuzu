@@ -7,10 +7,12 @@
  *              plugin-windows-process-spawn-non-literal) produced 0
  *              alerts despite many obvious call sites in plugin source.
  *
- *              If this query fires and the production query doesn't,
- *              the bug is in `arg.getValue()` folding or in the
- *              argument-position selection. If neither fires, the bug
- *              is in the path predicate or the function-name match.
+ *              Compare alert count against the production-query alert
+ *              count — if this diagnostic fires N times and the
+ *              production query fires 0 times, the bug is either
+ *              `arg.getValue()` folding too aggressively or a wrong
+ *              argument-position selection. If both fire 0, the bug is
+ *              in either the function-name match or the path predicate.
  *              Will be removed once the production queries are
  *              demonstrated to work.
  *
@@ -40,7 +42,4 @@ predicate inPluginSource(Element e) {
 from CommandExecCall call
 where inPluginSource(call)
 select call,
-  "DIAGNOSTIC: command-exec call in plugin source. Function: " + call.getTarget().getName() +
-  ". File: " + call.getFile().getRelativePath() +
-  ". Arg0: " + call.getArgument(0).toString() +
-  ". Arg0 has constant value: " + (if exists(call.getArgument(0).getValue()) then "YES" else "NO")
+  "DIAGNOSTIC: " + call.getTarget().getName() + " call in plugin source"
