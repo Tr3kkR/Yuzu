@@ -230,9 +230,9 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          # requirements-ci.txt is hash-pinned; gcovr is not.
+          # requirements-ci.txt is hash-pinned (includes gcovr for the
+          # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
-          pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Reset ccache stats

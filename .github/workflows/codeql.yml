@@ -63,7 +63,6 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  security-events: write
   contents: read
 
 env:
@@ -75,6 +74,9 @@ env:
 jobs:
   analyze:
     name: "Analyze (${{ matrix.os }})"
+    permissions:
+      contents: read
+      security-events: write   # github/codeql-action/upload-sarif
     # Verified Linux wall-clock (2026-04-13, dev@9b16d3c, security-extended,
     # build_tests=false): 14m49s with 155/156 compiles being real misses
     # on a 32-thread runner. Current config (+security-and-quality +
