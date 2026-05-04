@@ -373,22 +373,28 @@ jobs:
           output: codeql-sarif
           upload: never
 
-      - name: Filter SARIF (drop non-security findings in vendored/generated paths)
+      - name: Filter SARIF (drop non-security findings in vendored/generated paths + Catch2 TEST_CASE FP in tests/)
         # Strips results in vcpkg_installed/, build-*/, vcpkg/, and
         # generated proto code unless the rule has a security-severity.
-        # Security-severity findings in vendored code are KEPT — even
-        # though we cannot patch upstream, a vendor vulnerability that
-        # ships in our binary is a real exposure to customers and we
-        # need to stay aware of it (track via dedicated vendor-security
-        # process).
+        # Also strips cpp/unused-static-function in tests/ (Catch2
+        # TEST_CASE registration false-positive). Security-severity
+        # findings in vendored code are KEPT — even though we cannot
+        # patch upstream, a vendor vulnerability that ships in our
+        # binary is a real exposure to customers and we need to stay
+        # aware of it (track via dedicated vendor-security process).
         #
         # Why this is necessary: CodeQL's paths/paths-ignore config does
         # not reliably suppress C/C++ findings in transitively-included
         # vendored headers. Full writeup:
         #   https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8
+        #
+        # Implemented in Python rather than jq because jq is not on
+        # PATH in the MSYS2 environment used by the Windows self-hosted
+        # runner; python3 is already required by "Assert toolchain
+        # available" so the dependency is free.
         run: |
           for f in codeql-sarif/*.sarif; do
-            /usr/bin/bash scripts/ci/filter-codeql-sarif.sh "$f"
+            python3 scripts/ci/filter-codeql-sarif.py "$f"
           done
 
       - name: Upload SARIF
