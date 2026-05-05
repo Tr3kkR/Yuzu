@@ -594,7 +594,10 @@ TEST_CASE("REST templates: migration v3 probe-and-stamp on pre-existing column (
     // ALTER (which would otherwise fail with SQLITE_ERROR
     // "duplicate column name").
     auto raw_db_path = yuzu::test::unique_temp_path("rt-mig-v3-probe-");
-    std::filesystem::remove(raw_db_path);
+    {
+        std::error_code ec;
+        std::filesystem::remove(raw_db_path, ec);
+    }
 
     // Pre-seed the DB by hand: open with the v0.10 layout (incl. the column),
     // stamp schema_meta to v1.
@@ -639,22 +642,27 @@ TEST_CASE("REST templates: migration v3 probe-and-stamp on pre-existing column (
     }
 
     // Now open with InstructionStore — probe-and-stamp must move v1 → v3
-    // without crashing.
-    InstructionStore store(raw_db_path);
-    REQUIRE(store.is_open());
+    // without crashing. Scoped so the SQLite handle releases before the
+    // post-test cleanup tries to remove the file (Windows won't delete an
+    // open file).
+    {
+        InstructionStore store(raw_db_path);
+        REQUIRE(store.is_open());
 
-    // Validate by writing + reading back through the normal path.
-    InstructionDefinition d;
-    d.name = "post-migration-write";
-    d.type = "question";
-    d.plugin = "procfetch";
-    auto created = store.create_definition(d);
-    REQUIRE(created.has_value());
-    auto fetched = store.get_definition(*created);
-    REQUIRE(fetched);
-    CHECK(fetched->response_templates_spec == "[]");
+        // Validate by writing + reading back through the normal path.
+        InstructionDefinition d;
+        d.name = "post-migration-write";
+        d.type = "question";
+        d.plugin = "procfetch";
+        auto created = store.create_definition(d);
+        REQUIRE(created.has_value());
+        auto fetched = store.get_definition(*created);
+        REQUIRE(fetched);
+        CHECK(fetched->response_templates_spec == "[]");
+    }
 
-    std::filesystem::remove(raw_db_path);
-    std::filesystem::remove(raw_db_path.string() + "-wal");
-    std::filesystem::remove(raw_db_path.string() + "-shm");
+    std::error_code ec;
+    std::filesystem::remove(raw_db_path, ec);
+    std::filesystem::remove(raw_db_path.string() + "-wal", ec);
+    std::filesystem::remove(raw_db_path.string() + "-shm", ec);
 }

@@ -15,6 +15,13 @@
       "labels": ["self-hosted", "Windows", "X64"],
       "role": "Windows MSVC CI jobs — ci.yml windows matrix (release + debug), codeql Windows leg.",
       "installed": "2026-04-14"
+    },
+    {
+      "name": "scw-eager-lumiere",
+      "host": "Scaleway cloud VM (bare-VM install, not Dockerfile.runner-linux)",
+      "labels": ["self-hosted", "X64", "Linux", "yuzu-cloud-builder"],
+      "role": "Additional Linux capacity — shares the self-hosted/Linux/X64 label set with yuzu-wsl2-linux, so ci.yml linux matrix jobs distribute across both. The yuzu-cloud-builder label is reserved for future cloud-only workloads (e.g. release builds that should not pin the local Shulgi box).",
+      "installed": "2026-05-05"
     }
   ]
 }

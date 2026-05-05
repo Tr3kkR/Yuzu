@@ -411,8 +411,18 @@ TEST_CASE("OffloadTargetStore: dispatch refuses tampered non-http(s) URL",
     // is exercised by the security-guardian's source review and
     // codified in the dispatch path's explicit check.
     store.fire_event("execution.completed", R"({"k":"v"})");
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    auto deliveries = store.get_deliveries(id);
+    // Dispatch is async (detached std::thread). Poll for the delivery
+    // record rather than relying on a fixed sleep — the Windows MSVC
+    // runner under Defender can take well over 200 ms to schedule the
+    // detached thread + complete the connect failure.
+    std::vector<OffloadDelivery> deliveries;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (std::chrono::steady_clock::now() < deadline) {
+        deliveries = store.get_deliveries(id);
+        if (!deliveries.empty())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     REQUIRE(deliveries.size() == 1);
     // The connection fails (port 1 is reserved) — error is connection_failed,
     // proving the dispatch path ran and reached the HTTP client. The
