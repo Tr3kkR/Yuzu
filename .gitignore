@@ -149,4 +149,4 @@ __pycache__/
 # refuse to run under zsh or assume Linux toolchain layout (e.g. kerl
 # activation, ss/df flags, /var/lib/docker). Per the Darwin policy in
 # CLAUDE.md the shims are local-only — never tracked.
-/scripts/darwin-activate-erlang.sh
+/scripts/darwin-*.sh
