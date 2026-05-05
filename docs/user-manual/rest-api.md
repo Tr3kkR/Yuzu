@@ -59,6 +59,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Runtime Configuration](#runtime-configuration)
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
+  - [Offload Targets](#offload-targets)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
   - [Inventory](#inventory)
@@ -1853,6 +1854,93 @@ List recent delivery attempts for a webhook. Includes HTTP status code, response
 2. Subscribe to the event types relevant to your workflow.
 3. Optionally set an HMAC secret and verify the `X-Yuzu-Signature` header on receipt.
 4. Monitor delivery history via `GET /api/webhooks/{id}/deliveries` to detect failures.
+
+---
+
+### Offload Targets
+
+Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
+
+A target is identified by a unique `name` so a definition can reference it via `spec.offload.targets` in YAML (see [yaml-dsl-spec.md](../yaml-dsl-spec.md#specoffload)).
+
+All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`); only the auth_type and shape leak. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
+
+#### `GET /api/v1/offload-targets`
+
+List all configured offload targets.
+
+**Response:**
+
+```json
+{
+  "offload_targets": [
+    {
+      "id": 1,
+      "name": "siem-primary",
+      "url": "https://siem.example.com/ingest",
+      "auth_type": "bearer",
+      "event_types": "execution.completed",
+      "batch_size": 50,
+      "enabled": true,
+      "created_at": 1714501234
+    }
+  ]
+}
+```
+
+#### `GET /api/v1/offload-targets/{id}`
+
+Fetch a single target by numeric id. `auth_credential` is redacted. 404 when no such id exists.
+
+#### `POST /api/v1/offload-targets`
+
+Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Unique stable identifier referenced from `spec.offload.targets`. |
+| `url` | string | Yes | `http://` or `https://` POST endpoint. |
+| `auth_type` | string | No (`none`) | One of `none`, `bearer`, `basic`, `hmac`. |
+| `auth_credential` | string | No | Bearer token (Bearer), `user:pass` (Basic), shared secret (Hmac). Never returned by any endpoint. |
+| `event_types` | string | No (`*`) | Comma-separated list of event types or `*` for all. Same semantics as webhooks. |
+| `batch_size` | int | No (1) | Accumulate up to N events into a single POST body. `1` = no batching. |
+| `enabled` | bool | No (true) | When false, no events are dispatched until re-enabled. |
+
+**Auth headers (set per `auth_type`):**
+
+- `none` → no Authorization header.
+- `bearer` → `Authorization: Bearer <auth_credential>`.
+- `basic` → `Authorization: Basic <base64(user:pass)>`.
+- `hmac` → `X-Yuzu-Signature: sha256=<hmac-sha256(auth_credential, body)>`. Mirrors the webhook shape so receivers can share verification code.
+
+Every delivery also carries `X-Yuzu-Event` and `X-Yuzu-Event-Count` headers; batched bodies are JSON of shape `{"events":[…]}`.
+
+#### `DELETE /api/v1/offload-targets/{id}`
+
+Delete a target. Cascades on `offload_deliveries`. Pending events buffered for batching are dropped — operator who deletes the target asked for it.
+
+#### `GET /api/v1/offload-targets/{id}/deliveries`
+
+Recent delivery attempts for a target (default 50, override via `?limit=N`). Each row records `event_type`, `event_count`, `payload`, `status_code`, `delivered_at` (epoch seconds), and `error` (set on connection failure or exception).
+
+**Usage guide:**
+
+1. Register a target — e.g. a generic webhook collector, Datadog Logs HTTP endpoint, Elastic Common Schema ingest URL, or any in-house aggregator that accepts JSON over HTTP(S).
+2. Set `event_types` to the events you actually need; `execution.completed` is the typical analytics feed, `agent.registered` for inventory hydration.
+3. Tune `batch_size` to your downstream ingestion preference. SIEMs commonly prefer 50–500 per POST; real-time alerting wants `batch_size=1`.
+4. Monitor delivery via `GET /api/v1/offload-targets/{id}/deliveries`. Repeated `connection_failed` errors mean the receiver is down or the URL/auth is wrong.
+
+**Validating a new target.** There is no synthetic-test endpoint in this revision. To validate, set `batch_size=1`, run any instruction that produces an `execution.completed` event, then poll `GET /api/v1/offload-targets/{id}/deliveries` for the resulting row.
+
+**Authentication interop — known limitations.**
+
+- **Splunk HEC** uses the non-standard header `Authorization: Splunk <token>`. Yuzu's `bearer` mode emits `Authorization: Bearer <token>`. Splunk HEC will reject these with HTTP 401. Use `auth_type=none` + a Splunk HEC token enabled for "no authentication" (network-layer controls only) or front Splunk with a small reverse proxy that rewrites the header.
+- **AWS S3 / EventBridge / Kinesis** require AWS Signature v4 (Sigv4). Yuzu does not generate Sigv4 signatures in this revision; direct PUTs to S3 buckets and EventBridge endpoints **will not work**. Front them with a Sigv4-signing reverse proxy (e.g. `aws-sigv4-proxy`).
+- **Azure Monitor / Sentinel** use AAD token flow. Not directly supported. Front with a token-refresh shim.
+
+**Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the entire JSON payload — including potentially sensitive instruction response data (file paths, registry values, software inventory, security findings) — is transmitted in cleartext. Production deployments containing customer endpoint data should use `https://` only. The store accepts `http://` for development convenience and to maintain parity with the webhook precedent.
+
+**Operator trust model.** Any principal with `Infrastructure:Write` can register an offload target pointing at any URL the server can resolve, including RFC1918 / loopback / link-local destinations. There is no URL allowlist or network-egress mitigation in this revision; the trust model is "Infrastructure:Write operators are trusted to choose where data goes." For multi-tenant managed deployments this is a known limitation tracked as a roadmap follow-up.
 
 ---
 

@@ -53,6 +53,7 @@
 #include "discovery_routes.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
+#include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
 #include "webhook_routes.hpp"
@@ -64,6 +65,7 @@
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
+#include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
@@ -501,6 +503,8 @@ public:
             agent_service_.set_notification_store(notification_store_.get());
         if (webhook_store_)
             agent_service_.set_webhook_store(webhook_store_.get());
+        if (offload_target_store_)
+            agent_service_.set_offload_target_store(offload_target_store_.get());
         if (inventory_store_)
             agent_service_.set_inventory_store(inventory_store_.get());
 
@@ -736,6 +740,10 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+        }
+        {
+            auto offload_db = cfg_.db_dir() / "offload_targets.db";
+            offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
         }
 
         // Phase 7: Inventory Store (Issue 7.17)
@@ -1106,6 +1114,16 @@ public:
         }
         if (web_thread_.joinable()) {
             web_thread_.join();
+        }
+
+        // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
+        // reset further down. Detached delivery threads continue past
+        // process exit's perspective but get a fair chance to finish
+        // before the SQLite handle goes away. flush_all() spawns a final
+        // round of detached deliveries; we don't join them, but the
+        // buffer state is consistent (RESTART-1 from Gate 6 SRE).
+        if (offload_target_store_) {
+            offload_target_store_->flush_all();
         }
 
         // Release Phase 2 components before closing shared DB
@@ -1839,10 +1857,16 @@ private:
             // every Guardian endpoint returned 503. Mirrors the /readyz conjunction.
             bool guaranteed_state_ok =
                 guaranteed_state_store_ && guaranteed_state_store_->is_open();
+            // Phase 8.3 #255 — same pattern as Guardian above. Without
+            // this row /healthz would report "healthy" while every
+            // /api/v1/offload-targets endpoint and every fire_event call
+            // silently no-ops on a migration failure (HC-1 from Gate 6).
+            bool offload_target_ok =
+                offload_target_store_ && offload_target_store_->is_open();
 
             // Determine overall status
-            bool all_stores_ok =
-                response_ok && audit_ok && instruction_ok && policy_ok && guaranteed_state_ok;
+            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
+                                 guaranteed_state_ok && offload_target_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -1854,7 +1878,8 @@ private:
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
-                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"}}},
+                  {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
+                  {"offload_target", offload_target_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -1962,6 +1987,12 @@ private:
                 // an operator can detect a corrupt auth.db without scraping
                 // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
                 {"auth_db", auth_mgr_.is_auth_db_ok()},
+                // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
+                // and the AgentService fan-out path. A migration failure
+                // would silently no-op all offload deliveries while the
+                // probe reported "ready" (HC-1 gap from Gate 6 SRE).
+                {"offload_target_store",
+                 offload_target_store_ && offload_target_store_->is_open()},
             };
 
             std::string failed_list;
@@ -4882,6 +4913,12 @@ private:
             },
             webhook_store_.get());
 
+        // OffloadRoutes — /api/v1/offload-targets/* (Phase 8.3, #255)
+        offload_routes_ = std::make_unique<OffloadRoutes>();
+        offload_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            offload_target_store_.get());
+
         // DiscoveryRoutes — /api/directory/*, /api/patches/*, /api/deployments/*, /api/discovery/*
         discovery_routes_ = std::make_unique<DiscoveryRoutes>();
         discovery_routes_->register_routes(
@@ -5247,6 +5284,7 @@ private:
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
     std::unique_ptr<WebhookRoutes> webhook_routes_;
+    std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
@@ -5260,6 +5298,7 @@ private:
     // Notification & Webhook stores
     std::unique_ptr<NotificationStore> notification_store_;
     std::unique_ptr<WebhookStore> webhook_store_;
+    std::unique_ptr<OffloadTargetStore> offload_target_store_;
 
     // Phase 7: Inventory Store (Issue 7.17)
     std::unique_ptr<InventoryStore> inventory_store_;

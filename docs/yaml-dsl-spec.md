@@ -333,6 +333,26 @@ spec:
 
 > **Authoring through the dashboard YAML editor strips response templates.** Same caveat as `spec.visualization` — the lightweight line-scanner used by `POST /api/instructions/yaml` does not extract `spec.responseTemplates` into the indexed column. Use `POST /api/v1/definitions/import` (JSON envelope) or the in-tree `content/definitions/` library, or call `POST /api/v1/definitions/{id}/response-templates` directly to author templates against an already-imported definition.
 
+#### `spec.offload`
+
+Optional per-instruction override for the response-offload control plane (issue #255, Phase 8.3). Targets are global config registered through `POST /api/v1/offload-targets` with their own URL, auth (none / bearer / basic / hmac), event filter, and batch size. By default every enabled target whose `event_types` filter matches the fired event receives a copy of the payload. `spec.offload.targets` restricts that fan-out to a named subset for a specific definition.
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `targets` | array of strings | No | `[]` | Names of registered offload targets to receive responses for this definition. Empty / omitted means "fan out to every enabled target whose `event_types` matches" (the default behaviour). When set, only targets whose `name` appears here AND whose `event_types` matches receive the event. |
+
+Example — an inventory-collection definition that only ships its responses to the `siem-archive` target (other webhooks/offload targets do not receive these events):
+
+```yaml
+spec:
+  offload:
+    targets: [siem-archive]
+```
+
+> **`spec.offload.targets` is not extracted by the dashboard YAML editor or the JSON import endpoint.** The field is preserved verbatim in the `yaml_source` source-of-truth column on `instruction_definitions` but is **not** denormalised into an indexed column and is **not** consulted by the dispatcher in this revision. Authoring this field has no current effect on fan-out behaviour. See the runtime caveat below.
+
+> **Runtime correlation is opt-in.** The `agent.registered` and `execution.completed` events fan out globally to every enabled offload target whose `event_types` filter matches, regardless of `spec.offload.targets`. The store's `OffloadTargetStore::fire_event` accepts an optional `target_filter` argument that callers can use to restrict fan-out to a named subset, but the agent-service dispatch path does not currently extract the filter from the originating definition. Wiring the dispatcher to walk `command_id → execution_id → definition_id → InstructionStore::get_definition` and read `spec.offload.targets` is tracked as a follow-up.
+
 #### `status`
 
 | Field | Type | Required | Default | Description |

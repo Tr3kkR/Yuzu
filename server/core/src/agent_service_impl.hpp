@@ -32,6 +32,7 @@ class AnalyticsEventStore;
 class ManagementGroupStore;
 class NotificationStore;
 class WebhookStore;
+class OffloadTargetStore;
 class InventoryStore;
 class UpdateRegistry;
 struct UpdatePackage;
@@ -59,6 +60,7 @@ public:
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
+    void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
@@ -176,6 +178,7 @@ private:
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};
     WebhookStore* webhook_store_{nullptr};
+    OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
 
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);

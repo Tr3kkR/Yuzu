@@ -29,10 +29,10 @@ Each capability is rated on two axes:
 ```
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
-Future       [====================------------]  32/50 done  (64%)
+Future       [=====================-----------]  33/50 done  (66%)
 New (Ph 8-16)[=---------------------------]     2/41 done   (5%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   168/225 done (75%)
+Overall      [======================---------]   169/225 done (75%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -56,7 +56,7 @@ Overall      [======================---------]   168/225 done (75%)
 | 17. Triggers & Automation | 7 | 7 | 0 | 0 |
 | 18. Auth & Authorization | 10 | 9 | 0 | 1 |
 | 19. Device & Group Mgmt | 7 | 7 | 0 | 0 |
-| 20. Response Collection | 7 | 6 | 0 | 1 |
+| 20. Response Collection | 7 | 7 | 0 | 0 |
 | 21. Notifications & Audit | 5 | 4 | 0 | 1 |
 | 22. System & Infrastructure | 10 | 7 | 0 | 3 |
 | 23. Agent Key-Value Storage | 3 | 3 | 0 | 0 |
@@ -68,7 +68,7 @@ Overall      [======================---------]   168/225 done (75%)
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **225** | **168** | **3** | **54** |
+| **TOTAL** | **225** | **169** | **3** | **53** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -845,9 +845,9 @@ CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180
 
 Named response-view configurations (column subset, sort order, filter presets) attached to an `InstructionDefinition`. Synthesised `__default__` view derived from `spec.result.columns` (or the plugin's column schema) so every definition has at least one selectable view. REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]` gated on `InstructionDefinition:Read` (List/Get) and `InstructionDefinition:Write` (POST/PUT/DELETE). Dashboard surfaces the templates as a **View** dropdown in the filter bar; selecting one re-renders the table with the template's column subset, sort order, and equals-op filters auto-applied. YAML authoring via `spec.responseTemplates`. Phase 8.2, issue #254.
 
-### 20.7 Response Offloading :x: `T3`
+### 20.7 Response Offloading :white_check_mark: `T3`
 
-Not implemented. Route instruction responses to external HTTP endpoints.
+Operator-registered external HTTP endpoints (*offload targets*) that receive a copy of `agent.registered` and `execution.completed` events as they fire. Sibling `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into `AgentServiceImpl` next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: `batch_size > 1` accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape `{"events":[…]}`. REST CRUD at `/api/v1/offload-targets` gated on `Infrastructure:Read`/`Write`. `auth_credential` is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via `spec.offload.targets` is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.
 
 ---
 

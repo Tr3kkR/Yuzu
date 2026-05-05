@@ -9,6 +9,315 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Phase 8.3 Response Offloading governance hardening — round 3.**
+  Fixes for Gate 6 BLOCKING (SRE) + cheap SHOULD findings.
+  - **HC-1 (SRE BLOCKING)** — `OffloadTargetStore` now appears in both
+    `/readyz` and `/healthz` conjunctions in `server.cpp`. A migration
+    failure on `offload_targets.db` would otherwise have left the
+    probes reporting "ready"/"healthy" while every
+    `/api/v1/offload-targets` endpoint and the `AgentService` fan-out
+    silently no-opped. Mirrors the same pattern Guardian's
+    `guaranteed_state_store` follows. The `/healthz` `stores` map gains
+    an `offload_target` row.
+  - **RESTART-1 (SRE SHOULD)** — `Server::stop()` now calls
+    `offload_target_store_->flush_all()` after the web server stops
+    accepting requests but before any further teardown. Drains pending
+    batched events on graceful shutdown so a SIGTERM does not silently
+    drop a partial buffer. Detached delivery threads spawned by
+    `flush_all` are not joined (matches the WebhookStore precedent),
+    but the buffer state is consistent and the SQLite handle is still
+    open at the moment of dispatch.
+  - **Round-3 re-review residual finding (MEDIUM)** — `create_target`
+    now rejects control bytes (`< 0x20`) in `name` and `url` as well
+    as `auth_credential`. The DELETE-audit detail change in F-3 below
+    embeds `name` and `url` verbatim into the audit row's `detail`
+    field as `name=<n> url=<u>`; a control byte (CR/LF/NUL) in either
+    would line-split the audit row and forge a downstream event in
+    any SIEM that parses log lines individually. New test cases
+    `[offload_store][security]` pin the guard for both fields including
+    the embedded-NUL edge case.
+  - **F-3 (compliance SHOULD, 1-line fix)** — `DELETE
+    /api/v1/offload-targets/{id}` now snapshots the target's `name` and
+    `url` BEFORE calling `delete_target` and embeds them in the audit
+    row's `detail` field as `name=<n> url=<u>`. Closes the brief
+    compromise-and-cleanup forensic gap where a delete audit row carried
+    only the numeric id, leaving the URL recoverable only via a chain
+    join to the create row.
+  - **Enterprise BLOCKING (doc)** — `docs/user-manual/rest-api.md`
+    Offload Targets section now carries:
+    - A "Known authentication limitations" callout explaining that
+      Splunk HEC's `Authorization: Splunk <token>` header is NOT the
+      same as `bearer`, AWS S3/EventBridge/Kinesis require Sigv4 (not
+      shipped), and Azure Monitor/Sentinel require AAD token flow.
+      Removes the misleading "S3-bucket-receiver" example and replaces
+      with realistic targets (Datadog Logs, Elastic ingest, in-house
+      aggregator).
+    - A "Validating a new target" note explaining that there is no
+      synthetic-test endpoint and the validation procedure is to set
+      `batch_size=1`, fire an instruction, and poll `/deliveries`.
+    - A bold "Cleartext HTTP warning" stating that `http://` URLs
+      transmit data in cleartext and are not suitable for production
+      deployments containing customer endpoint data (compliance F-5).
+    - An "Operator trust model" callout documenting that
+      `Infrastructure:Write` operators can register any URL with no
+      allowlist / egress controls — known limitation tracked as a
+      roadmap follow-up.
+  - **Known follow-ups (deferred — sibling-pattern issues, not new in
+    this PR):**
+    - **Retention sweep on `offload_deliveries` and `webhook_deliveries`
+      (CAP-1 SRE BLOCKING for production deployments).** Both tables
+      grow unboundedly; ~21 GB/day at 100 events/sec * 5 targets *
+      `batch_size=1`. Offload mirrors the existing webhook gap; fix
+      should land for both stores together. Until then, deployments
+      handling sustained traffic should monitor `db_dir` disk usage and
+      prune deliveries manually.
+    - **SSRF allowlist for outbound URLs (compliance F-2 / chaos
+      CH-2).** Both webhook and offload stores accept arbitrary
+      operator-supplied URLs including RFC1918 / loopback / link-local
+      / cloud-metadata endpoints. The trust model accepts this as
+      operator-tier-privileged today; multi-tenant deployments will
+      need a network-egress allowlist before production use.
+    - **Prometheus metrics on the fan-out path (perf-S10 / OBS-1).**
+      `yuzu_offload_*` counters/histograms for delivery success/failure,
+      buffer depth, semaphore wait. WebhookStore has the same gap;
+      file as a joint follow-up.
+    - **`spec.offload.targets` per-instruction filter at the
+      dispatcher (UP-14).** The DSL field is documented + parsed
+      verbatim; the dispatcher does not yet extract or honour it.
+      Doc-warned; runtime wiring is the follow-up.
+    - **Outbound TLS cert verification + proxy support (SEC-1, SEC-2).**
+      `httplib::Client` defaults; cert verification is on but custom
+      CA bundles are not surfaced; `HTTPS_PROXY` env vars are not
+      respected. Same shape as webhooks.
+
+  **Tests:** new `[rest][offload]` 404-on-missing-target case for
+  `/deliveries`. Total `[offload]` count: 17 cases (was 11) /
+  100+ assertions including hardening-pin tests for sec-H1, sec-M2,
+  sec-M5, sec-L6, qe-S3 (batch accumulator), qe-S6 (migration v1),
+  HP-2 (deliveries 404).
+
+- **Phase 8.3 Response Offloading governance hardening — round 2.**
+  Fixes for Gate 3 + Gate 4 findings.
+  - **HP-1 / UP-6** — `agent_service_impl.cpp` outer-guard regression at
+    all three fire-event sites: round-1 hoisted `wh_payload.dump()` into
+    a single `body` to avoid double-serialise (perf-S1), but accidentally
+    nested the offload `fire_event` inside the `webhook_store_` null
+    check. Result: a deployment without a webhook store would silently
+    skip offload dispatch even when the offload store was healthy. Fix
+    splits the guards: outer `if (webhook OR offload)` builds the body
+    once; each sink fires under its own independent guard. Both
+    happy-path and unhappy-path Gate 4 reviewers caught this
+    independently — exactly the Pattern C "fix commit ships a worse bug
+    than the one it closes" hazard the governance ladder exists for.
+  - **HP-2** — `GET /api/v1/offload-targets/{id}/deliveries` now returns
+    404 when the underlying target does not exist, matching the sibling
+    `GET /api/v1/offload-targets/{id}` semantics. Previously returned
+    `{"deliveries":[]}` + 200, which an operator polling for a deleted
+    target could mistake for "delivery channel quiet" rather than "this
+    target is gone." OpenAPI 404 description updated accordingly.
+  - **arch-S1 / agentic A2** — `openapi_spec()` in `rest_api_v1.cpp`
+    now enumerates the five `/offload-targets*` paths so an
+    OpenAPI-driven client (operator scripting, agentic workers, REST
+    SDK generators) can discover the surface. Per
+    `agentic-first-principle.md` §A2, mounting under `/api/v1/`
+    requires enumeration through the openapi.json discovery channel.
+  - **perf-S1** — `wh_payload.dump()` hoisted to a local `const auto
+    body` once per fire-event site (3 sites in `agent_service_impl.cpp`)
+    rather than dumping per `fire_event` call. Halves the per-response
+    JSON serialise cost on the response-receipt hot path. Subject to
+    the outer-guard fix above so the optimisation does not silence
+    either sink.
+  - **perf-S2** — `offload_targets` table now carries a partial index
+    `idx_offload_targets_enabled WHERE enabled = 1` baked into the v1
+    migration. `fire_event`'s SELECT scans only the index for enabled
+    rows; at N>~50 targets the partial form is materially faster than
+    a full table scan and stays index-resident.
+  - **cpp-S-1** — `~OffloadTargetStore` destructor trade-off documented
+    in the public header (the in-flight detached delivery / SQLite
+    handle close race), so callers know not to assume flush-on-destroy.
+    Mirrors the WebhookStore precedent.
+  - **qe-B1** — `OffloadHarness` in `test_rest_offload_targets.cpp`
+    refactored to use `yuzu::test::TempDbFile` RAII (member declaration
+    order: `db_file` before `store`) so a partially-constructed
+    fixture cleans up the on-disk SQLite + WAL/SHM siblings on any
+    exit path including failed `REQUIRE(store->is_open())`. Closes the
+    qe-B1 leak pattern flagged by quality-engineer in Gate 3.
+  - **qe-S2** — Three `[offload_store][filter]` tests dropped their
+    `sleep_for(150ms)` synchronisation barriers. The filter decision
+    (target_filter / event_types / enabled) runs synchronously inside
+    `fire_event` before any thread is spawned, so the absence-of-delivery
+    assertion is deterministic without sleep. Tightens runtime by ~450ms
+    and removes a CI-runner-pause flake hazard.
+  - **qe-S3** — New test pins `batch_size > 1` accumulator behaviour:
+    fire 2 events into a `batch_size=3` target, verify no dispatch yet,
+    call `flush_all()`, poll `get_deliveries` for up to 5s, assert the
+    single resulting delivery has `event_count == 2` and a body of
+    shape `{"events":[…]}`.
+  - **qe-S6** — New test pins migration v1 outcome: open a fresh
+    on-disk store, query `schema_meta WHERE store='offload_target_store'`,
+    assert `version == 1`. Establishes the migration self-test pattern
+    for future v2+ schema work.
+  - **arch-INFO / capability-map** — `docs/capability-map.md` flips
+    20.7 Response Offloading to ✓ T3, bumps Future progress 32→33,
+    Overall 168→169, and corrects the Domain 20 row from `7|6|0|1`
+    to `7|7|0|0` (the round-2 re-review caught a three-way disagreement
+    between header bar, TOTAL row, and per-domain row that was
+    previously inconsistent).
+  - **doc-S2 (round 2)** — `docs/yaml-dsl-spec.md` `spec.offload`
+    caveat rewritten to remove the inaccurate "parsed and persisted
+    (`offload_spec` column reserved for v5 migration)" claim. The
+    field is preserved verbatim in `yaml_source` only and is not
+    extracted, denormalised, or honoured by the dispatcher in this
+    revision.
+  - **doc-S3 (round 2)** — `spec.offload` now carries the same
+    dashboard-YAML-editor strip caveat that `spec.visualization` and
+    `spec.responseTemplates` carry, plus a stronger "no current
+    runtime effect" warning so an operator authoring the field is not
+    misled into expecting filtering behaviour.
+
+  **Tests (separate from prod for changelog tracking, per
+  `feedback_test_commits.md`):** new `[offload_store][batch]` batch
+  accumulator pinning; new `[offload_store][migration]` v1 schema_meta
+  verification; new `[rest][offload]` 404-on-missing-target deliveries
+  test; harness refactor to `TempDbFile` RAII; sleep removal from
+  three filter tests.
+
+- **Phase 8.3 Response Offloading governance hardening — round 1.**
+  Single-pass fixes for governance Gate 2 BLOCKING and SHOULD items on
+  the Phase 8.3 work below.
+  - **sec-H1** — `auth_credential` now rejected at create-time when it
+    contains any byte `< 0x20`. Closed an outbound-request-smuggling
+    vector where an `Infrastructure:Write` operator could plant a CRLF
+    in a Bearer token to inject a second header (`X-Evil: 1`,
+    `Transfer-Encoding: chunked`) on every outbound POST. Basic and
+    HMAC are CRLF-safe by construction (base64 / hex output) but the
+    guard fires for all auth types as defence-in-depth. Pinned by
+    `[offload_store][security]` test cases against `\r\n`, `\n`-only,
+    `\r`-only, embedded `NUL`, and CRLF in Basic/HMAC paths.
+  - **sec-M2** — Defence-in-depth scheme guard now re-checks `tgt.url`
+    at dispatch time. Create-time guard rejects non-`http(s)` URLs,
+    but a tampered row (manual SQLite write, future update path)
+    would otherwise be dispatched verbatim. Mismatch records an
+    `invalid_scheme` delivery row and refuses to construct the HTTP
+    client.
+  - **sec-M4** — Destructor no longer calls `flush_all()`. Pending
+    buffered events are dropped on shutdown rather than spawning
+    detached worker threads that capture `this` and reach back into
+    `mtx_` / `db_` after the destructor closes the database. Matches
+    the WebhookStore precedent (no flush in dtor); operators that need
+    at-least-once semantics should set `batch_size=1` (immediate
+    dispatch) or build a queue at the receiver.
+  - **sec-M5** — `std::stoll` on the `(\d+)` regex captures in the
+    REST routes now wrapped in a `parse_id_segment()` helper that
+    treats `out_of_range` (21+ digit ids) as 404 rather than letting
+    httplib turn the throw into a 500. New test pins `GET
+    /api/v1/offload-targets/999999999999999999999 → 404`.
+  - **sec-L6** — `?limit=` query param on `/deliveries` clamped to
+    `[1, 1000]` to prevent operator-self-DoS via a billion-row vector
+    allocation. New test pins the clamp.
+  - **sec-L7** — Semaphore acquire/release wrapped in an RAII
+    `SemaGuard` so a `std::bad_alloc` or other exception between
+    acquire and release no longer leaks a delivery slot for the
+    lifetime of the process.
+  - **sec-L8** — `DELETE /api/v1/offload-targets/{id}` 404 path now
+    emits an audit row with `result=denied`, `detail=not_found`. The
+    successful-delete-only emission was a SIEM signal gap — operators
+    fishing for valid offload-target ids leave no trace today.
+  - **sec-INFO9** — Secret-leak paranoia test extended to cover
+    `GET /api/v1/offload-targets/{id}` and
+    `GET /api/v1/offload-targets/{id}/deliveries` in addition to the
+    list endpoint, so a future field-rename leaking the credential
+    via either single-target read fails the test.
+
+  **Docs:**
+  - **doc-B1** — `docs/user-manual/audit-log.md` now lists
+    `offload_target.create` and `offload_target.delete` in the logged
+    actions table with full `target_type` / `target_id` / `detail` /
+    `result` contracts. Result-vocabulary paragraph extended to cite
+    Phase 8.3 explicitly.
+  - **doc-S2** — `docs/yaml-dsl-spec.md` `spec.offload` caveat
+    rewritten. The previous draft claimed the field was "parsed and
+    persisted (`offload_spec` column on `instruction_definitions`
+    reserved for v5 migration)"; no such column exists and no parser
+    extracts the field. Updated to state accurately that the field is
+    preserved verbatim in `yaml_source` only and currently has no
+    runtime effect.
+  - **doc-S3** — `spec.offload` now carries the same dashboard YAML
+    editor strip caveat that `spec.visualization` and
+    `spec.responseTemplates` carry, so an operator authoring the
+    field is not misled into expecting runtime fan-out filtering.
+  - **doc-S4** — `audit-log.md` Event Structure table's `result` field
+    description updated from "success or failure" to
+    "success, denied, or failure" with a pointer to the Result
+    vocabulary section, fixing a stale row that the round-1
+    response-templates work also missed.
+
+- **Phase 8.3 Response Offloading (#255).** Configurable external HTTP
+  endpoints — *offload targets* — that receive a copy of `agent.registered`
+  and `execution.completed` events as they fire. Built around a sibling
+  `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into
+  `AgentServiceImpl` next to the existing webhook fan-out, so every event
+  that fires a webhook also fans out to every enabled target whose
+  `event_types` filter matches.
+  - **Typed auth** — `none`, `bearer`, `basic`, `hmac`. Bearer adds
+    `Authorization: Bearer <token>`; Basic adds
+    `Authorization: Basic <base64(user:pass)>`; HMAC adds
+    `X-Yuzu-Signature: sha256=<hex>` so receivers can share verification
+    code with webhooks. `auth_credential` is persisted but **never**
+    returned by any REST surface (`list()` / `get()` / `get_by_name()`
+    redact; the test harness includes a paranoia assertion that the secret
+    string never appears in any serialised list body).
+  - **Server-side batching** — `batch_size > 1` accumulates events into a
+    per-target buffer and flushes on threshold; flush body is JSON of
+    shape `{"events":[…]}` plus an `X-Yuzu-Event-Count` header. SIEM /
+    data-warehouse receivers that prefer fewer larger requests can set
+    `batch_size = 50–500`; real-time alerting stays on `1`. `flush_all()`
+    drains pending buffers on store destruction.
+  - **Per-instruction filter (DSL)** — `spec.offload.targets: [<name>, …]`
+    in `InstructionDefinition` YAML restricts fan-out to a named subset
+    of targets. The store honours an explicit `target_filter` argument
+    on `fire_event`; the dispatcher does NOT yet extract the filter from
+    the originating definition (tracked as a follow-up so the global
+    fan-out path lands clean first). Documented in
+    `docs/yaml-dsl-spec.md` § `spec.offload`.
+  - **REST** — `GET/POST/DELETE /api/v1/offload-targets`,
+    `GET /api/v1/offload-targets/{id}`,
+    `GET /api/v1/offload-targets/{id}/deliveries`. RBAC:
+    `Infrastructure:Read` for GETs, `Infrastructure:Write` for POST/DELETE.
+    Audit events: `offload_target.create` (success | denied),
+    `offload_target.delete`. Routes are exposed via both
+    `httplib::Server` (production) and `HttpRouteSink` (tests) overloads
+    so the suite dispatches in-process without an acceptor thread (#438).
+  - **URL scheme guard** — only `http://` and `https://` are accepted at
+    create time; `ftp://`, `javascript:`, empty URL all rejected with -1
+    return + warning log + 400 + denied audit. Matches the WebhookStore
+    L12 hardening.
+  - **UNIQUE name + batch_size validation** — duplicate target names and
+    `batch_size < 1` rejected at create time so the dashboard can rely
+    on names as stable references.
+  - **Files:** new `server/core/src/offload_target_store.{hpp,cpp}` and
+    `server/core/src/offload_routes.{hpp,cpp}`; `server/core/src/server.cpp`
+    opens `offload_targets.db`, wires the store into AgentServiceImpl,
+    and registers routes; `server/core/src/agent_service_impl.{hpp,cpp}`
+    fires `agent.registered` and `execution.completed` to the offload
+    store at the same three call sites as webhooks; `docs/roadmap.md`
+    8.3 marked done; `docs/yaml-dsl-spec.md` adds `spec.offload`;
+    `docs/user-manual/rest-api.md` adds the Offload Targets section
+    with auth-header reference and per-event header table.
+
+  **Tests (separate from prod for changelog tracking):** new
+  `tests/unit/server/test_offload_target_store.cpp` (16 cases / 68
+  assertions — store CRUD, URL scheme, UNIQUE name, batch_size
+  validation, secret redaction, base64 RFC 4648 vectors,
+  RFC 4231 HMAC-SHA256 case 2, target_filter exclusion,
+  event_types filter exclusion, disabled-target skip, auth-type
+  string roundtrip with unknown→`None` fallback) and
+  `tests/unit/server/test_rest_offload_targets.cpp` (11 cases — list
+  empty, create 201, secret-redaction-paranoia,
+  GET/:id 200+404, DELETE remove+audit, POST 400 missing fields,
+  POST 400 invalid JSON, POST 400 bad URL scheme + denied audit,
+  403 perm denied, 503 null store, deliveries empty list).
+
 - **Response Templates governance hardening — round 2.** Round-2
   re-review of the round-1 hardening commit caught a BLOCKING and three
   SHOULD regressions that round-1 introduced or left unaddressed:

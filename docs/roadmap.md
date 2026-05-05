@@ -82,7 +82,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 7.20 | [#236](https://github.com/Tr3kkR/Yuzu/issues/236) | MCP Server (Model Context Protocol) Phase 1 | Done |
 | **8** | 8.1 | [#253](https://github.com/Tr3kkR/Yuzu/issues/253) | Response Visualization Engine | **Done** |
 | | 8.2 | [#254](https://github.com/Tr3kkR/Yuzu/issues/254) | Response Templates | **Done** |
-| | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Open |
+| :white_check_mark: | 8.3 | [#255](https://github.com/Tr3kkR/Yuzu/issues/255) | Response Offloading (Data Export Streams) | Done |
 | **9** | 9.1 | [#256](https://github.com/Tr3kkR/Yuzu/issues/256) | Connector Framework (Core) | Open |
 | | 9.2 | [#257](https://github.com/Tr3kkR/Yuzu/issues/257) | Inventory Repository Model | Open |
 | | 9.3 | [#258](https://github.com/Tr3kkR/Yuzu/issues/258) | SCCM / ConfigMgr Connector | Open |
@@ -967,16 +967,19 @@ REST CRUD at `/api/v1/definitions/{id}/response-templates[/{template_id}]`. Filt
 
 **Files:** `server/core/src/response_templates_engine.{hpp,cpp}` (new), `server/core/src/instruction_store.{hpp,cpp}` (column + migration v3), `server/core/src/rest_api_v1.cpp` (5 routes), `server/core/src/dashboard_routes.{hpp,cpp}` (selector + visibility + template-driven sort/filter defaults), `docs/yaml-dsl-spec.md` § `spec.responseTemplates`, `docs/user-manual/instructions.md` § Response Templates, `docs/user-manual/rest-api.md` § Response Templates, `tests/unit/server/test_response_templates_engine.cpp`, `tests/unit/server/test_rest_response_templates.cpp`.
 
-### Issue 8.3: Response Offloading (Data Export Streams)
-**Capability:** 20.7 | **Scope:** Server | **Status:** Open
+### Issue 8.3: Response Offloading (Data Export Streams) :white_check_mark:
+**Capability:** 20.7 | **Scope:** Server | **Status:** Done
+**Depends on:** 8.1
 
-Configure external HTTP endpoints to receive response data in real time:
-- `OffloadTarget` model: URL, auth (bearer/basic/HMAC), event filter, batch size
-- Fire-and-forget delivery on background thread (reuse WebhookStore pattern)
-- Per-instruction override: `spec.offload.target` in YAML
-- REST: `GET/POST/DELETE /api/v1/offload-targets`
+Named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire. Built around a sibling `OffloadTargetStore` SQLite database (`offload_targets.db`) wired into `AgentServiceImpl` next to the existing webhook fan-out, so every event that fires a webhook also fans out to every enabled offload target whose `event_types` filter matches.
 
-**Files:** New `server/core/src/offload_target_store.cpp`, `server/core/src/rest_api_v1.cpp`
+Targets carry typed auth (none / bearer / basic / hmac), a server-side batching threshold (`batch_size > 1` accumulates events into a per-target buffer and flushes on threshold), and a unique `name` so a definition can name a specific subset via `spec.offload.targets` in YAML. `auth_credential` is persisted but never returned by any REST surface (paranoia-double-check assertion in `test_rest_offload_targets.cpp`). Outgoing requests carry `X-Yuzu-Event`, `X-Yuzu-Event-Count`, and (for hmac) `X-Yuzu-Signature: sha256=<hex>` headers — receivers can share verification code with webhooks.
+
+REST: `GET/POST/DELETE /api/v1/offload-targets`, `GET /api/v1/offload-targets/{id}`, `GET /api/v1/offload-targets/{id}/deliveries`. RBAC: `Infrastructure:Read`/`Write`. Audit events: `offload_target.create` (success | denied), `offload_target.delete`.
+
+**Known follow-up:** the dispatcher does not yet extract `spec.offload.targets` from the originating definition — `fire_event(target_filter)` honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through `cmd_execution_ids_ → execution_id → definition_id → InstructionStore` is tracked separately so the global fan-out path lands clean first.
+
+**Files:** `server/core/src/offload_target_store.{hpp,cpp}` (new, migration v1), `server/core/src/offload_routes.{hpp,cpp}` (new), `server/core/src/server.cpp` (DB open + AgentService wiring + route registration), `server/core/src/agent_service_impl.{hpp,cpp}` (`set_offload_target_store` + fire_event at 3 call sites), `docs/yaml-dsl-spec.md` § `spec.offload`, `docs/user-manual/rest-api.md` § Offload Targets, `tests/unit/server/test_offload_target_store.cpp`, `tests/unit/server/test_rest_offload_targets.cpp`.
 
 ---
 
@@ -1756,7 +1759,7 @@ Cross-phase dependencies:
 
 Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:
 
-1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading remains.
+1. **Phase 8** — Visualization & response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in `content/definitions/visualization_demo_set.yaml` and `content/packs/visualization-demo-pack.yaml`. 8.2 Response Templates done. 8.3 Response Offloading done — `offload_targets.db` + REST `/api/v1/offload-targets` + global fan-out wired into `AgentServiceImpl` for `agent.registered` and `execution.completed`. Phase 8 complete.
 2. **Phase 9** — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)
 3. **Phase 10** — Software catalog & license compliance (builds on 9.8 normalization)
 4. **Phase 12** — Remaining agent capabilities (closes capability map to 100%, parallelizable)

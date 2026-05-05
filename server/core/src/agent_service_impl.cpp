@@ -6,6 +6,7 @@
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
+#include "offload_target_store.hpp"
 #include "response_store.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -228,15 +229,27 @@ enrolled:
             "Agent " + info.agent_id() + " (" + info.hostname() + ") enrolled successfully");
     }
 
-    // Fire webhook for agent enrollment
-    if (webhook_store_ && webhook_store_->is_open()) {
+    // Fire webhook + offload for agent enrollment.
+    //
+    // Both sinks receive the same serialised body; we build the JSON +
+    // dump it ONCE (perf-S1) outside either guard so that one sink being
+    // disabled does not silently disable the other (HP-1 / UP-6
+    // regression caught at Gate 4).
+    if ((webhook_store_ && webhook_store_->is_open()) ||
+        (offload_target_store_ && offload_target_store_->is_open())) {
         nlohmann::json payload = {{"event", "agent.registered"},
                                   {"agent_id", info.agent_id()},
                                   {"hostname", info.hostname()},
                                   {"os", info.platform().os()},
                                   {"arch", info.platform().arch()},
                                   {"agent_version", info.agent_version()}};
-        webhook_store_->fire_event("agent.registered", payload.dump());
+        const auto body = payload.dump();
+        if (webhook_store_ && webhook_store_->is_open()) {
+            webhook_store_->fire_event("agent.registered", body);
+        }
+        if (offload_target_store_ && offload_target_store_->is_open()) {
+            offload_target_store_->fire_event("agent.registered", body);
+        }
     }
 
     // Sync agent-reported tags to persistent TagStore
@@ -515,8 +528,11 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
                         " failed: " + err_msg);
             }
 
-            // Fire webhook on execution completion
-            if (webhook_store_ && webhook_store_->is_open()) {
+            // Fire webhook + offload on execution completion. Each sink is
+            // guarded independently — one sink null/closed must not silence
+            // the other (HP-1 / UP-6). Single serialise per response (perf-S1).
+            if ((webhook_store_ && webhook_store_->is_open()) ||
+                (offload_target_store_ && offload_target_store_->is_open())) {
                 nlohmann::json wh_payload = {
                     {"event", "execution.completed"},
                     {"command_id", resp.command_id()},
@@ -526,7 +542,13 @@ AgentServiceImpl::Subscribe(grpc::ServerContext* context,
                 if (resp.has_error()) {
                     wh_payload["error"] = resp.error().message();
                 }
-                webhook_store_->fire_event("execution.completed", wh_payload.dump());
+                const auto body = wh_payload.dump();
+                if (webhook_store_ && webhook_store_->is_open()) {
+                    webhook_store_->fire_event("execution.completed", body);
+                }
+                if (offload_target_store_ && offload_target_store_->is_open()) {
+                    offload_target_store_->fire_event("execution.completed", body);
+                }
             }
 
             // Publish total round-trip and clean up timing maps
@@ -719,7 +741,8 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                     " failed: " + err_msg);
         }
 
-        if (webhook_store_ && webhook_store_->is_open()) {
+        if ((webhook_store_ && webhook_store_->is_open()) ||
+            (offload_target_store_ && offload_target_store_->is_open())) {
             nlohmann::json wh_payload = {
                 {"event", "execution.completed"},
                 {"command_id", resp.command_id()},
@@ -729,7 +752,13 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 wh_payload["error"] = resp.error().message();
             }
-            webhook_store_->fire_event("execution.completed", wh_payload.dump());
+            const auto body = wh_payload.dump();
+            if (webhook_store_ && webhook_store_->is_open()) {
+                webhook_store_->fire_event("execution.completed", body);
+            }
+            if (offload_target_store_ && offload_target_store_->is_open()) {
+                offload_target_store_->fire_event("execution.completed", body);
+            }
         }
 
         // Publish total round-trip and clean up timing maps
