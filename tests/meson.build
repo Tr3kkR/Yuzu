@@ -207,6 +207,8 @@ if build_server
       'unit/server/test_rest_visualization.cpp',
       'unit/server/test_response_templates_engine.cpp',
       'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_offload_target_store.cpp',
+      'unit/server/test_rest_offload_targets.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
