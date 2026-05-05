@@ -143,3 +143,10 @@ __pycache__/
 /scripts/test/perf-histograms.py
 
 .screenshots/
+
+# Local Darwin-native shims for Linux/WSL-only helpers in scripts/.
+# These exist only on macOS dev boxes and replace upstream scripts that
+# refuse to run under zsh or assume Linux toolchain layout (e.g. kerl
+# activation, ss/df flags, /var/lib/docker). Per the Darwin policy in
+# CLAUDE.md the shims are local-only — never tracked.
+/scripts/darwin-activate-erlang.sh
