@@ -879,7 +879,20 @@ std::string AgentServiceImpl::render_row(const std::string& agent_name, const st
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
                                            const std::string& agent_id,
                                            const pb::CommandResponse& resp) {
-    if (!execution_tracker_)
+    // Atomic snapshot — detached gateway-forward worker threads spawned
+    // by ServerImpl::forward_gateway_pending outlive gRPC's Shutdown
+    // drain (those threads are *clients* of the gateway, not server-side
+    // handlers, so Shutdown does not cancel them). Load with acquire so
+    // a concurrent set_execution_tracker(nullptr) at shutdown is safely
+    // observed and we short-circuit rather than dereference a destroyed
+    // ExecutionTracker (governance UAT 2026-05-06 Gate 7 re-review HIGH).
+    // Residual race: the tracker can begin destruction between this load
+    // and the update_agent_status call below; the window is bounded by
+    // ServerImpl's "drain gRPC, null setter, then reset" ordering. A
+    // full fix (in-flight counter or shared_ptr lifetime) is tracked
+    // as a follow-up.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    if (!tracker)
         return;
     std::string execution_id;
     {
@@ -931,7 +944,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     default:
         return;
     }
-    execution_tracker_->update_agent_status(execution_id, s);
+    tracker->update_agent_status(execution_id, s);
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,

@@ -425,9 +425,11 @@ jobs:
           # importable for `meson setup` to pass — embed_content.py
           # hard-fails without it. The runner image should provision
           # python-yaml via MSYS2 pacman, but ensure idempotently here
-          # so a re-baked runner doesn't silently break release.
+          # so a re-baked runner doesn't silently break release. Use
+          # the hash-pinned requirements file so a compromised PyPI
+          # cannot inject a malicious wheel (Gate 7 re-review LOW).
           python -c "import yaml" >/dev/null 2>&1 || \
-            python -m pip install --user pyyaml
+            python -m pip install --user --require-hashes -r requirements-ci.txt
 
       - name: Assert runner disk (>= 45 GB free)
         run: |

@@ -71,7 +71,18 @@ public:
     /// (which the drawer client listens to for live updates without
     /// page reload). nullptr disables the wiring — used by tests that
     /// don't exercise the executions ladder.
-    void set_execution_tracker(ExecutionTracker* tracker) { execution_tracker_ = tracker; }
+    ///
+    /// Stored atomically because `process_gateway_response` is invoked
+    /// from detached `std::thread` workers spawned by `forward_gateway
+    /// _pending` in server.cpp; those threads outlive the gRPC server's
+    /// Shutdown drain (gateway-forward is a *client* of the gateway,
+    /// not a server-side handler). Setting nullptr at shutdown lets
+    /// in-flight forwarders observe the null and short-circuit
+    /// `notify_exec_tracker` instead of dereferencing a destroyed
+    /// `ExecutionTracker` (governance UAT 2026-05-06 Gate 7 re-review).
+    void set_execution_tracker(ExecutionTracker* tracker) {
+        execution_tracker_.store(tracker, std::memory_order_release);
+    }
 
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
@@ -186,7 +197,10 @@ private:
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
-    ExecutionTracker* execution_tracker_{nullptr};
+    /// Atomic — see `set_execution_tracker` doc for why detached
+    /// gateway-forward threads require the lock-free release/acquire
+    /// pair instead of a plain raw pointer.
+    std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
 
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
