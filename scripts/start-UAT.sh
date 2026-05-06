@@ -325,7 +325,23 @@ start_all() {
     kill_stale
 
     # ── Clean UAT state ─────────────────────────────────────────────────
-    rm -rf "$UAT_DIR"
+    #
+    # If a prior run used --as-user, the agent left files owned by that
+    # user (typically _yuzu) under $UAT_DIR. The current user can't `rm`
+    # them. Try plain rm first; on failure, fall back to `sudo -n rm -rf`
+    # which works if the operator's sudo cache is still warm. If both
+    # fail, fall through to mkdir -p which will succeed for the new
+    # subdirectories — the leftover files are mostly harmless (they get
+    # overwritten by this run), and the operator gets a hint to rerun
+    # `sudo -v` if they care about a fully fresh state.
+    if ! rm -rf "$UAT_DIR" 2>/dev/null; then
+        if sudo -n rm -rf "$UAT_DIR" 2>/dev/null; then
+            ok "Cleared $UAT_DIR (had files owned by another user; sudo cleanup)"
+        else
+            warn "Could not fully clear $UAT_DIR (some files owned by another user)"
+            warn "  manual fix: sudo rm -rf $UAT_DIR"
+        fi
+    fi
     mkdir -p "$UAT_DIR/agent-data"
 
     # ── Generate credentials ────────────────────────────────────────────

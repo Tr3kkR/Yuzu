@@ -413,7 +413,12 @@ def run(args: argparse.Namespace) -> int:
     rel_indicates_success = False
     if rel_poll.get("responses"):
         out = rel_poll["responses"][0].get("output", "") or ""
-        if "status|ok" in out:
+        # The release plugin emits `status|released` (or `status|ok`
+        # legacy form, or `status|released|note|...` when /etc/pf.conf
+        # restoration falls back to `pfctl -d`). Match any of these.
+        if ("status|ok" in out
+                or "status|released" in out
+                or "status|disabled" in out):
             rel_indicates_success = True
 
     if not rel_indicates_success:
@@ -469,7 +474,9 @@ def _try_release(client: YuzuClient, result: CeremonyResult, state_dir: Path) ->
             poll = client.poll_response(payload["command_id"], timeout_s=15)
             rel.response = poll
             out = (poll.get("responses") or [{}])[0].get("output", "") or ""
-            rel.ok = "status|ok" in out
+            rel.ok = ("status|ok" in out
+                      or "status|released" in out
+                      or "status|disabled" in out)
         else:
             rel.note = f"emergency release dispatch HTTP {code}"
     except Exception as e:
