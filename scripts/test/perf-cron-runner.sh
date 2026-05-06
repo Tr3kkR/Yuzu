@@ -124,12 +124,15 @@ CAPTURE_START=$(date +%s)
 # start; doing it here gives us a clean log entry.
 echo
 echo "--- pre-flight: stop UAT (if up) ---"
-bash scripts/linux-start-UAT.sh stop 2>&1 || true
+bash scripts/start-UAT.sh stop 2>&1 || true
 sleep 1
 
-LISTENING=$(ss -tnlH 2>/dev/null | awk '{print $4}' | grep -cE ':(8080|50051|50052|50055|50063|8081|9568)$' || true)
-if [[ "$LISTENING" != "0" ]]; then
-    echo "perf-cron-runner: $LISTENING UAT ports still listening after stop — aborting"
+# shellcheck source=scripts/test/_portable.sh
+. "$(dirname "$0")/_portable.sh"
+QUIET_PORTS=(8080 50051 50052 50055 50063 8081 9568)
+STILL_BUSY=$(listening_ports_among "${QUIET_PORTS[@]}")
+if [[ -n "$STILL_BUSY" ]]; then
+    echo "perf-cron-runner: ports still listening after stop ($STILL_BUSY) — aborting"
     exit 3
 fi
 

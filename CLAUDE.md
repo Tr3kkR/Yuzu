@@ -104,12 +104,12 @@ The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Window
 
 ## UAT Environment (Server ↔ Gateway ↔ Agent)
 
-A Linux UAT script at `scripts/linux-start-UAT.sh` stands up the full stack, verifies connectivity, and runs command round-trip tests. Usage:
+A cross-platform UAT script at `scripts/start-UAT.sh` (Linux + macOS) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
 
 ```bash
-bash scripts/linux-start-UAT.sh          # start + verify (6 automated tests)
-bash scripts/linux-start-UAT.sh stop     # kill all
-bash scripts/linux-start-UAT.sh status   # show running processes
+bash scripts/start-UAT.sh          # start + verify (6 automated tests)
+bash scripts/start-UAT.sh stop     # kill all
+bash scripts/start-UAT.sh status   # show running processes
 ```
 
 ### Port assignments

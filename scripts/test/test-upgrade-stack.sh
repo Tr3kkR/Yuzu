@@ -93,6 +93,23 @@ if [[ -z "$RUN_ID" ]]; then
     exit 2
 fi
 
+# Cross-platform helpers (docker_available, ensure_docker_path).
+# shellcheck source=scripts/test/_portable.sh
+. "$HERE/_portable.sh"
+
+# Phase 2 fundamentally needs a working dockerd — every step is docker
+# compose. If docker is missing/down, soft-skip with a SKIP gate row so
+# the rest of /test continues. The skill prompt warns operators on macOS
+# that this happens when OrbStack/Docker Desktop isn't running.
+if ! docker_available; then
+    echo "test-upgrade-stack: docker not reachable — recording SKIP and exiting cleanly" >&2
+    bash "$HERE/test-db-write.sh" gate \
+        --run-id "$RUN_ID" --phase 2 --gate "Upgrade test" \
+        --status SKIP --duration 0 \
+        --notes "docker not available — install/start OrbStack or Docker Desktop" || true
+    exit 0
+fi
+
 # Resolve --old-version default from GitHub's "Latest release" (which excludes
 # prereleases) if the operator didn't pin one. This lets /test track whatever
 # the last published stable tag is rather than an ever-staler hardcoded pin.

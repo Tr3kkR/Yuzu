@@ -77,7 +77,7 @@ Produce an **Operational Readiness Review** with:
 - `deploy/systemd/` — Service definitions
 - `deploy/docker/` — Container configs
 - `deploy/packaging/` — Installer scripts
-- `scripts/linux-start-UAT.sh` — Integration test topology
+- `scripts/start-UAT.sh` — Integration test topology (cross-platform; `linux-start-UAT.sh` is a back-compat shim)
 
 ## Anti-patterns
 - Shipping a feature without observability ("we'll add metrics later")

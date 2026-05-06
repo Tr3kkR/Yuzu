@@ -77,16 +77,20 @@ echo "================================"
 
 if [[ $KEEP_STACK -eq 1 ]]; then
     warn "--keep-stack: leaving compose projects running"
+elif ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    info "docker unavailable — no compose projects to stop"
 else
     info "stopping compose projects matching yuzu-test-${RUN_ID}-*"
     # Collect every container labelled with this run's project prefix.
     # The suffix regex accepts [a-z0-9-]+ so future phase project names
     # like 'yuzu-test-${RUN_ID}-ota-windows' or '-phase7-perf' work.
     # Escape literal dots so they only match com.docker.compose.project,
-    # not com_docker_compose_project or other label drift.
+    # not com_docker_compose_project or other label drift. Use -oE (POSIX
+    # extended) rather than -oP (Perl) so this works with BSD grep on
+    # macOS — the regex uses no Perl-specific features.
     mapfile -t projects_arr < <(
         docker ps -a --format "{{.Labels}}" 2>/dev/null \
-        | grep -oP "com\\.docker\\.compose\\.project=yuzu-test-${RUN_ID}-[a-z0-9-]+" \
+        | grep -oE "com\\.docker\\.compose\\.project=yuzu-test-${RUN_ID}-[a-z0-9-]+" \
         | sort -u | cut -d= -f2 || true
     )
     if [[ ${#projects_arr[@]} -eq 0 ]]; then

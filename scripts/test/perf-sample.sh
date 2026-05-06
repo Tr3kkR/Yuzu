@@ -65,14 +65,14 @@ source "$YUZU_ROOT/scripts/ensure-erlang.sh" 2>/dev/null || true
 # Pre-flight: refuse to start if UAT ports are listening. perf-gate.sh
 # does this per-run too, but checking once up front lets us bail before
 # we burn the first iteration's compile time.
+# shellcheck source=scripts/test/_portable.sh
+. "$YUZU_ROOT/scripts/test/_portable.sh"
 QUIET_PORTS=(8080 50051 50052 50055 50063 8081 9568)
-LISTENING=$(ss -tnlH 2>/dev/null | awk '{print $4}' || true)
 BUSY=()
-for port in "${QUIET_PORTS[@]}"; do
-    if echo "$LISTENING" | grep -qE ":${port}$"; then
-        BUSY+=("$port")
-    fi
-done
+BUSY_CSV=$(listening_ports_among "${QUIET_PORTS[@]}")
+if [[ -n "$BUSY_CSV" ]]; then
+    IFS=',' read -ra BUSY <<< "$BUSY_CSV"
+fi
 if [[ ${#BUSY[@]} -gt 0 ]]; then
     echo "perf-sample: refusing to start — UAT ports listening: ${BUSY[*]}" >&2
     echo "perf-sample: run 'bash scripts/linux-start-UAT.sh stop' first" >&2
