@@ -22,7 +22,63 @@
 #include <string_view>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/wait.h> // WIFEXITED / WEXITSTATUS — interpret popen()'s return value
+#include <unistd.h>   // geteuid() — privilege detection for sudo prefix
+#endif
+
 namespace {
+
+// ── Privilege escalation helper (Unix only) ──────────────────────────────────
+//
+// The agent runs as a dedicated unprivileged account (`_yuzu` on macOS,
+// `yuzu` on Linux — see docs/agent-privilege-model.md). Plugins that need
+// privileged operations shell out via narrow `sudo NOPASSWD` entries
+// installed by scripts/install-agent-user.sh. This helper returns the
+// prefix to glue in front of the binary path.
+//
+//   - When EUID is 0 (test/dev runs that launched the agent as root):
+//     returns "" so we don't have a useless sudo round-trip.
+//   - Otherwise (production / properly-installed dev): returns "sudo -n ".
+//     The `-n` is critical: non-interactive mode makes sudo fail
+//     immediately with a useful error if the sudoers grant is missing,
+//     rather than blocking the daemon waiting on a password prompt
+//     it can't answer.
+//
+// The result is cached on first call — EUID can't change during the
+// agent's lifetime, so this is a const for all practical purposes.
+//
+// Windows takes a different path entirely: the YuzuAgent service account
+// carries SeAssignPrimaryTokenPrivilege + Administrators membership,
+// granted at install time via LsaAddAccountRights. The Windows code
+// blocks below shell out to `netsh` directly — no sudo equivalent.
+
+#ifndef _WIN32
+const char* sudo_prefix() {
+    static const char* prefix = (geteuid() == 0) ? "" : "sudo -n ";
+    return prefix;
+}
+#endif
+
+// Absolute paths to firewall binaries. These MUST match the paths in
+// the sudoers grants — see scripts/install-agent-user.sh
+// generate_sudoers_content(). PATH-injection bypass would be possible
+// with bare names: an attacker who got code execution as the agent
+// could prepend a directory to $PATH containing a malicious `iptables`,
+// and the sudoers entry `/usr/sbin/iptables` would happily run that
+// instead. Absolute paths in the shell-out close that gap.
+//
+// If a future distro ships these binaries somewhere else (`/sbin/iptables`
+// on a few older Linuxes, `/opt/homebrew/sbin/pfctl` on a developer's
+// custom box), update both sides — the constant here AND the sudoers
+// entry generator.
+
+#ifdef __APPLE__
+constexpr const char* kPfctl = "/sbin/pfctl";
+#endif
+#ifdef __linux__
+constexpr const char* kIptables = "/usr/sbin/iptables";
+#endif
 
 // ── Subprocess helpers ───────────────────────────────────────────────────────
 
@@ -272,45 +328,56 @@ std::vector<std::string> win_get_whitelist() {
 
 int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
     int rules_applied = 0;
+    const auto* pfx = sudo_prefix();
 
     // Create the yuzu-quarantine chain (ignore error if it already exists)
-    run_command_rc("iptables -N yuzu-quarantine 2>/dev/null");
+    auto cmd = std::format("{}{} -N yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
     // Flush the chain to start fresh
-    run_command_rc("iptables -F yuzu-quarantine");
+    cmd = std::format("{}{} -F yuzu-quarantine", pfx, kIptables);
+    run_command_rc(cmd.c_str());
 
     // Allow loopback
-    if (run_command_rc("iptables -A yuzu-quarantine -i lo -j ACCEPT") == 0)
+    cmd = std::format("{}{} -A yuzu-quarantine -i lo -j ACCEPT", pfx, kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
-    if (run_command_rc("iptables -A yuzu-quarantine -o lo -j ACCEPT") == 0)
+    cmd = std::format("{}{} -A yuzu-quarantine -o lo -j ACCEPT", pfx, kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
 
     // Allow established/related connections (keeps management connection alive)
-    if (run_command_rc(
-            "iptables -A yuzu-quarantine -m state --state ESTABLISHED,RELATED -j ACCEPT") == 0)
+    cmd = std::format("{}{} -A yuzu-quarantine -m state --state ESTABLISHED,RELATED -j ACCEPT", pfx,
+                      kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
 
     // Allow each whitelisted IP
     for (const auto& ip : whitelist_ips) {
-        auto cmd = std::format("iptables -A yuzu-quarantine -s {} -j ACCEPT", ip);
+        cmd = std::format("{}{} -A yuzu-quarantine -s {} -j ACCEPT", pfx, kIptables, ip);
         if (run_command_rc(cmd.c_str()) == 0)
             ++rules_applied;
 
-        cmd = std::format("iptables -A yuzu-quarantine -d {} -j ACCEPT", ip);
+        cmd = std::format("{}{} -A yuzu-quarantine -d {} -j ACCEPT", pfx, kIptables, ip);
         if (run_command_rc(cmd.c_str()) == 0)
             ++rules_applied;
     }
 
     // Drop everything else
-    if (run_command_rc("iptables -A yuzu-quarantine -j DROP") == 0)
+    cmd = std::format("{}{} -A yuzu-quarantine -j DROP", pfx, kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
 
     // Insert jump to our chain at the top of INPUT and OUTPUT
     // Remove any existing jumps first to avoid duplicates
-    run_command_rc("iptables -D INPUT -j yuzu-quarantine 2>/dev/null");
-    run_command_rc("iptables -D OUTPUT -j yuzu-quarantine 2>/dev/null");
-    if (run_command_rc("iptables -I INPUT 1 -j yuzu-quarantine") == 0)
+    cmd = std::format("{}{} -D INPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
+    cmd = std::format("{}{} -D OUTPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
+    cmd = std::format("{}{} -I INPUT 1 -j yuzu-quarantine", pfx, kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
-    if (run_command_rc("iptables -I OUTPUT 1 -j yuzu-quarantine") == 0)
+    cmd = std::format("{}{} -I OUTPUT 1 -j yuzu-quarantine", pfx, kIptables);
+    if (run_command_rc(cmd.c_str()) == 0)
         ++rules_applied;
 
     ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
@@ -318,25 +385,36 @@ int linux_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
 }
 
 int linux_unquarantine(yuzu::CommandContext& ctx) {
+    const auto* pfx = sudo_prefix();
     // Remove jumps from INPUT and OUTPUT
-    run_command_rc("iptables -D INPUT -j yuzu-quarantine 2>/dev/null");
-    run_command_rc("iptables -D OUTPUT -j yuzu-quarantine 2>/dev/null");
+    auto cmd = std::format("{}{} -D INPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
+    cmd = std::format("{}{} -D OUTPUT -j yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
     // Flush and delete the chain
-    run_command_rc("iptables -F yuzu-quarantine 2>/dev/null");
-    run_command_rc("iptables -X yuzu-quarantine 2>/dev/null");
+    cmd = std::format("{}{} -F yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
+    cmd = std::format("{}{} -X yuzu-quarantine 2>/dev/null", pfx, kIptables);
+    run_command_rc(cmd.c_str());
 
     ctx.write_output("status|released");
     return 0;
 }
 
 bool linux_is_quarantined() {
-    auto output = run_command("iptables -L INPUT -n 2>/dev/null");
+    // -L is a read-only list operation; depending on the distro and kernel
+    // build, iptables will refuse the operation without root even for
+    // listing because /proc/net/ip_tables_names is root-readable. So we
+    // also use sudo for the read path.
+    auto cmd = std::format("{}{} -L INPUT -n 2>/dev/null", sudo_prefix(), kIptables);
+    auto output = run_command(cmd.c_str());
     return output.find("yuzu-quarantine") != std::string::npos;
 }
 
 std::vector<std::string> linux_get_whitelist() {
     std::vector<std::string> ips;
-    auto output = run_command("iptables -L yuzu-quarantine -n 2>/dev/null");
+    auto cmd = std::format("{}{} -L yuzu-quarantine -n 2>/dev/null", sudo_prefix(), kIptables);
+    auto output = run_command(cmd.c_str());
     std::istringstream iss(output);
     std::string line;
 
@@ -388,32 +466,56 @@ std::vector<std::string> linux_get_whitelist() {
 #ifdef __APPLE__
 
 int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips) {
-    int rules_applied = 0;
+    // rules_written counts the lines we hand to pfctl. The actual number
+    // of rules installed in pf is reported back to the operator only if
+    // pfctl's load succeeds (see the rc check after run_command_rc below).
+    // Pre-patch behaviour was to increment this counter unconditionally
+    // and report it as `rules_applied`, which lied about success when
+    // pfctl was rejected (e.g., agent not in sudoers). Now: any load
+    // failure returns `error|...` instead of a falsely-positive count.
+    int rules_written = 0;
+    const auto* pfx = sudo_prefix();
 
     // Build pf anchor rules
     std::string rules;
 
     // Allow loopback
     rules += "pass quick on lo0 all\n";
-    ++rules_applied;
+    ++rules_written;
 
     // Allow whitelisted IPs
     for (const auto& ip : whitelist_ips) {
         rules += std::format("pass quick from {} to any\n", ip);
         rules += std::format("pass quick from any to {}\n", ip);
-        rules_applied += 2;
+        rules_written += 2;
     }
 
     // Block everything else
     rules += "block all\n";
-    ++rules_applied;
+    ++rules_written;
 
-    // Write rules to a temporary file
-    auto tmp_path = std::string{"/tmp/yuzu_quarantine_anchor.conf"};
+    // Write rules to a securely-created temp file. We deliberately avoid
+    // a predictable path like /tmp/yuzu_quarantine_anchor.conf because:
+    //
+    //   - Any local user can pre-create that path as a symlink pointing
+    //     at /etc/pf.conf (or any other root-owned file), and the agent
+    //     would then overwrite it under sudo via `sudo /sbin/pfctl -f`
+    //     after we wrote our content. mkstemp()-based TempFile generates
+    //     an unpredictable suffix and uses O_CREAT|O_EXCL so we can't
+    //     follow a pre-existing symlink.
+    //   - When the agent ran as root the attacker had to be root to
+    //     win the race; once the agent runs as `_yuzu` (per
+    //     docs/agent-privilege-model.md) the bar is just "any local user".
+    //
+    // The TempFile RAII destructor cleans up when the function returns.
+    auto tmp_file_result = yuzu::TempFile::create("yuzu-quarantine-anchor-", ".conf");
+    if (!tmp_file_result) {
+        ctx.write_output("error|failed to create temp file for pf anchor rules");
+        return 1;
+    }
+    auto tmp_file = std::move(*tmp_file_result);
     {
-        auto cmd = std::format("printf '%s' '{}' > {}", rules, tmp_path);
-        // Use a safer write approach
-        FILE* f = fopen(tmp_path.c_str(), "w");
+        FILE* f = fopen(tmp_file.path().c_str(), "w");
         if (f) {
             fputs(rules.c_str(), f);
             fclose(f);
@@ -423,41 +525,69 @@ int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
         }
     }
 
-    // Load the anchor
-    auto cmd = std::format("pfctl -a yuzu-quarantine -f {} 2>/dev/null", tmp_path);
-    run_command_rc(cmd.c_str());
-
-    // Ensure pf is enabled
-    run_command_rc("pfctl -e 2>/dev/null");
-
-    // Add anchor reference to the main ruleset if not present
-    auto pf_conf = run_command("pfctl -s rules 2>/dev/null");
-    if (pf_conf.find("yuzu-quarantine") == std::string::npos) {
-        // Append anchor reference
-        run_command_rc("echo 'anchor \"yuzu-quarantine\"' | pfctl -f - 2>/dev/null");
+    // Load the anchor. We DO NOT swallow stderr here (no `2>/dev/null`)
+    // because that's the channel sudo uses for permission errors —
+    // diagnostic messages we want surfaced. popen()'s read side is stdout
+    // only by default, but `2>&1` would interleave them. We accept the
+    // trade-off of stderr going to the agent's terminal: the load_rc
+    // below is the load-bearing signal, and the response carries the
+    // operator-actionable note.
+    auto cmd = std::format("{}{} -a yuzu-quarantine -f {}", pfx, kPfctl, tmp_file.path());
+    int load_rc = run_command_rc(cmd.c_str());
+    if (load_rc != 0) {
+        // popen(3) returns the wait(2) status — extract the exit code if
+        // it was a normal exit. Most failures here are sudo refusing
+        // (exit 1) or pfctl rejecting the rules file (exit 1 or 255).
+        int exit_code = WIFEXITED(load_rc) ? WEXITSTATUS(load_rc) : load_rc;
+        ctx.write_output(std::format("error|pfctl load failed (rc={}). Likely the agent account "
+                                     "is not in /etc/sudoers.d/yuzu-agent — run "
+                                     "`sudo bash scripts/install-agent-user.sh --check` to verify.",
+                                     exit_code));
+        return 1;
     }
 
-    ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_applied));
+    // Ensure pf is enabled (idempotent — fails harmlessly if already enabled)
+    cmd = std::format("{}{} -e 2>/dev/null", pfx, kPfctl);
+    run_command_rc(cmd.c_str());
+
+    // Add anchor reference to the main ruleset if not present.
+    // The read-side `pfctl -s rules` also needs sudo on a hardened pf
+    // config (some macOS releases require root just to enumerate the
+    // active ruleset), so we wrap it the same way.
+    cmd = std::format("{}{} -s rules 2>/dev/null", pfx, kPfctl);
+    auto pf_conf = run_command(cmd.c_str());
+    if (pf_conf.find("yuzu-quarantine") == std::string::npos) {
+        // Append anchor reference. The pipe sends data to sudo's stdin;
+        // by default sudo passes stdin through to the child, so pfctl
+        // sees our anchor declaration on stdin via `-f -`.
+        cmd = std::format("echo 'anchor \"yuzu-quarantine\"' | {}{} -f - 2>/dev/null", pfx, kPfctl);
+        run_command_rc(cmd.c_str());
+    }
+
+    ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
     return 0;
 }
 
 int macos_unquarantine(yuzu::CommandContext& ctx) {
     // Flush the anchor rules
-    run_command_rc("pfctl -a yuzu-quarantine -F all 2>/dev/null");
+    auto cmd = std::format("{}{} -a yuzu-quarantine -F all 2>/dev/null", sudo_prefix(), kPfctl);
+    run_command_rc(cmd.c_str());
 
     ctx.write_output("status|released");
     return 0;
 }
 
 bool macos_is_quarantined() {
-    auto output = run_command("pfctl -a yuzu-quarantine -s rules 2>/dev/null");
+    auto cmd = std::format("{}{} -a yuzu-quarantine -s rules 2>/dev/null", sudo_prefix(), kPfctl);
+    auto output = run_command(cmd.c_str());
     // If the anchor has rules, quarantine is active
     return !output.empty() && output.find("block") != std::string::npos;
 }
 
 std::vector<std::string> macos_get_whitelist() {
     std::vector<std::string> ips;
-    auto output = run_command("pfctl -a yuzu-quarantine -s rules 2>/dev/null");
+    auto cmd = std::format("{}{} -a yuzu-quarantine -s rules 2>/dev/null", sudo_prefix(), kPfctl);
+    auto output = run_command(cmd.c_str());
     std::istringstream iss(output);
     std::string line;
 
@@ -670,21 +800,29 @@ private:
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__linux__)
-            for (const auto& ip : new_ips) {
-                // Insert before the DROP rule (second-to-last position)
-                auto cmd = std::format("iptables -I yuzu-quarantine -s {} -j ACCEPT", ip);
-                run_command_rc(cmd.c_str());
-                cmd = std::format("iptables -I yuzu-quarantine -d {} -j ACCEPT", ip);
-                run_command_rc(cmd.c_str());
+            {
+                const auto* pfx = sudo_prefix();
+                for (const auto& ip : new_ips) {
+                    // Insert before the DROP rule (second-to-last position)
+                    auto cmd =
+                        std::format("{}{} -I yuzu-quarantine -s {} -j ACCEPT", pfx, kIptables, ip);
+                    run_command_rc(cmd.c_str());
+                    cmd =
+                        std::format("{}{} -I yuzu-quarantine -d {} -j ACCEPT", pfx, kIptables, ip);
+                    run_command_rc(cmd.c_str());
+                }
             }
 #elif defined(__APPLE__)
-            // Re-read current rules and append new ones
-            for (const auto& ip : new_ips) {
-                auto cmd =
-                    std::format("echo 'pass quick from {} to any\npass quick from any to {}' | "
-                                "pfctl -a yuzu-quarantine -f - 2>/dev/null",
-                                ip, ip);
-                run_command_rc(cmd.c_str());
+            {
+                // Re-read current rules and append new ones
+                const auto* pfx = sudo_prefix();
+                for (const auto& ip : new_ips) {
+                    auto cmd =
+                        std::format("echo 'pass quick from {} to any\npass quick from any to {}' | "
+                                    "{}{} -a yuzu-quarantine -f - 2>/dev/null",
+                                    ip, ip, pfx, kPfctl);
+                    run_command_rc(cmd.c_str());
+                }
             }
 #else
             ctx.write_output("error|unsupported platform");
@@ -702,38 +840,53 @@ private:
                 run_command_rc(cmd.c_str());
             }
 #elif defined(__linux__)
-            for (const auto& ip : new_ips) {
-                auto cmd =
-                    std::format("iptables -D yuzu-quarantine -s {} -j ACCEPT 2>/dev/null", ip);
-                run_command_rc(cmd.c_str());
-                cmd = std::format("iptables -D yuzu-quarantine -d {} -j ACCEPT 2>/dev/null", ip);
-                run_command_rc(cmd.c_str());
+            {
+                const auto* pfx = sudo_prefix();
+                for (const auto& ip : new_ips) {
+                    auto cmd = std::format("{}{} -D yuzu-quarantine -s {} -j ACCEPT 2>/dev/null",
+                                           pfx, kIptables, ip);
+                    run_command_rc(cmd.c_str());
+                    cmd = std::format("{}{} -D yuzu-quarantine -d {} -j ACCEPT 2>/dev/null", pfx,
+                                      kIptables, ip);
+                    run_command_rc(cmd.c_str());
+                }
             }
 #elif defined(__APPLE__)
-            // Removing individual pf rules requires rewriting the anchor.
-            // Read current rules, filter out the IPs, and reload.
-            auto current = run_command("pfctl -a yuzu-quarantine -s rules 2>/dev/null");
-            std::string filtered;
-            std::istringstream iss(current);
-            std::string line;
-            while (std::getline(iss, line)) {
-                bool skip = false;
-                for (const auto& ip : new_ips) {
-                    if (line.find(ip) != std::string::npos) {
-                        skip = true;
-                        break;
+            {
+                // Removing individual pf rules requires rewriting the anchor.
+                // Read current rules, filter out the IPs, and reload from a
+                // securely-created temp file (same symlink-attack rationale
+                // as in macos_quarantine — see comment there).
+                const auto* pfx = sudo_prefix();
+                auto cmd = std::format("{}{} -a yuzu-quarantine -s rules 2>/dev/null", pfx, kPfctl);
+                auto current = run_command(cmd.c_str());
+                std::string filtered;
+                std::istringstream iss(current);
+                std::string line;
+                while (std::getline(iss, line)) {
+                    bool skip = false;
+                    for (const auto& ip : new_ips) {
+                        if (line.find(ip) != std::string::npos) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    if (!skip) {
+                        filtered += line + "\n";
                     }
                 }
-                if (!skip) {
-                    filtered += line + "\n";
+                auto tmp_file_result = yuzu::TempFile::create("yuzu-quarantine-anchor-", ".conf");
+                if (tmp_file_result) {
+                    auto tmp_file = std::move(*tmp_file_result);
+                    FILE* f = fopen(tmp_file.path().c_str(), "w");
+                    if (f) {
+                        fputs(filtered.c_str(), f);
+                        fclose(f);
+                        cmd = std::format("{}{} -a yuzu-quarantine -f {} 2>/dev/null", pfx, kPfctl,
+                                          tmp_file.path());
+                        run_command_rc(cmd.c_str());
+                    }
                 }
-            }
-            FILE* f = fopen("/tmp/yuzu_quarantine_anchor.conf", "w");
-            if (f) {
-                fputs(filtered.c_str(), f);
-                fclose(f);
-                run_command_rc(
-                    "pfctl -a yuzu-quarantine -f /tmp/yuzu_quarantine_anchor.conf 2>/dev/null");
             }
 #else
             ctx.write_output("error|unsupported platform");
