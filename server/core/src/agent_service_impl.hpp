@@ -35,6 +35,7 @@ class WebhookStore;
 class OffloadTargetStore;
 class InventoryStore;
 class UpdateRegistry;
+class ExecutionTracker;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -63,6 +64,15 @@ public:
     void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
 
+    /// UAT 2026-05-06 #8: when set, response-receipt paths (Subscribe +
+    /// process_gateway_response) call `update_agent_status` so the
+    /// executions detail drawer's per-agent KPI table populates as
+    /// responses arrive, and the SSE `agent-transition` event fires
+    /// (which the drawer client listens to for live updates without
+    /// page reload). nullptr disables the wiring — used by tests that
+    /// don't exercise the executions ladder.
+    void set_execution_tracker(ExecutionTracker* tracker) { execution_tracker_ = tracker; }
+
     grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
                           pb::RegisterResponse* response) override;
 
@@ -82,12 +92,10 @@ public:
     /// handlers and stamped onto every StoredResponse so the executions
     /// detail drawer can correlate exactly via `query_by_execution`. Empty
     /// `execution_id` removes any existing mapping for this command_id.
-    void record_execution_id(const std::string& command_id,
-                              const std::string& execution_id);
+    void record_execution_id(const std::string& command_id, const std::string& execution_id);
 
     // Process a CommandResponse forwarded from the gateway.
-    void process_gateway_response(const std::string& agent_id,
-                                   const pb::CommandResponse& resp);
+    void process_gateway_response(const std::string& agent_id, const pb::CommandResponse& resp);
 
     // -- Server-rendered SSE row helpers ----------------------------------------
     // Parsing utilities (columns_for_plugin, split_fields, etc.) are in
@@ -95,14 +103,12 @@ public:
     // state remain here.
 
     static std::string thead_for_plugin(const std::string& plugin);
-    static std::string render_row(const std::string& agent_name,
-                                   const std::string& plugin,
-                                   const std::string& line,
-                                   const std::vector<std::string>& col_names);
+    static std::string render_row(const std::string& agent_name, const std::string& plugin,
+                                  const std::string& line,
+                                  const std::vector<std::string>& col_names);
 
-    void publish_output_rows(const std::string& agent_id,
-                              const std::string& plugin,
-                              const std::string& raw_output);
+    void publish_output_rows(const std::string& agent_id, const std::string& plugin,
+                             const std::string& raw_output);
 
     // -- OTA Update RPCs -------------------------------------------------------
 
@@ -180,6 +186,7 @@ private:
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    ExecutionTracker* execution_tracker_{nullptr};
 
     static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
     static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
@@ -190,6 +197,18 @@ private:
                                      const std::vector<std::string>& rhs);
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
+
+    /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
+    /// state change for the given command_id. Resolves command_id →
+    /// execution_id via cmd_execution_ids_ and calls
+    /// `ExecutionTracker::update_agent_status` with a synthesised
+    /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
+    /// No-op if the tracker isn't wired or the command_id has no
+    /// execution mapping (out-of-band dispatch). Each call publishes an
+    /// `agent-transition` SSE event the drawer's client listens to for
+    /// live-updates without a page reload.
+    void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
+                             const pb::CommandResponse& resp);
 };
 
 } // namespace yuzu::server::detail

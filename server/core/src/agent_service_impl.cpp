@@ -3,6 +3,7 @@
 #include <grpc/grpc_security_constants.h>
 
 #include "analytics_event_store.hpp"
+#include "execution_tracker.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -440,6 +441,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                 response_store_->store(sr);
             }
 
+            // UAT 2026-05-06 #8: notify the executions tracker so the
+            // drawer's per-agent KPI table populates and the SSE
+            // `agent-transition` event fires for live updates.
+            notify_exec_tracker(resp.command_id(), agent_id, resp);
+
             if (analytics_store_) {
                 AnalyticsEvent ae;
                 ae.event_type = "command.response";
@@ -500,6 +506,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                     response_store_->store(sr);
                 }
             }
+
+            // UAT 2026-05-06 #8: notify the executions tracker on terminal
+            // status so the drawer's per-agent KPI flips to its terminal
+            // state and the SSE `agent-transition` event fires.
+            notify_exec_tracker(resp.command_id(), agent_id, resp);
 
             std::string status_str =
                 (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -670,6 +681,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             response_store_->store(sr);
         }
 
+        // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
+        notify_exec_tracker(resp.command_id(), agent_id, resp);
+
         if (analytics_store_) {
             AnalyticsEvent ae;
             ae.event_type = "command.response";
@@ -722,6 +736,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 response_store_->store(sr);
             }
         }
+
+        // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
+        notify_exec_tracker(resp.command_id(), agent_id, resp);
 
         std::string status_str = (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
         metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}}).increment();
@@ -845,6 +862,64 @@ std::string AgentServiceImpl::render_row(const std::string& agent_name, const st
     }
     html += "</div></td></tr>";
     return html;
+}
+
+void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
+                                           const std::string& agent_id,
+                                           const pb::CommandResponse& resp) {
+    if (!execution_tracker_)
+        return;
+    std::string execution_id;
+    {
+        std::lock_guard lock(cmd_times_mu_);
+        if (auto eit = cmd_execution_ids_.find(command_id); eit != cmd_execution_ids_.end()) {
+            execution_id = eit->second;
+        }
+    }
+    if (execution_id.empty())
+        return; // out-of-band dispatch, nothing to publish
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+
+    AgentExecStatus s;
+    s.agent_id = agent_id;
+    s.dispatched_at = 0; // upsert keeps prior value if non-zero
+    s.exit_code = resp.exit_code();
+    if (resp.has_error()) {
+        s.error_detail = resp.error().message();
+    }
+    switch (resp.status()) {
+    case pb::CommandResponse::RUNNING:
+        s.status = "running";
+        s.first_response_at = now;
+        s.completed_at = 0;
+        break;
+    case pb::CommandResponse::SUCCESS:
+        s.status = "success";
+        s.first_response_at = now;
+        s.completed_at = now;
+        break;
+    case pb::CommandResponse::FAILURE:
+        s.status = "failure";
+        s.first_response_at = now;
+        s.completed_at = now;
+        break;
+    case pb::CommandResponse::TIMEOUT:
+        s.status = "timeout";
+        s.first_response_at = now;
+        s.completed_at = now;
+        break;
+    case pb::CommandResponse::REJECTED:
+        s.status = "rejected";
+        s.first_response_at = 0;
+        s.completed_at = now;
+        break;
+    default:
+        return;
+    }
+    execution_tracker_->update_agent_status(execution_id, s);
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,
