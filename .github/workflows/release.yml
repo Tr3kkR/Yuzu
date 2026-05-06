@@ -117,9 +117,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-linux-x64"
-          mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
+          mkdir -p "${STAGING}/bin" "${STAGING}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server
+          # at build time — no content/ directory shipped).
           cp build-linux/server/core/yuzu-server "${STAGING}/bin/"
           cp build-linux/agents/core/yuzu-agent "${STAGING}/bin/"
 
@@ -128,9 +129,6 @@ jobs:
 
           # Plugin shared libraries
           find build-linux/agents/plugins -name '*.so' -exec cp {} "${STAGING}/plugins/" \;
-
-          # Content definitions
-          cp content/definitions/*.yaml "${STAGING}/content/definitions/"
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
@@ -526,9 +524,10 @@ jobs:
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
           $staging = "yuzu-${version}-windows-x64"
-          New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins", "${staging}/content/definitions"
+          New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server.exe
+          # at build time — no content/ directory shipped).
           Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"
           Copy-Item "build-windows/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
@@ -543,9 +542,6 @@ jobs:
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
           }
-
-          # Content definitions
-          Copy-Item "content/definitions/*.yaml" "${staging}/content/definitions/"
 
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-windows-x64.zip"
 
@@ -887,9 +883,10 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
           STAGING="yuzu-${VERSION}-macos-arm64"
-          mkdir -p "${STAGING}/bin" "${STAGING}/plugins" "${STAGING}/content/definitions"
+          mkdir -p "${STAGING}/bin" "${STAGING}/plugins"
 
-          # Binaries
+          # Binaries (InstructionDefinitions are embedded into yuzu-server
+          # at build time — no content/ directory shipped).
           cp build-macos/server/core/yuzu-server "${STAGING}/bin/"
           cp build-macos/agents/core/yuzu-agent "${STAGING}/bin/"
 
@@ -898,9 +895,6 @@ jobs:
 
           # Plugin dylibs
           find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
-
-          # Content definitions
-          cp content/definitions/*.yaml "${STAGING}/content/definitions/"
 
           tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
 

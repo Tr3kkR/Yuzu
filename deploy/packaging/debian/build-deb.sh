@@ -35,7 +35,10 @@ mkdir -p "$PKG/usr/lib/systemd/system"
 mkdir -p "$PKG/etc/yuzu"
 mkdir -p "$PKG/var/lib/yuzu"
 mkdir -p "$PKG/var/log/yuzu"
-mkdir -p "$PKG/usr/share/yuzu/content/definitions"
+# InstructionDefinitions are embedded into the server binary at build
+# time (server/core/scripts/embed_content.py); the runtime never reads
+# them from disk. Don't ship the YAMLs alongside the binary — operators
+# would edit them expecting changes to take effect.
 
 # Handle both flat layout (staging) and meson build layout (server/core/)
 if [[ -f "$BIN_DIR/yuzu-server" ]]; then
@@ -46,10 +49,6 @@ else
     echo "ERROR: yuzu-server not found in $BIN_DIR" >&2; exit 1
 fi
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-server.service" "$PKG/usr/lib/systemd/system/"
-
-if [[ -d "$BIN_DIR/content/definitions" ]]; then
-    cp "$BIN_DIR/content/definitions/"*.yaml "$PKG/usr/share/yuzu/content/definitions/" 2>/dev/null || true
-fi
 
 cat > "$PKG/DEBIAN/control" <<EOF
 Package: yuzu-server

@@ -88,7 +88,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown yuzu:yuzu /var/lib/yuzu /var/log/yuzu
 
 COPY --from=builder /src/builddir/server/core/yuzu-server /usr/local/bin/
-COPY --from=builder /src/content/definitions/ /usr/share/yuzu/definitions/
+# InstructionDefinitions are embedded into yuzu-server at build time
+# (server/core/scripts/embed_content.py). No filesystem copy needed.
 
 USER yuzu
 WORKDIR /var/lib/yuzu

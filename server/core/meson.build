@@ -104,11 +104,28 @@ inter_embed = custom_target(
 # upserts them into the instruction store, so charts are populated
 # without operator intervention. Sidesteps yaml-cpp on Windows MSVC
 # (#625) by doing the parse at build time with PyYAML.
+#
+# PyYAML is a hard build dependency: the embedded vector is the only
+# path by which shipped InstructionDefinitions reach the server (no
+# filesystem fallback at runtime), so a missing PyYAML used to silently
+# produce a binary with an empty Instructions tab. Probe at configure
+# time so the failure surfaces here rather than mid-compile.
+embed_python = find_program('python3', 'python')
+_yaml_probe = run_command(embed_python, '-c', 'import yaml', check: false)
+if _yaml_probe.returncode() != 0
+  error(
+    'PyYAML is required to embed shipped InstructionDefinitions but is '
+    + 'not importable from ' + embed_python.full_path() + '. '
+    + 'Install with `pip install pyyaml` (Linux/macOS) or '
+    + '`pacman -S python-yaml` (MSYS2). See CLAUDE.md "Instruction Engine".'
+  )
+endif
+
 content_embed = custom_target(
   'bundled_content',
   output: 'bundled_content.cpp',
   command: [
-    find_program('python3', 'python'),
+    embed_python,
     files('scripts/embed_content.py'),
     meson.project_source_root() / 'content',
     '@OUTPUT@',

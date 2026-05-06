@@ -56,7 +56,8 @@ services:
     volumes:
       - ${UAT_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
-      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+      # InstructionDefinitions are embedded into yuzu-server at build time
+      # (server/core/scripts/embed_content.py); no host mount required.
     depends_on:
       clickhouse:
         condition: service_started

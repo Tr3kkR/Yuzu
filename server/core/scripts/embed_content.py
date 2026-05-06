@@ -29,17 +29,24 @@ import re
 import sys
 from pathlib import Path
 
-# PyYAML graceful fallback: required for content embedding, but missing
-# from a build host the developer hasn't provisioned (e.g. fresh Windows
-# MSYS2) shouldn't hard-fail the entire build. Emit empty bundle arrays
-# and a build-time warning; the server will boot with no auto-imported
-# content rather than failing to compile. (Gate 3 xp-S2.)
+# PyYAML is a hard build dependency. Bundled content is the *only* path
+# by which shipped InstructionDefinitions reach the server's runtime
+# (no filesystem fallback — see CLAUDE.md "Instruction Engine"), so a
+# build host without PyYAML must fail loudly rather than silently
+# producing a binary with zero embedded definitions and an empty
+# Instructions tab. Provisioning: `pip install pyyaml` (Linux/macOS),
+# `pacman -S python-yaml` (MSYS2). The `meson setup` step also probes
+# this so the failure surfaces at configure rather than mid-compile.
 try:
     import yaml  # type: ignore[import-not-found]
-    _YAML_OK = True
 except ImportError:
-    yaml = None  # type: ignore[assignment]
-    _YAML_OK = False
+    print(
+        "ERROR: embed_content.py: PyYAML is required to embed shipped "
+        "InstructionDefinitions. Install it with `pip install pyyaml` "
+        "(Linux/macOS) or `pacman -S python-yaml` (MSYS2).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def to_string_list(v):
@@ -139,78 +146,90 @@ def main() -> int:
     sets_json: list[str] = []
     bad_defs: list[tuple[str, str]] = []  # (path, reason) — fail loudly at build
 
-    if not _YAML_OK:
-        # PyYAML missing on this build host — emit empty bundle so the
-        # translation unit compiles, but warn loudly. Server will boot
-        # with no auto-imported content. (Gate 3 xp-S2.)
+    if not root.is_dir():
         print(
-            "WARNING: PyYAML not installed; bundled content will be empty. "
-            "Install with: pip install pyyaml (or `pacman -S python-yaml` "
-            "on MSYS2). See docs/windows-build.md for the supported path.",
+            f"ERROR: embed_content.py: content root {root} does not exist. "
+            f"The build-time embed is the only source of shipped "
+            f"InstructionDefinitions; an empty bundle would silently ship a "
+            f"binary with no instructions. Did the source tree get cleaned?",
             file=sys.stderr,
         )
-    elif not root.is_dir():
-        # Empty content root (e.g. when running outside the source tree)
-        # is fine: emit an empty bundle so the build still produces a
-        # valid translation unit.
-        pass
-    else:
-        yaml_files = sorted(
-            list((root / "definitions").rglob("*.yaml")) +
-            list((root / "packs").rglob("*.yaml"))
+        return 1
+
+    yaml_files = sorted(
+        list((root / "definitions").rglob("*.yaml")) +
+        list((root / "packs").rglob("*.yaml"))
+    )
+
+    if not yaml_files:
+        print(
+            f"ERROR: embed_content.py: no .yaml files found under "
+            f"{root}/definitions or {root}/packs. Refusing to emit an "
+            f"empty bundle. Restore content/ from git and rebuild.",
+            file=sys.stderr,
         )
-        seen_def_ids: set[str] = set()
-        seen_set_ids: set[str] = set()
+        return 1
 
-        for yf in yaml_files:
-            text = yf.read_text(encoding="utf-8")
-            for doc_text in split_docs(text):
-                try:
-                    doc = yaml.safe_load(doc_text)
-                except yaml.YAMLError as e:
-                    print(f"WARN {yf}: YAML parse error: {e}", file=sys.stderr)
-                    continue
-                if not isinstance(doc, dict):
-                    continue
-                kind = doc.get("kind")
-                if kind == "InstructionDefinition":
-                    env = def_envelope(doc, doc_text)
-                    if env is None:
-                        # Required field missing — capture for fail-loud
-                        # exit at end of pass. Silently skipping at build
-                        # time becomes an unexplained "errored" line at
-                        # operator startup. (Gate 3 QE-S3.)
-                        meta = (doc.get("metadata") or {})
-                        spec = (doc.get("spec") or {})
-                        exec_ = (spec.get("execution") or {})
-                        bad_defs.append((
-                            str(yf),
-                            f"missing required field(s): "
-                            f"id={meta.get('id')!r} "
-                            f"plugin={(exec_.get('plugin') or spec.get('plugin'))!r} "
-                            f"action={(exec_.get('action') or spec.get('action'))!r}",
-                        ))
-                        continue
-                    if env["id"] not in seen_def_ids:
-                        seen_def_ids.add(env["id"])
-                        defs_json.append(json.dumps(env))
-                elif kind == "InstructionSet":
-                    env = set_envelope(doc)
-                    if env and env["id"] not in seen_set_ids:
-                        seen_set_ids.add(env["id"])
-                        sets_json.append(json.dumps(env))
-                # ProductPack and other kinds: skipped here. The pack's
-                # member docs are imported via their own kind dispatch.
+    seen_def_ids: set[str] = set()
+    seen_set_ids: set[str] = set()
 
-        if bad_defs:
-            print(
-                f"ERROR: embed_content.py: {len(bad_defs)} "
-                f"InstructionDefinition doc(s) missing required fields:",
-                file=sys.stderr,
-            )
-            for path, reason in bad_defs:
-                print(f"  {path}: {reason}", file=sys.stderr)
-            return 1
+    for yf in yaml_files:
+        text = yf.read_text(encoding="utf-8")
+        for doc_text in split_docs(text):
+            try:
+                doc = yaml.safe_load(doc_text)
+            except yaml.YAMLError as e:
+                print(f"WARN {yf}: YAML parse error: {e}", file=sys.stderr)
+                continue
+            if not isinstance(doc, dict):
+                continue
+            kind = doc.get("kind")
+            if kind == "InstructionDefinition":
+                env = def_envelope(doc, doc_text)
+                if env is None:
+                    # Required field missing — capture for fail-loud
+                    # exit at end of pass. Silently skipping at build
+                    # time becomes an unexplained "errored" line at
+                    # operator startup. (Gate 3 QE-S3.)
+                    meta = (doc.get("metadata") or {})
+                    spec = (doc.get("spec") or {})
+                    exec_ = (spec.get("execution") or {})
+                    bad_defs.append((
+                        str(yf),
+                        f"missing required field(s): "
+                        f"id={meta.get('id')!r} "
+                        f"plugin={(exec_.get('plugin') or spec.get('plugin'))!r} "
+                        f"action={(exec_.get('action') or spec.get('action'))!r}",
+                    ))
+                    continue
+                if env["id"] not in seen_def_ids:
+                    seen_def_ids.add(env["id"])
+                    defs_json.append(json.dumps(env))
+            elif kind == "InstructionSet":
+                env = set_envelope(doc)
+                if env and env["id"] not in seen_set_ids:
+                    seen_set_ids.add(env["id"])
+                    sets_json.append(json.dumps(env))
+            # ProductPack and other kinds: skipped here. The pack's
+            # member docs are imported via their own kind dispatch.
+
+    if bad_defs:
+        print(
+            f"ERROR: embed_content.py: {len(bad_defs)} "
+            f"InstructionDefinition doc(s) missing required fields:",
+            file=sys.stderr,
+        )
+        for path, reason in bad_defs:
+            print(f"  {path}: {reason}", file=sys.stderr)
+        return 1
+
+    if not defs_json:
+        print(
+            "ERROR: embed_content.py: walked content/ but extracted zero "
+            "InstructionDefinitions. Refusing to emit an empty bundle.",
+            file=sys.stderr,
+        )
+        return 1
 
     # Emit C++. Each JSON string becomes a raw string literal in a
     # std::vector<std::string>. Picking ")BCT(" as the raw-string
