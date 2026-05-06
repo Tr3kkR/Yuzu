@@ -168,6 +168,10 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 - CMake (required by Meson's cmake dependency method)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - [vcpkg](https://github.com/microsoft/vcpkg) with `VCPKG_ROOT` set
+- Python 3 with **PyYAML** (`pip install pyyaml`, or `pacman -S python-yaml`
+  on MSYS2). Required at `meson setup` for the build-time
+  `InstructionDefinition` content embed; meson configure fails fast
+  with a clear error if missing.
 
 ### Quick Start
 

@@ -148,6 +148,39 @@ void ResponseStore::create_tables() {
             }
         }
     }
+    // v3 pre-migration probe (governance UAT 2026-05-06 architect S-1 /
+    // consistency S-2 / unhappy UP-13). Mirrors the v2 pattern above:
+    // a developer who pre-added the `received_at_ms` column on an iterated
+    // build hits SQLITE_ERROR: duplicate column name on the next ALTER,
+    // which the runner treats as migration failure -> db_ = nullptr ->
+    // every response is silently dropped. Probe + stamp avoids the trap.
+    {
+        sqlite3_stmt* probe = nullptr;
+        bool col_exists = false;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM pragma_table_info('responses') "
+                               "WHERE name='received_at_ms' LIMIT 1",
+                               -1, &probe, nullptr) == SQLITE_OK) {
+            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+            sqlite3_finalize(probe);
+        }
+        int current_v = MigrationRunner::current_version(db_, "response_store");
+        if (col_exists && current_v < 3) {
+            sqlite3_stmt* stamp = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "INSERT OR REPLACE INTO schema_meta "
+                                   "(store, version, upgraded_at) VALUES (?, 3, ?)",
+                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp, 2, now);
+                sqlite3_step(stamp);
+                sqlite3_finalize(stamp);
+            }
+        }
+    }
     if (!MigrationRunner::run(db_, "response_store", kMigrations)) {
         spdlog::error("ResponseStore: schema migration failed, closing database");
         sqlite3_close(db_);
@@ -262,13 +295,12 @@ void ResponseStore::store(const StoredResponse& resp) {
     sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
 }
 
-bool ResponseStore::finalize_terminal_status(const std::string& instruction_id,
-                                             const std::string& agent_id, int terminal_status,
-                                             const std::string& error_detail,
-                                             const std::string& execution_id) {
+ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
+    const std::string& instruction_id, const std::string& agent_id, int terminal_status,
+    const std::string& error_detail, const std::string& execution_id) {
     std::unique_lock lock(mtx_);
     if (!db_)
-        return false;
+        return FinalizeResult::Error;
 
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
@@ -280,7 +312,7 @@ bool ResponseStore::finalize_terminal_status(const std::string& instruction_id,
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         spdlog::error("ResponseStore::finalize_terminal_status: prepare failed: {}",
                       sqlite3_errmsg(db_));
-        return false;
+        return FinalizeResult::Error;
     }
     sqlite3_bind_int(stmt, 1, terminal_status);
     sqlite3_bind_text(stmt, 2, error_detail.c_str(), -1, SQLITE_TRANSIENT);
@@ -293,11 +325,16 @@ bool ResponseStore::finalize_terminal_status(const std::string& instruction_id,
     sqlite3_finalize(stmt);
 
     if (rc != SQLITE_DONE) {
-        spdlog::error("ResponseStore::finalize_terminal_status: step failed: {}",
+        // Real SQL error (SQLITE_BUSY, SQLITE_LOCKED, SQLITE_CORRUPT, …).
+        // Distinct from "no row matched" — caller MUST NOT fall through to
+        // insert here because that re-creates the empty-output sentinel
+        // row the UAT-#11 fix removed (governance UAT 2026-05-06 UP-3 /
+        // chaos CH-1).
+        spdlog::error("ResponseStore::finalize_terminal_status: step failed: rc={} err={}", rc,
                       sqlite3_errmsg(db_));
-        return false;
+        return FinalizeResult::Error;
     }
-    return changes > 0;
+    return changes > 0 ? FinalizeResult::Updated : FinalizeResult::NoRow;
 }
 
 std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_id,

@@ -88,6 +88,18 @@ public:
 
     void store(const StoredResponse& resp);
 
+    /// Tri-state outcome of `finalize_terminal_status` so callers can
+    /// distinguish "we updated rows in place" from "no matching RUNNING
+    /// row exists" from "the SQL itself errored". Conflating the latter
+    /// two (bool return) caused UP-3 / chaos CH-1 — under SQLITE_BUSY the
+    /// caller fell through to insert and re-created the empty-output
+    /// sentinel that the original UAT-#11 fix removed.
+    enum class FinalizeResult {
+        Updated, ///< 1+ rows had their status changed; do NOT also insert.
+        NoRow,   ///< 0 rows matched; caller should insert the terminal frame.
+        Error,   ///< SQL prepare/step failed; caller should log, NOT insert.
+    };
+
     /// Update existing RUNNING `responses` rows' status when a terminal
     /// CommandResponse frame (SUCCESS / FAILURE / TIMEOUT / REJECTED)
     /// arrives carrying no output — the data already lives in the prior
@@ -101,13 +113,10 @@ public:
     /// command_ids (retry under a new execution row) don't fold a
     /// terminal frame back onto rows tagged with the old execution_id.
     /// Empty execution_id matches empty (legacy / out-of-band callers).
-    ///
-    /// Returns true if at least one row was updated, false if no matching
-    /// row exists — caller should fall back to `store()` in that case so
-    /// a terminal frame from a no-output command is still recorded.
-    bool finalize_terminal_status(const std::string& instruction_id, const std::string& agent_id,
-                                  int terminal_status, const std::string& error_detail,
-                                  const std::string& execution_id);
+    FinalizeResult finalize_terminal_status(const std::string& instruction_id,
+                                            const std::string& agent_id, int terminal_status,
+                                            const std::string& error_detail,
+                                            const std::string& execution_id);
     std::vector<StoredResponse> query(const std::string& instruction_id,
                                       const ResponseQuery& q = {}) const;
     /// Exact-correlation lookup keyed on the new `execution_id` column

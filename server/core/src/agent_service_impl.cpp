@@ -486,13 +486,19 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // Persisting an empty-output row whose status enum reads
                 // to operators as a failure exit code was the cause of
                 // the spurious "exit=1 then exit=0" pair (UAT 2026-05-06).
-                bool finalized = false;
+                //
+                // Governance UAT 2026-05-06 UP-3 / chaos CH-1: the result
+                // is tri-state. Only NoRow falls through to insert; an
+                // Error (SQLITE_BUSY etc.) must NOT insert because that
+                // re-creates the duplicate-row bug the fix removed.
+                using FR = ::yuzu::server::ResponseStore::FinalizeResult;
+                FR finalize_result = FR::NoRow;
                 if (resp.output().empty()) {
-                    finalized = response_store_->finalize_terminal_status(
+                    finalize_result = response_store_->finalize_terminal_status(
                         resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
                         current_exec);
                 }
-                if (!finalized) {
+                if (finalize_result == FR::NoRow) {
                     // No prior RUNNING row (terminal-only command) or the
                     // terminal frame carries output — insert as before.
                     StoredResponse sr;
@@ -505,6 +511,9 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.execution_id = current_exec;
                     response_store_->store(sr);
                 }
+                // FR::Updated → row already updated in place, no insert.
+                // FR::Error → already logged inside the store; do NOT
+                //             insert — would re-create the sentinel.
             }
 
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
@@ -717,14 +726,16 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
             // Terminal frame with no output: update existing RUNNING row(s)
             // instead of inserting a separate empty-output sentinel that
-            // operators misread as a failure (UAT 2026-05-06).
-            bool finalized = false;
+            // operators misread as a failure (UAT 2026-05-06). Tri-state
+            // result handling per UP-3 / chaos CH-1.
+            using FR = ::yuzu::server::ResponseStore::FinalizeResult;
+            FR finalize_result = FR::NoRow;
             if (resp.output().empty()) {
-                finalized = response_store_->finalize_terminal_status(
+                finalize_result = response_store_->finalize_terminal_status(
                     resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
                     current_exec);
             }
-            if (!finalized) {
+            if (finalize_result == FR::NoRow) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
@@ -735,6 +746,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 sr.execution_id = current_exec;
                 response_store_->store(sr);
             }
+            // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.

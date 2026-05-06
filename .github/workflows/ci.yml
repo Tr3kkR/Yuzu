@@ -421,6 +421,13 @@ jobs:
           done
           meson --version
           ccache --version | head -1
+          # Governance UAT 2026-05-06 build-ci B-2: PyYAML must be
+          # importable for `meson setup` to pass — embed_content.py
+          # hard-fails without it. The runner image should provision
+          # python-yaml via MSYS2 pacman, but ensure idempotently here
+          # so a re-baked runner doesn't silently break release.
+          python -c "import yaml" >/dev/null 2>&1 || \
+            python -m pip install --user pyyaml
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
@@ -566,6 +573,9 @@ jobs:
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
+          # Governance UAT 2026-05-06 build-ci B-1: PyYAML hard-required
+          # at meson configure time for the content embed.
+          pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
       # Split restore + always-save: `save-always: true` is deprecated and
       # documented as "does not work as intended" by the actions/cache

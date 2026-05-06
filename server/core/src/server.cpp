@@ -1121,8 +1121,33 @@ public:
             offload_target_store_->flush_all();
         }
 
-        // Release Phase 2 components before closing shared DB
-        // Release Phase 2 components before closing shared DB (RAII handles close)
+        // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
+        // ManagementService streams drain before we drop the stores they
+        // reference. Without a deadline, Shutdown() waits indefinitely for
+        // all RPCs to finish, and the Subscribe RPC is a long-lived
+        // bidirectional stream that never completes on its own. With a
+        // deadline, RPCs are forcibly cancelled at expiry.
+        //
+        // Governance round (UAT 2026-05-06 architect Gate 3 B-1):
+        // AgentServiceImpl borrows execution_tracker_ via a raw pointer
+        // (set_execution_tracker), and Subscribe/process_gateway_response
+        // call notify_exec_tracker -> update_agent_status on every
+        // CommandResponse frame. Resetting execution_tracker_ before the
+        // gRPC drain race-windowed a use-after-free during graceful
+        // shutdown. Drain producers first, null the borrowed pointer
+        // explicitly, then release the tracker.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        if (agent_server_)
+            agent_server_->Shutdown(deadline);
+        if (mgmt_server_)
+            mgmt_server_->Shutdown(deadline);
+
+        // Now safe: gRPC streams have either completed or been cancelled,
+        // so no thread is inside notify_exec_tracker holding the borrowed
+        // pointer. Null it before reset for belt-and-braces.
+        agent_service_.set_execution_tracker(nullptr);
+
+        // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
         // but in the explicit reset path we drop the tracker first
@@ -1131,16 +1156,6 @@ public:
         approval_manager_.reset();
         schedule_engine_.reset();
         instr_db_pool_.reset();
-
-        // Shutdown with a deadline — without one, Shutdown() waits
-        // indefinitely for all RPCs to finish.  The Subscribe RPC is a
-        // long-lived bidirectional stream that never completes on its own,
-        // so a bare Shutdown() hangs forever.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
     }
 
 private:
@@ -1996,6 +2011,17 @@ private:
                 // would silently no-op all offload deliveries while the
                 // probe reported "ready" (HC-1 gap from Gate 6 SRE).
                 {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
+                // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
+                // load-bearing in this batch — AgentServiceImpl's
+                // notify_exec_tracker calls update_agent_status on every
+                // CommandResponse frame. The tracker has no is_open() of
+                // its own; it shares the instructions DB pool. We probe
+                // the pointer (nullptr means the pool failed to construct)
+                // AND the underlying instr_db_pool_ explicitly, so a
+                // pool-open failure surfaces as /readyz=503 rather than a
+                // silent no-op on every response.
+                {"execution_tracker",
+                 execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
             };
 
             std::string failed_list;

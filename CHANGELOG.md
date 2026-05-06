@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**
+  `ExecutionTracker::update_agent_status` wrote to `agent_exec_status`
+  and published `agent-transition` SSE events but never invoked
+  `refresh_counts` to recompute the parent `executions` row's
+  `agents_responded` / `agents_success` / `agents_failure`. The aggregates
+  stayed at 0 forever and the row never crossed to terminal status.
+  `update_agent_status` now chains `refresh_counts` at the end of every
+  call (UAT 2026-05-06).
+- **Executions drawer: per-agent + responses tables now live-populate
+  via SSE — no page reload.** AgentServiceImpl now calls
+  `ExecutionTracker::update_agent_status` from every response-receipt
+  site (`Subscribe` and `process_gateway_response`, both RUNNING and
+  terminal branches), so `agent_exec_status` populates as responses
+  arrive and the existing `agent-transition` SSE bus fires for every
+  state change. The drawer JS schedules a 500 ms-debounced
+  `htmx.ajax(GET /fragments/executions/<id>/detail)` re-fetch on each
+  event so the responses table picks up new rows without a manual
+  refresh (UAT 2026-05-06).
+- **Executions drawer: spurious "exit=1 then exit=0" pair removed.**
+  Every dispatched instruction previously produced two response rows
+  per agent — a RUNNING data row and an empty terminal sentinel.
+  Operators read the non-zero `status` enum value (1=SUCCESS,
+  2=FAILURE, …) on the sentinel as a failure exit code that "happened
+  before" the real result. New `ResponseStore::finalize_terminal_status`
+  updates existing RUNNING rows in place when the terminal frame
+  carries no output, scoped to `(instruction_id, agent_id,
+  execution_id, status=0)`. Tri-state `FinalizeResult`
+  (`Updated`/`NoRow`/`Error`) prevents SQLITE_BUSY from silently
+  re-creating the sentinel (UAT 2026-05-06 #11; governance UP-3 / CH-1).
+
+### Added
+
+- **Wall-clock `HH:MM:SS.mmm <TZ>` timestamps in the executions list
+  and drawer.** Right-hand instruction-line timestamp and per-agent
+  response arrival time now render in the operator's browser-local
+  timezone (e.g. `12:22:33.251 BST`) instead of a relative
+  "Ns ago" string. Server emits `data-epoch-ms` on the cells; new JS
+  helpers (`formatLocalTime` + `renderLocalTimes`) format on
+  `DOMContentLoaded` and `htmx:afterSwap`. Title attribute and cell
+  fallback retain the ISO-8601 UTC timestamp for hover correlation
+  and no-JS environments (UAT 2026-05-06 #9).
+- **Server-side response arrival timestamp at millisecond precision.**
+  New `responses.received_at_ms` column (response_store v3 migration,
+  with idempotent pre-stamp probe mirroring v2) records when the
+  server received each response frame. Coexists with the legacy
+  seconds-precision `timestamp` column. The drawer's per-agent
+  responses table gained a "Time" column that renders this value as
+  wall-clock (UAT 2026-05-06 #10).
+- **Live-drawer regression test.** New
+  `tests/puppeteer/executions-uat-2026-05-06.mjs` operator-runnable
+  test pins the four UAT contracts: dispatch toast, drawer
+  populates without reload, wall-clock timestamps, single response
+  row per agent.
+- **`/readyz` covers `execution_tracker`.** Added to the readiness
+  conjunction so a failed instructions-DB pool surfaces as HTTP 503
+  rather than a silent no-op on every response receipt
+  (governance UAT 2026-05-06 SRE-1).
+
+### Changed
+
+- **Build-time content embed locked down — single source of truth.**
+  Shipped `InstructionDefinition` YAMLs are embedded into
+  `yuzu-server` at build time via `embed_content.py`; the runtime
+  never reads them from disk. **PyYAML is now a hard build dependency**
+  — `meson setup` runs `python -c "import yaml"` and `error()`s if
+  the import fails. The script itself hard-errors on missing
+  PyYAML, missing `content/` directory, or zero parsed definitions
+  (the historical "warn and emit empty bundle" fallback is removed,
+  which silently produced binaries with empty Instructions tabs).
+  Provision PyYAML with `pip install pyyaml` (Linux/macOS) or
+  `pacman -S python-yaml` (MSYS2). CI workflows updated to install
+  PyYAML on every leg (release Linux + macOS, ci.yml macOS +
+  Windows, `Dockerfile.runner-linux` apt manifest).
+- **Executions drawer SSE event volume.** Each per-agent state
+  change now publishes 2 events (`agent-transition` then
+  `execution-progress`) and 3 on the all-agents-responded threshold
+  (additional `execution-completed`). Custom SSE consumers should
+  expect the higher cadence; the drawer's debounced refresh is the
+  default consumer experience.
+- **Shutdown ordering.** gRPC servers now shut down BEFORE
+  `execution_tracker_` is reset so in-flight `Subscribe` /
+  `process_gateway_response` handlers cannot dereference a freed
+  tracker pointer mid-call (governance UAT 2026-05-06 architect B-1).
+
+### Removed
+
+- **Install packages no longer ship `content/definitions/`.** The
+  Debian `.deb`, Docker images (`Dockerfile.server`,
+  `Dockerfile.server-local`), Docker compose UAT mounts, Windows
+  Inno Setup `[Files]` block, and three release-archive staging
+  blocks (Linux/Windows/macOS) used to copy YAMLs to filesystem
+  paths the binary ignored — operator-misleading dead code. The
+  paths varied between packages
+  (`/usr/share/yuzu/content/definitions/` on .deb,
+  `/usr/share/yuzu/definitions/` on Docker, `{app}\content\definitions\`
+  on Windows). Operator runbooks pointing at any of those paths for
+  edits are obsolete; use the dashboard / REST `PATCH
+  /api/v1/definitions/<id>` to override shipped definitions
+  (operator edits persist in `instructions.db`). Old YAMLs left
+  on disk from prior installs are harmless and untouched on
+  upgrade.
+- **`docs/operations/disaster-recovery.md`** content-definitions
+  backup row removed — it pointed at filesystem YAMLs that no longer
+  ship; operator-customised definitions are already covered by the
+  `instructions.db` row.
+
 ### Added
 
 - **Cross-platform `/test` pipeline (Linux + macOS).** The `/test`

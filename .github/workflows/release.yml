@@ -66,6 +66,18 @@ jobs:
             exit 1
           fi
 
+      - name: Install Python build deps (PyYAML for content embed)
+        # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+        # configure-time dependency for the bundled-content embed
+        # (server/core/scripts/embed_content.py). meson setup fails
+        # with error() if `import yaml` returns non-zero. Without an
+        # explicit install step, this self-hosted runner relied on
+        # CI-job pip-bleed-over (ci.yml installs requirements-ci to
+        # ~/.local on the same runner). A runner re-bake would break
+        # release. Install explicitly and hash-pinned.
+        run: |
+          pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
+
       - name: Clean stale build directory (preserve vcpkg_installed)
         run: rm -rf build-linux
 
@@ -700,6 +712,12 @@ jobs:
           # awk strips the trailing ` \` that pip-compile adds when the
           # requirement is continued by `--hash=...` lines.
           pipx install "$(awk '/^meson==/ {print $1}' requirements-ci.txt)"
+          # Governance UAT 2026-05-06 build-ci B-1: PyYAML is a hard
+          # configure-time dependency for the bundled-content embed
+          # (server/core/scripts/embed_content.py). meson setup fails
+          # with error() if `import yaml` returns non-zero. Install via
+          # the same hash-pinned requirements file used elsewhere.
+          pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
       - name: Cache ccache
         # Restore-only: release builds consume cache, never produce.
