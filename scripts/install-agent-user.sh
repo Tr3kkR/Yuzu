@@ -229,33 +229,96 @@ macos_user_exists() {
     dscl . -read "/Users/$ACCOUNT_NAME" >/dev/null 2>&1
 }
 
-macos_create_user() {
-    # Pick the first free UID in the system range (200-400). dscl returns
-    # all UIDs; we sort numerically, find the first free one >= 200.
-    local next_uid
-    next_uid=$(dscl . -list /Users UniqueID 2>/dev/null \
-        | awk '{print $2}' \
-        | sort -n \
-        | awk 'BEGIN{u=200} $1==u{u++} END{print u}')
+macos_group_exists() {
+    dscl . -read "/Groups/$ACCOUNT_NAME" >/dev/null 2>&1
+}
 
-    log "creating macOS user $ACCOUNT_NAME (UID/GID=$next_uid, hidden, no shell)"
-    run dscl . -create "/Users/$ACCOUNT_NAME"
-    run dscl . -create "/Users/$ACCOUNT_NAME" UserShell /usr/bin/false
-    run dscl . -create "/Users/$ACCOUNT_NAME" RealName "Yuzu Agent Daemon"
-    run dscl . -create "/Users/$ACCOUNT_NAME" UniqueID "$next_uid"
-    run dscl . -create "/Users/$ACCOUNT_NAME" PrimaryGroupID "$next_uid"
-    run dscl . -create "/Users/$ACCOUNT_NAME" NFSHomeDirectory /var/empty
-    run dscl . -create "/Users/$ACCOUNT_NAME" Password "*"
-    # Hide from the login window's user picker (cosmetic but expected).
-    run dscl . -create "/Users/$ACCOUNT_NAME" IsHidden 1
+# Pick an ID >= 200 that is free in BOTH the user and group namespaces.
+# macOS user UIDs and group GIDs are independent number spaces — Apple
+# ships `_guest` at GID 201 and `_yuzu` at no UID, so naively assuming
+# UID==GID lands on a collision. We scan both lists and find the first
+# integer that's used by neither, so the resulting account has matching
+# UID and GID for ergonomic consistency with the Linux convention.
+macos_pick_free_id() {
+    {
+        dscl . -list /Users UniqueID 2>/dev/null | awk '{print $2}'
+        dscl . -list /Groups PrimaryGroupID 2>/dev/null | awk '{print $2}'
+    } \
+        | sort -un \
+        | awk 'BEGIN{u=200} $1==u{u++} END{print u}'
+}
+
+macos_create_user() {
+    local user_exists group_exists
+    macos_user_exists && user_exists=1 || user_exists=0
+    macos_group_exists && group_exists=1 || group_exists=0
+
+    # If both records are present AND the user's PrimaryGroupID actually
+    # resolves to the `_yuzu` group (not, say, `_guest` because a prior
+    # collision left the user's PGID pointing somewhere else), skip the
+    # whole sequence. Otherwise fall through to the repair path below.
+    if [[ "$user_exists" -eq 1 && "$group_exists" -eq 1 ]]; then
+        local user_pgid group_pgid
+        user_pgid=$(dscl . -read "/Users/$ACCOUNT_NAME" PrimaryGroupID 2>/dev/null \
+                        | awk '/PrimaryGroupID:/ {print $2}')
+        group_pgid=$(dscl . -read "/Groups/$ACCOUNT_NAME" PrimaryGroupID 2>/dev/null \
+                         | awk '/PrimaryGroupID:/ {print $2}')
+        if [[ -n "$user_pgid" && -n "$group_pgid" && "$user_pgid" == "$group_pgid" ]]; then
+            log "user and group $ACCOUNT_NAME already consistent (gid=$user_pgid) — skipping"
+            return 0
+        fi
+        log "user and group $ACCOUNT_NAME exist but inconsistent " \
+            "(user pgid='${user_pgid:-<missing>}', group pgid='${group_pgid:-<missing>}') — repairing"
+    fi
+
+    local next_id
+    next_id=$(macos_pick_free_id)
+    log "selected ID $next_id (free in both /Users UniqueID and /Groups PrimaryGroupID)"
+
+    if [[ "$user_exists" -eq 0 ]]; then
+        log "creating macOS user $ACCOUNT_NAME (UID=$next_id, hidden, no shell)"
+        run dscl . -create "/Users/$ACCOUNT_NAME"
+        run dscl . -create "/Users/$ACCOUNT_NAME" UserShell /usr/bin/false
+        run dscl . -create "/Users/$ACCOUNT_NAME" RealName "Yuzu Agent Daemon"
+        run dscl . -create "/Users/$ACCOUNT_NAME" UniqueID "$next_id"
+        run dscl . -create "/Users/$ACCOUNT_NAME" PrimaryGroupID "$next_id"
+        run dscl . -create "/Users/$ACCOUNT_NAME" NFSHomeDirectory /var/empty
+        run dscl . -create "/Users/$ACCOUNT_NAME" Password "*"
+        # Hide from the login window's user picker (cosmetic but expected).
+        run dscl . -create "/Users/$ACCOUNT_NAME" IsHidden 1
+    else
+        log "user $ACCOUNT_NAME exists — repointing PrimaryGroupID to $next_id"
+        # Self-heal a partial install where the user record exists but
+        # its PrimaryGroupID points at someone else's GID (commonly
+        # `_guest` if a prior run grabbed UID 201 without checking the
+        # group namespace).
+        run dscl . -create "/Users/$ACCOUNT_NAME" PrimaryGroupID "$next_id"
+    fi
 
     # Matching group entry. Without it, anything that maps gid → name
-    # (ls -l, `ps`, etc.) prints the bare GID instead of "_yuzu".
-    log "creating macOS group $ACCOUNT_NAME (GID=$next_uid)"
-    run dscl . -create "/Groups/$ACCOUNT_NAME"
-    run dscl . -create "/Groups/$ACCOUNT_NAME" PrimaryGroupID "$next_uid"
-    run dscl . -create "/Groups/$ACCOUNT_NAME" Password "*"
-    run dscl . -create "/Groups/$ACCOUNT_NAME" RealName "Yuzu Agent Daemon"
+    # (ls -l, `ps`, install -g) prints the bare GID instead of `_yuzu` —
+    # or, worse, fails outright with "unknown group".
+    if [[ "$group_exists" -eq 0 ]]; then
+        log "creating macOS group $ACCOUNT_NAME (GID=$next_id)"
+        run dscl . -create "/Groups/$ACCOUNT_NAME"
+        run dscl . -create "/Groups/$ACCOUNT_NAME" PrimaryGroupID "$next_id"
+        run dscl . -create "/Groups/$ACCOUNT_NAME" Password "*"
+        run dscl . -create "/Groups/$ACCOUNT_NAME" RealName "Yuzu Agent Daemon"
+    else
+        log "group $ACCOUNT_NAME exists — repairing PrimaryGroupID to $next_id"
+        # Self-heal a partial install where the group record was created
+        # but its PrimaryGroupID couldn't be set (e.g., earlier dscl
+        # collision on the chosen GID). Without a PrimaryGroupID, the
+        # group is invisible to getgrnam() and `install -g` fails.
+        run dscl . -create "/Groups/$ACCOUNT_NAME" PrimaryGroupID "$next_id"
+    fi
+
+    # Flush the Directory Services cache so getpwnam() / getgrnam() see
+    # the new records immediately. Without this, the very next `install
+    # -o _yuzu -g _yuzu` call after group creation fails with
+    # "install: unknown group _yuzu" because the cache hasn't picked
+    # up the new dscl record yet. dscacheutil is idempotent and harmless.
+    run dscacheutil -flushcache
 }
 
 macos_delete_user() {
@@ -460,8 +523,19 @@ install_sudoers() {
         fi
     fi
 
-    log "installing $tmp -> $target (mode 0440, root:root)"
-    run install -m 0440 -o root -g root "$tmp" "$target"
+    # macOS uses `wheel` (GID 0) as root's primary group; there is no
+    # group named `root` on Darwin. Linux uses `root:root`. The sudoers
+    # file must end up owner=root:wheel on macOS, owner=root:root on
+    # Linux — without the right ownership sudo refuses to load it.
+    local root_group
+    if [[ "$PLATFORM" == "macos" ]]; then
+        root_group="wheel"
+    else
+        root_group="root"
+    fi
+
+    log "installing $tmp -> $target (mode 0440, root:$root_group)"
+    run install -m 0440 -o root -g "$root_group" "$tmp" "$target"
 }
 
 remove_sudoers() {
@@ -536,12 +610,25 @@ check_install() {
     done
 
     # 3. sudoers file is present and valid
+    #
+    # The file is installed mode 0440 root:<wheel|root>, so a non-root
+    # user can't read it (correct — sudoers files MUST refuse access
+    # below their group, sudo refuses to load them otherwise). When we
+    # invoke visudo -cf without read access, it returns non-zero with
+    # EACCES — that's NOT a validation failure, it's a permissions
+    # condition this user can't resolve here. Detect explicitly and
+    # report a SKIP-with-instructions instead of a misleading FAIL.
     if [[ "$SKIP_SUDOERS" -eq 0 ]]; then
         if [[ ! -f /etc/sudoers.d/yuzu-agent ]]; then
             warn "/etc/sudoers.d/yuzu-agent is missing"; ((errs++))
+        elif [[ ! -r /etc/sudoers.d/yuzu-agent ]]; then
+            log "/etc/sudoers.d/yuzu-agent present but not readable by $(id -un)"
+            log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate)"
         else
             if ! visudo -cf /etc/sudoers.d/yuzu-agent >/dev/null 2>&1; then
                 warn "/etc/sudoers.d/yuzu-agent fails visudo validation"; ((errs++))
+            else
+                log "/etc/sudoers.d/yuzu-agent present and visudo-valid"
             fi
         fi
     fi
@@ -574,12 +661,18 @@ case "$ACTION" in
     install)
         require_root
         log "installing Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
+        # macos_create_user / linux_create_user are themselves idempotent —
+        # they probe existing state, create what's missing, repair what's
+        # broken. Don't short-circuit here (we used to, which meant a
+        # half-installed account couldn't be self-healed by re-running).
         if [[ "$PLATFORM" == "macos" ]]; then
-            macos_user_exists && log "user $ACCOUNT_NAME already exists — skipping create" \
-                              || macos_create_user
+            macos_create_user
         else
-            linux_user_exists && log "user $ACCOUNT_NAME already exists — skipping create" \
-                              || linux_create_user
+            if linux_user_exists; then
+                log "user $ACCOUNT_NAME already exists — skipping create"
+            else
+                linux_create_user
+            fi
         fi
         create_state_dirs
         install_sudoers
