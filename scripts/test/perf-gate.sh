@@ -47,6 +47,14 @@
 
 set -uo pipefail
 
+# Bash 4+ required: `declare -A` is used for the metric→value map below.
+# macOS /bin/bash is 3.2; `#!/usr/bin/env bash` picks up Homebrew bash 5.
+# Fail loudly with a recovery hint rather than a parse error mid-script.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "perf-gate needs bash 4+ (got $BASH_VERSION) — install GNU bash via brew or apt" >&2
+    exit 2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
@@ -192,7 +200,7 @@ if [[ "$ALLOW_BUSY" == "0" ]]; then
         cat <<EOF | tee -a "$GATE_LOG" >&2
 perf-gate: refusing to run — UAT stack appears to be up (ports: $BUSY_PORTS)
   Perf measurements are too sensitive to CPU/scheduler contention to coexist
-  with a running stack. Run \`bash scripts/linux-start-UAT.sh stop\` first,
+  with a running stack. Run \`bash scripts/start-UAT.sh stop\` first,
   or pass --allow-busy if you understand the numbers will be contended.
 EOF
         write_gate FAIL 0 "refused: UAT ports listening ($BUSY_PORTS)"

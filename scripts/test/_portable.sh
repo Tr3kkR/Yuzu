@@ -78,11 +78,14 @@ listening_ports_among() {
 # disk_free_gb <path> — print integer GB free at $path, or empty string
 # if the path doesn't exist or df fails. df -k is portable (POSIX); we
 # convert kB to GB ourselves to avoid the BSD/GNU split on -BG/-g flags.
+# Rounds to nearest (not floor) so a box with exactly 20.0 GB free isn't
+# reported as 19 — which would trip the default DISK_MIN_GB=20 threshold
+# in preflight.sh and produce a false-FAIL within ~512 MB of the boundary.
 disk_free_gb() {
     local path="$1"
     [[ -d "$path" ]] || return 0
     df -k "$path" 2>/dev/null \
-        | awk 'NR==2 {printf "%d\n", int($4 / 1024 / 1024)}'
+        | awk 'NR==2 {printf "%d\n", int($4 / 1024 / 1024 + 0.5)}'
 }
 
 # loadavg_1m — print 1-minute system load average as a float string.
@@ -102,20 +105,23 @@ loadavg_1m() {
 }
 
 # cpu_brand — print a single-line CPU brand string, or "unknown".
+# Note: `grep ... | sed ... || echo unknown` does not work — sed exits 0
+# on empty stdin and prints nothing. ARM kernels and some containers
+# don't emit `model name` in /proc/cpuinfo (they use `Processor` or omit
+# entirely), and Darwin can return empty if sysctl OID is missing on a
+# stripped image. Capture into a variable and fall back explicitly.
 cpu_brand() {
+    local cpu=""
     case "$(host_os)" in
         darwin)
-            sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown"
+            cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
             ;;
         linux)
-            grep -m1 '^model name' /proc/cpuinfo 2>/dev/null \
-                | sed 's/.*: //' \
-                || echo "unknown"
-            ;;
-        *)
-            echo "unknown"
+            cpu=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //')
             ;;
     esac
+    [[ -n "$cpu" ]] || cpu="unknown"
+    echo "$cpu"
 }
 
 # mem_total_gb — print integer GB of physical memory, or "unknown".

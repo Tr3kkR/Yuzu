@@ -20,6 +20,14 @@
 
 set -uo pipefail
 
+# Bash 4+ required: `declare -A` is used below for the per-fixture
+# verification result map. macOS /bin/bash is 3.2; the `#!/usr/bin/env bash`
+# shebang picks up Homebrew bash 5 when present.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "test-fixtures-verify needs bash 4+ (got $BASH_VERSION) — install GNU bash via brew or apt" >&2
+    exit 2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DASHBOARD_URL=""

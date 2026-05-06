@@ -961,7 +961,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.status.connection` | connection | Q | WLM | *(none)* | server_address:string, tls_enabled:bool, log_level:string |
 | `device.status.config` | config | Q | WLM | *(none)* | agent_id:string, agent_version:string, server_address:string |
 | `device.agent_actions.set_log_level` | set_log_level | A | WLM | level:enum (req) | status:string, level:string |
-| `device.agent_actions.info` | agent info | Q | WLM | *(none)* | agent_id:string, agent_version:string, plugins_count:int32 |
+| `device.agent_actions.info` | agent info | Q | WLM | *(none)* | agent_id:string, agent_version:string, server_address:string, heartbeat_interval:string, plugins_count:int32 |
 | `device.agent_logging.get_log` | get log | Q | WLM | lines:int32 | log_file:string, line_count:int32, line:string |
 | `device.tags.set` | set tag | A | WLM | key:string (req), value:string | key:string, value:string |
 | `device.tags.get` | get tag | Q | WLM | key:string (req) | key:string, value:string |

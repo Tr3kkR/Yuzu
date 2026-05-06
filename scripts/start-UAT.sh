@@ -24,9 +24,9 @@
 #             :9568  metrics       :8081  health
 #
 # Usage:
-#   bash scripts/linux-start-UAT.sh          # start + verify
-#   bash scripts/linux-start-UAT.sh stop     # kill all
-#   bash scripts/linux-start-UAT.sh status   # show running processes
+#   bash scripts/start-UAT.sh          # start + verify
+#   bash scripts/start-UAT.sh stop     # kill all
+#   bash scripts/start-UAT.sh status   # show running processes
 
 set -euo pipefail
 
@@ -472,7 +472,7 @@ for r in d.get('responses',[]):
     echo "║  Server → GW(:50063) → Agent          [commands]║"
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Logs:  $UAT_DIR/{server,gateway,agent}.log     ║"
-    echo "║  Stop:  bash scripts/linux-start-UAT.sh stop    ║"
+    echo "║  Stop:  bash scripts/start-UAT.sh stop          ║"
     echo "╚══════════════════════════════════════════════════╝"
 
     # Exit non-zero if any connectivity test failed. Callers (notably the

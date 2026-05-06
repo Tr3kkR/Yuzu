@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-platform `/test` pipeline (Linux + macOS).** The `/test`
+  orchestration was Linux-only — preflight required `ss`, `df -BG`,
+  iproute2, `/var/lib/docker`; perf-gate read `/proc`; the UAT bring-up
+  was named `linux-start-UAT.sh`. macOS operators couldn't run `/test`
+  locally and had to push-and-watch CI for cross-platform validation.
+  - New `scripts/test/_portable.sh` exposes `host_os`, `build_dir`,
+    `port_listening`, `disk_free_gb`, `loadavg_1m`, `cpu_brand`,
+    `mem_total_gb`, `ensure_docker_path` (probes OrbStack + Docker
+    Desktop bundle paths on macOS), `docker_available`. Branches on
+    `uname -s`; Linux behavior unchanged byte-for-byte.
+  - New canonical `scripts/start-UAT.sh` replaces `linux-start-UAT.sh`
+    as the cross-platform UAT bring-up. Same topology, ports, and 6
+    connectivity tests; uses lsof + grep -oE/awk in place of -oP. The
+    historical `scripts/linux-start-UAT.sh` is now a 9-line back-compat
+    shim that execs `start-UAT.sh`.
+  - `preflight.sh`, `perf-{gate,sample,cron-runner}.sh`, `teardown.sh`,
+    `test-upgrade-stack.sh` patched to use the helpers and gracefully
+    handle `docker_available` returning false. Phase 1 docker-image-build
+    and Phase 2 upgrade-test record SKIP gate rows on macOS without
+    OrbStack/Docker Desktop running rather than failing the run.
+  - `disk_free_gb` rounds to nearest (rather than floor) so a box with
+    exactly 20G free does not trip the default 20G preflight threshold.
+  - `cpu_brand` Linux fallback explicitly handles empty stdout from
+    `grep | sed` (which previously silently returned "" on ARM kernels
+    that don't emit `model name`).
+  - Bash 4+ guards added to `perf-gate.sh`, `teardown.sh`,
+    `test-fixtures-verify.sh` for parity with `preflight.sh`.
+  - macOS prerequisites: `brew install bash` (stock /bin/bash 3.2 lacks
+    `mapfile` / `declare -A`), kerl-installed Erlang, OrbStack or
+    Docker Desktop. `.claude/skills/test/SKILL.md` adds a
+    "Cross-platform support" section; `CLAUDE.md` UAT block points at
+    `scripts/start-UAT.sh`.
+
 - **Phase 8.3 Response Offloading governance hardening — round 3.**
   Fixes for Gate 6 BLOCKING (SRE) + cheap SHOULD findings.
   - **HC-1 (SRE BLOCKING)** — `OffloadTargetStore` now appears in both
@@ -585,6 +618,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`device.agent_actions.info` returns the real `plugins_count` and
+  the agent.plugins.N.* roster.** Per-plugin `PluginContextImpl` config
+  maps were snapshot-copied from `plugin_ctx_.config` during the load
+  loop in `agent.cpp`, freezing each one before the agent had populated
+  `agent.plugins.count`, `agent.modules.count`, the `agent.plugins.N.*`
+  roster, or any `agent.modules.N.*` entries written after that
+  plugin's own snapshot point. The `agent_actions:info` action then
+  read `(not set)` for `plugins_count` from its frozen context even
+  though the master config had the right value. A new
+  `sync_master_config_to_plugins` helper (extracted to
+  `agents/core/src/plugin_config_sync.hpp` for unit testing) re-walks
+  every per-plugin context after load completes and copies in every
+  master key. Validated end-to-end: `agent_actions info` from the
+  dashboard now returns `agent.plugins.count|45` matching the
+  "Loaded 45 plugin(s)" agent log line. Runtime keys written
+  post-registration (`agent.session_id`, `agent.reconnect_count`,
+  `agent.latency_ms`, `agent.grpc_channel_state`,
+  `agent.connected_since`) still observe stale snapshot values — that
+  pre-existing gap is tracked separately as `status_plugin runtime
+  staleness` follow-up.
+
 - **MCP token authorization restored to documented tier-first design
   (#520, #630, branch `fix/520-630-auth-hardening`).** An earlier
   hardening pass (`5fcb346`..`7c8d4ac`) conflated MCP tokens with
@@ -711,7 +765,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_workflow_routes.cpp:814` pin exercised the response-store level
   only; this new file exercises the `process_gateway_response` upstream
   path that the comment said had to be deferred to UAT. (#117)
-- `scripts/linux-start-UAT.sh` — added regression assertion that `/health`
+- `scripts/start-UAT.sh` (formerly `linux-start-UAT.sh`) — added
+  regression assertion that `/health`
   and `/api/health` return 200 AND identical JSON bodies, guarding
   against both the #620 regression and a future split of the dual-mount
   handler lambda.
@@ -5771,4 +5826,3 @@ development independently from the primary software changelog.
 - Input validation on all REST API endpoints
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
-

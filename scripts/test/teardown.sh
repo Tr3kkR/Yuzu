@@ -23,6 +23,13 @@
 
 set -uo pipefail
 
+# Bash 4+ required: `mapfile` is used below for the compose-project enumeration.
+# macOS /bin/bash is 3.2; `#!/usr/bin/env bash` picks up Homebrew bash 5.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "teardown needs bash 4+ (got $BASH_VERSION) — install GNU bash via brew or apt" >&2
+    exit 2
+fi
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 RUN_ID=""

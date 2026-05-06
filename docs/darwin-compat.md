@@ -32,3 +32,15 @@ After **any** cross-platform change, always run `bash scripts/run-tests.sh all` 
 ## Per-OS build directory
 
 The Yuzu source tree is built from multiple hosts (WSL2 Linux + native Windows on the same physical machine, plus this macOS dev box). `scripts/setup.sh` selects the canonical `build-macos` directory automatically and refuses to reconfigure a directory whose recorded source path looks like a different host's. See CLAUDE.md `## Build` → `### Per-OS build directory convention` for the full rule.
+
+## macOS `/test` prerequisites
+
+Before invoking `/test` (the pre-commit/pre-push gate skill) on a fresh macOS dev box, install:
+
+| Tool | Install | Why |
+|---|---|---|
+| GNU bash 5+ | `brew install bash` | `mapfile` and `declare -A` are bash-4-only; stock `/bin/bash` 3.2 trips the version guards in `preflight.sh`, `perf-gate.sh`, `teardown.sh`, `test-fixtures-verify.sh` |
+| Erlang/OTP 28 | via kerl (see `scripts/ensure-erlang.sh` or `scripts/darwin-activate-erlang.sh` if you've created a local shim) | Gateway build + EUnit + dialyzer |
+| OrbStack or Docker Desktop | GUI / `brew install --cask orbstack` | Phase 1 image build + Phase 2 upgrade-test. Without a running Docker daemon both phases SKIP gracefully (the rest of `/test` continues), but you cannot exercise the upgrade-test surface |
+
+UAT bring-up is `bash scripts/start-UAT.sh` (cross-platform; `linux-start-UAT.sh` is a back-compat shim). The `_portable.sh` helper auto-discovers OrbStack at `/Applications/OrbStack.app/Contents/MacOS/xbin/docker` and Docker Desktop at `/Applications/Docker.app/Contents/Resources/bin/docker` — you do not need either on PATH globally.

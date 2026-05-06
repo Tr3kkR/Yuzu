@@ -75,7 +75,7 @@ if [[ -n "$BUSY_CSV" ]]; then
 fi
 if [[ ${#BUSY[@]} -gt 0 ]]; then
     echo "perf-sample: refusing to start — UAT ports listening: ${BUSY[*]}" >&2
-    echo "perf-sample: run 'bash scripts/linux-start-UAT.sh stop' first" >&2
+    echo "perf-sample: run 'bash scripts/start-UAT.sh stop' first" >&2
     exit 2
 fi
 
