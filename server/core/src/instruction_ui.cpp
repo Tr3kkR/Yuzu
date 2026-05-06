@@ -4,7 +4,8 @@
 // only shown to users with the PlatformEngineer or Administrator role.
 
 // NOLINTBEGIN(cert-err58-cpp)
-extern const char* const kInstructionPageHtml = R"HTM(<!DOCTYPE html>
+extern const char* const kInstructionPageHtml =
+    R"HTM(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Yuzu — Instructions</title>
@@ -245,6 +246,50 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
     // Part 2: JavaScript (split to stay under MSVC's 16380-byte string limit)
     R"HTM(
 <script>
+/* ── Wall-clock time formatter (UAT 2026-05-06 #9) ───────────────────────
+   Server emits `data-epoch-ms="<ms>"` on every cell that previously showed
+   a relative "Ns ago" timestamp. We format here in the operator's local
+   timezone so an operator in EST and one in BST each see their own
+   wall clock. Format: `HH:MM:SS.mmm <TZ>` (e.g. `12:22:33.251 BST`). The
+   server keeps a UTC fallback in the cell text and the full ISO-8601
+   timestamp in the `title` attribute for cross-day hover correlation.
+
+   Idempotent — safe to call multiple times on the same node. Targeted
+   from DOMContentLoaded and from htmx:afterSwap so HTMX-injected fragments
+   pick up the same treatment. */
+function formatLocalTime(epochMs) {
+  if (!Number.isFinite(epochMs) || epochMs <= 0) return '';
+  var d = new Date(epochMs);
+  var hh = String(d.getHours()).padStart(2, '0');
+  var mm = String(d.getMinutes()).padStart(2, '0');
+  var ss = String(d.getSeconds()).padStart(2, '0');
+  var ms = String(d.getMilliseconds()).padStart(3, '0');
+  var tz = '';
+  try {
+    var parts = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
+                  .formatToParts(d);
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].type === 'timeZoneName') { tz = parts[i].value; break; }
+    }
+  } catch (e) { /* fallback: omit TZ */ }
+  return tz ? (hh + ':' + mm + ':' + ss + '.' + ms + ' ' + tz)
+            :  hh + ':' + mm + ':' + ss + '.' + ms;
+}
+function renderLocalTimes(root) {
+  var scope = root || document;
+  var nodes = scope.querySelectorAll('[data-epoch-ms]');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var ms = parseInt(el.getAttribute('data-epoch-ms'), 10);
+    var text = formatLocalTime(ms);
+    if (text) el.textContent = text;
+  }
+}
+document.addEventListener('DOMContentLoaded', function() { renderLocalTimes(); });
+document.body.addEventListener('htmx:afterSwap', function(e) {
+  renderLocalTimes(e && e.detail && e.detail.target ? e.detail.target : null);
+});
+
 /* ── Toast notification system ─────────────────────────── */
 function showToast(message, level) {
   var c = document.getElementById('toast-container');
