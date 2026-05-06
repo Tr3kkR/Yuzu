@@ -42,8 +42,8 @@ struct FacetValue {
 
 /// Filter criteria for faceted queries.
 struct FacetFilter {
-    int col_idx{-1};        // column index (0-based, excl. Agent column)
-    std::string value;      // exact match
+    int col_idx{-1};   // column index (0-based, excl. Agent column)
+    std::string value; // exact match
 };
 
 struct ResponseQuery {
@@ -81,6 +81,27 @@ public:
     bool is_open() const;
 
     void store(const StoredResponse& resp);
+
+    /// Update existing RUNNING `responses` rows' status when a terminal
+    /// CommandResponse frame (SUCCESS / FAILURE / TIMEOUT / REJECTED)
+    /// arrives carrying no output — the data already lives in the prior
+    /// RUNNING row(s). Without this, the agent_service Subscribe stream
+    /// inserts an empty-output row whose non-zero `status` enum value
+    /// (1=SUCCESS, 2=FAILURE, …) reads to operators as a failure exit
+    /// code that "happened before" the real result row (UAT 2026-05-06).
+    ///
+    /// Scope is (instruction_id, agent_id, execution_id, status=0). The
+    /// execution_id match preserves the PR-2 invariant that re-mapped
+    /// command_ids (retry under a new execution row) don't fold a
+    /// terminal frame back onto rows tagged with the old execution_id.
+    /// Empty execution_id matches empty (legacy / out-of-band callers).
+    ///
+    /// Returns true if at least one row was updated, false if no matching
+    /// row exists — caller should fall back to `store()` in that case so
+    /// a terminal frame from a no-output command is still recorded.
+    bool finalize_terminal_status(const std::string& instruction_id, const std::string& agent_id,
+                                  int terminal_status, const std::string& error_detail,
+                                  const std::string& execution_id);
     std::vector<StoredResponse> query(const std::string& instruction_id,
                                       const ResponseQuery& q = {}) const;
     /// Exact-correlation lookup keyed on the new `execution_id` column
@@ -90,7 +111,7 @@ public:
     /// is the legacy path; callers must fall back to `query()` if they
     /// support pre-PR-2 data. Backed by `idx_resp_execution_ts`.
     std::vector<StoredResponse> query_by_execution(const std::string& execution_id,
-                                                    const ResponseQuery& q = {}) const;
+                                                   const ResponseQuery& q = {}) const;
     std::vector<StoredResponse> get_by_instruction(const std::string& instruction_id) const;
     std::vector<AggregationResult> aggregate(const std::string& instruction_id,
                                              const AggregationQuery& aq,
@@ -101,28 +122,27 @@ public:
     // -- Faceted queries (for dashboard filtering at scale) --------------------
 
     /// Distinct facet values for a column within an instruction's results.
-    std::vector<FacetValue> facet_values(const std::string& instruction_id,
-                                         int col_idx) const;
+    std::vector<FacetValue> facet_values(const std::string& instruction_id, int col_idx) const;
 
     /// Distinct agent IDs that have a matching facet value.
     std::vector<std::string> facet_agent_ids(const std::string& instruction_id,
-                                              const std::vector<FacetFilter>& filters) const;
+                                             const std::vector<FacetFilter>& filters) const;
 
     /// Count of distinct agents matching facet filters.
     int64_t facet_agent_count(const std::string& instruction_id,
-                               const std::vector<FacetFilter>& filters) const;
+                              const std::vector<FacetFilter>& filters) const;
 
     /// Total result line count matching facet filters.
     int64_t facet_line_count(const std::string& instruction_id,
-                              const std::vector<FacetFilter>& filters) const;
+                             const std::vector<FacetFilter>& filters) const;
 
     /// Load specific responses by their IDs (for two-phase filtered display).
     std::vector<StoredResponse> query_by_ids(const std::vector<int64_t>& response_ids) const;
 
     /// Response IDs that match all given facet filters.
     std::vector<int64_t> facet_response_ids(const std::string& instruction_id,
-                                             const std::vector<FacetFilter>& filters,
-                                             int limit = 200, int offset = 0) const;
+                                            const std::vector<FacetFilter>& filters,
+                                            int limit = 200, int offset = 0) const;
 
     void start_cleanup();
     void stop_cleanup();
@@ -134,7 +154,7 @@ private:
     int cleanup_interval_min_;
     mutable std::shared_mutex mtx_;
     sqlite3_stmt* insert_stmt_{nullptr};       // Cached prepared INSERT for responses
-    sqlite3_stmt* facet_insert_stmt_{nullptr};  // Cached prepared INSERT for facets
+    sqlite3_stmt* facet_insert_stmt_{nullptr}; // Cached prepared INSERT for facets
 #ifdef __cpp_lib_jthread
     std::jthread cleanup_thread_;
 #else

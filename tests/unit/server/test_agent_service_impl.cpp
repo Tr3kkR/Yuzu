@@ -72,9 +72,13 @@ struct GatewayResponseHarness {
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     ResponseStore responses{":memory:"};
-    AgentServiceImpl svc{
-        registry, bus, /*require_client_identity=*/false, auth_mgr, auto_approve, metrics,
-        /*gateway_mode=*/false};
+    AgentServiceImpl svc{registry,
+                         bus,
+                         /*require_client_identity=*/false,
+                         auth_mgr,
+                         auto_approve,
+                         metrics,
+                         /*gateway_mode=*/false};
 
     GatewayResponseHarness() {
         REQUIRE(responses.is_open());
@@ -83,8 +87,7 @@ struct GatewayResponseHarness {
 
     static apb::CommandResponse make_response(const std::string& command_id,
                                               apb::CommandResponse::Status status,
-                                              const std::string& output = "",
-                                              int exit_code = 0) {
+                                              const std::string& output = "", int exit_code = 0) {
         apb::CommandResponse r;
         r.set_command_id(command_id);
         r.set_status(status);
@@ -103,8 +106,8 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-A", "exec-42");
 
-    auto resp = GatewayResponseHarness::make_response(
-        "cmd-A", apb::CommandResponse::SUCCESS, /*output=*/"", /*exit_code=*/0);
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
+                                                      /*output=*/"", /*exit_code=*/0);
     h.svc.process_gateway_response("agent-1", resp);
 
     auto rows = h.responses.query_by_execution("exec-42");
@@ -121,8 +124,7 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
     h.svc.record_execution_id("cmd-A", "exec-42");
     h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
 
-    auto resp = GatewayResponseHarness::make_response("cmd-A",
-                                                     apb::CommandResponse::SUCCESS);
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
     auto by_exec = h.responses.query_by_execution("exec-42");
@@ -142,9 +144,9 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-stream", "exec-stream");
 
-    auto running = GatewayResponseHarness::make_response("cmd-stream",
-                                                        apb::CommandResponse::RUNNING,
-                                                        /*output=*/"row-1");
+    auto running =
+        GatewayResponseHarness::make_response("cmd-stream", apb::CommandResponse::RUNNING,
+                                              /*output=*/"row-1");
     h.svc.process_gateway_response("agent-1", running);
 
     auto rows = h.responses.query_by_execution("exec-stream");
@@ -158,10 +160,9 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-fail", "exec-fail");
 
-    auto resp = GatewayResponseHarness::make_response("cmd-fail",
-                                                     apb::CommandResponse::FAILURE,
-                                                     /*output=*/"",
-                                                     /*exit_code=*/2);
+    auto resp = GatewayResponseHarness::make_response("cmd-fail", apb::CommandResponse::FAILURE,
+                                                      /*output=*/"",
+                                                      /*exit_code=*/2);
     resp.mutable_error()->set_message("plugin returned non-zero");
     h.svc.process_gateway_response("agent-1", resp);
 
@@ -178,8 +179,7 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     // that calls record_execution_id. The receipt path must degrade to an
     // empty execution_id rather than crashing or inventing a value.
     GatewayResponseHarness h;
-    auto resp = GatewayResponseHarness::make_response("cmd-orphan",
-                                                     apb::CommandResponse::SUCCESS);
+    auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
     auto by_cmd = h.responses.get_by_instruction("cmd-orphan");
@@ -247,45 +247,59 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-time", "exec-time");
 
-    auto timing = GatewayResponseHarness::make_response("cmd-time",
-                                                       apb::CommandResponse::RUNNING,
-                                                       /*output=*/"__timing__|elapsed=42");
+    auto timing = GatewayResponseHarness::make_response("cmd-time", apb::CommandResponse::RUNNING,
+                                                        /*output=*/"__timing__|elapsed=42");
     h.svc.process_gateway_response("agent-1", timing);
 
     CHECK(h.responses.query_by_execution("exec-time").empty());
     CHECK(h.responses.get_by_instruction("cmd-time").empty());
 }
 
-TEST_CASE("process_gateway_response: streaming + terminal both carry execution_id",
+TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNING rows",
           "[agent_service][executions][pr2]") {
-    // The drawer's per-execution timeline expects both the RUNNING
-    // streaming rows and the final SUCCESS row to be query_by_execution-
-    // visible. Two RUNNING rows then a terminal SUCCESS = 3 rows tagged.
+    // Post-UAT 2026-05-06: an empty-output terminal frame is folded into
+    // the existing RUNNING rows in place via
+    // ResponseStore::finalize_terminal_status, instead of inserting a
+    // separate sentinel row that operators misread as a failed run that
+    // happened "before" the data row. Two streaming RUNNING rows + a
+    // terminal SUCCESS = 2 rows, both updated to SUCCESS, both still
+    // tagged with the same execution_id.
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-mix", "exec-mix");
 
-    auto r1 = GatewayResponseHarness::make_response("cmd-mix",
-                                                    apb::CommandResponse::RUNNING,
+    auto r1 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
                                                     /*output=*/"line-1");
     h.svc.process_gateway_response("agent-1", r1);
-    auto r2 = GatewayResponseHarness::make_response("cmd-mix",
-                                                    apb::CommandResponse::RUNNING,
+    auto r2 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
                                                     /*output=*/"line-2");
     h.svc.process_gateway_response("agent-1", r2);
-    auto r3 = GatewayResponseHarness::make_response("cmd-mix",
-                                                    apb::CommandResponse::SUCCESS);
+    auto r3 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", r3);
 
     auto rows = h.responses.query_by_execution("exec-mix");
-    REQUIRE(rows.size() == 3);
-    int running = 0, success = 0;
+    REQUIRE(rows.size() == 2);
     for (const auto& row : rows) {
-        if (row.status == static_cast<int>(apb::CommandResponse::RUNNING)) ++running;
-        if (row.status == static_cast<int>(apb::CommandResponse::SUCCESS)) ++success;
+        CHECK(row.status == static_cast<int>(apb::CommandResponse::SUCCESS));
         CHECK(row.execution_id == "exec-mix");
     }
-    CHECK(running == 2);
-    CHECK(success == 1);
+}
+
+TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
+          "[agent_service][executions][pr2]") {
+    // Edge case: a plugin whose terminal frame carries the result data
+    // (rather than streaming via RUNNING + sentinel terminal) should
+    // still produce a row, since finalize_terminal_status only fires
+    // when the terminal output is empty.
+    GatewayResponseHarness h;
+    h.svc.record_execution_id("cmd-direct", "exec-direct");
+    auto only = GatewayResponseHarness::make_response("cmd-direct", apb::CommandResponse::SUCCESS,
+                                                      /*output=*/"final-data");
+    h.svc.process_gateway_response("agent-1", only);
+
+    auto rows = h.responses.query_by_execution("exec-direct");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
+    CHECK(rows[0].output == "final-data");
 }
 
 TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
@@ -294,16 +308,20 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     // mapping (e.g. retry under a new execution row), responses arriving
     // after the overwrite stamp the new execution_id. Old execution_id
     // sees only pre-overwrite responses.
+    //
+    // Post-UAT 2026-05-06: the terminal-frame finalize path is scoped by
+    // execution_id, so a terminal SUCCESS arriving after the re-mapping
+    // does NOT fold back onto the old execution's row. With no RUNNING
+    // row under exec-new, finalize matches zero rows and falls through
+    // to insert (preserving the re-mapping invariant).
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-re", "exec-old");
-    auto first = GatewayResponseHarness::make_response("cmd-re",
-                                                       apb::CommandResponse::RUNNING,
+    auto first = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::RUNNING,
                                                        /*output=*/"old");
     h.svc.process_gateway_response("agent-1", first);
 
     h.svc.record_execution_id("cmd-re", "exec-new");
-    auto second = GatewayResponseHarness::make_response("cmd-re",
-                                                        apb::CommandResponse::SUCCESS);
+    auto second = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", second);
 
     auto old_rows = h.responses.query_by_execution("exec-old");

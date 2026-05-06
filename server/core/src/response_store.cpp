@@ -56,8 +56,8 @@ void ResponseStore::create_tables() {
     // Legacy compat: bring pre-v0.10 databases up to v1's schema before stamping.
     // v1's CREATE TABLE IF NOT EXISTS is a no-op on existing tables, so the
     // `plugin` column must still be applied here.
-    sqlite3_exec(db_, "ALTER TABLE responses ADD COLUMN plugin TEXT DEFAULT ''",
-                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE responses ADD COLUMN plugin TEXT DEFAULT ''", nullptr, nullptr,
+                 nullptr);
 
     static const std::vector<Migration> kMigrations = {
         {1, R"(
@@ -247,6 +247,44 @@ void ResponseStore::store(const StoredResponse& resp) {
     sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
 }
 
+bool ResponseStore::finalize_terminal_status(const std::string& instruction_id,
+                                             const std::string& agent_id, int terminal_status,
+                                             const std::string& error_detail,
+                                             const std::string& execution_id) {
+    std::unique_lock lock(mtx_);
+    if (!db_)
+        return false;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = R"(
+        UPDATE responses
+           SET status = ?, error_detail = ?
+         WHERE instruction_id = ? AND agent_id = ? AND status = 0
+           AND execution_id = ?
+    )";
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("ResponseStore::finalize_terminal_status: prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return false;
+    }
+    sqlite3_bind_int(stmt, 1, terminal_status);
+    sqlite3_bind_text(stmt, 2, error_detail.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, instruction_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db_);
+    sqlite3_finalize(stmt);
+
+    if (rc != SQLITE_DONE) {
+        spdlog::error("ResponseStore::finalize_terminal_status: step failed: {}",
+                      sqlite3_errmsg(db_));
+        return false;
+    }
+    return changes > 0;
+}
+
 std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_id,
                                                  const ResponseQuery& q) const {
     std::shared_lock lock(mtx_);
@@ -338,9 +376,8 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
 // timestamp-window join. Same filter surface as `query()` minus the
 // outer instruction_id (replaced with execution_id) — agent / status /
 // since / until / limit / offset still work.
-std::vector<StoredResponse>
-ResponseStore::query_by_execution(const std::string& execution_id,
-                                   const ResponseQuery& q) const {
+std::vector<StoredResponse> ResponseStore::query_by_execution(const std::string& execution_id,
+                                                              const ResponseQuery& q) const {
     std::shared_lock lock(mtx_);
     std::vector<StoredResponse> results;
     if (!db_)
@@ -568,10 +605,11 @@ std::uintmax_t ResponseStore::db_size_bytes() const {
 // -- Faceted query methods -----------------------------------------------------
 
 std::vector<FacetValue> ResponseStore::facet_values(const std::string& instruction_id,
-                                                     int col_idx) const {
+                                                    int col_idx) const {
     std::shared_lock lock(mtx_);
     std::vector<FacetValue> results;
-    if (!db_) return results;
+    if (!db_)
+        return results;
 
     const char* sql = "SELECT value, SUM(line_count) FROM response_facets"
                       " WHERE instruction_id = ? AND col_idx = ?"
@@ -584,7 +622,8 @@ std::vector<FacetValue> ResponseStore::facet_values(const std::string& instructi
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         FacetValue fv;
         auto v = sqlite3_column_text(stmt, 0);
-        if (v) fv.value = reinterpret_cast<const char*>(v);
+        if (v)
+            fv.value = reinterpret_cast<const char*>(v);
         fv.line_count = sqlite3_column_int64(stmt, 1);
         results.push_back(std::move(fv));
     }
@@ -592,11 +631,13 @@ std::vector<FacetValue> ResponseStore::facet_values(const std::string& instructi
     return results;
 }
 
-std::vector<std::string> ResponseStore::facet_agent_ids(
-    const std::string& instruction_id, const std::vector<FacetFilter>& filters) const {
+std::vector<std::string>
+ResponseStore::facet_agent_ids(const std::string& instruction_id,
+                               const std::vector<FacetFilter>& filters) const {
     std::shared_lock lock(mtx_);
     std::vector<std::string> results;
-    if (!db_ || filters.empty()) return results;
+    if (!db_ || filters.empty())
+        return results;
 
     // Build query with one subquery per filter (intersection)
     std::string sql = "SELECT DISTINCT agent_id FROM response_facets"
@@ -620,16 +661,18 @@ std::vector<std::string> ResponseStore::facet_agent_ids(
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         auto v = sqlite3_column_text(stmt, 0);
-        if (v) results.emplace_back(reinterpret_cast<const char*>(v));
+        if (v)
+            results.emplace_back(reinterpret_cast<const char*>(v));
     }
     sqlite3_finalize(stmt);
     return results;
 }
 
 int64_t ResponseStore::facet_agent_count(const std::string& instruction_id,
-                                          const std::vector<FacetFilter>& filters) const {
+                                         const std::vector<FacetFilter>& filters) const {
     std::shared_lock lock(mtx_);
-    if (!db_ || filters.empty()) return 0;
+    if (!db_ || filters.empty())
+        return 0;
 
     std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM response_facets"
                       " WHERE instruction_id = ?";
@@ -658,9 +701,10 @@ int64_t ResponseStore::facet_agent_count(const std::string& instruction_id,
 }
 
 int64_t ResponseStore::facet_line_count(const std::string& instruction_id,
-                                         const std::vector<FacetFilter>& filters) const {
+                                        const std::vector<FacetFilter>& filters) const {
     std::shared_lock lock(mtx_);
-    if (!db_ || filters.empty()) return 0;
+    if (!db_ || filters.empty())
+        return 0;
 
     std::string sql = "SELECT SUM(line_count) FROM response_facets"
                       " WHERE instruction_id = ? AND col_idx = ? AND value = ?";
@@ -682,12 +726,13 @@ int64_t ResponseStore::facet_line_count(const std::string& instruction_id,
     return count;
 }
 
-std::vector<int64_t> ResponseStore::facet_response_ids(
-    const std::string& instruction_id, const std::vector<FacetFilter>& filters,
-    int limit, int offset) const {
+std::vector<int64_t> ResponseStore::facet_response_ids(const std::string& instruction_id,
+                                                       const std::vector<FacetFilter>& filters,
+                                                       int limit, int offset) const {
     std::shared_lock lock(mtx_);
     std::vector<int64_t> results;
-    if (!db_ || filters.empty()) return results;
+    if (!db_ || filters.empty())
+        return results;
 
     std::string sql = "SELECT DISTINCT response_id FROM response_facets"
                       " WHERE instruction_id = ?";
@@ -717,22 +762,25 @@ std::vector<int64_t> ResponseStore::facet_response_ids(
     return results;
 }
 
-std::vector<StoredResponse> ResponseStore::query_by_ids(
-    const std::vector<int64_t>& response_ids) const {
+std::vector<StoredResponse>
+ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
     std::shared_lock lock(mtx_);
     std::vector<StoredResponse> results;
-    if (!db_ || response_ids.empty()) return results;
+    if (!db_ || response_ids.empty())
+        return results;
 
     // Build IN list — safe because the values are int64_t, not user strings
     std::string in_list;
     for (size_t i = 0; i < response_ids.size(); ++i) {
-        if (i > 0) in_list += ',';
+        if (i > 0)
+            in_list += ',';
         in_list += std::to_string(response_ids[i]);
     }
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output,"
                       " error_detail, ttl_expires_at, COALESCE(plugin,''),"
                       " COALESCE(execution_id,'') FROM responses"
-                      " WHERE id IN (" + in_list + ") ORDER BY id";
+                      " WHERE id IN (" +
+                      in_list + ") ORDER BY id";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
@@ -746,14 +794,18 @@ std::vector<StoredResponse> ResponseStore::query_by_ids(
         r.timestamp = sqlite3_column_int64(stmt, 3);
         r.status = sqlite3_column_int(stmt, 4);
         auto out = sqlite3_column_text(stmt, 5);
-        if (out) r.output = reinterpret_cast<const char*>(out);
+        if (out)
+            r.output = reinterpret_cast<const char*>(out);
         auto err = sqlite3_column_text(stmt, 6);
-        if (err) r.error_detail = reinterpret_cast<const char*>(err);
+        if (err)
+            r.error_detail = reinterpret_cast<const char*>(err);
         r.ttl_expires_at = sqlite3_column_int64(stmt, 7);
         auto pl = sqlite3_column_text(stmt, 8);
-        if (pl) r.plugin = reinterpret_cast<const char*>(pl);
+        if (pl)
+            r.plugin = reinterpret_cast<const char*>(pl);
         auto ex = sqlite3_column_text(stmt, 9);
-        if (ex) r.execution_id = reinterpret_cast<const char*>(ex);
+        if (ex)
+            r.execution_id = reinterpret_cast<const char*>(ex);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -820,9 +872,9 @@ void ResponseStore::run_cleanup() {
                         spdlog::info("ResponseStore: expired {} rows", deleted);
                         // Cascade: remove orphaned facets
                         sqlite3_exec(db_,
-                            "DELETE FROM response_facets WHERE response_id NOT IN"
-                            " (SELECT id FROM responses)",
-                            nullptr, nullptr, nullptr);
+                                     "DELETE FROM response_facets WHERE response_id NOT IN"
+                                     " (SELECT id FROM responses)",
+                                     nullptr, nullptr, nullptr);
                     }
                 } else {
                     spdlog::warn("ResponseStore: cleanup error: {}", sqlite3_errmsg(db_));

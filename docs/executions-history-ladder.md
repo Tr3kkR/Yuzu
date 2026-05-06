@@ -57,6 +57,33 @@ The mapping is in-memory; restart loses it. In-flight commands at restart
 time produce responses tagged `execution_id=''` that use the legacy
 fallback in the drawer.
 
+### Terminal-frame finalize invariant (UAT 2026-05-06)
+
+A `CommandResponse` with `status` ∈ {`SUCCESS`,`FAILURE`,`TIMEOUT`,`REJECTED`}
+and **empty output** does NOT create a new `responses` row. Both
+`Subscribe()` and `process_gateway_response()` call
+`ResponseStore::finalize_terminal_status(instr, agent, status, err, exec_id)`,
+which UPDATEs every existing RUNNING (status=0) row scoped to
+`(instruction_id, agent_id, execution_id)`. A terminal frame WITH output
+still inserts (rare; the data is the result). A terminal frame whose
+finalize updates zero rows (no preceding RUNNING under that
+execution_id — typically a re-mapped command_id retry) falls through to
+insert.
+
+Why: pre-fix, every command produced **two** rows per agent — a RUNNING
+row carrying the streamed output, plus an empty terminal sentinel. The
+dashboard rendered both, sorted newest-first, and operators read the
+non-zero `status` enum value (1=SUCCESS, 2=FAILURE, …) on the empty row
+as a failure exit code that "happened before" the data row. Now there
+is exactly one logical response row per (instruction, agent, execution),
+carrying the data and the terminal status.
+
+Regression pins: `test_agent_service_impl.cpp` "terminal SUCCESS folds
+into existing RUNNING rows" and "terminal frame WITH output still
+inserts" cover the two branches; the re-mapping case is pinned by
+"re-mapping a command_id updates the stamp" (terminal under the new
+exec_id falls through to insert because no RUNNING row exists there).
+
 ### Partial-index planner contract
 
 `idx_resp_execution_ts ON responses(execution_id, timestamp) WHERE
