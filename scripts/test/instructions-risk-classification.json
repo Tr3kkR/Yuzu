@@ -1,0 +1,74 @@
+{
+  "_doc": [
+    "Risk classification for the /test --instructions gate.",
+    "",
+    "Categories:",
+    "  safe              - read-only; no host effect. Default for type=question/query.",
+    "  mutating          - changes server-side state or agent metadata in the test stack;",
+    "                      safe to run against a UAT stack.",
+    "  destructive       - modifies host filesystem, registry, services, or runs arbitrary",
+    "                      code. NOT run by default --instructions mode.",
+    "  network-disrupt   - disconnects host network; only run inside the quarantine",
+    "                      ceremony (PR B).",
+    "  interactive       - pops UI on the host; opt-in only.",
+    "",
+    "Default rule (applied if id not listed below):",
+    "  - spec.type=question or spec.type=query -> safe",
+    "  - spec.type=action                      -> mutating",
+    "",
+    "This file is the AUTHORITY: an explicit override here always wins over the default.",
+    "",
+    "When you add a new InstructionDefinition, classify it here if it is anything",
+    "other than 'safe' or 'mutating'. The runner refuses to dispatch unclassified",
+    "instructions in --strict mode."
+  ],
+
+  "_overrides": {
+    "security.quarantine.isolate":            "network-disrupt",
+    "security.quarantine.release":            "network-disrupt",
+    "security.quarantine.whitelist":          "network-disrupt",
+
+    "device.script_exec.exec":                "destructive",
+    "device.script_exec.powershell":          "destructive",
+    "device.script_exec.bash":                "destructive",
+
+    "windows.registry.set_value":             "destructive",
+    "windows.registry.delete_value":          "destructive",
+    "windows.registry.delete_key":            "destructive",
+
+    "crossplatform.service.set_start_mode":   "destructive",
+
+    "security.certificates.delete":           "destructive",
+
+    "device.filesystem.replace":              "destructive",
+    "device.filesystem.write_content":        "destructive",
+    "device.filesystem.append":               "destructive",
+    "device.filesystem.delete_lines":         "destructive",
+    "workflow.config_search_and_replace":     "destructive",
+
+    "agent.http_client.download":             "destructive",
+    "agent.content_dist.execute_staged":      "destructive",
+
+    "server.patches.deploy":                  "destructive",
+    "server.patches.cancel_deployment":       "destructive",
+
+    "server.workflow.delete":                 "destructive",
+    "server.product_pack.uninstall":          "destructive",
+    "server.policy.delete":                   "destructive",
+    "server.policy.invalidate_all":           "destructive",
+
+    "device.wol.wake":                        "destructive",
+
+    "device.interaction.notify":              "interactive",
+    "device.interaction.message_box":         "interactive",
+    "device.interaction.input":               "interactive",
+    "device.interaction.survey":              "interactive",
+    "device.interaction.set_dnd":             "interactive",
+
+    "server.directory.sync_entra":                  "destructive",
+    "server.directory.configure_group_mappings":    "destructive",
+
+    "testing.chargen.start":                  "destructive",
+    "testing.chargen.stop":                   "mutating"
+  }
+}

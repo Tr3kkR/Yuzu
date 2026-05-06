@@ -1002,7 +1002,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_run_start.add_argument("--run-id", required=True)
     p_run_start.add_argument("--commit", required=True)
     p_run_start.add_argument("--branch", required=True)
-    p_run_start.add_argument("--mode", required=True, choices=["quick", "default", "full"])
+    p_run_start.add_argument("--mode", required=True,
+                              choices=["quick", "default", "full", "instructions"])
     p_run_start.add_argument("--notes", default=None)
     p_run_start.set_defaults(func=cmd_run_start)
 

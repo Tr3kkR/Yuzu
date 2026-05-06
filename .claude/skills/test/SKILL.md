@@ -13,6 +13,19 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
 /test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
+/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
+                         InstructionDefinitions against a live UAT stack via REST.
+                         Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
+                         only. Skips build/upgrade/sanitizers/coverage. Use when content
+                         changes (yaml under `content/definitions/`) or after touching the
+                         instruction-engine dispatch path.
+/test --instructions-quarantine
+                       — quarantine ceremony (~30-40s): exercises the security.quarantine
+                         cluster (isolate / release / status / whitelist) with the
+                         self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
+                         HOST — see safety section below. PR C will add hand-written
+                         semantic-correctness tests for the 25 destructive instructions
+                         (`--instructions-destructive`).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -55,7 +68,7 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / e2e-security /
-                                 synthetic UAT / puppeteer)
+                                 synthetic UAT / puppeteer / instructions)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
@@ -449,10 +462,95 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
 ) &
 
+# Instructions content-suite gate — schema-driven REST exerciser.
+# Drives every safe + mutating InstructionDefinition (184 of 217) and
+# records per-instruction pass/fail/timing into the test-runs DB.
+# Destructive (25), interactive (5), and network-disrupting (3) classes
+# are opt-in via --risks; default-mode invocation excludes them.
+gate_run "Instructions" "instructions.log" \
+    "bash scripts/test/instructions-tests.sh \
+        --dashboard http://localhost:8080 \
+        --user admin --password 'YuzuUatAdmin1!' \
+        --run-id $RUN_ID --gate-name phase5-instructions \
+        --output $LOG_DIR/instructions-outcomes.json"
+
 wait
 ```
 
 `--quick` runs only the unit / EUnit / dialyzer subset (NO synthetic UAT — quick mode skips Phase 4 and has no live stack). `--full` adds the optional MCP agent gate (invokes `mcp-uat-tester` via the Agent tool against the live stack).
+
+### `--instructions` mode (content-suite standalone)
+
+When the operator runs `/test --instructions`, the orchestration is **truncated**: Phase 0 preflight, Phase 4 stack stand-up, then the Instructions gate from Phase 5, then Phase 8 teardown. No build, no upgrade test, no other Phase 5 gates, no sanitizers, no coverage. Use when:
+
+- A YAML under `content/definitions/` changed (added/edited/removed an InstructionDefinition).
+- The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
+- Investigating a content regression flagged by the trend tooling.
+
+Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
+
+```bash
+# In --instructions mode:
+if [[ "$MODE" == "instructions" ]]; then
+    # Run only Phase 0, 4, the Instructions gate, and Phase 8.
+    # Build is not gated — operator should already have $BUILDDIR populated;
+    # if not, the start-UAT.sh in Phase 4 will surface the missing binary.
+    bash scripts/test/instructions-tests.sh \
+        --dashboard http://localhost:8080 \
+        --user admin --password 'YuzuUatAdmin1!' \
+        --run-id "$RUN_ID" --gate-name instructions \
+        --output "$LOG_DIR/instructions-outcomes.json"
+    # then jump straight to Phase 8 teardown
+fi
+```
+
+The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).
+
+### `--instructions-quarantine` mode (the self-disconnect ceremony)
+
+> **DO NOT RUN ON A REMOTE / SSH-ONLY HOST.** The ceremony briefly cuts ALL external network. If your only access path to the box is SSH-over-the-network, you will lock yourself out until the un-quarantine fires (~25-30s) — and if the un-quarantine fails, you stay locked out until you physically reach the box. Run only on your local dev box (the one with a keyboard and a screen).
+>
+> Additional preconditions:
+> - Yuzu agent must be running as **root** for the OS firewall change to actually apply (`pfctl` on macOS, `iptables` on Linux, `netsh advfirewall` on Windows). If the agent is running as a regular user, the survivor will dispatch isolate but the firewall won't actually close — the survivor catches that in `confirm-blackout`, dispatches emergency release, and exits FAIL/1 without locking the box. That's the *safe* failure mode; it tells you the test environment isn't set up correctly.
+
+This mode exercises the four-instruction quarantine cluster (`security.quarantine.{isolate,release,status,whitelist}`) including the part the schema-driven runner can't: **the actual network blackout**. Because the blackout cuts Claude Code's path to api.anthropic.com, the ceremony is driven by a detached survivor (`scripts/test/instructions_quarantine_survivor.py`) that:
+
+1. Probes preconditions (UAT reachable, plugin loaded, external connectivity present, Yuzu localhost reachable).
+2. Dispatches `security.quarantine.isolate` with `server_ip=127.0.0.1` and `whitelist_ips=127.0.0.1`. The plugin auto-whitelists loopback on every platform, so localhost endpoints stay reachable.
+3. After a 5s grace, probes external destinations (1.1.1.1, 8.8.8.8, github.com, api.anthropic.com on :443) — they MUST be unreachable. Probes Yuzu localhost (8080, 50051, 8081) — they MUST be reachable.
+4. Sleeps 10s, re-probes external to confirm sustained blackout.
+5. Dispatches `security.quarantine.release`. Probes external to confirm recovery.
+6. Writes `results.json` to the state dir.
+7. (If `--launch-resume`) Tries to spawn a new Terminal with `claude --resume <session-id>` via `osascript` (macOS) or `tmux` (other platforms). Always falls back to writing `<state-dir>/relaunch.sh` for manual use.
+
+**Operator workflow inside Claude Code**:
+
+```bash
+bash scripts/test/instructions-quarantine.sh \
+    --dashboard http://localhost:8080 \
+    --user admin --password 'YuzuUatAdmin1!' \
+    --launch-resume      # macOS only — opens a new Terminal window
+```
+
+This script captures the current Claude session UUID from `~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
+
+**During the blackout**, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
+- Type `/exit` and let the survivor's auto-resume open a new Terminal
+- Wait for the connection to recover (it usually does after un-quarantine)
+- Manually run `bash /tmp/yuzu-quarantine-test/relaunch.sh` after the survivor finishes
+
+**On resume, read the results**:
+```bash
+cat /tmp/yuzu-quarantine-test/results.json
+```
+
+The results document each phase, every probe (with TCP latency), the agent's responses to isolate/release, and any operator-actionable note. Exit codes:
+- 0 — full ceremony passed: blackout sustained, recovery confirmed
+- 1 — blackout incomplete or recovery probe failed (firewall partially or fully not actually closed; OR external reachable mid-blackout)
+- 2 — precondition fail (login, plugin not loaded, no external connectivity at start) — no firewall change happened
+- 3 — release dispatch failed: **operator must clear firewall manually** (`pfctl -F all` / `iptables -F` / `netsh advfirewall reset`). The note in `results.json` tells you which.
+
+**Probe-only mode** (`--probe-only`) runs only the precondition checks via the schema-driven runner — verifies the quarantine plugin is loaded without any firewall side effect. Use this first if you've never run the ceremony on this box.
 
 ## Phase 6 — Sanitizers (PR2)
 
@@ -589,6 +687,8 @@ The skill is designed so a single gate failure does NOT short-circuit the run. G
 | `--quick` | 0, 1 (no images), 5-subset, 8 | 8-15 min | "About to commit, want a fast sanity check" |
 | default | 0, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
 | `--full` | 0-8 (PR2/PR3 features lit) | 60-120 min | "About to tag a release" |
+| `--instructions` | 0, 4, 5-instructions, 8 | 8-20 min | "Content YAML changed / dispatch path edited" |
+| `--instructions-quarantine` | 0, 4, ceremony | 30-40s | "Quarantine plugin / firewall behaviour edited" |
 
 Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catches the highest-stakes class of bugs (silent data loss on schema migration) which no other local gate finds.
 
