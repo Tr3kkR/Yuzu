@@ -52,6 +52,27 @@ UAT_DIR="/tmp/yuzu-uat"
 ADMIN_USER="admin"
 ADMIN_PASS='YuzuUatAdmin1!'
 
+# ── Optional: launch the agent under a dedicated unprivileged account.
+#
+# When `--as-user USER` is passed, the yuzu-agent process is launched
+# via `sudo -u USER -H env ...` instead of as the current user. This
+# exercises the privilege model defined in docs/agent-privilege-model.md
+# end-to-end: the agent itself is unprivileged, but the quarantine /
+# services / firewall plugins shell out via `sudo -n` to the narrow
+# NOPASSWD entries in /etc/sudoers.d/yuzu-agent.
+#
+# Prerequisites the script verifies before launching:
+#   1. USER exists (`id USER`)
+#   2. /etc/sudoers.d/yuzu-agent is present (proxy for "install-agent-user.sh
+#      has been run")
+#   3. USER can read the agent binary at $BUILDDIR/agents/core/yuzu-agent
+#   4. USER can read the plugin dir at $BUILDDIR/agents/plugins
+#   5. USER can write to /tmp/yuzu-uat/agent-data (the data dir)
+#
+# The first failure prints a friendly fix command and exits non-zero
+# rather than starting an agent that will crash on first plugin call.
+AGENT_AS_USER=""
+
 # Colours (disabled if not a terminal)
 if [ -t 1 ]; then
     GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -144,6 +165,119 @@ wait_for_port() {
     # next timeout breach. SRE-2.
     echo "  ✓ $name bound to :$port in ${elapsed}s"
     return 0
+}
+
+# ── --as-user pre-flight checks ────────────────────────────────────────
+#
+# Run a few cheap probes before we attempt to spawn the agent under a
+# different account. These catch the common mistakes (forgot to run
+# install-agent-user.sh, build dir not traversable by the target user,
+# data dir not writable) and turn them into one-line fix instructions.
+#
+# Returns 0 if everything looks good, non-zero with a printed reason
+# otherwise. Caller is expected to exit 1 on failure.
+
+verify_as_user_prereqs() {
+    local target_user="$1"
+    local errs=0
+
+    # 0. The caller's sudo cache must be primed for the rest of these
+    # probes to be meaningful. `sudo -u $target_user -n test ...` fails
+    # for TWO unrelated reasons that we'd otherwise conflate:
+    #   - target user can't read the file       (the actual permission probe)
+    #   - caller's sudo timestamp is stale     (no password cached yet)
+    # Probe with a no-op `sudo -n true` first. If that fails, we know
+    # we're in case 2 and bail with a single actionable instruction
+    # rather than a misleading "binary not readable" cascade.
+    if ! sudo -n true 2>/dev/null; then
+        fail "sudo cache is empty — pre-flight needs to probe as '$target_user'"
+        info "  fix: sudo -v   (then re-run this command)"
+        return 1
+    fi
+
+    # 1. User exists
+    if ! id "$target_user" >/dev/null 2>&1; then
+        fail "user '$target_user' does not exist on this host"
+        info "  fix: sudo bash scripts/install-agent-user.sh"
+        return 1
+    fi
+    ok "user '$target_user' exists ($(id "$target_user" | tr ',' ' ' | head -c 80))"
+
+    # 2. Sudoers grant present (proxy for "install script ran successfully")
+    if [ ! -f /etc/sudoers.d/yuzu-agent ]; then
+        fail "/etc/sudoers.d/yuzu-agent is missing — quarantine and other"
+        fail "  privileged plugins will not work"
+        info "  fix: sudo bash scripts/install-agent-user.sh"
+        ((errs++))
+    else
+        ok "/etc/sudoers.d/yuzu-agent installed"
+    fi
+
+    # 3. Agent binary readable by target user. The probe runs as root
+    # (sudo -n) then drops to target_user; we test BOTH the binary's
+    # readability AND every parent directory's traverse permission,
+    # because `_yuzu` reading the binary fails if any ancestor has the
+    # other-execute bit clear. macOS Sequoia ships /Users/<name> at
+    # mode 0750 owner <name>:staff — `_yuzu` is not in staff, can't
+    # traverse, can't reach $BUILDDIR. Same trap exists on Linux for
+    # any path under /home/<other-user>/.
+    local agent_bin="$BUILDDIR/agents/core/yuzu-agent"
+    if ! sudo -u "$target_user" -n test -r "$agent_bin" 2>/dev/null; then
+        fail "agent binary at $agent_bin is not readable by '$target_user'"
+        # Walk up the path and identify the first ancestor that's not
+        # traversable, so the operator's fix is precise.
+        local p="$agent_bin"
+        local first_blocker=""
+        while [ "$p" != "/" ] && [ -n "$p" ]; do
+            p="$(dirname "$p")"
+            if ! sudo -u "$target_user" -n test -x "$p" 2>/dev/null; then
+                first_blocker="$p"
+                break
+            fi
+        done
+        if [ -n "$first_blocker" ]; then
+            fail "  blocking traversal at: $first_blocker"
+            info "  fix (dev box):  sudo chmod o+x \"$first_blocker\""
+        fi
+        info "  fix (build dir): chmod -R go+rX \"$BUILDDIR\""
+        info "  fix (production): install the agent under /usr/local/bin via meson install"
+        ((errs++))
+    else
+        ok "agent binary readable by '$target_user'"
+    fi
+
+    # 4. Plugin dir readable
+    local plugin_dir="$BUILDDIR/agents/plugins"
+    if ! sudo -u "$target_user" -n test -r "$plugin_dir" 2>/dev/null; then
+        fail "plugin dir at $plugin_dir is not readable by '$target_user'"
+        info "  fix: chmod -R go+rX \"$BUILDDIR\"  (one-time, dev box only)"
+        ((errs++))
+    else
+        ok "plugin dir readable by '$target_user'"
+    fi
+
+    # 5. Test that sudo -n actually works FROM the target user (NOPASSWD
+    # in /etc/sudoers.d/yuzu-agent). Run a harmless probe: sudo -u USER -n
+    # /sbin/pfctl -s rules (macOS) — that's a read-only command we already
+    # have a sudoers entry for. The double-sudo (we as nathan run sudo to
+    # become _yuzu, who then runs sudo to become root) needs both halves
+    # to be NOPASSWD; the inner half is the install-script's grant.
+    local probe_cmd
+    if [ "$(uname -s)" = "Darwin" ]; then
+        probe_cmd="/sbin/pfctl -s rules"
+    else
+        probe_cmd="/usr/sbin/iptables -L -n"
+    fi
+    if ! sudo -u "$target_user" -n sudo -n $probe_cmd >/dev/null 2>&1; then
+        warn "'$target_user' cannot exercise its sudoers grant non-interactively"
+        warn "  quarantine + services.set_start_mode + flush_dns will fail"
+        info "  fix: sudo bash scripts/install-agent-user.sh --check"
+        # Not a hard failure — agent will still start, just degraded
+    else
+        ok "'$target_user' can sudo -n $probe_cmd (privileged plugins will work)"
+    fi
+
+    [ "$errs" -eq 0 ]
 }
 
 # ── Generate server config ──────────────────────────────────────────────
@@ -279,15 +413,46 @@ start_all() {
 
     # ── 3. Agent (via gateway) ──────────────────────────────────────────
     echo ""
-    echo "[3/3] Starting yuzu-agent (→ gateway :50051)..."
-    "$BUILDDIR/agents/core/yuzu-agent" \
-        --server localhost:50051 \
-        --no-tls \
-        --data-dir "$UAT_DIR/agent-data" \
-        --plugin-dir "$BUILDDIR/agents/plugins" \
-        --log-level info \
-        --enrollment-token "$enroll_token" \
-        > "$UAT_DIR/agent.log" 2>&1 &
+    if [ -n "$AGENT_AS_USER" ]; then
+        echo "[3/3] Starting yuzu-agent (→ gateway :50051) as user '$AGENT_AS_USER'..."
+        verify_as_user_prereqs "$AGENT_AS_USER" || exit 1
+        # Make agent-data writable by the runtime user; install-agent-user.sh
+        # creates the canonical state dirs under /Library/Application Support/Yuzu
+        # (or /var/lib/yuzu-agent on Linux), but the UAT script defaults to
+        # $UAT_DIR/agent-data so it survives `start-UAT.sh stop` cleanups
+        # without touching the production state path. Re-own the UAT dir
+        # so the agent can write to it.
+        mkdir -p "$UAT_DIR/agent-data"
+        chown -R "$AGENT_AS_USER" "$UAT_DIR/agent-data" 2>/dev/null \
+            || sudo -n chown -R "$AGENT_AS_USER" "$UAT_DIR/agent-data" 2>/dev/null \
+            || warn "could not chown $UAT_DIR/agent-data to $AGENT_AS_USER"
+
+        # `-H` resets HOME to the target user's home (which is /var/empty
+        # for _yuzu — that's intentional, the agent doesn't need a HOME).
+        # `env -i` would scrub everything; we keep PATH so sudo -n itself
+        # works, and propagate YUZU_* envs so debug knobs survive.
+        sudo -u "$AGENT_AS_USER" -H \
+            env PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+                YUZU_AGENT_LAUNCHED_AS="$AGENT_AS_USER" \
+            "$BUILDDIR/agents/core/yuzu-agent" \
+            --server localhost:50051 \
+            --no-tls \
+            --data-dir "$UAT_DIR/agent-data" \
+            --plugin-dir "$BUILDDIR/agents/plugins" \
+            --log-level info \
+            --enrollment-token "$enroll_token" \
+            > "$UAT_DIR/agent.log" 2>&1 &
+    else
+        echo "[3/3] Starting yuzu-agent (→ gateway :50051)..."
+        "$BUILDDIR/agents/core/yuzu-agent" \
+            --server localhost:50051 \
+            --no-tls \
+            --data-dir "$UAT_DIR/agent-data" \
+            --plugin-dir "$BUILDDIR/agents/plugins" \
+            --log-level info \
+            --enrollment-token "$enroll_token" \
+            > "$UAT_DIR/agent.log" 2>&1 &
+    fi
     local agent_pid=$!
 
     # Wait for registration
@@ -483,9 +648,47 @@ for r in d.get('responses',[]):
 
 # ── Main ────────────────────────────────────────────────────────────────
 
-case "${1:-start}" in
+# Parse optional flags BEFORE the action verb. Supported flags:
+#   --as-user USER   launch yuzu-agent under USER via sudo -u
+ACTION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --as-user)  AGENT_AS_USER="$2"; shift 2 ;;
+        --as-user=*) AGENT_AS_USER="${1#--as-user=}"; shift ;;
+        -h|--help)
+            cat <<EOF
+Usage: $0 [options] {start|stop|status}
+
+Options:
+  --as-user USER       Launch yuzu-agent under the named system user via
+                       sudo -u (default: current user). Pre-flight checks
+                       verify the user, sudoers entry, and read access to
+                       BUILDDIR before launching. Requires install-agent-user.sh
+                       to have been run.
+
+Actions:
+  start                Bring up server + gateway + agent (default)
+  stop                 Kill all Yuzu processes
+  status               Show running processes + listening ports
+
+Examples:
+  bash scripts/start-UAT.sh
+  bash scripts/start-UAT.sh --as-user _yuzu
+  bash scripts/start-UAT.sh stop
+EOF
+            exit 0 ;;
+        start|stop|status)
+            ACTION="$1"; shift ;;
+        *)
+            echo "unknown arg: $1" >&2
+            echo "use --help for usage." >&2
+            exit 1 ;;
+    esac
+done
+
+case "${ACTION:-start}" in
     start)  start_all ;;
     stop)   kill_stale; echo "UAT stack stopped." ;;
     status) show_status ;;
-    *)      echo "Usage: $0 {start|stop|status}"; exit 1 ;;
+    *)      echo "Usage: $0 [options] {start|stop|status}"; exit 1 ;;
 esac
