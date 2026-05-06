@@ -18,7 +18,13 @@ struct StoredResponse {
     std::string instruction_id;
     std::string agent_id;
     int64_t timestamp{0}; // epoch seconds
-    int status{0};        // CommandResponse::Status enum value
+    /// Server-side ingest wall-clock in epoch milliseconds (UAT
+    /// 2026-05-06 #10). Stamped by ResponseStore::store at insert time
+    /// so the executions drawer's per-agent row can render the actual
+    /// arrival time instead of the agent-claimed timestamp. Legacy
+    /// rows (pre-v3) read 0; renderers fall back to `timestamp * 1000`.
+    int64_t received_at_ms{0};
+    int status{0}; // CommandResponse::Status enum value
     std::string output;
     std::string error_detail;
     int64_t ttl_expires_at{0}; // 0 = use default retention

@@ -108,6 +108,14 @@ void ResponseStore::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_resp_execution_ts
                 ON responses(execution_id, timestamp) WHERE execution_id != '';
         )"},
+        // v3 (UAT 2026-05-06 #10): add millisecond-precision server-side
+        // ingest timestamp. The legacy `timestamp` column is seconds and
+        // is used by retention math + indexes — we don't migrate its
+        // semantics. The new column is what the executions drawer renders
+        // as the per-agent wall-clock arrival time.
+        {3, R"(
+            ALTER TABLE responses ADD COLUMN received_at_ms INTEGER NOT NULL DEFAULT 0;
+        )"},
     };
     // Pre-migration probe (mirrors instruction_store.cpp:197-216): if the
     // execution_id column already exists and schema_meta is below v2, stamp
@@ -152,8 +160,9 @@ void ResponseStore::prepare_insert_stmt() {
         return;
     const char* sql = R"(
         INSERT INTO responses (instruction_id, agent_id, timestamp, status, output,
-                               error_detail, ttl_expires_at, plugin, execution_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               error_detail, ttl_expires_at, plugin, execution_id,
+                               received_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     if (sqlite3_prepare_v2(db_, sql, -1, &insert_stmt_, nullptr) != SQLITE_OK) {
         spdlog::error("ResponseStore: failed to prepare insert statement: {}", sqlite3_errmsg(db_));
@@ -176,13 +185,18 @@ void ResponseStore::store(const StoredResponse& resp) {
     if (!db_ || !insert_stmt_)
         return;
 
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    auto now = now_ms / 1000;
     auto ts = resp.timestamp > 0 ? resp.timestamp : now;
     auto ttl = resp.ttl_expires_at > 0
                    ? resp.ttl_expires_at
                    : (retention_days_ > 0 ? now + retention_days_ * 86400LL : 0);
+    // UAT 2026-05-06 #10: stamp the server-side ingest wall-clock with
+    // millisecond precision. Caller's pre-set value (e.g. tests using
+    // a deterministic clock) wins; default 0 means "stamp now".
+    auto received_ms = resp.received_at_ms > 0 ? resp.received_at_ms : now_ms;
 
     sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr);
 
@@ -202,6 +216,7 @@ void ResponseStore::store(const StoredResponse& resp) {
     // legacy code paths). The detail handler uses the timestamp-window
     // fallback for empty values.
     sqlite3_bind_text(insert_stmt_, 9, resp.execution_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(insert_stmt_, 10, received_ms);
 
     if (sqlite3_step(insert_stmt_) != SQLITE_DONE) {
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -294,7 +309,8 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
 
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
                       "error_detail, ttl_expires_at, COALESCE(plugin,''), "
-                      "COALESCE(execution_id,'') FROM responses"
+                      "COALESCE(execution_id,''), "
+                      "COALESCE(received_at_ms, 0) FROM responses"
                       " WHERE instruction_id = ?";
     std::vector<std::string> bind_texts;
     // int64_binds: (param_index, value) pairs for integer parameters
@@ -364,6 +380,7 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
         auto ex = sqlite3_column_text(stmt, 9);
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
+        r.received_at_ms = sqlite3_column_int64(stmt, 10);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -405,7 +422,8 @@ std::vector<StoredResponse> ResponseStore::query_by_execution(const std::string&
     // is always trivially true; it exists solely for the planner.
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
                       "error_detail, ttl_expires_at, COALESCE(plugin,''), "
-                      "COALESCE(execution_id,'') FROM responses"
+                      "COALESCE(execution_id,''), "
+                      "COALESCE(received_at_ms, 0) FROM responses"
                       " WHERE execution_id != '' AND execution_id = ?";
     std::vector<std::string> bind_texts;
     std::vector<std::pair<int, int64_t>> int_binds;
@@ -473,6 +491,7 @@ std::vector<StoredResponse> ResponseStore::query_by_execution(const std::string&
         auto ex = sqlite3_column_text(stmt, 9);
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
+        r.received_at_ms = sqlite3_column_int64(stmt, 10);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -778,7 +797,8 @@ ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
     }
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output,"
                       " error_detail, ttl_expires_at, COALESCE(plugin,''),"
-                      " COALESCE(execution_id,'') FROM responses"
+                      " COALESCE(execution_id,''),"
+                      " COALESCE(received_at_ms, 0) FROM responses"
                       " WHERE id IN (" +
                       in_list + ") ORDER BY id";
 
@@ -806,6 +826,7 @@ ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
         auto ex = sqlite3_column_text(stmt, 9);
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
+        r.received_at_ms = sqlite3_column_int64(stmt, 10);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);

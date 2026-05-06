@@ -575,9 +575,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "<th>Agent</th><th>Time</th><th>Status</th><th>Output</th>"
                             "<th>Error</th></tr></thead><tbody>";
                     for (const auto& r : filtered) {
+                        // UAT 2026-05-06 #10: server-side ingest wall-clock,
+                        // millisecond precision. Falls back to `timestamp * 1000`
+                        // for legacy rows (received_at_ms == 0). The
+                        // instruction_ui.cpp `renderLocalTimes` JS formats this
+                        // as `HH:MM:SS.mmm <TZ>` in the operator's local
+                        // timezone; the cell text + title attribute keep the
+                        // UTC ISO timestamp as a fallback for no-JS contexts.
+                        int64_t arrived_ms =
+                            r.received_at_ms > 0 ? r.received_at_ms : r.timestamp * 1000;
                         html += "<tr><td><code>" + html_escape(r.agent_id) + "</code></td>";
-                        html += "<td title=\"" + format_iso_utc(r.timestamp) + "\">" +
-                                format_iso_utc(r.timestamp) + "</td>";
+                        html += "<td class=\"resp-arrived\" data-epoch-ms=\"" +
+                                std::to_string(arrived_ms) + "\" title=\"" +
+                                format_iso_utc(r.timestamp) + "\">" + format_iso_utc(r.timestamp) +
+                                "</td>";
                         html += "<td>" + std::to_string(r.status) + "</td>";
                         html += "<td><details class=\"resp-output\"><summary>output</summary>"
                                 "<pre>" +
