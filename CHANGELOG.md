@@ -9,27 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Session revocation REST surface (CC6.3 / CC6.8 evidence).**
-  `DELETE /api/v1/sessions?username=<name>` (admin-only via
-  `UserManagement:Write`) and `DELETE /api/v1/sessions/me` (authenticated
-  self-revoke) expose the previously internal `AuthDB::invalidate_all_sessions`
-  + `AuthManager::invalidate_user_sessions` primitives over REST, so
-  operators can force-log-out a compromised account from every device
-  and any user can sign out of every browser without operator
-  involvement. `AuthManager::invalidate_user_sessions` is now public and
-  performs the dual-write itself (DB rows first, then in-memory map),
-  mirroring the `remove_user` / `update_role` lock-ordering pattern.
-  Two distinct audit actions land:
-  - `session.revoke_all` — admin force-logging out a different user
-  - `session.revoke_all.self` — operator self-revoke (via either route)
-  so SIEM rules can split operator self-service from sibling-admin
-  force-logout. Self-target via the admin path is permitted (recoverable
-  by re-auth) but routes through the self audit action; this differs
-  from the `#397/#403` self-target guard on DELETE-user / role-demote,
-  which exists to prevent admin-role self-lockout.
-  Settings → Users gains a "Revoke sessions" button per non-self row
-  and a "Sign out everywhere" button on the operator's own row; both
-  use `hx-confirm` for blast-radius messaging.
+- **Session revocation REST surface (SOC 2 CC6.3 revocation, CC6.7
+  disposition, CC6.8 termination evidence).**
+  - `DELETE /api/v1/sessions?username=<name>` — admin force-logout via
+    `UserManagement:Write`. Wipes cookie sessions only; API tokens are
+    deliberately left intact (operator may be revoking a leaked cookie
+    while leaving CI/CD automation running). `username` is validated
+    via `is_valid_username` so NUL bytes / control characters / newlines
+    cannot truncate the SQL bind in a way that diverges from the
+    in-memory `==` compare and silently mis-targets revocation.
+  - `DELETE /api/v1/sessions/me` — authenticated self-revoke "Sign out
+    everywhere". Wipes cookie sessions AND revokes every API token
+    belonging to the caller, so a stolen-laptop scenario kills every
+    credential bearing the user's identity in one call. Sets
+    `Set-Cookie: yuzu_session=; Max-Age=0` on the response so the
+    client side completes the disposition. Rejected with 403 for
+    MCP-tier and service-scoped tokens — those credential classes have
+    no other write privilege and accepting them here would create a
+    novel DoS surface against the human owner.
+  - `AuthManager::invalidate_user_sessions` is now public, returns a
+    `RevokeResult { count, db_persisted }`, and performs the dual-write
+    explicitly. The in-memory wipe runs even on AuthDB DELETE failure
+    (the operator's "stop NOW" mental model demands the active session
+    die immediately), but `db_persisted=false` propagates up so the
+    REST handler audits with `result="partial"` and `detail` includes
+    `db_error=true`. A SOC 2 auditor reading the audit log can
+    distinguish a confirmed durable revocation from a partial one
+    awaiting retry/restart. Defence-in-depth: the AuthDB primitive
+    `invalidate_all_sessions` itself now validates username (sibling
+    primitives `add_user`, `update_role` already did).
+  - `ApiTokenStore::revoke_for_principal` — new public method,
+    transactionally marks every non-revoked token for a principal as
+    revoked and invalidates the in-memory validate-token cache so the
+    revocation takes effect within the next request, not after the
+    60-second TTL.
+  - Two distinct audit actions: `session.revoke_all` (admin cross-user)
+    and `session.revoke_all.self` (self via either route, including
+    admin self-target through the admin path; recoverable by re-auth,
+    distinguishable in SIEM). Audit `target_type` is the project-wide
+    PascalCase `User`. `result` is one of `success`/`partial`/`denied`.
+  - New Prometheus counter
+    `yuzu_auth_sessions_revoked_total{caller, result, scope}` — CC7.2
+    anomaly-detection signal for "100 revokes/minute" patterns.
+  - Settings → Users grows "Revoke sessions" (`btn-danger`) per non-self
+    row and "Sign out everywhere" on the operator's own row, with
+    `hx-confirm` blast-radius messaging that explicitly states whether
+    API tokens are revoked. The admin button uses
+    `hx-target="#user-section" hx-swap="innerHTML"` so the section
+    re-renders cleanly after a revoke (without it, HTMX swapped the
+    raw JSON into the button itself).
+  - Operator runbook in `docs/user-manual/server-admin.md` ("Force-
+    logging out a user (incident response)") and emergency manual-
+    revocation recipe in `docs/ops-runbooks/auth-db-recovery.md`.
+  - 16 unit tests in `tests/unit/server/test_rest_sessions.cpp` and 3
+    direct AuthManager tests in `tests/unit/server/test_auth.cpp`
+    pinning the REST contract, the dual-write semantics, the
+    multi-token wipe, and idempotency.
+
+  Self-target through the admin path is permitted (recoverable by
+  re-auth) and audited as `.self`; this is a deliberately weaker
+  guard than the `#397/#403` self-target guard on DELETE-user /
+  role-demote, which exists to prevent admin-role self-lockout (an
+  unrecoverable state).
 
 ### Fixed
 

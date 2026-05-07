@@ -159,6 +159,54 @@ sudo chmod 0600 /var/lib/yuzu/auth.db
 sudo chown yuzu:yuzu /var/lib/yuzu/auth.db
 ```
 
+## Emergency session revocation (dashboard unreachable)
+
+When the dashboard is down or unreachable but you need to force-logout a
+compromised account immediately, you can clear sessions directly from
+the SQLite database. This is the recipe of last resort — the standard
+flow is **Settings > User Management > Revoke sessions** (admin) or
+**Sign out everywhere** (self), both of which produce audit rows and
+metrics. The manual flow below produces no audit row, so file an
+incident note recording the action.
+
+```bash
+# 1. Identify how many sessions exist for the target user.
+sqlite3 /var/lib/yuzu/auth.db \
+  "SELECT username, COUNT(*) FROM sessions GROUP BY username;"
+
+# 2. Wipe every session for the target user. Parameterise to avoid
+#    quoting accidents.
+sqlite3 /var/lib/yuzu/auth.db \
+  "DELETE FROM sessions WHERE username = 'alice';"
+
+# 3. Restart the server. The in-memory sessions_ map is rebuilt empty
+#    on startup; without a restart, in-memory cookie sessions remain
+#    valid until they hit the next validate_session check (cleanup
+#    sweeper has a finite window). Restart guarantees immediate effect.
+systemctl restart yuzu-server   # or service yuzu-server restart
+```
+
+After the restart, validate that the target user's previously-issued
+cookies return 401 and that they can re-authenticate normally. File a
+manual audit-log entry referencing the incident ticket so the
+unaudited DB-level action is traceable in the SOC 2 evidence chain.
+
+## Verifying persistence after a Settings → Revoke sessions click
+
+The dashboard flow is dual-write (in-memory + `auth.db`). If the response
+body reports `db_persisted: false` or the audit row shows `result=partial`
+with `db_error=true`, the in-memory wipe succeeded but persisted rows
+remain. A server restart will resurrect them. Verify and remediate:
+
+```bash
+sqlite3 /var/lib/yuzu/auth.db \
+  "SELECT username, expires_at FROM sessions WHERE username = 'alice';"
+```
+
+If rows are returned, repeat the **Revoke sessions** click after the DB
+lock clears (typically a minute), or use the manual flow above and
+restart.
+
 ## Limit-of-blast-radius — what you CANNOT recover from
 
 - **Lost `yuzu-server.cfg`.** This file is the seed for the AuthDB on first

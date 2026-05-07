@@ -47,6 +47,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Current User](#current-user)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
+  - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [RBAC](#rbac)
   - [Tags](#tags)
@@ -657,30 +658,40 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 ### Sessions
 
-Operator and dashboard sessions are the cookie-based sessions issued by `POST /login`. The endpoints below let an admin force-log-out another user from every device, and let any authenticated principal sign out of every browser at once.
+Operator and dashboard sessions are the cookie-based sessions issued by `POST /login`. The endpoints below let an admin force-log-out another user from every device, and let any authenticated principal sign out of every browser at once. They are the SOC 2 CC6.3 (revocation) and CC6.8 (termination) evidence path; both endpoints emit auditable actions distinguishable by SIEM correlation.
 
 The DB primitive (`AuthDB::invalidate_all_sessions`) and the in-memory counterpart already fire when a user is removed (`DELETE /api/settings/users/{username}`) or when their role changes; these REST endpoints expose the same primitive standalone for incident response and operator self-service.
 
 #### `DELETE /api/v1/sessions?username=<name>`
 
-Revoke every active session for a named user. The user remains valid (no role change, no account disable); they simply have to authenticate again to obtain a new session cookie.
+Revoke every active cookie session for a named user. The user remains valid (no role change, no account disable); they simply have to authenticate again to obtain a new session cookie. **API tokens belonging to the user are deliberately NOT revoked** — operators force-logging out a leaked cookie session typically want to leave CI/CD and automation tokens running. Use `DELETE /api/v1/tokens/{token_id}` (or the user's own `DELETE /api/v1/sessions/me`) to revoke those.
 
 **Permission:** `UserManagement:Write`
 
 **Self-target behaviour.** An admin invoking this with their own username is permitted (signing yourself out of every device is recoverable — re-authenticate and you are back), but the audit row is recorded as `session.revoke_all.self` instead of `session.revoke_all` so SIEM rules can split operator self-service from a sibling-admin force-logout. This is a deliberately weaker guard than the `#397/#403` self-target guard on `DELETE /api/settings/users/{username}`, which exists to prevent admin-role self-lockout (an unrecoverable state).
 
-**Response:**
+**Example:**
+
+```bash
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/sessions?username=alice"
+```
+
+**Response (200):**
 
 ```json
 {
-  "data": { "username": "alice", "revoked": 2 },
+  "data": { "username": "alice", "revoked": 2, "db_persisted": true },
   "meta": { "api_version": "v1" }
 }
 ```
 
-`revoked` is the number of in-memory session cookies wiped. The persisted DB row count is intentionally not surfaced — it may include already-expired entries the cleanup sweeper had not yet reaped, which would mislead the audit chain.
+`revoked` is the number of in-memory session cookies wiped. `db_persisted` reports whether the AuthDB DELETE for persisted session rows succeeded; when `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. A `false` value indicates the operator should retry or restart the server — server restart will otherwise resurrect any persisted rows that were not deleted.
 
-**Error (400) -- missing username:**
+**Audit:** successful cross-user invocations emit `session.revoke_all` with `target_type=User`, `target_id=<username>`, and `detail=count=<N>` (or `count=<N> db_error=true` on partial failure). When the caller's own username is supplied, the action is `session.revoke_all.self` instead.
+
+**Error (400) -- missing or invalid username:**
 
 ```json
 {
@@ -689,22 +700,61 @@ Revoke every active session for a named user. The user remains valid (no role ch
 }
 ```
 
-#### `DELETE /api/v1/sessions/me`
+The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1).
 
-Self-revoke. Wipes every session belonging to the authenticated caller (cookie-based or API-token-derived). No admin permission required — this is intended as a "Sign out everywhere" UX so a user can recover from a lost device without operator involvement.
-
-**Permission:** authenticated session only.
-
-**Response:**
+**Error (403) -- caller lacks `UserManagement:Write`:**
 
 ```json
 {
-  "data": { "revoked": 3 },
+  "error": { "code": 403, "message": "forbidden" },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**Audit:** every successful invocation emits `session.revoke_all.self` with `detail=count=<N>`. The dashboard's "Sign out everywhere" button on the operator's own row in Settings → Users uses this endpoint and follows up with a redirect to `/login`.
+#### `DELETE /api/v1/sessions/me`
+
+Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the authenticated caller AND revokes every API token they own. This is intended as the lost-device recovery flow: every credential bearing the caller's identity is killed in one call.
+
+**Permission:** Any interactive authenticated session (cookie). MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard or a fresh password-authenticated session.
+
+**Example:**
+
+```bash
+curl -s -X DELETE \
+  -H "Cookie: yuzu_session=$COOKIE" \
+  "https://yuzu.example.com/api/v1/sessions/me"
+```
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "revoked": 3,
+    "api_tokens_revoked": 2,
+    "db_persisted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The response sets `Set-Cookie: yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` so the client side completes the revocation by deleting the cookie from the browser jar.
+
+**Error (403) -- non-interactive credential:**
+
+The caller authenticated with an MCP-tier token (`X-Yuzu-Token` carrying a non-empty `mcp_tier`) or a service-scoped token. The denial is audited as `session.revoke_all.self` with `result=denied`.
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "self-revoke requires an interactive session, not an API token"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** every successful invocation emits `session.revoke_all.self` with `target_type=User`, `target_id=<caller>`, `detail=count=<N> api_tokens_revoked=<M>` (with `db_error=true` appended on partial failure). The dashboard's "Sign out everywhere" button on the operator's own row in Settings → Users uses this endpoint and follows up with a redirect to `/login`.
 
 ---
 

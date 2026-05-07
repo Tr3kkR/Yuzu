@@ -205,6 +205,68 @@ TEST_CASE("invalidate_session destroys session", "[auth][session]") {
     REQUIRE_FALSE(mgr->validate_session(*token).has_value());
 }
 
+TEST_CASE("invalidate_user_sessions wipes every session for a user (multi-token)",
+          "[auth][session][invalidate_user_sessions]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    mgr->upsert_user("bob", "secret123456", Role::user);
+
+    // Three concurrent alice sessions (different browsers/devices)
+    // and one bob session.
+    auto a1 = mgr->authenticate("alice", "secret123456");
+    auto a2 = mgr->authenticate("alice", "secret123456");
+    auto a3 = mgr->authenticate("alice", "secret123456");
+    auto b1 = mgr->authenticate("bob", "secret123456");
+    REQUIRE(a1);
+    REQUIRE(a2);
+    REQUIRE(a3);
+    REQUIRE(b1);
+
+    auto result = mgr->invalidate_user_sessions("alice");
+    // All three alice sessions wiped.
+    REQUIRE(result.count == 3);
+    // db_persisted is true when AuthDB is configured and the DELETE
+    // succeeds; legacy config-file-only path also reports true.
+    REQUIRE(result.db_persisted);
+
+    // bob's session unaffected.
+    REQUIRE(mgr->validate_session(*b1).has_value());
+    // Every alice token rejected.
+    REQUIRE_FALSE(mgr->validate_session(*a1).has_value());
+    REQUIRE_FALSE(mgr->validate_session(*a2).has_value());
+    REQUIRE_FALSE(mgr->validate_session(*a3).has_value());
+}
+
+TEST_CASE("invalidate_user_sessions returns 0 for unknown user",
+          "[auth][session][invalidate_user_sessions]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    auto a = mgr->authenticate("alice", "secret123456");
+    REQUIRE(a);
+
+    auto result = mgr->invalidate_user_sessions("ghost");
+    REQUIRE(result.count == 0);
+    REQUIRE(result.db_persisted);
+
+    // Existing alice session still valid.
+    REQUIRE(mgr->validate_session(*a).has_value());
+}
+
+TEST_CASE("invalidate_user_sessions is idempotent",
+          "[auth][session][invalidate_user_sessions][idempotent]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("alice", "secret123456", Role::admin);
+    auto a1 = mgr->authenticate("alice", "secret123456");
+    REQUIRE(a1);
+
+    auto first = mgr->invalidate_user_sessions("alice");
+    REQUIRE(first.count == 1);
+
+    auto second = mgr->invalidate_user_sessions("alice");
+    REQUIRE(second.count == 0);
+    REQUIRE(second.db_persisted);
+}
+
 TEST_CASE("validate_session fails for garbage token", "[auth][session]") {
     auto mgr = make_temp_auth();
     REQUIRE_FALSE(mgr->validate_session("not-a-real-token").has_value());

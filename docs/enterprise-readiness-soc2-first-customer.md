@@ -69,7 +69,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 - Enforce OIDC SSO for production admin access.
 - Disable local-password fallback in hardened mode (or tightly constrain break-glass account policy).
 - Add **2FA/TOTP for high-risk approvals** (aligned with roadmap hardening).
-- Session management controls: expiration, revocation, inactivity timeout, secure cookie attributes.
+- Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. Inactivity timeout and explicit secure-cookie-attribute review remain open.
 - API token governance: scoped permissions, expiration defaults, rotation process, token inventory.
 
 ### Evidence

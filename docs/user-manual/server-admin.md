@@ -456,6 +456,60 @@ The server emits an audit event on every branch:
 
 ---
 
+### Force-logging out a user (incident response)
+
+Use this when an account credential is suspected of compromise but the
+account itself should remain functional (the user reports a stolen
+laptop but still needs to keep working from a clean device, or a
+short-lived contractor's badge is being rotated).
+
+1. Navigate to **Settings > User Management**.
+2. Click **Revoke sessions** next to the target user.
+3. Confirm the blast-radius warning. The user's active dashboard
+   sessions end immediately; their account remains intact and they
+   can re-authenticate normally.
+
+The audit log records `session.revoke_all` with `target_id=<username>`,
+`target_type=User`, and `detail=count=<N>` where N is the number of
+in-memory cookie sessions wiped. The action is also surfaced on the
+`yuzu_auth_sessions_revoked_total{caller="admin",scope="cookies"}`
+Prometheus counter — a sustained spike there is the operator's
+automated alert for either a real incident response in progress or
+a misbehaving automation script.
+
+> **API tokens are not revoked by this flow.** Use it for a leaked
+> session cookie. If the user's API tokens are also implicated, either
+> revoke them individually via Settings → API Tokens or instruct the
+> user to click **Sign out everywhere** themselves (see below), which
+> revokes both cookies and tokens.
+
+> **Verify persistence after a partial failure.** If the response body
+> reports `db_persisted: false` (or the audit row shows `result=partial`
+> with `db_error=true`), the in-memory wipe succeeded but the
+> persisted `auth.db` rows survive. A server restart will resurrect
+> those sessions. Either retry the revoke after the DB lock clears, or
+> see `docs/ops-runbooks/auth-db-recovery.md` for emergency manual
+> revocation via the SQLite CLI.
+
+### Self-service "Sign out everywhere"
+
+Any user — not just admins — can wipe every credential bearing their
+identity by clicking the **Sign out everywhere** button on their own
+row in Settings → Users. Unlike the admin **Revoke sessions** button,
+this revokes BOTH cookie sessions AND every API token the user owns
+(the lost-laptop scenario must kill every credential, not just
+browser cookies). After the request the page redirects to `/login`
+and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
+
+> **MCP-tier and service-scoped tokens cannot self-revoke.** Those
+> credential classes have no other write privilege; accepting a
+> self-revoke from one would create a novel DoS surface against the
+> human owner. The endpoint returns 403 and the audit row records
+> `session.revoke_all.self` with `result=denied`. Use the dashboard
+> from a password-authenticated session.
+
+---
+
 ## Agent Enrollment
 
 Yuzu uses a tiered enrollment model. Each tier provides a different balance of security and convenience.

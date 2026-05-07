@@ -90,14 +90,31 @@ public:
     /// Destroy a session (logout).
     void invalidate_session(const std::string& token);
 
+    /// Outcome of `invalidate_user_sessions`. The in-memory `count` is the
+    /// number of session cookies erased; `db_persisted` is true iff the
+    /// AuthDB DELETE returned success (or the deployment is config-file
+    /// only and AuthDB is not configured). When `db_persisted=false` the
+    /// caller MUST surface the partial outcome in any audit row — a
+    /// "success" audit row that hides a DB write failure produces fictional
+    /// SOC 2 CC6.3/CC6.6 evidence (Gate 6 COMPL-H1 / authdb-H1 / UP-3).
+    struct RevokeResult {
+        std::size_t count{0};
+        bool db_persisted{true};
+    };
+
     /// Wipe every session for a username, both in-memory and (if AuthDB
-    /// is configured) persisted in `auth.db`. Returns the number of
-    /// in-memory tokens erased — the DB row count is not surfaced as it
-    /// may include already-expired entries the cleanup sweeper hadn't
-    /// reaped. Caller is responsible for audit emission; this method does
-    /// no logging or event publishing so it can run while the caller
-    /// holds unrelated locks.
-    std::size_t invalidate_user_sessions(const std::string& username);
+    /// is configured) persisted in `auth.db`. The DB DELETE happens
+    /// FIRST, outside `mu_`, mirroring the lock-ordering of `remove_user`
+    /// and `update_role`. The in-memory wipe runs unconditionally — even
+    /// after a DB failure — so the actively-validating session is killed
+    /// immediately for the operator's "stop NOW" use case; the caller is
+    /// responsible for surfacing `db_persisted=false` so the operator
+    /// knows a server restart may resurrect persisted rows.
+    ///
+    /// Caller is responsible for audit emission; this method does no
+    /// logging or event publishing so it can run while the caller holds
+    /// unrelated locks.
+    [[nodiscard]] RevokeResult invalidate_user_sessions(const std::string& username);
 
     /// List all configured users (password hashes omitted from caller view).
     std::vector<UserEntry> list_users() const;

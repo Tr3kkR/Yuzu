@@ -416,6 +416,50 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
     return changed;
 }
 
+std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!db_ || principal_id.empty())
+        return 0;
+
+    std::unique_lock db_lock(db_mtx_);
+
+    // Snapshot the hashes of every non-revoked token for the principal so
+    // we can invalidate the in-memory validate_token cache after the
+    // UPDATE. Without this, a freshly-revoked token would still validate
+    // for up to `kTokenCacheTtl` seconds (60 s) — long enough for a
+    // stolen API token to keep working through the entire incident
+    // response window of someone clicking "Sign out everywhere".
+    std::vector<std::string> hashes_to_invalidate;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT token_hash FROM api_tokens "
+                               "WHERE principal_id = ? AND revoked = 0;",
+                               -1, &q, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(q, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(q) == SQLITE_ROW) {
+                hashes_to_invalidate.emplace_back(
+                    safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0))));
+            }
+            sqlite3_finalize(q);
+        }
+    }
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE api_tokens SET revoked = 1 "
+                           "WHERE principal_id = ? AND revoked = 0;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+
+    const auto changed = static_cast<std::size_t>(std::max(sqlite3_changes(db_), 0));
+    for (const auto& h : hashes_to_invalidate)
+        invalidate_cache(h);
+    return changed;
+}
+
 bool ApiTokenStore::delete_token(const std::string& token_id) {
     if (!db_)
         return false;

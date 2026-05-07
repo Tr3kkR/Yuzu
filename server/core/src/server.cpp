@@ -258,6 +258,13 @@ public:
         metrics_.describe("yuzu_auth_login_duration_seconds",
                           "Login PBKDF2 verify latency in seconds, by method and result",
                           "histogram");
+        // Session-revocation observability (CC7.2 anomaly-detection +
+        // capacity planning). Counter labels: caller=admin|self,
+        // result=success|partial|denied, scope=cookies|all (all = /me's
+        // "Sign out everywhere" which also revokes API tokens).
+        metrics_.describe("yuzu_auth_sessions_revoked_total",
+                          "Total session revocations, by caller, result, and scope",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -5130,12 +5137,36 @@ private:
             /*sw_deploy_store=*/nullptr,
             /*device_token_store=*/nullptr,
             /*license_store=*/nullptr, guaranteed_state_store_.get(),
-            // session_revoke_fn — wipes both persisted (auth.db) and
-            // in-memory sessions for a username. AuthManager handles the
-            // dual-write internally so the REST handler stays
-            // implementation-agnostic.
-            [this](const std::string& username) -> std::size_t {
-                return auth_mgr_.invalidate_user_sessions(username);
+            // session_revoke_fn — composes the cookie-session wipe
+            // (AuthManager dual-write) with optional API-token revocation
+            // when called from /me's "Sign out everywhere" flow. Exposes
+            // the dual-write outcome (db_persisted) so the REST handler
+            // can audit a partial failure honestly (CC6.6 evidence).
+            [this](const std::string& username, bool revoke_api_tokens)
+                -> RestApiV1::SessionRevokeResult {
+                const auto revoke = auth_mgr_.invalidate_user_sessions(username);
+                std::size_t tokens = 0;
+                if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
+                    tokens = api_token_store_->revoke_for_principal(username);
+                }
+                // CC7.2 anomaly-detection signal: a spike in this counter
+                // is the operator's automated alert for compromised-account
+                // response or rogue automation calling /me in a loop.
+                // Caller dimension is inferred from the api-tokens flag:
+                // /me passes true (self full-credential revoke), admin
+                // path passes false (cookies only, automation tokens
+                // intact). Result dimension carries db_persisted so SOC 2
+                // partial-failure rows are filterable.
+                metrics_.counter("yuzu_auth_sessions_revoked_total",
+                                 {{"caller", revoke_api_tokens ? "self" : "admin"},
+                                  {"result", revoke.db_persisted ? "success" : "partial"},
+                                  {"scope", revoke_api_tokens ? "all" : "cookies"}})
+                    .increment();
+                return RestApiV1::SessionRevokeResult{
+                    revoke.count,
+                    tokens,
+                    revoke.db_persisted,
+                };
             });
 
         // -- Register MCP server routes ----------------------------------------

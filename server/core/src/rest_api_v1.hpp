@@ -43,13 +43,29 @@ public:
     using TagPushFn =
         std::function<void(const std::string& agent_id, const std::string& key)>;
 
-    /// Wipe every session belonging to a username — both the persisted
-    /// `sessions` rows in `auth.db` and the in-memory `AuthManager::sessions_`
-    /// map. Returns the number of in-memory tokens erased (the DB row count
-    /// is not returned — it's an implementation detail and may include
-    /// already-expired entries the cleanup sweeper hadn't reaped).
-    /// Empty/missing callback = endpoint returns 503.
-    using SessionRevokeFn = std::function<std::size_t(const std::string& username)>;
+    /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
+    /// is the number of in-memory cookie sessions wiped (the operationally
+    /// meaningful "active session" count). `api_tokens_revoked` is the
+    /// number of API tokens marked revoked for the principal — non-zero
+    /// only when the caller asked for full-principal revocation
+    /// (`/me`'s "Sign out everywhere"; admin force-logout deliberately
+    /// leaves automation tokens intact). `db_persisted` reports whether
+    /// the AuthDB DELETE for cookie sessions succeeded; when false, the
+    /// caller MUST surface this in the audit row (a "success" audit row
+    /// hiding a DB write failure produces fictional CC6.3/CC6.6 evidence).
+    struct SessionRevokeResult {
+        std::size_t cookie_sessions_revoked{0};
+        std::size_t api_tokens_revoked{0};
+        bool db_persisted{true};
+    };
+
+    /// Revoke every credential bearing a username — cookie sessions
+    /// (`AuthManager::invalidate_user_sessions`) and, when
+    /// `revoke_api_tokens=true`, the user's API tokens (closes UP-13:
+    /// "Sign out everywhere" must mean everywhere, not just browser
+    /// cookies). Empty/missing callback = endpoint returns 503.
+    using SessionRevokeFn = std::function<SessionRevokeResult(
+        const std::string& username, bool revoke_api_tokens)>;
 
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.

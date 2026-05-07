@@ -747,17 +747,29 @@ std::expected<void, AuthDBError> AuthDB::invalidate_session(const std::string& t
 }
 
 std::expected<void, AuthDBError> AuthDB::invalidate_all_sessions(const std::string& username) {
+    // Defence-in-depth (authdb-H2): every public AuthDB write taking a
+    // username must validate. `sqlite3_bind_text(..., -1, SQLITE_STATIC)`
+    // truncates at the first NUL byte, so a NUL-embedded username would
+    // delete the wrong rows while the in-memory `==` comparison in
+    // AuthManager would match no one — the layers would silently
+    // diverge. Sibling primitives `add_user` and `update_role` validate
+    // here for the same reason.
+    if (!is_valid_username(username)) {
+        spdlog::warn("invalidate_all_sessions: invalid username");
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+
     static const char* sql = R"(
         DELETE FROM sessions WHERE username = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare invalidate_all_sessions statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
