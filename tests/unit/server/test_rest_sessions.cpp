@@ -140,11 +140,14 @@ struct RestSessionsHarness {
                             std::move(session_revoke_fn));
     }
 
-    // Helper: parse JSON body, used in place of substring matches so a
-    // future response wrapper change doesn't silently pass tests.
+    // Helper: parse the `data` payload of the JSON envelope. The server's
+    // `ok_json` wraps every successful body in `{"data": {...}, "meta":
+    // {...}}`; tests should assert on the inner shape, not the wrapper.
     nlohmann::json json_body(const std::unique_ptr<httplib::Response>& res) {
         REQUIRE(res);
-        return nlohmann::json::parse(res->body);
+        auto parsed = nlohmann::json::parse(res->body);
+        REQUIRE(parsed.contains("data"));
+        return parsed["data"];
     }
 };
 
