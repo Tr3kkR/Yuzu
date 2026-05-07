@@ -400,7 +400,7 @@ The default-mode Phase 5 fan-out:
 
 ```bash
 gate_run "C++ unit (Catch2)" "unit-cpp.log" \
-    "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
+    "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite transport --suite proto --suite docs --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test"

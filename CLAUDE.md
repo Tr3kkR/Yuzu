@@ -271,12 +271,13 @@ Cross files live in `meson/cross/`. Native files for CI compiler selection live 
 
 ## Test
 
-Every test target carries a short `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly — no more guessing `"yuzu:server unit tests"`:
+Every test target carries a short `suite:` label (`agent`, `tar`, `server`, `transport`) so `--suite <name>` filters directly — no more guessing `"yuzu:server unit tests"`:
 
 ```bash
 meson test -C build-linux --suite server --print-errorlogs
 meson test -C build-linux --suite agent --print-errorlogs
 meson test -C build-linux --suite tar --print-errorlogs
+meson test -C build-linux --suite transport --print-errorlogs
 meson test -C build-linux --print-errorlogs              # everything
 ```
 
@@ -377,6 +378,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Enterprise-platform parity matrix — competitor capability comparison and gap analysis (complements `docs/capability-map.md`) | `docs/enterprise-parity-plan.md` | `architect` on capability-map / roadmap changes; `enterprise-readiness` agent during Gate 6 |
 | CI cache patterns — split `actions/cache/restore` + paired `actions/cache/save` for GHA-hosted; local `runner.tool_cache` for self-hosted; **never `save-always: true`** (zizmor guard enforces) | `.claude/skills/ci-cache/SKILL.md` | `build-ci` on any change touching `actions/cache@`, vcpkg cache scope, ccache scope, or self-hosted-runner cache wiring |
 | Agent privilege model — dedicated `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent` account, narrow `sudo NOPASSWD` entries (Linux/macOS) and LSA privileges (Windows), per-plugin privilege matrix, **production virtual-service-account vs dev local-user paths**, install scripts at `scripts/install-agent-user.{sh,ps1}` | `docs/agent-privilege-model.md` | `security-guardian` on any plugin shell-out / sudoers / setcap change; `cross-platform` on any change that gates a plugin behind a privileged command; `plugin-developer` when adding a new privileged plugin (the doc has the procedure) |
+| Transport abstraction — `yuzu::transport::` Channel/ServerListener/BidiStream interface, Credentials zeroisation, ClientCertMode partial-order reload contract, frame-size hierarchy (`kDefaultMaxFrameSize`/`kAbsoluteMaxFrameSize`), method-name regex, BackoffPolicy bounds, deferred PR ladder (#376 PR 1b grpc dispatch, PR 3 msquic, PR 5 dual-stack) | `docs/adrs/0001-quic-transport-msquic-quicer.md` + `transport/include/yuzu/transport/transport.hpp` | `cpp-expert` on any `transport/**/*.{cpp,hpp}` change; `build-ci` on `transport/meson.build`; `security-guardian` on Credentials / zeroisation / mTLS surface change |
 
 ## Guardian engine — stores
 

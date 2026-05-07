@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Smoke tests for the yuzu::transport:: abstraction (#376 PR 1a).
+// Smoke + lifecycle tests for the yuzu::transport:: abstraction (#376).
 //
-// Verifies that the abstraction's public surface compiles and behaves
-// at the construction level. RPC dispatch tests (unary, bidi) are
-// added in PR 1b once grpc::GenericStub wiring lands.
+// Verifies the public surface compiles and behaves at the construction
+// level, and exercises the registration / lifecycle invariants
+// strengthened by the hardening rounds.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,12 +14,12 @@
 
 using namespace yuzu::transport;
 
-TEST_CASE("backend_name maps both backends", "[transport][smoke]") {
+TEST_CASE("backend_name maps both backends", "[transport]") {
     REQUIRE(backend_name(Backend::Grpc) == "grpc");
     REQUIRE(backend_name(Backend::Msquic) == "msquic");
 }
 
-TEST_CASE("parse_backend recognises documented spellings", "[transport][smoke]") {
+TEST_CASE("parse_backend recognises documented spellings", "[transport]") {
     auto g = parse_backend("grpc");
     REQUIRE(g.has_value());
     REQUIRE(g.value() == Backend::Grpc);
@@ -38,7 +38,7 @@ TEST_CASE("parse_backend recognises documented spellings", "[transport][smoke]")
     REQUIRE(bad.error().code == StatusCode::InvalidArgument);
 }
 
-TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport][smoke]") {
+TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport]") {
     // Wire-stability commitment: the integer values are FROZEN to match
     // google.rpc.Code / grpc::StatusCode. PR 1b will harden this with
     // a static_assert against the generated proto enum; the smoke
@@ -52,13 +52,13 @@ TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport][smoke]
     REQUIRE(static_cast<int>(StatusCode::Unauthenticated) == 16);
 }
 
-TEST_CASE("Frame size constants follow the documented hierarchy", "[transport][smoke]") {
+TEST_CASE("Frame size constants follow the documented hierarchy", "[transport]") {
     REQUIRE(kDefaultMaxFrameSize == 4u * 1024u * 1024u);
     REQUIRE(kAbsoluteMaxFrameSize == 64u * 1024u * 1024u);
     REQUIRE(kDefaultMaxFrameSize < kAbsoluteMaxFrameSize);
 }
 
-TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport][smoke]") {
+TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport]") {
     Endpoint target{"127.0.0.1", 0};
     Credentials creds{};       // plaintext-default
     creds.verify_peer = false; // permitted in test build
@@ -70,14 +70,66 @@ TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport][smoke]") {
     // MUST return false within the deadline. Documents the
     // wait_for_connected contract: "ready to accept new streams" is
     // the only signal; never an indefinite wait.
-    REQUIRE_FALSE(ch->wait_for_connected(std::chrono::milliseconds(50)));
+    //
+    // 200ms gives slack for Defender-induced channel-init slowness on
+    // the yuzu-local-windows runner (governance NICE-1) without
+    // meaningfully changing total test wall time.
+    REQUIRE_FALSE(ch->wait_for_connected(std::chrono::milliseconds(200)));
 
     // close() is documented as idempotent.
     ch->close();
     ch->close();
 }
 
-TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[transport][smoke]") {
+TEST_CASE("make_channel rejects asymmetric mTLS material", "[transport]") {
+    // governance UP-1: cert-without-key (or vice versa) silently produces
+    // a non-null but unusable channel. Hardening adds a pre-flight check;
+    // the resulting Channel surfaces construction_error_ via every call.
+    Endpoint target{"127.0.0.1", 0};
+    Credentials creds{};
+    creds.verify_peer = true;
+    creds.client_cert_pem = "-----BEGIN CERTIFICATE-----\n"
+                            "fake\n-----END CERTIFICATE-----\n";
+    // client_key_pem deliberately empty.
+
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr); // construction succeeds; channel is born dead.
+
+    // Any call surfaces the construction error as Unauthenticated.
+    Status dummy_status;
+    CallContext ctx;
+    struct DummyMsg final : SerializableMessage {
+        bool serialize(std::string&) const override { return true; }
+        bool parse(std::string_view) override { return true; }
+    } req, resp;
+    auto r = ch->unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Unauthenticated);
+}
+
+TEST_CASE("make_channel rejects BackoffPolicy invariant violation", "[transport]") {
+    // governance UP-5: initial_delay > max_delay would produce
+    // implementation-defined gRPC reconnect behaviour.
+    Endpoint target{"127.0.0.1", 0};
+    Credentials creds{};
+    creds.verify_peer = false;
+    BackoffPolicy bad_backoff;
+    bad_backoff.initial_delay = std::chrono::seconds(60);
+    bad_backoff.max_delay = std::chrono::seconds(1);
+
+    auto ch = make_channel(Backend::Grpc, target, creds, bad_backoff);
+    REQUIRE(ch != nullptr);
+
+    CallContext ctx;
+    struct DummyMsg final : SerializableMessage {
+        bool serialize(std::string&) const override { return true; }
+        bool parse(std::string_view) override { return true; }
+    } req, resp;
+    auto r = ch->unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Unauthenticated);
+    REQUIRE(r.status.detail.find("initial_delay") != std::string::npos);
+}
+
+TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[transport]") {
     Endpoint target{"127.0.0.1", 0};
     Credentials creds{};
     creds.verify_peer = false;
@@ -86,7 +138,7 @@ TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[tran
     REQUIRE(ch == nullptr);
 }
 
-TEST_CASE("ServerListener registers handlers and reports is_serving", "[transport][smoke]") {
+TEST_CASE("ServerListener registers handlers and reports is_serving", "[transport]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
     REQUIRE_FALSE(listener->is_serving());
@@ -117,7 +169,69 @@ TEST_CASE("ServerListener registers handlers and reports is_serving", "[transpor
     REQUIRE_FALSE(listener->is_serving());
 }
 
-TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][smoke]") {
+TEST_CASE("ServerListener register_unary parity with register_bidi_stream", "[transport]") {
+    // governance qe-S1: register_unary's malformed-name path was
+    // structurally validated via the shared enforce_method_or_die but
+    // not directly exercised. Add explicit coverage.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto noop_handler = [](const CallContext&, const SerializableMessage&, SerializableMessage&) {
+        return Status{StatusCode::Ok, ""};
+    };
+    auto noop_factory = []() -> std::unique_ptr<SerializableMessage> {
+        struct DummyMsg final : SerializableMessage {
+            bool serialize(std::string&) const override { return true; }
+            bool parse(std::string_view) override { return true; }
+        };
+        return std::make_unique<DummyMsg>();
+    };
+
+    REQUIRE_NOTHROW(listener->register_unary("yuzu.agent.v1.AgentService/Heartbeat", noop_factory,
+                                             noop_factory, noop_handler));
+
+    REQUIRE_THROWS_AS(
+        listener->register_unary("../etc/passwd", noop_factory, noop_factory, noop_handler),
+        std::invalid_argument);
+
+    REQUIRE_THROWS_AS(listener->register_unary("", noop_factory, noop_factory, noop_handler),
+                      std::invalid_argument);
+}
+
+TEST_CASE("ServerListener rejects duplicate registration", "[transport]") {
+    // governance UP-7: silent first-wins on collision is a debugging
+    // foot-gun. Hardening makes the contract "throw on collision."
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto noop_handler = [](const CallContext&, BidiStream&) {
+        return Status{StatusCode::Ok, ""};
+    };
+
+    listener->register_bidi_stream("yuzu.agent.v1.AgentService/Subscribe", noop_handler);
+
+    // Re-registering the same method (same kind) throws.
+    REQUIRE_THROWS_AS(
+        listener->register_bidi_stream("yuzu.agent.v1.AgentService/Subscribe", noop_handler),
+        std::invalid_argument);
+
+    // Re-registering as a different kind also throws (cross-kind clash).
+    auto noop_unary = [](const CallContext&, const SerializableMessage&, SerializableMessage&) {
+        return Status{StatusCode::Ok, ""};
+    };
+    auto noop_factory = []() -> std::unique_ptr<SerializableMessage> {
+        struct DummyMsg final : SerializableMessage {
+            bool serialize(std::string&) const override { return true; }
+            bool parse(std::string_view) override { return true; }
+        };
+        return std::make_unique<DummyMsg>();
+    };
+    REQUIRE_THROWS_AS(listener->register_unary("yuzu.agent.v1.AgentService/Subscribe", noop_factory,
+                                               noop_factory, noop_unary),
+                      std::invalid_argument);
+}
+
+TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 
@@ -132,4 +246,7 @@ TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][smoke]"
     auto r = listener->start(bind, creds, opts);
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == StatusCode::InvalidArgument);
+    // is_serving stays false because the validation happens BEFORE the
+    // started_ exchange (governance UP-18).
+    REQUIRE_FALSE(listener->is_serving());
 }

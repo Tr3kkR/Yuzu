@@ -61,7 +61,7 @@ private:
 
     void enforce_method_or_die(const std::string& method);
 
-    mutable std::mutex                  mu_;
+    mutable std::mutex                  mtx_;
     std::condition_variable             shutdown_cv_;
     std::map<std::string, UnaryRegistration> unary_handlers_;
     std::map<std::string, BidiStreamHandler> bidi_handlers_;

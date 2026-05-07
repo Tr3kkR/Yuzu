@@ -36,8 +36,9 @@ std::shared_ptr<::grpc::ServerCredentials> make_grpc_server_credentials(
 
 class GrpcChannel final : public Channel {
 public:
-    GrpcChannel(const Endpoint& target, const Credentials& creds,
-                BackoffPolicy backoff,
+    // Sink-by-value: callers can std::move large Credentials/Endpoint
+    // payloads in. Cheap structs (BackoffPolicy) are also by-value.
+    GrpcChannel(Endpoint target, Credentials creds, BackoffPolicy backoff,
                 std::shared_ptr<TransportMetricSink> metric_sink);
     ~GrpcChannel() override;
 
@@ -57,7 +58,7 @@ public:
 
 private:
     Endpoint                                  target_;
-    Credentials                               creds_;          // copy; PEM material zeroed in dtor
+    Credentials                               creds_;          // PEM private-key material zeroed in dtor
     BackoffPolicy                             backoff_;
     std::shared_ptr<TransportMetricSink>      metric_sink_;
     std::shared_ptr<::grpc::Channel>          channel_;        // null if construction failed

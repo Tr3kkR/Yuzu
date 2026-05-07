@@ -4,32 +4,28 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include <regex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-#include "grpc_channel.hpp"  // for make_grpc_server_credentials
+#include "grpc_channel.hpp"           // for make_grpc_server_credentials
+#include "grpc_method_validator.hpp"  // method_name_well_formed
 
 namespace yuzu::transport::grpc_backend {
-
-namespace {
-
-bool method_name_well_formed(std::string_view method) {
-    if (method.empty() || method.size() > kMaxMethodSize) return false;
-    static const std::regex re{
-        R"(^[A-Za-z][A-Za-z0-9_.]*\/[A-Za-z][A-Za-z0-9_]*$)"};
-    return std::regex_match(method.begin(), method.end(), re);
-}
-
-}  // namespace
 
 GrpcServerListener::GrpcServerListener() = default;
 
 GrpcServerListener::~GrpcServerListener() {
     if (started_.load(std::memory_order_acquire) &&
         !shutting_down_.load(std::memory_order_acquire)) {
-        shutdown();
+        // Sink any throws — destructors must not propagate (governance
+        // UP-10 sibling). Shutdown itself doesn't throw, but the
+        // metric-sink callback is user-supplied.
+        try {
+            shutdown();
+        } catch (...) {
+            // Documented as noexcept; swallow defensively.
+        }
     }
 }
 
@@ -55,28 +51,48 @@ void GrpcServerListener::register_unary(
     std::function<std::unique_ptr<SerializableMessage>()> response_factory,
     UnaryHandler handler) {
     enforce_method_or_die(method);
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mtx_);
+    // Reject duplicate registration: silent first-wins is a debugging
+    // foot-gun (governance UP-7). The contract is now "throw on
+    // collision" — operators see a clear error instead of mysterious
+    // dispatch behaviour.
+    if (unary_handlers_.contains(method) || bidi_handlers_.contains(method)) {
+        throw std::invalid_argument(
+            "yuzu::transport: method already registered: " + method);
+    }
     unary_handlers_.emplace(
         std::move(method),
         UnaryRegistration{std::move(request_factory),
-                          std::move(response_factory),
-                          std::move(handler)});
+                          std::move(response_factory), std::move(handler)});
 }
 
 void GrpcServerListener::register_bidi_stream(std::string method,
                                               BidiStreamHandler handler) {
     enforce_method_or_die(method);
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (unary_handlers_.contains(method) || bidi_handlers_.contains(method)) {
+        throw std::invalid_argument(
+            "yuzu::transport: method already registered: " + method);
+    }
     bidi_handlers_.emplace(std::move(method), std::move(handler));
 }
 
 std::expected<void, Status> GrpcServerListener::start(
     const Endpoint& bind, const Credentials& creds,
     const ListenerOptions& opts) {
+    // Frame-size validation BEFORE the started_ exchange so a bad opts
+    // does not flip is_serving() momentarily. (governance UP-18)
+    const std::size_t frame_cap =
+        opts.max_frame_size > 0 ? opts.max_frame_size : kDefaultMaxFrameSize;
+    if (frame_cap > kAbsoluteMaxFrameSize) {
+        return std::unexpected(Status{
+            StatusCode::InvalidArgument,
+            "ListenerOptions::max_frame_size exceeds kAbsoluteMaxFrameSize"});
+    }
+
     if (started_.exchange(true, std::memory_order_acq_rel)) {
-        return std::unexpected(
-            Status{StatusCode::FailedPrecondition,
-                   "ServerListener::start called twice"});
+        return std::unexpected(Status{StatusCode::FailedPrecondition,
+                                      "ServerListener::start called twice"});
     }
 
     std::string detail;
@@ -87,7 +103,7 @@ std::expected<void, Status> GrpcServerListener::start(
     }
 
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard<std::mutex> lock(mtx_);
         opts_ = opts;
     }
 
@@ -99,14 +115,6 @@ std::expected<void, Status> GrpcServerListener::start(
         builder.AddChannelArgument(
             GRPC_ARG_MAX_CONCURRENT_STREAMS,
             static_cast<int>(opts.max_concurrent_streams_per_connection));
-    }
-    const std::size_t frame_cap =
-        opts.max_frame_size > 0 ? opts.max_frame_size : kDefaultMaxFrameSize;
-    if (frame_cap > kAbsoluteMaxFrameSize) {
-        started_.store(false, std::memory_order_release);
-        return std::unexpected(Status{
-            StatusCode::InvalidArgument,
-            "ListenerOptions::max_frame_size exceeds kAbsoluteMaxFrameSize"});
     }
     builder.SetMaxReceiveMessageSize(static_cast<int>(frame_cap));
     builder.SetMaxSendMessageSize(static_cast<int>(frame_cap));
@@ -131,9 +139,10 @@ std::expected<void, Status> GrpcServerListener::start(
 }
 
 void GrpcServerListener::wait_for_shutdown() {
-    std::unique_lock<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mtx_);
     shutdown_cv_.wait(
-        lock, [this] { return shutting_down_.load(std::memory_order_acquire); });
+        lock,
+        [this] { return shutting_down_.load(std::memory_order_acquire); });
 }
 
 void GrpcServerListener::shutdown() {
@@ -147,10 +156,14 @@ void GrpcServerListener::shutdown() {
         // wires this through the AsyncGenericService dispatcher; in PR
         // 1a there is no live RPC dispatch path so the guarantee is
         // structurally vacuous.
+        //
+        // PR 1b should also pass a deadline to Shutdown() so a wedged
+        // handler does not block forever (governance UP-13). PR 1a has
+        // no live handlers so the no-deadline form is safe.
         server_->Shutdown();
     }
     {
-        std::lock_guard<std::mutex> lock(mu_);
+        std::lock_guard<std::mutex> lock(mtx_);
         shutdown_cv_.notify_all();
     }
 }

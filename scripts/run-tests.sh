@@ -49,7 +49,7 @@ run_cpp_unit() {
 
     # Compile tests
     echo "  Building test executables..."
-    if ! meson compile -C "$BUILDDIR" yuzu_agent_tests yuzu_server_tests 2>&1 | tail -5; then
+    if ! meson compile -C "$BUILDDIR" yuzu_agent_tests yuzu_server_tests yuzu_transport_tests 2>&1 | tail -5; then
         fail "C++ test compilation failed"
         return
     fi
@@ -70,6 +70,15 @@ run_cpp_unit() {
         pass "Server unit tests"
     else
         fail "Server unit tests"
+    fi
+
+    # Run transport tests (#376 PR 1+)
+    echo ""
+    echo "  Running transport unit tests..."
+    if "$BUILDDIR/tests/yuzu_transport_tests" --reporter compact 2>&1; then
+        pass "Transport unit tests"
+    else
+        fail "Transport unit tests"
     fi
 }
 
