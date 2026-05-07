@@ -1,0 +1,8 @@
+[-576460751936 ms] [client] client starting mode=halfclose cacert=/Users/nathan/Yuzu/spike/0001-quic-transport/certs/ca.crt
+[-576460751930 ms] [client] event: ignoring streams_available
+[-576460751930 ms] [client] event: ignoring dgram_state_changed
+[-576460746930 ms] [client] sender exited last_seq=2500 bytes=2560000
+[-576460746930 ms] [client] halfclose: client issuing FIN at -576460746930
+[-576460746930 ms] [client] sender <0.87.0> exited with reason normal
+[-576460746930 ms] [client] event: ignoring send_shutdown_complete
+[-576460746930 ms] [client] event: peer_send_shutdown

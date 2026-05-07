@@ -1,0 +1,5 @@
+# Evidence files for spike-validation gates are intentionally tracked
+# even though *.log is globally gitignored. Per ADR-0001's
+# "Evidence capture (Workstream D)" section, spike output is committed
+# to the repo as audit material for the change-management trail.
+!*.log

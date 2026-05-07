@@ -1,0 +1,9 @@
+# Spike build artefacts and certs are not committed.
+cpp-server/build/
+cpp-server/vcpkg_installed/
+erlang-client/_build/
+certs/*.pem
+certs/*.key
+certs/*.crt
+certs/*.csr
+certs/*.srl

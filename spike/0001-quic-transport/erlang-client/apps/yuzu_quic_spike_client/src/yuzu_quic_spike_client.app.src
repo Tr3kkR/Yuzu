@@ -1,0 +1,8 @@
+{application, yuzu_quic_spike_client,
+ [{description, "Throwaway quicer client for #376 PR 0 spike"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, quicer]},
+  {modules, [yuzu_quic_spike_client]},
+  {env, []}
+ ]}.

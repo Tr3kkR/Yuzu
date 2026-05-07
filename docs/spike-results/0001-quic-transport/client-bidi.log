@@ -1,0 +1,9 @@
+[-576460751935 ms] [client] client starting mode=bidi-30s cacert=/Users/nathan/Yuzu/spike/0001-quic-transport/certs/ca.crt
+[-576460751929 ms] [client] bidi mode: streaming for 30000 ms
+[-576460751929 ms] [client] event: ignoring streams_available
+[-576460751929 ms] [client] event: ignoring dgram_state_changed
+[-576460721929 ms] [client] sender exited last_seq=15000 bytes=15360000
+[-576460721929 ms] [client] bidi: send phase done sent_chunks=15000 sent_bytes=15360000; FIN-ing
+[-576460721929 ms] [client] sender <0.87.0> exited with reason normal
+[-576460721929 ms] [client] event: ignoring send_shutdown_complete
+[-576460721929 ms] [client] event: peer_send_shutdown

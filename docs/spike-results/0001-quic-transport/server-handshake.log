@@ -1,0 +1,5 @@
+[170417626 ms] [main] listening on udp/50053 mode=normal ALPN=yuzu-spike
+[170417793 ms] [listener] NEW_CONNECTION
+[170417793 ms] [conn] CONNECTED (TLS handshake done)
+[170417793 ms] [conn] SHUTDOWN_INITIATED_BY_PEER err=0
+[170417808 ms] [conn] SHUTDOWN_COMPLETE

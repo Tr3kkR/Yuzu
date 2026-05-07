@@ -1,0 +1,10 @@
+[170449155 ms] [main] listening on udp/50053 mode=normal ALPN=yuzu-spike
+[170449352 ms] [listener] NEW_CONNECTION
+[170449353 ms] [conn] CONNECTED (TLS handshake done)
+[170449353 ms] [conn] PEER_STREAM_STARTED
+[170454353 ms] [stream] RECEIVE with FIN
+[170454353 ms] [stream] PEER_SEND_SHUTDOWN
+[170454353 ms] [stream] SEND_SHUTDOWN_COMPLETE graceful=1
+[170454353 ms] [stream] SHUTDOWN_COMPLETE
+[170454353 ms] [conn] SHUTDOWN_INITIATED_BY_PEER err=0
+[170454368 ms] [conn] SHUTDOWN_COMPLETE

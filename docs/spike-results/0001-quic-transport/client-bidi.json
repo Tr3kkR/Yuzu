@@ -1,0 +1,1 @@
+{"role":"client","mode":"bidi-30s","ok":true,"sent_chunks":15000,"recv_chunks":15000,"sent_bytes":15360000,"recv_bytes":15360000,"loss_bytes":0,"next_expected_seq":15000,"peer_fin_lag_ms":0,"peer_fin_observed":true}

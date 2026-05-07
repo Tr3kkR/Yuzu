@@ -1,0 +1,1 @@
+{"role":"server","mode":"normal","bytes_received":0,"bytes_sent":0,"chunks_received":0,"chunks_sent":0,"peer_send_shutdown_ms":-1,"stream_shutdown_complete_ms":-1,"halfclose_lag_ms":-1,"slow_reader_disable_ms":-1,"slow_reader_reenable_ms":-1,"slow_pause_observed_ms":-1,"completed":true}

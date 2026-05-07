@@ -1,15 +1,15 @@
 # ADR-0001: Use msquic + quicer for QUIC transport
 
-- **Status**: Accepted — pending spike validation (PR 0). If the spike
-  fails any of the pass criteria below, status changes to Rejected and
-  a new ADR with the alternative is required.
+- **Status**: Accepted — spike validation passed 2026-05-07
+  (`docs/spike-results/0001-quic-transport/README.md`).
 - **Accepted-by**: Nathan Dornbrook (project lead) on 2026-05-07
 - **Date**: 2026-05-07
 - **Tracking issue**: #376
 - **Supersedes**: prior implicit decision to use gRPC (no ADR existed)
 - **Related**: #375 (LNK2038/LNK2005 saga), #501 (absl DLL kSeed),
   `docs/per-target-agent-build-pipeline-scope.md`,
-  `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375"
+  `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375",
+  `docs/spike-results/0001-quic-transport/` (PR 0 evidence)
 
 ## Context
 
@@ -214,7 +214,7 @@ and SOC 2 auditors can see what has shipped without grepping git log
 
 | PR | Description | Status |
 |---|---|---|
-| PR 0 | Spike (msquic ↔ quicer echo) | Pending — see "Spike validation gate" below |
+| PR 0 | Spike (msquic ↔ quicer echo) | **Passed 2026-05-07** — evidence at `docs/spike-results/0001-quic-transport/` |
 | PR 1a | Transport abstraction skeleton (header, proto, build wiring) | Merged |
 | PR 1b-1 | Client-side unary dispatch (grpc::GenericStub callback API) | Merged |
 | PR 1b-2 | Server-side AsyncGenericService dispatcher + ServerCall state machine | Merged |
@@ -271,6 +271,32 @@ which environment ran the spike (host OS, msquic version, quicer
 version, cert-pair fingerprint), who ran it, and pass/fail per
 criterion. The named approver in this ADR's header signs off on the
 evidence by referencing the spike-results commit SHA in their approval.
+
+#### Evidence — 2026-05-07 run
+
+Macro-summary (full detail in `docs/spike-results/0001-quic-transport/README.md`):
+
+| Pass criterion | Observed |
+|---|---|
+| TLS 1.3 handshake | 4 ms; ALPN `yuzu-spike` negotiated |
+| Bidi 30 s, zero loss | 15 000 chunks each direction, `loss_bytes = 0` |
+| Half-close < 1 s | client peer-FIN observed in 0 ms (sub-millisecond) |
+| Flow control resume | `slow_pause_observed_ms = 5005`, zero loss across the pause |
+
+Environment: macOS 26.4 / Apple Silicon arm64, AppleClang 21.0,
+OTP 28 / erts 16.4, msquic 2.4.8 (vcpkg port `arm64-osx`), quicer
+0.2.15 (hex). Spike repo SHA at run time: `054cda0`.
+
+Two design choices that the production transport (`transport/`) must
+honour, pulled forward from spike findings (Caveats section of the
+spike-results README):
+
+1. quicer 0.2.x event tuples are **4-element** `{quic, Tag, Resource, Prop}`
+   even when the event has no payload (e.g. `peer_send_shutdown` ships
+   with `Prop = undefined`). 3-tuple patterns silently fall through.
+2. `quicer:async_send/3` without `?QUICER_SEND_FLAG_SYNC` does **not**
+   deliver `send_complete` events. Application-level back-pressure
+   tracking must use `send/2` (sync) or `async_send` *with* the SYNC bit.
 
 ## Release communication checklist
 

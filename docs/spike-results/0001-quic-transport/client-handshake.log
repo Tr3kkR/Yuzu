@@ -1,0 +1,2 @@
+[-576460751936 ms] [client] client starting mode=handshake cacert=/Users/nathan/Yuzu/spike/0001-quic-transport/certs/ca.crt
+[-576460751930 ms] [client] connected handshake_ms=4 alpn=undefined

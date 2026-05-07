@@ -1,0 +1,1 @@
+{"role":"server","mode":"normal","bytes_received":2560000,"bytes_sent":2560000,"chunks_received":2500,"chunks_sent":2500,"peer_send_shutdown_ms":170454353,"stream_shutdown_complete_ms":170454353,"halfclose_lag_ms":0,"slow_reader_disable_ms":-1,"slow_reader_reenable_ms":-1,"slow_pause_observed_ms":-1,"completed":true}
